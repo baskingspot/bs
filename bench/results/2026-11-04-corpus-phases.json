@@ -1,0 +1,3981 @@
+{
+ "zap": {
+  "zls": {
+   "first": {
+    "median_ms": 2286.275481001212,
+    "times_ms": [
+     2286.275481001212,
+     2185.965525000938,
+     2381.376019999152
+    ],
+    "phases_ms": {
+     "total": 2351.8330000006245,
+     "startup": 0.7240000013553072,
+     "configurer": 50.674999998591375,
+     "maker": 21.113999995577615,
+     "compile": 159.63700000429526,
+     "run": 2119.683000000805
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 6931.076508000842,
+    "times_ms": [
+     5865.806421999878,
+     6931.076508000842,
+     7101.225353999325
+    ],
+    "phases_ms": {
+     "total": 7195.012000000133,
+     "startup": 0.5249999994703103,
+     "configurer": 1037.7539999972214,
+     "maker": 21.962000002531568,
+     "compile": 4079.569999998057,
+     "run": 2055.201000002853
+    }
+   },
+   "noop": {
+    "median_ms": 253.7347649995354,
+    "times_ms": [
+     270.5950359995768,
+     253.7347649995354,
+     251.87118200119585,
+     250.13414299974102,
+     259.41600300211576
+    ],
+    "phases_ms": {
+     "total": 261.5010000008624,
+     "startup": 0.5149999997229315,
+     "configurer": 0,
+     "maker": 24.805999997624895,
+     "compile": 7.900000000518048,
+     "run": 228.28000000299653
+    }
+   },
+   "edit-zig": {
+    "median_ms": 2175.336578999122,
+    "times_ms": [
+     1989.0540250016784,
+     2175.336578999122,
+     2413.128643998789
+    ],
+    "phases_ms": {
+     "total": 2237.496999998257,
+     "startup": 0.6109999994805548,
+     "configurer": 0,
+     "maker": 5.0859999973909,
+     "compile": 180.89500000496628,
+     "run": 2050.904999996419
+    }
+   },
+   "edit-build": {
+    "median_ms": 391.6303189980681,
+    "times_ms": [
+     391.6303189980681,
+     380.58516500314,
+     407.4724999991304
+    ],
+    "phases_ms": {
+     "total": 477.165000000241,
+     "startup": 0.8070000003499445,
+     "configurer": 79.75099999748636,
+     "maker": 38.34200000346755,
+     "compile": 8.250999999290798,
+     "run": 350.01399999964633
+    }
+   }
+  },
+  "ghostty": {
+   "failed": "    pt: point.Point.C,\n    ^~~~~~~~~~~~~~~~~\nsrc/terminal/c/terminal.zig:2174:5: note: struct with automatic layout has no guaranteed in-memory representation\n    pt: point.Point.C,\n    ^~~~~~~~~~~~~~~~~\nsrc/lib/union.zig:52:21: note: struct declared here\n            .zig => struct {},\n                    ^~~~~~~~~\nsrc/terminal/c/terminal.zig:2187:5: error: [bad-fn-type] parameter of type 'lib.union.TaggedUnion(.{ .zig = {} },terminal.stream.Action,.{ .padding = [16]u64, .field_renames = .{ ... } }).C__struct_4' not allowed in function with calling convention 'x86_64_sysv'\n    pt: point.Point.C,\n    ^~~~~~~~~~~~~~~~~\nsrc/terminal/c/terminal.zig:2187:5: note: struct with automatic layout has no guaranteed in-memory representation\n    pt: point.Point.C,\n    ^~~~~~~~~~~~~~~~~\nsrc/lib/union.zig:52:21: note: struct declared here\n            .zig => struct {},\n                    ^~~~~~~~~\nsrc/terminal/c/terminal.zig:2231:5: error: [bad-fn-type] parameter of type 'lib.enum.Enum(.{ .zig = {} },&.{ &.{ ... }[0..(...)], &.{ ... }[0..(...)], &.{ ... }[0..(...)], &.{ ... }[0..(...)] }[0..4])' not allowed in function with calling convention 'x86_64_sysv'\n    tag: point.Tag,\n    ^~~~~~~~~~~~~~\nsrc/lib/enum.zig:43:12: note: enum tag type 'u2' is not extern compatible\n    return @Enum(TagInt, .exhaustive, names_actual, &(values: {\n           ^~~~~\nsrc/lib/enum.zig:43:12: note: only integers with 0, 8, 16, 32, 64 and 128 bits are extern compatible\n    return @Enum(TagInt, .exhaustive, names_actual, &(values: {\n           ^~~~~\nsrc/lib/enum.zig:43:12: note: enum declared here\n    return @Enum(TagInt, .exhaustive, names_actual, &(values: {\n           ^~~~~\nsrc/terminal/c/terminal.zig:5607:32: error: [no-field] no field named 'tag' in struct 'lib.union.TaggedUnion(.{ .zig = {} },terminal.stream.Action,.{ .padding = [16]u64, .field_renames = .{ ... } }).C__struct_4'\n            last_tag = request.tag;\n                               ^~~\nsrc/lib/union.zig:52:21: note: struct declared here\n            .zig => struct {},\n                    ^~~~~~~~~\nsrc/terminal/c/terminal.zig:5997:33: error: [no-field] no field named 'tag' in struct 'lib.union.TaggedUnion(.{ .zig = {} },terminal.stream.Action,.{ .padding = [16]u64, .field_renames = .{ ... } }).C__struct_4'\n            last_tag = sequence.tag;\n                                ^~~\nsrc/lib/union.zig:52:21: note: struct declared here\n            .zig => struct {},\n                    ^~~~~~~~~\nerror: 24 compilation errors\nfailed command: /tmp/zbs/zap-c3 test -Odebug --dep build_options --dep terminal_options --dep unicode_tables --dep symbols_tables --dep uucode -Mroot=src/lib_vt.zig -Mbuild_options=.zig-cache/o/4397625620ceabab4657b3f7627413f8/options.zig -Mterminal_options=.zig-cache/o/cc2d4bf2ab143f96af53b0fec1fbbdc2/options.zig -Municode_tables=.zig-cache/o/51f10865bdc75040a1c435b4d2a91ba3/props.zig -Msymbols_tables=.zig-cache/o/51f10865bdc75040a1c435b4d2a91ba3/symbols.zig -Odebug --dep types.zig --dep config.zig --dep tables -Muucode=zig-pkg/uucode-0.2.0-ZZjBPoGFVgCiflJNFc6Io8xzC67B6PA5bUkk4LT0kCxg/src/root.zig -Odebug -Mtypes.zig=zig-pkg/uucode-0.2.0-ZZjBPoGFVgCiflJNFc6Io8xzC67B6PA5bUkk4LT0kCxg/src/types.zig -Odebug --dep types.zig --dep storage.zig -Mconfig.zig=zig-pkg/uucode-0.2.0-ZZjBPoGFVgCiflJNFc6Io8xzC67B6PA5bUkk4LT0kCxg/src/config.zig -Odebug --dep config.zig --dep storage.zig --dep build_config -Mtables=.zig-cache/o/22947751ba52f9291e7b60d70c5beea5/tables.zig -Odebug --dep config.zig -Mstorage.zig=zig-pkg/uucode-0.2.0-ZZjBPoGFVgCiflJNFc6Io8xzC67B6PA5bUkk4LT0kCxg/src/storage.zig --dep config.zig --dep storage.zig -Mbuild_config=src/build/uucode_config.zig --cache-dir .zig-cache --global-cache-dir /home/user/workspace/repo/bench/.work/phases/global-zap --build-root . --name ghostty-vt-test --zig-lib-dir /home/user/.cache/zap/zig-0.17.0/lib/ --listen=-\n\nBuild Summary: 12/14 steps succeeded (1 failed)\ntest-lib-vt-build transitive failure\n+- compile test ghostty-vt-test debug native 24 errors\n\n"
+  },
+  "superhtml": {
+   "first": {
+    "median_ms": 350.6150009998237,
+    "times_ms": [
+     350.6150009998237,
+     321.71269500031485,
+     373.2992950026528
+    ],
+    "phases_ms": {
+     "total": 321.75400000051013,
+     "startup": 0.8679999991727527,
+     "configurer": 50.11299999750918,
+     "maker": 30.842000003758585,
+     "compile": 149.16600000287872,
+     "run": 90.7649999971909
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 3447.853721001593,
+    "times_ms": [
+     3869.1590820017154,
+     3177.732393000042,
+     3447.853721001593
+    ],
+    "phases_ms": {
+     "total": 3373.1100000004517,
+     "startup": 0.8290000005217735,
+     "configurer": 897.4119999984396,
+     "maker": 22.268000000622123,
+     "compile": 2452.601000000868,
+     "run": 0
+    }
+   },
+   "noop": {
+    "median_ms": 28.56691000124556,
+    "times_ms": [
+     27.410156002588337,
+     29.062300000077812,
+     35.61227099999087,
+     28.56691000124556,
+     28.407628000422847
+    ],
+    "phases_ms": {
+     "total": 39.935000000696164,
+     "startup": 0.5630000014207326,
+     "configurer": 16.15699999820208,
+     "maker": 11.961000000155764,
+     "compile": 11.254000000917586,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 113.39619900172693,
+    "times_ms": [
+     113.39619900172693,
+     114.01631300032022,
+     105.78991600050358
+    ],
+    "phases_ms": {
+     "total": 115.15999999755877,
+     "startup": 0.7149999983084854,
+     "configurer": 12.105000001611188,
+     "maker": 36.08099999837577,
+     "compile": 66.25899999926332,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 82.58052599921939,
+    "times_ms": [
+     82.58052599921939,
+     82.43457400021725,
+     87.60283599985996
+    ],
+    "phases_ms": {
+     "total": 78.69799999753013,
+     "startup": 0.7530000002589077,
+     "configurer": 60.633000000962056,
+     "maker": 10.284999996656552,
+     "compile": 7.026999999652617,
+     "run": 0
+    }
+   }
+  },
+  "ziggy": {
+   "first": {
+    "median_ms": 393.24543900147546,
+    "times_ms": [
+     406.0548689994903,
+     393.24543900147546,
+     391.1739030008903
+    ],
+    "phases_ms": {
+     "total": 401.29200000228593,
+     "startup": 0.6030000004102476,
+     "configurer": 53.214999999909196,
+     "maker": 24.81400000397116,
+     "compile": 291.54799999741954,
+     "run": 31.11200000057579
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 3217.5492189999204,
+    "times_ms": [
+     3224.398585000017,
+     3217.5492189999204,
+     3133.581633999711
+    ],
+    "phases_ms": {
+     "total": 2967.79400000014,
+     "startup": 0.5209999981161673,
+     "configurer": 627.8249999995751,
+     "maker": 28.25700000539655,
+     "compile": 2298.9640000014333,
+     "run": 12.226999995618826
+    }
+   },
+   "noop": {
+    "median_ms": 48.48568899979,
+    "times_ms": [
+     64.41041200014297,
+     62.05440000121598,
+     47.46259799867403,
+     48.48568899979,
+     48.15716200027964
+    ],
+    "phases_ms": {
+     "total": 44.37400000097114,
+     "startup": 0.6119999998190906,
+     "configurer": 11.609999997745035,
+     "maker": 12.928000000101747,
+     "compile": 14.724000004207483,
+     "run": 4.499999999097781
+    }
+   },
+   "edit-zig": {
+    "median_ms": 101.55544000008376,
+    "times_ms": [
+     94.7471969993785,
+     102.74531100003514,
+     101.55544000008376
+    ],
+    "phases_ms": {
+     "total": 97.48899999976857,
+     "startup": 0.5440000022645108,
+     "configurer": 12.478000000555767,
+     "maker": 28.31099999457365,
+     "compile": 46.793999998044455,
+     "run": 9.362000004330184
+    }
+   },
+   "edit-build": {
+    "median_ms": 96.77888399892254,
+    "times_ms": [
+     105.53145299854805,
+     96.77888399892254,
+     90.84312300183228
+    ],
+    "phases_ms": {
+     "total": 92.84699999989243,
+     "startup": 0.6589999975403771,
+     "configurer": 54.45599999802653,
+     "maker": 15.492000002268469,
+     "compile": 17.278000002988847,
+     "run": 4.961999999068212
+    }
+   }
+  },
+  "z2d": {
+   "first": {
+    "median_ms": 225.95719800301595,
+    "times_ms": [
+     233.78473399861832,
+     225.95719800301595,
+     215.31683699868154
+    ],
+    "phases_ms": {
+     "total": 202.28599999973085,
+     "startup": 0.6109999994805548,
+     "configurer": 54.75599999772385,
+     "maker": 21.716000002925284,
+     "compile": 40.11299999910989,
+     "run": 85.09000000049127
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 1666.322738998133,
+    "times_ms": [
+     1666.322738998133,
+     1756.2071240026853,
+     1471.5980539986049
+    ],
+    "phases_ms": {
+     "total": 1457.4179999981425,
+     "startup": 0.7129999976314139,
+     "configurer": 602.4189999989176,
+     "maker": 24.7750000016822,
+     "compile": 740.2110000002722,
+     "run": 89.29999999963911
+    }
+   },
+   "noop": {
+    "median_ms": 5.768962000729516,
+    "times_ms": [
+     8.718157001567306,
+     6.825042000855319,
+     5.768962000729516,
+     5.52356200205395,
+     5.392953000409761
+    ],
+    "phases_ms": {
+     "total": 5.923000000620959,
+     "startup": 0.5799999998998828,
+     "configurer": 0,
+     "maker": 3.178999999363441,
+     "compile": 2.1640000013576355,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 135.69530500171822,
+    "times_ms": [
+     135.47513199955574,
+     136.67807300225832,
+     135.69530500171822
+    ],
+    "phases_ms": {
+     "total": 135.31899999725283,
+     "startup": 0.5789999995613471,
+     "configurer": 0,
+     "maker": 18.413999994663754,
+     "compile": 30.975000001490116,
+     "run": 85.35100000153761
+    }
+   },
+   "edit-build": {
+    "median_ms": 52.57327800063649,
+    "times_ms": [
+     49.48803699880955,
+     52.57327800063649,
+     54.917751000175485
+    ],
+    "phases_ms": {
+     "total": 61.30699999994249,
+     "startup": 0.6290000019362196,
+     "configurer": 49.118999999336665,
+     "maker": 7.288000000698958,
+     "compile": 4.270999997970648,
+     "run": 0
+    }
+   }
+  },
+  "zf": {
+   "first": {
+    "median_ms": 479.11199299778673,
+    "times_ms": [
+     491.98816200078,
+     471.83815999960643,
+     479.11199299778673
+    ],
+    "phases_ms": {
+     "total": 513.7859999995271,
+     "startup": 0.5199999977776315,
+     "configurer": 124.94699999660952,
+     "maker": 32.35200000563054,
+     "compile": 61.883999998826766,
+     "run": 294.08300000068266
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 1711.9536440004595,
+    "times_ms": [
+     1687.956067999039,
+     1711.9536440004595,
+     1713.0384419979237
+    ],
+    "phases_ms": {
+     "total": 1991.94400000124,
+     "startup": 0.6020000000717118,
+     "configurer": 718.100999998569,
+     "maker": 35.12600000249222,
+     "compile": 947.5899999997637,
+     "run": 290.5250000003434
+    }
+   },
+   "noop": {
+    "median_ms": 12.186693998955889,
+    "times_ms": [
+     22.445442002208438,
+     12.486309999076184,
+     10.904421000304865,
+     12.186693998955889,
+     11.670053001580527
+    ],
+    "phases_ms": {
+     "total": 10.99899999826448,
+     "startup": 0.6020000000717118,
+     "configurer": 0,
+     "maker": 6.295999995927559,
+     "compile": 4.101000002265209,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 74.8700110016216,
+    "times_ms": [
+     75.12293999752728,
+     74.8700110016216,
+     62.90069700116874
+    ],
+    "phases_ms": {
+     "total": 53.364999999757856,
+     "startup": 0.6890000004204921,
+     "configurer": 0,
+     "maker": 8.813000000372995,
+     "compile": 39.86100000111037,
+     "run": 4.001999997854
+    }
+   },
+   "edit-build": {
+    "median_ms": 68.01752300088992,
+    "times_ms": [
+     62.65507300122408,
+     68.01752300088992,
+     70.21202499890933
+    ],
+    "phases_ms": {
+     "total": 70.93699999677483,
+     "startup": 0.5959999980404973,
+     "configurer": 53.96599999949103,
+     "maker": 9.71400000344147,
+     "compile": 6.660999995801831,
+     "run": 0
+    }
+   }
+  },
+  "zig-clap": {
+   "first": {
+    "median_ms": 481.874783999956,
+    "times_ms": [
+     326.2960780011781,
+     495.493346999865,
+     481.874783999956
+    ],
+    "phases_ms": {
+     "total": 492.8810000019439,
+     "startup": 0.5760000021837186,
+     "configurer": 57.44599999889033,
+     "maker": 15.628000004653586,
+     "compile": 413.0559999975958,
+     "run": 6.174999998620478
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 1614.393129999371,
+    "times_ms": [
+     1755.4477900011989,
+     1555.9978259989293,
+     1614.393129999371
+    ],
+    "phases_ms": {
+     "total": 1508.3269999995537,
+     "startup": 0.51299999904586,
+     "configurer": 554.6140000005835,
+     "maker": 10.864999996556435,
+     "compile": 942.3350000033679,
+     "run": 0
+    }
+   },
+   "noop": {
+    "median_ms": 9.260943999834126,
+    "times_ms": [
+     11.343522997776745,
+     9.904245998768602,
+     8.434341998508899,
+     9.260943999834126,
+     9.249789000023156
+    ],
+    "phases_ms": {
+     "total": 10.59000000168453,
+     "startup": 0.5290000008244533,
+     "configurer": 0,
+     "maker": 3.966000000218628,
+     "compile": 6.095000000641448,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 159.12940000271192,
+    "times_ms": [
+     200.77344399760477,
+     156.29716900002677,
+     159.12940000271192
+    ],
+    "phases_ms": {
+     "total": 123.65300000237767,
+     "startup": 0.5789999995613471,
+     "configurer": 0,
+     "maker": 9.253000003809575,
+     "compile": 113.82099999900674,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 55.71263300225837,
+    "times_ms": [
+     50.573968001117464,
+     62.72542599981534,
+     55.71263300225837
+    ],
+    "phases_ms": {
+     "total": 53.27899999974761,
+     "startup": 0.565999998798361,
+     "configurer": 39.3499999991036,
+     "maker": 7.040000000415603,
+     "compile": 6.323000001430046,
+     "run": 0
+    }
+   }
+  },
+  "anyzig": {
+   "first": {
+    "median_ms": 456.54057299907436,
+    "times_ms": [
+     534.5046160000493,
+     456.54057299907436,
+     450.0993980000203
+    ],
+    "phases_ms": {
+     "total": 499.95599999965634,
+     "startup": 0.5459999993036035,
+     "configurer": 282.2260000029928,
+     "maker": 137.0969999989029,
+     "compile": 64.51499999820953,
+     "run": 15.572000000247499
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 3224.993766998523,
+    "times_ms": [
+     3224.993766998523,
+     3795.9575269997003,
+     3170.60195799786
+    ],
+    "phases_ms": {
+     "total": 3129.7229999981937,
+     "startup": 0.5099999980302528,
+     "configurer": 1128.3579999981157,
+     "maker": 126.8129999989469,
+     "compile": 1849.2330000044603,
+     "run": 24.808999998640502
+    }
+   },
+   "noop": {
+    "median_ms": 30.909371002053376,
+    "times_ms": [
+     39.87197899914463,
+     30.061811998166377,
+     37.74826999870129,
+     30.361634999280795,
+     30.909371002053376
+    ],
+    "phases_ms": {
+     "total": 30.976000001828652,
+     "startup": 0.517000000400003,
+     "configurer": 0,
+     "maker": 26.477999999769963,
+     "compile": 3.9810000016586855,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 117.58523699973011,
+    "times_ms": [
+     117.58523699973011,
+     111.3842989980185,
+     118.6809010032448
+    ],
+    "phases_ms": {
+     "total": 143.69599999918137,
+     "startup": 0.7250000016938429,
+     "configurer": 0,
+     "maker": 62.8389999983483,
+     "compile": 80.13199999913923,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 340.5009060006705,
+    "times_ms": [
+     374.5569920029084,
+     340.5009060006705,
+     338.1224590011698
+    ],
+    "phases_ms": {
+     "total": 349.5419999999285,
+     "startup": 0.4890000018349383,
+     "configurer": 292.7509999972244,
+     "maker": 51.92499999611755,
+     "compile": 4.377000004751608,
+     "run": 0
+    }
+   }
+  },
+  "zine": {
+   "failed": "ug native (reused)\n            |  +- compile obj tree-sitter-scheme-parser debug native (reused)\n            |  +- compile obj tree-sitter-scss-parser debug native (reused)\n            |  +- compile obj tree-sitter-scss-scanner debug native (reused)\n            |  +- compile obj tree-sitter-sql-parser debug native (reused)\n            |  +- compile obj tree-sitter-sql-scanner debug native (reused)\n            |  +- compile obj tree-sitter-ssh-config-parser debug native (reused)\n            |  +- compile obj tree-sitter-superhtml-parser debug native (reused)\n            |  +- compile obj tree-sitter-superhtml-scanner debug native (reused)\n            |  +- compile obj tree-sitter-supermd-parser debug native (reused)\n            |  +- compile obj tree-sitter-supermd-scanner debug native (reused)\n            |  +- compile obj tree-sitter-supermd-parser debug native (reused)\n            |  +- compile obj tree-sitter-supermd-scanner debug native (reused)\n            |  +- compile obj tree-sitter-svelte-parser debug native (reused)\n            |  +- compile obj tree-sitter-svelte-scanner debug native (reused)\n            |  +- compile obj tree-sitter-swift-parser debug native (reused)\n            |  +- compile obj tree-sitter-swift-scanner debug native (reused)\n            |  +- compile obj tree-sitter-systemverilog-parser debug native (reused)\n            |  +- compile obj tree-sitter-thrift-parser debug native (reused)\n            |  +- compile obj tree-sitter-toml-parser debug native (reused)\n            |  +- compile obj tree-sitter-toml-scanner debug native (reused)\n            |  +- compile obj tree-sitter-typescript-parser debug native (reused)\n            |  +- compile obj tree-sitter-typescript-scanner debug native (reused)\n            |  +- compile obj tree-sitter-typescript-parser debug native (reused)\n            |  +- compile obj tree-sitter-typescript-scanner debug native (reused)\n            |  +- compile obj tree-sitter-typst-parser debug native (reused)\n            |  +- compile obj tree-sitter-typst-scanner debug native (reused)\n            |  +- compile obj tree-sitter-unison-parser debug native (reused)\n            |  +- compile obj tree-sitter-unison-scanner debug native (reused)\n            |  +- compile obj tree-sitter-uxntal-parser debug native (reused)\n            |  +- compile obj tree-sitter-uxntal-scanner debug native (reused)\n            |  +- compile obj tree-sitter-v-parser debug native (reused)\n            |  +- compile obj tree-sitter-vim-parser debug native (reused)\n            |  +- compile obj tree-sitter-vim-scanner debug native (reused)\n            |  +- compile obj tree-sitter-vue-parser debug native (reused)\n            |  +- compile obj tree-sitter-vue-scanner debug native (reused)\n            |  +- compile obj tree-sitter-wat-parser debug native (reused)\n            |  +- compile obj tree-sitter-wat-scanner debug native (reused)\n            |  +- compile obj tree-sitter-wgsl-parser debug native (reused)\n            |  +- compile obj tree-sitter-wgsl-scanner debug native (reused)\n            |  +- compile obj tree-sitter-wikitext-parser debug native (reused)\n            |  +- compile obj tree-sitter-wikitext-scanner debug native (reused)\n            |  +- compile obj tree-sitter-xml-parser debug native (reused)\n            |  +- compile obj tree-sitter-xml-scanner debug native (reused)\n            |  +- compile obj tree-sitter-xml-parser debug native (reused)\n            |  +- compile obj tree-sitter-xml-scanner debug native (reused)\n            |  +- compile obj tree-sitter-yaml-parser debug native (reused)\n            |  +- compile obj tree-sitter-yaml-scanner debug native (reused)\n            |  +- compile obj tree-sitter-ziggy-parser debug native (reused)\n            |  +- compile obj tree-sitter-ziggy-parser debug native (reused)\n            |  +- compile obj tree-sitter-zig-parser debug native (reused)\n            +- compile lib tree-sitter debug native (+606 more reused dependencies)\n\n"
+  },
+  "zig-protobuf": {
+   "first": {
+    "median_ms": 3725.6004820010276,
+    "times_ms": [
+     3898.686059001193,
+     3725.6004820010276,
+     3625.121424000099
+    ],
+    "phases_ms": {
+     "total": 3948.9900000007765,
+     "startup": 0.884000000951346,
+     "configurer": 49.430999999458436,
+     "maker": 36.47700000874465,
+     "compile": 3600.5679999907443,
+     "run": 261.63000000087777
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 5282.936177998636,
+    "times_ms": [
+     5235.985884999536,
+     5282.936177998636,
+     5850.410538998403
+    ],
+    "phases_ms": {
+     "total": 6594.2529999992985,
+     "startup": 0.6919999977981206,
+     "configurer": 694.8970000012196,
+     "maker": 45.429999991029035,
+     "compile": 5578.080000002956,
+     "run": 275.154000006296
+    }
+   },
+   "noop": {
+    "median_ms": 387.82610700218356,
+    "times_ms": [
+     391.83117500215303,
+     384.1908880021947,
+     464.31504300198867,
+     387.82610700218356,
+     358.5828639988904
+    ],
+    "phases_ms": {
+     "total": 470.8199999986391,
+     "startup": 0.8200000011129305,
+     "configurer": 0,
+     "maker": 17.523999991681194,
+     "compile": 78.590000008262,
+     "run": 373.885999997583
+    }
+   },
+   "edit-zig": {
+    "median_ms": 963.6481339985039,
+    "times_ms": [
+     963.6481339985039,
+     1067.8947689993947,
+     962.8347300022142
+    ],
+    "phases_ms": {
+     "total": 1166.773999997531,
+     "startup": 0.853999998071231,
+     "configurer": 0,
+     "maker": 23.08600000833394,
+     "compile": 640.3079999945476,
+     "run": 502.5259999965783
+    }
+   },
+   "edit-build": {
+    "median_ms": 400.4155209986493,
+    "times_ms": [
+     418.21464500026195,
+     384.2320220028341,
+     400.4155209986493
+    ],
+    "phases_ms": {
+     "total": 417.7239999989979,
+     "startup": 0.8129999987431802,
+     "configurer": 52.947000000131084,
+     "maker": 18.54000000457745,
+     "compile": 73.23999999425723,
+     "run": 272.18400000128895
+    }
+   }
+  },
+  "vulkan-zig": {
+   "first": {
+    "median_ms": 69.09275499856449,
+    "times_ms": [
+     74.20952100073919,
+     69.09275499856449,
+     67.21001600089949
+    ],
+    "phases_ms": {
+     "total": 68.32699999722536,
+     "startup": 0.5719999971915968,
+     "configurer": 31.062999998539453,
+     "maker": 5.729000000428641,
+     "compile": 27.557000001252163,
+     "run": 3.4059999998135027
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 1065.4935960010334,
+    "times_ms": [
+     1028.7241660007567,
+     1065.4935960010334,
+     1271.4054560019576
+    ],
+    "phases_ms": {
+     "total": 1131.6470000019763,
+     "startup": 0.5669999991368968,
+     "configurer": 622.298000002047,
+     "maker": 12.247999999090098,
+     "compile": 496.5340000017022,
+     "run": 0
+    }
+   },
+   "noop": {
+    "median_ms": 8.817518999421736,
+    "times_ms": [
+     8.817518999421736,
+     7.999340999958804,
+     8.47694099866203,
+     9.601828001905233,
+     8.898890999262221
+    ],
+    "phases_ms": {
+     "total": 8.314999999129213,
+     "startup": 0.9140000001934823,
+     "configurer": 0,
+     "maker": 4.354999997303821,
+     "compile": 3.04600000163191,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 76.88409899856197,
+    "times_ms": [
+     75.63041499815881,
+     76.88409899856197,
+     78.11983200008399
+    ],
+    "phases_ms": {
+     "total": 77.93199999650824,
+     "startup": 0.8249999991676304,
+     "configurer": 0,
+     "maker": 18.08800000071642,
+     "compile": 59.01899999662419,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 64.91668499802472,
+    "times_ms": [
+     61.04449399936129,
+     64.91668499802472,
+     71.3737799997034
+    ],
+    "phases_ms": {
+     "total": 70.6400000017311,
+     "startup": 0.9290000016335398,
+     "configurer": 57.58100000093691,
+     "maker": 8.671999999933178,
+     "compile": 3.457999999227468,
+     "run": 0
+    }
+   }
+  },
+  "tls.zig": {
+   "first": {
+    "median_ms": 3611.5415150015906,
+    "times_ms": [
+     3611.5415150015906,
+     3846.159324999462,
+     2508.8242109995917
+    ],
+    "phases_ms": {
+     "total": 3873.4240000012505,
+     "startup": 0.5560000026889611,
+     "configurer": 45.702999996137805,
+     "maker": 28.228999995917547,
+     "compile": 1537.253000005876,
+     "run": 2261.6830000006303
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 6903.789970001526,
+    "times_ms": [
+     6903.789970001526,
+     5798.375195998233,
+     8876.75963899892
+    ],
+    "phases_ms": {
+     "total": 7677.058000001125,
+     "startup": 0.6329999996523838,
+     "configurer": 599.2830000031972,
+     "maker": 31.23799999957555,
+     "compile": 4697.934999996505,
+     "run": 2347.9690000021947
+    }
+   },
+   "noop": {
+    "median_ms": 17.309399001533166,
+    "times_ms": [
+     17.47446900117211,
+     16.31742999961716,
+     17.649468998570228,
+     15.697512000770075,
+     17.309399001533166
+    ],
+    "phases_ms": {
+     "total": 14.311999999335967,
+     "startup": 0.5549999987124465,
+     "configurer": 0,
+     "maker": 5.0760000012815,
+     "compile": 8.68099999934202,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 2555.7976249983767,
+    "times_ms": [
+     2598.799183000665,
+     2555.7976249983767,
+     2398.2073449988093
+    ],
+    "phases_ms": {
+     "total": 2340.763000000152,
+     "startup": 0.4980000012437813,
+     "configurer": 0,
+     "maker": 9.299000001192326,
+     "compile": 239.39799999789102,
+     "run": 2091.5679999998247
+    }
+   },
+   "edit-build": {
+    "median_ms": 56.32528600108344,
+    "times_ms": [
+     54.92698600210133,
+     61.257656998350285,
+     56.32528600108344
+    ],
+    "phases_ms": {
+     "total": 65.1849999994738,
+     "startup": 0.7369999984803144,
+     "configurer": 45.88799999692128,
+     "maker": 8.21100000757724,
+     "compile": 10.348999996494967,
+     "run": 0
+    }
+   }
+  },
+  "zlinter": {
+   "first": {
+    "median_ms": 115.13109100269503,
+    "times_ms": [
+     117.98638099935488,
+     114.93170700123301,
+     115.13109100269503
+    ],
+    "phases_ms": {
+     "total": 117.59800000072573,
+     "startup": 0.49199999921256676,
+     "configurer": 111.94799999793759,
+     "maker": 5.15800000357558,
+     "compile": 0,
+     "run": 0
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 708.4242029995949,
+    "times_ms": [
+     734.4150040007662,
+     708.4242029995949,
+     681.0256480021053
+    ],
+    "phases_ms": {
+     "total": 611.7190000004484,
+     "startup": 0.5629999977827538,
+     "configurer": 605.729999999312,
+     "maker": 5.426000003353693,
+     "compile": 0,
+     "run": 0
+    }
+   },
+   "noop": {
+    "median_ms": 16.580526000325335,
+    "times_ms": [
+     16.669450000335928,
+     16.072402002464514,
+     15.16116799757583,
+     16.63193900094484,
+     16.580526000325335
+    ],
+    "phases_ms": {
+     "total": 15.967999999702442,
+     "startup": 0.8200000011129305,
+     "configurer": 9.613999998691725,
+     "maker": 5.533999999897787,
+     "compile": 0,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 12.72174800033099,
+    "times_ms": [
+     13.547812999604503,
+     12.72174800033099,
+     12.680601001193281
+    ],
+    "phases_ms": {
+     "total": 12.206999999762047,
+     "startup": 0.49000000217347406,
+     "configurer": 7.775999998557381,
+     "maker": 3.9409999990311917,
+     "compile": 0,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 60.44559400106664,
+    "times_ms": [
+     53.66508699808037,
+     63.911413999448996,
+     60.44559400106664
+    ],
+    "phases_ms": {
+     "total": 59.45900000006077,
+     "startup": 0.7899999982328154,
+     "configurer": 53.36700000043493,
+     "maker": 5.302000001393026,
+     "compile": 0,
+     "run": 0
+    }
+   }
+  },
+  "zig-ecs": {
+   "first": {
+    "median_ms": 102.54082900064532,
+    "times_ms": [
+     141.97857799808844,
+     100.62287200344144,
+     102.54082900064532
+    ],
+    "phases_ms": {
+     "total": 106.34600000048522,
+     "startup": 0.4850000004807953,
+     "configurer": 43.22700000193436,
+     "maker": 16.50799999697483,
+     "compile": 46.126000001095235,
+     "run": 0
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 1332.2350480011664,
+    "times_ms": [
+     1434.28675800169,
+     1302.9778790005366,
+     1332.2350480011664
+    ],
+    "phases_ms": {
+     "total": 1336.7980000002717,
+     "startup": 0.49899999794433825,
+     "configurer": 548.8179999993008,
+     "maker": 15.172000003076391,
+     "compile": 772.3089999999502,
+     "run": 0
+    }
+   },
+   "noop": {
+    "median_ms": 22.412572001485387,
+    "times_ms": [
+     28.468725002312567,
+     22.412572001485387,
+     20.128829000896076,
+     24.379478996706894,
+     19.490304999635555
+    ],
+    "phases_ms": {
+     "total": 21.036999998614192,
+     "startup": 0.5859999982931186,
+     "configurer": 0,
+     "maker": 12.743999999656808,
+     "compile": 7.707000000664266,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 125.94814499971108,
+    "times_ms": [
+     125.94814499971108,
+     137.81752599970787,
+     114.95599699992454
+    ],
+    "phases_ms": {
+     "total": 142.612999999983,
+     "startup": 0.6390000016835984,
+     "configurer": 0,
+     "maker": 15.619999998307321,
+     "compile": 126.35399999999208,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 65.43644100020174,
+    "times_ms": [
+     65.43644100020174,
+     71.6723989971797,
+     59.80970099699334
+    ],
+    "phases_ms": {
+     "total": 61.79599999813945,
+     "startup": 0.5700000001525041,
+     "configurer": 41.76799999913783,
+     "maker": 11.192000001756242,
+     "compile": 8.265999997092877,
+     "run": 0
+    }
+   }
+  },
+  "zig-minisign": {
+   "first": {
+    "median_ms": 164.21704400272574,
+    "times_ms": [
+     160.4151030005596,
+     192.42918199961423,
+     164.21704400272574
+    ],
+    "phases_ms": {
+     "total": 141.29200000024866,
+     "startup": 0.5380000002332963,
+     "configurer": 90.44199999698321,
+     "maker": 12.53300000098534,
+     "compile": 23.514000000432134,
+     "run": 14.26500000161468
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 1184.3121009987954,
+    "times_ms": [
+     1237.9504439995799,
+     1094.2504169979657,
+     1184.3121009987954
+    ],
+    "phases_ms": {
+     "total": 1068.767000000662,
+     "startup": 0.525999999808846,
+     "configurer": 656.6189999975904,
+     "maker": 15.695000005507609,
+     "compile": 383.0630000011297,
+     "run": 12.863999996625353
+    }
+   },
+   "noop": {
+    "median_ms": 6.866907999210525,
+    "times_ms": [
+     8.7226389987336,
+     7.442946996889077,
+     6.747488001565216,
+     6.866907999210525,
+     6.336641999951098
+    ],
+    "phases_ms": {
+     "total": 7.2000000000116415,
+     "startup": 0.5879999989701901,
+     "configurer": 0,
+     "maker": 3.8040000035834964,
+     "compile": 2.807999997457955,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 52.563111999916146,
+    "times_ms": [
+     52.563111999916146,
+     52.6886090010521,
+     49.10432700125966
+    ],
+    "phases_ms": {
+     "total": 57.778000002144836,
+     "startup": 0.9219999992637895,
+     "configurer": 0,
+     "maker": 16.84900000327616,
+     "compile": 40.006999999604886,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 70.80450200010091,
+    "times_ms": [
+     64.62603099862463,
+     70.80450200010091,
+     78.49613600046723
+    ],
+    "phases_ms": {
+     "total": 69.40100000065286,
+     "startup": 0.5670000027748756,
+     "configurer": 60.306999999738764,
+     "maker": 5.8299999982409645,
+     "compile": 2.696999999898253,
+     "run": 0
+    }
+   }
+  },
+  "zalgebra": {
+   "first": {
+    "median_ms": 85.3472469971166,
+    "times_ms": [
+     85.3472469971166,
+     98.05035200042767,
+     79.12420299908263
+    ],
+    "phases_ms": {
+     "total": 75.24299999931827,
+     "startup": 0.543999998626532,
+     "configurer": 37.85799999968731,
+     "maker": 12.452000002667774,
+     "compile": 19.82999999745516,
+     "run": 4.559000000881497
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 899.3953609970049,
+    "times_ms": [
+     899.3953609970049,
+     1021.7969139994239,
+     841.955947002134
+    ],
+    "phases_ms": {
+     "total": 818.7189999989641,
+     "startup": 0.5339999988791533,
+     "configurer": 538.7229999978445,
+     "maker": 13.511000001017237,
+     "compile": 261.2230000013369,
+     "run": 4.727999999886379
+    }
+   },
+   "noop": {
+    "median_ms": 7.330945001740474,
+    "times_ms": [
+     7.330945001740474,
+     7.892711000749841,
+     6.689343001198722,
+     7.442245998390717,
+     5.766886999481358
+    ],
+    "phases_ms": {
+     "total": 5.4139999992912635,
+     "startup": 0.5139999993843958,
+     "configurer": 0,
+     "maker": 3.0870000009599607,
+     "compile": 1.812999998946907,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 56.78298500060919,
+    "times_ms": [
+     44.57082100270782,
+     58.957951001502806,
+     56.78298500060919
+    ],
+    "phases_ms": {
+     "total": 39.354000000457745,
+     "startup": 0.5209999981161673,
+     "configurer": 0,
+     "maker": 9.87399999939953,
+     "compile": 24.401000002399087,
+     "run": 4.558000000542961
+    }
+   },
+   "edit-build": {
+    "median_ms": 45.23809600141249,
+    "times_ms": [
+     42.965933000232326,
+     45.60418500113883,
+     45.23809600141249
+    ],
+    "phases_ms": {
+     "total": 48.908999997365754,
+     "startup": 0.5049999999755528,
+     "configurer": 40.727999999944586,
+     "maker": 5.637999998725718,
+     "compile": 2.037999998719897,
+     "run": 0
+    }
+   }
+  },
+  "zig-args": {
+   "first": {
+    "median_ms": 106.77415800091694,
+    "times_ms": [
+     106.77415800091694,
+     108.34361999877729,
+     88.87791099914466
+    ],
+    "phases_ms": {
+     "total": 99.11300000021583,
+     "startup": 0.5870000022696331,
+     "configurer": 47.55799999838928,
+     "maker": 9.147000000666594,
+     "compile": 28.454999999667052,
+     "run": 13.365999999223277
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 1228.5120809974615,
+    "times_ms": [
+     1240.044851998391,
+     1228.5120809974615,
+     1114.9587389991211
+    ],
+    "phases_ms": {
+     "total": 991.676000001462,
+     "startup": 1.0140000013052486,
+     "configurer": 573.3700000018871,
+     "maker": 15.950999997585313,
+     "compile": 396.66700000088895,
+     "run": 4.673999999795342
+    }
+   },
+   "noop": {
+    "median_ms": 27.565226002479903,
+    "times_ms": [
+     25.940370000171242,
+     27.565226002479903,
+     26.210065003397176,
+     29.564666001533624,
+     28.766908999386942
+    ],
+    "phases_ms": {
+     "total": 28.033999999024672,
+     "startup": 0.8349999989150092,
+     "configurer": 0,
+     "maker": 6.683999999950174,
+     "compile": 3.8569999996980187,
+     "run": 16.65800000046147
+    }
+   },
+   "edit-zig": {
+    "median_ms": 46.51980999915395,
+    "times_ms": [
+     42.31493800034514,
+     46.51980999915395,
+     48.41662500257371
+    ],
+    "phases_ms": {
+     "total": 44.546000000991626,
+     "startup": 0.5860000019310974,
+     "configurer": 0,
+     "maker": 3.8279999971564393,
+     "compile": 27.9740000005404,
+     "run": 12.158000001363689
+    }
+   },
+   "edit-build": {
+    "median_ms": 66.46148399886442,
+    "times_ms": [
+     61.506490001193015,
+     66.46148399886442,
+     76.96397700055968
+    ],
+    "phases_ms": {
+     "total": 63.02299999879324,
+     "startup": 0.4939999998896383,
+     "configurer": 37.86099999706494,
+     "maker": 8.699000005435664,
+     "compile": 2.4599999997008126,
+     "run": 13.508999996702187
+    }
+   }
+  },
+  "zBench": {
+   "first": {
+    "median_ms": 194.61294099892257,
+    "times_ms": [
+     177.0546240004478,
+     194.61294099892257,
+     238.32687299727695
+    ],
+    "phases_ms": {
+     "total": 209.44999999846914,
+     "startup": 0.5510000009962823,
+     "configurer": 54.903999996895436,
+     "maker": 15.263000001141336,
+     "compile": 135.94000000011874,
+     "run": 2.7919999993173406
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 1403.43912300159,
+    "times_ms": [
+     1403.43912300159,
+     1508.6747530003777,
+     1385.8846990005986
+    ],
+    "phases_ms": {
+     "total": 1333.7270000010903,
+     "startup": 0.5300000011629891,
+     "configurer": 625.8429999979853,
+     "maker": 15.287000001990236,
+     "compile": 689.78000000061,
+     "run": 2.2869999993417878
+    }
+   },
+   "noop": {
+    "median_ms": 11.144652002258226,
+    "times_ms": [
+     12.054594000801444,
+     11.144652002258226,
+     11.784662001446122,
+     10.209226002189098,
+     10.526524998567766
+    ],
+    "phases_ms": {
+     "total": 12.627000000065891,
+     "startup": 0.6109999994805548,
+     "configurer": 0,
+     "maker": 4.708999997092178,
+     "compile": 7.307000003493158,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 82.00930900056846,
+    "times_ms": [
+     109.22783299974981,
+     82.00930900056846,
+     73.0089089993271
+    ],
+    "phases_ms": {
+     "total": 59.385000000474975,
+     "startup": 0.5820000005769543,
+     "configurer": 0,
+     "maker": 4.385000000183936,
+     "compile": 54.417999999714084,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 55.442082997615216,
+    "times_ms": [
+     55.442082997615216,
+     54.04220600030385,
+     58.21926700082258
+    ],
+    "phases_ms": {
+     "total": 57.87799999961862,
+     "startup": 0.5820000005769543,
+     "configurer": 44.56699999718694,
+     "maker": 6.793000004108762,
+     "compile": 5.9359999977459665,
+     "run": 0
+    }
+   }
+  },
+  "linuxwave": {
+   "first": {
+    "median_ms": 312.06123599986313,
+    "times_ms": [
+     292.8740180032037,
+     312.06123599986313,
+     367.8505869975197
+    ],
+    "phases_ms": {
+     "total": 435.3289999999106,
+     "startup": 0.6269999976211693,
+     "configurer": 100.05599999931292,
+     "maker": 14.680000003863825,
+     "compile": 188.36599999849568,
+     "run": 131.600000000617
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 1521.0137870017206,
+    "times_ms": [
+     1665.315725000255,
+     1521.0137870017206,
+     1350.7438870001351
+    ],
+    "phases_ms": {
+     "total": 1499.5689999996102,
+     "startup": 0.5559999990509823,
+     "configurer": 642.7889999977197,
+     "maker": 16.308999998727813,
+     "compile": 837.6770000031684,
+     "run": 2.2380000009434298
+    }
+   },
+   "noop": {
+    "median_ms": 9.499687999777962,
+    "times_ms": [
+     9.5501100004185,
+     8.338757997989887,
+     9.98605900167604,
+     9.499687999777962,
+     9.200140997563722
+    ],
+    "phases_ms": {
+     "total": 10.281000002578367,
+     "startup": 0.5130000026838388,
+     "configurer": 0,
+     "maker": 4.452999997738516,
+     "compile": 5.315000002156012,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 180.27680600062013,
+    "times_ms": [
+     186.862940001447,
+     178.5472049996315,
+     180.27680600062013
+    ],
+    "phases_ms": {
+     "total": 177.99400000149035,
+     "startup": 0.7100000002537854,
+     "configurer": 0,
+     "maker": 9.473999998590443,
+     "compile": 31.26200000042445,
+     "run": 136.54800000222167
+    }
+   },
+   "edit-build": {
+    "median_ms": 51.9665210013045,
+    "times_ms": [
+     50.13944799793535,
+     51.9665210013045,
+     53.55852000138839
+    ],
+    "phases_ms": {
+     "total": 53.05500000031316,
+     "startup": 0.5419999979494605,
+     "configurer": 41.3490000028105,
+     "maker": 6.478000002971385,
+     "compile": 4.685999996581813,
+     "run": 0
+    }
+   }
+  },
+  "zli": {
+   "first": {
+    "median_ms": 105.71636399981799,
+    "times_ms": [
+     91.46456999951624,
+     105.71636399981799,
+     110.0728369965509
+    ],
+    "phases_ms": {
+     "total": 99.527999998827,
+     "startup": 0.5229999987932388,
+     "configurer": 50.122000000556,
+     "maker": 6.228999995073536,
+     "compile": 24.111000002449146,
+     "run": 18.54300000195508
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 856.7312239974854,
+    "times_ms": [
+     856.7312239974854,
+     850.9966030032956,
+     964.7346130004735
+    ],
+    "phases_ms": {
+     "total": 941.3659999991069,
+     "startup": 0.5380000002332963,
+     "configurer": 623.7619999992603,
+     "maker": 8.576000003813533,
+     "compile": 291.57999999733875,
+     "run": 16.90999999846099
+    }
+   },
+   "noop": {
+    "median_ms": 24.60763099952601,
+    "times_ms": [
+     27.214347002882278,
+     25.116511002124753,
+     24.241897997853812,
+     23.64738899996155,
+     24.60763099952601
+    ],
+    "phases_ms": {
+     "total": 24.09299999999348,
+     "startup": 0.5410000012489036,
+     "configurer": 0,
+     "maker": 3.7730000003648456,
+     "compile": 1.9749999992200173,
+     "run": 17.803999999159714
+    }
+   },
+   "edit-zig": {
+    "median_ms": 45.58777199781616,
+    "times_ms": [
+     43.09651199946529,
+     45.58777199781616,
+     48.15128500194987
+    ],
+    "phases_ms": {
+     "total": 45.79999999987194,
+     "startup": 0.5869999986316543,
+     "configurer": 0,
+     "maker": 3.9900000010675285,
+     "compile": 24.765000001934823,
+     "run": 16.457999998237938
+    }
+   },
+   "edit-build": {
+    "median_ms": 65.54223500279477,
+    "times_ms": [
+     65.32389599669841,
+     65.65858499743626,
+     65.54223500279477
+    ],
+    "phases_ms": {
+     "total": 65.49100000120234,
+     "startup": 0.49500000022817403,
+     "configurer": 39.419000000634696,
+     "maker": 6.5630000026430935,
+     "compile": 2.0889999977953266,
+     "run": 16.924999999901047
+    }
+   }
+  },
+  "zig-compiler": {
+   "failed": "failed in /home/user/workspace/repo/bench/.work/phases: git clone --quiet upstream/lib/compiler (Zig 0.17.0's own tools) /home/user/workspace/repo/bench/.work/phases/src/zig-compiler\nfatal: repository 'upstream/lib/compiler (Zig 0.17.0's own tools)' does not exist\n"
+  },
+  "zigimg": {
+   "first": {
+    "median_ms": 784.6478369974648,
+    "times_ms": [
+     829.1903829995135,
+     784.6478369974648,
+     741.5673750001588
+    ],
+    "phases_ms": {
+     "total": 727.3419999983162,
+     "startup": 0.49199999921256676,
+     "configurer": 62.76900000375463,
+     "maker": 14.248999996198108,
+     "compile": 32.86300000036135,
+     "run": 616.9689999987895
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 2100.914394002757,
+    "times_ms": [
+     1978.134445998876,
+     2100.914394002757,
+     2223.926009999559
+    ],
+    "phases_ms": {
+     "total": 1996.3820000011765,
+     "startup": 0.4889999981969595,
+     "configurer": 578.7619999973685,
+     "maker": 15.256000006047543,
+     "compile": 787.7599999992526,
+     "run": 614.1150000003108
+    }
+   },
+   "noop": {
+    "median_ms": 616.7005589995824,
+    "times_ms": [
+     616.7005589995824,
+     663.06685300151,
+     621.7767869966337,
+     606.6978829985601,
+     615.5468480028503
+    ],
+    "phases_ms": {
+     "total": 639.5789999987755,
+     "startup": 0.5009999986214098,
+     "configurer": 0,
+     "maker": 3.969999997934792,
+     "compile": 2.10000000151922,
+     "run": 633.0080000007001
+    }
+   },
+   "edit-zig": {
+    "median_ms": 893.2673930030433,
+    "times_ms": [
+     713.1872400022985,
+     893.4477740003786,
+     893.2673930030433
+    ],
+    "phases_ms": {
+     "total": 715.2119999991555,
+     "startup": 0.7719999994151294,
+     "configurer": 0,
+     "maker": 27.001999998901738,
+     "compile": 54.32500000097207,
+     "run": 633.1129999998666
+    }
+   },
+   "edit-build": {
+    "median_ms": 674.7104169990052,
+    "times_ms": [
+     665.6365880007797,
+     674.7104169990052,
+     738.1390219998138
+    ],
+    "phases_ms": {
+     "total": 659.7910000018601,
+     "startup": 0.5490000003192108,
+     "configurer": 41.31699999925331,
+     "maker": 6.321000000752974,
+     "compile": 2.3990000008780044,
+     "run": 609.2050000006566
+    }
+   }
+  },
+  "zeit": {
+   "first": {
+    "median_ms": 382.73485399986384,
+    "times_ms": [
+     419.1054190014256,
+     380.3018170001451,
+     382.73485399986384
+    ],
+    "phases_ms": {
+     "total": 451.47999999971944,
+     "startup": 0.8379999999306165,
+     "configurer": 46.65999999997439,
+     "maker": 15.315999997255858,
+     "compile": 31.213000002026092,
+     "run": 357.4530000005325
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 1253.857842002617,
+    "times_ms": [
+     1253.857842002617,
+     1226.384367000719,
+     1565.816812999401
+    ],
+    "phases_ms": {
+     "total": 1287.2619999980088,
+     "startup": 0.7829999995010439,
+     "configurer": 612.1090000015101,
+     "maker": 14.321999999083346,
+     "compile": 340.43799999926705,
+     "run": 319.60999999864725
+    }
+   },
+   "noop": {
+    "median_ms": 5.033476998505648,
+    "times_ms": [
+     6.262325998250162,
+     5.273669001326198,
+     5.033476998505648,
+     4.396493000967894,
+     4.125505998672452
+    ],
+    "phases_ms": {
+     "total": 5.379000001994427,
+     "startup": 0.5530000016733538,
+     "configurer": 0,
+     "maker": 2.914000000600936,
+     "compile": 1.9119999997201376,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 367.0032249974611,
+    "times_ms": [
+     367.0032249974611,
+     383.70088699957705,
+     351.7000280007778
+    ],
+    "phases_ms": {
+     "total": 371.4040000013483,
+     "startup": 0.840000000607688,
+     "configurer": 0,
+     "maker": 17.93800000086776,
+     "compile": 49.85899999883259,
+     "run": 302.7670000010403
+    }
+   },
+   "edit-build": {
+    "median_ms": 76.9535219988029,
+    "times_ms": [
+     77.57954600310768,
+     61.56441900020582,
+     76.9535219988029
+    ],
+    "phases_ms": {
+     "total": 56.98199999824283,
+     "startup": 0.8079999970505014,
+     "configurer": 47.483999995165505,
+     "maker": 6.262000006245216,
+     "compile": 2.427999999781605,
+     "run": 0
+    }
+   }
+  },
+  "zbor": {
+   "failed": "zbor: /tmp/zbs/zap-c3 build test failed:\ntest\n+- run test 97 pass, 1 fail (98 total)\nerror: 'cose.Sign1.test.Single ECDSA Signature - ECDSA w/ SHA-256, Curve P-256 #2' failed:\n       slices differ. first difference occurs at index 0 (0x0)\n       \n       ============ expected this output: =============  len: 64 (0x40)\n       \n       87 DB 0D 2E 55 71 84 3B  78 AC 33 EC B2 83 0D F7  ..\u240d.Uq.;x.3...\u240d.\n       B6 E0 A4 D5 B7 37 6D E3  36 B2 3C 59 1C 90 C4 25  .....7m.6.<Y...%\n       31 7E 56 12 7F BE 04 37  00 97 CE 34 70 87 B2 33  1~V....7...4p..3\n       BF 72 2B 64 07 2B EB 44  86 BD A4 03 1D 27 24 4F  .r+d.+.D.....'$O\n       \n       ============= instead found this: ==============  len: 64 (0x40)\n       \n       D8 43 8C 2A 76 0A 85 0A  8F E4 87 5D B3 5D 6F 3B  .C.*v\u240a.\u240a...].]o;\n       05 DE 6B D1 D7 4C A2 AC  9B 8F CA 1F D2 58 BA 58  ..k..L.......X.X\n       C4 7D E5 99 CB BC 04 41  1C 07 9A 8A 0B 44 A0 1A  .}.....A.....D..\n       92 A9 C1 24 A8 BE BF 3E  A4 F1 15 49 DA 1A 53 EE  ...$...>...I..S.\n       \n       ================================================\n       \n       /home/user/.cache/zap/zig-0.17.0/lib/std/testing.zig:346:5: 0x450eb9 in expectEqualSlices (std.zig)\n           return error.TestExpectedEqual;\n           ^\n       /home/user/workspace/repo/bench/.work/phases/zap/zbor/src/cose/Sign1.zig:250:5: 0x308875 in test.Single ECDSA Signature - ECDSA w/ SHA-256, Curve P-256 #2 (main.zig)\n           try std.testing.expectEqualSlices(u8, \"\\x87\\xdb\\x0d\\x2e\\x55\\x71\\x84\\x3b\\x78\\xac\\x33\\xec\\xb2\\x83\\x0d\\xf7\\xb6\\xe0\\xa4\\xd5\\xb7\\x37\\x6d\\xe3\\x36\\xb2\\x3c\\x59\\x1c\\x90\\xc4\\x25\\x31\\x7e\\x56\\x12\\x7f\\xbe\\x04\\x37\\x00\\x97\\xce\\x34\\x70\\x87\\xb2\\x33\\xbf\\x72\\x2b\\x64\\x07\\x2b\\xeb\\x44\\x86\\xbd\\xa4\\x03\\x1d\\x27\\x24\\x4f\", sig);\n           ^\nfailed command: ./.zig-cache/o/b7d0ff4f41801df26ecdab9047e832ac/test --cache-dir=./.zig-cache --seed=0x1512c024 --listen=-\n\nBuild Summary: 1/3 steps succeeded (1 failed); 97/98 tests passed (1 failed)\ntest transitive failure\n+- run test 97 pass, 1 fail (98 total)\n\n"
+  },
+  "libvaxis": {
+   "failed": "debug --dep zigimg --dep uucode -Mvaxis=src/main.zig -Mbuild_options=.zig-cache/o/61b07e3fa330af934bdb71493476d73a/options.zig -Odebug -Mvaxis_h=.zig-cache/o/37bac6697167a418717254b072b716b8/vaxis.zig -Odebug --dep zigimg -Mzigimg=zig-pkg/zigimg-0.1.0-8_eo2sBLGACBebrhQZUwRliZNSUyDn6szp99eip_6-Rw/zigimg.zig -Odebug --dep types.zig --dep config.zig --dep tables -Muucode=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/root.zig -Odebug -Mtypes.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/types.zig -Odebug --dep types.zig --dep storage.zig -Mconfig.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/config.zig -Odebug --dep config.zig --dep storage.zig --dep build_config -Mtables=.zig-cache/o/a9a5a6747f95e58f596f36ab83b89197/tables.zig -Odebug --dep config.zig -Mstorage.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/storage.zig --dep config.zig --dep storage.zig -Mbuild_config=.zig-cache/o/821c3376afe365e5e901f761d135e9d8/build_config.zig -lc --cache-dir .zig-cache --global-cache-dir /home/user/workspace/repo/bench/.work/phases/global-zap --build-root . --name test --zig-lib-dir /home/user/.cache/zap/zig-0.17.0/lib/ --listen=-\n\ntest\n+- run exe example-c-tty\n   +- compile exe example-c-tty debug native\n      +- compile lib vaxis debug native\n         +- compile obj vaxis-c-api debug native 1 errors\nsrc/c_api.zig:1183:16: error: [switch-incomplete] else prong required when switching on type 'anyerror'\n        return switch (err) {\n               ^~~~~~\nreferenced by:\n    comptime: src/c_api.zig:93:26\nerror: 1 compilation errors\nfailed command: /tmp/zbs/zap-c3 build-obj -fllvm -fPIC -Odebug --dep vaxis --dep build_options -Mroot=src/c_api.zig -Odebug --dep zigimg --dep uucode -Mvaxis=src/main.zig -Mbuild_options=.zig-cache/o/61b07e3fa330af934bdb71493476d73a/options.zig -Odebug --dep zigimg -Mzigimg=zig-pkg/zigimg-0.1.0-8_eo2sBLGACBebrhQZUwRliZNSUyDn6szp99eip_6-Rw/zigimg.zig -Odebug --dep types.zig --dep config.zig --dep tables -Muucode=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/root.zig -Odebug -Mtypes.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/types.zig -Odebug --dep types.zig --dep storage.zig -Mconfig.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/config.zig -Odebug --dep config.zig --dep storage.zig --dep build_config -Mtables=.zig-cache/o/a9a5a6747f95e58f596f36ab83b89197/tables.zig -Odebug --dep config.zig -Mstorage.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/storage.zig --dep config.zig --dep storage.zig -Mbuild_config=.zig-cache/o/821c3376afe365e5e901f761d135e9d8/build_config.zig -lc --cache-dir .zig-cache --global-cache-dir /home/user/workspace/repo/bench/.work/phases/global-zap --build-root . --name vaxis-c-api --zig-lib-dir /home/user/.cache/zap/zig-0.17.0/lib/ --listen=-\n\nBuild Summary: 40/51 steps succeeded (2 failed); 216/219 tests passed (3 skipped)\ntest transitive failure\n+- run test transitive failure\n|  +- compile test debug native 1 errors\n+- run exe example-c-parse transitive failure\n|  +- compile exe example-c-parse debug native transitive failure\n|     +- compile lib vaxis debug native transitive failure\n|     |  +- compile obj vaxis-c-api debug native 1 errors\n|     |  +- compile obj vaxis-c-api debug native (+3 more reused dependencies)\n|     +- compile lib vaxis debug native (+3 more reused dependencies)\n+- run exe example-c-runtime transitive failure\n|  +- compile exe example-c-runtime debug native transitive failure\n|     +- compile lib vaxis debug native (+3 more reused dependencies)\n|     +- compile lib vaxis debug native (+3 more reused dependencies)\n+- run exe example-c-tty transitive failure\n   +- compile exe example-c-tty debug native transitive failure\n      +- compile lib vaxis debug native (+3 more reused dependencies)\n      +- compile lib vaxis debug native (+3 more reused dependencies)\n\n"
+  },
+  "cache.zig": {
+   "first": {
+    "median_ms": 89.82946499963873,
+    "times_ms": [
+     99.83077899960335,
+     89.82946499963873,
+     83.58480300012161
+    ],
+    "phases_ms": {
+     "total": 84.83200000046054,
+     "startup": 0.5780000028607901,
+     "configurer": 50.376999999571126,
+     "maker": 6.6470000019762665,
+     "compile": 21.7659999980242,
+     "run": 5.463999998028157
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 919.7198030014988,
+    "times_ms": [
+     919.7198030014988,
+     1091.1720399999467,
+     919.5555180012889
+    ],
+    "phases_ms": {
+     "total": 905.9390000002168,
+     "startup": 0.5419999979494605,
+     "configurer": 598.7129999994067,
+     "maker": 8.434999999735737,
+     "compile": 292.2440000002098,
+     "run": 6.00500000291504
+    }
+   },
+   "noop": {
+    "median_ms": 12.15033199696336,
+    "times_ms": [
+     13.443121002637781,
+     12.507202998676803,
+     12.15033199696336,
+     11.19150300291949,
+     11.32653500098968
+    ],
+    "phases_ms": {
+     "total": 12.86900000195601,
+     "startup": 0.5720000008295756,
+     "configurer": 0,
+     "maker": 3.9500000020780135,
+     "compile": 2.1149999993212987,
+     "run": 6.2319999997271225
+    }
+   },
+   "edit-zig": {
+    "median_ms": 57.51435999991372,
+    "times_ms": [
+     64.24121400050353,
+     57.51435999991372,
+     56.559864002338145
+    ],
+    "phases_ms": {
+     "total": 56.103999999322696,
+     "startup": 0.7259999983943999,
+     "configurer": 0,
+     "maker": 4.993000002286863,
+     "compile": 44.35699999885401,
+     "run": 6.027999999787426
+    }
+   },
+   "edit-build": {
+    "median_ms": 57.61576399891055,
+    "times_ms": [
+     58.46205299894791,
+     57.61576399891055,
+     57.47060999783571
+    ],
+    "phases_ms": {
+     "total": 57.64400000043679,
+     "startup": 0.499999998282874,
+     "configurer": 42.15700000349898,
+     "maker": 6.913999997777864,
+     "compile": 2.31300000086776,
+     "run": 5.760000000009313
+    }
+   }
+  },
+  "zul": {
+   "first": {
+    "median_ms": 7209.789200001978,
+    "times_ms": [
+     7209.789200001978,
+     7212.807650998002,
+     7196.819510998466
+    ],
+    "phases_ms": {
+     "total": 7281.878000001598,
+     "startup": 0.9950000021490268,
+     "configurer": 52.177000001393026,
+     "maker": 9.481999994022772,
+     "compile": 31.04200000234414,
+     "run": 7188.182000001689
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 8967.302471999574,
+    "times_ms": [
+     8967.302471999574,
+     9197.0966709996,
+     8801.978152001539
+    ],
+    "phases_ms": {
+     "total": 8748.22000000131,
+     "startup": 0.5530000016733538,
+     "configurer": 576.9080000027316,
+     "maker": 8.167999996658182,
+     "compile": 1095.2250000009371,
+     "run": 7067.365999999311
+    }
+   },
+   "noop": {
+    "median_ms": 7252.142784000171,
+    "times_ms": [
+     7131.566153002495,
+     7252.142784000171,
+     7273.113467999792,
+     7320.521596000617,
+     7116.172231999371
+    ],
+    "phases_ms": {
+     "total": 7166.559000001143,
+     "startup": 0.5769999988842756,
+     "configurer": 0,
+     "maker": 3.789000002143439,
+     "compile": 1.8739999977697153,
+     "run": 7160.319000002346
+    }
+   },
+   "edit-zig": {
+    "median_ms": 7271.588583000266,
+    "times_ms": [
+     7271.588583000266,
+     7263.000347000343,
+     7336.02372599853
+    ],
+    "phases_ms": {
+     "total": 7458.296000000701,
+     "startup": 0.5329999985406175,
+     "configurer": 0,
+     "maker": 3.9629999992030207,
+     "compile": 48.41600000145263,
+     "run": 7405.384000001504
+    }
+   },
+   "edit-build": {
+    "median_ms": 7199.940236998373,
+    "times_ms": [
+     7174.033661001886,
+     7199.940236998373,
+     7321.577086000616
+    ],
+    "phases_ms": {
+     "total": 7185.480000000098,
+     "startup": 0.5689999998139683,
+     "configurer": 38.12399999878835,
+     "maker": 6.930999999894993,
+     "compile": 2.0629999999073334,
+     "run": 7137.793000001693
+    }
+   }
+  },
+  "metrics.zig": {
+   "first": {
+    "median_ms": 180.51046399705228,
+    "times_ms": [
+     180.51046399705228,
+     206.6342829966743,
+     170.77395099840942
+    ],
+    "phases_ms": {
+     "total": 177.03900000196882,
+     "startup": 1.0540000002947636,
+     "configurer": 56.115999999747146,
+     "maker": 8.215999998355983,
+     "compile": 22.65600000100676,
+     "run": 88.99700000256416
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 1180.784438001865,
+    "times_ms": [
+     1180.784438001865,
+     1223.756723000406,
+     1039.3298219969438
+    ],
+    "phases_ms": {
+     "total": 1067.639999997482,
+     "startup": 0.556999999389518,
+     "configurer": 586.4910000018426,
+     "maker": 7.136999996873783,
+     "compile": 396.6790000013134,
+     "run": 76.77599999806262
+    }
+   },
+   "noop": {
+    "median_ms": 83.93971400073497,
+    "times_ms": [
+     87.99305700085824,
+     84.09128099810914,
+     83.93971400073497,
+     79.07099000294693,
+     80.1977959999931
+    ],
+    "phases_ms": {
+     "total": 81.19000000078813,
+     "startup": 0.5180000007385388,
+     "configurer": 0,
+     "maker": 3.6500000023806933,
+     "compile": 1.8519999975978862,
+     "run": 75.17000000007101
+    }
+   },
+   "edit-zig": {
+    "median_ms": 113.98340400046436,
+    "times_ms": [
+     106.42448200087529,
+     113.98340400046436,
+     115.1712380014942
+    ],
+    "phases_ms": {
+     "total": 113.80499999722815,
+     "startup": 0.543999998626532,
+     "configurer": 0,
+     "maker": 4.289000000426313,
+     "compile": 34.72200000032899,
+     "run": 74.24999999784632
+    }
+   },
+   "edit-build": {
+    "median_ms": 132.20136599920806,
+    "times_ms": [
+     122.01260800065938,
+     132.80540800042218,
+     132.20136599920806
+    ],
+    "phases_ms": {
+     "total": 149.82599999711965,
+     "startup": 0.5069999970146455,
+     "configurer": 39.98700000011013,
+     "maker": 5.492000000231201,
+     "compile": 2.3020000007818453,
+     "run": 101.53799999898183
+    }
+   }
+  },
+  "zig-hpke": {
+   "failed": "zig-hpke: /tmp/zbs/zap-c3 build test failed:\ntest\n+- run test 30 pass, 1 fail (31 total)\nerror: 'tests.test.draft-ietf-hpke-pq-04 vector 3: MLKEM768-P256 / HKDF-SHA256 / AES-128-GCM base mode' failed:\n       /home/user/workspace/repo/bench/.work/phases/zap/zig-hpke/src/main.zig:715:57: 0x37e2a2 in pqEncapDeterministic (main.zig)\n                       if (seed.len != Kem.encaps_seed_length) return error.InvalidEncoding;\n                                                               ^\n       /home/user/workspace/repo/bench/.work/phases/zap/zig-hpke/src/main.zig:577:28: 0x334917 in senderSetupDeterministicCommon (main.zig)\n                   const result = try pqEncapDeterministic(self.suite.kem, pk_r, sk_e);\n                                  ^\n       /home/user/workspace/repo/bench/.work/phases/zap/zig-hpke/src/main.zig:437:9: 0x37eabe in senderSetupDeterministic (main.zig)\n               return self.senderSetupDeterministicCommon(pk_r, info, .base, \"\", \"\", sk_e, null);\n               ^\n       /home/user/workspace/repo/bench/.work/phases/zap/zig-hpke/src/tests.zig:978:18: 0x48ea68 in test.draft-ietf-hpke-pq-04 vector 3: MLKEM768-P256 / HKDF-SHA256 / AES-128-GCM base mode (tests.zig)\n           var sender = try h.senderSetupDeterministic(kp_r.public_key[0..1249], &info, &ikmE);\n                        ^\nfailed command: ./.zig-cache/o/5b59e537a24aa314e7de946de51dcac6/test --cache-dir=./.zig-cache --seed=0xbe1e998c --listen=-\n\nBuild Summary: 1/3 steps succeeded (1 failed); 30/31 tests passed (1 failed)\ntest transitive failure\n+- run test 30 pass, 1 fail (31 total)\n\n"
+  },
+  "libxev": {
+   "failed": "libxev: /tmp/zbs/zap-c3 build install test failed:\ntest\n+- run test xev-test 141 pass, 4 skip, 1 crash (146 total)\nerror: 'watcher.file.FileStream(api.Xev(.epoll,backend.epoll)).test.queuePWrite' terminated with signal TERM\nfailed command: ./.zig-cache/o/30d495a0bf97b644610bf7fb09d3a72b/xev-test --cache-dir=./.zig-cache --seed=0xa164b228 --listen=-\n\nBuild Summary: 8/10 steps succeeded (1 failed); 141/146 tests passed (4 skipped, 1 crashed)\ntest transitive failure\n+- run test xev-test 141 pass, 4 skip, 1 crash (146 total)\n\n"
+  },
+  "zio": {
+   "first": {
+    "median_ms": 16117.404397999053,
+    "times_ms": [
+     16117.404397999053,
+     12645.780368999112,
+     16959.726646997296
+    ],
+    "phases_ms": {
+     "total": 12538.614000000962,
+     "startup": 0.5370000035327394,
+     "configurer": 80.09400000082678,
+     "maker": 7.593999995151535,
+     "compile": 5082.4720000018715,
+     "run": 7367.916999999579
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 15236.293929003295,
+    "times_ms": [
+     19775.964631000534,
+     13960.834033001447,
+     15236.293929003295
+    ],
+    "phases_ms": {
+     "total": 18230.444000000716,
+     "startup": 0.4960000005667098,
+     "configurer": 606.1579999986861,
+     "maker": 25.483000001258915,
+     "compile": 5441.283000000112,
+     "run": 12157.024000000092
+    }
+   },
+   "noop": {
+    "median_ms": 12751.65877299878,
+    "times_ms": [
+     12751.65877299878,
+     12622.622949998913,
+     12477.880326001468,
+     13804.465281999,
+     13492.112934000033
+    ],
+    "phases_ms": {
+     "total": 12501.76499999725,
+     "startup": 0.7679999980609864,
+     "configurer": 0,
+     "maker": 5.442999998194864,
+     "compile": 123.03699999756645,
+     "run": 12372.517000003427
+    }
+   },
+   "edit-zig": {
+    "median_ms": 12177.600727998652,
+    "times_ms": [
+     12056.846814997698,
+     12177.600727998652,
+     13094.58872200048
+    ],
+    "phases_ms": {
+     "total": 12693.060000001424,
+     "startup": 0.5460000029415824,
+     "configurer": 0,
+     "maker": 4.024999998364365,
+     "compile": 889.7150000047986,
+     "run": 11798.77399999532
+    }
+   },
+   "edit-build": {
+    "median_ms": 11848.126805998618,
+    "times_ms": [
+     11403.855312000815,
+     11848.126805998618,
+     12511.152199000207
+    ],
+    "phases_ms": {
+     "total": 12480.806999999913,
+     "startup": 0.525999999808846,
+     "configurer": 45.80600000190316,
+     "maker": 5.308999996486818,
+     "compile": 59.634000001096865,
+     "run": 12369.532000000618
+    }
+   }
+  },
+  "zedis": {
+   "first": {
+    "median_ms": 3141.437991998828,
+    "times_ms": [
+     3319.9364870015415,
+     3105.7275040002423,
+     3141.437991998828
+    ],
+    "phases_ms": {
+     "total": 3113.4879999990517,
+     "startup": 0.5300000011629891,
+     "configurer": 89.32300000014948,
+     "maker": 21.642999996402068,
+     "compile": 37.715999998908956,
+     "run": 2964.276000002428
+    }
+   },
+   "first-nodonor": {
+    "median_ms": 4111.369677997573,
+    "times_ms": [
+     4111.369677997573,
+     3493.8729900022736,
+     4264.69321499826
+    ],
+    "phases_ms": {
+     "total": 4225.603999999294,
+     "startup": 0.5549999987124465,
+     "configurer": 608.698000000004,
+     "maker": 22.8690000003553,
+     "compile": 559.3220000009751,
+     "run": 3034.159999999247
+    }
+   },
+   "noop": {
+    "median_ms": 6.90820599993458,
+    "times_ms": [
+     8.196144000976346,
+     6.86025899995002,
+     6.939588998648105,
+     6.875449998915428,
+     6.90820599993458
+    ],
+    "phases_ms": {
+     "total": 7.802000000083353,
+     "startup": 0.48600000081933104,
+     "configurer": 0,
+     "maker": 3.687000000354601,
+     "compile": 3.6289999989094213,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 3037.3691569984658,
+    "times_ms": [
+     3048.445978998643,
+     3031.806973998755,
+     3037.3691569984658
+    ],
+    "phases_ms": {
+     "total": 3086.11799999926,
+     "startup": 0.5280000004859176,
+     "configurer": 0,
+     "maker": 18.163999993703328,
+     "compile": 56.888000002800254,
+     "run": 3010.5380000022706
+    }
+   },
+   "edit-build": {
+    "median_ms": 62.7307929971721,
+    "times_ms": [
+     3043.0029160015692,
+     58.69814899779158,
+     62.7307929971721
+    ],
+    "phases_ms": {
+     "total": 3058.8969999989786,
+     "startup": 0.835999999253545,
+     "configurer": 49.7209999957704,
+     "maker": 29.368999999860534,
+     "compile": 3.162000000884291,
+     "run": 2975.80900000321
+    }
+   }
+  },
+  "tokamak": {
+   "failed": ".OK\n4/89 ai.fmt.test_0...OK\n5/89 container.test.empty...OK\n6/89 container.test.basic single-mod...OK\n7/89 container.test.basic multi-mod...OK\n8/89 container.test.T.init()...OK\n9/89 container.test.M.configure()...OK\n10/89 container.test.partial deinit...Failed to init: pc=3\nx dep container.test.partial deinit.App val\nx dep container.test.partial deinit.H.Alloc(u8) fac\nx dep container.test.partial deinit.H.Alloc(i8) fac\n> dep container.test.partial deinit.Fail fac\nOK\n11/89 container.test.heap-allocated svc (ct2 regression)...OK\n12/89 cron.decltest.Cron...OK\n13/89 cron.test.Expr.parse()...OK\n14/89 cron.test.expr.match()...OK\n15/89 cron.test.expr.next()...OK\n16/89 cron.test.expr.next() stress-test...OK\n17/89 cron.test.expr.format()...OK\n18/89 crypto.decltest.sha1...OK\n19/89 csv.test.basic usage...OK\n20/89 csv.test.tuples...OK\n21/89 csv.test.delimiter...OK\n22/89 csv.test.quoting...OK\n23/89 dom.document.test_0...thread 286834 panic: incorrect alignment\n/home/user/workspace/repo/bench/.work/phases/zap/tokamak/src/meta.zig:222:27: 0x39b7ec in transmute (main.zig)\n    const tmp: *const T = @ptrCast(@alignCast(&val));\n                          ^\n/home/user/workspace/repo/bench/.work/phases/zap/tokamak/src/dom/element.zig:28:33: 0x83d1f8 in init (main.zig)\n            .local_name = .parse(local_name),\n                                ^\n/home/user/workspace/repo/bench/.work/phases/zap/tokamak/src/dom/document.zig:61:25: 0x41597b in createElement (main.zig)\n        try element.init(self, local_name);\n                        ^\n/home/user/workspace/repo/bench/.work/phases/zap/tokamak/src/dom/parser.zig:59:53: 0x2e4e76 in parseInto (main.zig)\n                    const el = try doc.createElement(tag);\n                                                    ^\n/home/user/workspace/repo/bench/.work/phases/zap/tokamak/src/dom/parser.zig:29:27: 0x60a9f2 in parseDocument (main.zig)\n        try self.parseInto(&doc.node);\n                          ^\n/home/user/workspace/repo/bench/.work/phases/zap/tokamak/src/dom/document.zig:49:36: 0x7527b0 in parseFromSlice (main.zig)\n        return parser.parseDocument(allocator);\n                                   ^\n/home/user/workspace/repo/bench/.work/phases/zap/tokamak/src/dom/document.zig:101:42: 0x6224fc in test_0 (main.zig)\n    var doc = try Document.parseFromSlice(std.testing.allocator, \"<html lang='en'><body><div><button class='btn'>Hello <i>World</i></button><br></div></body></html>\");\n                                         ^\n/home/user/.cache/zap/zig-0.17.0/lib/compiler/test_runner.zig:295:25: 0x745202 in mainTerminal (test_runner.zig)\n        if (test_fn.func()) |_| {\n                        ^\n/home/user/.cache/zap/zig-0.17.0/lib/compiler/test_runner.zig:74:28: 0x5d4edc in main (test_runner.zig)\n        return mainTerminal(init);\n                           ^\n/home/user/.cache/zap/zig-0.17.0/lib/std/start.zig:789:88: 0x5b5131 in callMain (std.zig)\n    if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{\n                                                                                       ^\n../sysdeps/nptl/libc_start_call_main.h:58:16: 0x7feafd171249 in __libc_start_call_main (../sysdeps/x86/libc-start.c)\n../csu/libc-start.c:360:3: 0x7feafd171304 in __libc_start_main_impl (../sysdeps/x86/libc-start.c)\n/home/user/workspace/repo/bench/.work/phases/global-zap/zap/builtin/680152f66278ef30cf7772a75ce038d4/glibc_start.zig:43:22: 0x360ced in startMain (builtin.zig)\n    __libc_start_main(&main, @intCast(sp[0]), @ptrCast(sp + 1), null, null, rtld_fini, sp);\n                     ^\n/home/user/workspace/repo/bench/.work/phases/global-zap/zap/builtin/680152f66278ef30cf7772a75ce038d4/glibc_start.zig:30:5: 0x4b4910 in _start (builtin.zig)\n    asm volatile (\n    ^\ntest\n+- run_test failure\nerror: process terminated with signal ABRT\nfailed command: ./.zig-cache/o/2bfac49d23d80652149164a263adf2e3/test\n\nBuild Summary: 4/6 steps succeeded (1 failed)\ntest transitive failure\n+- run_test failure\n\n"
+  }
+ },
+ "zig": {
+  "zls": {
+   "first": {
+    "median_ms": 9961.332525999751,
+    "times_ms": [
+     10525.726754000061,
+     9961.332525999751,
+     9582.105197998317
+    ],
+    "phases_ms": {
+     "total": 10779.677000002266,
+     "startup": 8.009000001038658,
+     "configurer": 1246.7279999982566,
+     "maker": 42.76100000424776,
+     "compile": 5549.844999997731,
+     "run": 3932.334000000992
+    }
+   },
+   "noop": {
+    "median_ms": 525.591251996957,
+    "times_ms": [
+     573.4235989984882,
+     525.7419009976729,
+     525.591251996957,
+     522.5989319988003,
+     522.7418129979924
+    ],
+    "phases_ms": {
+     "total": 517.6899999969464,
+     "startup": 7.18599999891012,
+     "configurer": 0,
+     "maker": 19.156999995175283,
+     "compile": 16.772999999375315,
+     "run": 474.5740000034857
+    }
+   },
+   "edit-zig": {
+    "median_ms": 7799.348180997185,
+    "times_ms": [
+     7799.348180997185,
+     5898.147267998866,
+     9130.286791001708
+    ],
+    "phases_ms": {
+     "total": 8258.70699999723,
+     "startup": 7.152999998652376,
+     "configurer": 0,
+     "maker": 35.31499999007792,
+     "compile": 6304.117000006954,
+     "run": 1912.1220000015455
+    }
+   },
+   "edit-build": {
+    "median_ms": 2018.2958689983934,
+    "times_ms": [
+     1934.6847899978457,
+     2031.707550999272,
+     2018.2958689983934
+    ],
+    "phases_ms": {
+     "total": 2008.1009999994421,
+     "startup": 7.266000000527129,
+     "configurer": 1432.5659999994969,
+     "maker": 38.41100000136066,
+     "compile": 20.931999995809747,
+     "run": 508.92600000224775
+    }
+   }
+  },
+  "ghostty": {
+   "first": {
+    "median_ms": 50365.863319999335,
+    "times_ms": [
+     49651.95312400101,
+     50365.863319999335,
+     50915.502587002265
+    ],
+    "phases_ms": {
+     "total": 51290.31899999973,
+     "startup": 7.838000001356704,
+     "configurer": 1873.1119999974908,
+     "maker": 92.69300000232761,
+     "compile": 47134.67600000149,
+     "run": 2181.9999999970605
+    }
+   },
+   "noop": {
+    "median_ms": 41.03732500152546,
+    "times_ms": [
+     42.418574001203524,
+     41.03732500152546,
+     36.01060399887501,
+     42.21977899942431,
+     38.91807200125186
+    ],
+    "phases_ms": {
+     "total": 40.1739999979327,
+     "startup": 6.6299999998591375,
+     "configurer": 0,
+     "maker": 9.809999999561114,
+     "compile": 23.733999998512445,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 40094.421980000334,
+    "times_ms": [
+     39237.42427999969,
+     40094.421980000334,
+     44312.48853699799
+    ],
+    "phases_ms": {
+     "total": 41226.35799999989,
+     "startup": 22.842999998829328,
+     "configurer": 0,
+     "maker": 36.86599999855389,
+     "compile": 41166.64900000251,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 1980.9493600005226,
+    "times_ms": [
+     1980.9493600005226,
+     1958.4462490020087,
+     2026.498494000407
+    ],
+    "phases_ms": {
+     "total": 1876.8530000015744,
+     "startup": 9.412999999767635,
+     "configurer": 1812.4790000001667,
+     "maker": 28.103000000555767,
+     "compile": 26.858000001084292,
+     "run": 0
+    }
+   }
+  },
+  "superhtml": {
+   "first": {
+    "median_ms": 6489.479055002448,
+    "times_ms": [
+     6762.739473000693,
+     6489.479055002448,
+     6346.6134009977395
+    ],
+    "phases_ms": {
+     "total": 6174.455000000307,
+     "startup": 7.6029999981983565,
+     "configurer": 1496.767999997246,
+     "maker": 72.34300000345684,
+     "compile": 4597.741000001406,
+     "run": 0
+    }
+   },
+   "noop": {
+    "median_ms": 68.95667500066338,
+    "times_ms": [
+     70.42992900096579,
+     71.3055570013239,
+     68.95667500066338,
+     64.38605600123992,
+     62.87163299930398
+    ],
+    "phases_ms": {
+     "total": 70.2290000008361,
+     "startup": 8.204000001569511,
+     "configurer": 21.532000002480345,
+     "maker": 17.905999997310573,
+     "compile": 22.586999999475665,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 3091.235511998093,
+    "times_ms": [
+     2964.998523999384,
+     3226.923999001883,
+     3091.235511998093
+    ],
+    "phases_ms": {
+     "total": 3129.38099999883,
+     "startup": 7.761000000755303,
+     "configurer": 20.743000000948086,
+     "maker": 166.665999997349,
+     "compile": 2934.2109999997774,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 1351.374018999195,
+    "times_ms": [
+     1351.374018999195,
+     1325.9518160011794,
+     1365.538292000565
+    ],
+    "phases_ms": {
+     "total": 1278.1039999972563,
+     "startup": 7.944999997562263,
+     "configurer": 1237.0609999998123,
+     "maker": 18.566000002465444,
+     "compile": 14.531999997416278,
+     "run": 0
+    }
+   }
+  },
+  "ziggy": {
+   "first": {
+    "median_ms": 6713.600705999852,
+    "times_ms": [
+     6713.600705999852,
+     6899.608003997855,
+     6517.564967998624
+    ],
+    "phases_ms": {
+     "total": 6449.040999999852,
+     "startup": 8.585999999922933,
+     "configurer": 1206.9239999982528,
+     "maker": 57.82000000181142,
+     "compile": 5141.917000000831,
+     "run": 33.793999999033986
+    }
+   },
+   "noop": {
+    "median_ms": 102.27192700040177,
+    "times_ms": [
+     115.32846999762114,
+     111.10500599897932,
+     96.98770099930698,
+     91.5601830020023,
+     102.27192700040177
+    ],
+    "phases_ms": {
+     "total": 97.33000000051106,
+     "startup": 7.2489999984099995,
+     "configurer": 28.88600000005681,
+     "maker": 20.64000000973465,
+     "compile": 36.70899999633548,
+     "run": 3.8459999959741253
+    }
+   },
+   "edit-zig": {
+    "median_ms": 1502.0181910003885,
+    "times_ms": [
+     1502.0181910003885,
+     1526.7070709996915,
+     1444.0778110001702
+    ],
+    "phases_ms": {
+     "total": 1536.0299999993003,
+     "startup": 7.2779999973136,
+     "configurer": 25.73100000154227,
+     "maker": 136.38699999864912,
+     "compile": 1344.3499999993946,
+     "run": 22.284000002400717
+    }
+   },
+   "edit-build": {
+    "median_ms": 1283.3908360007626,
+    "times_ms": [
+     1334.852657000738,
+     1258.310410001286,
+     1283.3908360007626
+    ],
+    "phases_ms": {
+     "total": 1278.094000001147,
+     "startup": 7.153000002290355,
+     "configurer": 1213.4000000005472,
+     "maker": 20.216999993863283,
+     "compile": 33.883000003697816,
+     "run": 3.4410000007483177
+    }
+   }
+  },
+  "z2d": {
+   "first": {
+    "median_ms": 2745.5405129985593,
+    "times_ms": [
+     2634.107107998716,
+     2745.5405129985593,
+     2829.0519100009988
+    ],
+    "phases_ms": {
+     "total": 2810.5089999990014,
+     "startup": 8.287000000564149,
+     "configurer": 1190.8960000000661,
+     "maker": 61.10699999771896,
+     "compile": 1393.2500000009895,
+     "run": 156.96899999966263
+    }
+   },
+   "noop": {
+    "median_ms": 21.343709002394462,
+    "times_ms": [
+     22.66300500195939,
+     25.272120998124592,
+     17.71839200227987,
+     21.343709002394462,
+     16.712034001102438
+    ],
+    "phases_ms": {
+     "total": 18.507000000681728,
+     "startup": 8.22600000174134,
+     "configurer": 0,
+     "maker": 4.089999998541316,
+     "compile": 6.191000000399072,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 1529.5330199987802,
+    "times_ms": [
+     1515.1016540003184,
+     1606.7868280006223,
+     1529.5330199987802
+    ],
+    "phases_ms": {
+     "total": 1596.400000002177,
+     "startup": 10.321000001567882,
+     "configurer": 0,
+     "maker": 43.626999999105465,
+     "compile": 1386.5480000022217,
+     "run": 155.90399999928195
+    }
+   },
+   "edit-build": {
+    "median_ms": 1232.728920000227,
+    "times_ms": [
+     1253.68173699826,
+     1219.6564879996004,
+     1232.728920000227
+    ],
+    "phases_ms": {
+     "total": 1253.6270000018703,
+     "startup": 8.738000000448665,
+     "configurer": 1219.666999997571,
+     "maker": 17.537000003358116,
+     "compile": 7.685000000492437,
+     "run": 0
+    }
+   }
+  },
+  "zf": {
+   "first": {
+    "median_ms": 6628.107171000011,
+    "times_ms": [
+     6307.145404000039,
+     6673.1443559983745,
+     6628.107171000011
+    ],
+    "phases_ms": {
+     "total": 6373.822000001383,
+     "startup": 7.994999999937136,
+     "configurer": 1243.3549999987008,
+     "maker": 70.11399999828427,
+     "compile": 4551.637000004121,
+     "run": 500.7210000003397
+    }
+   },
+   "noop": {
+    "median_ms": 21.377339002356166,
+    "times_ms": [
+     25.126050000835676,
+     24.915285997849423,
+     21.377339002356166,
+     20.608361999620683,
+     20.47810500152991
+    ],
+    "phases_ms": {
+     "total": 25.590000001102453,
+     "startup": 7.724999999481952,
+     "configurer": 0,
+     "maker": 5.526999997528037,
+     "compile": 12.338000004092464,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 1298.093183999299,
+    "times_ms": [
+     1305.5284840011154,
+     1278.6236760002794,
+     1298.093183999299
+    ],
+    "phases_ms": {
+     "total": 1289.8260000001756,
+     "startup": 7.689999998547137,
+     "configurer": 0,
+     "maker": 85.13400000447291,
+     "compile": 1197.0019999971555,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 1316.8279050005367,
+    "times_ms": [
+     1341.068876998179,
+     1316.8279050005367,
+     1260.2298620004149
+    ],
+    "phases_ms": {
+     "total": 1268.8249999991967,
+     "startup": 8.289999997941777,
+     "configurer": 1222.6960000007239,
+     "maker": 21.082000002934365,
+     "compile": 16.756999997596722,
+     "run": 0
+    }
+   }
+  },
+  "zig-clap": {
+   "first": {
+    "median_ms": 3318.9352010012954,
+    "times_ms": [
+     3318.9352010012954,
+     3263.1248110010347,
+     3497.451168997941
+    ],
+    "phases_ms": {
+     "total": 3755.3459999980987,
+     "startup": 8.501999996951781,
+     "configurer": 1273.1950000015786,
+     "maker": 44.31800000020303,
+     "compile": 2429.3309999993653,
+     "run": 0
+    }
+   },
+   "noop": {
+    "median_ms": 31.666341001255205,
+    "times_ms": [
+     39.32585700022173,
+     31.666341001255205,
+     34.5740630000364,
+     27.522305001184577,
+     26.58238000003621
+    ],
+    "phases_ms": {
+     "total": 30.323999999382067,
+     "startup": 7.355999998253537,
+     "configurer": 0,
+     "maker": 4.613000000972534,
+     "compile": 18.355000000155997,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 2141.9328890006,
+    "times_ms": [
+     2067.1831510007905,
+     2141.9328890006,
+     2268.7729870012845
+    ],
+    "phases_ms": {
+     "total": 2377.258000000438,
+     "startup": 6.832999999460299,
+     "configurer": 0,
+     "maker": 60.74100000114413,
+     "compile": 2309.6839999998338,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 1225.8490410022205,
+    "times_ms": [
+     1181.4920709985017,
+     1242.9737049969845,
+     1225.8490410022205
+    ],
+    "phases_ms": {
+     "total": 1372.0050000010815,
+     "startup": 6.648000002314802,
+     "configurer": 1323.9119999998366,
+     "maker": 18.638000001374166,
+     "compile": 22.806999997555977,
+     "run": 0
+    }
+   }
+  },
+  "anyzig": {
+   "first": {
+    "median_ms": 5976.793701000133,
+    "times_ms": [
+     6021.596574999421,
+     5976.793701000133,
+     5974.507056998846
+    ],
+    "phases_ms": {
+     "total": 5884.741000001668,
+     "startup": 7.416000000375789,
+     "configurer": 2168.359999999666,
+     "maker": 124.457000001712,
+     "compile": 3564.456000000064,
+     "run": 20.051999999850523
+    }
+   },
+   "noop": {
+    "median_ms": 29.335114999412326,
+    "times_ms": [
+     32.144323999091284,
+     29.470762998244027,
+     29.335114999412326,
+     28.882978000183357,
+     29.18537399818888
+    ],
+    "phases_ms": {
+     "total": 32.386000002588844,
+     "startup": 6.480000000010477,
+     "configurer": 0,
+     "maker": 14.387000002898276,
+     "compile": 11.51899999968009,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 3285.0953429988294,
+    "times_ms": [
+     3285.0953429988294,
+     3292.790540999704,
+     3185.4400060001353
+    ],
+    "phases_ms": {
+     "total": 3197.5409999977273,
+     "startup": 6.485999998403713,
+     "configurer": 0,
+     "maker": 184.52199999956065,
+     "compile": 3006.532999999763,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 2114.1434210003354,
+    "times_ms": [
+     2114.1434210003354,
+     2069.4431180018,
+     2124.699570998928
+    ],
+    "phases_ms": {
+     "total": 2196.3749999995343,
+     "startup": 7.141999998566462,
+     "configurer": 2113.225999997667,
+     "maker": 57.362000003195135,
+     "compile": 18.645000000105938,
+     "run": 0
+    }
+   }
+  },
+  "zine": {
+   "failed": "zine: zig build install failed:\n"
+  },
+  "zig-protobuf": {
+   "first": {
+    "median_ms": 11996.778238000843,
+    "times_ms": [
+     12237.210052000592,
+     11996.778238000843,
+     11860.491208000894
+    ],
+    "phases_ms": {
+     "total": 12221.035999999003,
+     "startup": 8.160000001225853,
+     "configurer": 1224.049999997078,
+     "maker": 111.6879999935918,
+     "compile": 10419.297000004008,
+     "run": 457.8410000030999
+    }
+   },
+   "noop": {
+    "median_ms": 650.4887150003924,
+    "times_ms": [
+     626.8688860000111,
+     650.4887150003924,
+     655.2941310001188,
+     630.438760999823,
+     706.5374010016967
+    ],
+    "phases_ms": {
+     "total": 632.5469999974302,
+     "startup": 8.14899999750196,
+     "configurer": 0,
+     "maker": 14.497000003757421,
+     "compile": 146.6909999944619,
+     "run": 463.210000001709
+    }
+   },
+   "edit-zig": {
+    "median_ms": 9371.517761002906,
+    "times_ms": [
+     9245.228838000912,
+     9802.304239001387,
+     9371.517761002906
+    ],
+    "phases_ms": {
+     "total": 9181.660999998712,
+     "startup": 7.978999998158542,
+     "configurer": 0,
+     "maker": 61.70000000929576,
+     "compile": 8550.782999995135,
+     "run": 561.1989999961224
+    }
+   },
+   "edit-build": {
+    "median_ms": 1750.158389997523,
+    "times_ms": [
+     1750.158389997523,
+     1750.8447719992546,
+     1743.526551999821
+    ],
+    "phases_ms": {
+     "total": 1760.5510000030336,
+     "startup": 6.960000002436573,
+     "configurer": 1123.00999999934,
+     "maker": 24.65700000175275,
+     "compile": 111.83099999834667,
+     "run": 494.09300000115763
+    }
+   }
+  },
+  "vulkan-zig": {
+   "first": {
+    "median_ms": 1956.3023949995113,
+    "times_ms": [
+     1956.3023949995113,
+     2030.5021630010742,
+     1913.641187002213
+    ],
+    "phases_ms": {
+     "total": 1901.1570000002393,
+     "startup": 7.341000000451459,
+     "configurer": 1070.5679999991844,
+     "maker": 37.17799999867566,
+     "compile": 786.0700000019278,
+     "run": 0
+    }
+   },
+   "noop": {
+    "median_ms": 15.095093000127235,
+    "times_ms": [
+     17.41153600232792,
+     16.70130899947253,
+     15.095093000127235,
+     14.461789000051795,
+     13.629559998662444
+    ],
+    "phases_ms": {
+     "total": 16.33600000059232,
+     "startup": 7.067999998980667,
+     "configurer": 0,
+     "maker": 3.541999998560641,
+     "compile": 5.726000003051013,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 989.1301179995935,
+    "times_ms": [
+     1020.768788002897,
+     989.1301179995935,
+     956.312247999449
+    ],
+    "phases_ms": {
+     "total": 943.9629999978933,
+     "startup": 7.5589999978546984,
+     "configurer": 0,
+     "maker": 53.886000001512,
+     "compile": 882.5179999985266,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 1156.5275400025712,
+    "times_ms": [
+     1156.5275400025712,
+     1184.8886539992236,
+     1147.7327800021158
+    ],
+    "phases_ms": {
+     "total": 1165.074000000459,
+     "startup": 8.085000001301523,
+     "configurer": 1132.835000000341,
+     "maker": 17.536999999720138,
+     "compile": 6.616999999096151,
+     "run": 0
+    }
+   }
+  },
+  "tls.zig": {
+   "first": {
+    "median_ms": 11241.595846000564,
+    "times_ms": [
+     11117.65223600014,
+     14374.66510000013,
+     11241.595846000564
+    ],
+    "phases_ms": {
+     "total": 16602.238999999827,
+     "startup": 7.896999999502441,
+     "configurer": 1168.5470000011264,
+     "maker": 64.21899999986636,
+     "compile": 10996.167999997851,
+     "run": 4365.40800000148
+    }
+   },
+   "noop": {
+    "median_ms": 44.21785099839326,
+    "times_ms": [
+     44.21785099839326,
+     46.866899996530265,
+     46.247271999163786,
+     39.72853899904294,
+     40.46062000270467
+    ],
+    "phases_ms": {
+     "total": 43.22800000227289,
+     "startup": 7.369999999355059,
+     "configurer": 0,
+     "maker": 5.793999996967614,
+     "compile": 30.06400000595022,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 10382.725254999968,
+    "times_ms": [
+     14748.214134000591,
+     10160.151659001713,
+     10382.725254999968
+    ],
+    "phases_ms": {
+     "total": 10396.189999999478,
+     "startup": 8.450000001175795,
+     "configurer": 0,
+     "maker": 195.55200000104378,
+     "compile": 10181.069999998726,
+     "run": 11.117999998532468
+    }
+   },
+   "edit-build": {
+    "median_ms": 1200.1560290009365,
+    "times_ms": [
+     1264.7745460017177,
+     1200.1560290009365,
+     1173.5688820008363
+    ],
+    "phases_ms": {
+     "total": 1153.1429999995453,
+     "startup": 7.806999998138053,
+     "configurer": 1092.8319999984524,
+     "maker": 22.37800000148127,
+     "compile": 30.126000001473585,
+     "run": 0
+    }
+   }
+  },
+  "zlinter": {
+   "first": {
+    "median_ms": 1232.496299999184,
+    "times_ms": [
+     1220.0430880002386,
+     1298.7415789975785,
+     1232.496299999184
+    ],
+    "phases_ms": {
+     "total": 1230.081000001519,
+     "startup": 7.408999998006038,
+     "configurer": 1206.9890000020678,
+     "maker": 15.68300000144518,
+     "compile": 0,
+     "run": 0
+    }
+   },
+   "noop": {
+    "median_ms": 39.18748100113589,
+    "times_ms": [
+     41.429909000726184,
+     41.06631499962532,
+     39.18748100113589,
+     38.395126997784246,
+     37.98801900120452
+    ],
+    "phases_ms": {
+     "total": 43.79599999811035,
+     "startup": 8.38600000133738,
+     "configurer": 20.961999998689862,
+     "maker": 14.447999998083105,
+     "compile": 0,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 44.854078001662856,
+    "times_ms": [
+     44.854078001662856,
+     47.79193399735959,
+     43.601722001767484
+    ],
+    "phases_ms": {
+     "total": 41.1019999992277,
+     "startup": 7.203000001027249,
+     "configurer": 19.03600000150618,
+     "maker": 14.86299999669427,
+     "compile": 0,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 1234.6414880012162,
+    "times_ms": [
+     1235.70275900056,
+     1227.0281710007112,
+     1234.6414880012162
+    ],
+    "phases_ms": {
+     "total": 1262.0280000010098,
+     "startup": 10.292000002664281,
+     "configurer": 1235.513000003266,
+     "maker": 16.22299999507959,
+     "compile": 0,
+     "run": 0
+    }
+   }
+  },
+  "zig-ecs": {
+   "first": {
+    "median_ms": 3115.6001089984784,
+    "times_ms": [
+     3115.6001089984784,
+     3103.919967998081,
+     3368.6451539979316
+    ],
+    "phases_ms": {
+     "total": 2980.4389999990235,
+     "startup": 7.26099999883445,
+     "configurer": 1108.5730000013427,
+     "maker": 132.33900000341237,
+     "compile": 1732.265999995434,
+     "run": 0
+    }
+   },
+   "noop": {
+    "median_ms": 119.380132000515,
+    "times_ms": [
+     144.68022999790264,
+     114.23273999753292,
+     119.380132000515,
+     116.31919100182131,
+     130.702876002033
+    ],
+    "phases_ms": {
+     "total": 82.59399999951711,
+     "startup": 8.700999998836778,
+     "configurer": 0,
+     "maker": 33.12999999980093,
+     "compile": 40.7630000008794,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 1861.6104569991876,
+    "times_ms": [
+     1861.6104569991876,
+     2035.4753510000592,
+     1747.8628149983706
+    ],
+    "phases_ms": {
+     "total": 2020.7850000006147,
+     "startup": 7.20500000170432,
+     "configurer": 0,
+     "maker": 44.36100000384613,
+     "compile": 1969.2189999950642,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 1264.443553998717,
+    "times_ms": [
+     1182.0284099994751,
+     1264.443553998717,
+     1286.02634300114
+    ],
+    "phases_ms": {
+     "total": 1306.2840000020515,
+     "startup": 7.450000000972068,
+     "configurer": 1157.494000002771,
+     "maker": 94.93899999870337,
+     "compile": 46.40099999960512,
+     "run": 0
+    }
+   }
+  },
+  "zig-minisign": {
+   "first": {
+    "median_ms": 2164.9704560004466,
+    "times_ms": [
+     2168.6481819997425,
+     2164.9704560004466,
+     2115.6298290006816
+    ],
+    "phases_ms": {
+     "total": 2093.799999998737,
+     "startup": 7.945999997900799,
+     "configurer": 1146.1999999992258,
+     "maker": 36.8479999997362,
+     "compile": 884.5280000023195,
+     "run": 18.277999999554595
+    }
+   },
+   "noop": {
+    "median_ms": 14.580908999050735,
+    "times_ms": [
+     18.745510998996906,
+     14.462843002547743,
+     14.412581000215141,
+     14.580908999050735,
+     16.478253997775028
+    ],
+    "phases_ms": {
+     "total": 19.873000001098262,
+     "startup": 7.829000001947861,
+     "configurer": 0,
+     "maker": 4.07699999777833,
+     "compile": 7.967000001372071,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 683.9068779991067,
+    "times_ms": [
+     692.7694370024255,
+     682.9138699977193,
+     683.9068779991067
+    ],
+    "phases_ms": {
+     "total": 681.7589999991469,
+     "startup": 7.921999997051898,
+     "configurer": 0,
+     "maker": 56.84800000017276,
+     "compile": 616.9890000019222,
+     "run": 0
+    }
+   },
+   "edit-build": {
+    "median_ms": 1208.7913079994905,
+    "times_ms": [
+     1248.1551640012185,
+     1203.6673900001915,
+     1208.7913079994905
+    ],
+    "phases_ms": {
+     "total": 1208.4630000026664,
+     "startup": 7.1380000008502975,
+     "configurer": 1175.1839999960794,
+     "maker": 17.493000006652437,
+     "compile": 8.647999999084277,
+     "run": 0
+    }
+   }
+  },
+  "zalgebra": {
+   "first": {
+    "median_ms": 1745.2878080002847,
+    "times_ms": [
+     1811.231460997078,
+     1738.441593999596,
+     1745.2878080002847
+    ],
+    "phases_ms": {
+     "total": 1737.0620000001509,
+     "startup": 7.91899999967427,
+     "configurer": 1112.010000000737,
+     "maker": 35.59799999857205,
+     "compile": 573.5510000013164,
+     "run": 7.983999999851221
+    }
+   },
+   "noop": {
+    "median_ms": 19.09646200147108,
+    "times_ms": [
+     20.582001001457684,
+     20.284019003156573,
+     18.190400001913076,
+     19.09646200147108,
+     18.546413997682976
+    ],
+    "phases_ms": {
+     "total": 19.93399999992107,
+     "startup": 8.024999999179272,
+     "configurer": 0,
+     "maker": 3.440000000409782,
+     "compile": 8.469000000332016,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 597.0601810004155,
+    "times_ms": [
+     596.7490930015629,
+     597.0601810004155,
+     600.8145490013703
+    ],
+    "phases_ms": {
+     "total": 589.5239999990736,
+     "startup": 8.257000001322012,
+     "configurer": 0,
+     "maker": 23.018999992928002,
+     "compile": 550.4290000026231,
+     "run": 7.819000002200482
+    }
+   },
+   "edit-build": {
+    "median_ms": 1196.5835880000668,
+    "times_ms": [
+     1196.5835880000668,
+     1191.8358109978726,
+     1209.248770999693
+    ],
+    "phases_ms": {
+     "total": 1177.4829999994836,
+     "startup": 8.00600000002305,
+     "configurer": 1134.7619999978633,
+     "maker": 23.96700000099372,
+     "compile": 10.748000000603497,
+     "run": 0
+    }
+   }
+  },
+  "zig-args": {
+   "first": {
+    "median_ms": 5566.497381998488,
+    "times_ms": [
+     5566.497381998488,
+     5742.981809999037,
+     5204.069242001424
+    ],
+    "phases_ms": {
+     "total": 5398.745999998937,
+     "startup": 8.923999997932697,
+     "configurer": 1201.2389999981679,
+     "maker": 48.66300000139745,
+     "compile": 4134.749000000738,
+     "run": 5.171000000700587
+    }
+   },
+   "noop": {
+    "median_ms": 47.563890999299474,
+    "times_ms": [
+     66.12841800233582,
+     48.56401899814955,
+     47.563890999299474,
+     45.417676999932155,
+     43.197694001719356
+    ],
+    "phases_ms": {
+     "total": 47.88899999766727,
+     "startup": 8.244000000559026,
+     "configurer": 0,
+     "maker": 7.738999996945495,
+     "compile": 8.463999998639338,
+     "run": 23.44200000152341
+    }
+   },
+   "edit-zig": {
+    "median_ms": 4525.2831779980625,
+    "times_ms": [
+     4525.2831779980625,
+     4486.578938001912,
+     4825.358059999417
+    ],
+    "phases_ms": {
+     "total": 4305.359999998473,
+     "startup": 8.645999998407206,
+     "configurer": 0,
+     "maker": 28.662000000622356,
+     "compile": 4260.04599999942,
+     "run": 8.00600000002305
+    }
+   },
+   "edit-build": {
+    "median_ms": 1278.2120480005688,
+    "times_ms": [
+     1278.2120480005688,
+     1349.9544780024735,
+     1227.0740829990245
+    ],
+    "phases_ms": {
+     "total": 1306.1989999987418,
+     "startup": 8.988000001409091,
+     "configurer": 1217.1829999970214,
+     "maker": 30.23600000233273,
+     "compile": 16.80800000031013,
+     "run": 32.983999997668434
+    }
+   }
+  },
+  "zBench": {
+   "first": {
+    "median_ms": 3137.6040970026224,
+    "times_ms": [
+     3194.6495919983136,
+     2795.0026239996077,
+     3137.6040970026224
+    ],
+    "phases_ms": {
+     "total": 2941.065000002709,
+     "startup": 10.407000001578126,
+     "configurer": 1122.667999999976,
+     "maker": 50.682000000961125,
+     "compile": 1752.5119999991148,
+     "run": 4.796000001078937
+    }
+   },
+   "noop": {
+    "median_ms": 39.587154002219904,
+    "times_ms": [
+     28.900893001264194,
+     46.63706599967554,
+     47.94694700103719,
+     36.40797100160853,
+     39.587154002219904
+    ],
+    "phases_ms": {
+     "total": 26.658999999199295,
+     "startup": 8.232000000134576,
+     "configurer": 0,
+     "maker": 4.5699999973294325,
+     "compile": 13.857000001735287,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 616.8159099979675,
+    "times_ms": [
+     696.5275809998275,
+     606.7508950000047,
+     616.8159099979675
+    ],
+    "phases_ms": {
+     "total": 608.6770000001707,
+     "startup": 8.571999998821411,
+     "configurer": 0,
+     "maker": 24.34999999968568,
+     "compile": 569.4089999997232,
+     "run": 6.346000001940411
+    }
+   },
+   "edit-build": {
+    "median_ms": 1203.227693997178,
+    "times_ms": [
+     1203.227693997178,
+     1182.905852998374,
+     1212.72400199814
+    ],
+    "phases_ms": {
+     "total": 1226.9349999987753,
+     "startup": 7.6869999975315295,
+     "configurer": 1176.6029999998864,
+     "maker": 19.62700000149198,
+     "compile": 23.017999999865424,
+     "run": 0
+    }
+   }
+  },
+  "linuxwave": {
+   "first": {
+    "median_ms": 3186.6414600008284,
+    "times_ms": [
+     3239.0865960005613,
+     3106.040339000174,
+     3186.6414600008284
+    ],
+    "phases_ms": {
+     "total": 3205.028999997012,
+     "startup": 8.350000000064028,
+     "configurer": 1281.7680000007385,
+     "maker": 49.69899999923655,
+     "compile": 1857.864999998128,
+     "run": 7.346999998844694
+    }
+   },
+   "noop": {
+    "median_ms": 28.84190300028422,
+    "times_ms": [
+     32.42901699923095,
+     30.56430799915688,
+     28.84190300028422,
+     25.22369099824573,
+     28.673304001131328
+    ],
+    "phases_ms": {
+     "total": 26.083000000653556,
+     "startup": 9.575000000040745,
+     "configurer": 0,
+     "maker": 5.116999996971572,
+     "compile": 11.391000003641238,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 815.4500309974537,
+    "times_ms": [
+     1165.6211209992762,
+     815.4500309974537,
+     809.6228159993188
+    ],
+    "phases_ms": {
+     "total": 812.9079999998794,
+     "startup": 7.834000000002561,
+     "configurer": 0,
+     "maker": 24.055999998381594,
+     "compile": 640.8090000004449,
+     "run": 140.2090000010503
+    }
+   },
+   "edit-build": {
+    "median_ms": 1237.6281049982936,
+    "times_ms": [
+     1271.810351001477,
+     1215.575407997676,
+     1237.6281049982936
+    ],
+    "phases_ms": {
+     "total": 1243.2300000000396,
+     "startup": 8.49000000016531,
+     "configurer": 1198.605999998108,
+     "maker": 22.85400000255322,
+     "compile": 13.279999999213032,
+     "run": 0
+    }
+   }
+  },
+  "zli": {
+   "first": {
+    "median_ms": 1887.4132439996174,
+    "times_ms": [
+     1887.4132439996174,
+     1777.5520249997498,
+     1897.1785200010345
+    ],
+    "phases_ms": {
+     "total": 1939.7169999974722,
+     "startup": 7.592999998450978,
+     "configurer": 1201.651999996102,
+     "maker": 26.573999999527587,
+     "compile": 676.5420000010636,
+     "run": 27.356000002328074
+    }
+   },
+   "noop": {
+    "median_ms": 46.891090998542495,
+    "times_ms": [
+     46.610654000687646,
+     48.993821001204196,
+     45.23701600191998,
+     46.9709419994615,
+     46.891090998542495
+    ],
+    "phases_ms": {
+     "total": 47.32099999819184,
+     "startup": 8.002999999007443,
+     "configurer": 0,
+     "maker": 4.23899999805144,
+     "compile": 5.924000000959495,
+     "run": 29.15500000017346
+    }
+   },
+   "edit-zig": {
+    "median_ms": 688.4564949978085,
+    "times_ms": [
+     668.3544909974444,
+     688.4564949978085,
+     700.1107959986257
+    ],
+    "phases_ms": {
+     "total": 653.2289999995555,
+     "startup": 7.372000000032131,
+     "configurer": 0,
+     "maker": 12.39299999724608,
+     "compile": 629.0850000004866,
+     "run": 4.3790000017907005
+    }
+   },
+   "edit-build": {
+    "median_ms": 1167.4988820013823,
+    "times_ms": [
+     1178.0131949999486,
+     1167.2719289999804,
+     1167.4988820013823
+    ],
+    "phases_ms": {
+     "total": 1144.89500000127,
+     "startup": 7.0589999995718244,
+     "configurer": 1087.5300000006973,
+     "maker": 16.790000001492444,
+     "compile": 6.466999999247491,
+     "run": 27.049000000261003
+    }
+   }
+  },
+  "zigimg": {
+   "first": {
+    "median_ms": 13842.706213999918,
+    "times_ms": [
+     14317.385508998996,
+     13842.706213999918,
+     13452.107393997721
+    ],
+    "phases_ms": {
+     "total": 13363.154999999097,
+     "startup": 11.338999996951316,
+     "configurer": 1136.4070000017819,
+     "maker": 79.87100000173086,
+     "compile": 10750.137999999424,
+     "run": 1385.3999999992084
+    }
+   },
+   "noop": {
+    "median_ms": 1429.606394001894,
+    "times_ms": [
+     1429.606394001894,
+     1468.2654710013594,
+     1462.7841309993528,
+     1416.317816998344,
+     1395.8655390015338
+    ],
+    "phases_ms": {
+     "total": 1413.6809999981779,
+     "startup": 7.212000000436092,
+     "configurer": 0,
+     "maker": 4.057999998622108,
+     "compile": 5.804000000352971,
+     "run": 1396.6069999987667
+    }
+   },
+   "edit-zig": {
+    "median_ms": 11995.564212000318,
+    "times_ms": [
+     12241.03616100183,
+     11972.469689997524,
+     11995.564212000318
+    ],
+    "phases_ms": {
+     "total": 11755.83099999858,
+     "startup": 7.619999996677507,
+     "configurer": 0,
+     "maker": 121.83700000241515,
+     "compile": 10223.942000000534,
+     "run": 1402.431999998953
+    }
+   },
+   "edit-build": {
+    "median_ms": 2573.156039998139,
+    "times_ms": [
+     2573.156039998139,
+     2546.8760860021575,
+     2593.114040999353
+    ],
+    "phases_ms": {
+     "total": 2687.9320000007283,
+     "startup": 8.280000001832377,
+     "configurer": 1181.0529999966093,
+     "maker": 18.5139999994135,
+     "compile": 7.381999999779509,
+     "run": 1472.7030000030936
+    }
+   }
+  },
+  "zeit": {
+   "first": {
+    "median_ms": 2144.3225969997,
+    "times_ms": [
+     2073.069629001111,
+     2250.3056269997614,
+     2144.3225969997
+    ],
+    "phases_ms": {
+     "total": 2129.127000000153,
+     "startup": 7.802000000083353,
+     "configurer": 1160.0949999992736,
+     "maker": 39.37400000359048,
+     "compile": 697.7359999982582,
+     "run": 224.1199999989476
+    }
+   },
+   "noop": {
+    "median_ms": 14.01313200040022,
+    "times_ms": [
+     16.77936199848773,
+     13.514681999367895,
+     13.311671998962993,
+     16.185772998142056,
+     14.01313200040022
+    ],
+    "phases_ms": {
+     "total": 16.126999998959946,
+     "startup": 7.18599999891012,
+     "configurer": 0,
+     "maker": 3.510999998979969,
+     "compile": 5.430000001069857,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 930.461705000198,
+    "times_ms": [
+     924.7590900013165,
+     944.1570119997778,
+     930.461705000198
+    ],
+    "phases_ms": {
+     "total": 932.3519999998098,
+     "startup": 7.938999999169027,
+     "configurer": 0,
+     "maker": 25.427999997191364,
+     "compile": 676.4040000016394,
+     "run": 222.58100000181003
+    }
+   },
+   "edit-build": {
+    "median_ms": 1185.8475810004165,
+    "times_ms": [
+     1149.104416002956,
+     1185.8475810004165,
+     1339.0205620016786
+    ],
+    "phases_ms": {
+     "total": 1196.6409999986354,
+     "startup": 7.699000001593959,
+     "configurer": 1164.4880000021658,
+     "maker": 16.929999994317768,
+     "compile": 7.524000000557862,
+     "run": 0
+    }
+   }
+  },
+  "zbor": {
+   "failed": "zbor: zig build test failed:\ntest\n+- run test 97 pass, 1 fail (98 total)\nerror: 'cose.Sign1.test.Single ECDSA Signature - ECDSA w/ SHA-256, Curve P-256 #2' failed:\n       slices differ. first difference occurs at index 0 (0x0)\n       \n       ============ expected this output: =============  len: 64 (0x40)\n       \n       87 DB 0D 2E 55 71 84 3B  78 AC 33 EC B2 83 0D F7  ..\u240d.Uq.;x.3...\u240d.\n       B6 E0 A4 D5 B7 37 6D E3  36 B2 3C 59 1C 90 C4 25  .....7m.6.<Y...%\n       31 7E 56 12 7F BE 04 37  00 97 CE 34 70 87 B2 33  1~V....7...4p..3\n       BF 72 2B 64 07 2B EB 44  86 BD A4 03 1D 27 24 4F  .r+d.+.D.....'$O\n       \n       ============= instead found this: ==============  len: 64 (0x40)\n       \n       D8 43 8C 2A 76 0A 85 0A  8F E4 87 5D B3 5D 6F 3B  .C.*v\u240a.\u240a...].]o;\n       05 DE 6B D1 D7 4C A2 AC  9B 8F CA 1F D2 58 BA 58  ..k..L.......X.X\n       C4 7D E5 99 CB BC 04 41  1C 07 9A 8A 0B 44 A0 1A  .}.....A.....D..\n       92 A9 C1 24 A8 BE BF 3E  A4 F1 15 49 DA 1A 53 EE  ...$...>...I..S.\n       \n       ================================================\n       \n       /home/user/.cache/zap/zig-0.17.0/lib/std/testing.zig:346:5: 0x128758d in expectEqualSlices__func_959 (std.zig)\n           return error.TestExpectedEqual;\n           ^\n       /home/user/workspace/repo/bench/.work/phases/zig/zbor/src/cose/Sign1.zig:250:5: 0x1356a3f in test.Single ECDSA Signature - ECDSA w/ SHA-256, Curve P-256 #2 (main.zig)\n           try std.testing.expectEqualSlices(u8, \"\\x87\\xdb\\x0d\\x2e\\x55\\x71\\x84\\x3b\\x78\\xac\\x33\\xec\\xb2\\x83\\x0d\\xf7\\xb6\\xe0\\xa4\\xd5\\xb7\\x37\\x6d\\xe3\\x36\\xb2\\x3c\\x59\\x1c\\x90\\xc4\\x25\\x31\\x7e\\x56\\x12\\x7f\\xbe\\x04\\x37\\x00\\x97\\xce\\x34\\x70\\x87\\xb2\\x33\\xbf\\x72\\x2b\\x64\\x07\\x2b\\xeb\\x44\\x86\\xbd\\xa4\\x03\\x1d\\x27\\x24\\x4f\", sig);\n           ^\nfailed command: ./.zig-cache/o/b2945e8305b4d8265c6a20958569f684/test --cache-dir=./.zig-cache --seed=0x3ca6d978 --listen=-\n\nBuild Summary: 1/3 steps succeeded (1 failed); 97/98 tests passed (1 failed)\ntest transitive failure\n+- run test 97 pass, 1 fail (98 total)\n\n"
+  },
+  "libvaxis": {
+   "failed": "libvaxis: zig build test install failed:\nC TTY SIGWINCH and program status checks passed\ndebug(vaxis_parser): decoded paste: osc52 paste\nlibvaxis 0.6.0: all C API checks passed\n"
+  },
+  "cache.zig": {
+   "first": {
+    "median_ms": 1859.5674319985847,
+    "times_ms": [
+     1859.5674319985847,
+     1796.1425729990879,
+     1955.7687980013725
+    ],
+    "phases_ms": {
+     "total": 1923.1140000010782,
+     "startup": 9.172999998554587,
+     "configurer": 1206.5000000002328,
+     "maker": 31.147000001510605,
+     "compile": 666.3369999987481,
+     "run": 9.957000002032146
+    }
+   },
+   "noop": {
+    "median_ms": 30.231159998947987,
+    "times_ms": [
+     32.41885200259276,
+     30.197456002497347,
+     30.231159998947987,
+     31.405599998834077,
+     28.822985997976502
+    ],
+    "phases_ms": {
+     "total": 29.93900000001304,
+     "startup": 8.444999999483116,
+     "configurer": 0,
+     "maker": 4.548999997496139,
+     "compile": 6.861000001663342,
+     "run": 10.084000001370441
+    }
+   },
+   "edit-zig": {
+    "median_ms": 654.3156879997696,
+    "times_ms": [
+     651.462100999197,
+     654.4820849994721,
+     654.3156879997696
+    ],
+    "phases_ms": {
+     "total": 657.9679999995278,
+     "startup": 8.15100000181701,
+     "configurer": 0,
+     "maker": 11.932999994314741,
+     "compile": 627.7990000016871,
+     "run": 10.085000001708977
+    }
+   },
+   "edit-build": {
+    "median_ms": 1255.1751360006165,
+    "times_ms": [
+     1216.3732320004783,
+     1255.1751360006165,
+     1355.5385379986546
+    ],
+    "phases_ms": {
+     "total": 1286.6589999975986,
+     "startup": 11.554000000614906,
+     "configurer": 1233.0179999989923,
+     "maker": 19.73100000031991,
+     "compile": 7.735999999567866,
+     "run": 14.619999998103594
+    }
+   }
+  },
+  "zul": {
+   "first": {
+    "median_ms": 10686.889106997114,
+    "times_ms": [
+     10813.23586399958,
+     10638.474781997502,
+     10686.889106997114
+    ],
+    "phases_ms": {
+     "total": 10451.39399999971,
+     "startup": 8.104000000457745,
+     "configurer": 1168.5139999972307,
+     "maker": 28.792000004614238,
+     "compile": 2233.5859999984677,
+     "run": 7012.397999998939
+    }
+   },
+   "noop": {
+    "median_ms": 7221.158357999229,
+    "times_ms": [
+     7334.589194000728,
+     7231.6592690003745,
+     7115.056277001713,
+     7182.391471000301,
+     7221.158357999229
+    ],
+    "phases_ms": {
+     "total": 7155.836000001727,
+     "startup": 8.02800000019488,
+     "configurer": 0,
+     "maker": 4.978000000846805,
+     "compile": 6.2010000001464505,
+     "run": 7136.629000000539
+    }
+   },
+   "edit-zig": {
+    "median_ms": 9253.28999300109,
+    "times_ms": [
+     9253.28999300109,
+     9217.379580000852,
+     9459.553608001443
+    ],
+    "phases_ms": {
+     "total": 9571.303000000626,
+     "startup": 7.471000000805361,
+     "configurer": 0,
+     "maker": 19.030999999813503,
+     "compile": 2323.330999999598,
+     "run": 7221.470000000409
+    }
+   },
+   "edit-build": {
+    "median_ms": 8318.916396001441,
+    "times_ms": [
+     8556.9665289986,
+     8318.916396001441,
+     8251.765393000824
+    ],
+    "phases_ms": {
+     "total": 8440.152999999555,
+     "startup": 7.429000001138775,
+     "configurer": 1220.5079999985173,
+     "maker": 18.405999999231426,
+     "compile": 7.532999999966705,
+     "run": 7186.2770000007
+    }
+   }
+  },
+  "metrics.zig": {
+   "first": {
+    "median_ms": 2057.0545390000916,
+    "times_ms": [
+     2047.6323709990538,
+     2057.0545390000916,
+     2066.5194899993367
+    ],
+    "phases_ms": {
+     "total": 2010.2660000011383,
+     "startup": 11.365999998815823,
+     "configurer": 1132.900000004156,
+     "maker": 26.4839999981632,
+     "compile": 743.8399999991816,
+     "run": 95.67600000082166
+    }
+   },
+   "noop": {
+    "median_ms": 106.27404800106888,
+    "times_ms": [
+     106.27404800106888,
+     103.943182999501,
+     107.04557699864381,
+     120.35076499887509,
+     104.88164400157984
+    ],
+    "phases_ms": {
+     "total": 104.92099999828497,
+     "startup": 7.311000001209322,
+     "configurer": 0,
+     "maker": 3.942999999708263,
+     "compile": 5.601999997452367,
+     "run": 88.06499999991502
+    }
+   },
+   "edit-zig": {
+    "median_ms": 870.1130869994813,
+    "times_ms": [
+     852.3998749988095,
+     870.1130869994813,
+     880.8852649999608
+    ],
+    "phases_ms": {
+     "total": 858.3460000008927,
+     "startup": 7.669000002351822,
+     "configurer": 0,
+     "maker": 11.504999998578569,
+     "compile": 748.3850000025996,
+     "run": 90.78699999736273
+    }
+   },
+   "edit-build": {
+    "median_ms": 1272.89665400167,
+    "times_ms": [
+     1282.876994999242,
+     1245.3741709978203,
+     1272.89665400167
+    ],
+    "phases_ms": {
+     "total": 1369.038000000728,
+     "startup": 8.258000001660548,
+     "configurer": 1242.378999999346,
+     "maker": 22.032999997463776,
+     "compile": 7.49799999903189,
+     "run": 88.87000000322587
+    }
+   }
+  },
+  "zig-hpke": {
+   "failed": "zig-hpke: zig build test failed:\ntest\n+- run test 30 pass, 1 fail (31 total)\nerror: 'tests.test.draft-ietf-hpke-pq-04 vector 3: MLKEM768-P256 / HKDF-SHA256 / AES-128-GCM base mode' failed:\n       /home/user/workspace/repo/bench/.work/phases/zig/zig-hpke/src/main.zig:715:57: 0x128952c in pqEncapDeterministic (main.zig)\n                       if (seed.len != Kem.encaps_seed_length) return error.InvalidEncoding;\n                                                               ^\n       /home/user/workspace/repo/bench/.work/phases/zig/zig-hpke/src/main.zig:577:28: 0x12825eb in senderSetupDeterministicCommon (main.zig)\n                   const result = try pqEncapDeterministic(self.suite.kem, pk_r, sk_e);\n                                  ^\n       /home/user/workspace/repo/bench/.work/phases/zig/zig-hpke/src/main.zig:437:9: 0x1425739 in senderSetupDeterministic (main.zig)\n               return self.senderSetupDeterministicCommon(pk_r, info, .base, \"\", \"\", sk_e, null);\n               ^\n       /home/user/workspace/repo/bench/.work/phases/zig/zig-hpke/src/tests.zig:978:18: 0x142fccb in test.draft-ietf-hpke-pq-04 vector 3: MLKEM768-P256 / HKDF-SHA256 / AES-128-GCM base mode (tests.zig)\n           var sender = try h.senderSetupDeterministic(kp_r.public_key[0..1249], &info, &ikmE);\n                        ^\nfailed command: ./.zig-cache/o/341fa77fdd500aeaf7edb614df445f66/test --cache-dir=./.zig-cache --seed=0xc663f34b --listen=-\n\nBuild Summary: 1/3 steps succeeded (1 failed); 30/31 tests passed (1 failed)\ntest transitive failure\n+- run test 30 pass, 1 fail (31 total)\n\n"
+  },
+  "libxev": {
+   "first": {
+    "median_ms": 2517.132185999799,
+    "times_ms": [
+     2462.2124980014632,
+     2517.132185999799,
+     2527.6860630001465
+    ],
+    "phases_ms": {
+     "total": 2549.8640000005253,
+     "startup": 7.9160000022966415,
+     "configurer": 1215.0969999966037,
+     "maker": 42.52000000269618,
+     "compile": 1006.240999999136,
+     "run": 278.0899999997928
+    }
+   },
+   "noop": {
+    "median_ms": 59.06660999971791,
+    "times_ms": [
+     329.0462180011673,
+     59.06660999971791,
+     55.136909999419004,
+     56.926061002741335,
+     66.3377130003937
+    ],
+    "phases_ms": {
+     "total": 61.09500000093249,
+     "startup": 7.950999999593478,
+     "configurer": 17.413999998098006,
+     "maker": 15.970000004017493,
+     "compile": 19.75999999922351,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 1375.8898349988158,
+    "times_ms": [
+     1375.8898349988158,
+     1410.5311419989448,
+     1275.9934140012774
+    ],
+    "phases_ms": {
+     "total": 1300.796999999875,
+     "startup": 7.936999998491956,
+     "configurer": 15.854000001127133,
+     "maker": 37.73499999806518,
+     "compile": 996.2730000006559,
+     "run": 242.99800000153482
+    }
+   },
+   "edit-build": {
+    "median_ms": 1313.6282900013612,
+    "times_ms": [
+     1234.6631779983,
+     1313.6282900013612,
+     1578.619156996865
+    ],
+    "phases_ms": {
+     "total": 1185.606999999436,
+     "startup": 7.295999999769265,
+     "configurer": 1142.5139999992098,
+     "maker": 16.616000000794884,
+     "compile": 19.180999999662163,
+     "run": 0
+    }
+   }
+  },
+  "zio": {
+   "first": {
+    "median_ms": 25137.181993999548,
+    "times_ms": [
+     25137.181993999548,
+     25510.797473998537,
+     24733.977774998493
+    ],
+    "phases_ms": {
+     "total": 26546.30399999951,
+     "startup": 8.502999997290317,
+     "configurer": 1191.5390000031039,
+     "maker": 114.66000000291388,
+     "compile": 13791.337999995449,
+     "run": 11440.264000000752
+    }
+   },
+   "noop": {
+    "median_ms": 11645.418404998054,
+    "times_ms": [
+     12105.04699199737,
+     12104.991330998018,
+     11378.501805000269,
+     11645.418404998054,
+     11567.47785600237
+    ],
+    "phases_ms": {
+     "total": 11363.839000001462,
+     "startup": 8.90100000106031,
+     "configurer": 0,
+     "maker": 5.571000001509674,
+     "compile": 511.2950000038836,
+     "run": 10838.071999995009
+    }
+   },
+   "edit-zig": {
+    "median_ms": 24358.752149000793,
+    "times_ms": [
+     16506.619575000514,
+     25113.993655999366,
+     24358.752149000793
+    ],
+    "phases_ms": {
+     "total": 25147.816000000603,
+     "startup": 7.9919999989215285,
+     "configurer": 0,
+     "maker": 85.36500000263914,
+     "compile": 13526.640000000043,
+     "run": 11527.818999998999
+    }
+   },
+   "edit-build": {
+    "median_ms": 12514.144623000902,
+    "times_ms": [
+     12240.984303000005,
+     12943.099805997917,
+     12514.144623000902
+    ],
+    "phases_ms": {
+     "total": 12144.758999998885,
+     "startup": 7.911000000603963,
+     "configurer": 1140.1850000002014,
+     "maker": 17.46600000114995,
+     "compile": 306.1170000000857,
+     "run": 10673.079999996844
+    }
+   }
+  },
+  "zedis": {
+   "first": {
+    "median_ms": 6391.511906000233,
+    "times_ms": [
+     6316.357302002871,
+     6391.511906000233,
+     6555.889355997351
+    ],
+    "phases_ms": {
+     "total": 6289.872000001196,
+     "startup": 8.003999999345979,
+     "configurer": 1181.7040000023553,
+     "maker": 54.72799999915878,
+     "compile": 1334.5379999991565,
+     "run": 3710.8980000011798
+    }
+   },
+   "noop": {
+    "median_ms": 33.08807500070543,
+    "times_ms": [
+     33.08807500070543,
+     33.79990399844246,
+     33.303781998256454,
+     32.838422997883754,
+     30.754866998904618
+    ],
+    "phases_ms": {
+     "total": 33.068000000639586,
+     "startup": 8.043999998335494,
+     "configurer": 0,
+     "maker": 4.369000002043322,
+     "compile": 20.65500000026077,
+     "run": 0
+    }
+   },
+   "edit-zig": {
+    "median_ms": 4787.131966000743,
+    "times_ms": [
+     4818.292363001092,
+     4741.104009997798,
+     4787.131966000743
+    ],
+    "phases_ms": {
+     "total": 4737.011999997776,
+     "startup": 7.344999998167623,
+     "configurer": 0,
+     "maker": 36.65199999886681,
+     "compile": 1289.4899999992049,
+     "run": 3403.5250000015367
+    }
+   },
+   "edit-build": {
+    "median_ms": 1303.6841109969828,
+    "times_ms": [
+     5072.267150997504,
+     1291.729843000212,
+     1303.6841109969828
+    ],
+    "phases_ms": {
+     "total": 1321.0799999978917,
+     "startup": 11.454999999841675,
+     "configurer": 1268.051999999443,
+     "maker": 20.232999995641876,
+     "compile": 21.3400000029651,
+     "run": 0
+    }
+   }
+  },
+  "tokamak": {
+   "failed": "ner.test.basic single-mod...OK\n72/89 container.test.basic multi-mod...OK\n73/89 container.test.T.init()...OK\n74/89 container.test.M.configure()...OK\n75/89 container.test.partial deinit...Failed to init: pc=3\nx dep container.test.partial deinit.App val\nx dep container.test.partial deinit.H.Alloc(u8) fac\nx dep container.test.partial deinit.H.Alloc(i8) fac\n> dep container.test.partial deinit.Fail fac\nOK\n76/89 container.test.heap-allocated svc (ct2 regression)...OK\n77/89 util.buf.decltest.Buf...OK\n78/89 route.test.Params matching...OK\n79/89 schema.test.Schema.schema()...OK\n80/89 schema.test.schema json...OK\n81/89 util.shm.test_0...OK\n82/89 util.slotmap.decltest.SlotMap...OK\n83/89 util.slotmap.test.iterator...OK\n84/89 util.sparse.test_0...OK\n85/89 http.client.test_0...error: AddressInUse\n/home/user/workspace/repo/bench/.work/phases/zig/tokamak/zig-pkg/httpz-0.0.0-PNVzrEgRCQAMqyHdKN16TRJmvAqAj5a4N0QehE9k-_a9/src/posix.zig:258:27: 0x1307861 in bind (httpz.zig)\n            .ADDRINUSE => return error.AddressInUse,\n                          ^\n/home/user/workspace/repo/bench/.work/phases/zig/tokamak/zig-pkg/httpz-0.0.0-PNVzrEgRCQAMqyHdKN16TRJmvAqAj5a4N0QehE9k-_a9/src/httpz.zig:388:17: 0x130ec04 in listen (httpz.zig)\n                try posix.bind(listener, &address.any, socklen);\n                ^\n/home/user/workspace/repo/bench/.work/phases/zig/tokamak/src/server.zig:71:9: 0x1310725 in start (main.zig)\n        try self.http.listen();\n        ^\nexpected .ok, found .bad_request\n[httpz] (err): Cannot stop server, .listen() was never called\nFAIL (TestExpectedEqual)\n/home/user/.cache/zap/zig-0.17.0/lib/std/fmt.zig:583:24: 0x1199641 in charToDigit (std.zig)\n    if (value >= base) return error.InvalidCharacter;\n                       ^\n/home/user/.cache/zap/zig-0.17.0/lib/std/fmt.zig:448:23: 0x13b0e62 in parseIntWithSign__func_1679 (std.zig)\n        const digit = try charToDigit(math.cast(u8, c) orelse return error.InvalidCharacter, buf_base);\n                      ^\n/home/user/.cache/zap/zig-0.17.0/lib/std/fmt.zig:336:5: 0x13afa66 in parseIntWithGenericCharacter__func_1678 (std.zig)\n    return parseIntWithSign(Result, Character, buf, base, .pos);\n    ^\n/home/user/.cache/zap/zig-0.17.0/lib/std/fmt.zig:323:5: 0x13af395 in parseInt__func_1677 (std.zig)\n    return parseIntWithGenericCharacter(T, u8, buf, base);\n    ^\n/home/user/.cache/zap/zig-0.17.0/lib/std/fmt.zig:583:24: 0x1199641 in charToDigit (std.zig)\n    if (value >= base) return error.InvalidCharacter;\n                       ^\n/home/user/.cache/zap/zig-0.17.0/lib/std/fmt.zig:448:23: 0x13b0e62 in parseIntWithSign__func_1679 (std.zig)\n        const digit = try charToDigit(math.cast(u8, c) orelse return error.InvalidCharacter, buf_base);\n                      ^\n/home/user/.cache/zap/zig-0.17.0/lib/std/fmt.zig:336:5: 0x13afa66 in parseIntWithGenericCharacter__func_1678 (std.zig)\n    return parseIntWithSign(Result, Character, buf, base, .pos);\n    ^\n/home/user/.cache/zap/zig-0.17.0/lib/std/fmt.zig:323:5: 0x13af395 in parseInt__func_1677 (std.zig)\n    return parseIntWithGenericCharacter(T, u8, buf, base);\n    ^\n/home/user/.cache/zap/zig-0.17.0/lib/std/testing.zig:93:17: 0x13b5d6a in expectEqualInner__func_1691 (std.zig)\n                return error.TestExpectedEqual;\n                ^\n/home/user/.cache/zap/zig-0.17.0/lib/std/testing.zig:57:5: 0x13b6536 in expectEqual (main.zig)\n    return expectEqualInner(T, expected, actual);\n    ^\n/home/user/workspace/repo/bench/.work/phases/zig/tokamak/src/http/client.zig:204:5: 0x13b6608 in test_0 (main.zig)\n    try std.testing.expectEqual(.ok, res1.status);\n    ^\n86/89 dom.document.test_0...OK\n87/89 ai.chat.test.json...OK\n88/89 ai.agent.decltest.AgentToolbox...OK\n89/89 ai.fmt.test_0...OK\n88 passed; 0 skipped; 1 failed.\n1 errors were logged.\ntest\n+- run_test failure\nerror: process exited with code 1\nfailed command: ./.zig-cache/o/9b0c8128536fb24ecfdd3d0615709a0c/test\n\nBuild Summary: 4/6 steps succeeded (1 failed)\ntest transitive failure\n+- run_test failure\n\n"
+  }
+ }
+}
