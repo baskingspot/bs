@@ -1508,7 +1508,8 @@ pub fn pcrelTarget(emit: *Emit, name: []const u8, weak: bool) !?SymbolKey {
 /// it, and only those with an atom.
 fn findExports(emit: *Emit) !void {
     const ip = &emit.zcu.ip;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    // Each name's place in `emit.exports`.
+    var seen: std.StringHashMapUnmanaged(usize) = .empty;
     defer seen.deinit(emit.gpa);
     for (emit.zcu.exports.items) |x| {
         const name = ip.stringSlice(x.name);
@@ -1522,8 +1523,14 @@ fn findExports(emit: *Emit) !void {
             },
             .uav => |v| try emit.uavKey(v, 0),
         };
-        if ((try seen.getOrPut(emit.gpa, name)).found_existing) continue;
-        try emit.exports.append(emit.gpa, .{ .key = key, .name = name, .weak = x.linkage == .weak, .visibility = x.visibility });
+        const entry: ElfObject.Export = .{ .key = key, .name = name, .weak = x.linkage == .weak, .visibility = x.visibility };
+        const gop = try seen.getOrPut(emit.gpa, name);
+        if (gop.found_existing) {
+            if (!entry.weak) emit.exports.items[gop.value_ptr.*] = entry;
+            continue;
+        }
+        gop.value_ptr.* = emit.exports.items.len;
+        try emit.exports.append(emit.gpa, entry);
     }
 }
 
@@ -1682,21 +1689,25 @@ fn rtExport(emit: *Emit, name: []const u8) !?SymbolKey {
     return .fromName(try emit.requestRtKey(Zcu.compilerRtKey(&buf, e.file, e.decl)));
 }
 
-/// The symbol the compilation exports as `name`, or null.
+/// The symbol the compilation exports as `name`, or null. Of several
+/// exports of one name, the last strong one wins, else the first, as
+/// upstream 0.17.1's linker (a weak export after a definition is ignored).
 fn userExport(emit: *Emit, name: []const u8) !?SymbolKey {
     const ip = &emit.zcu.ip;
     const view = emit.exportsView();
+    var pick: ?usize = null;
     for (view.list, 0..) |x, i| {
         if (!std.mem.eql(u8, ip.stringSlice(x.name), name)) continue;
-        const x_nav = switch (x.target) {
-            .nav => |n| n,
-            .uav => |v| return try emit.uavKey(v, 0),
-        };
-        const nav = ip.getNav(x_nav);
-        if (!(if (view.resolved) |r| r[i] else nav.status == .resolved)) continue;
-        return if (ip.keyTag(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x_nav);
+        if (x.target == .nav and !(if (view.resolved) |r| r[i] else ip.getNav(x.target.nav).status == .resolved)) continue;
+        if (pick == null or x.linkage != .weak) pick = i;
     }
-    return null;
+    const x = view.list[pick orelse return null];
+    const x_nav = switch (x.target) {
+        .nav => |n| n,
+        .uav => |v| return try emit.uavKey(v, 0),
+    };
+    const nav = ip.getNav(x_nav);
+    return if (ip.keyTag(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x_nav);
 }
 
 pub fn allocator(emit: *Emit) Allocator {
