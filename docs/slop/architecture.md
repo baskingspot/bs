@@ -6817,11 +6817,15 @@ libraries as inputs. To be agreed with that thread.
   byte for the same CPU with upstream's own linker (`-fno-llvm
   -fno-lld`); a library of C only under `zig build` links with LLD by
   default, which writes llvm-ar's format (a 32-bit `/` index). A rootless module other than the root
-  contributes its C files to any build; a rootless root module of
-  `build-lib -dynamic` is `[unsupported]`.
+  contributes its C files to any build. A rootless root module of
+  `build-lib -dynamic` (libsodium's shared library) makes a shared
+  library of C, linked from bs's root file as an executable of C only
+  is (below, `Options.c_root`), for compiler_rt and ubsan_rt; it is
+  position-independent, so it has no cache entry, and each build links
+  it again from the C objects' records (built 2026-11-04).
 - **Executables of C only** (libxml2's xmllint): a rootless root
   module, or C files and no module, in `build-exe` or `run` with `-lc`
-  (`Options.c_exe`). Upstream analyzes no Zig and links glibc's crt1.o;
+  (`Options.c_root`). Upstream analyzes no Zig and links glibc's crt1.o;
   bs's start code is Zig (`Builtin.glibc_start`), so the root file is
   bs's `Builtin.c_main` (`<global>/bs/c_main/<hash>/c_main.zig`),
   which declares `_start` so that std's start code exports neither
@@ -6954,8 +6958,9 @@ diagnostics.
 - **Stack protector**: as upstream's `Module.create`, a C or C++ source
   gets `-fstack-protector-strong --param ssp-buffer-size=4` when the
   compilation links libc and its Zig code has no self-hosted backend: a
-  library of C only (`c_only`), or `-fllvm`, which bs otherwise
-  ignores; a module's `-fstack-protector`/`-fno-stack-protector` wins.
+  library of C only (`c_only`), an executable or shared library of C only
+  (`c_root`: upstream has no Zig for it), or `-fllvm`, which bs
+  otherwise ignores; a module's `-fstack-protector`/`-fno-stack-protector` wins.
   Otherwise `-fno-stack-protector`, as before.
 - **Native include directories** (upstream's
   `native_system_include_paths`): a native build without `--sysroot`
@@ -6994,10 +6999,13 @@ diagnostics.
   wrappers (≤ 2.32) and `__libc_csu_init`/`__libc_csu_fini` (≤ 2.33),
   compiled from `lib/libc/glibc` with upstream's flags and include
   directories, built and cached like the runtime libraries above. A glibc
-  executable links it when it has C inputs (C or C++ sources, objects,
-  archives, `-lc++`); upstream links it into every glibc executable, but
+  executable or shared library links it when it has C inputs (C or C++
+  sources, objects, archives, `-lc++`); upstream links it into every
+  glibc executable and shared library, but
   Zig code calls none of its functions, so a pure Zig `-lc` program keeps
-  needing no Clang. SDL's `libSDL3.a` calls `atexit`.
+  needing no Clang. SDL's `libSDL3.a` calls `atexit`;
+  a shared library whose C calls `atexit` imported it unversioned
+  before, which no loader resolves (test/link_input/so_libc.c).
 - **Exceptions** need the objects' `.eh_frame` and `.gcc_except_table`
   and `__dso_handle`, which are the link thread's stage B (`c-frames`).
   test/link_input/cxx.cpp throws through three frames with a

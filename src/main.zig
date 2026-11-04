@@ -140,9 +140,10 @@ pub const Options = struct {
     /// A static library of C sources only (no Zig root module): its
     /// archive holds their objects, and bs analyzes no Zig.
     c_only: bool = false,
-    /// An executable of C sources only, linking glibc: its root file is
-    /// bs's (`Builtin.c_main`), and C defines `main`.
-    c_exe: bool = false,
+    /// An executable of C sources only, linking glibc, or a shared library
+    /// of C sources and objects only: its root file is bs's
+    /// (`Builtin.c_main`), and in an executable C defines `main`.
+    c_root: bool = false,
     c_global_cc_argv: []const []const u8 = &.{},
     /// `std.zig.system.NativePaths`' include directories, which upstream's
     /// C takes after libc's when a native build names system libraries
@@ -440,7 +441,7 @@ pub const Job = struct {
         }
         var job_opts = opts;
         job_opts.modules = modules;
-        if (opts.c_exe) job_opts.root_src_path = try Builtin.writeCMain(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }));
+        if (opts.c_root) job_opts.root_src_path = try Builtin.writeCMain(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }));
         // A test that fuzzes links the fuzzer, whose module family has a
         // builtin of its own, as upstream's separate compilation of it (a
         // static library) does. Only the test runner references the
@@ -494,7 +495,7 @@ pub const Job = struct {
             .compile_args = compile_args.items,
             .link_objects = link_objects,
             .link_shared = link_shared,
-            .stem = opts.name orelse if (is_test) "test" else if (opts.c_only or opts.c_exe) std.fs.path.stem(if (opts.c_sources.len != 0) opts.c_sources[0].path else if (opts.link_inputs.len != 0) opts.link_inputs[0] else opts.root_name) else std.fs.path.stem(opts.root_src_path),
+            .stem = opts.name orelse if (is_test) "test" else if (opts.c_only or opts.c_root) std.fs.path.stem(if (opts.c_sources.len != 0) opts.c_sources[0].path else if (opts.link_inputs.len != 0) opts.link_inputs[0] else opts.root_name) else std.fs.path.stem(opts.root_src_path),
             .run_test = is_test and !opts.test_no_exec and !opts.listen and opts.emit_bin != .none,
             .environ_map = init_.environ_map,
             .full_args = args,
@@ -894,11 +895,12 @@ fn cxxRuntime(opts: *const Options) bool {
     return opts.link_libcpp and opts.command != .build_obj and opts.command != .build_lib;
 }
 
-/// Whether the build links glibc's libc_nonshared.a: an executable linking
-/// glibc with C inputs, which may call its functions (`atexit`); Zig code
-/// calls none of them.
+/// Whether the build links glibc's libc_nonshared.a: an executable or
+/// shared library linking glibc with C inputs, which may call its
+/// functions (`atexit`, `__stack_chk_fail_local`), as upstream links it into
+/// both; Zig code calls none of them.
 fn libcNonshared(opts: *const Options) bool {
-    return opts.link_libc and opts.glibc_version != null and opts.command != .build_obj and opts.command != .build_lib and
+    return opts.link_libc and opts.glibc_version != null and opts.command != .build_obj and (opts.command != .build_lib or opts.dynamic) and
         (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp);
 }
 
@@ -922,7 +924,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .libc_nonshared = libcNonshared(opts),
         .global_cache = job.cache_dirs.global,
         .single_threaded = opts.single_threaded,
-        .stack_protector = opts.c_only or opts.use_llvm,
+        .stack_protector = opts.c_only or opts.c_root or opts.use_llvm,
         .pic = opts.dynamic,
         .pie = opts.c_pie,
         .function_sections = opts.function_sections,
@@ -2125,17 +2127,20 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         (c_files.items.len != 0 or (link_inputs.items.len != 0 and (command == .build_lib or command == .build_obj)))) rootless_root = true;
     if (root == null and rootless_root) {
         // An executable whose main is C's, as upstream's; bs needs glibc
-        // for its start code (`Builtin.glibc_start`).
+        // for its start code (`Builtin.glibc_start`). A shared library of
+        // C is linked from bs's root too, for compiler_rt and ubsan_rt.
         if ((command == .build_exe or command == .run) and opts.link_libc and c_files.items.len != 0)
-            opts.c_exe = true
-        else if ((command != .build_lib and command != .build_obj) or opts.dynamic)
-            setUnsupported(&opts, arena, "bs builds modules without a Zig root source file only into static libraries and objects of C and executables of C that link glibc ('-M{s}'); build this step with upstream zig", .{opts.root_name})
+            opts.c_root = true
+        else if (command != .build_lib and command != .build_obj)
+            setUnsupported(&opts, arena, "bs builds modules without a Zig root source file only into libraries and objects of C and executables of C that link glibc ('-M{s}'); build this step with upstream zig", .{opts.root_name})
         else if (c_files.items.len == 0 and link_inputs.items.len == 0)
             setUnsupported(&opts, arena, "bs builds a library or object without a Zig root source file only from C sources and objects ('-M{s}')", .{opts.root_name})
+        else if (opts.dynamic)
+            opts.c_root = true
         else
             opts.c_only = true;
     }
-    opts.root_src_path = root orelse if (opts.unsupported != null or opts.c_only or opts.c_exe) "" else fatal("expected a root source file", .{});
+    opts.root_src_path = root orelse if (opts.unsupported != null or opts.c_only or opts.c_root) "" else fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
     // As upstream: `-L` directories that do not exist are left out, and
     // `-l` names also search the native library directories, after them.
@@ -2196,7 +2201,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     opts.modules = modules.items;
     // A root file given by position owns what no -M took, as upstream's;
     // so does a library or executable of C only.
-    if (positional_root or ((opts.c_only or opts.c_exe) and c_owned == 0)) {
+    if (positional_root or ((opts.c_only or opts.c_root) and c_owned == 0)) {
         c_flags.optimize = mode.optimize;
         root_c_flags = c_flags;
         const module_cc = try cc_argv.toOwnedSlice(arena);

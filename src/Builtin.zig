@@ -95,8 +95,9 @@ pub const glibc_start =
 ;
 
 /// The root file of an executable whose main is C's (a module of C sources
-/// only, linking glibc). Upstream analyzes no Zig for it; bs's executables
-/// need a Zig root for the start code, compiler_rt and ubsan_rt. std's
+/// only, linking glibc) or of a shared library of C only. Upstream analyzes
+/// no Zig for them; bs's need a Zig root for the start code, compiler_rt
+/// and ubsan_rt. std's
 /// start code still runs, and declares `_start` unless the root does;
 /// `glibc_start.zig` exports it.
 pub const c_main =

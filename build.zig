@@ -705,15 +705,15 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     lc_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&lc_run.step);
     // Shared libraries that link glibc: lib.zig, whose c_twice the program
-    // that loads it defines, and so_libc.zig with a C source, which call
-    // glibc through versioned imports; upstream links the programs.
-    for ([_][]const u8{ "test/obj/lib.zig", "test/link_input/so_libc.zig" }, [_][]const u8{ "test/obj/main.zig", "test/link_input/so_libc_main.zig" }, [_][]const u8{ "bslc", "so_libc" }) |lib_src, main_src, name| {
+    // that loads it defines, so_libc.zig with a C source, which call glibc
+    // through versioned imports, and so_libc.c alone, a library of C only;
+    // upstream links the programs.
+    for ([_][]const u8{ "test/obj/lib.zig", "test/link_input/so_libc.zig", "test/link_input/so_libc.c" }, [_][]const u8{ "test/obj/main.zig", "test/link_input/so_libc_main.zig", "test/link_input/so_c_main.zig" }, [_][]const u8{ "bslc", "so_libc", "so_c" }, [_][]const u8{ "", "z[c7:1]\nz[c42:2]\nc bye\n", "c3:1\nc4:2\nc bye\n" }) |lib_src, main_src, name, stderr| {
         const lc_so = b.addRunArtifact(bs);
         lc_so.setName(b.fmt("bs build-lib -dynamic -lc {s}", .{std.fs.path.basename(lib_src)}));
         lc_so.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", "x86_64-linux-gnu", "--name", name });
         lc_so.addFileArg(b.path(lib_src));
-        const with_c = std.mem.eql(u8, name, "so_libc");
-        if (with_c) lc_so.addFileArg(b.path("test/link_input/so_libc.c"));
+        if (std.mem.eql(u8, name, "so_libc")) lc_so.addFileArg(b.path("test/link_input/so_libc.c"));
         lc_so.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
         const lc_so_file = lc_so.addPrefixedOutputFileArg("-femit-bin=", b.fmt("lib{s}.so", .{name}));
         const lc_so_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
@@ -723,7 +723,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         lc_so_run.setName(b.fmt("run {s} (bs shared library linking glibc)", .{std.fs.path.basename(main_src)}));
         lc_so_run.addFileArg(lc_so_file);
         lc_so_run.addFileArg(lc_so_host.addPrefixedOutputFileArg("-femit-bin=", "main"));
-        if (with_c) lc_so_run.addCheck(.{ .expect_stderr_exact = "z[c7:1]\nz[c42:2]\n" }) else lc_so_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
+        if (stderr.len != 0) lc_so_run.addCheck(.{ .expect_stderr_exact = stderr }) else lc_so_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
         lc_so_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&lc_so_run.step);
     }
