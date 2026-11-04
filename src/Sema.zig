@@ -8310,9 +8310,10 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
     };
     if (cast) |c| try sema.addFix(src, @import("diag.zig").wrapFix, .{ c, ")" });
     // Where the value comes from, after upstream's notes.
-    if (ip.keyTag(actual) == .error_union_type and ip.keyPayload(.error_union_type, actual).payload_type == wanted)
+    // The payload need only be of the wanted kind (`[]u8` for `[]const u8`).
+    if (ip.keyTag(actual) == .error_union_type and Type.class(ip, ip.keyPayload(.error_union_type, actual).payload_type) == Type.class(ip, wanted))
         try sema.noteOrigin(block, src, .self, .error_union)
-    else if (ip.keyTag(actual) == .opt_type and ip.keyPayload(.opt_type, actual) == wanted)
+    else if (ip.keyTag(actual) == .opt_type and Type.class(ip, ip.keyPayload(.opt_type, actual)) == Type.class(ip, wanted))
         try sema.noteOrigin(block, src, .self, .optional)
     else if (Type.class(ip, wanted) == .pointer and Type.class(ip, actual) == .pointer and
         !Type.ptrInfo(ip, wanted).flags.is_const and Type.ptrInfo(ip, actual).flags.is_const)
@@ -12396,7 +12397,11 @@ fn cPtrToSingle(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref
 /// comptime-known slice, as a pointer to an array of its length.
 fn derefPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref {
     const ty = sema.typeOf(ptr);
-    if (Type.class(sema.ip, ty) != .pointer) return sema.fail(block, src, "cannot dereference non-pointer type '{f}'", .{sema.fmtType(ty)});
+    if (Type.class(sema.ip, ty) != .pointer) {
+        const err = sema.fail(block, src, "cannot dereference non-pointer type '{f}'", .{sema.fmtType(ty)});
+        try sema.noteUnwrap(block, src, .operand, ty);
+        return err;
+    }
     if (Type.ptrInfo(sema.ip, ty).flags.size == .many) return sema.fail(block, src, "index syntax required for unknown-length pointer type '{f}'", .{sema.fmtType(ty)});
     if (Type.ptrInfo(sema.ip, ty).flags.size == .slice) {
         const v = sema.resolveValue(ptr) orelse return sema.fail(block, src, "index syntax required to access runtime-known slice", .{});
@@ -14002,7 +14007,16 @@ fn failInvalidFieldAccess(sema: *Sema, block: *Block, src: Src, ty: Index, name:
         .type, .@"struct", .@"union" => true,
         else => false,
     };
-    if (!supports) return sema.fail(block, src, "type '{f}' does not support field access", .{sema.fmtType(ty)});
+    if (!supports) {
+        const err = sema.fail(block, src, "type '{f}' does not support field access", .{sema.fmtType(ty)});
+        // Upstream names only payloads with the field itself; a pointer to
+        // a container has it too once unwrapped.
+        if (payload != .none and Type.class(ip, payload) == .pointer and Type.ptrInfo(ip, payload).flags.size == .one) switch (Type.class(ip, Type.ptrInfo(ip, payload).child)) {
+            .@"struct", .@"union", .@"opaque" => try sema.noteUnwrap(block, src, .operand, ty),
+            else => {},
+        };
+        return err;
+    }
     const err = sema.fail(block, src, "{s} type '{f}' does not support field access", .{ kind.?, sema.fmtType(ty) });
     try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "{s}", .{if (Type.class(ip, ty) == .optional) "consider using '.?', 'orelse', or 'if'" else "consider using 'try', 'catch', or 'if'"});
     try sema.noteOrigin(block, src, .operand, if (Type.class(ip, ty) == .optional) .optional else .error_union);

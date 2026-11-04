@@ -1164,8 +1164,9 @@ pub const Origin = struct {
 pub const OriginDepth = enum {
     /// The expression itself.
     self,
-    /// The operand of a field access or an indexing expression (`x` in
-    /// `x.f` and `x[i]`), an error about which points at the whole.
+    /// The operand of a field access, an indexing expression or a
+    /// dereference (`x` in `x.f`, `x[i]` and `x.*`), an error about which
+    /// points at the whole.
     operand,
     /// The variable whose memory a place expression names: `x` in `x`,
     /// `x.f.g`, `x[i]`, `&x`, and in a method call's callee `x.m`.
@@ -1180,6 +1181,7 @@ pub fn valueOrigin(tree: *const Ast, start: u32, end: u32, depth: OriginDepth) ?
         .operand => switch (tree.nodeTag(node)) {
             .field_access => node = tree.nodeData(node).node_and_token[0],
             .array_access => node = tree.nodeData(node).node_and_node[0],
+            .deref => node = tree.nodeData(node).node,
             else => {},
         },
         .root => while (true) switch (tree.nodeTag(node)) {
@@ -1193,14 +1195,17 @@ pub fn valueOrigin(tree: *const Ast, start: u32, end: u32, depth: OriginDepth) ?
     return .{ .node = node, .local = if (tree.nodeTag(node) == .identifier) localNamed(tree, tree.nodeMainToken(node)) else null };
 }
 
-/// The local declaration in scope at `use` that its identifier names.
-/// Zig has no shadowing, so it is the one declaration of that name in the
-/// enclosing function whose block holds `use`.
+/// The local declaration in scope at `use` that its identifier names: of
+/// the declarations of that name in the enclosing function whose block
+/// holds `use`, the last before it (Zig has no shadowing, but a local in
+/// another's initializer, `const x = blk: { const x = ...; ... }`, may
+/// share its name).
 fn localNamed(tree: *const Ast, use: Ast.TokenIndex) ?Local {
     const body = enclosingFnBody(tree, use) orelse return null;
     const body_first = tree.firstToken(body);
     const body_last = tree.lastToken(body);
     const name = tree.tokenSlice(use);
+    var best: ?Local = null;
     for (0..tree.nodes.len) |i| {
         const node: Ast.Node.Index = @enumFromInt(i);
         const decl = tree.fullVarDecl(node) orelse continue;
@@ -1220,13 +1225,14 @@ fn localNamed(tree: *const Ast, use: Ast.TokenIndex) ?Local {
         }
         const scope = inner orelse continue;
         if (use > tree.lastToken(scope)) continue;
+        if (best != null and best.?.mut_tok > mut_tok) continue;
         const literal = if (decl.ast.init_node.unwrap()) |init| switch (tree.nodeTag(init)) {
             .number_literal, .char_literal, .enum_literal => true,
             else => false,
         } else false;
-        return .{ .name = name, .mut_tok = mut_tok, .init = decl.ast.init_node, .var_ok = decl.ast.type_node != .none or !literal };
+        best = .{ .name = name, .mut_tok = mut_tok, .init = decl.ast.init_node, .var_ok = decl.ast.type_node != .none or !literal };
     }
-    return null;
+    return best;
 }
 
 /// Turns the `const` of `local` into `var`.
