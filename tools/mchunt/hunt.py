@@ -285,11 +285,14 @@ def main():
     ap.add_argument("--per-sig", type=int, default=2, help="reductions per finding signature")
     ap.add_argument("--one", type=int, help="check one seed and print its outcomes")
     ap.add_argument("--file", help="check one saved program and print its outcomes")
+    ap.add_argument("--boost", metavar="KIND=N,...", help="weight multipliers for statement kinds, such as vector=8")
     ap.add_argument("--ref-env", metavar="VAR=VALUE", action="append",
                     help="compare bs with bs under this environment (such as BS_PROVE=off) instead of upstream")
     args = ap.parse_args()
 
     tools = H.Tools(args.bs, args.zig)
+    if args.boost:
+        gen.BOOST.update({k: float(v) for k, v in (x.split("=") for x in args.boost.split(","))})
     if args.ref_env:
         H.set_ref_env(dict(e.split("=", 1) for e in args.ref_env))
     if args.file:

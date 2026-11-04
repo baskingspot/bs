@@ -162,6 +162,9 @@ class Func:
 ERRS = ["Alpha", "Beta", "Gamma"]
 # MCHUNT_DISABLE=statesw,bce: statement kinds to leave out (experiments).
 DISABLED = set(filter(None, __import__("os").environ.get("MCHUNT_DISABLE", "").split(",")))
+# MCHUNT_BOOST=vector=8,sroa=3: weight multipliers for statement kinds
+# (aiming a campaign at one pass).
+BOOST = {k: float(v) for k, v in (x.split("=") for x in filter(None, __import__("os").environ.get("MCHUNT_BOOST", "").split(",")))}
 
 
 class Gen:
@@ -1021,6 +1024,8 @@ class Gen:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
         if DISABLED:
             w = [x for x in w if x[1] not in DISABLED]
+        if BOOST:
+            w = [(n * BOOST.get(k, 1), k) for n, k in w]
         k = self.wpick(w)
         getattr(self, "s_" + k)(ctx)
 
