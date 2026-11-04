@@ -783,6 +783,13 @@ const InputResolver = struct {
         if (Zcu.compilerRtExport(name) == null) return null;
         return r.emit.rtExport(name);
     }
+
+    /// With `-lc`, glibc's symbols, imported.
+    pub fn importSym(r: InputResolver, name: []const u8, weak: bool) !?SymbolKey {
+        const g = r.emit.glibc orelse return null;
+        if (g.get(name) == null) return null;
+        return try r.emit.useImport(name, .{ .weak = weak });
+    }
 };
 
 /// Converts the inputs into atoms, after the externs' slots took their

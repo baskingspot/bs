@@ -2467,7 +2467,7 @@ Zig externs keep their 8-byte slots. A slot's target becomes the object
 symbol's (atom key, offset), with the offset in the addend.
 
 **Relocations.** These are the kinds that upstream's C objects carry,
-and system `cc`'s (`-fPIE` by default on Debian). Without `-lc`, upstream
+and system `cc`'s (GCC, `-fPIE` by default on Debian). Without `-lc`, upstream
 compiles C as non-PIC: extern data comes through R_X86_64_32S and
 thread-locals through TPOFF32 (checked). With `-lc` it compiles C as
 `-fPIC`, because glibc requires PIC. Targets are atom keys plus addends; a reference to a section
@@ -2503,11 +2503,12 @@ symbol or a local becomes (section atom, value + addend).
   are `[unsupported]` until something needs them.
 - GOTPC32/GOTOFF64 (large model), SIZE32/64 and the rest fail with an
   error naming the object, section and kind.
-- Copy relocations: only non-PIC code reading an import's data with PC32
-  or 32S needs them. Upstream's C flags under `-lc` (`-fPIC`) produce
-  none, and neither does Debian's `cc` default (`-fPIE`, which reads
-  through the GOT). Until an input needs
-  one, it is an error naming the symbol.
+- Copy relocations: code that reads an import's data with PC32 or 32S
+  needs them. Upstream's C flags under `-lc` (`-fPIC`) produce none, but
+  GCC's `-fPIE`, Debian `cc`'s default, does: it reads `stdout` with
+  R_X86_64_PC32 and relies on a copy relocation (checked 2026-11-04; the
+  design first said it read through the GOT). Until zap makes them, it
+  is an error naming the object, the section and the symbol.
 
 **Merged sections.** SHF_MERGE|SHF_STRINGS sections (`.rodata.str1.1`,
 which clang always emits) split into one content-addressed atom per
@@ -2599,6 +2600,11 @@ differs from the design above:
   compiler_rt functions the objects asked for (the cache thread's part).
 - A C GOT slot is content-addressed by its target, not shared with the
   Zig extern slot of the same name.
+- With `-lc`, names nothing else defines are glibc's imports
+  (`InputResolver.importSym`, after compiler_rt). A C call to one goes
+  through a content-addressed stub atom, `jmp [rip + slot]`, whose slot
+  is the content-addressed 8-byte atom GOT references use, with an
+  `x86_64_abs64` that the executable's link turns into R_X86_64_64.
 - Not yet: init and fini arrays (an error names the section),
   ubsan_rt and compiler_rt's stack protector for `zig cc`'s Debug
   objects (until then the tests compile with `-fno-sanitize=undefined

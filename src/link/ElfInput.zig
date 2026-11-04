@@ -247,7 +247,13 @@ pub fn undefinedSince(in: *const Inputs, first: usize, out: *std.ArrayList([]con
 
 /// Where a name the objects define resolves: an atom key and an offset in
 /// that atom.
-pub const Target = struct { key: SymbolKey, offset: u64 };
+pub const Target = struct {
+    key: SymbolKey,
+    offset: u64,
+    /// A shared library's symbol (`ctx.importSym`), which the loader
+    /// binds: code reaches it through a slot, calls through a stub.
+    import: bool = false,
+};
 
 /// The definition objects give `name`, or null.
 pub fn lookup(in: *Inputs, name: []const u8) Allocator.Error!?Target {
@@ -509,7 +515,7 @@ fn Converter(comptime Ctx: type) type {
             if (s >= o.first_global and (bind == elf.STB_GLOBAL or bind == elf.STB_WEAK)) {
                 const name = o.symName(sym);
                 const gop = try c.resolved.getOrPut(c.in.arena, name);
-                if (!gop.found_existing) gop.value_ptr.* = try c.resolve(name);
+                if (!gop.found_existing) gop.value_ptr.* = try c.resolve(name, bind == elf.STB_WEAK);
                 if (gop.value_ptr.*) |t| return t;
                 if (sym.st_shndx == elf.SHN_ABS) return try c.absolute(sym.st_value);
                 if (bind == elf.STB_WEAK) {
@@ -536,10 +542,11 @@ fn Converter(comptime Ctx: type) type {
 
         /// The compilation's exports come first, then the objects', then
         /// compiler_rt, as upstream links them.
-        fn resolve(c: *C, name: []const u8) !?Target {
+        fn resolve(c: *C, name: []const u8, weak: bool) !?Target {
             if (try c.ctx.zigExport(name)) |key| return .{ .key = key, .offset = 0 };
             if (try c.in.lookup(name)) |t| return t;
             if (try c.ctx.rtExport(name)) |key| return .{ .key = key, .offset = 0 };
+            if (try c.ctx.importSym(name, weak)) |key| return .{ .key = key, .offset = 0, .import = true };
             return null;
         }
 
@@ -572,6 +579,10 @@ fn Converter(comptime Ctx: type) type {
                 return 0;
             }
             const t = try c.target(r.r_sym(), r.r_addend) orelse return 0;
+            if (t.import) {
+                try c.importReloc(index, r, bytes);
+                return 0;
+            }
             switch (@as(R, @fromBackingInt(@intCast(ty)))) {
                 .@"64" => try c.add(off, .x86_64_abs64, t, r.r_addend),
                 .PC32, .PLT32 => try c.add(off, .x86_64_pc32, t, r.r_addend),
@@ -658,6 +669,42 @@ fn Converter(comptime Ctx: type) type {
                 else => try c.unsupported(index, ty),
             }
             return 0;
+        }
+
+        /// A relocation to a shared library's symbol: an absolute address
+        /// stays one, which the loader writes; a call goes through a stub
+        /// that jumps through the symbol's slot; GOT-relative code uses
+        /// the slot. Reading an import's data PC-relative would need a
+        /// copy relocation.
+        fn importReloc(c: *C, index: u32, r: elf.Elf64_Rela, bytes: []const u8) !void {
+            const o = c.o;
+            const off = r.r_offset;
+            const sym = o.syms[r.r_sym()];
+            const t: Target = .{ .key = (try c.target(r.r_sym(), r.r_addend)).?.key, .offset = 0 };
+            const R = elf.R_X86_64;
+            const ty: R = @fromBackingInt(@intCast(r.r_type()));
+            switch (ty) {
+                .@"64" => try c.add(off, .x86_64_abs64, t, r.r_addend),
+                .GOTPCREL, .GOTPCRELX, .REX_GOTPCRELX => try c.add(off, .x86_64_pc32, .{ .key = try c.slot(t), .offset = 0 }, r.r_addend),
+                .PLT32, .PC32 => {
+                    const op = if (off >= 1) bytes[@intCast(off - 1)] else 0;
+                    if (ty == .PC32 and op != 0xe8 and op != 0xe9) return c.fail("{s}: zap does not make copy relocations yet: section '{s}' reads {s}, which a shared library defines, PC-relative (GCC's -fPIE does); compile it with -fPIC", .{ o.path, o.sectionName(index), o.symName(sym) });
+                    try c.add(off, .x86_64_pc32, .{ .key = try c.stub(t), .offset = 0 }, r.r_addend);
+                },
+                else => try c.fail("{s}: zap does not link relocation R_X86_64_{s} against {s}, which a shared library defines, yet", .{ o.path, @tagName(ty), o.symName(sym) }),
+            }
+        }
+
+        /// A stub that jumps through `t`'s slot (`jmp [rip + slot]`),
+        /// content-addressed, so all calls to one import share it.
+        fn stub(c: *C, t: Target) Allocator.Error!SymbolKey {
+            const arena = c.in.arena;
+            const targets = try arena.dupe(SymbolKey, &.{try c.slot(t)});
+            const relocs = try arena.dupe(Atom.Reloc, &.{.init(2, .x86_64_pc32, 0, -4)});
+            const code: []const u8 = &.{ 0xff, 0x25, 0, 0, 0, 0 };
+            const key: SymbolKey = .fromContents(.text, .@"8", code, targets, relocs);
+            try c.atoms.append(arena, .{ .key = key, .name = "", .section = .text, .alignment = .@"8", .bytes = code, .targets = targets, .relocs = relocs });
+            return key;
         }
 
         /// Whether relocation `k + 1` is the call to `__tls_get_addr` at

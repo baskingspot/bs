@@ -827,6 +827,25 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&run.step);
     }
+
+    // A C object calling glibc, in a -lc executable: its calls go through
+    // stubs, its GOT loads through the imports' slots. Upstream compiles
+    // C as -fPIC under -lc.
+    const c = b.addSystemCommand(&.{ zig, "cc", "-fno-sanitize=undefined", "-fno-stack-protector", "-fPIC", "-c" });
+    c.addFileArg(b.path("test/link_input/libc.c"));
+    const libc_o = c.addPrefixedOutputFileArg("-o", "libc.o");
+    const exe = b.addRunArtifact(zap);
+    exe.setName("zap build-exe -lc with a C object");
+    exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+    exe.addFileArg(b.path("test/link_input/libc_main.zig"));
+    exe.addFileArg(libc_o);
+    exe.setEnvironmentVariable("ZAP_CACHE", "off");
+    const run = std.Build.Step.Run.create(b, "run zap -lc link of a C object");
+    run.addFileArg(exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\n" });
+    run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
+    run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&run.step);
 }
 
 fn upstreamZig(b: *std.Build) []const u8 {
