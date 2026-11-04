@@ -1019,7 +1019,7 @@ def zap_lines(stderr, case_name):
 def other_note(line):
     """Upstream's note outside the case file (':?:?: note:' or a bare
     'note:'), as zap_lines() writes one; None for other lines."""
-    m = re.match(r"^(?::\?:\?: )?note: (.*)$", line)
+    m = re.match(r"^(?::\?:\?: |: )?note: (.*)$", line)
     return f"?: note: {m.group(1)}" if m else None
 
 
@@ -1052,7 +1052,10 @@ def run_case(compiler, path, cfg, expected, args, workdir):
     argv.append("--error-format=json")
     code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout)
     shutil.rmtree(out_dir, ignore_errors=True)
-    exp_errors = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "error" or e.startswith("error: ")]
+    # Upstream's harness matches a line by its end, so ': error: msg' and
+    # ':?:?: error: msg' match the error at any location.
+    any_loc = lambda e: re.match(r"^(?::\?:\?:|:) error: ", e)
+    exp_errors = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "error" or e.startswith("error: ") or any_loc(e)]
     exp_notes = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "note"] + [o for o in map(other_note, expected) if o]
     r = {"expected": exp_errors}
     if timed_out:
@@ -1063,7 +1066,13 @@ def run_case(compiler, path, cfg, expected, args, workdir):
         r["status"] = "accepted"
     else:
         errors, notes = zap_lines(err, root.name)
-        r["got"] = errors
+        r["got"] = list(errors)
+        for e in filter(any_loc, exp_errors):
+            tail = e[e.index(" error: "):]
+            for i, g in enumerate(errors):
+                if g.endswith(tail) and not any_loc(g) and g not in exp_errors:
+                    errors[i] = e
+                    break
         locs = lambda ls: sorted(l.split(": error:")[0] for l in ls)
         if sorted(errors) == sorted(exp_errors):
             r["status"] = "exact"
