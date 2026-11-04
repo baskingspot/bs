@@ -5,3 +5,4 @@ zig-out/
 /bench/.work/
 __pycache__/
 /tools/corpus/.work/
+/tools/mchunt/.work/
