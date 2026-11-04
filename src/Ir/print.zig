@@ -395,6 +395,7 @@ fn typeIn(cx: Ctx, ty: InternPool.Index, w: *Writer) Writer.Error!void {
                 const alignment = if (p.flags.alignment != 0) @as(u64, 1) << (p.flags.alignment - 1) else @import("../Type.zig").abiAlignment(cx.ip, p.child);
                 try w.print("align({d}:{d}:{d}) ", .{ alignment, p.packed_offset.bit_offset, p.packed_offset.host_size });
             } else if (p.flags.alignment != 0) try w.print("align({d}) ", .{@as(u64, 1) << (p.flags.alignment - 1)});
+            if (p.flags.address_space != .generic) try w.print("addrspace(.{t}) ", .{p.flags.address_space});
             if (p.flags.is_const) try w.writeAll("const ");
             if (p.flags.is_volatile) try w.writeAll("volatile ");
             try typeIn(cx, p.child, w);

@@ -479,7 +479,7 @@ pub const Src = struct {
         cast_operand: Ast.Node.Offset,
         /// The alignment, bit offset or host size of the pointer type at
         /// `node`.
-        ptr_part: struct { node: Ast.Node.Offset, part: enum { @"align", bit_offset, host_size } },
+        ptr_part: struct { node: Ast.Node.Offset, part: enum { @"align", @"addrspace", bit_offset, host_size } },
         /// Argument `index` of the `@call` at `node`: an element of its
         /// argument tuple literal, or the tuple.
         call_tuple_elem: struct { node: Ast.Node.Offset, index: u32 },
@@ -613,6 +613,7 @@ pub const Src = struct {
                 const ptr = tree.fullPtrType(node) orelse return tree.nodeToSpan(node);
                 const part = switch (p.part) {
                     .@"align" => ptr.ast.align_node,
+                    .@"addrspace" => ptr.ast.addrspace_node,
                     .bit_offset => ptr.ast.bit_range_start,
                     .host_size => ptr.ast.bit_range_end,
                 };
@@ -3111,10 +3112,33 @@ fn addInst(sema: *Sema, block: *Block, inst: Ir.Inst) !Ref {
     // Callers should have checked with `requireRuntime` and a precise source
     // location; this is the backstop for paths that do not yet.
     if (block.is_comptime and !block.discards_runtime) return sema.fail(block, .{ .base = block.src_base, .loc = .{ .node = .zero } }, "unable to evaluate comptime expression", .{});
+    // CodeGen addresses memory in the generic address space only.
+    const mem_ptrs: [2]Ref = if (block.discards_runtime) .{ .none, .none } else switch (inst.tag) {
+        .load, .atomic_load => .{ inst.data.ty_op.operand, .none },
+        .store, .atomic_store, .ptr_elem_val, .slice_elem_val, .memset, .set_union_tag => .{ inst.data.bin_op.lhs, .none },
+        .memcpy, .memmove => .{ inst.data.bin_op.lhs, inst.data.bin_op.rhs },
+        .atomic_rmw, .cmpxchg => .{ @fromBackingInt(sema.ir_extra.items[inst.data.ty_pl.payload]), .none },
+        .vector_store_elem => .{ inst.data.pl_op.operand, .none },
+        else => .{ .none, .none },
+    };
+    for (mem_ptrs) |ptr| if (ptr != .none) {
+        // An inferred allocation (`.none` until resolved) is a generic local.
+        const ty = sema.typeOf(ptr);
+        if (ty != .none and sema.ip.keyTag(ty) == .ptr_type)
+            try sema.checkAddressSpace(block, .{ .base = block.src_base, .loc = .{ .node = .zero } }, sema.ip.keyPayload(.ptr_type, ty).flags.address_space);
+    };
     const index: Ir.Inst.Index = @fromBackingInt(@intCast(sema.ir_insts.len));
     try sema.ir_insts.append(sema.gpa, inst);
     try block.instructions.append(sema.gpa, index);
     return index.toRef();
+}
+
+/// Fails a runtime memory access through a pointer in address space `as`
+/// unless it is the generic one, the only one CodeGen addresses. Loads
+/// and stores check where they are written; `addInst` is the backstop.
+fn checkAddressSpace(sema: *Sema, block: *Block, src: Src, as: std.lang.AddressSpace) CompileError!void {
+    if (as == .generic or block.is_typeof) return;
+    return sema.fail(block, src, "zap does not support memory accesses through pointers in address space '{t}' yet", .{as});
 }
 
 fn addExtra(sema: *Sema, value: anytype) !u32 {
@@ -5849,7 +5873,7 @@ fn typeInfo(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!Index 
                 .{ "const", boolValue(p.flags.is_const) },
                 .{ "volatile", boolValue(p.flags.is_volatile) },
                 .{ "allowzero", boolValue(p.flags.is_allowzero) },
-                .{ "addrspace", try sema.optValue(as_ty, try sema.enumValueByName(block, src, as_ty, "generic")) },
+                .{ "addrspace", try sema.optValue(as_ty, try sema.enumValueByName(block, src, as_ty, @tagName(p.flags.address_space))) },
                 .{ "align", try sema.optValue(.usize_type, if (p.flags.alignment == 0) .none else try sema.intValue(.usize_type, @as(u64, 1) << @intCast(p.flags.alignment - 1))) },
             });
             break :blk try sema.structValue(block, src, try sema.stdLangType(block, src, "Type.Pointer"), &[_]S{
@@ -6694,7 +6718,7 @@ fn atomicPtr(sema: *Sema, block: *Block, call_src: Src, ref: Zir.Inst.Ref, is_co
     try sema.atomicElemType(block, sema.callArgSrc(call_src, false, 0), info.child);
     // As upstream's checkAtomicPtrOperand: the pointer coerces to one of
     // natural alignment.
-    const want = try sema.ptrType(.{ .child = info.child, .flags = .{ .is_const = is_const, .is_volatile = info.flags.is_volatile, .is_allowzero = info.flags.is_allowzero } });
+    const want = try sema.ptrType(.{ .child = info.child, .flags = .{ .is_const = is_const, .is_volatile = info.flags.is_volatile, .is_allowzero = info.flags.is_allowzero, .address_space = info.flags.address_space } });
     return .{ try sema.coerce(block, want, ptr, src), info.child };
 }
 
@@ -7787,7 +7811,12 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
         // to and from `*u32` in memory.
         alignment = @intCast(std.math.log2_int(u64, a) + 1);
     }
-    if (data.flags.has_addrspace) return sema.failUnsupported(block, src, "address spaces");
+    var address_space: std.lang.AddressSpace = .generic;
+    if (data.flags.has_addrspace) {
+        const as_src: Src = .{ .base = src.base, .loc = .{ .ptr_part = .{ .node = extra.data.src_node, .part = .@"addrspace" } } };
+        address_space = try sema.resolveAddressSpace(block, as_src, sema.resolveInst(@fromBackingInt(sema.code.extra[i])));
+        i += 1;
+    }
     var packed_offset: InternPool.PtrType.PackedOffset = .{};
     if (data.flags.has_bit_range) {
         const bit_offset = try sema.resolveInt(block, .{ .base = src.base, .loc = .{ .ptr_part = .{ .node = extra.data.src_node, .part = .bit_offset } } }, @fromBackingInt(sema.code.extra[i]), .u16_type, "bit offset must be comptime-known");
@@ -7817,8 +7846,25 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
             .is_volatile = data.flags.is_volatile,
             .is_allowzero = data.flags.is_allowzero,
             .alignment = alignment,
+            .address_space = address_space,
         },
     }));
+}
+
+/// The pointer address space `ref` names, which the target must support
+/// for pointers (upstream's `analyzeAsAddressSpace`).
+fn resolveAddressSpace(sema: *Sema, block: *Block, src: Src, ref: Ref) CompileError!std.lang.AddressSpace {
+    const as_ty = try sema.stdLangType(block, src, "AddressSpace");
+    const val = try sema.resolveConstValue(block, src, try sema.coerce(block, as_ty, ref, src), "address space must be comptime-known");
+    if (sema.isUndef(val)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+    const name = sema.enumTagName(val).?;
+    const as = std.meta.stringToEnum(std.lang.AddressSpace, name).?;
+    // As `std.Target.supportsAddressSpace` for x86_64, zap's one Sema target.
+    switch (as) {
+        .generic, .gs, .fs, .ss => {},
+        else => return sema.fail(block, src, "pointers with address space '{s}' are not supported on x86", .{name}),
+    }
+    return as;
 }
 
 fn stringLiteral(sema: *Sema, bytes: []const u8) !Index {
@@ -8282,6 +8328,8 @@ fn notePtrDifference(sema: *Sema, span: Ast.Span, wanted: Index, actual: Index, 
     const a_zero = a.flags.is_allowzero or a.flags.size == .c;
     const w_zero = w.flags.is_allowzero or w.flags.size == .c;
     if (a_zero and !w_zero) return zcu.addNote(file, span, "'{f}' could have null values which are illegal in type '{f}'", .{ sema.fmtType(actual), sema.fmtType(wanted) });
+    if (a.flags.address_space != w.flags.address_space)
+        return zcu.addNote(file, span, "address space '{t}' cannot cast into address space '{t}'", .{ a.flags.address_space, w.flags.address_space });
     if (w.child == .anyopaque_type and sema.isDoublePtr(a.child))
         return zcu.addNote(file, span, "cannot implicitly cast double pointer '{f}' to anyopaque pointer '{f}'", .{ sema.fmtType(actual), sema.fmtType(wanted) });
     if (a.child != w.child) {
@@ -8986,6 +9034,7 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
     if (s.flags.is_const and !d.flags.is_const) return false;
     if (s.flags.is_volatile and !d.flags.is_volatile) return false;
     if (s.flags.is_allowzero and !d.flags.is_allowzero and d.flags.size != .c) return false;
+    if (s.flags.address_space != d.flags.address_space) return false;
     if (@as(u32, @bitCast(s.packed_offset)) != @as(u32, @bitCast(d.packed_offset))) return false;
     if (d.flags.alignment != s.flags.alignment) {
         // The alignment may only decrease.
@@ -9120,6 +9169,7 @@ fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     if (s.flags.is_volatile and !d.flags.is_volatile) return false;
     // Read only, a pointer may also allow zero.
     if ((s.flags.is_allowzero or s.flags.size == .c) and !(d.flags.is_allowzero or d.flags.size == .c)) return false;
+    if (s.flags.address_space != d.flags.address_space) return false;
     if (@as(u32, @bitCast(s.packed_offset)) != @as(u32, @bitCast(d.packed_offset))) return false;
     if (s.flags.alignment != d.flags.alignment) {
         // The alignment may only decrease.
@@ -9186,7 +9236,7 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
         if (s.flags.is_const and !d.flags.is_const and !len0) return null;
         if (a.len != 0 and !sema.ptrAlignOk(s, d)) return null;
         if (d.sentinel != .none and !sema.sentinelsMatch(a.sentinel, d.sentinel)) return null;
-        const many_ty = try sema.ptrType(.{ .child = d.child, .sentinel = d.sentinel, .flags = .{ .size = .many, .is_const = d.flags.is_const, .is_volatile = d.flags.is_volatile } });
+        const many_ty = try sema.ptrType(.{ .child = d.child, .sentinel = d.sentinel, .flags = .{ .size = .many, .is_const = d.flags.is_const, .is_volatile = d.flags.is_volatile, .address_space = d.flags.address_space } });
         const ptr = try sema.coercePtrTo(block, inst, many_ty);
         const len: Ref = .fromInterned(try sema.intValue(.usize_type, a.len));
         return try sema.makeSlice(block, dest_ty, ptr, len);
@@ -9394,7 +9444,7 @@ fn coercePtrTo(sema: *Sema, block: *Block, ptr: Ref, ty: Index) CompileError!Ref
             .undef => return .fromInterned(try sema.undefValue(ty)),
             .slice => |sl| {
                 const d = Type.ptrInfo(ip, ty);
-                const many_ty = try sema.ptrType(.{ .child = d.child, .sentinel = d.sentinel, .flags = .{ .size = .many, .is_const = d.flags.is_const, .is_volatile = d.flags.is_volatile, .alignment = d.flags.alignment } });
+                const many_ty = try sema.ptrType(.{ .child = d.child, .sentinel = d.sentinel, .flags = .{ .size = .many, .is_const = d.flags.is_const, .is_volatile = d.flags.is_volatile, .alignment = d.flags.alignment, .address_space = d.flags.address_space } });
                 const p = try sema.coercePtrTo(block, .fromInterned(sl.ptr), many_ty);
                 return .fromInterned(try sema.intern(.{ .slice = .{ .ty = ty, .ptr = p.toInterned().?, .len = sl.len } }));
             },
@@ -9649,6 +9699,7 @@ fn peerPtrs(sema: *Sema, a: Index, b: Index) !?Index {
     if (sa.elem == .noreturn_type) sa.elem = sb.elem;
     if (sb.elem == .noreturn_type) sb.elem = sa.elem;
     if (sa.elem != sb.elem or sa.elem == .noreturn_type) return null;
+    if (sa.p.flags.address_space != sb.p.flags.address_space) return null;
     // Single pointers to one non-array type merge only their qualifiers.
     const single = sa.size == .one and !sa.array;
     if (single != (sb.size == .one and !sb.array)) return null;
@@ -9665,6 +9716,7 @@ fn peerPtrs(sema: *Sema, a: Index, b: Index) !?Index {
             .is_volatile = sa.p.flags.is_volatile or sb.p.flags.is_volatile,
             .is_allowzero = sa.p.flags.is_allowzero or sb.p.flags.is_allowzero,
             .alignment = sema.peerAlignment(sa.p, sb.p) orelse return null,
+            .address_space = sa.p.flags.address_space,
         },
     });
 }
@@ -9694,12 +9746,14 @@ fn peerCPtr(sema: *Sema, a: Index, b: Index) !?Index {
     }.f;
     const child = if (pa.flags.size == .c) pa.child else pb.child;
     if (elem(ip, pa) != child or elem(ip, pb) != child) return null;
+    if (pa.flags.address_space != pb.flags.address_space) return null;
     return try sema.ptrType(.{ .child = child, .flags = .{
         .size = .c,
         .is_const = pa.flags.is_const or pb.flags.is_const,
         .is_volatile = pa.flags.is_volatile or pb.flags.is_volatile,
         .is_allowzero = if (pa.flags.size == .c) pa.flags.is_allowzero else pb.flags.is_allowzero,
         .alignment = sema.peerAlignment(pa, pb) orelse return null,
+        .address_space = pa.flags.address_space,
     } });
 }
 
@@ -11874,13 +11928,14 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
     // A runtime store fails even in a comptime block that drops runtime
     // instructions, as upstream.
     if (block.is_comptime) return sema.failComptimeExpr(block, src);
+    try sema.checkAddressSpace(block, src, info.flags.address_space);
     try sema.validateRuntimeValue(block, operand_src, operand);
     if (!Type.hasRuntimeBits(ip, info.child)) return;
     // The comptime evaluator stores through bit pointers as the walker does.
     if (info.packed_offset.host_size != 0 and sema.bc == null) {
         // Read, modify, and write the host integer.
         const host_ty = try sema.intType(.unsigned, info.packed_offset.host_size * 8);
-        const host_ptr = try sema.addTyOp(block, .bitcast, try sema.ptrType(.{ .child = host_ty, .flags = .{ .is_volatile = info.flags.is_volatile } }), ptr);
+        const host_ptr = try sema.addTyOp(block, .bitcast, try sema.ptrType(.{ .child = host_ty, .flags = .{ .is_volatile = info.flags.is_volatile, .address_space = info.flags.address_space } }), ptr);
         const old = try sema.addTyOp(block, .load, host_ty, host_ptr);
         const new = try sema.packedInsert(block, old, info.packed_offset.bit_offset, operand);
         _ = try sema.addBinOp(block, .store, host_ptr, new);
@@ -11915,13 +11970,14 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
     // Even at comptime, through a runtime pointer.
     if (zero_bit) if (try sema.onePossibleValue(info.child)) |v| return .fromInterned(v);
     try sema.requireRuntimeLoad(block, src);
+    try sema.checkAddressSpace(block, src, info.flags.address_space);
     // Lowering reads a comptime_int at a run-time address as it does at a
     // run-time index (`runtimeElemAccess`).
     if (Type.isComptimeOnly(ip, info.child) and !(sema.bc != null and info.child == .comptime_int_type))
         return sema.fail(block, src, "unable to load comptime-only type '{f}' at runtime", .{sema.fmtType(info.child)});
     if (info.packed_offset.host_size != 0 and sema.bc == null) {
         const host_ty = try sema.intType(.unsigned, info.packed_offset.host_size * 8);
-        const host_ptr = try sema.addTyOp(block, .bitcast, try sema.ptrType(.{ .child = host_ty, .flags = .{ .is_const = true, .is_volatile = info.flags.is_volatile } }), ptr);
+        const host_ptr = try sema.addTyOp(block, .bitcast, try sema.ptrType(.{ .child = host_ty, .flags = .{ .is_const = true, .is_volatile = info.flags.is_volatile, .address_space = info.flags.address_space } }), ptr);
         return sema.packedExtract(block, try sema.addTyOp(block, .load, host_ty, host_ptr), info.packed_offset.bit_offset, info.child);
     }
     return sema.addTyOp(block, .load, info.child, ptr);
@@ -13302,7 +13358,7 @@ fn elemValue(sema: *Sema, val: Index, index: u64) Allocator.Error!Index {
         },
         .ptr_type => if (index == 0) blk: {
             const p = ip.keyPayload(.ptr_type, ty);
-            break :blk try sema.ptrType(.{ .child = p.child, .sentinel = p.sentinel, .flags = .{ .size = .many, .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
+            break :blk try sema.ptrType(.{ .child = p.child, .sentinel = p.sentinel, .flags = .{ .size = .many, .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .address_space = p.flags.address_space } });
         } else .usize_type,
         else => unreachable,
     };
@@ -13347,7 +13403,7 @@ fn elemPtrType(sema: *Sema, p: InternPool.PtrType, elem_ty: Index, index: ?u64) 
         }
         flag = @intCast(std.math.log2_int(u64, a) + 1);
     }
-    return sema.ptrType(.{ .child = elem_ty, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .alignment = flag } });
+    return sema.ptrType(.{ .child = elem_ty, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .address_space = p.flags.address_space, .alignment = flag } });
 }
 
 fn ptrElemPtrVal(sema: *Sema, ptr: Index, i: u64) !Index {
@@ -13376,7 +13432,7 @@ fn ptrElemPtrKey(sema: *Sema, ptr: Index, i: u64, want_ty: bool) !struct { key: 
         if (Type.abiSize(ip, elem_ty) == 0 and key.byte_offset == 0 and key.base == .uav) {
             const arr_ty = ip.typeOf(key.base.uav.val);
             if (ip.keyTag(arr_ty) == .array_type and Type.childType(ip, arr_ty) == elem_ty) {
-                const arr_ptr = try sema.intern(.{ .ptr = .{ .ty = try sema.ptrType(.{ .child = arr_ty, .flags = .{ .is_const = p.flags.is_const } }), .base = key.base } });
+                const arr_ptr = try sema.intern(.{ .ptr = .{ .ty = try sema.ptrType(.{ .child = arr_ty, .flags = .{ .is_const = p.flags.is_const, .address_space = p.flags.address_space } }), .base = key.base } });
                 break :blk .{ .{ .elem = .{ .base = arr_ptr, .index = i } }, 0 };
             }
         }
@@ -13589,6 +13645,7 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
                         .is_const = p.flags.is_const,
                         .is_volatile = p.flags.is_volatile,
                         .alignment = p.flags.alignment,
+                        .address_space = p.flags.address_space,
                     } }));
                 },
                 // An anonymous struct type is a tuple type with names; its
@@ -14100,12 +14157,10 @@ fn zirReifyPointer(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) 
         try sema.validateAlign(block, sema.callArgSrc(src, false, 1), a);
         alignment = @intCast(std.math.log2_int(u64, a) + 1);
     }
-    const addr_space = ip.keyPayload(.opt, try sema.structFieldValue(attrs, "addrspace")).val;
-    if (addr_space != .none) {
-        const as_ty = ip.typeOf(addr_space);
-        if (!std.mem.eql(u8, ip.stringSlice(ip.structInfo(as_ty).field_names[sema.enumTagIndex(addr_space).?]), "generic"))
-            return sema.failUnsupported(block, src, "address spaces");
-    }
+    // As upstream, any address space; runtime uses of one zap cannot
+    // lower fail where they happen (`addInst`).
+    const as_val = ip.keyPayload(.opt, try sema.structFieldValue(attrs, "addrspace")).val;
+    const address_space: std.lang.AddressSpace = if (as_val == .none) .generic else std.meta.stringToEnum(std.lang.AddressSpace, sema.enumTagName(as_val).?).?;
     const sentinel_opt = try sema.resolveConstValue(block, src, try sema.coerce(block, try sema.optType(elem_ty), sema.resolveInst(extra.sentinel), src), "pointer sentinel value must be comptime-known");
     if (sema.isUndef(sentinel_opt)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
     const sentinel = ip.keyPayload(.opt, sentinel_opt).val;
@@ -14120,6 +14175,7 @@ fn zirReifyPointer(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) 
             .is_volatile = try sema.structFieldValue(attrs, "volatile") == .bool_true,
             .is_allowzero = try sema.structFieldValue(attrs, "allowzero") == .bool_true,
             .alignment = alignment,
+            .address_space = address_space,
         },
     }));
 }
@@ -14195,8 +14251,8 @@ fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Ir.Inst.Tag)
     // The IR form: `dest` gives the length, `source` is a pointer.
     if (d.len == .none) {
         const dp = Type.ptrInfo(ip, sema.typeOf(dest));
-        const slice_ty = try sema.ptrType(.{ .child = d.elem, .flags = .{ .size = .slice, .is_const = dp.flags.is_const, .is_volatile = dp.flags.is_volatile } });
-        dest = try sema.makeSlice(block, slice_ty, try sema.coercePtrTo(block, dest, try sema.ptrType(.{ .child = d.elem, .flags = .{ .size = .many, .is_volatile = dp.flags.is_volatile } })), len);
+        const slice_ty = try sema.ptrType(.{ .child = d.elem, .flags = .{ .size = .slice, .is_const = dp.flags.is_const, .is_volatile = dp.flags.is_volatile, .address_space = dp.flags.address_space } });
+        dest = try sema.makeSlice(block, slice_ty, try sema.coercePtrTo(block, dest, try sema.ptrType(.{ .child = d.elem, .flags = .{ .size = .many, .is_volatile = dp.flags.is_volatile, .address_space = dp.flags.address_space } })), len);
     }
     source = try sema.memRawPtr(block, source);
 
@@ -14273,7 +14329,7 @@ fn zirMemset(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
 
 fn elemValueType(sema: *Sema, slice_ty: Index) !Index {
     const p = Type.ptrInfo(sema.ip, slice_ty);
-    return sema.ptrType(.{ .child = p.child, .sentinel = p.sentinel, .flags = .{ .size = .many, .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .is_allowzero = p.flags.is_allowzero, .alignment = p.flags.alignment } });
+    return sema.ptrType(.{ .child = p.child, .sentinel = p.sentinel, .flags = .{ .size = .many, .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .is_allowzero = p.flags.is_allowzero, .alignment = p.flags.alignment, .address_space = p.flags.address_space } });
 }
 
 /// `@bitSizeOf(ty)`, as upstream's `Type.bitSize`: the bits of its
@@ -14378,7 +14434,7 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
         const alignment: u6 = if (p.flags.alignment != 0) p.flags.alignment else @intCast(std.math.log2_int(u64, Type.abiAlignment(ip, p.child)) + 1);
         const result_ty = try sema.ptrType(.{
             .child = field_ty,
-            .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .alignment = alignment },
+            .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .address_space = p.flags.address_space, .alignment = alignment },
             .packed_offset = .{
                 .host_size = if (p.packed_offset.host_size != 0) p.packed_offset.host_size else @intCast(Type.abiSize(ip, p.child)),
                 .bit_offset = bit_offset,
@@ -14427,6 +14483,7 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
             .is_const = p.flags.is_const,
             .is_volatile = p.flags.is_volatile,
             .alignment = try sema.fieldPtrAlignment(block, src, p.flags.alignment, p.child, i),
+            .address_space = p.flags.address_space,
         } });
         entry.* = .{ .ptr_ty = ptr_ty, .field_ty = field_ty, .index = i, .result = result_ty };
         break :miss result_ty;
@@ -14568,7 +14625,7 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
                 try sema.requireRuntime(block, src);
                 const result_ty = try sema.ptrType(.{
                     .child = .bool_type,
-                    .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .alignment = if (p.flags.alignment != 0) p.flags.alignment else @intCast(std.math.log2_int(u64, Type.abiAlignment(ip, child)) + 1) },
+                    .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .address_space = p.flags.address_space, .alignment = if (p.flags.alignment != 0) p.flags.alignment else @intCast(std.math.log2_int(u64, Type.abiAlignment(ip, child)) + 1) },
                     .packed_offset = .{
                         .host_size = @intCast(Type.abiSize(ip, child)),
                         .bit_offset = @intCast(ip.intValue(u64, sema.resolveValue(index).?).?),
@@ -14799,6 +14856,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     var len: Ref = .none;
     var is_const = Type.ptrInfo(ip, ptr_ty).flags.is_const;
     var ptr_align = Type.ptrInfo(ip, ptr_ty).flags.alignment;
+    var address_space = Type.ptrInfo(ip, ptr_ty).flags.address_space;
     var is_allowzero = false;
     var elem_ty: Index = undefined;
     // The sentinel of the sliced object, which the result keeps when it
@@ -14812,12 +14870,13 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             elem_ty = a.child;
             ptr_sentinel = a.sentinel;
             len = .fromInterned(try sema.intValue(.usize_type, a.len));
-            base = try sema.coercePtrTo(block, ptr, try sema.ptrType(.{ .child = a.child, .flags = .{ .size = .many, .is_const = is_const } }));
+            base = try sema.coercePtrTo(block, ptr, try sema.ptrType(.{ .child = a.child, .flags = .{ .size = .many, .is_const = is_const, .address_space = address_space } }));
         },
         .ptr_type => |cp| {
             var obj = try sema.analyzeLoad(block, src, ptr);
             is_const = cp.flags.is_const;
             ptr_align = cp.flags.alignment;
+            address_space = cp.flags.address_space;
             // The result is allowzero if the sliced pointer is, as upstream.
             is_allowzero = cp.flags.is_allowzero and cp.flags.size != .c;
             switch (cp.flags.size) {
@@ -14826,13 +14885,13 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                     if (ip.keyTag(cp.child) != .array_type) {
                         len_of = .single;
                         const arr_ty = try sema.intern(.{ .array_type = .{ .len = 1, .child = cp.child } });
-                        obj = try sema.coerce(block, try sema.ptrType(.{ .child = arr_ty, .flags = .{ .is_const = cp.flags.is_const, .is_volatile = cp.flags.is_volatile, .alignment = cp.flags.alignment } }), obj, src);
+                        obj = try sema.coerce(block, try sema.ptrType(.{ .child = arr_ty, .flags = .{ .is_const = cp.flags.is_const, .is_volatile = cp.flags.is_volatile, .alignment = cp.flags.alignment, .address_space = cp.flags.address_space } }), obj, src);
                     }
                     const a = ip.keyPayload(.array_type, Type.ptrInfo(ip, sema.typeOf(obj)).child);
                     elem_ty = a.child;
                     ptr_sentinel = a.sentinel;
                     len = .fromInterned(try sema.intValue(.usize_type, a.len));
-                    base = try sema.coercePtrTo(block, obj, try sema.ptrType(.{ .child = a.child, .flags = .{ .size = .many, .is_const = is_const } }));
+                    base = try sema.coercePtrTo(block, obj, try sema.ptrType(.{ .child = a.child, .flags = .{ .size = .many, .is_const = is_const, .address_space = address_space } }));
                 },
                 .slice => {
                     len_of = .slice;
@@ -14840,7 +14899,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                     ptr_sentinel = cp.sentinel;
                     len = try sema.sliceLen(block, obj);
                     base = try sema.slicePtr(block, obj);
-                    if (cp.sentinel != .none) base = try sema.coercePtrTo(block, base, try sema.ptrType(.{ .child = elem_ty, .flags = .{ .size = .many, .is_const = is_const } }));
+                    if (cp.sentinel != .none) base = try sema.coercePtrTo(block, base, try sema.ptrType(.{ .child = elem_ty, .flags = .{ .size = .many, .is_const = is_const, .address_space = address_space } }));
                 },
                 .many, .c => {
                     if (cp.flags.size == .c) if (try sema.resolveDefinedValue(block, src, obj)) |v| {
@@ -14851,7 +14910,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                     ptr_sentinel = cp.sentinel;
                     many_obj = obj;
                     base = obj;
-                    if (cp.sentinel != .none) base = try sema.coercePtrTo(block, base, try sema.ptrType(.{ .child = elem_ty, .flags = .{ .size = .many, .is_const = is_const } }));
+                    if (cp.sentinel != .none) base = try sema.coercePtrTo(block, base, try sema.ptrType(.{ .child = elem_ty, .flags = .{ .size = .many, .is_const = is_const, .address_space = address_space } }));
                 },
             }
         },
@@ -14991,7 +15050,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     if (slice_sentinel != .none) try sema.checkSliceSentinel(block, src, new_ptr, start_val, end_val, start, end, elem_ty, slice_sentinel);
     if (known_len) |n| {
         const array_ty = try sema.intern(.{ .array_type = .{ .len = n, .child = elem_ty, .sentinel = result_sentinel } });
-        const result_ty = try sema.ptrType(.{ .child = array_ty, .flags = .{ .is_const = is_const, .is_allowzero = is_allowzero, .alignment = result_align } });
+        const result_ty = try sema.ptrType(.{ .child = array_ty, .flags = .{ .is_const = is_const, .is_allowzero = is_allowzero, .alignment = result_align, .address_space = address_space } });
         if (sema.resolveValue(new_ptr)) |pv| {
             if (sema.isUndef(pv)) return .fromInterned(try sema.undefValue(result_ty));
             const k = ip.keyPayload(.ptr, pv);
@@ -15007,7 +15066,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         }
         return sema.addTyOp(block, .bitcast, result_ty, new_ptr);
     }
-    const slice_ty = try sema.ptrType(.{ .child = elem_ty, .sentinel = result_sentinel, .flags = .{ .size = .slice, .is_const = is_const, .is_allowzero = is_allowzero, .alignment = result_align } });
+    const slice_ty = try sema.ptrType(.{ .child = elem_ty, .sentinel = result_sentinel, .flags = .{ .size = .slice, .is_const = is_const, .is_allowzero = is_allowzero, .alignment = result_align, .address_space = address_space } });
     const new_len = if (start_zero) end else try sema.analyzeArithmetic(block, src, .subwrap, end, start);
     return sema.makeSlice(block, slice_ty, new_ptr, new_len);
 }
@@ -15289,7 +15348,7 @@ fn errUnionPayloadPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, set: bool)
     const p = Type.ptrInfo(ip, sema.typeOf(ptr));
     if (Type.class(ip, p.child) != .error_union) return sema.fail(block, src, "expected error union type, found '{f}'", .{sema.fmtType(p.child)});
     const payload_ty = ip.keyPayload(.error_union_type, p.child).payload_type;
-    const result_ty = try sema.ptrType(.{ .child = payload_ty, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
+    const result_ty = try sema.ptrType(.{ .child = payload_ty, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .address_space = p.flags.address_space } });
     // Setting run-time memory (a global `var`) is a run-time store.
     if (sema.resolveValue(ptr)) |pv| if (try sema.comptimePtrRoot(pv) != .int and (!set or try sema.comptimePtrRoot(pv) == .comptime_alloc)) {
         if (set) try sema.comptimeStore(block, src, pv, try sema.intern(.{ .error_union = .{ .ty = p.child, .val = .{ .payload = try sema.undefValue(payload_ty) } } }));
@@ -17683,6 +17742,30 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
             try sema.zcu.addNote(sema.file, sema.callArgSrc(src, false, 0).span(tree), "'{f}' has alignment '{d}'", .{ sema.fmtType(src_ty), sa });
             try sema.zcu.addNote(sema.file, src.span(tree), "'{f}' has alignment '{d}'", .{ sema.fmtType(dest_ty), da });
             try sema.zcu.addNote(sema.file, src.span(tree), "use @alignCast to assert pointer alignment", .{});
+            return err;
+        }
+    }
+    if (s.flags.address_space != d.flags.address_space) {
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        if (!flags.addrspace_cast) {
+            const err = sema.fail(block, src, "{s} changes pointer address space", .{flags.needResultTypeBuiltinName()});
+            try sema.zcu.addNote(sema.file, src.castOperand().span(tree), "'{f}' has address space '{t}'", .{ sema.fmtType(src_ty), s.flags.address_space });
+            try sema.zcu.addNote(sema.file, src.span(tree), "'{f}' has address space '{t}'", .{ sema.fmtType(dest_ty), d.flags.address_space });
+            try sema.zcu.addNote(sema.file, src.span(tree), "use @addrSpaceCast to cast pointer address space", .{});
+            return err;
+        }
+        // As `target_util.addrSpaceCastIsValid` for x86_64.
+        const x86 = struct {
+            fn f(as: std.lang.AddressSpace) bool {
+                return switch (as) {
+                    .generic, .gs, .fs, .ss => true,
+                    else => false,
+                };
+            }
+        }.f;
+        if (!x86(s.flags.address_space) or !x86(d.flags.address_space)) {
+            const err = sema.fail(block, src, "invalid address space cast", .{});
+            try sema.zcu.addNote(sema.file, src.castOperand().span(tree), "address space '{t}' is not compatible with address space '{t}'", .{ s.flags.address_space, d.flags.address_space });
             return err;
         }
     }

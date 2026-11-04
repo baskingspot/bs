@@ -443,7 +443,10 @@ pub const PtrType = struct {
         is_allowzero: bool = false,
         /// 0 means the child's natural alignment, otherwise log2(align) + 1.
         alignment: u6 = 0,
-        _: u21 = 0,
+        /// `generic` is 0, so a pointer without an address space keeps the
+        /// key, encoding and stable hash it had before this field.
+        address_space: std.lang.AddressSpace = .generic,
+        _: u16 = 0,
     };
 
     pub const PackedOffset = packed struct(u32) {
