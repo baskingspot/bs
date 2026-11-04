@@ -1716,7 +1716,11 @@ code. Rules are matched per tag (a comptime index of the table):
   folded;
 - identities: `x + 0`, `x * 1`, `x & ~0`, `x | x`, `x - x`, `x ^ x`,
   `x * 0`, and the like;
-- compares of a value with itself, and of an unsigned value with 0;
+- compares of a value with itself, of an unsigned value with 0, and of
+  two enum constants (which are interned once, so they compare by
+  identity);
+- the pointer and length of a slice built from them (Wyhash's 8-byte
+  input, `mem.swap`'s `4 == 4`);
 - reads of constants: a field of a constant struct, an element of a
   constant array at a constant index, a constant slice's `ptr` and
   `len`, a constant optional's or error union's state and payload, and
@@ -1725,7 +1729,9 @@ code. Rules are matched per tag (a comptime index of the table):
 
 A `cond_br` whose condition became constant keeps only the taken body
 (`Ssa.build`), in a block of its own, so a panic that now always runs
-stays a cold block. Integers over 64 bits and floats are left alone (a
+stays a cold block; so does a `switch_br` whose operand became constant
+and whose items are all constants (`Ssa.takenCase`), and the walk then
+visits only that body. Integers over 64 bits and floats are left alone (a
 float compare of `x` with itself is false for NaN). Most matches come
 from inlining, where a parameter becomes the caller's constant.
 

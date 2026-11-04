@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "4\n18446744073709551612\n60\n18446744073709551614\n18446744073709551613\n18446744073709551615\n2\n52\n18446744073709551615\n1\n0\n1\n1\n0\n2\n300\n1\n0\n5\n1\n9\n34\n6\n"
+//! stdout: "4\n18446744073709551612\n60\n18446744073709551614\n18446744073709551613\n18446744073709551615\n2\n52\n18446744073709551615\n1\n0\n1\n1\n0\n2\n300\n1\n0\n5\n1\n9\n34\n6\n66\n98\n81\n8\n143\n"
 //! The rewrite rules (docs/slop/architecture.md, "Rewrite rules") fold what
 //! inlining makes constant: each helper below is inlined into `main` with
 //! constant arguments, and the folded results must be what the operations
@@ -94,6 +94,33 @@ fn checked(a: u32, b: u32) u32 {
     return a - b + a * b;
 }
 
+const Case = enum { lower, upper };
+
+fn digit(d: u8, case: Case) u8 {
+    const base: u8 = if (case == .upper) 'A' else 'a';
+    return if (d < 10) '0' + d else base + d - 10;
+}
+
+fn lenOf(p: [*]const u8, n: usize) usize {
+    const s = p[0..n];
+    return s.len * 10 + @intFromBool(s.ptr == p);
+}
+
+fn pick(c: Case) u64 {
+    return switch (c) {
+        .lower => 7,
+        .upper => 8,
+    };
+}
+
+fn code(n: u8) u64 {
+    return switch (n) {
+        1, 2 => 11,
+        3 => 33,
+        else => 99,
+    };
+}
+
 pub fn main() void {
     out(add8(250, 10));
     outI(shr(-16, 2));
@@ -118,5 +145,10 @@ pub fn main() void {
     out(checked(3, 2) + 2);
     out(choose(flag));
     out(sel(flag));
+    out(digit(11, .upper));
+    out(digit(11, .lower));
+    out(lenOf("abcdefgh", 8));
+    out(pick(.upper));
+    out(code(2) + code(3) + code(200));
     rt.exit(0);
 }

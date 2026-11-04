@@ -6,8 +6,9 @@
 //! overflow check) resolves in the same walk. A matched instruction is
 //! replaced by an operand or a constant in every later use; it keeps its
 //! place in the IR, and the dead-code pass drops it once nothing uses it.
-//! A `cond_br` whose condition became constant is left for `Ssa.build`,
-//! which builds only the taken body.
+//! A `cond_br` whose condition became constant, or a `switch_br` whose
+//! operand did, is left for `Ssa.build`, which builds only the taken body
+//! (`Ssa.takenCase`).
 //!
 //! Inlining makes most of the opportunities: a callee's parameters become
 //! the caller's constants. Runs on the Sema thread, which may intern.
@@ -265,6 +266,10 @@ const Walker = struct {
                 try w.body(else_body);
             },
             .switch_br => {
+                if (Ssa.takenCase(ir, data)) |taken| {
+                    w.stats.branches += 1;
+                    return w.body(taken);
+                }
                 const x = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
                 var i = x.end;
                 for (0..x.data.cases_len) |_| {
@@ -287,7 +292,8 @@ const Walker = struct {
         const ip = w.ip;
         switch (tag) {
             .struct_field_val => return try w.overflowField(data) orelse w.constField(data) orelse w.initField(data),
-            .slice_ptr, .slice_len, .optional_payload, .unwrap_errunion_payload => return w.constPart(tag, data.ty_op.operand),
+            .slice_ptr, .slice_len => return w.constPart(tag, data.ty_op.operand) orelse w.slicePart(tag, data.ty_op.operand),
+            .optional_payload, .unwrap_errunion_payload => return w.constPart(tag, data.ty_op.operand),
             .is_null, .is_non_null, .is_err, .is_non_err => return w.constPart(tag, data.un_op),
             .array_elem_val => return w.constElem(data.bin_op.lhs, data.bin_op.rhs),
             .load => return w.loadConst(data.ty_op.operand),
@@ -311,8 +317,17 @@ const Walker = struct {
         const class = Type.class(ip, ty);
         switch (class) {
             .int, .bool => {},
+            // Two enum constants compare by identity: values are interned
+            // once (an inlined `case == .upper`).
+            .@"enum" => if (!unary and rhs != lhs) {
+                const l = lhs.toInterned() orelse return null;
+                const r = rhs.toInterned() orelse return null;
+                if (tag != .cmp_eq and tag != .cmp_neq) return null;
+                if (ip.keyTag(l) != .enum_tag or ip.keyTag(r) != .enum_tag) return null;
+                return .fromInterned(if ((l == r) == (tag == .cmp_eq)) .bool_true else .bool_false);
+            },
             // Only `x == x` and the like.
-            .pointer, .@"enum" => if (unary or rhs != lhs) return null,
+            .pointer => if (unary or rhs != lhs) return null,
             else => return null,
         }
         if (class == .int and Type.intInfo(ip, ty).bits > 64) return null;
@@ -479,6 +494,16 @@ const Walker = struct {
             .repeated_elem => |e| .fromInterned(e),
             .bytes => |b| try w.intern(arr.child, ip.stringSlice(b)[k]),
         };
+    }
+
+    /// The pointer or length of a slice built from them (Wyhash's 8-byte
+    /// input, `mem.swap`'s `4 == 4`).
+    fn slicePart(w: *Walker, tag: Tag, operand: Inst.Ref) ?Inst.Ref {
+        const ir = w.ir;
+        const i = @backingInt(operand.toIndex() orelse return null);
+        if (ir.instructions.items(.tag)[i] != .slice) return null;
+        const bin = ir.extraData(Ir.Bin, ir.instructions.items(.data)[i].ty_pl.payload).data;
+        return if (tag == .slice_ptr) bin.lhs else bin.rhs;
     }
 
     /// What `tag` reads of a constant slice, optional, or error union.

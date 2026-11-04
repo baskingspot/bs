@@ -1236,6 +1236,25 @@ pub fn holdSlot(f: *Func, gpa: Allocator, inst: Inst.Index, off: i32, class: Slo
     h[i] = .{ .end = end, .off = off, .class = class.index };
 }
 
+/// The body a `switch_br` takes, if its operand and every item are
+/// constants. Constants are interned once, so an item matches by identity.
+pub fn takenCase(ir: *const Ir, data: Inst.Data) ?[]const Inst.Index {
+    if (data.pl_op.operand.toInterned() == null) return null;
+    const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
+    var i = extra.end;
+    var taken: ?[]const Inst.Index = null;
+    for (0..extra.data.cases_len) |_| {
+        const items_len = ir.extra[i];
+        const body_len = ir.extra[i + 1];
+        for (ir.refSlice(i + 2, items_len)) |item| {
+            if (item.toInterned() == null) return null;
+            if (item == data.pl_op.operand and taken == null) taken = ir.bodySlice(i + 2 + items_len, body_len);
+        }
+        i += 2 + items_len + body_len;
+    }
+    return taken orelse ir.bodySlice(i, extra.data.else_body_len);
+}
+
 const Builder = struct {
     f: *Func,
     gpa: Allocator,
@@ -1335,6 +1354,12 @@ const Builder = struct {
                 try b.body(else_body);
             },
             .switch_br => {
+                // An operand the rewrite rules made constant: only the
+                // taken case has code, as for `cond_br`.
+                if (takenCase(ir, data)) |taken| {
+                    try b.open(try b.newBlock());
+                    return b.body(taken);
+                }
                 const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
                 const cases_start: u32 = @intCast(b.f.extra.items.len);
                 for (0..extra.data.cases_len) |_| try b.f.extra.append(b.gpa, try b.newBlock());
