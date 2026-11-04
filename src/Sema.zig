@@ -2132,8 +2132,13 @@ fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames
         diag.nextName(source, last.span.start + at + @as(u32, @intCast(name.len)))
     else
         null else null;
-    last.hint = diag.migrationHint(try std.fmt.allocPrint(sema.arena, "{f}", .{sema.fmtType(ty)}), name, next);
+    const container = try std.fmt.allocPrint(sema.arena, "{f}", .{sema.fmtType(ty)});
+    last.hint = diag.migrationHint(container, name, next);
     try sema.attachCandidates(names.items, name, which == .fields);
+    // A mechanical rewrite of the removed name, where the error points at it.
+    if (last.file == sema.file and last.span.end <= source.len) if (diag.nameIn(source[last.span.start..last.span.end], name)) |at| {
+        if (try diag.migrationFix(zcu.arena.allocator(), container, name, source, last.span.start + at)) |fix| last.fix = fix;
+    };
 }
 
 /// Gives the most recent error the names among `names` close to `name`,

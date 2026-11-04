@@ -478,6 +478,39 @@ const migrations = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "array_list.Aligned", "init", "std.ArrayList is unmanaged: `var list: std.ArrayList(T) = .empty;`, then pass the allocator to each call (`list.append(gpa, x)`, `list.deinit(gpa)`); std.array_list.Managed keeps the old API; to print into a byte buffer, use std.Io.Writer.Allocating" },
     .{ "array_list.Aligned", "writer", "std.ArrayList has no writer: print into `var aw: std.Io.Writer.Allocating = .init(gpa);` through `&aw.writer`, then take the bytes with `aw.written()` or `try aw.toOwnedSlice()`" },
     .{ "@typeInfo(lang.Type).@\"union\".tag_type.?", "*", "@typeInfo's tags are lowercase: .int, .float, .pointer, .comptime_int, .@\"struct\", .@\"enum\", .@\"union\", .@\"fn\"" },
+    .{ "Build.ExecutableOptions", "*", "since 0.15, a compile step takes its source, target and optimize mode from a module: `.root_module = b.createModule(.{ .root_source_file = b.path(\"src/main.zig\"), .target = target, .optimize = optimize })`; link_libc, strip and the other code options moved to the module too" },
+    .{ "Build.TestOptions", "*", "since 0.15, a compile step takes its source, target and optimize mode from a module: `.root_module = b.createModule(.{ .root_source_file = b.path(\"src/main.zig\"), .target = target, .optimize = optimize })`; link_libc, strip and the other code options moved to the module too" },
+    .{ "Build.LibraryOptions", "*", "since 0.15, a compile step takes its source, target and optimize mode from a module: `.root_module = b.createModule(.{ .root_source_file = b.path(\"src/main.zig\"), .target = target, .optimize = optimize })`; link_libc, strip and the other code options moved to the module too" },
+    .{ "Build.ObjectOptions", "*", "since 0.15, a compile step takes its source, target and optimize mode from a module: `.root_module = b.createModule(.{ .root_source_file = b.path(\"src/main.zig\"), .target = target, .optimize = optimize })`; link_libc, strip and the other code options moved to the module too" },
+    .{ "Build.Step.Compile", "linkLibC", "moved to the compile step's module: `exe.root_module.link_libc = true;` (or `.link_libc = true` in createModule)" },
+    .{ "Build.Step.Compile", "linkLibCpp", "moved to the compile step's module: `exe.root_module.link_libcpp = true;` (or `.link_libcpp = true` in createModule)" },
+    .{ "Build.Step.Compile", "linkSystemLibrary", "moved to the compile step's module: `exe.root_module.linkSystemLibrary(name, .{})`" },
+    .{ "Build.Step.Compile", "linkSystemLibrary2", "moved to the compile step's module: `exe.root_module.linkSystemLibrary(name, .{})`" },
+    .{ "Build.Step.Compile", "linkFramework", "moved to the compile step's module: `exe.root_module.linkFramework(name, .{})`" },
+    .{ "Build.Step.Compile", "linkLibrary", "moved to the compile step's module: `exe.root_module.linkLibrary(lib)`" },
+    .{ "Build.Step.Compile", "addIncludePath", "moved to the compile step's module: `exe.root_module.addIncludePath(b.path(\"include\"))`" },
+    .{ "Build.Step.Compile", "addSystemIncludePath", "moved to the compile step's module: `exe.root_module.addSystemIncludePath(path)`" },
+    .{ "Build.Step.Compile", "addLibraryPath", "moved to the compile step's module: `exe.root_module.addLibraryPath(path)`" },
+    .{ "Build.Step.Compile", "addRPath", "moved to the compile step's module: `exe.root_module.addRPath(path)`" },
+    .{ "Build.Step.Compile", "addCSourceFile", "moved to the compile step's module: `exe.root_module.addCSourceFile(.{ .file = b.path(\"src/x.c\"), .flags = &.{} })`" },
+    .{ "Build.Step.Compile", "addCSourceFiles", "moved to the compile step's module: `exe.root_module.addCSourceFiles(.{ .files = &.{\"x.c\"}, .flags = &.{} })`" },
+    .{ "Build.Step.Compile", "addObjectFile", "moved to the compile step's module: `exe.root_module.addObjectFile(path)`" },
+    .{ "Build.Step.Compile", "addAssemblyFile", "moved to the compile step's module: `exe.root_module.addAssemblyFile(path)`" },
+    .{ "Build.Step.Compile", "defineCMacro", "moved to the compile step's module: `exe.root_module.addCMacro(name, value)`" },
+    .{ "Build.Step.Compile", "addModule", "moved to the compile step's module: `exe.root_module.addImport(name, module)`" },
+    .{ "Build.Step.Compile", "addAnonymousModule", "moved to the compile step's module: `exe.root_module.addAnonymousImport(name, .{ .root_source_file = b.path(path) })`" },
+    .{ "Build.Step.Compile", "addOptions", "moved to the compile step's module: `exe.root_module.addOptions(name, options)`" },
+    .{ "Build.Step.Compile", "install", "use `b.installArtifact(exe)`" },
+    .{ "Build.Step.Compile", "run", "use `b.addRunArtifact(exe)`" },
+    .{ "Build.Step.Compile", "setTarget", "the target is the module's: `.target = b.standardTargetOptions(.{})` in createModule" },
+    .{ "Build.Step.Compile", "setBuildMode", "the optimize mode is the module's: `.optimize = b.standardOptimizeOption(.{})` in createModule" },
+    .{ "Build", "addStaticLibrary", "since 0.15, use `b.addLibrary(.{ .linkage = .static, .name = name, .root_module = b.createModule(.{ ... }) })`" },
+    .{ "Build", "addSharedLibrary", "since 0.15, use `b.addLibrary(.{ .linkage = .dynamic, .name = name, .root_module = b.createModule(.{ ... }) })`" },
+    .{ "Build", "args", "since 0.17, a run step takes the arguments after `--` with `run_cmd.addPassthruArgs();`" },
+    .{ "Build", "standardReleaseOptions", "use `b.standardOptimizeOption(.{})`" },
+    .{ "Build.Module.CreateOptions", "source_file", "renamed root_source_file: `.root_source_file = b.path(\"src/main.zig\")`" },
+    .{ "Build.LazyPath", "path", "a path in the package is `b.path(\"src/main.zig\")`" },
+    .{ "std", "build", "std.build is now std.Build, and its Builder is std.Build itself: `pub fn build(b: *std.Build) void`" },
     .{ "lang.Type", "*", "@typeInfo's fields are lowercase: .int, .pointer, .@\"struct\", .@\"enum\", .@\"union\", .@\"fn\"" },
 };
 
@@ -504,6 +537,47 @@ pub fn migrationHint(container: []const u8, name: []const u8, next: ?[]const u8)
         const key = std.fmt.bufPrint(&buf, "{s}\x00{s}", .{ c, n }) catch return null;
         if (migration_map.get(key)) |h| return h;
     };
+    return null;
+}
+
+/// Mechanical rewrites of a name 0.17 removed, where the replacement means
+/// the same: the container as zap prints it without generic arguments, the
+/// name, the text that must follow the name in the source (replaced with
+/// it), and the replacement.
+const migration_fixes = [_]struct { []const u8, []const u8, []const u8, []const u8 }{
+    .{ "Build.Step.Compile", "addModule", "", "root_module.addImport" },
+    .{ "Build.Step.Compile", "addIncludePath", "", "root_module.addIncludePath" },
+    .{ "Build.Step.Compile", "addSystemIncludePath", "", "root_module.addSystemIncludePath" },
+    .{ "Build.Step.Compile", "addLibraryPath", "", "root_module.addLibraryPath" },
+    .{ "Build.Step.Compile", "addRPath", "", "root_module.addRPath" },
+    .{ "Build.Step.Compile", "addObjectFile", "", "root_module.addObjectFile" },
+    .{ "Build.Step.Compile", "addAssemblyFile", "", "root_module.addAssemblyFile" },
+    .{ "Build.Step.Compile", "addCSourceFile", "", "root_module.addCSourceFile" },
+    .{ "Build.Step.Compile", "addCSourceFiles", "", "root_module.addCSourceFiles" },
+    .{ "Build.Step.Compile", "addConfigHeader", "", "root_module.addConfigHeader" },
+    .{ "Build.Step.Compile", "addOptions", "", "root_module.addOptions" },
+    .{ "Build.Step.Compile", "linkLibrary", "", "root_module.linkLibrary" },
+    .{ "Build.Step.Compile", "defineCMacro", "", "root_module.addCMacro" },
+    .{ "Build.Step.Compile", "linkLibC", "()", "root_module.link_libc = true" },
+    .{ "Build.Step.Compile", "linkLibCpp", "()", "root_module.link_libcpp = true" },
+    .{ "Build", "standardReleaseOptions", "()", "standardOptimizeOption(.{})" },
+    .{ "std", "build", ".Builder", "Build" },
+    .{ "debug", "warn", "", "print" },
+    .{ "mem", "trimRight", "", "trimEnd" },
+    .{ "mem", "trimLeft", "", "trimStart" },
+};
+
+/// The fix for a failed lookup of `name` in `container` (as
+/// `migrationHint` takes it) at byte `start` of `source`, from
+/// `migration_fixes`.
+pub fn migrationFix(arena: std.mem.Allocator, container: []const u8, name: []const u8, source: []const u8, start: u32) !?RawFix {
+    const base = container[0 .. std.mem.indexOfScalar(u8, container, '(') orelse container.len];
+    for (migration_fixes) |f| {
+        if (!std.mem.eql(u8, f[0], base) or !std.mem.eql(u8, f[1], name)) continue;
+        const end = start + name.len;
+        if (!std.mem.startsWith(u8, source[end..], f[2])) return null;
+        return try rawFix(arena, .exact, &.{.{ .start = start, .end = @intCast(end + f[2].len), .text = f[3] }});
+    }
     return null;
 }
 
