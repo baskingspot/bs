@@ -57,6 +57,9 @@ errors: std.AutoArrayHashMapUnmanaged(InternPool.String, void) = .empty,
 /// External symbols the code reads the address of (`@extern`), by name,
 /// and whether every reference is weak. `finish` writes each one's slot.
 externs: std.StringArrayHashMapUnmanaged(bool) = .empty,
+/// For each bound slot at offset 0, its `externAddrKey` and where the
+/// slot binds the symbol, for `link` (`lowerExternSlots`).
+aliases: std.ArrayList(Alias) = .empty,
 /// Whether code reads `error_name_table`.
 uses_error_names: bool = false,
 /// Compile errors that codegen reports (unsupported constructs), rendered
@@ -415,6 +418,7 @@ pub fn deinit(emit: *Emit) void {
     emit.navs.deinit(gpa);
     emit.errors.deinit(gpa);
     emit.externs.deinit(gpa);
+    emit.aliases.deinit(gpa);
     emit.imports.deinit(gpa);
     emit.copies.deinit(gpa);
     emit.exports.deinit(gpa);
@@ -1218,7 +1222,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     // Source paths are as the compiler opened them, relative to the cwd.
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
-    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none, .local_symbols = emit.input_symbols, .input_sections = emit.input_sections };
+    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none, .local_symbols = emit.input_symbols, .input_sections = emit.input_sections, .aliases = emit.aliases.items };
     const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
     defer emit.gpa.free(imports);
     for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls };
@@ -1340,10 +1344,22 @@ pub fn useErrorNames(emit: *Emit) !void {
     try emit.addRef(.error_names);
 }
 
-fn externSlotKey(name: []const u8) SymbolKey {
+pub fn externSlotKey(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
     return .fromName(std.fmt.bufPrint(&buf, "extern.{s}", .{name}) catch name);
 }
+
+/// The key a constant that a function reads relocates the address of
+/// external symbol `name` to (`externDataTarget`): bound at link time,
+/// through an alias, to where `name`'s slot binds it. The constant's
+/// content then does not depend on where the symbol is defined.
+pub fn externAddrKey(name: []const u8) SymbolKey {
+    var buf: [256]u8 = undefined;
+    return .fromName(std.fmt.bufPrint(&buf, "extaddr.{s}", .{name}) catch name);
+}
+
+/// An `externAddrKey` and its slot's binding.
+pub const Alias = Elf.Alias;
 
 /// The `useExtern` name of the slot for the address `off` bytes into
 /// symbol `name`.
@@ -1472,6 +1488,7 @@ fn lowerExternSlots(emit: *Emit) !bool {
         }
         const bytes = try arena.alloc(u8, 8);
         @memset(bytes, 0);
+        if (target) |t| if (off == 0) try emit.aliases.append(emit.gpa, .{ .key = externAddrKey(name), .target = t.key, .addend = t.addend });
         const targets: []const SymbolKey = if (target) |t| try arena.dupe(SymbolKey, &.{t.key}) else &.{};
         const relocs: []const Atom.Reloc = if (target) |t| try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, std.math.cast(i32, t.addend + off) orelse return error.Overflow)}) else &.{};
         try emit.addAtom(.{
@@ -1510,27 +1527,25 @@ fn externTarget(emit: *Emit, name: []const u8, weak: bool) !?ExternTarget {
     return .{ .key = key orelse return null };
 }
 
-/// The relocation target of the address of external symbol `name` in a
-/// declaration's data, which `lowerNavs` writes once analysis is done. A
-/// lazy build keeps the data it does not lower, bound as the last build
-/// bound it (its inputs are those, and it falls back if the exports
-/// change); one with link inputs that lowers such data goes eager
-/// (`inputs_deferred`). Constants that functions read are written while
-/// analysis runs, before the exports and inputs are complete, and are not
-/// supported yet.
+/// The relocation target of the address of external symbol `name` in
+/// data. A declaration's data, which `lowerNavs` writes once analysis is
+/// done, binds it directly: a lazy build keeps the data it does not
+/// lower, bound as the last build bound it (its inputs are those, and it
+/// falls back if the exports change); one with link inputs that lowers
+/// such data goes eager (`inputs_deferred`). Constants that functions
+/// read are written while analysis runs, before the exports and inputs
+/// are complete: they relocate to `externAddrKey`, which the link binds
+/// as the symbol's slot.
 pub fn externDataTarget(emit: *Emit, name: []const u8) !ExternTarget {
-    const fail = switch (emit.owner) {
+    const late = switch (emit.owner) {
         .unit => |u| u != .nav_val,
         .content, .input => true,
         .link => emit.analyzing,
     };
-    if (fail) {
-        const reader = if (emit.owner == .unit and emit.owner.unit == .func)
-            try print.navNameAlloc(&emit.zcu.ip, emit.zcu.ip.keyPayload(.func, emit.owner.unit.func).owner_nav, emit.allocator())
-        else
-            "a function";
-        try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap does not support the address of extern symbol {s} in a constant that {s} reads yet; take the address at run time instead", .{ name, reader });
-        return error.CodegenFail;
+    if (late) {
+        _ = try emit.requestCompilerRtExport(name);
+        _ = try emit.useExtern(name, false);
+        return .{ .key = externAddrKey(name) };
     }
     if (emit.inputs_deferred) {
         // Any key: the build does not link.

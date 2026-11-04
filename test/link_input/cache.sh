@@ -86,6 +86,15 @@ grep -qF -- "!" out || fail "the Zig edit did not take"
 sed -i 's/.msg = c_msg + 7/.msg = c_msg + 6/' main.zig
 build "a declaration's data takes the address of a link input's symbol" "extern data  data 30 30"
 eager "the extern data's offset changed"
+# A constant that a function reads, whose addresses the link binds as
+# the slots (aliases of `extaddr` keys): a lazy edit relinks with them.
+sed -i 's/{ c_msg, c_msg + 7 }/{ c_msg, c_msg + 8 }/' main.zig
+build "inputs changed, first $work/main.zig" "extern data ata 26 111 2"
+lazy "a function's constant changed"
+# A new external symbol in one: the externs changed, so it is eager.
+sed -i 's/fn_table\[i\](1) });/fn_table[i](1) });\n    std.debug.print("more {d}\\n", .{([_]*const fn () callconv(.c) c_int{@extern(*const fn () callconv(.c) c_int, .{ .name = "unused_member_fn" })})[i]()});/' main.zig
+build "external symbols changed" "more 1"
+eager "a function's constant names a new symbol"
 # Without ZAP_CACHE_VERIFY, whose full build writes a new base, a lazy
 # edit build leaves a log; a relink from it links what the edit build did.
 sed -i 's/{d} {d} {d}!\\n"/{d} {d} {d}?\\n"/' main.zig
@@ -114,6 +123,28 @@ touch libc.c
 build "not relinking" "X=21 twice=42"
 sed -i 's/return 2 \* x/return 3 * x/' libc_main.zig
 build "inputs changed, first $work/libc_main.zig" "X=21 twice=63"
+
+# -lc alone: a lazy edit links from the manifest by number, and binds a
+# function's constant's glibc addresses as the slots.
+cat >lc.zig <<'ZIG'
+const std = @import("std");
+extern fn strlen([*:0]const u8) usize;
+extern fn abs(c_int) c_int;
+pub fn main() void {
+    var i: usize = 0;
+    _ = &i;
+    const fns = [_]*const fn (c_int) callconv(.c) c_int{&abs};
+    std.debug.print("lc {d} {d}\n", .{ fns[i](-3), strlen("four") });
+}
+ZIG
+args="build-exe -lc lc.zig"
+rm -rf local
+build "" "lc 3 4"
+rm main
+build "no input changed; relinked" "lc 3 4"
+sed -i 's/fns\[i\](-3)/fns[i](-5)/' lc.zig
+build "inputs changed, first $work/lc.zig" "lc 5 4"
+lazy "-lc: a function's constant changed"
 
 # -lc with objects: a C object's glibc imports, its reference to a Zig
 # export, and the executable's copies of glibc data that GCC's -fPIE reads

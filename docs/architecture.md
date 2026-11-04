@@ -3020,11 +3020,26 @@ value model:
   data naming an extern symbol builds again eagerly
   (`Emit.inputs_deferred`). An undefined symbol in data is a compile
   error (`lowerNav` records it as `Emit.failed`).
-- Not yet: such an address in a constant that a function reads (a
-  content atom CodeGen writes while analysis runs, before the exports
-  and inputs are complete, and which an eager build loads with the
-  function): `[unsupported]`, "take the address at run time instead". A
-  data-only reference to a symbol that only an unpulled archive member
+- A constant that a function reads is a content atom CodeGen writes
+  while analysis runs, before the exports and inputs are complete. Its
+  address of extern symbol `name` relocates to `Emit.externAddrKey`
+  (`extaddr.<name>`) with the pointer's offset as addend, so its content
+  does not depend on where `name` is defined and the pack stores it as
+  is; the unit requests `name`'s slot (`useExtern`), so the `ext`
+  reference carries it through replay, archive pulls and
+  `checkLinkInputs`. The link binds each such key through an alias
+  (`Elf.Options.aliases`, `Symbols.aliases`) to what `name`'s slot binds
+  it to: the target and addend of the slot atom's one relocation. A
+  build gets them from `lowerExternSlots`, a relink from the manifest
+  (`Incremental.externAliases`) from the slot atoms it links, for each
+  reference name whose `extaddr` key the manifest numbers, so a manifest
+  without any costs one lookup per name. A new extern symbol in such a
+  constant changes the externs, which a lazy build falls back on.
+- `&f` of an `extern fn` at comptime is the pointer `@extern` gives (an
+  `extern_func` uav base); in data it binds as extern data does, so an
+  input object's definition counts (it went to `exportTarget`, which
+  saw only exports, compiler_rt and libraries).
+- A data-only reference to a symbol that only an unpulled archive member
   defines is "undefined symbol": archive members are pulled from the
   slots' names during analysis. Weak and thread-local extern data at
   comptime keep their old error.
@@ -3045,8 +3060,10 @@ value model:
   reference to its target" test, keyed and numbered, byte for byte.
 - Checks: test/run/extern_data.zig (exports as the definitions, two
   chained edits, upstream the same), test/link_input/main.zig (C
-  objects' definitions, in code and data), and cache.sh's edit that
-  moves the definitions in their section.
+  objects' definitions, in code, declarations' data and functions'
+  constants), and cache.sh's edits: one that moves the definitions in
+  their section, a lazy edit of a function's constant, one that adds a
+  new symbol to it (eager), and -lc alone, relinked by number.
 
 ### compiler_rt (decided 2026-11-02)
 

@@ -4190,7 +4190,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
 const PtrTarget = struct {
     key: SymbolKey,
     off: i64,
-    /// For data an external symbol defines (`extern_var`), its name, and
+    /// For an external symbol (`extern_var`, `extern_func`), its name, and
     /// `key` is unset: the caller binds it, through a slot in code
     /// (`constLoc`) or directly in data (`lowerValue`).
     ext: ?InternPool.String = null,
@@ -4242,15 +4242,9 @@ pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
             if (Type.class(ip, nav.ty) == .@"fn" and ip.keyTag(nav.val) == .func) break :blk .{ .key = try emit.funcKey(nav.val), .off = 0 };
             break :blk .{ .key = try emit.navKey(n), .off = 0 };
         },
-        .uav => |u| if (ip.keyTag(u.val) == .extern_func) blk: {
-            // An extern function's address in data: the export's symbol.
-            const name = ip.stringSlice(ip.keyPayload(.extern_func, u.val).name);
-            const key = try emit.exportTarget(name) orelse {
-                try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
-                return error.CodegenFail;
-            };
-            break :blk .{ .key = key, .off = 0 };
-        } else if (ip.keyTag(u.val) == .extern_var)
+        .uav => |u| if (ip.keyTag(u.val) == .extern_func)
+            .{ .key = undefined, .off = 0, .ext = ip.keyPayload(.extern_func, u.val).name }
+        else if (ip.keyTag(u.val) == .extern_var)
             .{ .key = undefined, .off = 0, .ext = ip.keyPayload(.extern_var, u.val).name }
         else
         // A local constant declared `align(n)` keeps its alignment.

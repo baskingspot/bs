@@ -443,10 +443,17 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             return inc.noLink("import '{s}' has no symbol number", .{imp.name});
     }
 
+    const aliases = try externAliases(arena, m, &input, in.numbered);
+    const numbered_aliases = try arena.alloc(Elf.NumberedAlias, aliases.len);
+    for (numbered_aliases, aliases) |*n, a| n.* = .{
+        .symbol = m.symbol(@backingInt(a.key)).?,
+        .target = m.symbol(@backingInt(a.target)) orelse return inc.noLink("an extern slot's target has no symbol number", .{}),
+    };
     var diag: Elf.Diagnostic = .{};
     const options: Elf.Options = .{
         .entry = if (inc.output == .exe) @fromBackingInt(m.entry) else null,
         .dynamic = if (exe_dyn) &dynamic else null,
+        .aliases = aliases,
         .symbols = .{
             .atoms = in.numbered,
             .targets = in.targets,
@@ -456,6 +463,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             .entry = m.entry_symbol,
             .len = m.symbolLen(),
             .dynamic_imports = dynamic_imports,
+            .aliases = numbered_aliases,
         },
         .diag = &diag,
         .comp_dir = cwd,
@@ -519,6 +527,33 @@ fn loadShared(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io
         };
     }
     return shared;
+}
+
+/// The aliases of the `Emit.externAddrKey`s the linked atoms reference,
+/// each bound as its symbol's slot is (`Emit.lowerExternSlots`): the
+/// slot atom's one relocation's target and addend. Every name the
+/// manifest's references hold is a candidate; a manifest with no such
+/// key costs one lookup per name. A key only unlinked atoms still use
+/// may have no linked slot, and gets no alias.
+fn externAliases(arena: Allocator, m: *const Manifest, pack_atoms: *const Pack.LinkAtoms, numbered: []const Elf.NumberedAtom) ![]const Emit.Alias {
+    var slots: std.AutoArrayHashMapUnmanaged(u32, Atom.SymbolKey) = .empty;
+    for (0..m.refNameCount()) |i| {
+        const name = m.refName(@intCast(i));
+        if (m.symbol(@backingInt(Emit.externAddrKey(name))) == null) continue;
+        const slot = m.symbol(@backingInt(Emit.externSlotKey(name))) orelse continue;
+        try slots.put(arena, slot, Emit.externAddrKey(name));
+    }
+    if (slots.count() == 0) return &.{};
+    var aliases: std.ArrayList(Emit.Alias) = try .initCapacity(arena, slots.count());
+    for (numbered, 0..) |na, i| {
+        const key = slots.get(na.symbol) orelse continue;
+        const a = pack_atoms.atom(i);
+        // An undefined weak symbol's slot has no relocation; nothing
+        // strong refers to it through `extaddr`.
+        if (a.relocs.len == 0) continue;
+        aliases.appendAssumeCapacity(.{ .key = key, .target = a.targets[a.relocs[0].info.target], .addend = a.relocs[0].addend });
+    }
+    return aliases.items;
 }
 
 /// `linkFrom` for an executable with object and archive inputs, whose
@@ -661,6 +696,7 @@ fn linkWithInputs(
         .stack_size = inc.stack_size,
         .local_symbols = converted.symbols,
         .input_sections = converted.sections,
+        .aliases = try externAliases(arena, m, pack_atoms, numbered),
         .dynamic = if (glibc != null) &dynamic else null,
     };
     Elf.linkInput(gpa, io, out_dir, sub_path, WithInputs{ .pack = pack_atoms, .extra = extra.items }, options) catch |err| switch (err) {

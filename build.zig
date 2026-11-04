@@ -902,7 +902,7 @@ fn buildWebWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
 fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const host = b.graph.host.result;
     if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return;
-    const expect = "44 108 12 gamma hello from C 0 4 9 copied\nthread 712\n712 4 23\nextern data data 30 30\n";
+    const expect = "44 108 12 gamma hello from C 0 4 9 copied\nthread 712\n712 4 23\nextern data data 30 30\nextern data data 23 111 1\n";
     const zig = upstreamZig(b);
     const cc = b.findProgram(.{ .names = &.{"cc"} });
     // `zig cc`'s Debug objects call ubsan_rt and the stack protector.

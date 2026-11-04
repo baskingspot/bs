@@ -20,6 +20,7 @@ extern var c_common_var: c_int;
 const c_msg: [*c]const u8 = @extern([*c]const u8, .{ .name = "c_msg" });
 const c_arr2: *c_int = &@extern(*[4]c_int, .{ .name = "c_arr" })[2];
 var c_refs: struct { msg: [*c]const u8, arr: *c_int } = .{ .msg = c_msg + 7, .arr = c_arr2 };
+const fn_table = [_]*const fn (c_int) callconv(.c) c_int{&a1};
 export fn zig_add(a: c_int, b: c_int) c_int {
     return a + b;
 }
@@ -39,4 +40,11 @@ pub fn main() void {
     t.join();
     std.debug.print("{d} {d} {d}\n", .{ c_tls(), c_tls_ie2(), a1(5) });
     std.debug.print("{s} {s} {d} {d}\n", .{ c_msg, c_refs.msg, c_arr2.*, c_refs.arr.* });
+    // Constants a function reads, which CodeGen writes while analysis
+    // runs: the link binds their addresses as the symbols' slots.
+    var i: usize = 0;
+    _ = &i;
+    const strs = [_][*c]const u8{ c_msg, c_msg + 7 };
+    const fns = [_]*const fn (c_int) callconv(.c) c_int{ &a1, &c_call_zig };
+    std.debug.print("{s} {s} {d} {d} {d}\n", .{ strs[i], strs[i + 1], fns[i](5), fns[i + 1](3), fn_table[i](1) });
 }

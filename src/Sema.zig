@@ -6474,6 +6474,9 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     if (nav.linkage == .@"extern") {
         // At comptime, a pointer the link binds; the declaration is its site.
         if (block.is_comptime and !nav.is_threadlocal and isExternVar(sema.ip, nav)) return sema.externVarPtr(ptr_ty, nav.name, nav.key);
+        // An extern function's, as `@extern` gives it.
+        if (block.is_comptime and sema.ip.keyTag(nav.val) == .extern_func)
+            return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = nav.val, .orig_ty = ptr_ty } } } }));
         if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: zap resolves extern symbols at link time", .{});
         return sema.addInst(block, .{ .tag = if (nav.is_threadlocal) .extern_tls else .extern_ptr, .data = .{ .ty_pl = .{ .ty = ptr_ty, .payload = @backingInt(nav.name) } } });
     }
