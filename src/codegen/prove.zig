@@ -8,12 +8,13 @@
 //! a constant and nothing else.
 //!
 //! Values are compared by what they are, not by instruction: a load of a
-//! variable (an alloc only loaded and stored) is the value its last store
-//! stored when that store is known, else the variable at a version that
-//! changes at each store, at each loop entry (a later store in the loop
-//! reaches the loop's start), and after each merge of paths that stored
-//! it. A `*const` alloc is the value stored to it, and `slice_len` of
-//! equal slices are equal.
+//! variable (an alloc only loaded and stored) is, where it runs, the value
+//! its last store stored when that store is known, else the variable at a
+//! version that changes at each store, at each loop entry (a later store
+//! in the loop reaches the loop's start), and after each merge of paths
+//! that stored it. A `*const` alloc is the value stored to it, and
+//! `slice_len` of equal slices are equal. `ZAP_PROVE=off` turns the pass
+//! off. Each rule says next to it why it holds.
 //!
 //! Proven: compares (bounds checks `i < len`, `start <= end`) from facts on
 //! the same values or constant bounds, and the overflow checks of
@@ -48,8 +49,16 @@ pub const Scratch = struct {
     facts: std.ArrayList(Fact) = .empty,
     exits: std.ArrayList(Exit) = .empty,
     exit_facts: std.ArrayList(Fact) = .empty,
-    /// Variables stored, in walk order, so a merge can forget them.
+    /// Variables and `*const` allocs stored, in walk order, so a merge
+    /// can forget them.
     stored: std.ArrayList(u32) = .empty,
+    /// Per load: its term, taken when the walk reaches it (`Term.none`
+    /// before), since what the variable holds changes after.
+    loads: std.ArrayList(Term) = .empty,
+    /// Additions known not to wrap: overflow operations whose check the
+    /// walk passed (`markChecked`), and the value reads `wrap` made
+    /// wrapping operations.
+    exact: std.DynamicBitSetUnmanaged = .{},
 
     pub fn deinit(s: *Scratch, gpa: Allocator) void {
         s.kind.deinit(gpa);
@@ -59,6 +68,8 @@ pub const Scratch = struct {
         s.exits.deinit(gpa);
         s.exit_facts.deinit(gpa);
         s.stored.deinit(gpa);
+        s.loads.deinit(gpa);
+        s.exact.deinit(gpa);
     }
 };
 
@@ -66,9 +77,13 @@ pub const Scratch = struct {
 /// `classify` counts).
 const Kind = enum(u8) { other, variable, constant, stored_once };
 
-/// A value, compared exactly.
+/// A value, compared exactly. Every term stands for one mathematical
+/// integer at the point it is used: a constant for its value (`konst` a
+/// `u64`, `neg` a negative `i64`, whatever the type it was written in), an
+/// instruction for the value it computed (IR values never change), a
+/// variable at a version for what it held then.
 const Term = struct {
-    tag: enum(u8) { none, konst, inst, variable, interned, len_inst, len_variable, len_interned },
+    tag: enum(u8) { none, konst, neg, inst, variable, interned, len_inst, len_variable, len_interned },
     a: u32 = 0,
     b: u32 = 0,
 
@@ -82,15 +97,29 @@ const Term = struct {
         return .{ .tag = .konst, .a = @truncate(v), .b = @truncate(v >> 32) };
     }
 
-    fn bits(t: Term) u64 {
-        return @as(u64, t.b) << 32 | t.a;
+    fn neg(v: i64) Term {
+        const u: u64 = @bitCast(v);
+        return .{ .tag = .neg, .a = @truncate(u), .b = @truncate(u >> 32) };
+    }
+
+    fn isConst(t: Term) bool {
+        return t.tag == .konst or t.tag == .neg;
+    }
+
+    /// A constant's value.
+    fn value(t: Term) i128 {
+        const u = @as(u64, t.b) << 32 | t.a;
+        return if (t.tag == .neg) @as(i64, @bitCast(u)) else u;
     }
 };
 
-/// `a op b` holds, with the operands' signedness.
+/// `a op b` holds between the operands' values, compared as integers of
+/// `signed` and `bits` (the compare's operand type), which bound a value
+/// that only the fact bounds.
 const Fact = struct {
     op: Op,
     signed: bool,
+    bits: u8,
     a: Term,
     b: Term,
 };
@@ -119,6 +148,10 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *Scratch) Al
     scratch.exits.clearRetainingCapacity();
     scratch.exit_facts.clearRetainingCapacity();
     scratch.stored.clearRetainingCapacity();
+    try scratch.loads.resize(gpa, n);
+    @memset(scratch.loads.items, .none);
+    try scratch.exact.resize(gpa, n, false);
+    scratch.exact.unsetAll();
     classify(ip, ir, scratch.kind.items);
     var w: Walker = .{ .gpa = gpa, .ip = ip, .ir = ir, .s = scratch };
     try w.body(ir.mainBody());
@@ -126,7 +159,10 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *Scratch) Al
 }
 
 /// Which allocs are variables (only loaded from and stored to, never
-/// volatile) and which `*const` allocs hold one value.
+/// volatile) and which `*const` allocs hold one value. Any other use of
+/// an alloc (an address taken, passed, cast, or stored) makes it `other`,
+/// so nothing but its own loads and stores can read or write a variable:
+/// no call, store through a pointer, or other thread reaches it.
 fn classify(ip: *const InternPool, ir: *const Ir, kind: []Kind) void {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
@@ -190,7 +226,9 @@ const Walker = struct {
     }
 
     /// Forgets the values of the variables stored since `from` in
-    /// `stored`: paths that stored them merge here.
+    /// `stored`: paths that stored them merge here, so after this point a
+    /// variable may hold any of their values, and gets a version no fact
+    /// names.
     fn merge(w: *Walker, from: usize) void {
         const s = w.s;
         if (s.stored.items.len == from) return;
@@ -216,19 +254,31 @@ const Walker = struct {
                 .constant => s.value.items[ii] = .none,
                 .other, .stored_once => {},
             },
+            // A store changes only its own alloc: a variable's address
+            // goes nowhere else (`classify`), so no other store, call, or
+            // write through a pointer reaches it. The variable's next
+            // version holds the stored value; an undefined value is
+            // unknown, since two undefined values need not be equal.
             .store => {
                 const p = data.bin_op.lhs.toIndex() orelse return;
                 const pi = @backingInt(p);
+                const v: Term = if (w.isUndef(data.bin_op.rhs)) .none else w.term(data.bin_op.rhs);
                 switch (s.kind.items[pi]) {
                     .variable => {
                         s.version.items[pi] = w.tick();
-                        s.value.items[pi] = w.term(data.bin_op.rhs);
+                        s.value.items[pi] = v;
                         try s.stored.append(w.gpa, pi);
                     },
-                    .constant => s.value.items[pi] = w.term(data.bin_op.rhs),
+                    // Stored on one path, read after paths merge, it holds
+                    // nothing known there (`merge`).
+                    .constant => {
+                        s.value.items[pi] = v;
+                        try s.stored.append(w.gpa, pi);
+                    },
                     .other, .stored_once => {},
                 }
             },
+            .load => s.loads.items[ii] = w.loadTerm(inst, data),
             .block => {
                 const x = ir.extraData(Ir.Block, data.ty_pl.payload);
                 const insts = ir.bodySlice(x.end, x.data.body_len);
@@ -239,14 +289,28 @@ const Walker = struct {
                 try w.body(insts);
                 const exit = s.exits.pop().?;
                 s.facts.shrinkRetainingCapacity(depth);
-                // Straight-line code that ends in its only `br` merges
-                // nothing.
-                if (exit.count != 1 or insts.len == 0 or
-                    ir.instructions.items(.tag)[@backingInt(insts[insts.len - 1])] != .br) w.merge(from);
-                // What held at every exit holds after the block.
-                if (exit.count != 0) try s.facts.appendSlice(w.gpa, s.exit_facts.items[exit.start..][0..exit.len]);
+                // A body whose only exit is the `br` to this block that ends
+                // it ran every store at its top level before leaving, so
+                // they hold after it; stores in nested bodies were merged
+                // there. Any other shape merges.
+                const last: ?Inst.Index = if (insts.len == 0) null else insts[insts.len - 1];
+                const straight = exit.count == 1 and last != null and
+                    ir.instructions.items(.tag)[@backingInt(last.?)] == .br and
+                    ir.instructions.items(.data)[@backingInt(last.?)].br.block_inst == inst;
+                if (!straight) w.merge(from);
+                // What held at every `br` to the block holds after it,
+                // when those are its only exits: its body ends in an
+                // instruction that does not continue.
+                const closed = last != null and ir.typeOfIndex(last.?, w.ip) == .noreturn_type;
+                if (exit.count != 0 and closed) try s.facts.appendSlice(w.gpa, s.exit_facts.items[exit.start..][0..exit.len]);
                 s.exit_facts.shrinkRetainingCapacity(exit_start);
             },
+            // The body is walked once. Facts found in it are dropped at its
+            // end: they held in one iteration, not before the next. Loads
+            // in it of variables not stored since its entry are the
+            // variable at the entry stamp, which no fact from before the
+            // loop names, since a later store reaches them through the
+            // back edge.
             .loop => {
                 const x = ir.extraData(Ir.Block, data.ty_pl.payload);
                 const depth = s.facts.items.len;
@@ -267,7 +331,13 @@ const Walker = struct {
                 // Only Sema's own branches: those the user wrote are
                 // `-ffuzz` coverage points.
                 const check = cond.toIndex() != null and @as(u32, @bitCast(x.data.cover)) == 0 and (isCold(ir, then_body) or isCold(ir, else_body));
+                // A check is decided only when a fact proves which side
+                // runs, and only toward the side that passes: the failing
+                // side never becomes the only one. Otherwise each side
+                // learns its condition (and the negation), and the stores
+                // of the then side are forgotten before the else side.
                 if (check) w.stats.checks += 1;
+                if (check) w.markChecked(cond, isCold(ir, then_body));
                 if (check) if (w.decide(cond)) |c| if (!isCold(ir, if (c) then_body else else_body)) {
                     // The check passes (never decided toward its failure).
                     w.stats.proven += 1;
@@ -306,7 +376,10 @@ const Walker = struct {
     }
 
     /// A `br` to `block`: the facts that hold here hold after it, if they
-    /// hold at its other `br`s too.
+    /// hold at its other `br`s too. Facts name values, not places (a
+    /// variable's term has its version), so one that held at every `br`
+    /// still holds after the block; a store after it makes a new version
+    /// no fact names.
     fn exitTo(w: *Walker, block: Inst.Index) Allocator.Error!void {
         const s = w.s;
         var k = s.exits.items.len;
@@ -347,33 +420,23 @@ const Walker = struct {
     fn term(w: *const Walker, r: Inst.Ref) Term {
         const ip = w.ip;
         if (r.toInterned()) |v| {
-            if (ip.keyTag(v) == .int) if (ip.intValue(u64, v) orelse (if (ip.intValue(i64, v)) |x| @as(u64, @bitCast(x)) else null)) |k| return .konst(k);
+            if (ip.keyTag(v) == .int) {
+                if (ip.intValue(u64, v)) |k| return .konst(k);
+                if (ip.intValue(i64, v)) |k| return .neg(k);
+            }
             return .{ .tag = .interned, .a = @backingInt(v) };
         }
         const ir = w.ir;
-        const s = w.s;
         const i = r.toIndex().?;
         const data = ir.instructions.items(.data)[@backingInt(i)];
         switch (ir.instructions.items(.tag)[@backingInt(i)]) {
-            .load => if (data.ty_op.operand.toIndex()) |p| {
-                const pi = @backingInt(p);
-                switch (s.kind.items[pi]) {
-                    .variable => {
-                        const ver = s.version.items[pi];
-                        // Stored in this iteration of the innermost loop.
-                        if (ver > w.stamp) {
-                            const v = s.value.items[pi];
-                            return if (v.tag != .none) v else .{ .tag = .variable, .a = pi, .b = ver };
-                        }
-                        return .{ .tag = .variable, .a = pi, .b = w.stamp };
-                    },
-                    .constant => {
-                        const v = s.value.items[pi];
-                        if (v.tag != .none) return v;
-                    },
-                    .other, .stored_once => {},
-                }
+            // As the walk found it there (`loadTerm`).
+            .load => {
+                const t = w.s.loads.items[@backingInt(i)];
+                if (t.tag != .none) return t;
             },
+            // Equal slices have equal lengths; a `slice` has the length
+            // it was made with.
             .slice_len => {
                 const t = w.term(data.ty_op.operand);
                 // The length a `slice` was made with (`asBytes`, `@ptrCast`).
@@ -386,7 +449,8 @@ const Walker = struct {
                     else => .{ .tag = .inst, .a = @backingInt(i) },
                 };
             },
-            // A widening cast keeps the value.
+            // A widening cast of the same signedness keeps the value (terms
+            // are values, not bit patterns; `Fact.bits` bounds them).
             .intcast => if (w.intInfo(data.ty_op.operand)) |from| if (w.intInfo(r)) |to| {
                 if (from.signedness == to.signedness and from.bits <= to.bits) return w.term(data.ty_op.operand);
             },
@@ -395,26 +459,67 @@ const Walker = struct {
         return .{ .tag = .inst, .a = @backingInt(i) };
     }
 
-    /// For `x + 1` (an addition that wraps, or an overflow operation's
-    /// value), `x`.
-    fn plusOne(w: *const Walker, t: Term) ?Term {
+    /// The term of load `inst` where the walk reaches it: a variable's
+    /// value is its last store's when that store is in this iteration of
+    /// the innermost loop and known; else the variable at its version,
+    /// which changes at every store and merge; else, if no store reached
+    /// it since the innermost loop's entry, the variable at that entry
+    /// (`stamp`), since a store later in the loop reaches the entry through
+    /// the back edge. A `*const` alloc holds the value stored, while no
+    /// merge forgot it.
+    fn loadTerm(w: *const Walker, inst: Inst.Index, data: Inst.Data) Term {
+        const s = w.s;
+        if (data.ty_op.operand.toIndex()) |p| {
+            const pi = @backingInt(p);
+            switch (s.kind.items[pi]) {
+                .variable => {
+                    const ver = s.version.items[pi];
+                    if (ver > w.stamp) {
+                        const v = s.value.items[pi];
+                        return if (v.tag != .none) v else .{ .tag = .variable, .a = pi, .b = ver };
+                    }
+                    return .{ .tag = .variable, .a = pi, .b = w.stamp };
+                },
+                .constant => {
+                    const v = s.value.items[pi];
+                    if (v.tag != .none) return v;
+                },
+                .other, .stored_once => {},
+            }
+        }
+        return .{ .tag = .inst, .a = @backingInt(inst) };
+    }
+
+    fn isUndef(w: *const Walker, r: Inst.Ref) bool {
+        const v = r.toInterned() orelse return false;
+        return w.ip.keyTag(v) == .undef;
+    }
+
+    /// For `x + 1`, `x`. With `exact`, only an addition that cannot have
+    /// wrapped: an overflow operation's value, which is read only after
+    /// its check passed (or without safety, where overflow is illegal), or
+    /// one `wrap` made from such. Without, also `+%`: `x + 1 <= y` from
+    /// `x < y` needs no more, since `x < y <= max` keeps `x + 1` exact.
+    fn plusOne(w: *const Walker, t: Term, exact: bool) ?Term {
         if (t.tag != .inst) return null;
         const ir = w.ir;
         const data = ir.instructions.items(.data)[t.a];
         const bin: Ir.Bin = switch (ir.instructions.items(.tag)[t.a]) {
-            .add_wrap => .{ .lhs = data.bin_op.lhs, .rhs = data.bin_op.rhs },
+            .add_wrap => if (exact and !w.s.exact.isSet(t.a)) return null else .{ .lhs = data.bin_op.lhs, .rhs = data.bin_op.rhs },
             .struct_field_val => blk: {
                 const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
                 const op = sf.operand.toIndex() orelse return null;
                 if (sf.index != 0 or ir.instructions.items(.tag)[@backingInt(op)] != .add_with_overflow) return null;
+                // `@addWithOverflow(x, 1)[0]` without a check wraps.
+                if (exact and !w.s.exact.isSet(@backingInt(op))) return null;
                 break :blk ir.extraData(Ir.Bin, ir.instructions.items(.data)[@backingInt(op)].ty_pl.payload).data;
             },
             else => return null,
         };
         const l = w.term(bin.lhs);
         const r = w.term(bin.rhs);
-        if (r.tag == .konst and r.bits() == 1) return l;
-        if (l.tag == .konst and l.bits() == 1) return r;
+        if (r.isConst() and r.value() == 1) return l;
+        if (l.isConst() and l.value() == 1) return r;
         return null;
     }
 
@@ -426,7 +531,9 @@ const Walker = struct {
         return if (info.bits <= 64 and info.bits > 0) info else null;
     }
 
-    /// Records what holds where `cond` is `truth`.
+    /// Records what holds where `cond` is `truth`: `!a` is `a` false, `a
+    /// and b` true is both true, `a or b` false is both false, and a
+    /// compare of integers is its fact, or the negation.
     fn assume(w: *Walker, cond: Inst.Ref, truth: bool) Allocator.Error!void {
         const i = cond.toIndex() orelse return;
         const ir = w.ir;
@@ -441,14 +548,36 @@ const Walker = struct {
                 try w.assume(data.bin_op.lhs, false);
                 try w.assume(data.bin_op.rhs, false);
             },
+            // A compare of undefined values decides nothing.
             .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => |tag| {
                 const info = w.intInfo(data.bin_op.lhs) orelse return;
-                var f = fact(tag, w.term(data.bin_op.lhs), w.term(data.bin_op.rhs), info.signedness == .signed);
+                if (w.isUndef(data.bin_op.lhs) or w.isUndef(data.bin_op.rhs)) return;
+                var f = fact(tag, w.term(data.bin_op.lhs), w.term(data.bin_op.rhs), info);
                 if (!truth) f = negate(f);
                 try w.s.facts.append(w.gpa, f);
             },
             else => {},
         }
+    }
+
+    /// A check whose failing side (the then side if `then_cold`) is where
+    /// an overflow operation overflowed: past it, the operation's value
+    /// did not wrap.
+    fn markChecked(w: *Walker, cond: Inst.Ref, then_cold: bool) void {
+        const ir = w.ir;
+        const i = cond.toIndex() orelse return;
+        switch (ir.instructions.items(.tag)[@backingInt(i)]) {
+            .cmp_eq, .cmp_neq, .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte => {},
+            else => return,
+        }
+        const bit = ir.instructions.items(.data)[@backingInt(i)].bin_op.lhs.toIndex() orelse return;
+        if (ir.instructions.items(.tag)[@backingInt(bit)] != .struct_field_val) return;
+        const sf = ir.extraData(Ir.StructField, ir.instructions.items(.data)[@backingInt(bit)].ty_pl.payload).data;
+        if (sf.index != 1) return;
+        const op = sf.operand.toIndex() orelse return;
+        if (ir.instructions.items(.tag)[@backingInt(op)] != .add_with_overflow) return;
+        const true_if_ovf = Ssa.ovfBitCmp(ir, w.ip, i, @backingInt(bit)) orelse return;
+        if (true_if_ovf == then_cold) w.s.exact.set(@backingInt(op));
     }
 
     /// An overflow operation proven not to overflow: its value field,
@@ -467,6 +596,7 @@ const Walker = struct {
             else => .mul_wrap,
         };
         ir.instructions.items(.data)[next] = .{ .bin_op = .{ .lhs = bin.lhs, .rhs = bin.rhs } };
+        w.s.exact.set(next);
     }
 
     /// Whether the facts decide condition `cond`.
@@ -491,7 +621,8 @@ const Walker = struct {
                         return null;
                     };
                 };
-                return w.proves(fact(tag, w.term(lhs), w.term(rhs), info.signedness == .signed), info);
+                if (w.isUndef(lhs) or w.isUndef(rhs)) return null;
+                return w.proves(fact(tag, w.term(lhs), w.term(rhs), info), info);
             },
             else => return null,
         }
@@ -513,6 +644,9 @@ const Walker = struct {
         const ra = w.range(a, info);
         const rb = w.range(b, info);
         const lim = limits(info);
+        // The exact result's bounds, from the operands' (in i128, which
+        // holds any sum, difference, or product of 64-bit values but the
+        // largest products, which `mul` rejects), within the type's.
         switch (tag) {
             .add_with_overflow => {
                 if (ra.hi + rb.hi <= lim.hi and ra.lo + rb.lo >= lim.lo) return true;
@@ -520,11 +654,12 @@ const Walker = struct {
             },
             .sub_with_overflow => {
                 if (ra.lo - rb.hi >= lim.lo and ra.hi - rb.lo <= lim.hi) return true;
-                // `a - b` with `b <= a`.
-                if (!signed and w.holds(.{ .op = .le, .signed = false, .a = b, .b = a })) return true;
+                // `a - b` with `b <= a`, unsigned: `0 <= a - b <= a`.
+                if (!signed and w.holds(.{ .op = .le, .signed = false, .bits = @intCast(info.bits), .a = b, .b = a })) return true;
                 return false;
             },
             else => {
+                // Unsigned, so both operands are at least 0.
                 if (signed) return false;
                 const p = std.math.mul(i128, ra.hi, rb.hi) catch return false;
                 return p <= lim.hi;
@@ -542,30 +677,24 @@ const Walker = struct {
             .{ .lo = 0, .hi = (@as(i128, 1) << bits) - 1 };
     }
 
-    /// A constant's value. `term` keeps its exact value (sign-extended
-    /// to 64 bits when negative), not its bits in `info`: a fact from a
-    /// widened compare (`@as(i16, x) < 130`, with `x: i8`) relates `x` to
-    /// a constant its own type cannot hold, and truncating 130 to an i8
-    /// made it -126. Facts and queries agree in signedness.
-    fn value(t: Term, info: Type.IntInfo) i128 {
-        const v = t.bits();
-        return if (info.signedness == .unsigned) v else @as(i64, @bitCast(v));
-    }
-
-    /// The bounds of `t` the facts give: constant bounds, and one less
-    /// than any value of the type for `t < u`.
+    /// The bounds of the value of `t`, an operand of type `info`: those
+    /// of the type (a term shared with a narrower value through a widening
+    /// cast has a value within them too), narrowed by each fact on `t` with
+    /// a constant on the other side, and by `t < u` to one less than the
+    /// largest value of `u`'s type (the fact's, not `info`), and `u < t`
+    /// likewise.
     fn range(w: *const Walker, t: Term, info: Type.IntInfo) Range {
-        if (t.tag == .konst) {
-            const v = value(t, info);
+        if (t.isConst()) {
+            const v = t.value();
             return .{ .lo = v, .hi = v };
         }
         const signed = info.signedness == .signed;
-        const lim = limits(info);
-        var r = lim;
+        var r = limits(info);
         for (w.recent()) |f| {
             if (f.signed != signed) continue;
+            const lim = limits(.{ .signedness = info.signedness, .bits = f.bits });
             if (f.a.eql(t)) {
-                const k: ?i128 = if (f.b.tag == .konst) value(f.b, info) else null;
+                const k: ?i128 = if (f.b.isConst()) f.b.value() else null;
                 switch (f.op) {
                     .lt => r.hi = @min(r.hi, (k orelse lim.hi) - 1),
                     .le => if (k) |v| {
@@ -578,7 +707,7 @@ const Walker = struct {
                     .ne => {},
                 }
             } else if (f.b.eql(t)) {
-                const k: ?i128 = if (f.a.tag == .konst) value(f.a, info) else null;
+                const k: ?i128 = if (f.a.isConst()) f.a.value() else null;
                 switch (f.op) {
                     .lt => r.lo = @max(r.lo, (k orelse lim.lo) + 1),
                     .le => if (k) |v| {
@@ -602,7 +731,7 @@ const Walker = struct {
         return all[all.len -| 64..];
     }
 
-    /// Whether `f` holds: a fact says so, or the operands' bounds do.
+    /// Whether a fact implies `f`.
     fn holds(w: *const Walker, f: Fact) bool {
         for (w.recent()) |g| {
             if (g.signed != f.signed) continue;
@@ -611,19 +740,24 @@ const Walker = struct {
         return false;
     }
 
-    /// True or false if the facts decide `f`.
+    /// True or false if the facts decide `f`, a compare of operands of
+    /// type `info`.
     fn proves(w: *const Walker, f: Fact, info: Type.IntInfo) ?bool {
         if (w.holds(f)) return true;
         if (w.holds(negate(f))) return false;
-        // `x + 1 <= y` from `x < y` (so `x + 1` did not wrap), and
-        // `x < y` from `x + 1 <= y` (an earlier slice end check).
-        if (f.op == .le) if (w.plusOne(f.a)) |x| {
-            if (w.holds(.{ .op = .lt, .signed = f.signed, .a = x, .b = f.b })) return true;
+        // `x + 1 <= y` from `x < y`: then `x + 1 <= y <= max`, so even a
+        // wrapping `+%` computed `x + 1` exactly.
+        if (f.op == .le) if (w.plusOne(f.a, false)) |x| {
+            if (w.holds(with(f, .lt, x, f.b))) return true;
         };
+        // `x < y` from `x + 1 <= y` (an earlier slice end check), only for
+        // an addition that did not wrap: `maxInt +% 1` is 0.
         if (f.op == .lt) for (w.recent()) |g| {
             if (g.op != .le or g.signed != f.signed or !g.b.eql(f.b)) continue;
-            if (w.plusOne(g.a)) |x| if (x.eql(f.a)) return true;
+            if (w.plusOne(g.a, true)) |x| if (x.eql(f.a)) return true;
         };
+        // Bounds: `a < b` when every value of `a` is below every value of
+        // `b`, false when none is, and so on.
         const a = w.range(f.a, info);
         const b = w.range(f.b, info);
         return switch (f.op) {
@@ -644,29 +778,42 @@ fn isCold(ir: *const Ir, body: []const Inst.Index) bool {
     };
 }
 
-/// `a tag b` as a fact.
-fn fact(tag: Inst.Tag, a: Term, b: Term, signed: bool) Fact {
+/// `a tag b` as a fact, for operands of type `info`. `>` and `>=` swap
+/// their operands into `<` and `<=`.
+fn fact(tag: Inst.Tag, a: Term, b: Term, info: Type.IntInfo) Fact {
+    const f: Fact = .{ .op = undefined, .signed = info.signedness == .signed, .bits = @intCast(info.bits), .a = a, .b = b };
     return switch (tag) {
-        .cmp_lt => .{ .op = .lt, .signed = signed, .a = a, .b = b },
-        .cmp_lte => .{ .op = .le, .signed = signed, .a = a, .b = b },
-        .cmp_gt => .{ .op = .lt, .signed = signed, .a = b, .b = a },
-        .cmp_gte => .{ .op = .le, .signed = signed, .a = b, .b = a },
-        .cmp_eq => .{ .op = .eq, .signed = signed, .a = a, .b = b },
-        .cmp_neq => .{ .op = .ne, .signed = signed, .a = a, .b = b },
+        .cmp_lt => with(f, .lt, a, b),
+        .cmp_lte => with(f, .le, a, b),
+        .cmp_gt => with(f, .lt, b, a),
+        .cmp_gte => with(f, .le, b, a),
+        .cmp_eq => with(f, .eq, a, b),
+        .cmp_neq => with(f, .ne, a, b),
         else => unreachable,
     };
 }
 
+fn with(f: Fact, op: Op, a: Term, b: Term) Fact {
+    var g = f;
+    g.op = op;
+    g.a = a;
+    g.b = b;
+    return g;
+}
+
+/// The fact that holds where `f` does not: integers are totally ordered.
 fn negate(f: Fact) Fact {
     return switch (f.op) {
-        .lt => .{ .op = .le, .signed = f.signed, .a = f.b, .b = f.a },
-        .le => .{ .op = .lt, .signed = f.signed, .a = f.b, .b = f.a },
-        .eq => .{ .op = .ne, .signed = f.signed, .a = f.a, .b = f.b },
-        .ne => .{ .op = .eq, .signed = f.signed, .a = f.a, .b = f.b },
+        .lt => with(f, .le, f.b, f.a),
+        .le => with(f, .lt, f.b, f.a),
+        .eq => with(f, .ne, f.a, f.b),
+        .ne => with(f, .eq, f.a, f.b),
     };
 }
 
-/// Whether fact `g` alone implies `f` (same operands).
+/// Whether fact `g` alone implies `f` (same operands): `a < b` gives
+/// `a <= b` and `a != b` both ways, `a == b` gives `a <= b` both ways.
+/// Facts compare values, so this holds whatever their types' widths.
 fn implies(g: Fact, f: Fact) bool {
     const same = g.a.eql(f.a) and g.b.eql(f.b);
     const swapped = g.a.eql(f.b) and g.b.eql(f.a);
@@ -681,9 +828,9 @@ fn implies(g: Fact, f: Fact) bool {
 test "implies" {
     const x: Term = .{ .tag = .inst, .a = 1 };
     const y: Term = .{ .tag = .inst, .a = 2 };
-    const lt: Fact = .{ .op = .lt, .signed = false, .a = x, .b = y };
-    try std.testing.expect(implies(lt, .{ .op = .le, .signed = false, .a = x, .b = y }));
-    try std.testing.expect(implies(lt, .{ .op = .ne, .signed = false, .a = y, .b = x }));
-    try std.testing.expect(!implies(lt, .{ .op = .lt, .signed = false, .a = y, .b = x }));
-    try std.testing.expect(implies(negate(lt), .{ .op = .le, .signed = false, .a = y, .b = x }));
+    const lt: Fact = .{ .op = .lt, .signed = false, .bits = 64, .a = x, .b = y };
+    try std.testing.expect(implies(lt, .{ .op = .le, .signed = false, .bits = 64, .a = x, .b = y }));
+    try std.testing.expect(implies(lt, .{ .op = .ne, .signed = false, .bits = 64, .a = y, .b = x }));
+    try std.testing.expect(!implies(lt, .{ .op = .lt, .signed = false, .bits = 64, .a = y, .b = x }));
+    try std.testing.expect(implies(negate(lt), .{ .op = .le, .signed = false, .bits = 64, .a = y, .b = x }));
 }

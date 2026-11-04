@@ -312,7 +312,8 @@ pub fn main(init_std: std.process.Init) !void {
 /// `=<name>:<mode>` with `t` or `n` for tracing and `v` or `n` for
 /// Valgrind. ('=' is in no module's name.)
 /// Atoms inlined other than by default (`inlining`) get entries of their
-/// own too, as `+inline<budget>` and `s` for the safe variant.
+/// own too, as `+inline<budget>` and `s` for the safe variant, and
+/// atoms with every check kept (`ZAP_PROVE=off`) as `+noprove`.
 fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.process.Environ.Map) ![]const u8 {
     const inl = inlining(env);
     const default_inl = inl.budget == inline_ir.budget and !inl.safe;
@@ -320,7 +321,8 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
         if (m.optimize.? != opts.optimize or m.error_tracing.? != opts.error_tracing or m.valgrind.? != opts.valgrind) break false;
     } else true;
     const unsafe = opts.optimize == .fast or opts.optimize == .small;
-    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes) return "x86_64-linux";
+    const prove_on = proving(env);
+    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on) return "x86_64-linux";
     var s: std.ArrayList(u8) = .empty;
     try s.appendSlice(arena, "x86_64-linux");
     if (opts.fuzz) {
@@ -337,7 +339,17 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
         try s.print(arena, "={s}:{t}{c}{c}", .{ m.name, m.optimize.?, "nt"[@intFromBool(m.error_tracing.?)], "nv"[@intFromBool(m.valgrind.?)] });
     }
     if (!default_inl) try s.print(arena, "+inline{d}{s}", .{ inl.budget, if (inl.safe) "s" else "" });
+    if (!prove_on) try s.appendSlice(arena, "+noprove");
     return s.items;
+}
+
+/// Whether checks that facts prove are removed (docs/architecture.md,
+/// "Proving checks"): `ZAP_PROVE=off` keeps them all.
+fn proving(env: *const std.process.Environ.Map) bool {
+    const v = env.get("ZAP_PROVE") orelse return true;
+    if (std.mem.eql(u8, v, "off")) return false;
+    if (std.mem.eql(u8, v, "on")) return true;
+    fatal("invalid ZAP_PROVE '{s}': expected 'on' or 'off'", .{v});
 }
 
 /// How calls are inlined (docs/architecture.md, "Inlining within a
@@ -795,6 +807,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     };
     emit.stack_size = opts.stack_size;
     emit.fuzz = opts.fuzz;
+    emit.prove_on = proving(job.environ_map);
     // Only executables link glibc: an object or a static library with
     // -lc is an ordinary one, as upstream's.
     const links_glibc = opts.link_libc and opts.command != .build_obj and opts.command != .build_lib;

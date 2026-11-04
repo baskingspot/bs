@@ -1624,10 +1624,6 @@ from inlining, where a parameter becomes the caller's constant.
 
 #### Proving checks
 
-**Off** (`prove_enabled` in `Emit.generateFunction`) until its rules are
-shown sound: the miscompile hunter found it removing bounds checks it had
-not proven.
-
 Built on the IR, after the rewrite rules (`src/codegen/prove.zig`), as
 Go's `prove` and `loopbce`: one forward walk per function on its CodeGen
 worker (`Emit.generateFunction`, before `CodeGen.generate`) keeps the
@@ -1644,10 +1640,17 @@ are `-ffuzz` coverage points, are only learned from.
   known, else the variable at a version. The version changes at each
   store, at each loop entry (a later store in the loop reaches the
   loop's start through the back edge), and where paths that stored it
-  merge (after a `cond_br`, a `switch_br`, a loop, or a block that its
-  `br`s leave from more than one place). A `*const` alloc stored once is
-  its value, `slice_len` of equal slices are equal and of a `slice` its
-  length operand, and a widening `intcast` is its operand.
+  merge (after a `cond_br`, a `switch_br`, a loop, or a block not left
+  only by the `br` to it that ends its body). A load's term is taken
+  where the walk reaches it, not when a later compare asks: by then the
+  variable may hold a later store. A `*const` alloc stored once is its
+  value until paths merge, `slice_len` of equal slices are equal and of a
+  `slice` its length operand, and a widening `intcast` of the same
+  signedness is its operand. Terms are mathematical integers: a constant
+  is its value whatever type it was written in, and each fact records
+  its compare's type, which bounds an operand only the fact bounds. An
+  undefined value is no term: a store of one forgets the variable, and a
+  compare with one gives no fact.
 - **Facts.** A branch's condition (a compare, `not`, the `and` of two
   in its true side, the `or` of two in its false side) holds in the
   side it leads to, negated in the other. What held at every `br` that
@@ -1657,12 +1660,20 @@ are `-ffuzz` coverage points, are only learned from.
   searched, which keeps functions with thousands of checks linear.
 - **Proofs.** A compare follows from a fact on the same operands, from
   constant bounds the facts give each operand (with `x < y` bounding
-  `x` by the type's maximum less one), and from `x < y` for `x + 1 <=
-  y` and back. An overflow check of an addition, subtraction, or
+  `x` by the maximum of the fact's type less one), from `x < y` for
+  `x + 1 <= y`, and back from `x + 1 <= y` for `x < y` only when the
+  addition cannot have wrapped (an overflow operation whose check the
+  walk passed, not `+%`). An overflow check of an addition, subtraction, or
   unsigned multiplication goes when its operands' bounds exclude
   overflow, or for `a - b` when `b <= a` holds (`i + 1` after `i < len`,
   `n - 1` after `n >= 2`); the operation's value read then becomes the
   wrapping operation, so the overflow bit is not computed.
+- **Turning it off.** `ZAP_PROVE=off` keeps every check (its own cache
+  target, `+noprove`). A program whose output or panic differs between
+  on and off has found a bug in a proof, with no oracle needed. The
+  soundness argument for each rule is next to it in `prove.zig`; the run
+  tests `prove_wrap`, `prove_load`, `prove_width`, and `prove_exit`
+  each hold a program whose check a rule once removed unproven.
 
 #### Compile-time budget and how it is measured
 

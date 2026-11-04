@@ -170,6 +170,9 @@ ssa: Ssa = .{},
 rewrite_scratch: std.ArrayList(u32) = .empty,
 /// `prove.run`'s arrays, on a worker, reused for the next function.
 prove_scratch: prove.Scratch = .{},
+/// Whether `prove.run` removes the checks it proves (`ZAP_PROVE=off`
+/// turns it off, to compare a program's behavior with and without).
+prove_on: bool = true,
 /// Per-stage backend time and size, for `ZAP_TIMING` and bench-codegen.
 codegen_stats: CodeGenStats = .{},
 /// The CodeGen workers, on the main Emit (`startPool`).
@@ -509,6 +512,7 @@ pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64) !void {
         w.is_worker = true;
         w.obj = emit.obj;
         w.fuzz = emit.fuzz;
+        w.prove_on = emit.prove_on;
         w.pic = emit.pic;
         w.shared = emit.shared;
         w.glibc = emit.glibc;
@@ -947,17 +951,11 @@ fn generateFunction(emit: *Emit, ir: *const Ir) Allocator.Error!void {
     const io = emit.zcu.io;
     const t0 = std.Io.Timestamp.now(io, .awake);
     defer emit.codegen_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
-    // Off until its rules are sound: it removed bounds checks it had not
-    // proven (`x +% 1 <= n` taken as `x < n`; a load read against a later
-    // store).
-    const prove_enabled = false;
-    if (prove_enabled) {
-        // The IR is this job's own.
-        const st = try prove.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.prove_scratch);
-        emit.codegen_stats.prove_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
-        emit.codegen_stats.checks += st.checks;
-        emit.codegen_stats.proven += st.proven;
-    }
+    // The IR is this job's own.
+    const st: prove.Stats = if (!emit.prove_on) .{} else try prove.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.prove_scratch);
+    emit.codegen_stats.prove_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
+    emit.codegen_stats.checks += st.checks;
+    emit.codegen_stats.proven += st.proven;
     CodeGen.generate(emit, ir) catch |err| switch (err) {
         error.CodegenFail => emit.failed = true,
         else => |e| return e,
@@ -1128,6 +1126,7 @@ pub fn benchCodegen(emit: *Emit, runs: u32) !void {
         var e: Emit = .init(emit.gpa, emit.zcu);
         defer e.deinit();
         e.fuzz = emit.fuzz;
+        e.prove_on = emit.prove_on;
         for (irs.items) |*ir| try e.generateFunction(ir);
         const s = e.codegen_stats;
         if (best == null or s.build_ns + s.alloc_ns + s.emit_ns < best.?.build_ns + best.?.alloc_ns + best.?.emit_ns) best = s;
