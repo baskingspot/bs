@@ -2210,7 +2210,9 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
         .fallthrough => try cg.jumpTo(term.succ[0], next),
         .jump => {
             try cg.checkNaked(tag);
-            if (tag == .br) switch (cg.homes[@backingInt(data.br.block_inst)]) {
+            // Not for a block nothing reads (one the rewrite rules
+            // replaced with its constant result).
+            if (tag == .br and cg.ssa.live.items(.uses)[@backingInt(data.br.block_inst)] != 0) switch (cg.homes[@backingInt(data.br.block_inst)]) {
                 .slot => |off| if (!cg.inSlot(data.br.operand, off)) try cg.copyTo(Mem.at(.rbp, off), data.br.operand),
                 .reg => |r| try cg.load(r, data.br.operand),
                 .regs => |p| try cg.loadRegs(p, data.br.operand),
@@ -2379,20 +2381,6 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const ty = cg.typeOf(data.bin_op.lhs);
             if (cg.isFloat(ty)) return cg.genFloat(inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
-            // `x + 0`, `x * 1`, `x / 1` and the like are `x` (slicing from
-            // 0, `sliceAsBytes` of bytes).
-            if (Type.isInt(ip, ty)) if (data.bin_op.rhs.toInterned()) |v| if (ip.keyTag(v) == .int) if (ip.intValue(u64, v)) |c| {
-                const identity: ?u64 = switch (tag) {
-                    .add_wrap, .sub_wrap, .bit_or, .xor, .shl, .shr => 0,
-                    .mul_wrap, .div_trunc, .div_floor, .div_ceil => 1,
-                    else => null,
-                };
-                if (c == identity) {
-                    const d = cg.destReg(inst);
-                    try cg.load(d, data.bin_op.lhs);
-                    return cg.setResult(inst, ty, d);
-                }
-            };
             switch (tag) {
                 .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr => {
                     const d = cg.destReg(inst);
@@ -2554,15 +2542,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 } else {
                     const info = Type.intInfo(ip, ty);
                     const src = try cg.locOf(data.ty_op.operand);
-                    if (src == .imm and info.bits < 64) {
-                        // Truncated and extended here.
-                        const sh: u6 = @intCast(64 - info.bits);
-                        const v: u64 = if (info.signedness == .signed)
-                            @bitCast(@as(i64, @bitCast(src.imm << sh)) >> sh)
-                        else
-                            src.imm << sh >> sh;
-                        try cg.e.mov(.qword, .{ .reg = d }, .{ .imm = @bitCast(v) });
-                    } else if (src == .reg and (info.bits == 8 or info.bits == 16 or info.bits == 32)) {
+                    if (src == .reg and (info.bits == 8 or info.bits == 16 or info.bits == 32)) {
                         // Extend straight from the operand's register.
                         if (info.signedness == .signed)
                             try cg.e.movsx(.qword, d, sizeOf(info.bits / 8), .{ .reg = src.reg })

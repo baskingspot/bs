@@ -1439,6 +1439,37 @@ build, the passes, and the debug info treat them as Sema's inline calls
   `str x30, [sp, #-16]!; bl next`, with the row `CFA = sp+16` and x30 at
   `CFA-16`.
 
+#### Rewrite rules
+
+Built on the IR, after inlining (`src/codegen/rewrite.zig`): a table of
+peephole rules, pattern → replacement, as Go's generic `.rules`, applied
+in one forward walk on the Sema thread as Emit hands a function to
+CodeGen (`Emit.submit`). Each instruction's operands are rewritten
+before it is matched, so chains fold in the same walk; a matched
+instruction is replaced in every later use by an operand or a constant
+(interned there, which only the Sema thread may do) and left for dead
+code. Rules are matched per tag (a comptime index of the table):
+
+- operations on constants, with the IR's exact semantics (wrapping
+  arithmetic, shifts, division rounding, compares, `not`, `intcast`,
+  `trunc`, `int_from_bool`); an undefined result (division by zero, an
+  oversized shift, `minInt / -1`, an `intcast` that does not fit) is not
+  folded;
+- identities: `x + 0`, `x * 1`, `x & ~0`, `x | x`, `x - x`, `x ^ x`,
+  `x * 0`, and the like;
+- compares of a value with itself, and of an unsigned value with 0;
+- reads of constants: a field of a constant struct, an element of a
+  constant array at a constant index, a constant slice's `ptr` and
+  `len`, a constant optional's or error union's state and payload, and
+  the fields of an overflow operation on constants (so a check of `n - 1`
+  for a constant `n` folds).
+
+A `cond_br` whose condition became constant keeps only the taken body
+(`Ssa.build`), in a block of its own, so a panic that now always runs
+stays a cold block. Integers over 64 bits and floats are left alone (a
+float compare of `x` with itself is false for NaN). Most matches come
+from inlining, where a parameter becomes the caller's constant.
+
 #### Compile-time budget and how it is measured
 
 The backend is budgeted per IR instruction, single-threaded, on libvaxis

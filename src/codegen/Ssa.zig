@@ -813,6 +813,9 @@ pub fn removable(ir: *const Ir, ip: *const InternPool, inst: Inst.Index) bool {
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .not => true,
+        // Sema's checks keep integer divisors non-zero and quotients in range.
+        .div_trunc, .div_floor, .div_ceil, .rem, .mod => true,
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => true,
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .neg_float, .abs_float => true,
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => true,
         .intcast, .trunc, .float_cast, .bitcast, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => true,
@@ -885,69 +888,79 @@ const LiveWalk = struct {
 /// Calls `ctx.use(ref)` for each operand of the value `inst` (not for a
 /// terminator's operands, nor for the bodies a `block` or `loop` holds).
 pub fn forEachOperand(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
-    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    const Read = struct {
+        ctx: @TypeOf(ctx),
+        pub inline fn use(r: @This(), p: *Inst.Ref) void {
+            r.ctx.use(p.*);
+        }
+    };
+    forEachOperandPtr(ir, inst, Read{ .ctx = ctx });
+}
+
+/// As `forEachOperand`, with `ctx.use(ptr)` given where the operand is
+/// stored, so that it can be replaced.
+pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
+    const datas = ir.instructions.items(.data);
+    const data = &datas[@backingInt(inst)];
+    const extra = @constCast(ir.extra);
+    const at = struct {
+        fn f(x: []u32, i: usize) *Inst.Ref {
+            return @ptrCast(&x[i]);
+        }
+    }.f;
     switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
         .arg, .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .ret_addr, .frame_addr, .extern_ptr, .extern_pcrel, .extern_tls, .tls_ptr => {},
         .err_return_trace, .save_err_return_trace_index, .breakpoint, .c_va_start, .block, .loop => {},
         .repeat, .unreach, .trap, .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect => {},
-        .br => ctx.use(data.br.operand),
-        .ret, .error_name, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err, .set_err_return_trace => ctx.use(data.un_op),
-        .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ctx.use(data.un_op),
-        .load, .not, .intcast, .trunc, .float_cast, .float_from_int, .int_from_float, .bitcast, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => ctx.use(data.ty_op.operand),
-        .ptr_from_int, .atomic_load, .slice_ptr, .slice_len, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set, .wrap_optional => ctx.use(data.ty_op.operand),
-        .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => ctx.use(data.ty_op.operand),
-        .wrap_errunion_payload, .wrap_errunion_err, .get_union_tag, .tag_name, .c_va_arg, .c_va_copy => ctx.use(data.ty_op.operand),
+        .br => ctx.use(&data.br.operand),
+        .ret, .error_name, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err, .set_err_return_trace => ctx.use(&data.un_op),
+        .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ctx.use(&data.un_op),
+        .load, .not, .intcast, .trunc, .float_cast, .float_from_int, .int_from_float, .bitcast, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => ctx.use(&data.ty_op.operand),
+        .ptr_from_int, .atomic_load, .slice_ptr, .slice_len, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set, .wrap_optional => ctx.use(&data.ty_op.operand),
+        .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => ctx.use(&data.ty_op.operand),
+        .wrap_errunion_payload, .wrap_errunion_err, .get_union_tag, .tag_name, .c_va_arg, .c_va_copy => ctx.use(&data.ty_op.operand),
         .store, .add_wrap, .sub_wrap, .mul_wrap, .add_float, .sub_float, .mul_float, .div_float, .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
-            ctx.use(data.bin_op.lhs);
-            ctx.use(data.bin_op.rhs);
+            ctx.use(&data.bin_op.lhs);
+            ctx.use(&data.bin_op.rhs);
         },
         .min_float, .max_float, .bit_and, .bit_or, .xor, .shl, .shr, .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
-            ctx.use(data.bin_op.lhs);
-            ctx.use(data.bin_op.rhs);
+            ctx.use(&data.bin_op.lhs);
+            ctx.use(&data.bin_op.rhs);
         },
         .atomic_store, .ptr_elem_val, .slice_elem_val, .array_elem_val, .set_union_tag, .memcpy, .memmove, .memset => {
-            ctx.use(data.bin_op.lhs);
-            ctx.use(data.bin_op.rhs);
+            ctx.use(&data.bin_op.lhs);
+            ctx.use(&data.bin_op.rhs);
         },
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow, .ptr_elem_ptr, .slice_elem_ptr, .slice, .ptr_add => {
-            const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
-            ctx.use(bin.lhs);
-            ctx.use(bin.rhs);
+            ctx.use(at(extra, data.ty_pl.payload));
+            ctx.use(at(extra, data.ty_pl.payload + 1));
         },
         .mul_add, .vector_store_elem => {
-            const bin = ir.extraData(Ir.Bin, data.pl_op.payload).data;
-            ctx.use(data.pl_op.operand);
-            ctx.use(bin.lhs);
-            ctx.use(bin.rhs);
+            ctx.use(&data.pl_op.operand);
+            ctx.use(at(extra, data.pl_op.payload));
+            ctx.use(at(extra, data.pl_op.payload + 1));
         },
-        .cond_br, .switch_br, .comptime_exit => ctx.use(data.pl_op.operand),
-        .struct_field_ptr, .struct_field_val, .union_init => ctx.use(ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand),
+        .cond_br, .switch_br, .comptime_exit => ctx.use(&data.pl_op.operand),
+        .struct_field_ptr, .struct_field_val, .union_init => ctx.use(at(extra, data.ty_pl.payload)),
         .atomic_rmw => {
-            const x = ir.extraData(Ir.AtomicRmw, data.ty_pl.payload).data;
-            ctx.use(x.ptr);
-            ctx.use(x.operand);
+            ctx.use(at(extra, data.ty_pl.payload));
+            ctx.use(at(extra, data.ty_pl.payload + 1));
         },
-        .cmpxchg => {
-            const x = ir.extraData(Ir.Cmpxchg, data.ty_pl.payload).data;
-            ctx.use(x.ptr);
-            ctx.use(x.expected);
-            ctx.use(x.new);
-        },
+        .cmpxchg => for (0..3) |k| ctx.use(at(extra, data.ty_pl.payload + k)),
         .aggregate_init => {
-            const extra = ir.extraData(Ir.Aggregate, data.ty_pl.payload);
-            for (ir.refSlice(extra.end, extra.data.len)) |elem| ctx.use(elem);
+            const x = ir.extraData(Ir.Aggregate, data.ty_pl.payload);
+            for (0..x.data.len) |k| ctx.use(at(extra, x.end + k));
         },
         .call => {
-            const extra = ir.extraData(Ir.Call, data.pl_op.payload);
-            ctx.use(data.pl_op.operand);
-            for (ir.refSlice(extra.end, extra.data.args_len)) |arg| ctx.use(arg);
+            const x = ir.extraData(Ir.Call, data.pl_op.payload);
+            ctx.use(&data.pl_op.operand);
+            for (0..x.data.args_len) |k| ctx.use(at(extra, x.end + k));
         },
         .assembly => {
-            const extra = ir.extraData(Ir.Asm, data.ty_pl.payload);
-            var i = extra.end;
-            for (0..extra.data.outputs_len + extra.data.inputs_len) |_| {
-                const operand: Inst.Ref = @fromBackingInt(ir.extra[i + 2]);
-                if (operand != .none) ctx.use(operand);
+            const x = ir.extraData(Ir.Asm, data.ty_pl.payload);
+            var i = x.end;
+            for (0..x.data.outputs_len + x.data.inputs_len) |_| {
+                if (@as(Inst.Ref, @fromBackingInt(ir.extra[i + 2])) != .none) ctx.use(at(extra, i + 2));
                 i += 3;
             }
         },
@@ -1253,6 +1266,13 @@ const Builder = struct {
                 const extra = ir.extraData(Ir.CondBr, data.pl_op.payload);
                 const then_body = ir.bodySlice(extra.end, extra.data.then_body_len);
                 const else_body = ir.bodySlice(extra.end + then_body.len, extra.data.else_body_len);
+                // A condition the rewrite rules made constant: only the
+                // taken body has code, in a block of its own (cold if it
+                // panics).
+                if (data.pl_op.operand.toInterned()) |c| if (c == .bool_true or c == .bool_false) {
+                    try b.open(try b.newBlock());
+                    return b.body(if (c == .bool_true) then_body else else_body);
+                };
                 const then_block = try b.newBlock();
                 const else_block = try b.newBlock();
                 try b.terminate(.{ .tag = .branch, .inst = inst, .succ = .{ @backingInt(then_block), @backingInt(else_block) } });

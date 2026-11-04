@@ -31,6 +31,7 @@ const CSource = @import("CSource.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
 const Ssa = @import("codegen/Ssa.zig");
 const inline_ir = @import("codegen/inline.zig");
+const rewrite = @import("codegen/rewrite.zig");
 const Sema = @import("Sema.zig");
 const cache = @import("cache.zig");
 
@@ -160,6 +161,8 @@ codegen_ns: u64 = 0,
 bench_irs: ?std.ArrayList(Ir) = null,
 /// The SSA form of the function being generated, reused for the next.
 ssa: Ssa = .{},
+/// `rewrite.run`'s arrays, reused for the next function.
+rewrite_scratch: std.ArrayList(u32) = .empty,
 /// Per-stage backend time and size, for `ZAP_TIMING` and bench-codegen.
 codegen_stats: CodeGenStats = .{},
 /// The CodeGen workers, on the main Emit (`startPool`).
@@ -328,6 +331,10 @@ pub const ExportsView = struct {
 };
 
 pub const CodeGenStats = struct {
+    /// The rewrite rules (`rewrite.run`, on the Sema thread), and the
+    /// instructions and branches they folded.
+    rewrite_ns: u64 = 0,
+    folds: u64 = 0,
     /// Building the SSA form from the IR.
     build_ns: u64 = 0,
     /// Liveness and register allocation.
@@ -352,10 +359,13 @@ pub const CodeGenStats = struct {
                 return @as(f64, @floatFromInt(ns)) / 1e6;
             }
         }.f;
-        std.debug.print("{s}: {d} functions, {d} IR instructions; ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
+        std.debug.print("{s}: {d} functions, {d} IR instructions; rewrite {d:.1} ms ({d:.1} ns/IR, {d} folds), ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
             label,
             s.functions,
             s.ir_insts,
+            ms(s.rewrite_ns),
+            per(s.rewrite_ns, s.ir_insts),
+            s.folds,
             ms(s.build_ns),
             per(s.build_ns, s.ir_insts),
             ms(s.alloc_ns),
@@ -429,6 +439,7 @@ pub fn deinit(emit: *Emit) void {
     emit.link_refs.deinit(gpa);
     emit.link_content_uses.deinit(gpa);
     emit.ssa.deinit(gpa);
+    emit.rewrite_scratch.deinit(gpa);
     if (emit.bench_irs) |*irs| {
         for (irs.items) |*ir| ir.deinit(gpa);
         irs.deinit(gpa);
@@ -746,8 +757,15 @@ fn inlineBody(emit: *Emit, func: Index) error{ OutOfMemory, Busy }!?u32 {
 }
 
 /// Generates a function whose inlining is done.
-fn submit(emit: *Emit, ir: Ir, exports: ExportsView) !void {
+fn submit(emit: *Emit, ir_in: Ir, exports: ExportsView) !void {
     const zcu = emit.zcu;
+    var ir = ir_in;
+    {
+        const t0 = std.Io.Timestamp.now(zcu.io, .awake);
+        const st = try rewrite.run(emit.gpa, &zcu.ip, Zcu.tid, &ir, &emit.rewrite_scratch);
+        emit.codegen_stats.rewrite_ns += @intCast(t0.durationTo(.now(zcu.io, .awake)).nanoseconds);
+        emit.codegen_stats.folds += st.folds + st.branches;
+    }
     if (emit.bench_irs) |*irs| {
         var list = ir.instructions.toMultiArrayList();
         try irs.append(emit.gpa, .{
