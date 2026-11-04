@@ -232,6 +232,14 @@ class Gen:
         big.fields.append((f"f{len(big.fields) + 9}", Array(self.pick([U64, Int(True, 64), U32]), self.r.randint(3, 5))))
         self.big = big
         self.structs.append(big)
+        # A struct of 64 to 256 bytes for whole copies (s_bigcopy); kept out
+        # of self.structs so ordinary statements do not spell it out.
+        n = self.r.randint(5, 28)
+        hf = [("f0", U64), ("f1", Array(self.pick([U64, Int(True, 64)]), n)), ("f2", U32)]
+        if self.chance(0.5):
+            hf.append(("f3", Array(Int(False, 16), self.r.randint(1, 4))))
+        hf.append(("f4", Int(True, 64)))
+        self.huge = Struct("SH", hf, "auto")
 
     def make_enum(self, i):
         n = self.r.randint(2, 6)
@@ -1026,6 +1034,7 @@ class Gen:
             (1, "defer"), (1, "guard"), (1, "labeled"), (1, "inlinefor"), (1, "brk"), (1, "ret"),
             (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"), (3, "prove"),
             (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"), (2, "window"),
+            (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -1942,7 +1951,7 @@ class Gen:
         out.append(f"    return (d *% 7) ^ ({digest('mbs1', big)}) ^ ({digest('mbs3', big)}) ^ ({sums});")
         out.append("}")
         self.byref.append(("many", ("manyB", its), big, None))
-        tys = list(self.structs) + [Array(self.rand_int_type(), self.r.randint(2, 4))]
+        tys = list(self.structs) + [Array(self.rand_int_type(), self.r.randint(2, 4)), self.huge]
         for i, t in enumerate(tys):
             lv = self.leaves("r", t)
             if not lv:
@@ -1968,7 +1977,149 @@ class Gen:
             out.append(f"    return {digest('s', t)};")
             out.append("}")
             self.byref.append(("bp", name, t, None))
+        self.huge_fns = {k_: n_ for k_, n_, t_, _ in self.byref if t_ is self.huge}
         out.append("")
+
+    def s_wide(self, ctx):
+        """64x64->128 widening multiplies and their halves, wide wrapping and
+        checked arithmetic, and u128 compares, shifts and division."""
+        sg = self.chance(0.35)
+        h, w = (Int(True, 64), Int(True, 128)) if sg else (U64, Int(False, 128))
+        a, b, p = self.fresh("xa"), self.fresh("xb"), self.fresh("xp")
+        e = lambda x: self.emit(ctx, x)
+        ae, be = self.int_expr(ctx, h, 1), self.int_expr(ctx, h, 1)
+        e(f"const {a}: {h.name()} = {ae};")
+        e(f"const {b}: {h.name()} = {be};")
+        e(f"const {p}: {w.name()} = @as({w.name()}, {a}) * @as({w.name()}, {b});")
+        self.sink(ctx, f"@as({h.name()}, @truncate({p} >> 64))", h)
+        self.sink(ctx, f"@as({h.name()}, @truncate({p}))", h)
+        k = self.r.random()
+        if k < 0.25:
+            ov = self.fresh("xo")
+            e(f"const {ov} = @mulWithOverflow({a}, {b});")
+            self.sink(ctx, f"{ov}[0]", h)
+            self.sink(ctx, f"{ov}[1]", Int(False, 1))
+        elif k < 0.45:
+            q = self.fresh("xq")
+            e(f"const {q}: {w.name()} = {p} *% @as({w.name()}, {a} | 1) +% @as({w.name()}, {b});")
+            self.sink(ctx, f"@as(u64, @truncate(@as(u128, @bitCast({q})) >> {self.r.randrange(128)}))", U64)
+        elif k < 0.6 and not sg:
+            self.sink(ctx, f"@as(u64, @truncate(@divTrunc({p}, @as(u128, {b} | 1)) ^ @rem({p}, @as(u128, {a} | 1))))", U64)
+        elif k < 0.75:
+            amt = self.rt_int(ctx, Int(False, 8))
+            sh = f"@as(u7, @truncate({self.conv(amt, Int(False, 8), USIZE)}))" if amt else str(self.r.randrange(128))
+            self.sink(ctx, f"@as(u64, @truncate(@as(u128, @bitCast({p} {self.pick(['<<', '>>'])} {sh}))))", U64)
+        elif k < 0.85 and self.trap_ok(ctx, ae, be):
+            # A checked multiply that can overflow the 128 bits.
+            self.sink(ctx, f"@as(u64, @truncate(@as(u128, @bitCast({p} * @as({w.name()}, {a})))))", U64)
+        else:
+            self.sink(ctx, f"@as(u8, @intFromBool({p} {self.pick(['<', '<=', '==', '!=', '>', '>='])} @as({w.name()}, {a}) << 64))", Int(False, 8))
+
+    def s_rot(self, ctx):
+        """Rotates: std.math.rotl/rotr by runtime and constant amounts on any
+        width, and the shift-or idiom."""
+        t = self.pick([U64, U32, Int(False, 16), Int(False, 8), Int(False, 128)] + [x for x in self.ints if not x.signed and x.bits > 1])
+        tn = t.name()
+        x = self.fresh("rx")
+        e = lambda s_: self.emit(ctx, s_)
+        e(f"const {x}: {tn} = {self.int_expr(ctx, t, 1)};")
+        amt = self.rt_int(ctx, Int(False, 8))
+        ka = self.conv(amt, Int(False, 8), USIZE) if amt else str(self.r.randrange(200))
+        f = self.pick(["rotl", "rotr"])
+        self.sink(ctx, f"std.math.{f}({tn}, {x}, {ka})", t)
+        if self.chance(0.5):
+            self.sink(ctx, f"std.math.{self.pick(['rotl', 'rotr'])}({tn}, {x}, {self.r.randrange(t.bits * 2)})", t)
+        if t.bits & (t.bits - 1) == 0:
+            # x << k | x >> -%k: a rotate for every k when the width is a power of two.
+            k = self.fresh("rk")
+            e(f"const {k}: std.math.Log2Int({tn}) = @truncate({ka});")
+            op1, op2 = self.pick([("<<", ">>"), (">>", "<<")])
+            self.sink(ctx, f"({x} {op1} {k}) | ({x} {op2} -%{k})", t)
+        else:
+            k = self.fresh("rk")
+            e(f"const {k}: std.math.Log2Int({tn}) = @intCast(1 + {ka} % {t.bits - 1});")
+            self.sink(ctx, f"({x} << {k}) | ({x} >> @intCast({t.bits} - @as(u16, {k})))", t)
+
+    def s_not(self, ctx):
+        """Branches on negated compares and bools."""
+        t = self.rand_int_type()
+        a, b = self.int_expr(ctx, t, 1), self.int_expr(ctx, t, 1)
+        c = self.fresh("nc")
+        e = lambda s_: self.emit(ctx, s_)
+        op = self.pick(['<', '<=', '==', '!=', '>', '>='])
+        e(f"const {c}: bool = {a} {op} {b};")
+        k = self.r.randrange(4)
+        if k == 0:
+            e(f"if (!({a} {op} {b})) {{")
+            self.block(ctx, 1)
+            e("} else {")
+            self.block(ctx, 1)
+            e("}")
+            self.sink(ctx, f"@as(u8, @intFromBool(!{c}))", Int(False, 8))
+        elif k == 1:
+            other = self.bool_expr(ctx, 1)
+            e(f"if (!{c} {self.pick(['and', 'or'])} !({other})) {{")
+            self.block(ctx, 1)
+            e("}")
+        elif k == 2:
+            n_, i_ = self.fresh("nd"), self.fresh("ni")
+            e(f"var {n_}: bool = !{c};")
+            e(f"var {i_}: u8 = 0;")
+            e(f"while (!{n_}) : ({i_} += 1) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, i_, Int(False, 8))
+            e(f"{n_} = !({i_} < {self.r.randint(0, 3)});")
+            ctx["indent"] -= 1
+            e("}")
+            self.sink(ctx, i_, Int(False, 8))
+        else:
+            r = self.fresh("nr")
+            e(f"const {r}: {t.name()} = if (!{c}) {a} else {b};")
+            self.sink(ctx, r, t)
+
+    def s_bigcopy(self, ctx):
+        """Whole copies of a 64-256 byte struct: into locals, globals and
+        through pointers, by value into callees that write the source, and
+        returned into the location they read."""
+        hs, fns = self.huge, self.huge_fns
+        lv = self.leaves("X", hs)
+        h = self.fresh("hh")
+        e = lambda s_: self.emit(ctx, s_)
+        if ctx["fn"].pure:
+            e(f"var {h}: SH = {self.global_init(hs)};")
+        else:
+            e(f"var {h}: SH = gH;")
+        for _ in range(self.r.randint(1, 3)):
+            x, t = self.pick(lv)
+            e(f"{h}{x[1:]} {self.pick(['+%=', '^=', '='])} {self.int_expr(ctx, t, 1)};")
+        # The helpers call mix(), so a pure (comptime-callable) function
+        # only copies.
+        k = 1.0 if ctx["fn"].pure else self.r.random()
+        if k < 0.25:
+            if self.chance(0.5):
+                e(f"gH = {h};")
+            else:
+                p = self.fresh("hp")
+                e(f"const {p}: *SH = &gH;")
+                e(f"{p}.* = {h};")
+        elif k < 0.45 and "bv" in fns:
+            self.sink(ctx, f"{fns['bv']}({self.pick(['gH', h])})", U64)
+        elif k < 0.65 and "ru" in fns:
+            tgt = self.pick([h, "gH"])
+            e(f"{tgt} = {fns['ru']}({tgt});")
+        elif k < 0.8 and "bp" in fns:
+            tgt = self.pick([h, h, "gH"])
+            self.sink(ctx, f"{fns['bp']}(&{tgt}, {tgt})", U64)
+        else:
+            a = self.fresh("ha")
+            e(f"var {a}: [2]SH = .{{ {h}, {h} }};")
+            x, t = self.pick(lv)
+            e(f"{a}[0]{x[1:]} ^= {self.int_expr(ctx, t, 1)};")
+            e(f"{a}[1] = {a}[0];")
+            for x, t in self.r.sample(lv, min(3, len(lv))):
+                self.sink(ctx, f"{a}[1]{x[1:]}", t)
+        for x, t in self.r.sample(lv, min(4, len(lv))):
+            self.sink(ctx, f"{h}{x[1:]}", t)
 
     def s_window(self, ctx):
         """Loops over windows `sl[i..][0..N]` of a runtime slice, with the
@@ -2612,6 +2763,13 @@ class Gen:
         self.globals.append(v)
         out.append(f"var gB: {self.big.name()} = {self.global_init(self.big)};")
         out.append(f"const KB: {self.big.name()} = {self.global_init(self.big)};")
+        hs = self.huge
+        out.append(f"const SH = struct {{ {', '.join(f'{n_}: {t_.name()}' for n_, t_ in hs.fields)} }};")
+        v = Var("gH", hs, "global")
+        self.rt_names.add("gH")
+        v.used = True
+        self.globals.append(v)
+        out.append(f"var gH: SH = {self.global_init(hs)};")
         for i in range(self.r.randint(0, 3)):
             t = self.rand_int_type()
             v = Var(f"K{i}", t, "cglobal", ro=True, ct=True)
