@@ -2719,7 +2719,16 @@ differs from the design above:
   destructor, with and without `-lc`), a COMDAT pair written in
   assembly (in both orders), GCC `-fPIE` code reading `stdout` and
   `environ`, and an archive passed with `-l`/`-L`.
-- Not yet: timing SQLite and zlib links against upstream.
+- Timing (2026-11-04, ReleaseFast zap, `ZAP_CACHE=off`, against
+  upstream with a fresh local cache; objects from upstream `zig cc -c`,
+  linked with `-lc` and a small Zig main that calls them): SQLite
+  3.50.4's amalgamation, one 18 MB object with 148k relocations in
+  .text, builds in 0.21 s against upstream's 0.62 to 0.74 s, of which
+  emit (loading and converting the object included) is 21 ms and the
+  link 11 to 12 ms for a 10 MB output. zlib 1.3.1's 15 objects build in
+  0.18 s against 0.44 to 0.47 s, with emit 5 to 6 ms and the link 5 ms.
+  Hashing each object with std's XxHash3 cost SQLite 40 ms until it
+  became Wyhash.
 
 **Stages and checks.**
 1. A: objects and archives into zap's static and `-lc` executables (the
