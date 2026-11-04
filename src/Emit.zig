@@ -142,6 +142,8 @@ export_lookups: u32 = 0,
 error_values: std.ArrayList(Elf.Value) = .empty,
 /// The inputs' symbols within their atoms, for `link` (in `inputs`' arena).
 input_symbols: []const Elf.LocalSymbol = &.{},
+/// Their unwind and debug sections (`Elf.Options.input_sections`).
+input_sections: []const Elf.InputSection = &.{},
 /// The range of `atoms` that `convertInputs` added: its `.link` atoms are
 /// the inputs' and glibc data copies, which the cache leaves out of its
 /// records (every build with inputs converts them again); others are
@@ -880,6 +882,7 @@ fn convertInputs(emit: *Emit, in: *ElfInput) !bool {
     });
     try emit.error_values.appendSlice(emit.gpa, converted.values);
     emit.input_symbols = converted.symbols;
+    emit.input_sections = converted.sections;
     return true;
 }
 
@@ -1199,7 +1202,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     // Source paths are as the compiler opened them, relative to the cwd.
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
-    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none, .local_symbols = emit.input_symbols };
+    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none, .local_symbols = emit.input_symbols, .input_sections = emit.input_sections };
     const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
     defer emit.gpa.free(imports);
     for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls };

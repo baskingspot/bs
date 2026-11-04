@@ -368,7 +368,7 @@ fn sectionAlignment(sh: elf.Elf64_Shdr) std.mem.Alignment {
 }
 
 /// The `Atom.Section` an input section's atoms go to, or null for one the
-/// link drops (not allocated, notes, unwind tables until stage B).
+/// link drops (not allocated, notes, .eh_frame, which `inputSections` copies).
 fn sectionOf(o: *const Object, index: usize) ?Atom.Section {
     const sh = o.shdrs[index];
     if (sh.sh_flags & elf.SHF_ALLOC == 0 or sh.sh_flags & elf.SHF_EXCLUDE != 0) return null;
@@ -398,6 +398,8 @@ pub const Converted = struct {
     /// The objects' functions and objects within their sections' atoms,
     /// for .symtab, except those that name their atom.
     symbols: []const Elf.LocalSymbol,
+    /// Their unwind and debug sections, which the link copies.
+    sections: []const Elf.InputSection,
 };
 
 /// Converts every loaded object into atoms. `ctx` resolves what the
@@ -410,8 +412,9 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
     var atoms: std.ArrayList(Atom) = .empty;
     var values: std.ArrayList(Elf.Value) = .empty;
     var symbols: std.ArrayList(Elf.LocalSymbol) = .empty;
+    var sections: std.ArrayList(Elf.InputSection) = .empty;
     var weak_used = false;
-    var c: Converter(@TypeOf(ctx)) = .{ .in = in, .ctx = ctx, .atoms = &atoms, .weak_used = &weak_used };
+    var c: Converter(@TypeOf(ctx)) = .{ .in = in, .ctx = ctx, .atoms = &atoms, .sections = &sections, .weak_used = &weak_used };
     // Two strong definitions of a name, one Zig's, are an error, as ld's.
     var defs = in.defs.iterator();
     while (defs.next()) |d| if (!d.value_ptr.weak) if (try ctx.zigExport(d.key_ptr.*) != null) {
@@ -430,6 +433,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
         c.whole = try arena.realloc(c.whole, o.shdrs.len);
         @memset(c.whole, false);
         for (0..o.shdrs.len) |i| try c.section(@intCast(i));
+        try c.inputSections();
         for (o.syms[1..], 1..) |sym, s_index| {
             const ty = sym.st_type();
             if (ty != elf.STT_FUNC and ty != elf.STT_OBJECT and ty != elf.STT_TLS) continue;
@@ -452,7 +456,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
     try sortArrays(arena, atoms.items, c.arrays.items);
     if (weak_used) try values.append(arena, .{ .key = undefined_weak_key, .value = 0 });
     try values.appendSlice(arena, c.abs_values.items);
-    return .{ .atoms = atoms.items, .values = values.items, .symbols = symbols.items };
+    return .{ .atoms = atoms.items, .values = values.items, .symbols = symbols.items, .sections = sections.items };
 }
 
 const ArrayAtom = struct { atom: u32, priority: u32 };
@@ -499,6 +503,7 @@ fn Converter(comptime Ctx: type) type {
         ctx: Ctx,
         o: *const Object = undefined,
         atoms: *std.ArrayList(Atom),
+        sections: *std.ArrayList(Elf.InputSection),
         weak_used: *bool,
         abs_values: std.ArrayList(Elf.Value) = .empty,
         list: Atom.RelocList = .{},
@@ -506,6 +511,8 @@ fn Converter(comptime Ctx: type) type {
         names: []u32 = &.{},
         /// Per section of `o`: whether it became one atom of its own.
         whole: []bool = &.{},
+        /// Per section of `o`: its index in `sections`, or `no_input`.
+        input_of: []u32 = &.{},
         /// How each global name the objects reference resolved.
         resolved: std.StringHashMapUnmanaged(?Target) = .empty,
         /// The init and fini arrays' atoms, in input order.
@@ -571,6 +578,215 @@ fn Converter(comptime Ctx: type) type {
                 .targets = try arena.dupe(SymbolKey, c.list.targets.keys()),
                 .relocs = try arena.dupe(Atom.Reloc, c.list.relocs.items),
             });
+        }
+
+        const no_input = std.math.maxInt(u32);
+
+        /// Adds `o`'s unwind and debug sections to `sections`: each debug
+        /// section whole, and .eh_frame without the FDEs of sections the
+        /// link dropped (later copies of a COMDAT group).
+        fn inputSections(c: *C) !void {
+            const o = c.o;
+            const arena = c.in.arena;
+            c.input_of = try arena.realloc(c.input_of, o.shdrs.len);
+            @memset(c.input_of, no_input);
+            for (o.shdrs, 0..) |sh, i| {
+                if (o.discarded[i] or sh.sh_type == elf.SHT_NOBITS or sh.sh_type == elf.SHT_RELA) continue;
+                const name = o.sectionName(i);
+                const kind = Elf.InputKind.fromName(name) orelse continue;
+                // Only an allocated .eh_frame is the unwinder's.
+                if ((kind == .eh_frame) != (sh.sh_flags & elf.SHF_ALLOC != 0)) continue;
+                if (sh.sh_flags & elf.SHF_COMPRESSED != 0) {
+                    try c.fail("{s}: zap does not link compressed debug sections ('{s}') yet; compile without -gz", .{ o.path, name });
+                    continue;
+                }
+                c.input_of[i] = @intCast(c.sections.items.len);
+                try c.sections.append(arena, .{ .kind = kind, .name = o.path, .bytes = o.sectionBytes(i) });
+            }
+            for (c.input_of, 0..) |n, i| {
+                if (n == no_input) continue;
+                const s = &c.sections.items[n];
+                c.list.targets.clearRetainingCapacity();
+                var relocs: std.ArrayList(Elf.InputReloc) = .empty;
+                if (s.kind == .eh_frame) try c.ehFrame(@intCast(i), s, &relocs) else try c.debugRelocs(@intCast(i), s, &relocs);
+                s.targets = try arena.dupe(SymbolKey, c.list.targets.keys());
+                s.relocs = relocs.items;
+            }
+        }
+
+        /// The relocations of section `index`, sorted by offset.
+        fn sortedRelas(c: *C, index: u32) ![]elf.Elf64_Rela {
+            const o = c.o;
+            if (o.rela_of[index] == 0) return &.{};
+            const src = std.mem.bytesAsSlice(elf.Elf64_Rela, o.sectionBytes(o.rela_of[index]));
+            const relas = try c.in.arena.alloc(elf.Elf64_Rela, src.len);
+            for (relas, src) |*d, r| d.* = r;
+            std.sort.pdq(elf.Elf64_Rela, relas, {}, struct {
+                fn lt(_: void, a: elf.Elf64_Rela, b: elf.Elf64_Rela) bool {
+                    return a.r_offset < b.r_offset;
+                }
+            }.lt);
+            return relas;
+        }
+
+        const InputTarget = union(enum) {
+            atom: Target,
+            /// An input section of `sections`, and the offset in it.
+            section: struct { index: u32, offset: u64 },
+            constant: u64,
+            /// Dropped by the link, or undefined.
+            none,
+        };
+
+        /// Where a relocation of an unwind or debug section against
+        /// symbol `s` points, `addend` bytes on.
+        fn inputTarget(c: *C, s: u32, addend: i64) !InputTarget {
+            const o = c.o;
+            if (s >= o.syms.len) return .none;
+            const sym = o.syms[s];
+            const bind = sym.st_bind();
+            const plus: u64 = @bitCast(addend);
+            if (s >= o.first_global and (bind == elf.STB_GLOBAL or bind == elf.STB_WEAK)) {
+                const gop = try c.resolved.getOrPut(c.in.arena, o.symName(sym));
+                if (!gop.found_existing) gop.value_ptr.* = try c.resolve(gop.key_ptr.*, bind == elf.STB_WEAK);
+                if (gop.value_ptr.*) |t| return if (t.import) .none else .{ .atom = t };
+                if (sym.st_shndx == elf.SHN_ABS) return .{ .constant = sym.st_value +% plus };
+                return .none;
+            }
+            const shndx = sym.st_shndx;
+            if (shndx == elf.SHN_ABS) return .{ .constant = sym.st_value +% plus };
+            if (shndx == elf.SHN_UNDEF or shndx >= elf.SHN_LORESERVE) return .none;
+            if (c.input_of[shndx] != no_input) return .{ .section = .{ .index = c.input_of[shndx], .offset = sym.st_value } };
+            if (o.discarded[shndx] or sectionOf(o, shndx) == null) return .none;
+            return if (try c.in.symTarget(o, s, addend)) |t| .{ .atom = t } else .none;
+        }
+
+        /// Converts relocation `r` of an unwind or debug section. A
+        /// reference to what the link dropped becomes `tombstone`, as
+        /// lld's.
+        fn inputReloc(c: *C, index: u32, relocs: *std.ArrayList(Elf.InputReloc), r: elf.Elf64_Rela, new_offset: u64, tombstone: u64) !void {
+            const R = elf.R_X86_64;
+            const ty = std.enums.fromInt(R, r.r_type()) orelse return c.unsupported(index, r.r_type());
+            const wide = switch (ty) {
+                .NONE => return,
+                .@"32", .PC32, .DTPOFF32 => false,
+                .@"64", .DTPOFF64 => true,
+                else => return c.unsupported(index, r.r_type()),
+            };
+            var rel: Elf.InputReloc = .{ .offset = @intCast(new_offset), .target = 0, .addend = r.r_addend, .kind = undefined };
+            switch (try c.inputTarget(r.r_sym(), r.r_addend)) {
+                .atom => |t| {
+                    rel.kind = switch (ty) {
+                        .@"32" => .abs32,
+                        .@"64" => .abs64,
+                        .PC32 => .pc32,
+                        .DTPOFF32 => .dtpoff32,
+                        .DTPOFF64 => .dtpoff64,
+                        else => unreachable,
+                    };
+                    const gop = try c.list.targets.getOrPut(c.in.arena, t.key);
+                    rel.target = @intCast(gop.index);
+                    rel.addend = @as(i64, @bitCast(t.offset)) +% r.r_addend;
+                },
+                .section => |t| {
+                    if (ty != .@"32" and ty != .@"64") return c.unsupported(index, r.r_type());
+                    rel.kind = if (wide) .offset64 else .offset32;
+                    rel.target = t.index;
+                    rel.addend = @as(i64, @bitCast(t.offset)) +% r.r_addend;
+                },
+                .constant => |v| {
+                    rel.kind = if (wide) .const64 else .const32;
+                    rel.addend = @bitCast(v);
+                },
+                .none => {
+                    rel.kind = if (wide) .const64 else .const32;
+                    rel.addend = @bitCast(tombstone);
+                },
+            }
+            try relocs.append(c.in.arena, rel);
+        }
+
+        fn debugRelocs(c: *C, index: u32, s: *Elf.InputSection, relocs: *std.ArrayList(Elf.InputReloc)) !void {
+            // A dropped function's range would end a DWARF 4 range or
+            // location list as (0, 0); lld writes 1 there.
+            const tombstone: u64 = @intFromBool(s.kind == .debug_ranges or s.kind == .debug_loc);
+            for (try c.sortedRelas(index)) |r| {
+                if (r.r_offset >= s.bytes.len) return c.fail("{s}: relocation at offset {d} past the end of section '{s}'", .{ c.o.path, r.r_offset, c.o.sectionName(index) });
+                try c.inputReloc(index, relocs, r, r.r_offset, tombstone);
+            }
+        }
+
+        /// Converts .eh_frame section `index`: its CIEs, and the FDEs of
+        /// the sections the link keeps, each FDE's initial location a
+        /// PC-relative relocation, as the unwinder's binary search table
+        /// needs. The records stop at a terminator, if any.
+        fn ehFrame(c: *C, index: u32, s: *Elf.InputSection, relocs: *std.ArrayList(Elf.InputReloc)) !void {
+            const o = c.o;
+            const bytes = s.bytes;
+            const relas = try c.sortedRelas(index);
+            const arena = c.in.arena;
+            // Each record's start and length, and whether it is dropped.
+            const Rec = struct { off: usize, len: usize, drop: bool };
+            var recs: std.ArrayList(Rec) = .empty;
+            var dropped = false;
+            var off: usize = 0;
+            var ri: usize = 0;
+            while (bytes.len - off >= 4) {
+                const len = std.mem.readInt(u32, bytes[off..][0..4], .little);
+                if (len == 0) break;
+                if (len == 0xffffffff or len < 4 or len > bytes.len - off - 4) return c.fail("{s}: malformed or 64-bit record at offset {d} of .eh_frame", .{ o.path, off });
+                var drop = false;
+                if (std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little) != 0) {
+                    while (ri < relas.len and relas[ri].r_offset < off + 8) ri += 1;
+                    if (ri == relas.len or relas[ri].r_offset != off + 8 or relas[ri].r_type() != @backingInt(elf.R_X86_64.PC32))
+                        return c.fail("{s}: the FDE at offset {d} of .eh_frame is not PC-relative, which zap does not link yet", .{ o.path, off });
+                    drop = switch (try c.inputTarget(relas[ri].r_sym(), relas[ri].r_addend)) {
+                        .atom => false,
+                        else => true,
+                    };
+                    dropped = dropped or drop;
+                }
+                try recs.append(arena, .{ .off = off, .len = 4 + len, .drop = drop });
+                off += 4 + len;
+            }
+            // Without dropped records, the section is copied as it is.
+            var kept: []u8 = &.{};
+            if (dropped) kept = try arena.alloc(u8, off);
+            var at: usize = 0;
+            var removed: usize = 0;
+            ri = 0;
+            for (recs.items) |rec| {
+                while (ri < relas.len and relas[ri].r_offset < rec.off) ri += 1;
+                if (rec.drop) {
+                    removed += rec.len;
+                    continue;
+                }
+                if (dropped) {
+                    @memcpy(kept[at..][0..rec.len], bytes[rec.off..][0..rec.len]);
+                    // An FDE's CIE pointer spans the records dropped
+                    // between them.
+                    const id = std.mem.readInt(u32, bytes[rec.off + 4 ..][0..4], .little);
+                    if (id != 0) {
+                        if (id > rec.off + 4) return c.fail("{s}: an FDE of .eh_frame points before the section", .{o.path});
+                        const cie = rec.off + 4 - id;
+                        var gap: usize = 0;
+                        for (recs.items) |other| {
+                            if (other.off >= cie and other.off < rec.off and other.drop) gap += other.len;
+                        }
+                        std.mem.writeInt(u32, kept[at + 4 ..][0..4], @intCast(id - gap), .little);
+                    }
+                }
+                while (ri < relas.len and relas[ri].r_offset < rec.off + rec.len) : (ri += 1) {
+                    try c.inputReloc(index, relocs, relas[ri], relas[ri].r_offset - removed, 0);
+                }
+                at += rec.len;
+            }
+            s.bytes = if (dropped) kept[0..at] else bytes[0..off];
+            for (relocs.items) |r| switch (r.kind) {
+                .pc32, .abs64, .abs32 => {},
+                else => if (r.addend != 0 or (r.kind != .const32 and r.kind != .const64))
+                    return c.fail("{s}: .eh_frame references a dropped section or a shared library's symbol, which zap does not link yet", .{o.path}),
+            };
         }
 
         /// The section's first global symbol at its start, else its name.

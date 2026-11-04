@@ -2573,7 +2573,8 @@ and worktrees, so the store and donors can dedup. Input sections map to
   passes null init and fini to `__libc_start_main`, as glibc's own crt1.o
   does.
 - Non-allocated sections are dropped (`.comment`, `.note.*`, `.group`,
-  `.llvm_addrsig`), except `.eh_frame` and `.debug_*` (stage B). An
+  `.llvm_addrsig`), except `.eh_frame` and `.debug_*`, which are copied
+  (see "Unwind and debug info" below). An
   object without `.note.GNU-stack` does not make zap's stack executable.
 
 **Symbols and resolution.** An object's global symbol is a name for
@@ -2671,22 +2672,59 @@ contents" check is made, as ld makes none.
 pulled. Thin archives are `[unsupported]`. `-l<name>` searches `-L`
 directories for `lib<name>.a` (and `.so` in stage C).
 
-**Unwind and debug info (stage B).**
-- `.eh_frame`: each FDE belongs to the section its pc_begin names. The
-  atom's unwind gains a kind `.raw` with the FDE's CIE and instructions,
-  copied. Elf's `.eh_frame` writer emits each distinct input CIE once,
-  and `.eh_frame_hdr` covers the copies, so std's unwinder and debuggers
-  step through C frames.
-- `.debug_*` (clang's DWARF 4): each input compile unit is copied as
-  opaque contributions to .debug_info/.debug_abbrev/.debug_line/
-  .debug_str/.debug_ranges/.debug_loc, after zap's units, with its
-  relocations against atom keys (addresses) and its own contributions
-  (offsets). This needs a second debug input list in `Elf.Options`, since
-  `Atom.Debug` is zap's line-program format.
-- Until stage B, C frames unwind by frame pointer (upstream builds Debug
-  C with `-fno-omit-frame-pointer`), and traces show their symbols
-  without lines. Whether std's unwinder falls back to frame pointers
-  without an FDE is to check first.
+**Unwind and debug info (stage B; built 2026-11-04).** The inputs'
+`.eh_frame` and `.debug_*` sections are not atoms: `ElfInput.convert`
+turns each into an `Elf.InputSection` (kind, bytes, relocations), and
+Elf copies them after zap's own part of each output section, in input
+order, applying their relocations, one parallel task per section. So
+C frames get file:line in std's traces and gdb, and std's unwinder steps
+through them.
+- Relocations (`Elf.InputReloc`): `abs32`/`abs64` against atoms
+  (addresses), `offset32`/`offset64` against another input section of
+  the same object (its offset in its output section: zap's part, the
+  sections of that kind before it, plus the addend), `dtpoff32`/
+  `dtpoff64` for thread-locals' DWARF locations, `pc32` in .eh_frame,
+  and constants. A reference to what the link dropped (a later COMDAT
+  copy) or to an undefined name becomes lld's tombstone: 1 in
+  .debug_ranges and .debug_loc, where 0 would end a DWARF 4 list, else
+  0.
+- `.eh_frame`: CIEs are copied as they are, not merged. An FDE whose
+  section was dropped is dropped, and the CIE pointers of the FDEs after
+  it shrink by the records dropped in between; without drops the section
+  is copied in place. Every FDE's initial location must be a PC32
+  relocation at offset 8 (pcrel sdata4, as GCC and Clang write on
+  x86_64), from which the linker takes the function's address for
+  .eh_frame_hdr. The input records go after zap's FDEs, before the
+  terminator, and their search-table entries after zap's; with any,
+  the linker gathers the whole table after the copy and sorts it, since
+  C functions can lie among zap's.
+- `.debug_*`: zap writes .debug_abbrev, .debug_info, .debug_rnglists,
+  .debug_line and .debug_str; each input section of those kinds follows
+  zap's part, and the kinds only inputs bring (.debug_ranges, .debug_loc,
+  .debug_loclists, .debug_str_offsets, .debug_addr, .debug_line_str,
+  .debug_aranges, .debug_frame, .debug_names, .debug_macro, the pubnames
+  kinds) get headers and names of their own after .debug_str, only when
+  present, so outputs without inputs stay byte-identical. Units of any
+  DWARF version mix: each input unit keeps its own header, abbreviations
+  and string offsets. Strings are not merged. Compressed sections (`-gz`)
+  are an error.
+- C++ exceptions: a CIE's personality pointer (indirect pcrel through
+  the COMDAT `DW.ref.__gxx_personality_v0`) and an FDE's LSDA pointer
+  are ordinary `pc32` relocations; `.gcc_except_table` is a rodata atom
+  like any allocated section. libunwind finds the FDEs through
+  PT_GNU_EH_FRAME as std's unwinder does. Checked by hand with a Zig
+  main, a `zig c++` object and upstream's libc++.a, libc++abi.a and
+  libunwind.a (`-lc`): a throw through three frames with a cleanup,
+  `throw 5`, a static constructor and `thread_local` with a dynamic
+  initializer give upstream's result. The C thread keeps the committed
+  test with its `-lc++`.
+- Keyed links only, like `local_symbols`; builds with inputs do not
+  relink from the manifest.
+- Tests: the C object test (test/link_input/ub.c) checks the trace's
+  `ub.c:2:34` line and the Zig caller's frame below it; the COMDAT test's
+  assembly has FDEs, so the dropped copy's FDE is dropped; an Elf unit
+  test places a C function between two of zap's and checks the sorted
+  search table and the relocated debug sections.
 
 **Shared libraries as inputs (stage C; built 2026-11-04).** A `.so`
 contributes names, with their versions (`.dynsym`, `.gnu.version`,
@@ -2858,7 +2896,8 @@ differs from the design above:
    thread-locals (GD, LD and IE relaxed); a COMDAT pair written in
    assembly; a Zig panic in a callback the C code calls.
 2. B: `.eh_frame` and DWARF pass-through. Checks: gdb's `bt` and line
-   numbers through C frames, and std's stack trace through them.
+   numbers through C frames, and std's stack trace through them. Built
+   2026-11-04.
 3. C: `.so` inputs (`-l<name>` against a library upstream built), and
    copy relocations if an input needs them. Built 2026-11-04.
 

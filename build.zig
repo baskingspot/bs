@@ -1091,11 +1091,14 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     ub_exe.addFileArg(ub_o);
     ub_exe.setEnvironmentVariable("ZAP_CACHE", "off");
     const ub_bin = ub_exe.addPrefixedOutputFileArg("-femit-bin=", "main");
-    for ([_][2][]const u8{ .{ "o", "panic: signed integer overflow: 5 + 2147483647 cannot be represented in type 'int'\n" }, .{ "s", "panic: stack smashing detected\n" } }) |case| {
+    // The trace shows the C frame's line, from the object's DWARF, and
+    // unwinds through it by its .eh_frame FDE.
+    const trace_o = [_][]const u8{ "panic: signed integer overflow: 5 + 2147483647 cannot be represented in type 'int'\n", "ub.c:2:34: 0x", " in c_overflow (", "ub_main.zig:10:63: 0x" };
+    for ([_]struct { []const u8, []const []const u8 }{ .{ "o", &trace_o }, .{ "s", &.{"panic: stack smashing detected\n"} } }) |case| {
         const r = std.Build.Step.Run.create(b, b.fmt("run zap link of a C object ({s})", .{case[0]}));
         r.addFileArg(ub_bin);
         r.addArg(case[0]);
-        r.addCheck(.{ .expect_stderr_match = case[1] });
+        for (case[1]) |m| r.addCheck(.{ .expect_stderr_match = m });
         r.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
         test_step.dependOn(&r.step);
     }

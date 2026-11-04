@@ -35,6 +35,11 @@
 //! FDE, before the debug entries are read, so the room FDEs do not use
 //! is zero bytes after each section.
 //!
+//! C inputs' .eh_frame and .debug_* sections (`Options.input_sections`)
+//! follow zap's part of each output section, after zap's FDEs and before
+//! the terminator in .eh_frame; debug sections zap does not write follow
+//! .debug_str.
+//!
 //! Thread-local storage: .tdata and .tbss start the RW segment, covered by
 //! a PT_TLS program header (filesz the .tdata bytes, memsz through the end
 //! of .tbss, align the larger alignment), which is what the static TLS
@@ -111,6 +116,11 @@ pub const Options = struct {
     /// and objects of C inputs, whose sections are atoms. Each takes its
     /// type and section from its atom's place. Not with `symbols`.
     local_symbols: []const LocalSymbol = &.{},
+    /// The unwind and debug sections of C inputs, each copied after zap's
+    /// own part of its output section, in this order, with its relocations
+    /// applied. Each .eh_frame FDE gets a .eh_frame_hdr entry. Not with
+    /// `symbols`.
+    input_sections: []const InputSection = &.{},
 };
 
 pub const LocalSymbol = struct {
@@ -118,6 +128,85 @@ pub const LocalSymbol = struct {
     atom: SymbolKey,
     offset: u64,
     size: u64,
+};
+
+/// An input object's section that is copied rather than made atoms of
+/// (docs/architecture.md, "Unwind and debug info").
+pub const InputSection = struct {
+    kind: InputKind,
+    /// The object, for diagnostics.
+    name: []const u8,
+    bytes: []const u8,
+    /// The atoms `relocs` address.
+    targets: []const SymbolKey = &.{},
+    /// Sorted by offset. In `.eh_frame`, each FDE's initial location must
+    /// be a `pc32` relocation (pcrel sdata4), at offset 8 of the record.
+    relocs: []const InputReloc = &.{},
+};
+
+/// The output section an `InputSection` goes to: ".eh_frame", or
+/// "." ++ the tag's name.
+pub const InputKind = enum(u8) {
+    eh_frame,
+    // The debug sections zap writes, in their output order.
+    debug_abbrev,
+    debug_info,
+    debug_rnglists,
+    debug_line,
+    debug_str,
+    // Those only inputs bring, after them.
+    debug_ranges,
+    debug_loc,
+    debug_loclists,
+    debug_str_offsets,
+    debug_addr,
+    debug_line_str,
+    debug_aranges,
+    debug_frame,
+    debug_names,
+    debug_macro,
+    debug_macinfo,
+    debug_pubnames,
+    debug_pubtypes,
+    debug_gnu_pubnames,
+    debug_gnu_pubtypes,
+
+    /// The first kind zap writes no part of.
+    pub const first_extra: InputKind = .debug_ranges;
+
+    pub fn fromName(name: []const u8) ?InputKind {
+        if (name.len < 2 or name[0] != '.') return null;
+        return std.meta.stringToEnum(InputKind, name[1..]);
+    }
+};
+
+pub const InputReloc = extern struct {
+    offset: u32,
+    /// An index into `InputSection.targets`, or for `offset32` and
+    /// `offset64`, into `Options.input_sections`.
+    target: u32,
+    addend: i64,
+    kind: Kind,
+
+    pub const Kind = enum(u8) {
+        /// S + A, 32 bits checked and 64.
+        abs32,
+        abs64,
+        /// S + A - P (.eh_frame only).
+        pc32,
+        /// S + A minus the start of the TLS segment, for a thread-local
+        /// S (DWARF locations).
+        dtpoff32,
+        dtpoff64,
+        /// A within the input section `target` as its output section
+        /// places it: zap's part's size, the input sections of the kind
+        /// before it, plus A.
+        offset32,
+        offset64,
+        /// A, for references to what the link dropped.
+        const32,
+        const64,
+    };
 };
 
 pub const FileWrites = enum {
@@ -227,7 +316,8 @@ pub const Error = Allocator.Error || std.Io.Cancelable || error{
     /// Writing the output file failed, for example because the disk is
     /// full.
     WriteFailed,
-    /// An input's record is malformed (see `AtomSlice.check`).
+    /// An input's record is malformed (see `AtomSlice.check`), or an
+    /// input section's (`InputSection`).
     InvalidInput,
 };
 
@@ -508,6 +598,31 @@ const Place = packed struct(u64) {
 };
 /// Atoms per unit of work in placement and copying.
 const chunk_len = 2048;
+const n_input_kinds = std.enums.values(InputKind).len;
+/// An .eh_frame_hdr search table entry: a function's address and its
+/// FDE's, relative to .eh_frame_hdr.
+const HdrEntry = extern struct { pc: i32, fde: i32 };
+
+/// The number of FDEs in .eh_frame input section `s`, or null if its
+/// records are malformed or an FDE's initial location is not a `pc32`
+/// relocation at offset 8.
+fn inputFdes(s: *const InputSection) ?u32 {
+    var off: usize = 0;
+    var r: usize = 0;
+    var n: u32 = 0;
+    while (off < s.bytes.len) {
+        if (s.bytes.len - off < 8) return null;
+        const len = std.mem.readInt(u32, s.bytes[off..][0..4], .little);
+        if (len < 4 or len > s.bytes.len - off - 4) return null;
+        if (std.mem.readInt(u32, s.bytes[off + 4 ..][0..4], .little) != 0) {
+            while (r < s.relocs.len and s.relocs[r].offset < off + 8) r += 1;
+            if (r == s.relocs.len or s.relocs[r].offset != off + 8 or s.relocs[r].kind != .pc32 or s.relocs[r].target >= s.targets.len) return null;
+            n += 1;
+        }
+        off += 4 + len;
+    }
+    return n;
+}
 /// Address-table entries, with numbered symbols: an atom's address minus
 /// the base address, `value_tag` plus the index of a value in
 /// `Symbols.values`, or `unset` for a number with neither. 32 bits keep
@@ -570,7 +685,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const n_partitions = std.math.ceilPowerOfTwoAssert(usize, @min(n_threads, 8));
 
     const numbered = options.symbols;
-    if (numbered) |s| if (s.atoms.len != n_atoms or (options.entry != null and s.entry >= s.len) or options.local_symbols.len != 0) return error.InvalidSymbols;
+    if (numbered) |s| if (s.atoms.len != n_atoms or (options.entry != null and s.entry >= s.len) or options.local_symbols.len != 0 or options.input_sections.len != 0) return error.InvalidSymbols;
     if (numbered) |s| if (options.dynamic) |d| if (s.dynamic_imports.len != d.imports.len or s.dynamic_exports.len != d.exports.len) return error.InvalidSymbols;
     var symbols: SymbolTable = if (numbered == null) try .init(n_atoms, n_partitions) else .empty;
     defer symbols.deinit();
@@ -606,8 +721,23 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     defer for (debug_chunks) |*c| c.deinit(gpa);
     const file_of = try gpa.alloc(u32, n_debug);
     defer gpa.free(file_of);
-    // Atom chunks, then debug chunks.
-    const failures = try gpa.alloc(?Failure, @max(n_chunks + n_debug_chunks, n_partitions));
+    // The input sections' places within their kinds' parts, and the FDEs
+    // among them.
+    const inputs = options.input_sections;
+    var input_sizes: [n_input_kinds]u64 = @splat(0);
+    const input_offs = try gpa.alloc(u64, inputs.len);
+    defer gpa.free(input_offs);
+    var n_input_fdes: u32 = 0;
+    for (inputs, input_offs) |*s, *off| {
+        off.* = input_sizes[@backingInt(s.kind)];
+        input_sizes[@backingInt(s.kind)] += s.bytes.len;
+        if (s.kind == .eh_frame) n_input_fdes += inputFdes(s) orelse {
+            diag.* = .{ .atom = s.name };
+            return error.InvalidInput;
+        };
+    }
+    // Atom chunks, then debug chunks, then input sections.
+    const failures = try gpa.alloc(?Failure, @max(n_chunks + n_debug_chunks + inputs.len, n_partitions));
     defer gpa.free(failures);
     var l: Link = .{
         .gpa = gpa,
@@ -628,6 +758,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .chunks = chunks,
         .symbols = &symbols,
         .failures = failures,
+        .input_sections = inputs,
+        .input_offs = input_offs,
     };
 
     @memset(failures, null);
@@ -758,7 +890,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const n_arrays = @as(u64, @intFromBool(sizes[preinit] > 0)) + @intFromBool(sizes[init] > 0) + @intFromBool(sizes[fini] > 0);
     const has_arrays = n_arrays > 0;
     const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls or sizes[cntrs] > 0 or has_relro or has_arrays or has_dyn;
-    const has_cfi = n_debug > 0;
+    const input_eh = input_sizes[@backingInt(InputKind.eh_frame)];
+    const has_cfi = n_debug > 0 or input_eh > 0;
     // Which program headers are written, of all the linker writes, in
     // order: PHDR; the R, RX, and RW LOADs; DYNAMIC; TLS; GNU_RELRO;
     // GNU_EH_FRAME; GNU_STACK; INTERP comes second.
@@ -800,9 +933,10 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // atom is a distinct one (`Dwarf.layOutDebug` checks that they
     // ascend), so at most `n_long_fdes` FDEs exceed the short bound.
     const eh_off = std.mem.alignForward(u64, pcs_end, 8);
-    const eh_room = if (has_cfi) Dwarf.cie.len + n_debug * Dwarf.max_short_fde_size + @min(n_debug, n_long_fdes) * (Dwarf.max_fde_size - Dwarf.max_short_fde_size) + 4 else 0;
+    // The input sections' FDEs follow zap's.
+    const eh_room = if (has_cfi) Dwarf.cie.len + n_debug * Dwarf.max_short_fde_size + @min(n_debug, n_long_fdes) * (Dwarf.max_fde_size - Dwarf.max_short_fde_size) + input_eh + 4 else 0;
     const hdr_off = eh_off + eh_room;
-    const hdr_room = if (has_cfi) Dwarf.eh_frame_hdr_size + n_debug * Dwarf.eh_frame_hdr_entry_size else 0;
+    const hdr_room = if (has_cfi) Dwarf.eh_frame_hdr_size + (n_debug + n_input_fdes) * Dwarf.eh_frame_hdr_entry_size else 0;
     const r_end = if (has_cfi) hdr_off + hdr_room else pcs_end;
     const rx_start = if (has_rx) std.mem.alignForward(u64, r_end, page_size) else r_end;
     const plt_off = if (has_dyn) std.mem.alignForward(u64, rx_start, 16) else rx_start;
@@ -912,23 +1046,63 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // files and units in first-use order.
     var dwarf: Dwarf = try .place(gpa, debug_chunks, options.comp_dir, base + starts[text], dwarf_language);
     defer dwarf.deinit(gpa);
-    const has_debug = dwarf.present();
-
-    const abbrev_off = file_end;
-    const info_off = abbrev_off + if (has_debug) Dwarf.abbrev.len else 0;
-    const info_size = dwarf.info_size;
-    const ranges_off = info_off + info_size;
-    const ranges_size = if (has_debug) dwarf.ranges_size else 0;
-    const line_off = ranges_off + ranges_size;
-    const line_size = dwarf.line_size;
-    const str_off = line_off + line_size;
-    const str_size = if (has_debug) Dwarf.str.len else 0;
-    const symtab_off = std.mem.alignForward(u64, str_off + str_size, 8);
+    const has_zap_debug = dwarf.present();
+    // Each debug section: zap's part, then the input sections', in kind
+    // order; .eh_frame's input sections follow zap's FDEs.
+    var zap_parts: [n_input_kinds]u64 = @splat(0);
+    if (has_zap_debug) {
+        zap_parts[@backingInt(InputKind.debug_abbrev)] = Dwarf.abbrev.len;
+        zap_parts[@backingInt(InputKind.debug_info)] = dwarf.info_size;
+        zap_parts[@backingInt(InputKind.debug_rnglists)] = dwarf.ranges_size;
+        zap_parts[@backingInt(InputKind.debug_line)] = dwarf.line_size;
+        zap_parts[@backingInt(InputKind.debug_str)] = Dwarf.str.len;
+    }
+    var sec_offs: [n_input_kinds]u64 = undefined;
+    sec_offs[@backingInt(InputKind.eh_frame)] = eh_off + Dwarf.cie.len + dwarf.frame_bytes;
+    var debug_end = file_end;
+    var has_input_debug = false;
+    for (sec_offs[1..], zap_parts[1..], input_sizes[1..]) |*off, zap, in_size| {
+        off.* = debug_end;
+        debug_end += zap + in_size;
+        has_input_debug = has_input_debug or in_size > 0;
+    }
+    const has_debug = has_zap_debug or has_input_debug;
+    const sec_size = struct {
+        fn f(zap: []const u64, in_sizes: []const u64, k: InputKind) u64 {
+            return zap[@backingInt(k)] + in_sizes[@backingInt(k)];
+        }
+    }.f;
+    const abbrev_off = sec_offs[@backingInt(InputKind.debug_abbrev)];
+    const info_off = sec_offs[@backingInt(InputKind.debug_info)];
+    const ranges_off = sec_offs[@backingInt(InputKind.debug_rnglists)];
+    const line_off = sec_offs[@backingInt(InputKind.debug_line)];
+    const str_off = sec_offs[@backingInt(InputKind.debug_str)];
+    l.sec_offs = sec_offs;
+    l.zap_parts = zap_parts;
+    const symtab_off = std.mem.alignForward(u64, debug_end, 8);
     const strtab_off = symtab_off + @as(u64, n_syms) * @sizeOf(elf.Elf64.Sym);
     const shstrtab_off = strtab_off + strtab_len;
-    const shstr = if (has_arrays) shstrtab else if (exe_dyn) shstrtab_no_arrays else if (has_dyn) shstrtab_no_exe else if (has_relro) shstrtab_no_dyn else if (has_sancov) shstrtab_no_relro else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
+    const shstr_fixed = if (has_arrays) shstrtab else if (exe_dyn) shstrtab_no_arrays else if (has_dyn) shstrtab_no_exe else if (has_relro) shstrtab_no_dyn else if (has_sancov) shstrtab_no_relro else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
+    // The names of the debug sections only inputs bring follow.
+    const extra_kinds = std.enums.values(InputKind)[@backingInt(InputKind.first_extra)..];
+    var extra_names: [extra_kinds.len]u32 = @splat(0);
+    var shstr_len: u64 = shstr_fixed.len;
+    var n_extra: u16 = 0;
+    for (extra_kinds, &extra_names) |k, *name| if (input_sizes[@backingInt(k)] > 0) {
+        name.* = @intCast(shstr_len);
+        shstr_len += @tagName(k).len + 2;
+        n_extra += 1;
+    };
+    const shstr = try gpa.alloc(u8, shstr_len);
+    defer gpa.free(shstr);
+    @memcpy(shstr[0..shstr_fixed.len], shstr_fixed);
+    for (extra_kinds, extra_names) |k, name| if (name != 0) {
+        shstr[name] = '.';
+        @memcpy(shstr[name + 1 ..][0..@tagName(k).len], @tagName(k));
+        shstr[name + 1 + @tagName(k).len] = 0;
+    };
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
-    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 3 * @as(u16, @intFromBool(has_arrays)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug)) + 8 * @as(u16, @intFromBool(has_dyn)) + 3 * @as(u16, @intFromBool(exe_dyn));
+    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 3 * @as(u16, @intFromBool(has_arrays)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug)) + n_extra + 8 * @as(u16, @intFromBool(has_dyn)) + 3 * @as(u16, @intFromBool(exe_dyn));
     l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
     switch (l.target) {
         .memory => |buf| {
@@ -949,6 +1123,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
                 const lens = c.lens();
                 l.scratch_len = @max(l.scratch_len, lens.info + lens.ranges + lens.line + fde_len);
             }
+            for (inputs) |s| l.scratch_len = @max(l.scratch_len, s.bytes.len);
             l.scratch = try gpa.alloc(u8, n_threads * l.scratch_len);
         },
     }
@@ -965,19 +1140,20 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     try l.fill(tdata_end, starts[data_rel_ro] - tdata_end);
     for ([_]usize{ data_rel_ro, preinit, init }, [_]usize{ preinit, init, fini }) |a, b| try l.fill(starts[a] + sizes[a], starts[b] - (starts[a] + sizes[a]));
     try l.fill(relro_end, starts[data] - relro_end);
-    try l.fill(str_off + str_size, symtab_off - (str_off + str_size));
+    try l.fill(debug_end, symtab_off - debug_end);
     try l.fill(symtab_off, @sizeOf(elf.Elf64.Sym));
     try l.fill(strtab_off, 1);
     try l.put(shstrtab_off, shstr);
     try l.fill(shstrtab_off + shstr.len, shoff - (shstrtab_off + shstr.len));
-    const eh_size = Dwarf.cie.len + dwarf.frame_bytes + 4;
-    const hdr_size = Dwarf.eh_frame_hdr_size + @as(u64, dwarf.n_frames) * Dwarf.eh_frame_hdr_entry_size;
+    const eh_size = Dwarf.cie.len + dwarf.frame_bytes + input_eh + 4;
+    const n_frames = dwarf.n_frames + n_input_fdes;
+    const hdr_size = Dwarf.eh_frame_hdr_size + @as(u64, n_frames) * Dwarf.eh_frame_hdr_entry_size;
     if (has_cfi) {
         // The FDEs and the search table are written with the debug chunks.
         try l.put(eh_off, &Dwarf.cie);
         try l.fill(eh_off + eh_size - 4, hdr_off - (eh_off + eh_size - 4)); // terminator, unused room
         const eh_frame_rel: i32 = @intCast(@as(i64, @intCast(eh_off)) - @as(i64, @intCast(hdr_off + 4)));
-        try l.put(hdr_off, &Dwarf.ehFrameHdr(eh_frame_rel, dwarf.n_frames));
+        try l.put(hdr_off, &Dwarf.ehFrameHdr(eh_frame_rel, n_frames));
         try l.fill(hdr_off + hdr_size, r_end - (hdr_off + hdr_size));
     }
     if (dyn) |*t| {
@@ -1072,7 +1248,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         try l.put(symtab_off + @as(u64, local_sym) * @sizeOf(elf.Elf64.Sym), std.mem.sliceAsBytes(syms));
         try l.put(strtab_off + local_str, strs);
     }
-    if (has_debug) {
+    if (has_zap_debug) {
         try l.put(abbrev_off, &Dwarf.abbrev);
         l.info_off = info_off;
         l.ranges_off = ranges_off;
@@ -1080,6 +1256,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         try dwarf.heads(&l, Link.putDebug);
         try l.put(str_off, Dwarf.str);
     }
+    // With input FDEs, the search table is gathered and sorted after the
+    // copy, since their functions can lie anywhere among zap's.
+    const hdr_table = try gpa.alloc(HdrEntry, if (n_input_fdes > 0) n_frames else 0);
+    defer gpa.free(hdr_table);
+    l.hdr_table = hdr_table;
 
     const resolved = try gpa.alloc(u64, n_threads * max_targets);
     defer gpa.free(resolved);
@@ -1090,8 +1271,38 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     l.max_targets = max_targets;
     l.eh_off = eh_off;
     l.hdr_off = hdr_off;
-    try parallel(io, n_threads, n_chunks + n_debug_chunks, &l, Link.copyAll);
+    try parallel(io, n_threads, n_chunks + n_debug_chunks + inputs.len, &l, Link.copyAll);
     try l.check(diag);
+    if (n_input_fdes > 0) {
+        const hdr_addr = base + hdr_off;
+        var k: usize = dwarf.n_frames;
+        for (inputs, 0..) |*s, i| {
+            if (s.kind != .eh_frame) continue;
+            const eh_addr = base + l.inputOff(i);
+            var off: usize = 0;
+            var r: usize = 0;
+            while (off < s.bytes.len) {
+                const len = std.mem.readInt(u32, s.bytes[off..][0..4], .little);
+                if (std.mem.readInt(u32, s.bytes[off + 4 ..][0..4], .little) != 0) {
+                    while (s.relocs[r].offset < off + 8) r += 1;
+                    const rel = s.relocs[r];
+                    const pc = (l.resolveKey(s.targets[rel.target]) orelse unreachable) +% @as(u64, @bitCast(rel.addend));
+                    hdr_table[k] = .{
+                        .pc = std.math.cast(i32, @as(i64, @bitCast(pc -% hdr_addr))) orelse return error.RelocationOverflow,
+                        .fde = @intCast(@as(i64, @bitCast(eh_addr + off -% hdr_addr))),
+                    };
+                    k += 1;
+                }
+                off += 4 + len;
+            }
+        }
+        std.mem.sortUnstable(HdrEntry, hdr_table, {}, struct {
+            fn lt(_: void, a: HdrEntry, b: HdrEntry) bool {
+                return a.pc < b.pc;
+            }
+        }.lt);
+        try l.put(hdr_off + Dwarf.eh_frame_hdr_size, std.mem.sliceAsBytes(hdr_table));
+    }
 
     // Headers.
     var head: [@sizeOf(elf.Elf64.Ehdr) + ph_present.len * @sizeOf(elf.Elf64.Phdr)]u8 = undefined;
@@ -1149,12 +1360,19 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         shdr(shName(".eh_frame_hdr"), .PROGBITS, .{ .ALLOC = true }, base, hdr_off, hdr_size, .@"4"),
     };
     const debug_shdrs = [_]elf.Elf64.Shdr{
-        nonAlloc(shName(".debug_abbrev"), .PROGBITS, abbrev_off, Dwarf.abbrev.len),
-        nonAlloc(shName(".debug_info"), .PROGBITS, info_off, info_size),
-        nonAlloc(shName(".debug_rnglists"), .PROGBITS, ranges_off, ranges_size),
-        nonAlloc(shName(".debug_line"), .PROGBITS, line_off, line_size),
-        nonAlloc(shName(".debug_str"), .PROGBITS, str_off, str_size),
+        nonAlloc(shName(".debug_abbrev"), .PROGBITS, abbrev_off, sec_size(&zap_parts, &input_sizes, .debug_abbrev)),
+        nonAlloc(shName(".debug_info"), .PROGBITS, info_off, sec_size(&zap_parts, &input_sizes, .debug_info)),
+        nonAlloc(shName(".debug_rnglists"), .PROGBITS, ranges_off, sec_size(&zap_parts, &input_sizes, .debug_rnglists)),
+        nonAlloc(shName(".debug_line"), .PROGBITS, line_off, sec_size(&zap_parts, &input_sizes, .debug_line)),
+        nonAlloc(shName(".debug_str"), .PROGBITS, str_off, sec_size(&zap_parts, &input_sizes, .debug_str)),
     };
+    var extra_shdrs: [extra_kinds.len]elf.Elf64.Shdr = undefined;
+    const Present = struct { bool, usize };
+    var extra_present: [extra_kinds.len]Present = undefined;
+    for (&extra_shdrs, &extra_present, extra_kinds, extra_names) |*h, *p, k, name| {
+        h.* = nonAlloc(name, .PROGBITS, sec_offs[@backingInt(k)], input_sizes[@backingInt(k)]);
+        p.* = .{ name != 0, 1 };
+    }
     const tls_shdrs = [_]elf.Elf64.Shdr{
         shdr(shName(".tdata"), .PROGBITS, .{ .ALLOC = true, .WRITE = true, .TLS = true }, base, starts[tdata], sizes[tdata], aligns[tdata]),
         shdr(shName(".tbss"), .NOBITS, .{ .ALLOC = true, .WRITE = true, .TLS = true }, base, starts[tbss], sizes[tbss], aligns[tbss]),
@@ -1219,14 +1437,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     } ++ array_shdrs ++ [_]elf.Elf64.Shdr{
         shdr(shName(".data"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
         shdr(shName(".bss"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
-    } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ dyn_shdrs ++ exe_shdrs ++ [_]elf.Elf64.Shdr{
+    } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ extra_shdrs ++ dyn_shdrs ++ exe_shdrs ++ [_]elf.Elf64.Shdr{
         .{ .name = shName(".symtab"), .type = .SYMTAB, .flags = .{ .shf = .{} }, .addr = 0, .offset = symtab_off, .size = n_syms * @sizeOf(elf.Elf64.Sym), .link = strtab_ndx, .info = n_syms, .addralign = 8, .entsize = @sizeOf(elf.Elf64.Sym) },
         nonAlloc(shName(".strtab"), .STRTAB, strtab_off, strtab_len),
         nonAlloc(shName(".shstrtab"), .STRTAB, shstrtab_off, shstr.len),
     };
     var sh_buf: [shdrs.len * @sizeOf(elf.Elf64.Shdr)]u8 = undefined;
     var sh_at: usize = 0;
-    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ has_relro, 1 }, .{ has_arrays, array_shdrs.len }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ has_dyn, dyn_shdrs.len }, .{ exe_dyn, exe_shdrs.len }, .{ true, 3 } };
+    const present = [_]Present{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ has_relro, 1 }, .{ has_arrays, array_shdrs.len }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len } } ++ extra_present ++ [_]Present{ .{ has_dyn, dyn_shdrs.len }, .{ exe_dyn, exe_shdrs.len }, .{ true, 3 } };
     var group: usize = 0;
     var group_end: usize = present[0][1];
     for (shdrs, 0..) |s, i| {
@@ -1343,6 +1561,17 @@ fn LinkOf(comptime Input: type) type {
         /// File offsets of .eh_frame and .eh_frame_hdr.
         eh_off: u64 = undefined,
         hdr_off: u64 = undefined,
+        /// `Options.input_sections`, and each one's offset within its
+        /// kind's input sections.
+        input_sections: []const InputSection,
+        input_offs: []const u64,
+        /// Per `InputKind`: the file offset of the section (for .eh_frame,
+        /// of its input sections), and the size of zap's part of it.
+        sec_offs: [n_input_kinds]u64 = undefined,
+        zap_parts: [n_input_kinds]u64 = undefined,
+        /// With input FDEs, the whole .eh_frame_hdr search table, which
+        /// `copyDebug` copies zap's entries to.
+        hdr_table: []HdrEntry = &.{},
 
         fn check(l: *Link, diag: *Diagnostic) Error!void {
             var first: ?Failure = null;
@@ -1594,6 +1823,7 @@ fn LinkOf(comptime Input: type) type {
         }
 
         fn copyAll(l: *Link, task: usize, thread: usize) void {
+            if (task >= l.chunks.len + l.debug_chunks.len) return l.copyInput(task - l.chunks.len - l.debug_chunks.len, thread);
             if (task >= l.chunks.len) return l.copyDebug(task - l.chunks.len, thread);
             if (l.dynamic) return l.copyDynamic(task, thread);
             if (l.numbered == null) l.copy(task, thread, false, false) else l.copyNumbered(task, thread);
@@ -1677,10 +1907,70 @@ fn LinkOf(comptime Input: type) type {
                 }
             }
             w.finish();
+            if (l.hdr_table.len != 0) @memcpy(std.mem.sliceAsBytes(l.hdr_table[c.frame_base..][0..c.n_frames]), out[1]);
             l.writeParts(task, begin, 2, offsets, out);
             if (l.target == .file) for (units, info, ranges, line) |u, i, r, ln| {
                 l.writeParts(task, begin, 3, .{ l.info_off + u.info_off, l.ranges_off + u.ranges_off, l.line_off + u.line_off }, .{ i, r, ln });
             };
+        }
+
+        /// The file offset of input section `i`.
+        fn inputOff(l: *const Link, i: usize) u64 {
+            const k = @backingInt(l.input_sections[i].kind);
+            return l.sec_offs[k] + l.zap_parts[k] + l.input_offs[i];
+        }
+
+        /// The address or value of `key`, after `resolveAddrs`.
+        fn resolveKey(l: *const Link, key: SymbolKey) ?u64 {
+            return l.symbols.get(key) orelse l.values.get(key);
+        }
+
+        /// Copies input section `i` and applies its relocations.
+        noinline fn copyInput(l: *Link, i: usize, thread: usize) void {
+            const s = &l.input_sections[i];
+            const task = l.chunks.len + l.debug_chunks.len + i;
+            const off = l.inputOff(i);
+            const out = l.parts(thread, 1, .{off}, .{s.bytes.len});
+            @memcpy(out[0], s.bytes);
+            for (s.relocs) |r| l.inputReloc(s, r, out[0], l.base + off) catch |err| {
+                const target = if (r.kind == .offset32 or r.kind == .offset64 or r.target >= s.targets.len) null else s.targets[r.target];
+                return l.fail(task, l.n_atoms + i, err, .{ .atom = s.name, .target = target });
+            };
+            l.writeParts(task, l.n_atoms + i, 1, .{off}, out);
+        }
+
+        fn inputReloc(l: *const Link, s: *const InputSection, r: InputReloc, dst: []u8, p_base: u64) Error!void {
+            const wide = switch (r.kind) {
+                .abs64, .dtpoff64, .offset64, .const64 => true,
+                .abs32, .pc32, .dtpoff32, .offset32, .const32 => false,
+            };
+            if (@as(u64, r.offset) + @as(u64, if (wide) 8 else 4) > dst.len) return error.InvalidInput;
+            const v: i128 = switch (r.kind) {
+                .offset32, .offset64 => v: {
+                    if (r.target >= l.input_sections.len) return error.InvalidInput;
+                    const k = @backingInt(l.input_sections[r.target].kind);
+                    break :v @as(i128, l.zap_parts[k] + l.input_offs[r.target]) + r.addend;
+                },
+                .const32, .const64 => r.addend,
+                else => v: {
+                    if (r.target >= s.targets.len) return error.InvalidInput;
+                    const t = l.resolveKey(s.targets[r.target]) orelse return error.UndefinedSymbol;
+                    break :v switch (r.kind) {
+                        .abs32, .abs64 => @as(i128, t) + r.addend,
+                        .pc32 => if (s.kind == .eh_frame) @as(i128, t) + r.addend - (p_base + r.offset) else return error.InvalidInput,
+                        .dtpoff32, .dtpoff64 => if (t >= l.tls.start and t < l.tls.end) @as(i128, t - l.tls.start) + r.addend else return error.InvalidRelocation,
+                        else => unreachable,
+                    };
+                },
+            };
+            const f = dst[r.offset..];
+            if (wide) {
+                std.mem.writeInt(u64, f[0..8], @truncate(@as(u128, @bitCast(v))), .little);
+            } else switch (r.kind) {
+                .pc32, .dtpoff32 => std.mem.writeInt(i32, f[0..4], std.math.cast(i32, v) orelse return error.RelocationOverflow, .little),
+                .const32 => std.mem.writeInt(u32, f[0..4], @truncate(@as(u128, @bitCast(v))), .little),
+                else => std.mem.writeInt(u32, f[0..4], std.math.cast(u32, v) orelse return error.RelocationOverflow, .little),
+            }
         }
 
         /// Writes `bytes` at `offset` of a debug section.
@@ -2952,6 +3242,71 @@ test "line programs decode with std.debug.Dwarf" {
     defer gpa.free(stripped);
     try std.testing.expect(std.mem.indexOf(u8, stripped, ".debug_") == null);
     try std.testing.expect(std.mem.indexOf(u8, stripped, ".eh_frame") == null);
+}
+
+test "input sections follow zap's parts, relocated, and their FDEs join the sorted search table" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const code: [16]u8 = @splat(0xcc);
+    const f: SymbolKey = .fromName("f");
+    const c: SymbolKey = .fromName("c");
+    // A C function between two of zap's, whose search table entry must
+    // land between theirs.
+    const atoms = [_]Atom{
+        .{ .key = f, .name = "f", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .frame_pointer },
+        .{ .key = c, .name = "c", .section = .text, .alignment = .@"16", .bytes = &code },
+        .{ .key = .fromName("g"), .name = "g", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .frame_pointer },
+    };
+    const debug = [_]Atom.Debug{
+        .{ .atom = 0, .file = "a.zig", .name = "f", .base_line = 0, .lines = &.{} },
+        .{ .atom = 2, .file = "a.zig", .name = "g", .base_line = 0, .lines = &.{} },
+    };
+    // A CIE (version 1, "zR", pcrel sdata4) and an FDE for `c`.
+    const eh = [_]u8{ 0x14, 0, 0, 0, 0, 0, 0, 0, 1, 'z', 'R', 0, 1, 0x78, 0x10, 1, 0x1b, 0x0c, 0x07, 0x08, 0x90, 0x01, 0, 0 } ++
+        [_]u8{ 0x10, 0, 0, 0, 0x1c, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0 };
+    const info: [12]u8 = @splat(0xaa);
+    const inputs = [_]InputSection{
+        .{ .kind = .eh_frame, .name = "c.o", .bytes = &eh, .targets = &.{c}, .relocs = &.{.{ .offset = 32, .target = 0, .addend = 0, .kind = .pc32 }} },
+        .{ .kind = .debug_str, .name = "c.o", .bytes = "c.c\x00c\x00" },
+        .{ .kind = .debug_info, .name = "c.o", .bytes = &info, .targets = &.{c}, .relocs = &.{
+            .{ .offset = 0, .target = 1, .addend = 4, .kind = .offset32 },
+            .{ .offset = 4, .target = 0, .addend = 2, .kind = .abs64 },
+        } },
+        .{ .kind = .debug_ranges, .name = "c.o", .bytes = &(@as([8]u8, @splat(0xbb)) ++ @as([8]u8, @splat(0))), .relocs = &.{.{ .offset = 0, .target = 0, .addend = 1, .kind = .const64 }} },
+    };
+    const out = try emit(gpa, io, &atoms, .{ .entry = f, .debug = &debug, .input_sections = &inputs });
+    defer gpa.free(out);
+    const text = testSectionAddr(out, ".text");
+
+    // zap's CIE and two FDEs, then the input records, then the terminator.
+    const eh_sh = testSection(out, ".eh_frame").?;
+    try std.testing.expectEqual(Dwarf.cie.len + 2 * Dwarf.fde_size + eh.len + 4, eh_sh.size);
+    const fde_off = eh_sh.offset + Dwarf.cie.len + 2 * Dwarf.fde_size + 24;
+    try std.testing.expectEqual(text + 16, eh_sh.addr + (fde_off - eh_sh.offset) + 8 + @as(u64, @bitCast(@as(i64, std.mem.readInt(i32, out[fde_off + 8 ..][0..4], .little)))));
+    const hdr = testSection(out, ".eh_frame_hdr").?;
+    try std.testing.expectEqual(3, std.mem.readInt(u32, out[hdr.offset + 8 ..][0..4], .little));
+    for ([_]u64{ text, text + 16, text + 32 }, 0..) |pc, i| {
+        const entry = out[hdr.offset + Dwarf.eh_frame_hdr_size + 8 * i ..][0..8];
+        try std.testing.expectEqual(pc, hdr.addr +% @as(u64, @bitCast(@as(i64, std.mem.readInt(i32, entry[0..4], .little)))));
+        if (pc == text + 16) try std.testing.expectEqual(eh_sh.addr + (fde_off - eh_sh.offset), hdr.addr +% @as(u64, @bitCast(@as(i64, std.mem.readInt(i32, entry[4..8], .little)))));
+    }
+
+    // Each debug section: zap's part, then the input's, relocated.
+    const str_sh = testSection(out, ".debug_str").?;
+    try std.testing.expectEqual(Dwarf.str.len + 6, str_sh.size);
+    try std.testing.expectEqualStrings("c.c\x00c\x00", out[str_sh.offset + Dwarf.str.len ..][0..6]);
+    const info_sh = testSection(out, ".debug_info").?;
+    const in_info = out[info_sh.offset + info_sh.size - info.len ..][0..info.len];
+    try std.testing.expectEqual(Dwarf.str.len + 4, std.mem.readInt(u32, in_info[0..4], .little));
+    try std.testing.expectEqual(text + 16 + 2, std.mem.readInt(u64, in_info[4..12], .little));
+    // A section zap does not write gets a header and a name.
+    const ranges_sh = testSection(out, ".debug_ranges").?;
+    try std.testing.expectEqual(16, ranges_sh.size);
+    try std.testing.expectEqual(1, std.mem.readInt(u64, out[ranges_sh.offset..][0..8], .little));
+    // An FDE without its initial location's relocation is malformed.
+    var bad = inputs;
+    bad[0].relocs = &.{};
+    try std.testing.expectError(error.InvalidInput, emit(gpa, io, &atoms, .{ .entry = f, .debug = &debug, .input_sections = &bad }));
 }
 
 test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at the outermost frame" {
