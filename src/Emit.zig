@@ -1015,6 +1015,14 @@ fn lowerExternSlots(emit: *Emit) !bool {
     const zcu = emit.zcu;
     const arena = emit.allocator();
     var ok = true;
+    // By name, not in the order units requested them, which a replay
+    // changes: the slots' order is the link's.
+    emit.externs.sort(struct {
+        names: []const []const u8,
+        pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+            return std.mem.order(u8, c.names[a], c.names[b]) == .lt;
+        }
+    }{ .names = emit.externs.keys() });
     for (emit.externs.keys(), emit.externs.values()) |name, weak| {
         const target = if (emit.shared)
             try emit.userExport(name) orelse try emit.rtExport(name) orelse
