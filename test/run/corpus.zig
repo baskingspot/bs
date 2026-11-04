@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -242,6 +242,14 @@ fn opaqueAddr(p: ?*const anyopaque) u64 {
     return @intFromPtr(p);
 }
 
+// monstar (Keyboard.zig): optional pointers coerce to C pointers, null to
+// null.
+fn optCStrLen(s: ?[*:0]const u8) u64 {
+    const c: [*c]const u8 = s;
+    if (c == null) return 99;
+    return cStrLen(c);
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -314,5 +322,13 @@ fn main() callconv(.c) noreturn {
     rt.printInt(headBytes(big));
     var aligned: [80]u8 align(8) = undefined;
     rt.printInt(@intFromBool(opaqueAddr(&aligned) == @intFromPtr(&aligned)));
+    var name: ?[*:0]const u8 = "monstar";
+    _ = &name;
+    rt.printInt(optCStrLen(name));
+    rt.printInt(optCStrLen(null));
+    var one: ?*const u8 = &"ab"[0];
+    _ = &one;
+    const c_one: [*c]const u8 = one;
+    rt.printInt(c_one[1]);
     rt.exit(0);
 }

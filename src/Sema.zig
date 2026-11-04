@@ -7871,6 +7871,29 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 };
                 return r;
             },
+            // `?[*:0]const u8` to `[*c]const u8`: an optional pointer is
+            // a C pointer's representation, so its pointer must coerce in
+            // place, without an array pointer's decay, as upstream.
+            .optional => if (Type.ptrInfo(ip, dest_ty).flags.size == .c) {
+                const s_child = Type.childType(ip, src_ty);
+                if (!isOptionalNonC(ip, s_child)) return null;
+                const s = ip.keyPayload(.ptr_type, s_child);
+                const d = Type.ptrInfo(ip, dest_ty);
+                if (s.flags.size == .one and ip.keyTag(s.child) == .array_type and s.child != d.child) return null;
+                if (s.flags.alignment != d.flags.alignment) {
+                    try sema.resolveLayoutIfIdle(block, src, s.child);
+                    try sema.resolveLayoutIfIdle(block, src, d.child);
+                }
+                if (!sema.ptrCoercibleInPlace(s_child, dest_ty)) return null;
+                if (val) |v| return switch (ip.indexToKey(v)) {
+                    .opt => |o| if (o.val == .none)
+                        .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .int, .byte_offset = 0 } }))
+                    else
+                        try sema.coercePtrTo(block, .fromInterned(o.val), dest_ty),
+                    else => .fromInterned(try sema.undefValue(dest_ty)),
+                };
+                return try sema.addTyOp(block, .bitcast, dest_ty, inst);
+            },
             .null => if (Type.ptrInfo(ip, dest_ty).flags.size == .c)
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .int, .byte_offset = 0 } })),
             .int, .comptime_int => if (Type.ptrInfo(ip, dest_ty).flags.size == .c) {
