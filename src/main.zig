@@ -25,6 +25,9 @@ const InternPool = @import("InternPool.zig");
 
 pub const zig_version = "0.17.1";
 
+/// Upstream's (src/main.zig).
+const thread_stack_size = 60 << 20;
+
 const usage =
     \\Usage: bs [command] [options]
     \\
@@ -232,6 +235,12 @@ const use_block_cache = builtin.mode != .debug and !builtin.link_libc;
 
 pub fn main(init_std: std.process.Init) !void {
     var init = init_std;
+    // Worker threads get upstream's stack size (its src/main.zig,
+    // `thread_stack_size`), not std's 16 MiB default: AstGen and Sema
+    // recurse once per operand of a long `++` chain. std's start code
+    // passes its `Io.Threaded` as the io's userdata, and no thread is
+    // spawned yet.
+    @as(*std.Io.Threaded, @ptrCast(@alignCast(init.io.userdata.?))).stack_size = thread_stack_size;
     if (own_gpa) {
         safe_gpa = if (builtin.mode == .safe) .init(block_cache.allocator(), .{}) else .init(std.heap.page_allocator, .{
             .stack_trace_frames = if (init.environ_map.get("BS_ALLOC_TRACES")) |v| std.fmt.parseInt(usize, v, 10) catch 7 else 0,
