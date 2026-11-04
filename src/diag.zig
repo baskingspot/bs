@@ -1809,6 +1809,8 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "cannot directly embed opaque type '{f}' in union", .@"bad-container" },
     .{ "packed unions cannot contain fields of type '{f}'", .@"bad-container" },
     .{ "packed struct bit width '{d}' exceeds maximum bit width of 65535", .@"bad-container" },
+    .{ "struct layout requires size {d}, this compiler implementation supports up to {d}", .@"bad-container" },
+    .{ "union layout requires size {d}, this compiler implementation supports up to {d}", .@"bad-container" },
     .{ "empty exhaustive enums must be backed by 'noreturn'", .@"bad-container" },
     .{ "non-empty enums cannot be backed by 'noreturn'", .@"bad-container" },
     .{ "no size available for uninstantiable type '{f}'", .@"bad-type" },

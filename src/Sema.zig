@@ -1164,7 +1164,7 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
     if (decl_ty != .none) {
         val_ref = try sema.coerce(&block, decl_ty, val_ref, .{ .base = decl.src_node, .loc = .var_init });
     }
-    const val = try sema.resolveConstValue(&block, src, val_ref, "initializer of container-level variable must be comptime-known");
+    const val = try sema.resolveConstValue(&block, .{ .base = decl.src_node, .loc = .var_init }, val_ref, "initializer of container-level variable must be comptime-known");
     if (sema.refersToComptimeAlloc(val)) return sema.fail(&block, .{ .base = decl.src_node, .loc = .var_init }, "global variable contains reference to comptime var", .{});
     // As upstream, only a function declaration or a value with a runtime
     // type has an address to align or place.
@@ -1599,6 +1599,8 @@ fn structLayout(sema: *Sema, block: *Block, cont_src: Src, info: *InternPool.Con
             if (!info.fieldIsComptime(i) and Type.hasNoPossibleValue(ip, ft)) break true;
         } else false;
         info.size = if (npv) 0 else std.mem.alignForward(u64, offset, alignment);
+        // Upstream's limit, which its InternPool's 32-bit sizes set.
+        if (info.size > std.math.maxInt(u32)) return sema.fail(block, cont_src, "struct layout requires size {d}, this compiler implementation supports up to {d}", .{ info.size, std.math.maxInt(u32) });
         info.alignment = alignment;
     }
     info.status = .have_layout;
@@ -1921,6 +1923,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
         alignment = @max(alignment, Type.abiAlignment(ip, info.tag_type));
     }
     info.size = std.mem.alignForward(u64, size, alignment);
+    if (info.size > std.math.maxInt(u32)) return sema.fail(&block, cont_src, "union layout requires size {d}, this compiler implementation supports up to {d}", .{ info.size, std.math.maxInt(u32) });
     info.alignment = alignment;
     info.status = .have_layout;
     sema.setComptimeOnly(info);
@@ -3518,6 +3521,13 @@ fn resolveConstValue(sema: *Sema, block: *Block, src: Src, ref: Ref, reason: []c
 
 /// A value at `src` must be comptime-known for `reason`, as upstream's
 /// `failWithNeededComptime`: the reason is a note.
+/// The runtime-known operand at `src` of something a comptime block
+/// evaluates (a switch), as upstream reports it.
+fn failRuntimeOperand(sema: *Sema, block: *Block, src: Src) CompileError {
+    if (block.comptime_reason) |r| return sema.failNeededComptime(block, src, r);
+    return sema.fail(block, src, "unable to resolve comptime value", .{});
+}
+
 fn failNeededComptime(sema: *Sema, block: *Block, src: Src, reason: []const u8) CompileError {
     const err = sema.fail(block, src, "unable to resolve comptime value", .{});
     const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
@@ -12407,6 +12417,9 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
     const zero_bit = !Type.hasRuntimeBits(ip, info.child) and !Type.isComptimeOnly(ip, info.child);
     // Even at comptime, through a runtime pointer.
     if (zero_bit) if (try sema.onePossibleValue(info.child)) |v| return .fromInterned(v);
+    // As upstream, a runtime load in a comptime block is no error of its
+    // own: what needs the value comptime-known reports it.
+    if (block.is_comptime and !block.discards_runtime and !Type.isComptimeOnly(ip, info.child)) return sema.runtimeDummy(info.child);
     try sema.requireRuntimeLoad(block, src);
     try sema.checkAddressSpace(block, src, info.flags.address_space);
     // Lowering reads a comptime_int at a run-time address as it does at a
@@ -16483,7 +16496,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         }
         return sema.switchProngsRuntime(parent, src, inst, cond, operand, &.{chosen}, null, capture_inst);
     }
-    try sema.requireRuntime(parent, src);
+    if (parent.is_comptime and !parent.discards_runtime) return sema.failRuntimeOperand(parent, src.operandSrc(0));
     return sema.switchProngsRuntime(parent, src, inst, cond, operand, cases.items, under_case, capture_inst);
 }
 
@@ -16706,7 +16719,7 @@ fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, opera
             const cur = if (is_ref) try sema.analyzeLoad(parent, src, cur_slot) else cur_slot;
             if (is_ref) setPtr(cases, &else_case, cur_slot);
             const cond = try sema.switchCond(parent, src, cur);
-            const v = sema.resolveValue(cond) orelse return sema.fail(parent, src, "unable to evaluate comptime expression", .{});
+            const v = sema.resolveValue(cond) orelse return sema.failRuntimeOperand(parent, src.operandSrc(0));
             const chosen = for (cases) |c| {
                 if (try sema.switchCaseMatches(c, v)) break c;
             } else else_case orelse return sema.fail(parent, src, "switch must handle all possibilities", .{});
@@ -17084,6 +17097,17 @@ fn switchAsCondBrs(sema: *Sema, block: *Block, src: Src, cases: []const SwitchCa
 
 /// Builds an aggregate value from its elements (including an array's
 /// sentinel), comptime-known if every element is.
+/// An array or anonymous struct literal. As upstream, in a comptime block
+/// one with a runtime-known element is no error of its own: it is
+/// runtime-known, and what needs it comptime-known reports it (a comptime
+/// argument at the argument), so only its type can be used.
+fn initAggregate(sema: *Sema, block: *Block, src: Src, ty: Index, elems: []const Ref) CompileError!Ref {
+    if (block.is_comptime and !block.discards_runtime) for (elems) |e| {
+        if (sema.resolveValue(e) == null) return sema.runtimeDummy(ty);
+    };
+    return sema.aggregate(block, src, ty, elems);
+}
+
 fn aggregate(sema: *Sema, block: *Block, src: Src, ty: Index, elems: []const Ref) CompileError!Ref {
     const vals = try sema.arena.alloc(Index, elems.len);
     var all_comptime = true;
@@ -17094,7 +17118,13 @@ fn aggregate(sema: *Sema, block: *Block, src: Src, ty: Index, elems: []const Ref
         };
     }
     if (all_comptime) return .fromInterned(try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = vals } } }));
-    try sema.requireRuntime(block, src);
+    if (block.is_comptime and !block.discards_runtime) {
+        const err = sema.fail(block, src, "unable to evaluate comptime expression", .{});
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        try sema.zcu.addNote(sema.file, sema.initElemSrc(src, ty, std.mem.indexOfScalar(Index, vals, .none).?).span(tree), "operation is runtime due to this operand", .{});
+        if (block.comptime_reason) |r| try sema.zcu.addNote(sema.file, src.span(tree), "{s}", .{r});
+        return err;
+    }
     for (elems, vals, 0..) |e, v, i| if (v != .none and sema.refersToComptimeAlloc(v)) try sema.validateRuntimeValue(block, sema.initElemSrc(src, ty, i), e);
     try sema.resolveLayout(block, src, ty);
     const class = Type.class(sema.ip, ty);
@@ -17295,7 +17325,7 @@ fn anonStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index, src_node: As
         .names = names,
         .site = site,
     } }, .{ .creator = creator, .template = b.finish() });
-    return sema.aggregate(block, src, ty, inits);
+    return sema.initAggregate(block, src, ty, inits);
 }
 
 fn zirValidatePtrStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
@@ -17392,7 +17422,7 @@ fn zirArrayInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
             if (v.* != .none and sema.ip.keyTag(v.*) == .ptr and try sema.comptimePtrRoot(v.*) == .comptime_alloc) v.* = .none;
         }
         const ty = try sema.intern(.{ .tuple_type = .{ .types = types, .values = values } });
-        return sema.aggregate(block, src, ty, elems);
+        return sema.initAggregate(block, src, ty, elems);
     }
     // As upstream, a result type `?T` or `E!T` initializes a `T`.
     if (sema.unwrapOptEu(result_ty) != result_ty) {
@@ -17417,13 +17447,13 @@ fn arrayInitTyped(sema: *Sema, block: *Block, src: Src, result_ty: Index, inits:
             const elems = try sema.arena.alloc(Ref, a.lenIncludingSentinel());
             for (inits, 0..) |e, k| elems[k] = try sema.coerce(block, a.child, sema.resolveInst(e), arrayElemSrc(src, off, k));
             if (a.sentinel != .none) elems[a.len] = .fromInterned(a.sentinel);
-            return sema.aggregate(block, src, ty, elems);
+            return sema.initAggregate(block, src, ty, elems);
         },
         .vector_type => |v| {
             if (v.len != inits.len) return sema.fail(block, src, "expected {d} vector elements; found {d}", .{ v.len, inits.len });
             const elems = try sema.arena.alloc(Ref, v.len);
             for (inits, elems, 0..) |e, *r, k| r.* = try sema.coerce(block, v.child, sema.resolveInst(e), arrayElemSrc(src, off, k));
-            return sema.aggregate(block, src, ty, elems);
+            return sema.initAggregate(block, src, ty, elems);
         },
         .tuple_type => |t| {
             if (t.types.len != inits.len) return sema.fail(block, src, "expected {d} tuple elements; found {d}", .{ t.types.len, inits.len });
@@ -17434,7 +17464,7 @@ fn arrayInitTyped(sema: *Sema, block: *Block, src: Src, result_ty: Index, inits:
                 if (t.values[k] != .none and sema.resolveValue(elems[k]) != t.values[k])
                     return sema.fail(block, arrayElemSrc(src, off, k), "value stored in comptime field does not match the default value of the field", .{});
             }
-            return sema.aggregate(block, src, ty, elems);
+            return sema.initAggregate(block, src, ty, elems);
         },
         else => {
             ty = ty;
