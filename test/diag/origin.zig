@@ -40,7 +40,13 @@ pub fn main() !void {
     receiver();
     assign();
     _ = try field();
+    _ = table;
 }
+const table = blk: {
+    const t: [4]u8 = @splat(0);
+    t[1] = 2;
+    break :blk t;
+};
 
 // error
 // origin.zig:19:20: error[type-mismatch]: expected type 'u32', found '@typeInfo(@typeInfo(@TypeOf(origin.get)).@"fn".return_type.?).error_union.error_set!u32'
@@ -74,4 +80,9 @@ pub fn main() !void {
 //   fix? origin.zig:35:12-35:12: "(try "
 //   fix? origin.zig:35:20-35:20: ")"
 //   ref: main origin.zig:42:18 (+3 std frames)
-// 5 errors
+// origin.zig:47:6: error[assign-to-const]: cannot assign to constant
+//   | t[1] = 2;
+//   note origin.zig:46:11: 't' is declared 'const'; declare it with 'var' to modify it: const t: [4]u8 = @splat(0);
+//   fix? origin.zig:46:5-46:10: "var"
+//   ref: main origin.zig:43:9 (+3 std frames)
+// 6 errors

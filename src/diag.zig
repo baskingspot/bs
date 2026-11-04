@@ -1226,7 +1226,7 @@ pub fn valueOrigin(tree: *const Ast, start: u32, end: u32, depth: OriginDepth) ?
 /// another's initializer, `const x = blk: { const x = ...; ... }`, may
 /// share its name).
 fn localNamed(tree: *const Ast, use: Ast.TokenIndex) ?Local {
-    const body = enclosingFnBody(tree, use) orelse return null;
+    const body = enclosingFnBody(tree, use) orelse outermostBlock(tree, use) orelse return null;
     const body_first = tree.firstToken(body);
     const body_last = tree.lastToken(body);
     const name = tree.tokenSlice(use);
@@ -1618,6 +1618,23 @@ fn enclosingFnBody(tree: *const Ast, tok: Ast.TokenIndex) ?Ast.Node.Index {
         .fn_decl => tree.nodeData(decl).node_and_node[1],
         else => tree.nodeData(decl).opt_token_and_node[1],
     };
+}
+
+/// The outermost block around `tok`, outside functions: a container-level
+/// declaration's `blk: { ... }` or a `comptime` block, whose locals are
+/// a function's.
+fn outermostBlock(tree: *const Ast, tok: Ast.TokenIndex) ?Ast.Node.Index {
+    var best: ?Ast.Node.Index = null;
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        switch (tree.nodeTag(node)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {},
+            else => continue,
+        }
+        if (tok < tree.firstToken(node) or tok > tree.lastToken(node)) continue;
+        if (best == null or tree.firstToken(node) < tree.firstToken(best.?)) best = node;
+    }
+    return best;
 }
 
 /// The innermost function declaration or test around `tok`.
