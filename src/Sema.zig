@@ -11501,6 +11501,7 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
         if (sema.intoComptimeField(pv)) {
             // A store into a comptime field (or a part of it) only checks
             // that the value matches.
+            if (sema.resolveValue(operand) == null) return sema.fail(block, ptr_src, "cannot store runtime value in compile time variable", .{});
             if (sema.resolveValue(operand) != try sema.comptimeLoadOrNull(block, src, pv))
                 return sema.fail(block, src, "value stored in comptime field does not match the default value of the field", .{});
             return;
@@ -15983,7 +15984,8 @@ fn structInitEmpty(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError
             if (v.len != 0) return sema.fail(block, src, "expected {d} vector elements; found 0", .{v.len});
             return sema.aggregate(block, src, ty, &.{});
         },
-        .tuple_type => |t| if (t.types.len == 0) return .fromInterned(.empty_tuple),
+        // As upstream, a tuple whose fields are all comptime.
+        .tuple_type => |t| return if (t.types.len == 0) .fromInterned(.empty_tuple) else sema.structInitTyped(block, src, ty, &.{}),
         .union_type => return sema.fail(block, src, "union initializer must initialize one field", .{}),
         else => {},
     }
@@ -16060,11 +16062,11 @@ fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []con
         for (items) |item| {
             const idx = try sema.structFieldIndex(block, item.src, ty, item.name);
             elems[idx] = try sema.coerce(block, t.types[idx], item.init, item.src);
+            if (t.values[idx] != .none and sema.resolveValue(elems[idx]) != t.values[idx])
+                return sema.fail(block, item.src, "value stored in comptime field does not match the default value of the field", .{});
         }
         for (elems, t.values, 0..) |*e, v, k| {
             if (v != .none) {
-                if (e.* != .none and sema.resolveValue(e.*) != v)
-                    return sema.fail(block, src, "value stored in comptime field does not match the default value of the field", .{});
                 e.* = .fromInterned(v);
             } else if (e.* == .none) return sema.fail(block, src, "missing tuple field with index {d}", .{k});
         }
@@ -16264,7 +16266,12 @@ fn arrayInitTyped(sema: *Sema, block: *Block, src: Src, result_ty: Index, inits:
         .tuple_type => |t| {
             if (t.types.len != inits.len) return sema.fail(block, src, "expected {d} tuple elements; found {d}", .{ t.types.len, inits.len });
             const elems = try sema.arena.alloc(Ref, inits.len);
-            for (inits, 0..) |e, k| elems[k] = try sema.coerce(block, t.types[k], sema.resolveInst(e), arrayElemSrc(src, off, k));
+            for (inits, 0..) |e, k| {
+                elems[k] = try sema.coerce(block, t.types[k], sema.resolveInst(e), arrayElemSrc(src, off, k));
+                // A comptime field takes only its value, as upstream.
+                if (t.values[k] != .none and sema.resolveValue(elems[k]) != t.values[k])
+                    return sema.fail(block, arrayElemSrc(src, off, k), "value stored in comptime field does not match the default value of the field", .{});
+            }
             return sema.aggregate(block, src, ty, elems);
         },
         else => {
