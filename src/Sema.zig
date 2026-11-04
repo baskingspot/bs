@@ -14956,6 +14956,8 @@ const SwitchCase = struct {
     has_under: bool = false,
     /// A pointer to the operand, for captures by reference, or `none`.
     operand_ptr: Ref = .none,
+    /// The case in ZIR, for its source locations; null for the else prong.
+    index: ?Zir.UnwrappedSwitchBlock.Case.Index = null,
 };
 
 /// With `is_ref`, the operand is a pointer, and prongs may capture by
@@ -15151,6 +15153,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
             .tag_inst = if (case.prong_info.has_tag_capture) tag_inst.toOptional() else .none,
             .operand_ptr = operand_ptr,
             .has_under = under_index == cases.items.len,
+            .index = case.index,
         });
     }
     var else_case: ?SwitchCase = if (sb.else_case) |e| .{
@@ -15750,8 +15753,24 @@ fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: R
         if (Type.class(ip, ty) != .@"union" or c.items.len == 0) return c.operand_ptr;
         const info = ip.structInfo(ty);
         const i = info.fieldIndex(ip, sema.enumTagName(c.items[0]).?).?;
-        const ptr = try sema.fieldPtrAt(block, src, c.operand_ptr, info.field_types[i], i);
+        var ptr = try sema.fieldPtrAt(block, src, c.operand_ptr, info.field_types[i], i);
         if (c.items.len == 1) return ptr;
+        // As upstream, fields of different types are captured by a pointer
+        // of their pointers' peer type (`*c_int` and `*i32`).
+        for (c.items[1..]) |item| {
+            if (info.field_types[info.fieldIndex(ip, sema.enumTagName(item).?).?] == info.field_types[i]) continue;
+            _ = try sema.unionCapturePeer(block, src, ty, c, false);
+            const samples = try sema.arena.alloc(Ref, c.items.len);
+            for (c.items, samples) |it, *r| {
+                const fi = info.fieldIndex(ip, sema.enumTagName(it).?).?;
+                r.* = .fromInterned(try sema.undefValue(try sema.ptrType(.{ .child = info.field_types[fi], .flags = Type.ptrInfo(ip, sema.typeOf(ptr)).flags })));
+            }
+            const peer = try sema.capturePeer(block, src, c, samples, true);
+            if (Type.class(ip, peer) != .pointer or Type.ptrInfo(ip, peer).flags.size != .one)
+                return sema.failUnsupported(block, src.switchCapture(c.index, false), "capturing fields by reference as a pointer of another size");
+            ptr = try sema.coercePtrTo(block, ptr, peer);
+            break;
+        }
         // Several fields: the least aligned of their pointers, as upstream.
         var ptr_info = Type.ptrInfo(ip, sema.typeOf(ptr));
         const op_align = Type.ptrInfo(ip, sema.typeOf(c.operand_ptr)).flags.alignment;
@@ -15799,9 +15818,9 @@ fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: R
         const active = info.fieldIndex(ip, sema.enumTagName(ip.keyPayload(.un, v).tag).?).?;
         const val: Ref = .fromInterned(try sema.fieldValue(v, active));
         if (!differing) return val;
-        return sema.coerce(block, try sema.unionCapturePeer(block, src, ty, c.items), val, src);
+        return sema.coerce(block, try sema.unionCapturePeer(block, src, ty, c, false), val, src);
     }
-    if (differing) return sema.peerUnionCapture(block, src, c.items, operand);
+    if (differing) return sema.peerUnionCapture(block, src, c, operand);
     if (!Type.hasRuntimeBits(ip, info.field_types[i]) and !Type.isComptimeOnly(ip, info.field_types[i]))
         if (try sema.onePossibleValue(info.field_types[i])) |v| return .fromInterned(v);
     try sema.requireRuntime(block, src);
@@ -15810,13 +15829,14 @@ fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: R
 
 /// The payload capture of a prong over union fields of different types:
 /// the active field's value as their peer type, read by the tag.
-fn peerUnionCapture(sema: *Sema, block: *Block, src: Src, items: []const Index, operand: Ref) CompileError!Ref {
+fn peerUnionCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: Ref) CompileError!Ref {
+    const items = c.items;
     const ip = sema.ip;
     const ty = sema.typeOf(operand);
     const info = ip.structInfo(ty);
     const fields = try sema.arena.alloc(u32, items.len);
     for (items, fields) |item, *f| f.* = info.fieldIndex(ip, sema.enumTagName(item).?).?;
-    const peer = try sema.unionCapturePeer(block, src, ty, items);
+    const peer = try sema.unionCapturePeer(block, src, ty, c, false);
     try sema.requireRuntime(block, src);
     const tag = try sema.unionTag(block, src, operand);
     const block_inst = try sema.reserveInst();
@@ -15846,12 +15866,55 @@ fn peerUnionCapture(sema: *Sema, block: *Block, src: Src, items: []const Index, 
 }
 
 /// The peer type of union `ty`'s fields named by a prong's `items`.
-fn unionCapturePeer(sema: *Sema, block: *Block, src: Src, ty: Index, items: []const Index) CompileError!Index {
+fn unionCapturePeer(sema: *Sema, block: *Block, src: Src, ty: Index, c: SwitchCase, by_ref: bool) CompileError!Index {
     const ip = sema.ip;
     const info = ip.structInfo(ty);
-    const samples = try sema.arena.alloc(Ref, items.len);
-    for (items, samples) |item, *r| r.* = .fromInterned(try sema.undefValue(info.field_types[info.fieldIndex(ip, sema.enumTagName(item).?).?]));
-    return sema.resolvePeerTypes(block, src, samples);
+    const samples = try sema.arena.alloc(Ref, c.items.len);
+    for (c.items, samples) |item, *r| r.* = .fromInterned(try sema.undefValue(info.field_types[info.fieldIndex(ip, sema.enumTagName(item).?).?]));
+    return sema.capturePeer(block, src, c, samples, by_ref);
+}
+
+/// The peer type of `samples`, values of the types prong `c` of the
+/// switch at `src` captures. As upstream, a failure is "capture group
+/// with incompatible types" at the capture, with the items whose types
+/// conflict.
+fn capturePeer(sema: *Sema, block: *Block, src: Src, c: SwitchCase, samples: []const Ref, by_ref: bool) CompileError!Index {
+    const cap_src = src.switchCapture(c.index, false);
+    const n = sema.zcu.errors.items.len;
+    return sema.resolvePeerTypes(block, cap_src, samples) catch |err| {
+        if (err != error.AnalysisFail or sema.zcu.errors.items.len != n + 1) return err;
+        const old = sema.zcu.errors.pop().?;
+        // The first pair of peers that does not resolve, probed one at a
+        // time as upstream's peer type resolution reports it.
+        var chosen = sema.typeOf(samples[0]);
+        var ci: usize = 0;
+        var pair: ?[2]usize = null;
+        for (samples[1..], 1..) |r, k| {
+            const t = sema.typeOf(r);
+            if (sema.peerPair(block, cap_src, chosen, t)) |p| {
+                if (p != chosen) ci = k;
+                chosen = p;
+            } else |e| {
+                if (e != error.AnalysisFail) return e;
+                sema.zcu.errors.shrinkRetainingCapacity(n);
+                pair = .{ ci, k };
+                break;
+            }
+        }
+        const e = sema.fail(block, cap_src, "capture group with incompatible types", .{});
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        try sema.zcu.addNote(sema.file, cap_src.span(tree), "{s}", .{old.msg});
+        if (old.notes.len != 0) {
+            const last = &sema.zcu.errors.items[sema.zcu.errors.items.len - 1];
+            last.notes = try std.mem.concat(sema.zcu.arena.allocator(), Zcu.ErrorMsg.Note, &.{ last.notes, old.notes });
+        }
+        if (pair) |p| for (p) |k| {
+            const item_src = if (c.index) |ci_| src.switchItem(ci_, k, .item) else src;
+            try sema.zcu.addNote(sema.file, item_src.span(tree), "type '{f}' here", .{sema.fmtType(sema.typeOf(samples[k]))});
+        };
+        if (by_ref) try sema.zcu.addNote(sema.file, cap_src.span(tree), "this coercion is only possible when capturing by value", .{});
+        return e;
+    };
 }
 
 fn bindSwitchCaptures(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: Ref, capture_inst: Zir.Inst.Index) CompileError!void {
@@ -15879,7 +15942,7 @@ fn analyzeProng(sema: *Sema, block: *Block, c: SwitchCase, operand: Ref, capture
             return;
         }
     }
-    try sema.bindSwitchCaptures(block, block.nodeSrc(.zero), c, operand, capture_inst);
+    try sema.bindSwitchCaptures(block, block.nodeSrc(sema.code.instructions.items(.data)[@backingInt(switch_inst)].pl_node.src_node), c, operand, capture_inst);
     if (c.capture == .by_val and sema.typeOf(sema.inst_map.get(capture_inst).?) == .noreturn_type) {
         // A union payload of type noreturn: the prong cannot be reached.
         _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
