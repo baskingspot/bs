@@ -5101,9 +5101,12 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     const nav = sema.ip.getNav(nav_index);
     if (nav.status == .resolved and sema.ip.keyTag(nav.val) == .func and sema.fnHasRuntimeBits(nav.ty)) try sema.queueFuncRef(src, nav.val);
     // A referenced declaration is emitted with its type's layout (`var
-    // global: @This()` inside the struct leaves it unresolved until now),
-    // which its value resolved unless only its type is known yet.
-    if (!nav.is_const or nav.status != .resolved) try sema.resolveLayoutIfIdle(block, src, nav.ty);
+    // global: @This()` inside the struct leaves it unresolved until now).
+    // Declared even when the value, resolved already, resolved the layout:
+    // this unit read only the type, so whether some unit resolved the
+    // value first, which depends on analysis order (a replay loads it),
+    // must not decide its dependencies.
+    try sema.resolveLayoutIfIdle(block, src, nav.ty);
     // The address of a resolved declaration is the same value each time.
     const cacheable = (nav.status == .resolved or nav.ty_status == .resolved) and nav.linkage != .@"extern" and !(nav.is_threadlocal and !block.is_comptime);
     if (cacheable) if (sema.zcu.nav_ptrs.get(nav_index)) |ptr| return .fromInterned(ptr);
