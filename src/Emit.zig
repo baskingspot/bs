@@ -1358,8 +1358,9 @@ pub fn requestCompilerRtExport(emit: *Emit, name: []const u8) !?[]const u8 {
 
 /// Requests compiler_rt function `key` and returns the key, owned: from a
 /// worker, for the merge; while analysis runs, for `sync`; after it, from
-/// the Zcu.
-fn requestRtKey(emit: *Emit, key: []const u8) ![]const u8 {
+/// the Zcu. No unit's reference: also for a lazy replay, whose kept unit
+/// keeps its recorded `rt` reference (`Replay.walkNode`).
+pub fn requestRtKey(emit: *Emit, key: []const u8) ![]const u8 {
     if (emit.is_worker) {
         const gop = try emit.rt_keys.getOrPut(emit.gpa, key);
         if (gop.found_existing) return gop.key_ptr.*;

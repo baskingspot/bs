@@ -3219,7 +3219,16 @@ value model:
   also reaches the helper's function and its file's root namespace
   (`addRtReach`). Replay skips those two references while the helper's
   file is not loaded yet, since only analysis may load it: the replayed
-  request brings them back. Helpers are named by declaration,
+  request brings them back. A lazy edit build does the same for kept
+  units: a helper node that the edit outdates (or whose file is a changed
+  input) waits until its file loads (`Replay.rt_waiting`), the kept
+  requester requests its helpers again (`Emit.requestRtKey`) and, once
+  the file is loaded, marks the namespaces it used as used (`rt_effects`),
+  and the file's old instructions are mapped to its new ones when it
+  loads. A compiler_rt file that is not loaded yet counts as changed only
+  if the last build's input for it changed (`isChangedPath`), so an
+  inlined helper (`generic_fmod` in `fmod`) does not force an eager
+  replay when the edit is elsewhere. Helpers are named by declaration,
   not by exported symbol (`__cmptf2` serves `__lttf2`, `fmodq` is exported
   as `fmodf128`).
 - Externs and the link resolve names compiler_rt exports to its functions

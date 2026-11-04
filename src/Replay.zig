@@ -49,6 +49,13 @@ outdated: std.DynamicBitSetUnmanaged,
 state: []State,
 /// Inputs whose contents changed, with their instruction maps.
 maps: seeds.InstMaps = .{},
+/// Changed inputs `lateMap` tried to map.
+late_mapped: std.AutoHashMapUnmanaged(u32, void) = .empty,
+/// Nodes in compiler_rt files not loaded yet that an edit reached, which
+/// `settle` walks once their file loads (`walkNode`).
+rt_waiting: std.ArrayList(u32) = .empty,
+/// (namespace node, requester node) of those that are files' namespaces.
+rt_effects: std.ArrayList([2]u32) = .empty,
 changed: std.ArrayList(seeds.Changed) = .empty,
 /// Each input's file in this build, once looked up: its index + 1, or 0
 /// if not looked up yet, or `no_file`.
@@ -328,6 +335,9 @@ pub fn destroy(r: *Replay) void {
     r.data_refs.deinit(gpa);
     r.dead.deinit(gpa);
     r.refresh.deinit(gpa);
+    r.late_mapped.deinit(gpa);
+    r.rt_waiting.deinit(gpa);
+    r.rt_effects.deinit(gpa);
     if (r.debug_paths) |*d| {
         var it = d.keyIterator();
         while (it.next()) |k| gpa.free(k.*);
@@ -1004,6 +1014,14 @@ pub fn walk(r: *Replay) !void {
 fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
     const m = r.m;
     const tag = std.enums.fromInt(Tag, m.node(n).tag) orelse return;
+    // In a compiler_rt file not loaded yet: its subject names nothing yet.
+    // If an edit reached it, its requester requests it again (below), and
+    // analysis decides it once the file loads.
+    if (r.inUnloadedCompilerRt(n) and (r.outdated.isSet(n) or r.inChangedInput(n)) and r.state[n] == .unknown) {
+        r.visited.unset(n);
+        try r.rt_waiting.append(r.gpa, n);
+        return;
+    }
     if (r.outdated.isSet(n) and r.state[n] == .unknown) switch (tag) {
         // Analysis decides it; a green one is visited again as it loads,
         // and walked on from then.
@@ -1035,6 +1053,18 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
     }
     try Incremental.reachNext(m.deps(n), m.nodeRefs(n), next, r.gpa);
     for (m.nodeRefs(n)) |ref| if (ref.kind == .nav) r.data_refs.set(ref.value);
+    // A kept unit's compiler_rt helpers in a file an edit reached, which
+    // is not loaded yet: requested again, as analysis would (`Emit.
+    // requestCompilerRt`), which loads the file and analyzes them there.
+    const rt_edited = for (m.nodeRefs(n)) |ref| {
+        if ((ref.kind == .func or ref.kind == .effects) and r.inUnloadedCompilerRt(ref.value) and
+            (r.outdated.isSet(ref.value) or r.inChangedInput(ref.value))) break true;
+    } else false;
+    if (rt_edited) for (m.nodeRefs(n)) |ref| switch (ref.kind) {
+        .rt => _ = try r.emit.requestRtKey(m.refName(ref.value)),
+        .effects => if (r.inUnloadedCompilerRt(ref.value)) try r.rt_effects.append(r.gpa, .{ ref.value, n }),
+        else => {},
+    };
     // A function's lines: its own declaration's, and those of the
     // functions it inlines, which it depends on. Those are made now, so
     // that their namespaces exist as in a full build.
@@ -1108,6 +1138,37 @@ fn die(r: *Replay, n: u32) void {
 pub fn settle(r: *Replay) !bool {
     const emit = r.emit;
     const before = emit.navs_done;
+    // Nodes in compiler_rt files that have loaded since the walk reached
+    // them, walked now.
+    var kept: usize = 0;
+    for (r.rt_waiting.items) |n| {
+        if (r.inUnloadedCompilerRt(n)) {
+            r.rt_waiting.items[kept] = n;
+            kept += 1;
+        } else try r.visit(n);
+    }
+    r.rt_waiting.shrinkRetainingCapacity(kept);
+    // Their requesters' reach of their files' namespaces, which a full
+    // build records (`Incremental.addRtReach`), as the effects uses an
+    // eager build replays: the namespace is then decided as in a full
+    // build, not left for the next build.
+    kept = 0;
+    for (r.rt_effects.items) |pair| {
+        const ns_node, const from = pair;
+        if (r.inUnloadedCompilerRt(ns_node)) {
+            r.rt_effects.items[kept] = pair;
+            kept += 1;
+            continue;
+        }
+        const ns = try r.dependee(ns_node, .namespace) orelse continue;
+        const unit: Zcu.AnalUnit = switch (std.enums.fromInt(Tag, r.m.node(from).tag) orelse continue) {
+            .func => .{ .func = (try r.dependee(from, .func) orelse continue).func_body },
+            .nav_val => .{ .nav_val = (try r.dependee(from, .nav_val) orelse continue).nav_val },
+            else => continue,
+        };
+        try r.zcu.effect_uses.put(r.zcu.gpa, .{ .unit = unit, .ty = r.zcu.namespaces.items[ns.namespace].owner_type }, {});
+    }
+    r.rt_effects.shrinkRetainingCapacity(kept);
     var it = r.data_refs.iterator(.{});
     while (it.next()) |n| {
         if (r.state[n] != .red or r.dead.isSet(n) or r.m.node(@intCast(n)).tag != @backingInt(Tag.nav_val)) continue;
@@ -1492,9 +1553,27 @@ fn knowsDebugPaths(r: *Replay, debug: *const Atom.Debug) !bool {
 
 /// Instruction `inst` of input `input`'s recorded ZIR, in its ZIR now.
 pub fn mapInst(r: *Replay, input: u32, inst: Zir.Inst.Index) ?Zir.Inst.Index {
-    const entry = r.maps.maps.get(input) orelse return inst;
-    const map = entry orelse return null;
+    const entry = r.maps.maps.getPtr(input) orelse return inst;
+    if (entry.* == null) entry.* = r.lateMap(input);
+    const map = entry.* orelse return null;
     return map.get(inst);
+}
+
+/// The map of changed input `input` from its recorded ZIR to its ZIR now,
+/// if its file loaded after `create` mapped the others (compiler_rt's
+/// load on demand), or null.
+fn lateMap(r: *Replay, input: u32) ?seeds.InstMap {
+    const file = r.fileOf(input) orelse return null;
+    if ((r.late_mapped.getOrPut(r.gpa, input) catch return null).found_existing) return null;
+    const in, _ = r.m.input(input);
+    var old = (r.zcu.fe.loadOldZir(@fromBackingInt(file), @bitCast(in.content_hash)) catch return null) orelse return null;
+    defer old.deinit(r.zcu.fe);
+    var map: seeds.InstMap = .empty;
+    seeds.mapOldZirToNew(r.gpa, &old.zir, &r.zcu.file(file).zir, &map) catch {
+        map.deinit(r.gpa);
+        return null;
+    };
+    return map;
 }
 
 /// Creates the items that name source, as analysis would, without
