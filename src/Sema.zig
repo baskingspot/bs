@@ -6071,6 +6071,7 @@ fn ccName(cc: InternPool.CallingConvention) []const u8 {
         .c => "x86_64_sysv",
         .naked => "naked",
         .@"inline" => "inline",
+        .x86_64_win => "x86_64_win",
     };
 }
 
@@ -7967,6 +7968,8 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
         .@"inline"
     else if (std.mem.eql(u8, name, "x86_64_sysv"))
         .c
+    else if (std.mem.eql(u8, name, "x86_64_win"))
+        .x86_64_win
     else {
         // As upstream, a convention of another architecture is an error.
         if (std.meta.stringToEnum(std.lang.CallingConvention.Tag, name)) |tag| {
@@ -14043,7 +14046,7 @@ fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Compi
         else => unreachable,
     };
     const is_var_args = try sema.structFieldValue(attrs, "varargs") == .bool_true;
-    if (is_var_args and cc != .c) return sema.failVarArgsCc(block, sema.callArgSrc(src, false, 3), cc);
+    if (is_var_args and cc != .c and cc != .x86_64_win) return sema.failVarArgsCc(block, sema.callArgSrc(src, false, 3), cc);
     var is_generic = false;
     for (params) |pt| if ((try sema.isComptimeOnlyResolved(block, src, pt))) {
         is_generic = true;
@@ -17952,7 +17955,10 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     }
     if (is_noinline and cc == .@"inline") return sema.fail(block, cc_src, "'noinline' function cannot have calling convention 'inline'", .{});
     if (is_var_args) {
-        if (cc != .c) return sema.failVarArgsCc(block, .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(params.len) } } }, cc);
+        const var_src: Src = .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(params.len) } } };
+        if (cc != .c and cc != .x86_64_win) return sema.failVarArgsCc(block, var_src, cc);
+        // zap calls variadic Win64 functions but does not define them.
+        if (cc == .x86_64_win and body_len != 0) return sema.fail(block, var_src, "zap does not support defining variadic functions with calling convention 'x86_64_win' yet", .{});
     }
 
     // Errors about a parameter or the return type point at it, as upstream.

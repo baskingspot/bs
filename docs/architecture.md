@@ -739,8 +739,18 @@ comptime arguments are run-time values in the lowered code (uucode's
   rax). `va_arg` gathers a register-class aggregate from the register
   save area, which keeps all 16 bytes of each XMM register. Not done:
   bool vectors of 65 to 128 elements as arguments (Clang passes one GPR
-  per element; zap passes them in memory), and the `x86_64_win`
-  convention. Measured by upstream's test/c_abi (`run.py --c-abi`).
+  per element; zap passes them in memory). `.x86_64_win` (C's ms_abi,
+  `winClass`, after upstream's `classifyWindows`) passes each argument by
+  position in rcx, rdx, r8, r9 or xmm0-3, the rest on the stack above
+  the caller's 32-byte shadow space; values not of size 1, 2, 4, or 8
+  (and f80, f128, 16-byte integers) go by reference to a caller-owned
+  copy; results of those sizes come back in rax or xmm0 (f128, 16-byte
+  integers and vectors in xmm0), others through a result pointer in rcx,
+  returned in rax. A variadic callee also gets each float argument in
+  its position's GPR. Functions zap defines with it save rsi, rdi, and
+  xmm6-15 in frame slots with plain moves (they are not in the unwind
+  info, which only records pushed GPRs); defining a variadic one is
+  `[unsupported]`. Measured by upstream's test/c_abi (`run.py --c-abi`).
   Zap-to-zap calls (`.auto`) pass every argument in
   memory at 8-byte aligned offsets of the caller's outgoing area, return
   1-, 2-, 4-, and 8-byte results in rax, and return anything else through a

@@ -67,6 +67,9 @@ out_args_size: u32 = 0,
 ret_ptr_slot: ?i32 = null,
 /// The `alloc` whose memory is the result's (see `planCopies`).
 rvo_alloc: ?Inst.Index = null,
+/// rbp offset of the slots a Win64 function saves rsi, rdi, and
+/// xmm6-xmm15 in (`setupWinParams`), which that convention preserves.
+win_save: ?i32 = null,
 /// From `planCopies`: `*const` allocs that may alias the memory of the
 /// value they are initialized with, and those values, whose slots are
 /// not shared.
@@ -626,6 +629,7 @@ fn loadPair(cg: *CodeGen, lo: Reg, hi: Reg, ref: Ref) Error!void {
 fn setupParams(cg: *CodeGen) Error!void {
     const ip = cg.ip;
     if (cg.fn_ty.cc == .c) return cg.setupCParams();
+    if (cg.fn_ty.cc == .x86_64_win) return cg.setupWinParams();
     const ir = cg.ir;
     const tags = ir.instructions.items(.tag);
     // The error return trace pointer arrives in rax; a function that
@@ -2062,6 +2066,11 @@ fn epilogue(cg: *CodeGen) Error!void {
     cg.ret_bound = true;
     // The epilogue belongs to the closing brace, as in upstream's line tables.
     try cg.e.line(cg.ir.rbrace_line, cg.ir.rbrace_column);
+    if (cg.win_save) |save| {
+        try cg.e.mov(.qword, .{ .reg = .rsi }, .{ .mem = Mem.at(.rbp, save) });
+        try cg.e.mov(.qword, .{ .reg = .rdi }, .{ .mem = Mem.at(.rbp, save + 8) });
+        for (win_saved_xmms, 0..) |x, i| try cg.e.movups(.{ .reg = x }, .{ .mem = Mem.at(.rbp, save + 16 + 16 * @as(i32, @intCast(i))) });
+    }
     if (cg.saved != 0) {
         try cg.e.lea(.qword, .rsp, Mem.at(.rbp, -8 * @as(i32, @popCount(cg.saved))));
         var i: usize = alloc_regs.len;
@@ -3542,6 +3551,8 @@ fn ret(cg: *CodeGen, operand: Ref, next: Ssa.Block.Index) Error!void {
     const ty = cg.fn_ty.return_type;
     if (cg.fn_ty.cc == .c) {
         try cg.cRet(operand);
+    } else if (cg.fn_ty.cc == .x86_64_win) {
+        try cg.winRet(operand);
     } else switch (cg.autoClass(ty)) {
         .none => {},
         .gpr => try cg.loadGpr(.rax, operand, ty),
@@ -3585,9 +3596,10 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const callee_ty = ip.keyPayload(.func_type, if (Type.class(ip, callee_fn_ty) == .pointer) Type.ptrInfo(ip, callee_fn_ty).child else callee_fn_ty);
     const ret_ty = extra.data.ret_ty;
     const is_c = callee_ty.cc == .c;
+    const is_win = callee_ty.cc == .x86_64_win;
     const ret_class = cg.autoClass(ret_ty);
     // A result in rax goes to its home after the call.
-    const in_rax = cg.passInRegs(ret_ty) and if (is_c) cg.cRetClass(ret_ty) == .int else ret_class == .gpr;
+    const in_rax = cg.passInRegs(ret_ty) and if (is_c) cg.cRetClass(ret_ty) == .int else if (is_win) cg.winClass(ret_ty, true) == .int else ret_class == .gpr;
     const in_pair = cg.pairOf(inst.toRef());
     const in_xmm = cg.xmmOf(inst.toRef());
     const dst = if (in_rax or in_pair != null or in_xmm != null) null else try cg.resultMem(inst, ret_ty);
@@ -3600,6 +3612,11 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         defer cg.gpa.free(vals);
         for (args, vals) |arg, *v| v.* = try cg.valOf(arg);
         va_sse = try cg.cCallArgs(vals, ret_ty, dst);
+    } else if (is_win) {
+        const vals = try cg.gpa.alloc(Val, args.len);
+        defer cg.gpa.free(vals);
+        for (args, vals) |arg, *v| v.* = try cg.valOf(arg);
+        try cg.winCallArgs(vals, ret_ty, dst, callee_ty.is_var_args);
     } else {
         const tys, const locs = try cg.argScratch(args.len);
         for (args, tys) |arg, *ty| ty.* = cg.typeOf(arg);
@@ -3619,24 +3636,24 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         };
         if (ret_class == .memory) if (dst) |m| try cg.e.lea(.qword, .rdi, m);
     }
-    if (!is_c) try cg.loadTrace(.rax);
+    if (!is_c and !is_win) try cg.loadTrace(.rax);
     if (callee_val) |f| {
-        if (callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
+        if (is_c and callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
         // A panic in code the backend inlined, with its arguments in
         // registers, gets the frames of the calls it was inlined from.
-        if (ret_ty == .noreturn_type and cg.in_cold and !is_c and !stack_args and !cg.outermost_frame) {
+        if (ret_ty == .noreturn_type and cg.in_cold and !is_c and !is_win and !stack_args and !cg.outermost_frame) {
             try cg.panicThroughStubs(try cg.emit.funcKey(f));
         } else try cg.e.call(.{ .sym = try cg.emit.funcKey(f) });
     } else {
         // r11 is not an argument register in either convention.
         try cg.load(.r11, callee_ref);
-        if (callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
+        if (is_c and callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
         try cg.e.callIndirect(.{ .reg = .r11 });
     }
     if (in_rax) {
         // C callees leave the bits above a narrow result unspecified.
         const size = Type.abiSize(ip, ret_ty);
-        if (is_c and size < 8) {
+        if ((is_c or is_win) and size < 8) {
             if (cg.signed(ret_ty)) try cg.e.movsx(.qword, .rax, sizeOf(size), .{ .reg = .rax }) else try cg.e.movzx(.qword, .rax, sizeOf(size), .{ .reg = .rax });
         }
         return cg.setResult(inst, ret_ty, .rax);
@@ -3644,6 +3661,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     // Both conventions return f32 and f64 in xmm0.
     if (in_xmm) |x| return cg.e.movups(.{ .reg = x }, .{ .reg = .xmm0 });
     if (is_c) return cg.cCallResult(ret_ty, dst);
+    if (is_win) return cg.winCallResult(ret_ty, dst);
     if (in_pair) |d| {
         // `.auto` pairs come back in rax and rdx, which no value lives in.
         try cg.e.mov(.qword, .{ .reg = d.lo }, .{ .reg = .rax });
@@ -5063,6 +5081,168 @@ fn cRet(cg: *CodeGen, operand: Ref) Error!void {
         .agg => |ebs| try cg.loadEbs(try cg.memOf(operand), ebs, Type.abiSize(cg.ip, ty)),
         .x87 => try cg.e.fld(.m80, try cg.memOf(operand)),
         .memory => {
+            try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
+            try cg.copyTo(Mem.at(.r10, 0), operand);
+            try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
+        },
+    }
+}
+
+
+// ---------------------------------------------------------------- Win64 calls
+
+/// How the Win64 convention passes a value, as upstream's
+/// `classifyWindows`: in its position's GPR (`int`: a 1-, 2-, 4-, or
+/// 8-byte value other than a float), in its position's XMM register
+/// (`sse`: f16, f32, f64; as a result, also 16-byte integers and packed
+/// containers, f128, and vectors of up to 16 bytes, in xmm0), or by
+/// reference (`ref`: as an argument, a pointer to a copy the caller makes;
+/// as a result, memory the caller passes a pointer to in the first
+/// position and the callee returns in rax).
+const WinClass = enum { none, int, sse, ref };
+
+fn winClass(cg: *CodeGen, ty: Index, is_ret: bool) WinClass {
+    const ip = cg.ip;
+    if (!Type.hasRuntimeBits(ip, ty)) return .none;
+    switch (Type.class(ip, ty)) {
+        .float => return switch (Type.floatBits(ip, ty)) {
+            16, 32, 64 => .sse,
+            128 => if (is_ret) .sse else .ref,
+            else => .ref,
+        },
+        .vector => {
+            const v = ip.keyPayload(.vector_type, ty);
+            if (v.len == 1) return cg.winClass(v.child, is_ret);
+            const bytes = Type.abiSize(ip, v.child) * v.len;
+            return if (is_ret and v.child != .bool_type and bytes <= 16) .sse else .ref;
+        },
+        else => {},
+    }
+    const size = Type.abiSize(ip, ty);
+    if (cg.passInRegs(ty)) return .int;
+    if (size == 16 and is_ret and (Type.isInt(ip, ty) or Type.isPacked(ip, ty))) return .sse;
+    return .ref;
+}
+
+const win_arg_regs = [_]Reg{ .rcx, .rdx, .r8, .r9 };
+const win_saved_xmms = [_]Encoder.Xmm{ .xmm6, .xmm7, .xmm8, .xmm9, .xmm10, .xmm11, .xmm12, .xmm13, .xmm14, .xmm15 };
+
+/// Places the arguments of a call to a Win64 function: each in its
+/// position's register (rcx, rdx, r8, r9, or xmm0-xmm3) or at
+/// `rsp + 32 + 8 * (position - 4)`, past the callee's 32-byte shadow
+/// space. By-reference arguments are copied to slots first (copies use
+/// rax, rsi, rdi, rcx), then stack arguments, then XMM registers (rax),
+/// then GPRs. A variadic callee gets a float in its position's GPR too.
+fn winCallArgs(cg: *CodeGen, args: []const Val, ret_ty: Index, dst: ?Mem, var_args: bool) Error!void {
+    const ip = cg.ip;
+    const sret = dst != null and cg.winClass(ret_ty, true) == .ref;
+    const pos = try cg.gpa.alloc(u32, args.len);
+    defer cg.gpa.free(pos);
+    const mems = try cg.gpa.alloc(Mem, args.len);
+    defer cg.gpa.free(mems);
+    var n: u32 = @intFromBool(sret);
+    for (args, pos) |a, *p| {
+        p.* = n;
+        if (cg.winClass(a.ty, false) != .none) n += 1;
+    }
+    cg.out_args_size = @max(cg.out_args_size, 32 + 8 * (@max(n, 4) - 4));
+    for (args, mems) |a, *m| if (cg.winClass(a.ty, false) == .ref) {
+        const size = Type.abiSize(ip, a.ty);
+        m.* = Mem.at(.rbp, try cg.allocSlot(size, @max(Type.abiAlignment(ip, a.ty), 16)));
+        try cg.copyMem(m.*, try cg.valMem(a), size);
+    };
+    for (args, pos, mems) |a, p, m| if (p >= 4) {
+        const at = Mem.at(.rsp, @intCast(32 + 8 * (p - 4)));
+        switch (cg.winClass(a.ty, false)) {
+            .none => {},
+            .int, .sse => try cg.copyMem(at, try cg.valMem(a), Type.abiSize(ip, a.ty)),
+            .ref => {
+                try cg.e.lea(.qword, .rax, m);
+                try cg.e.mov(.qword, .{ .mem = at }, .{ .reg = .rax });
+            },
+        }
+    };
+    for (args, pos) |a, p| if (p < 4 and cg.winClass(a.ty, false) == .sse) try cg.loadXmm(xmm_args[p], a);
+    for (args, pos, mems) |a, p, m| if (p < 4) switch (cg.winClass(a.ty, false)) {
+        .none => {},
+        .int => try cg.loadVal(win_arg_regs[p], a),
+        .sse => if (var_args) try cg.e.movFromXmm(.qword, .{ .reg = win_arg_regs[p] }, xmm_args[p]),
+        .ref => try cg.e.lea(.qword, win_arg_regs[p], m),
+    };
+    if (sret) try cg.e.lea(.qword, .rcx, dst.?);
+}
+
+/// Stores the result of a Win64 call, of type `ret_ty`, to `dst`.
+fn winCallResult(cg: *CodeGen, ret_ty: Index, dst: ?Mem) Error!void {
+    const m = dst orelse return;
+    switch (cg.winClass(ret_ty, true)) {
+        .none, .ref => {},
+        .int => try cg.storeReg(m, .rax, Type.abiSize(cg.ip, ret_ty)),
+        .sse => try cg.storeXmm(m, .xmm0, Type.abiSize(cg.ip, ret_ty)),
+    }
+}
+
+/// The callee side of the Win64 convention: saves the registers it
+/// preserves that zap's code may use (rsi, rdi, xmm6-xmm15; the others
+/// are callee-saved in SysV too), and gives each `arg` a home, spilling
+/// register arguments to slots and copying by-reference ones.
+fn setupWinParams(cg: *CodeGen) Error!void {
+    const ip = cg.ip;
+    const save = try cg.allocSlot(16 + 16 * win_saved_xmms.len, 16);
+    try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, save) }, .{ .reg = .rsi });
+    try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, save + 8) }, .{ .reg = .rdi });
+    for (win_saved_xmms, 0..) |x, i| try cg.e.movups(.{ .mem = Mem.at(.rbp, save + 16 + 16 * @as(i32, @intCast(i))) }, .{ .reg = x });
+    cg.win_save = save;
+    var p: u32 = 0;
+    if (cg.winClass(cg.fn_ty.return_type, true) == .ref) {
+        const off = try cg.allocSlot(8, 8);
+        try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, off) }, .{ .reg = .rcx });
+        cg.ret_ptr_slot = off;
+        p = 1;
+    }
+    // By-reference arguments: their pointers' slots, copied from once the
+    // registers are spilled.
+    var refs: std.ArrayList(struct { inst: Inst.Index, ptr: i32 }) = .empty;
+    defer refs.deinit(cg.gpa);
+    for (cg.ir.mainBody()) |inst| {
+        if (cg.ir.instructions.items(.tag)[@backingInt(inst)] != .arg) break;
+        const ty = cg.ir.instructions.items(.data)[@backingInt(inst)].arg.ty;
+        const size = Type.abiSize(ip, ty);
+        const class = cg.winClass(ty, false);
+        if (class == .none) continue;
+        defer p += 1;
+        if (p >= 4) {
+            const off: i32 = @intCast(16 + 32 + 8 * (p - 4));
+            if (class == .ref) try refs.append(cg.gpa, .{ .inst = inst, .ptr = off }) else cg.homes[@backingInt(inst)] = .{ .slot = off };
+            continue;
+        }
+        if (class == .ref) {
+            const off = try cg.allocSlot(8, 8);
+            try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, off) }, .{ .reg = win_arg_regs[p] });
+            try refs.append(cg.gpa, .{ .inst = inst, .ptr = off });
+            continue;
+        }
+        const m = Mem.at(.rbp, try cg.allocSlot(size, Type.abiAlignment(ip, ty)));
+        cg.homes[@backingInt(inst)] = .{ .slot = m.disp };
+        if (class == .int) try cg.storeReg(m, win_arg_regs[p], size) else try cg.storeXmm(m, xmm_args[p], size);
+    }
+    for (refs.items) |ref| {
+        const ty = cg.ir.instructions.items(.data)[@backingInt(ref.inst)].arg.ty;
+        const size = Type.abiSize(ip, ty);
+        const m = Mem.at(.rbp, try cg.allocSlot(size, Type.abiAlignment(ip, ty)));
+        try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .mem = Mem.at(.rbp, ref.ptr) });
+        try cg.copyMem(m, Mem.at(.r11, 0), size);
+        cg.homes[@backingInt(ref.inst)] = .{ .slot = m.disp };
+    }
+}
+
+/// Returns `operand` from a Win64 function.
+fn winRet(cg: *CodeGen, operand: Ref) Error!void {
+    switch (cg.winClass(cg.fn_ty.return_type, true)) {
+        .none => {},
+        .int => try cg.load(.rax, operand),
+        .sse => try cg.loadXmm(.xmm0, try cg.valOf(operand)),
+        .ref => {
             try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
             try cg.copyTo(Mem.at(.r10, 0), operand);
             try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });

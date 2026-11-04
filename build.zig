@@ -1114,6 +1114,20 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     abi_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&abi_run.step);
 
+    // The Win64 convention (`.x86_64_win`, C's ms_abi) both ways.
+    const win_exe = b.addRunArtifact(zap);
+    win_exe.setName("zap build-exe with Win64 calls");
+    win_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+    win_exe.addFileArg(b.path("test/link_input/win64_main.zig"));
+    win_exe.addFileArg(b.path("test/link_input/win64.c"));
+    win_exe.setEnvironmentVariable("ZAP_ZIG", zig);
+    const win_run = std.Build.Step.Run.create(b, "run zap build with Win64 calls");
+    win_run.addFileArg(win_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    win_run.addCheck(.{ .expect_stdout_exact = "c_win_mix 1 2.5 3 4 5.5 6 7 8 9.5 10.5 11 12.5\nva u64 1\nva f64 2.5\nva u64 3\nva f64 4.5\nzig via ptr 32.5\nzig byref 15 77\n" });
+    win_run.addCheck(.{ .expect_stderr_exact = "byref 42 9 mix 32.5 s8 2 1 u128 80000000000000000\nzig_win_mix 1 2.5 3 4 5.5 6 7 8 9.5 10.5 11 12.5\n" });
+    win_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&win_run.step);
+
     // GCC's -fPIE reads glibc's data PC-relative: the executable copies
     // `stdout` and `environ` (with its aliases, which glibc's start code
     // sets), and glibc, C and Zig all use the copies.

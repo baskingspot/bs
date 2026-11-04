@@ -421,6 +421,9 @@ pub const CallingConvention = enum(u8) {
     c,
     naked,
     @"inline",
+    /// x86_64's Windows convention (`.x86_64_win`), which C code declares
+    /// with `__attribute__((ms_abi))`.
+    x86_64_win,
 };
 
 pub const PtrType = struct {
