@@ -2216,7 +2216,18 @@ arguments, and the donor key gains the options that change code
 donor key matters because a first build replays another compilation's
 manifest, and a differing builtin.zig turns most units red but not those
 that do not read it, whose function atoms would otherwise load from a
-non-pic donor. The manifest's output kind gains `shared`. The new
+non-pic donor. The manifest's output kind gains `shared`. The numbered
+link (`Elf.Symbols`, what a relink passes) takes pic and shared images
+(2026-11-04): what the key-based link finds by key comes as numbers, the
+imports' (parallel to `ElfDynamic.Options.imports`, set to their PLT
+stubs after layout), the exports' atoms' (parallel to `.exports`, found
+in one pass over the numbered atoms) and `_DYNAMIC`'s; names, flags and
+the soname still come as `ElfDynamic.Options`. The output is the same
+bytes as the key-based link's (a unit test checks a shared object with
+an import call, an import's address in data, `.data.rel.ro`,
+local-dynamic TLS and `_DYNAMIC`). The manifest and `linkFrom` side is
+the cache thread's, with `build-lib -dynamic` as its first user, then
+`-lc` executables. The new
 relocation kinds need no format bump: the store seed and the compilation
 key include the zap binary's identity, and `atoms.check` rejects unknown
 kinds.

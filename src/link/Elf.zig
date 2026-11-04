@@ -89,7 +89,8 @@ pub const Options = struct {
     comp_dir: []const u8 = ".",
     /// The atoms' symbols, already numbered by the caller, so that the link
     /// looks up no keys. When set, `entry` is used only in diagnostics and
-    /// `values` not at all.
+    /// to say whether there is one (`Symbols.entry` is ignored without),
+    /// and `values` not at all.
     symbols: ?Symbols = null,
     /// How `link` writes the file; for tests and benchmarks.
     file_writes: FileWrites = .auto,
@@ -148,6 +149,14 @@ pub const Symbols = struct {
     /// The numbers of the section bounds the linker defines, in
     /// `bound_sections` order, or `no_bound` for one nothing references.
     bounds: [bound_sections.len * 2]u32 = @splat(no_bound),
+    /// With `Options.dynamic`, the numbers its key-based link finds by key:
+    /// its imports', parallel to `ElfDynamic.Options.imports`, which
+    /// resolve to their PLT stubs; its exports' atoms', parallel to
+    /// `ElfDynamic.Options.exports`; and `_DYNAMIC`'s
+    /// (`ElfDynamic.dynamic_key`), or `no_bound` if nothing references it.
+    dynamic_imports: []const u32 = &.{},
+    dynamic_exports: []const u32 = &.{},
+    dynamic: u32 = no_bound,
     entry: u32,
     /// Numbers are below this; numbers with no atom or value are
     /// undefined, which is an error only if a relocation uses one.
@@ -534,9 +543,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const n_partitions = std.math.ceilPowerOfTwoAssert(usize, @min(n_threads, 8));
 
     const numbered = options.symbols;
-    if (numbered) |s| if (s.atoms.len != n_atoms or s.entry >= s.len) return error.InvalidSymbols;
-    // The cache, which numbers symbols, holds no pic compilations.
-    if (numbered != null and (options.pic or options.dynamic != null)) return error.InvalidSymbols;
+    if (numbered) |s| if (s.atoms.len != n_atoms or (options.entry != null and s.entry >= s.len)) return error.InvalidSymbols;
+    if (numbered) |s| if (options.dynamic) |d| if (s.dynamic_imports.len != d.imports.len or s.dynamic_exports.len != d.exports.len) return error.InvalidSymbols;
     var symbols: SymbolTable = if (numbered == null) try .init(n_atoms, n_partitions) else .empty;
     defer symbols.deinit();
     // With numbered symbols, each number's address or value.
@@ -624,7 +632,27 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var n_rela: u64 = 0;
     if (dyn) |*t| {
         dyn_exports = try dyn_arena.allocator().alloc(u64, t.exports.len);
-        for (dyn_exports, t.exports) |*atom, i| {
+        if (numbered) |s| {
+            // The atoms with the exports' numbers, found in one pass. One
+            // atom can have several exports (aliases).
+            var atom_of: std.AutoHashMapUnmanaged(u32, u64) = .empty;
+            try atom_of.ensureTotalCapacity(dyn_arena.allocator(), @intCast(t.exports.len));
+            for (t.exports) |i| {
+                const gop = atom_of.getOrPutAssumeCapacity(s.dynamic_exports[i]);
+                gop.value_ptr.* = std.math.maxInt(u64);
+            }
+            for (s.atoms, 0..) |n, i| if (atom_of.getPtr(n.symbol)) |a| {
+                a.* = i;
+            };
+            for (dyn_exports, t.exports) |*atom, i| {
+                atom.* = atom_of.get(s.dynamic_exports[i]).?;
+                if (atom.* == std.math.maxInt(u64)) {
+                    const x = dyn_opts.?.exports[i];
+                    diag.* = .{ .atom = x.name, .target = x.key };
+                    return error.UndefinedSymbol;
+                }
+            }
+        } else for (dyn_exports, t.exports) |*atom, i| {
             const x = dyn_opts.?.exports[i];
             atom.* = symbols.get(x.key) orelse {
                 diag.* = .{ .atom = x.name, .target = x.key };
@@ -773,12 +801,23 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         l.rela_off = rela_off;
         // Imports resolve to their PLT stubs; absolute relocations to
         // them become symbol relocations.
-        for (d.imports, 0..) |imp, i| values.getOrPut(imp.key).* = .{ .key = imp.key, .value = l.plt_start + i * ElfDynamic.plt_entry_size, .used = true };
-        values.getOrPut(ElfDynamic.dynamic_key).* = .{ .key = ElfDynamic.dynamic_key, .value = base + dynamic_off, .used = true };
+        if (numbered) |s| {
+            for (s.dynamic_imports, 0..) |n, i| {
+                if (n >= addrs.len) return error.InvalidSymbols;
+                addrs[n] = @intCast(plt_off + i * ElfDynamic.plt_entry_size);
+            }
+            if (s.dynamic != no_bound) {
+                if (s.dynamic >= addrs.len) return error.InvalidSymbols;
+                addrs[s.dynamic] = @intCast(dynamic_off);
+            }
+        } else {
+            for (d.imports, 0..) |imp, i| values.getOrPut(imp.key).* = .{ .key = imp.key, .value = l.plt_start + i * ElfDynamic.plt_entry_size, .used = true };
+            values.getOrPut(ElfDynamic.dynamic_key).* = .{ .key = ElfDynamic.dynamic_key, .value = base + dynamic_off, .used = true };
+        }
     }
     try parallel(io, n_threads, l.n_resolve_tasks + n_debug_chunks, &l, Link.resolveAddrsAndLayOutDebug);
     try l.check(diag);
-    const entry_addr = if (numbered) |s| l.numberedAddr(addrs[s.entry]) else if (options.entry) |e| symbols.get(e).? else 0;
+    const entry_addr = if (options.entry == null) 0 else if (numbered) |s| l.numberedAddr(addrs[s.entry]) else symbols.get(options.entry.?).?;
     if (entry_addr == null) {
         diag.* = .{ .target = options.entry };
         return error.UndefinedSymbol;
@@ -1275,16 +1314,18 @@ fn LinkOf(comptime Input: type) type {
         /// Lays out one chunk's atoms within each section, as if the chunk's
         /// part of every section started at 0.
         fn layOutKeyed(l: *Link, chunk: usize, _: usize) void {
-            l.layOut(chunk, false);
+            l.layOut(chunk, false, true);
         }
 
+        /// A relink of a pic or shared image is rare; the static one keeps
+        /// its loop free of their checks.
         fn layOutNumbered(l: *Link, chunk: usize, _: usize) void {
-            l.layOut(chunk, true);
+            if (l.pic or l.dynamic) l.layOut(chunk, true, true) else l.layOut(chunk, true, false);
         }
 
         /// The key-based and numbered paths are compiled apart, so that each
         /// is as tight as if it were the only one.
-        fn layOut(l: *Link, chunk: usize, comptime numbered: bool) void {
+        fn layOut(l: *Link, chunk: usize, comptime numbered: bool, comptime pic_or_dynamic: bool) void {
             const begin = chunk * chunk_len;
             const end = @min(l.n_atoms, begin + chunk_len);
             var c: Chunk = .{
@@ -1302,10 +1343,8 @@ fn LinkOf(comptime Input: type) type {
             };
             defer l.chunks[chunk] = c;
             // Locals: the loop writes through pointers that could alias `l`.
-            // Numbered input comes from the cache, which holds no pic
-            // compilations, so that path compiles without them.
-            const pic = !numbered and l.pic;
-            const dynamic = !numbered and l.dynamic;
+            const pic = pic_or_dynamic and l.pic;
+            const dynamic = pic_or_dynamic and l.dynamic;
             for (l.places[begin..end], begin..) |*p, i| {
                 // The numbered path's first read of each atom; the key
                 // path checked them in `gatherKeys`.
@@ -1497,7 +1536,7 @@ fn LinkOf(comptime Input: type) type {
         /// A shared object's, which also writes a .rela.dyn record per
         /// absolute relocation; out of line, as `copyNumbered`.
         noinline fn copyDynamic(l: *Link, chunk: usize, thread: usize) void {
-            l.copy(chunk, thread, false, true);
+            if (l.numbered == null) l.copy(chunk, thread, false, true) else l.copy(chunk, thread, true, true);
         }
 
         fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool, comptime dynamic: bool) void {
@@ -2060,6 +2099,93 @@ test "links and runs a program that writes from rodata and exits with 42" {
     const conflicting = [_]Atom{ atoms[0], .{ .key = start, .name = "other", .section = .text, .bytes = "\xc3" } };
     try std.testing.expectError(error.DuplicateSymbol, emit(gpa, io, &conflicting, .{ .entry = start, .diag = &diag }));
     try std.testing.expectEqualStrings("other", diag.atom);
+}
+
+test "a shared object links the same with numbered symbols" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const f: SymbolKey = .fromName("f");
+    const tv: SymbolKey = .fromName("tv");
+    const ptrs: SymbolKey = .fromName("ptrs");
+    const table: SymbolKey = .fromName("table");
+    const g: SymbolKey = .fromName("import.g");
+    const get_addr: SymbolKey = .fromName("import.__tls_get_addr");
+    // `call g; lea rax, [rip + _DYNAMIC]`, the local-dynamic sequence for
+    // `tv`, `ret`: every symbol kind a shared object's code reaches.
+    const code = "\xe8\x00\x00\x00\x00" ++ "\x48\x8d\x05\x00\x00\x00\x00" ++ "\x48\x8d\x3d\x00\x00\x00\x00" ++
+        "\xe8\x00\x00\x00\x00" ++ "\x48\x8d\x80\x00\x00\x00\x00" ++ "\xc3";
+    const zeros: [16]u8 = @splat(0);
+    const atoms = [_]Atom{
+        .{ .key = f, .name = "f", .section = .text, .alignment = .@"16", .bytes = code, .targets = &.{ g, ElfDynamic.dynamic_key, tv, get_addr }, .relocs = &.{
+            .init(1, .x86_64_pc32, 0, -4),
+            .init(8, .x86_64_pc32, 1, -4),
+            .init(15, .x86_64_tlsld, 2, -4),
+            .init(20, .x86_64_pc32, 3, -4),
+            .init(27, .x86_64_dtpoff32, 2, 0),
+        } },
+        .{ .key = tv, .name = "tv", .section = .tdata, .alignment = .@"4", .bytes = zeros[0..4] },
+        // An address of the object's own (RELATIVE) and of an import's.
+        .{ .key = ptrs, .name = "ptrs", .section = .data, .alignment = .@"8", .bytes = &zeros, .targets = &.{ f, g }, .relocs = &.{
+            .init(0, .x86_64_abs64, 0, 0),
+            .init(8, .x86_64_abs64, 1, 0),
+        } },
+        // In .data.rel.ro.
+        .{ .key = table, .name = "table", .section = .rodata, .alignment = .@"8", .bytes = zeros[0..8], .targets = &.{f}, .relocs = &.{
+            .init(0, .x86_64_abs64, 0, 0),
+        } },
+    };
+    const dynamic: ElfDynamic.Options = .{
+        // `f` twice, as two `@export`s of one function give.
+        .exports = &.{ .{ .key = tv, .name = "tv" }, .{ .key = f, .name = "f" }, .{ .key = f, .name = "f_alias" } },
+        .imports = &.{ .{ .key = g, .name = "g" }, .{ .key = get_addr, .name = "__tls_get_addr" } },
+        .soname = "libt.so",
+    };
+    const options: Options = .{ .entry = null, .base_address = 0, .pic = true, .dynamic = &dynamic };
+    const bytes = try emit(gpa, io, &atoms, options);
+    defer gpa.free(bytes);
+    try std.testing.expectEqual(elf.ET.DYN, @as(elf.ET, @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[16..18], .little)))));
+
+    // Numbers: the atoms in order, then g, __tls_get_addr, and _DYNAMIC.
+    const numbering = [_]SymbolKey{ f, tv, ptrs, table, g, get_addr, ElfDynamic.dynamic_key };
+    var numbered_atoms: [atoms.len]NumberedAtom = undefined;
+    var targets: std.ArrayList(u32) = .empty;
+    defer targets.deinit(gpa);
+    for (atoms, &numbered_atoms, 0..) |a, *n, i| {
+        n.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
+        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.indexOfScalar(SymbolKey, &numbering, t).?));
+    }
+    var symbols: Symbols = .{
+        .atoms = &numbered_atoms,
+        .targets = targets.items,
+        .dynamic_imports = &.{ 4, 5 },
+        .dynamic_exports = &.{ 1, 0, 0 },
+        .dynamic = 6,
+        .entry = 0,
+        .len = numbering.len,
+    };
+    var numbered_options = options;
+    numbered_options.symbols = symbols;
+    const numbered = try emit(gpa, io, &atoms, numbered_options);
+    defer gpa.free(numbered);
+    try std.testing.expectEqualSlices(u8, bytes, numbered);
+    // The same at a nonzero base: numbered addresses are offsets from it.
+    var based_options = options;
+    based_options.base_address = 0x1000000;
+    const based = try emit(gpa, io, &atoms, based_options);
+    defer gpa.free(based);
+    try std.testing.expect(!std.mem.eql(u8, bytes, based));
+    based_options.symbols = symbols;
+    const based_numbered = try emit(gpa, io, &atoms, based_options);
+    defer gpa.free(based_numbered);
+    try std.testing.expectEqualSlices(u8, based, based_numbered);
+
+    // An export's number must be an atom's.
+    var diag: Diagnostic = .{};
+    symbols.dynamic_exports = &.{ 1, 4, 0 };
+    numbered_options.symbols = symbols;
+    numbered_options.diag = &diag;
+    try std.testing.expectError(error.UndefinedSymbol, emit(gpa, io, &atoms, numbered_options));
+    try std.testing.expectEqualStrings("f", diag.atom);
 }
 
 test "thread-locals in .tdata and .tbss read back after static TLS setup" {
