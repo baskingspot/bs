@@ -14169,7 +14169,11 @@ fn loadElem(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref)
             else => {},
         }
     }
-    return sema.analyzeLoad(block, src, try sema.elemPtr(block, src, ptr, uncasted_index, true));
+    const ep = try sema.elemPtr(block, src, ptr, uncasted_index, true);
+    // As upstream's elemVal: an element of a comptime-only type cannot be
+    // read at a runtime index.
+    if (sema.resolveValue(uncasted_index) == null) try sema.runtimeElemAccess(block, src, Type.ptrInfo(ip, sema.typeOf(ep)).child);
+    return sema.analyzeLoad(block, src, ep);
 }
 
 fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, safety: bool) CompileError!Ref {
@@ -14331,7 +14335,13 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
                     if (a.len == 0 and a.sentinel == .none) return sema.fail(block, src, "cannot index into empty array", .{});
                     if (safety) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none);
                     break :blk try sema.elemPtrOfArrayPtr(block, src, lhs, index);
-                } else try sema.elemPtrOfManyPtr(block, src, lhs, index);
+                } else blk: {
+                    // As upstream's validateRuntimeElemAccess: a pointer to
+                    // a comptime-only element may be formed at runtime, but
+                    // not loaded.
+                    if (sema.resolveValue(lhs) == null or sema.resolveValue(index) == null) try sema.runtimeElemAccess(block, src, p.child);
+                    break :blk try sema.elemPtrOfManyPtr(block, src, lhs, index);
+                };
                 return sema.analyzeLoad(block, src, ep);
             },
         },
@@ -14367,8 +14377,11 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
 /// a comptime_int at a run-time index; only `@intCast` takes it.
 fn runtimeElemAccess(sema: *Sema, block: *Block, src: Src, elem_ty: Index) CompileError!void {
     if (sema.bc != null and elem_ty == .comptime_int_type) return;
-    if (try sema.isComptimeOnlyResolved(block, src, elem_ty))
-        return sema.fail(block, src.operandSrc(1), "values of type '{f}' must be comptime-known, but index value is runtime-known", .{sema.fmtType(elem_ty)});
+    if (try sema.isComptimeOnlyResolved(block, src, elem_ty)) {
+        const err = sema.fail(block, src.operandSrc(1), "values of type '{f}' must be comptime-known, but index value is runtime-known", .{sema.fmtType(elem_ty)});
+        try sema.explainWhyComptime(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), elem_ty);
+        return err;
+    }
 }
 
 fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
