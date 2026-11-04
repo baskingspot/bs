@@ -16,11 +16,17 @@ const Zir = std.zig.Zir;
 /// has, after its own callees are inlined.
 pub const budget = 30;
 
-/// A call that may be inlined: a direct call of an `.auto` function, not
-/// `never_inline`, outside cold code. `line:column` is the call's statement
-/// position.
+/// The most such instructions a body that keeps calls has and is still
+/// inlinable. CodeGen routes a call left in inlined code through
+/// returning stubs, so the inlined frames stay on the stack.
+pub const nonleaf_budget = 16;
+
+/// A direct call of an `.auto` function outside cold code: one that may
+/// be inlined, or a `never_inline` one (`keep`), which stays a call.
+/// `line:column` is the call's statement position.
 pub const Site = struct {
     call: Inst.Index,
+    keep: bool,
     callee: Index,
     line: u32,
     column: u32,
@@ -33,7 +39,7 @@ pub const Scan = struct {
     /// Whether the function could be spliced into a caller once its
     /// candidate calls are inlined: an `.auto`, non-`noinline` function
     /// whose IR uses only instructions `splice` maps, and that calls
-    /// nothing else but cold `noreturn` functions.
+    /// nothing else but cold `noreturn` functions and the sites' callees.
     inlinable: bool = true,
     /// Whether the function can start a panic: it calls a cold `noreturn`
     /// function (a safety check's handler, `unreachable`, `@panic`) or
@@ -161,15 +167,24 @@ const Scanner = struct {
             s.out.inlinable = false;
             return;
         };
-        if (cold or extra.flags.never_inline or ip.keyTag(callee) != .func or
+        if (cold or ip.keyTag(callee) != .func or
             ip.keyPayload(.func_type, ip.typeOf(callee)).cc != .auto)
         {
             s.out.inlinable = false;
             return;
         }
-        try s.sites.append(s.gpa, .{ .call = inst, .callee = callee, .line = s.line, .column = s.column });
+        try s.sites.append(s.gpa, .{ .call = inst, .keep = extra.flags.never_inline, .callee = callee, .line = s.line, .column = s.column });
     }
 };
+
+/// Whether an inlinable body keeps a call: one that returns. (Its other
+/// calls are cold `noreturn` ones.)
+pub fn keepsCalls(body: *const Ir) bool {
+    for (body.instructions.items(.tag), body.instructions.items(.data)) |tag, data| {
+        if (tag == .call and body.extraData(Ir.Call, data.pl_op.payload).data.ret_ty != .noreturn_type) return true;
+    }
+    return false;
+}
 
 /// Whether a body is cold code: a safety check's failure or `unreachable`.
 fn isCold(ir: *const Ir, body: []const Inst.Index) bool {

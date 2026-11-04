@@ -316,14 +316,14 @@ pub fn main(init_std: std.process.Init) !void {
 /// `=<name>:<mode>` with `t` or `n` for tracing and `v` or `n` for
 /// Valgrind. ('=' is in no module's name.)
 /// Atoms inlined other than by default (`inlining`) get entries of their
-/// own too, as `+inline<budget>` and `s` for the safe variant, and
-/// atoms with every check kept (`ZAP_PROVE=off`) as `+noprove`. A CPU
-/// other than the baseline (`-mcpu`), which changes builtin and the code
-/// generated for every function, follows the target as `@<model>` and its
-/// feature words (`cpu.cacheName`).
+/// own too, as `+inline<budget>`, `n<nonleaf budget>`, and `s` for the
+/// safe variant, and atoms with every check kept (`ZAP_PROVE=off`) as
+/// `+noprove`. A CPU other than the baseline (`-mcpu`), which changes
+/// builtin and the code generated for every function, follows the target
+/// as `@<model>` and its feature words (`cpu.cacheName`).
 fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.process.Environ.Map) ![]const u8 {
     const inl = inlining(env);
-    const default_inl = inl.budget == inline_ir.budget and !inl.safe;
+    const default_inl = inl.budget == inline_ir.budget and inl.nonleaf == inline_ir.nonleaf_budget and !inl.safe;
     const same_modes = for (opts.modules) |m| {
         if (m.optimize.? != opts.optimize or m.error_tracing.? != opts.error_tracing or m.valgrind.? != opts.valgrind) break false;
     } else true;
@@ -347,7 +347,7 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
         if (m.optimize.? == opts.optimize and m.error_tracing.? == opts.error_tracing and m.valgrind.? == opts.valgrind) continue;
         try s.print(arena, "={s}:{t}{c}{c}", .{ m.name, m.optimize.?, "nt"[@intFromBool(m.error_tracing.?)], "nv"[@intFromBool(m.valgrind.?)] });
     }
-    if (!default_inl) try s.print(arena, "+inline{d}{s}", .{ inl.budget, if (inl.safe) "s" else "" });
+    if (!default_inl) try s.print(arena, "+inline{d}n{d}{s}", .{ inl.budget, inl.nonleaf, if (inl.safe) "s" else "" });
     if (!prove_on) try s.appendSlice(arena, "+noprove");
     return s.items;
 }
@@ -363,10 +363,13 @@ fn proving(env: *const std.process.Environ.Map) bool {
 
 /// How calls are inlined (docs/architecture.md, "Inlining within a
 /// budget"): `ZAP_INLINE=<budget>` sets the budget, 0 turns inlining off,
-/// and `ZAP_INLINE_SAFE=1` inlines only callees that cannot panic.
-fn inlining(env: *const std.process.Environ.Map) struct { budget: u32, safe: bool } {
+/// `ZAP_INLINE_NONLEAF=<budget>` sets the budget of bodies that keep
+/// calls, 0 inlining only leaves, and `ZAP_INLINE_SAFE=1` inlines only
+/// callees that cannot panic.
+fn inlining(env: *const std.process.Environ.Map) struct { budget: u32, nonleaf: u32, safe: bool } {
     const budget = if (env.get("ZAP_INLINE")) |v| std.fmt.parseInt(u32, v, 10) catch fatal("invalid ZAP_INLINE '{s}': expected a number", .{v}) else inline_ir.budget;
-    return .{ .budget = budget, .safe = env.get("ZAP_INLINE_SAFE") != null };
+    const nonleaf = if (env.get("ZAP_INLINE_NONLEAF")) |v| std.fmt.parseInt(u32, v, 10) catch fatal("invalid ZAP_INLINE_NONLEAF '{s}': expected a number", .{v}) else inline_ir.nonleaf_budget;
+    return .{ .budget = budget, .nonleaf = nonleaf, .safe = env.get("ZAP_INLINE_SAFE") != null };
 }
 
 /// What one compilation needs besides its output path, resolved from the
@@ -868,7 +871,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     const bench_runs: u32 = if (env.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
     if (bench_runs != 0) emit.bench_irs = .empty;
     const inl = inlining(job.environ_map);
-    if (inl.budget != 0) emit.enableInlining(inl.budget, inl.safe);
+    if (inl.budget != 0) emit.enableInlining(inl.budget, inl.nonleaf, inl.safe);
     // `ZAP_THREADS=n`: analysis and CodeGen on n threads, Sema on one and
     // CodeGen on the others; 1 generates on the Sema thread. The output
     // is the same for every n.

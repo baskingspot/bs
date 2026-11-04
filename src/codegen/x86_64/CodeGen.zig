@@ -99,10 +99,10 @@ ret_label: ?Encoder.Label = null,
 ret_bound: bool = false,
 /// Where the epilogue's `ret` ends, before shortening.
 ret_end: u32 = 0,
-/// Panic calls in code the backend inlined, which call a chain of stubs
-/// emitted after the epilogue instead of the handler (`panicThroughStubs`),
-/// with the inlined calls open at each (`stub_open`), and the stubs'
-/// bytes so far.
+/// Calls in code the backend inlined, which call a chain of stubs emitted
+/// after the epilogue instead of their target (`callThroughStubs`), with
+/// the inlined calls open at each (`stub_open`), and the stubs' bytes so
+/// far.
 stub_chains: std.ArrayList(StubChain) = .empty,
 stub_open: std.ArrayList(OpenInline) = .empty,
 stub_bytes: u32 = 0,
@@ -150,10 +150,11 @@ dbg_open: std.ArrayList(OpenInline) = .empty,
 /// resume after it.
 const OpenInline = struct { index: u32, line: u32, column: u32, backend: bool = false };
 
-/// A panic call through stubs: the stubs' first label, the handler, the
-/// inlined calls open at the call (`stub_open[open_start..][0..open_len]`),
-/// and the row of the check, relative to the innermost.
-const StubChain = struct { label: Encoder.Label, target: SymbolKey, open_start: u32, open_len: u32, line: u32, column: u32 };
+/// A call through stubs: the stubs' first label, the target, the inlined
+/// calls open at the call (`stub_open[open_start..][0..open_len]`), the
+/// row of the call, relative to the innermost, and whether the stubs
+/// return (all but a panic handler's call).
+const StubChain = struct { label: Encoder.Label, target: SymbolKey, open_start: u32, open_len: u32, line: u32, column: u32, returns: bool };
 
 const ColdStart = struct { line: u32, column: u32, open_start: u32, open_len: u32 };
 
@@ -2063,14 +2064,17 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
     }
 }
 
-/// Calls panic handler `target` from cold code through a chain of stubs,
-/// one per call the backend inlined that is open here, so that the stack
-/// trace shows the frames those calls would have had (docs/architecture.md,
+/// Calls `target` through a chain of stubs, one per call the backend
+/// inlined that is open here, so that a stack trace taken in `target`
+/// shows the frames those calls would have had (docs/architecture.md,
 /// "Synthetic panic frames"): the call itself is at the outermost such
 /// call's site, in its caller, and the stubs after the epilogue
-/// (`emitStubs`) are at each next site inward, the last at the check.
+/// (`emitStubs`) are at each next site inward, the last at the call.
 /// Without such calls open, or past the stubs' room, calls `target`.
-fn panicThroughStubs(cg: *CodeGen, target: SymbolKey) Error!void {
+/// A panic handler's call (`returns` false) is the last code of a cold
+/// block. Otherwise each stub returns after its call, and the inlined
+/// calls open here end before the call and get new entries after it.
+fn callThroughStubs(cg: *CodeGen, target: SymbolKey, returns: bool) Error!void {
     const open = cg.dbg_open.items;
     var first: ?usize = null;
     var depth: u32 = 0;
@@ -2079,17 +2083,26 @@ fn panicThroughStubs(cg: *CodeGen, target: SymbolKey) Error!void {
         depth += 1;
     };
     // `Atom.Unwind.epilogue` counts the stubs and probes in 16 bits.
-    if (first == null or cg.stub_bytes + 5 * depth > 0xfe00) return cg.e.call(.{ .sym = target });
-    cg.stub_bytes += 5 * depth;
+    const stub_size: u32 = if (returns) 6 else 5;
+    if (first == null) return cg.e.call(.{ .sym = target });
+    if (cg.stub_bytes + stub_size * depth > 0xfe00) {
+        cg.emit.codegen_stats.stubless += 1;
+        return cg.e.call(.{ .sym = target });
+    }
+    cg.stub_bytes += stub_size * depth;
     const b = first.?;
     const label = try cg.e.newLabel();
-    try cg.stub_chains.append(cg.gpa, .{ .label = label, .target = target, .open_start = @intCast(cg.stub_open.items.len), .open_len = @intCast(open.len), .line = cg.dbg_line, .column = cg.dbg_column });
+    const open_start: u32 = @intCast(cg.stub_open.items.len);
+    const open_len: u32 = @intCast(open.len);
+    try cg.stub_chains.append(cg.gpa, .{ .label = label, .target = target, .open_start = open_start, .open_len = open_len, .line = cg.dbg_line, .column = cg.dbg_column, .returns = returns });
     try cg.stub_open.appendSlice(cg.gpa, open);
     // Each stub's call pushes 8 bytes; the handler is entered as from an
     // aligned call.
     if (depth % 2 == 1) try cg.e.alu(.sub, .qword, .{ .reg = .rsp }, .{ .imm = 8 });
     // The call is the outermost inlined call's caller's: the inlined calls
-    // from there in end before it. No code that runs follows it.
+    // from there in end before it.
+    const line = cg.dbg_line;
+    const column = cg.dbg_column;
     const pc: u32 = @intCast(cg.e.code.items.len);
     for (open[b..]) |o| cg.dbg_inlines.items[o.index].high = pc;
     const site = cg.dbg_inlines.items[open[b].index];
@@ -2101,14 +2114,34 @@ fn panicThroughStubs(cg: *CodeGen, target: SymbolKey) Error!void {
     cg.dbg_column = site.call_column;
     try cg.e.line(site.call_line, site.call_column);
     try cg.e.call(.{ .label = label });
+    if (!returns) return;
+    if (depth % 2 == 1) try cg.e.alu(.add, .qword, .{ .reg = .rsp }, .{ .imm = 8 });
+    // The code after the call is in the same inlined calls again, as new
+    // entries with the same call information.
+    const after: u32 = @intCast(cg.e.code.items.len);
+    for (cg.stub_open.items[open_start + b .. open_start + open_len]) |o| {
+        var copy = cg.dbg_inlines.items[o.index];
+        copy.low = after;
+        copy.high = after;
+        copy.parent = if (cg.dbg_open.getLastOrNull()) |p| p.index else Atom.Debug.Inline.none;
+        try cg.dbg_inline_callees.append(cg.gpa, cg.dbg_inline_callees.items[o.index]);
+        try cg.dbg_open.append(cg.gpa, .{ .index = @intCast(cg.dbg_inlines.items.len), .line = o.line, .column = o.column, .backend = o.backend });
+        try cg.dbg_inlines.append(cg.gpa, copy);
+    }
+    const inner = cg.dbg_open.getLast().index;
+    try cg.e.switchLines(cg.dbg_inlines.items[inner].file, inner + 1);
+    cg.dbg_line = line;
+    cg.dbg_column = column;
+    try cg.e.line(line, column);
 }
 
-/// The stubs of the panic calls `panicThroughStubs` made, after the
+/// The stubs of the calls `callThroughStubs` made, after the
 /// epilogue: frameless code whose CFA is rsp + 8 (`Atom.Unwind.epilogue`).
 /// Stub k is in entries copying the inlined calls open from the k-th
 /// backend-inlined call to the next one (from the function's own for the
 /// first), at the next one's site, and calls stub k + 1, which follows; the
-/// last is at the check and calls the handler.
+/// last is at the call and calls its target. A returning chain's stubs
+/// `ret` after their call.
 fn emitStubs(cg: *CodeGen) Error!void {
     for (cg.stub_chains.items) |ch| {
         cg.e.bind(ch.label);
@@ -2146,10 +2179,12 @@ fn emitStubs(cg: *CodeGen) Error!void {
                 try cg.e.line(site.call_line, site.call_column);
                 const next = try cg.e.newLabel();
                 try cg.e.call(.{ .label = next });
+                if (ch.returns) try cg.e.ret();
                 cg.e.bind(next);
             } else {
                 try cg.e.line(ch.line, ch.column);
                 try cg.e.call(.{ .sym = ch.target });
+                if (ch.returns) try cg.e.ret();
             }
             i = end;
         }
@@ -3738,9 +3773,11 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     if (callee_val) |f| {
         if (is_c and callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
         // A panic in code the backend inlined, with its arguments in
-        // registers, gets the frames of the calls it was inlined from.
-        if (ret_ty == .noreturn_type and cg.in_cold and !is_c and !is_win and !stack_args and !cg.outermost_frame) {
-            try cg.panicThroughStubs(try cg.emit.funcKey(f));
+        // registers, gets the frames of the calls it was inlined from. So
+        // does a call that returns there, through stubs that return
+        // (inlined bodies keep calls only of such functions, `Emit.keepable`).
+        if (!is_c and !is_win and !stack_args and !cg.outermost_frame and cg.in_cold == (ret_ty == .noreturn_type)) {
+            try cg.callThroughStubs(try cg.emit.funcKey(f), !cg.in_cold);
         } else try cg.e.call(.{ .sym = try cg.emit.funcKey(f) });
     } else {
         // r11 is not an argument register in either convention.

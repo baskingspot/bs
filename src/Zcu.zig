@@ -90,8 +90,9 @@ func_refs: std.AutoArrayHashMapUnmanaged(FuncRef, void) = .empty,
 /// the reference trace of its errors.
 referenced_by: std.AutoHashMapUnmanaged(AnalUnit, Reference) = .empty,
 next_func: usize = 0,
-/// The inlinable functions (Emit, `codegen/inline.zig`): their size and
-/// the `func_inline` result hash. A function not here is not inlinable.
+/// The inlinable functions (Emit, `codegen/inline.zig`) and those on a
+/// cycle of candidate calls: their size and the `func_inline` result
+/// hash. A function not here is not inlinable.
 inline_results: std.AutoHashMapUnmanaged(InternPool.Index, InlineResult) = .empty,
 /// The `func_inline` result of a function that is not inlinable is this
 /// `^ 1`: the inlining variant (`Emit.inlineSalt`).
@@ -1351,7 +1352,14 @@ pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !bool {
     return true;
 }
 
-pub const InlineResult = struct { size: u32, hash: cache.Hash };
+/// An inlinable function's size and hash; `size` is `cyclic` for a
+/// function on a cycle of candidate calls (Emit's `Fate.cyclic`).
+pub const InlineResult = struct {
+    size: u32,
+    hash: cache.Hash,
+
+    pub const cyclic = std.math.maxInt(u32);
+};
 
 pub const FuncBody = union(enum) {
     /// Its analysis failed.

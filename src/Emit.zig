@@ -215,6 +215,8 @@ exports_view: ExportsView = .{ .list = &.{}, .resolved = &.{} },
 inlining: bool = false,
 inline_safe: bool = false,
 inline_budget: u32 = inline_ir.budget,
+/// The budget of a body that keeps calls.
+inline_nonleaf: u32 = inline_ir.nonleaf_budget,
 /// Each decided function's fate.
 inline_fates: std.AutoHashMapUnmanaged(Index, Fate) = .empty,
 /// The inlinable bodies, already inlined into themselves.
@@ -222,6 +224,11 @@ inline_bodies: std.ArrayList(Ir) = .empty,
 /// The functions whose fate is being decided, which a cycle of calls
 /// reaches again.
 inline_active: std.ArrayList(Index) = .empty,
+/// The lowest index in `inline_active` that a cycle of candidate calls
+/// through the function decided last reached (`no_cycle` for none), which
+/// its caller reads: every function from there to the one that reached it
+/// is on the cycle.
+inline_cycle: usize = no_cycle,
 
 /// The CodeGen workers. Sema hands each analyzed function over as a job
 /// (`functionOwned`); workers take jobs in order, and `mergeJobs` waits
@@ -268,7 +275,12 @@ pub const Pool = struct {
 };
 
 const Fate = union(enum) {
+    /// Not inlinable; a body inlined elsewhere may keep a call of it.
     no,
+    /// Not inlinable, and on a cycle of candidate calls or calling a
+    /// function that is: its fate would depend on which function of the
+    /// cycle was decided first, so no body keeps a call of it.
+    cyclic,
     yes: struct {
         size: u32,
         hash: cache.Hash,
@@ -279,6 +291,7 @@ const Fate = union(enum) {
 };
 
 const no_body = std.math.maxInt(u32);
+const no_cycle = std.math.maxInt(usize);
 
 /// What deciding a function's fate came to: a fate, or not yet, because a
 /// cycle of calls reached a function being decided (which makes every
@@ -362,6 +375,9 @@ pub const CodeGenStats = struct {
     /// outgoing argument areas.
     code_bytes: u64 = 0,
     frame_bytes: u64 = 0,
+    /// Calls in backend-inlined code made directly because the function's
+    /// stubs ran out of room: their traces lack the inlined frames.
+    stubless: u64 = 0,
 
     pub fn print(s: CodeGenStats, label: []const u8) void {
         const per = struct {
@@ -374,7 +390,7 @@ pub const CodeGenStats = struct {
                 return @as(f64, @floatFromInt(ns)) / 1e6;
             }
         }.f;
-        std.debug.print("{s}: {d} functions, {d} IR instructions; rewrite {d:.1} ms ({d:.1} ns/IR, {d} folds), prove {d:.1} ms ({d:.1} ns/IR, {d} of {d} checks proven), ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
+        std.debug.print("{s}: {d} functions, {d} IR instructions; rewrite {d:.1} ms ({d:.1} ns/IR, {d} folds), prove {d:.1} ms ({d:.1} ns/IR, {d} of {d} checks proven), ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function, {d} calls without stubs\n", .{
             label,
             s.functions,
             s.ir_insts,
@@ -394,6 +410,7 @@ pub const CodeGenStats = struct {
             per(s.build_ns + s.alloc_ns + s.emit_ns, s.ir_insts),
             per(s.code_bytes, s.ir_insts),
             per(s.frame_bytes, s.functions),
+            s.stubless,
         });
     }
 };
@@ -616,7 +633,12 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     defer if (ir_owned) ir.deinit(gpa);
     const func = ir.func;
     try emit.inline_active.append(gpa, func);
+    const depth = emit.inline_active.items.len - 1;
     defer emit.inline_active.items.len -= 1;
+    // The lowest index in `inline_active` a cycle through this function's
+    // candidate calls reaches.
+    var low: usize = no_cycle;
+    emit.inline_cycle = no_cycle;
 
     var sites: std.ArrayList(inline_ir.Site) = .empty;
     defer sites.deinit(gpa);
@@ -629,6 +651,7 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     var seen: std.AutoHashMapUnmanaged(Index, void) = .empty;
     defer seen.deinit(gpa);
     for (sites.items, 0..) |site, i| {
+        if (site.keep) continue;
         // Functions with hundreds of calls (big switches) are common.
         const dup = if (i < 16) for (sites.items[0..i]) |prev| {
             if (prev.callee == site.callee) break true;
@@ -644,19 +667,42 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     var callee_hash: cache.Hash = 0;
     var size = s.size;
     var all = s.inlinable;
+    // Whether a call stays in the body, and whether the function is on a
+    // cycle of candidate calls or calls one that is.
+    var keeps = false;
+    var cyclic = false;
     for (sites.items) |site| {
-        const fate = switch (try emit.inlineFate(site.callee)) {
+        if (site.keep) {
+            if (!emit.keepable(site.callee)) all = false;
+            keeps = true;
+            continue;
+        }
+        const result = try emit.inlineFate(site.callee);
+        low = @min(low, emit.inline_cycle);
+        emit.inline_cycle = no_cycle;
+        const fate = switch (result) {
             .fate => |f| f,
-            .cycle => Fate.no,
+            .cycle => blk: {
+                low = @min(low, std.mem.indexOfScalar(Index, emit.inline_active.items, site.callee).?);
+                break :blk Fate.cyclic;
+            },
             .busy => if (mode == .generate_or_defer) {
                 try zcu.ready_irs.append(gpa, ir);
                 ir_owned = false;
                 return false;
-            } else Fate.no,
+            } else {
+                all = false;
+                continue;
+            },
         };
         const yes = switch (fate) {
             .no => {
-                all = false;
+                if (!emit.keepable(site.callee)) all = false;
+                keeps = true;
+                continue;
+            },
+            .cyclic => {
+                cyclic = true;
                 continue;
             },
             .yes => |y| y,
@@ -673,12 +719,18 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
             all = false;
             continue;
         };
+        if (inline_ir.keepsCalls(&emit.inline_bodies.items[body])) keeps = true;
         size += yes.size;
         callee_hash = cache.hash(@truncate(callee_hash), std.mem.asBytes(&yes.hash)) ^ callee_hash;
         try bodies.append(gpa, body);
         try splices.append(gpa, .{ .site = site, .body = undefined });
     }
-    const inlinable = all and size <= emit.inline_budget;
+    // The functions on a cycle are those from the one it reached to the
+    // one that reached it, whichever of them was decided first; the
+    // caller learns whether it is one of them.
+    if (low <= depth) cyclic = true;
+    emit.inline_cycle = if (low < depth) low else no_cycle;
+    const inlinable = all and !cyclic and size <= (if (keeps) emit.inline_nonleaf else emit.inline_budget);
     // Of its own body, before the splices.
     const loaded = emit.inline_fates.contains(func);
     const own_hash: cache.Hash = if (inlinable and !loaded) try inline_ir.hashBody(gpa, &zcu.ip, &ir) else 0;
@@ -711,6 +763,9 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
         });
         try emit.inline_fates.put(gpa, func, .{ .yes = .{ .size = size, .hash = hash, .body = @intCast(emit.inline_bodies.items.len - 1) } });
         try zcu.inline_results.put(gpa, func, .{ .size = size, .hash = hash });
+    } else if (cyclic) {
+        try emit.inline_fates.put(gpa, func, .cyclic);
+        try zcu.inline_results.put(gpa, func, .{ .size = Zcu.InlineResult.cyclic, .hash = emit.zcu.inline_salt ^ 2 });
     } else try emit.inline_fates.put(gpa, func, .no);
     if (mode == .body) return true;
     ir_owned = false;
@@ -721,13 +776,24 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
 /// Mixed into every `func_inline` result, so a different budget or
 /// variant changes every caller's.
 fn inlineSalt(emit: *const Emit) cache.Hash {
-    return cache.hash(emit.inline_budget, if (emit.inline_safe) "safe" else "full");
+    return cache.hash(emit.inline_budget | @as(u64, emit.inline_nonleaf) << 32, if (emit.inline_safe) "safe" else "full");
+}
+
+/// Whether an inlinable body may keep its call of `callee`: CodeGen calls
+/// it through returning stubs, one per inlined call open there, so the
+/// stack shows their frames. The stubs come between the caller's frame
+/// and the callee's, so the callee may take no arguments on the stack.
+/// The safe variant inlines only bodies that cannot panic, which a call
+/// may.
+fn keepable(emit: *const Emit, callee: Index) bool {
+    return !emit.inline_safe and CodeGen.argsInRegs(&emit.zcu.ip, emit.zcu.ip.typeOf(callee));
 }
 
 /// Turns inlining on, with `budget` and the variant (`inline_safe`).
-pub fn enableInlining(emit: *Emit, budget: u32, safe: bool) void {
+pub fn enableInlining(emit: *Emit, budget: u32, nonleaf: u32, safe: bool) void {
     emit.inlining = true;
     emit.inline_budget = budget;
+    emit.inline_nonleaf = nonleaf;
     emit.inline_safe = safe;
     emit.zcu.inline_salt = emit.inlineSalt();
 }
@@ -742,7 +808,7 @@ pub fn inlineFate(emit: *Emit, func: Index) Allocator.Error!FateResult {
         .failed => try emit.inline_fates.put(emit.gpa, func, .no),
         // Loaded from the cache: its recorded result.
         .done => try emit.inline_fates.put(emit.gpa, func, if (emit.zcu.inline_results.get(func)) |r|
-            .{ .yes = .{ .size = r.size, .hash = r.hash, .body = no_body } }
+            if (r.size == Zcu.InlineResult.cyclic) .cyclic else .{ .yes = .{ .size = r.size, .hash = r.hash, .body = no_body } }
         else
             .no),
         .analyzed => |ir| if (!try emit.inlineProcess(ir, .generate_or_defer)) return .busy,

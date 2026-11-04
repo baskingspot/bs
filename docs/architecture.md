@@ -1482,10 +1482,18 @@ build, the passes, and the debug info treat them as Sema's inline calls
   uses only instructions the splice maps (no `@returnAddress`,
   `@frameAddress`, inline assembly, error return trace access). Its size is its instructions with code
   outside cold bodies, plus the sizes of the callees inlined into it
-  (mid-stack inlining); the budget is 30. A function whose callees are
-  not all inlined is not inlinable itself, so only leaves and functions
-  that become leaves inline, and every decision reads the callee's own
-  IR, the same in every build and schedule.
+  (mid-stack inlining); the budget is 30. A function that keeps calls
+  after its own callees are inlined (*non-leaf*) inlines within a
+  smaller budget, 16, when each kept call is a direct `.auto` call whose
+  arguments all go in registers (`CodeGen.argsInRegs`, `Emit.keepable`):
+  CodeGen calls it through returning stubs (synthetic panic frames,
+  below), whose return addresses sit between the caller's frame and the
+  callee's, so no argument may be read from the caller's stack. Indirect
+  calls, other conventions, and calls in cold code still make a function
+  not inlinable. Every decision reads the callee's own IR and its
+  callees' fates, the same in every build and schedule.
+  `ZAP_INLINE_NONLEAF=<budget>` sets the non-leaf budget (0 inlines only
+  leaves).
 - **Variants.** *Full*, the default, inlines any such callee; synthetic
   panic frames (below) keep its panic traces complete. *Safe* also
   requires that the callee can start no panic: no call of a cold
@@ -1500,8 +1508,14 @@ build, the passes, and the debug info treat them as Sema's inline calls
   candidate sites and the size, and `Emit.inlineFate` decides each
   callee, depth first. A callee not analyzed yet is analyzed out of queue
   order (`Zcu.takeFuncBody`, as `ensureFuncIes` does), and its own fate
-  is decided and its IR handed to CodeGen in turn. A cycle of calls makes
-  the call stay a call; a callee whose analysis is in progress or waits on
+  is decided and its IR handed to CodeGen in turn. A cycle of candidate
+  calls makes the call stay a call, and every function on it, from the
+  one reached again to the one reaching it (`Emit.inline_cycle`), and
+  every function calling one of those, is *cyclic*: not inlinable, and no
+  body keeps a call of it. Which function of a cycle is decided first
+  depends on the schedule and on what an edit build loads, so a
+  function's fate must not; a cyclic callee's fate is recorded as such.
+  A callee whose analysis is in progress or waits on
   a speculation stays a call when the caller is generated now, or defers
   the caller to `ready_irs` when it was itself analyzed out of order. Each
   inlinable function keeps its body, already inlined into itself, for the
@@ -1529,7 +1543,8 @@ build, the passes, and the debug info treat them as Sema's inline calls
     `f`'s declaration), its inlined callees' hashes, its size, and the
     variant (`Emit.inlineSalt`: budget and full/safe). A function that is
     not inlinable has the result `salt ^ 1`, so edits to a large `f` do
-    not touch its callers. The size is the node's one result word, and
+    not touch its callers, and a cyclic one the size word `maxInt(u32)`
+    and the result `salt ^ 2` (`Zcu.InlineResult.cyclic`). The size is the node's one result word, and
     every inlinable function's node is recorded, as an inferred error
     set's is, so a loaded function without one is not inlinable.
   - **Replay.** Loading a function reads its `func_inline` node back into
@@ -1570,11 +1585,11 @@ build, the passes, and the debug info treat them as Sema's inline calls
   panic frames remove the loss.
   Error return traces are unaffected: their return-site addresses
   already map to the callee's lines.
-- **Synthetic panic frames.** Only cold code changes. A panic call in
+- **Synthetic panic frames.** A panic call in
   cold code inside calls the backend inlined (`DbgInline.flags.backend`;
   Sema's inline calls lose their frame as upstream's do) calls a chain of
   stubs after the function's epilogue instead of the handler
-  (`CodeGen.panicThroughStubs`, `emitStubs`): one stub per backend call
+  (`CodeGen.callThroughStubs`, `emitStubs`): one stub per backend call
   open there, `call next` each, the last calling the handler. The call in
   the cold block is at the outermost such call's site, in its caller;
   stub k is at the site of backend call k + 1, inside copies of the
@@ -1587,12 +1602,25 @@ build, the passes, and the debug info treat them as Sema's inline calls
   into the physical frame. The cold block does `sub rsp, 8` first when
   the depth is odd, so the handler is entered with an aligned stack. A
   function with stubs and no return gets an epilogue for its frame
-  description. The hot path is untouched; the cost is 5 bytes per stub.
+  description. Each panic stub costs 5 bytes. A call that returns, in hot
+  code inside backend-inlined calls (a non-leaf body's kept call), goes
+  through a chain of stubs that return
+  (`call next; ret`, 6 bytes each; `callThroughStubs` with `returns`):
+  the inline entries open there end before the call, which is at the
+  outermost site with `sub rsp, 8` around it when the depth is odd, and
+  new entries with the same call information start after it, so a trace
+  taken anywhere in the callee (a panic, `std.debug.captureStackTrace`)
+  has the uninlined program's frames. Error return traces need nothing:
+  their entries are return sites, which already map to each function's
+  own lines. Register allocation is unchanged: the call clobbers
+  what any call does.
   A panic call with arguments passed in memory keeps the direct call
   (std's handlers take theirs in registers), and the stubs stop growing
   near `epilogue`'s 16 bits. `zig build test` compares
-  `test/run/panic_inlined.zig`'s and `panic_trace.zig`'s traces with
-  those of the same programs built with `ZAP_INLINE=0`. Limit: a hardware
+  the traces of `test/run/panic_inlined.zig`, `panic_trace.zig`,
+  `panic_through_call.zig`, and `error_through_call.zig` with those of
+  the same programs built with `ZAP_INLINE=0`; `inline_keep_call.zig`
+  checks the callee's stack alignment at odd and even depths. Limit: a hardware
   fault (a segfault from a bad pointer, a division trap) in inlined code
   has no stub, so the signal handler's trace shows the callee's line
   under the caller's name and loses the inlined callers. aarch64's

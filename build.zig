@@ -515,7 +515,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
 }
 
 fn isTraceChecked(file: []const u8) bool {
-    for ([_][]const u8{ "panic_inlined.zig", "panic_trace.zig" }) |f| {
+    for ([_][]const u8{ "error_through_call.zig", "panic_inlined.zig", "panic_through_call.zig", "panic_trace.zig" }) |f| {
         if (std.mem.eql(u8, file, f)) return true;
     }
     return false;
