@@ -17851,18 +17851,43 @@ fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         return sema.withCandidates(sema.fail(block, src.callFunc(), "no field or member function named '{s}' in '{f}'", .{ name, sema.fmtType(container) }), container, name, .fields_and_members);
     const callee = try sema.navVal(block, src, nav);
     const callee_ty = sema.typeOf(callee);
-    if (Type.class(ip, callee_ty) != .@"fn") return sema.withCandidates(sema.fail(block, src.callFunc(), "no field or member function named '{s}' in '{f}'", .{ name, sema.fmtType(container) }), container, name, .fields_and_members);
-    const fn_ty = ip.keyPayload(.func_type, callee_ty);
-    if (fn_ty.param_types.len == 0) return sema.fail(block, src, "member function '{s}' has no parameters", .{name});
-    const first_ty = fn_ty.param_types[0];
-    // An `anytype` first parameter gets the pointer, as upstream.
-    const by_ptr = first_ty == .generic_poison_type or switch (Type.class(ip, first_ty)) {
-        .pointer => true,
-        .optional => Type.class(ip, Type.childType(ip, first_ty)) == .pointer,
-        else => false,
+    // As upstream's fieldCallBind, a declaration is a member function only
+    // if its first parameter takes the container: by value, by
+    // single-item or C pointer, as an optional of either, or as an error
+    // union payload. An `anytype` first parameter gets the pointer.
+    const by_ptr: ?bool = if (Type.class(ip, callee_ty) != .@"fn") null else by_ptr: {
+        const params = ip.keyPayload(.func_type, callee_ty).param_types;
+        if (params.len == 0) break :by_ptr null;
+        const first = params[0];
+        if (first == .generic_poison_type or sema.isPtrTo(first, container, true)) break :by_ptr true;
+        if (first == container) break :by_ptr false;
+        switch (Type.class(ip, first)) {
+            .optional => {
+                const child = Type.childType(ip, first);
+                if (child == container) break :by_ptr false;
+                if (sema.isPtrTo(child, container, false)) break :by_ptr true;
+            },
+            .error_union => if (ip.keyPayload(.error_union_type, first).payload_type == container) break :by_ptr false,
+            else => {},
+        }
+        break :by_ptr null;
     };
-    const self: Ref = if (by_ptr) self_ptr else try sema.analyzeLoad(block, src, self_ptr);
+    if (by_ptr == null) {
+        const err = sema.withCandidates(sema.fail(block, src.callFunc(), "no field or member function named '{s}' in '{f}'", .{ name, sema.fmtType(container) }), container, name, .fields_and_members);
+        const n = ip.getNav(nav);
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(n.file));
+        try sema.zcu.addNote(n.file, tree.nodeToSpan(sema.zcu.file(n.file).zir.getDeclaration(n.zir_inst).src_node), "'{s}' is not a member function", .{name});
+        return err;
+    }
+    const self: Ref = if (by_ptr.?) self_ptr else try sema.analyzeLoad(block, src, self_ptr);
     return sema.analyzeCall(block, src, callee, self, args, modifier);
+}
+
+/// Whether `ty` is a single-item (or, with `c`, a C) pointer to `child`.
+fn isPtrTo(sema: *Sema, ty: Index, child: Index, c: bool) bool {
+    if (Type.class(sema.ip, ty) != .pointer) return false;
+    const p = Type.ptrInfo(sema.ip, ty);
+    return p.child == child and (p.flags.size == .one or (c and p.flags.size == .c));
 }
 
 fn analyzeCall(

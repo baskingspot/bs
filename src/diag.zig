@@ -1300,7 +1300,6 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "cannot call optional type '{f}'", .@"bad-call" },
     .{ "cannot pass '{f}' to variadic function", .@"bad-call" },
     .{ "integer and float literals passed to variadic function must be casted to a fixed-size number type", .@"bad-call" },
-    .{ "member function '{s}' has no parameters", .@"bad-call" },
     .{ "type '{f}' not a function", .@"bad-call" },
     .{ "unable to call function with calling convention '{s}'", .@"bad-call" },
     .{ "runtime {s} not allowed in naked function", .@"naked-fn" },
