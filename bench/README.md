@@ -181,6 +181,37 @@ build), which now link a hidden output the cache can answer from, and
 which the cache does not take and which an inputs record now skips when
 nothing changed.
 
+### No-change builds after the nochange-speed branch
+
+A no-change `build` (default step) of libvaxis's wrapper and of zls, each
+compiler's global and local caches warm, median of 20 interleaved runs
+(ms), and the phases of 10 runs recorded with perf's scheduler events:
+upstream zig 0.17.1 / bs before (729ad25) / bs after.
+
+| | total | startup | runner until its first step | compile steps | runner, rest |
+|---|---:|---:|---:|---:|---:|
+| vaxis (2 steps) | 23.7 / 10.3 / 7.6 | 7.4 / 0.6 / 0.5 | 4.2 / 3.8 / 3.5 | 12.5 / 4.2 / 2.0 | 1.1 / 1.3 / 1.2 |
+| zls (3 steps) | 25.1 / 11.4 / 7.6 | 7.4 / 0.6 / 0.5 | 4.8 / 4.5 / 4.0 | 14.4 / 4.3 / 1.9 | 1.2 / 1.6 / 1.4 |
+
+- **A cached compile step takes 0.8–1.0 ms** from exec to exit, against
+  about 2 before and upstream's 6–7, close to the cost of starting a
+  process on this orb. It no longer stats the ~700 inputs of bs's pinned
+  lib directory (43% of its time; docs/slop/architecture.md, "No-edit
+  builds"), and a ReleaseFast bs no longer maps and zeroes std's 256 KiB
+  per-thread signal stack, which only a segfault handler uses (0.3 ms
+  and a quarter of the step's page faults).
+- **The runner's stack probes write** (codegen/x86_64/Encoder.zig): a
+  probe that read an untouched page mapped the zero page, and the first
+  write then copied it and flushed every CPU's TLB, for each page of
+  each Fetch worker's 64 KiB buffer.
+- What is left is mostly upstream's runner: forking a multithreaded
+  process for each step, and before its first step about 4 ms, 40% of
+  whose CPU time is page faults (its threads' signal stacks, a 20 MB
+  binary's code, fresh heap). bs's code generation still costs it some:
+  a store of a packed struct literal is one read-modify-write per field,
+  so SafeAllocator's footers read fresh pages before writing them, and
+  std's hashes run slower than upstream's (above).
+
 ## `bs build --watch` against `zig build --watch` (2026-11-04)
 
 `bench/watch.py` starts `<compiler> build --watch --summary new` on a
