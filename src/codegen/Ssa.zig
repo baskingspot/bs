@@ -143,6 +143,10 @@ pub const no_reg: u8 = 0xff;
 /// A `Live.hint` for a value whose tied user crosses a clobber point: it
 /// prefers a register in `survives`.
 pub const hint_saved: u8 = 0xfe;
+/// A second `Live.hint` for a single-register value that no other value
+/// may evict: spilling it would cost far more than a register's value
+/// (a by-reference argument, copied in whole).
+pub const hint_pinned: u8 = 0xfc;
 pub const want_reg: u8 = 0xfe;
 /// Like `want_reg`, for a value that needs two registers: a 9- to 16-byte
 /// value as its two eightbytes (`reg` the low, `reg2` the high one).
@@ -1128,7 +1132,7 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, 
         }
         var last: ?u8 = null;
         for (active[0..active_len], 0..) |a, k| {
-            if (usable >> @intCast(reg[a]) & 1 == 0 or held[reg[a]] >= def[inst] or reg2[a] != no_reg) continue;
+            if (usable >> @intCast(reg[a]) & 1 == 0 or held[reg[a]] >= def[inst] or reg2[a] != no_reg or hint[a][1] == hint_pinned) continue;
             if (last == null or end[a] > end[active[last.?]]) last = @intCast(k);
         }
         const victim = if (last) |l| active[l] else {
