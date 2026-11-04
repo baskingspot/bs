@@ -2366,7 +2366,15 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
   (gatherKeys for keys, layout for numbers); a false result fails the link
   with `error.InvalidInput`, reporting the lowest such atom in
   `Diagnostic.index`. The linker itself checks that `debugAtom(j)`
-  ascends and is in range before calling `debug(j)`.
+  ascends and is in range before calling `debug(j)`. A relink from the
+  cache checks each record once: after a link checked every record of a
+  base manifest (its id and pack id, recorded in the compilation's
+  `checked` file), later links of that base check only the bounds of the
+  base's records (`Pack.LinkAtoms.trusted`) and wholly check the log's
+  (`Manifest.LinkInput.fresh`). Packs are append-only and base packs are
+  never rewritten, so a record once well-formed stays so; a new base
+  (fold, compaction, full build) is checked whole again. On zls this
+  saves about 1.1 ms of each edit build's 17 ms relink.
   `Symbols.targets_tail` continues `targets` (index k ≥ targets.len reads
   `targets_tail[k - targets.len]`; no run may straddle), so a manifest's
   base runs and its log's runs are passed without joining them. Cost to

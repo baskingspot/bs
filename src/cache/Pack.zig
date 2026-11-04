@@ -235,9 +235,18 @@ pub const LinkAtoms = struct {
     /// The atom at `refs[i]` is named `names[i]`: records keep no names
     /// (`Manifest.atom_names`). Without them, names are empty.
     names: ?[]const []const u8 = null,
+    /// The atoms whose records an earlier link of the same packs already
+    /// checked (`Incremental.linkFrom`): `check` tests only their bounds.
+    /// Packs are append-only and base packs never change, so a record
+    /// that was well-formed stays so.
+    trusted: ?std.DynamicBitSetUnmanaged = null,
 
     pub fn deinit(in: LinkAtoms, gpa: Allocator) void {
         gpa.free(in.mems);
+        if (in.trusted) |t| {
+            var bits = t;
+            bits.deinit(gpa);
+        }
     }
 
     pub inline fn len(in: LinkAtoms) usize {
@@ -257,6 +266,7 @@ pub const LinkAtoms = struct {
         const mem = in.mems[r.pack];
         const off = r.offset();
         if ((r.pack == 0 and off < @sizeOf(Header)) or off > mem.len or r.len > mem.len - off) return false;
+        if (in.trusted) |t| if (t.isSet(i)) return true;
         return atoms_codec.check(@alignCast(mem[off..][0..r.len]), in.arch) == r.len;
     }
 
