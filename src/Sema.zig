@@ -11821,11 +11821,12 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
         const backing = ip.structInfo(lt).tag_type;
         if (sema.resolveValue(lhs)) |a| if (sema.resolveValue(rhs)) |b| {
             if (sema.isUndef(a) or sema.isUndef(b)) return .fromInterned(try sema.undefValue(.bool_type));
-            var ab = try BigInt.init(sema.arena);
-            var bb = try BigInt.init(sema.arena);
-            try sema.valueBits(a, &ab, 0);
-            try sema.valueBits(b, &bb, 0);
-            return .fromInterned(boolValue(ab.eql(bb) == (op == .eq)));
+            const n = Type.intInfo(ip, backing).bits;
+            const ab = try sema.bitsBuffer(n);
+            const bb = try sema.bitsBuffer(n);
+            try sema.valueBits(a, ab, 0);
+            try sema.valueBits(b, bb, 0);
+            return .fromInterned(boolValue(std.mem.eql(u8, ab, bb) == (op == .eq)));
         };
         try sema.requireRuntime(block, src);
         return sema.addBinOp(block, if (op == .eq) .cmp_eq else .cmp_neq, try sema.addTyOp(block, .bitcast, backing, lhs), try sema.addTyOp(block, .bitcast, backing, rhs));
@@ -13675,9 +13676,8 @@ fn writeMemBytes(sema: *Sema, v: Index, buf: []u8, undef: []bool) CompileError!b
         },
         .@"struct", .@"union" => {
             if (Type.isPacked(ip, ty)) {
-                var bits = try BigInt.init(sema.arena);
-                try sema.valueBits(v, &bits, 0);
-                bits.toConst().writeTwosComplement(buf[0..size], .little);
+                @memset(buf[0..size], 0);
+                try sema.valueBits(v, buf[0..size], 0);
             } else if (ip.structInfo(ty).layout == .@"extern" and Type.class(ip, ty) == .@"union") {
                 return sema.writeMemBytes(ip.keyPayload(.un, v).val, buf, undef);
             } else return false;
@@ -13758,9 +13758,7 @@ fn readMemBytes(sema: *Sema, ty: Index, buf_in: []const u8, undef: []const bool)
         },
         .@"struct", .@"union" => {
             if (!Type.isPacked(ip, ty)) return null;
-            const backing = ip.structInfo(ty).tag_type;
-            const bits = try sema.bigValue(try sema.intFromMemBytes(backing, buf));
-            return try sema.bitsValue(ty, bits.toConst(), 0);
+            return try sema.bitsValue(ty, buf, 0);
         },
         else => return null,
     }
@@ -13830,9 +13828,9 @@ fn elemValue(sema: *Sema, val: Index, index: u64) Allocator.Error!Index {
             if (ip.keyTag(val) == .un and ip.keyPayload(.un, val).tag == try sema.unionFieldTagValue(ty, @intCast(index))) return ip.keyPayload(.un, val).val;
             if (ip.keyTag(val) == .un and Type.isPacked(ip, ty)) {
                 // Another field of a packed union: the same bits.
-                var bits = try BigInt.init(sema.arena);
-                try sema.valueBits(ip.keyPayload(.un, val).val, &bits, 0);
-                return sema.bitsValue(ft, bits.toConst(), 0);
+                const bits = try sema.bitsBuffer(Type.intInfo(ip, ip.structInfo(ty).tag_type).bits);
+                try sema.valueBits(ip.keyPayload(.un, val).val, bits, 0);
+                return sema.bitsValue(ft, bits, 0);
             }
             break :blk ft;
         },
@@ -17992,9 +17990,9 @@ fn bitCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) C
             // Up to 64 bits of scalars and packed structs, without big
             // integers (`BreakState` and its `u3` in uucode's tables).
             if (d_bits <= 64) if (sema.valueBits64(v, 0)) |bits| if (try sema.bitsValue64(dest_ty, bits, 0)) |r| return .fromInterned(r);
-            var bits = try BigInt.init(sema.arena);
-            try sema.valueBits(v, &bits, 0);
-            return .fromInterned(try sema.bitsValue(dest_ty, bits.toConst(), 0));
+            const bits = try sema.bitsBuffer(d_bits);
+            try sema.valueBits(v, bits, 0);
+            return .fromInterned(try sema.bitsValue(dest_ty, bits, 0));
         }
         try sema.requireRuntime(block, src);
         return sema.addTyOp(block, .bitcast, dest_ty, operand);
@@ -18016,9 +18014,9 @@ fn bitCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) C
         if (d_bits != s_bits) return sema.fail(block, src, "@bitCast size mismatch: destination type '{f}' has {d} bits but source type '{f}' has {d} bits", .{ sema.fmtType(dest_ty), d_bits, sema.fmtType(src_ty), s_bits });
         if (sema.resolveValue(operand)) |v| {
             if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
-            var bits = try BigInt.init(sema.arena);
-            try sema.valueBits(v, &bits, 0);
-            return .fromInterned(try sema.bitsValue(dest_ty, bits.toConst(), 0));
+            const bits = try sema.bitsBuffer(d_bits);
+            try sema.valueBits(v, bits, 0);
+            return .fromInterned(try sema.bitsValue(dest_ty, bits, 0));
         }
         try sema.requireRuntime(block, src);
         if (d_bits > std.math.maxInt(u16)) return sema.failUnsupported(block, src, "@bitCast of more than 65535 bits with padded elements");
@@ -18034,9 +18032,9 @@ fn bitCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) C
 fn reinterpretBits(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) CompileError!Ref {
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
-        var bits = try BigInt.init(sema.arena);
-        try sema.valueBits(v, &bits, 0);
-        return .fromInterned(try sema.bitsValue(dest_ty, bits.toConst(), 0));
+        const bits = try sema.bitsBuffer(sema.bitCastBits(dest_ty).?);
+        try sema.valueBits(v, bits, 0);
+        return .fromInterned(try sema.bitsValue(dest_ty, bits, 0));
     }
     try sema.requireRuntime(block, src);
     return sema.addTyOp(block, .bitcast, dest_ty, operand);
@@ -18118,11 +18116,22 @@ fn unpackLogicalBits(sema: *Sema, block: *Block, src: Src, host: Ref, ty: Index,
     return sema.aggregate(block, src, ty, elems);
 }
 
-/// ORs the bits of value `v` (see `logicalBits`) into `out` at bit `offset`.
-fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) Allocator.Error!void {
+/// A zeroed buffer for `bits` bits, little-endian, for `valueBits` and
+/// `bitsValue`.
+fn bitsBuffer(sema: *Sema, bits: u64) Allocator.Error![]u8 {
+    const buf = try sema.arena.alloc(u8, @intCast((bits + 7) / 8));
+    @memset(buf, 0);
+    return buf;
+}
+
+/// Writes the bits of value `v` (see `logicalBits`) into `out`, which is
+/// zero there, at bit `offset`, little-endian (both targets' memory order).
+/// Each scalar writes only its own bits, so a value costs time and memory
+/// linear in its size (a BigInt shifted and ORed per element was
+/// quadratic: zig-libs' strRepeat bit-casts a 30 k-element array).
+fn valueBits(sema: *Sema, v: Index, out: []u8, offset: u64) Allocator.Error!void {
     const ip = sema.ip;
     const ty = ip.typeOf(v);
-    var part = try BigInt.init(sema.arena);
     switch (Type.class(ip, ty)) {
         .array => {
             const child = Type.childType(ip, ty);
@@ -18130,16 +18139,16 @@ fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) Allocator.Error!v
             const a = ip.keyPayload(.array_type, ty);
             // `elemValue` at `len` is the sentinel.
             for (0..a.len + @intFromBool(a.sentinel != .none)) |i| try sema.valueBits(try sema.elemValue(v, i), out, offset + i * eb);
-            return;
         },
         .vector => {
             const child = Type.childType(ip, ty);
             const eb = sema.logicalBits(child).?;
             for (0..ip.keyPayload(.vector_type, ty).len) |i| try sema.valueBits(try sema.elemValue(v, i), out, offset + i * eb);
-            return;
         },
-        .float => try part.set(ip.keyPayload(.float, v).bits()),
-        .bool => try part.set(@intFromBool(v == .bool_true)),
+        .float => std.mem.writeVarPackedInt(out, @intCast(offset), Type.floatBits(ip, ty), ip.keyPayload(.float, v).bits(), .little),
+        .bool => if (v == .bool_true) {
+            out[@intCast(offset / 8)] |= @as(u8, 1) << @intCast(offset % 8);
+        },
         // A packed struct's fields, and an enum (a packed struct field) by
         // its tag.
         .@"struct" => {
@@ -18159,12 +18168,10 @@ fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) Allocator.Error!v
         .void => return,
         else => {
             if (sema.isUndef(v)) return; // An undefined element: zeros.
-            part = try sema.bigValue(v);
-            try part.truncate(&part, .unsigned, Type.intInfo(ip, ty).bits);
+            var space: [2]std.math.big.Limb = undefined;
+            ip.intToBig(v, &space).writePackedTwosComplement(out, @intCast(offset), Type.intInfo(ip, ty).bits, .little);
         },
     }
-    try part.shiftLeft(&part, @intCast(offset));
-    try out.bitOr(out, &part);
 }
 
 /// `valueBits` for a value of at most 64 bits made of integers, bools,
@@ -18230,11 +18237,9 @@ fn bitsValue64(sema: *Sema, ty: Index, bits: u64, offset: u16) Allocator.Error!?
 }
 
 /// The value of type `ty` (see `bitCastBits`) whose bits are those of `bits`
-/// from bit `offset`.
-fn bitsValue(sema: *Sema, ty: Index, bits: std.math.big.int.Const, offset: u64) Allocator.Error!Index {
+/// (little-endian, as `valueBits` writes them) from bit `offset`.
+fn bitsValue(sema: *Sema, ty: Index, bits: []const u8, offset: u64) Allocator.Error!Index {
     const ip = sema.ip;
-    var part = try BigInt.init(sema.arena);
-    try part.shiftRight(&try bits.toManaged(sema.arena), @intCast(offset));
     switch (Type.class(ip, ty)) {
         .array => {
             const child = Type.childType(ip, ty);
@@ -18253,11 +18258,8 @@ fn bitsValue(sema: *Sema, ty: Index, bits: std.math.big.int.Const, offset: u64) 
             for (elems, 0..) |*e, i| e.* = try sema.bitsValue(child, bits, offset + i * eb);
             return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
         },
-        .float => {
-            try part.truncate(&part, .unsigned, Type.floatBits(ip, ty));
-            return sema.floatFromBits(ty, part.toConst().toInt(u128) catch unreachable);
-        },
-        .bool => return boolValue(part.toConst().limbs[0] & 1 != 0),
+        .float => return sema.floatFromBits(ty, std.mem.readVarPackedInt(u128, bits, @intCast(offset), Type.floatBits(ip, ty), .little, .unsigned)),
+        .bool => return boolValue(bits[@intCast(offset / 8)] >> @intCast(offset % 8) & 1 != 0),
         .@"struct" => {
             const elems = try sema.arena.alloc(Index, Type.fieldCount(ip, ty));
             for (elems, 0..) |*e, i| e.* = try sema.bitsValue(Type.fieldType(ip, ty, i), bits, offset + Type.packedFieldBitOffset(ip, ty, i));
@@ -18268,8 +18270,11 @@ fn bitsValue(sema: *Sema, ty: Index, bits: std.math.big.int.Const, offset: u64) 
         .void => return .void_value,
         else => {
             const info = Type.intInfo(ip, ty);
-            try part.truncate(&part, info.signedness, info.bits);
-            return sema.bigToValue(ty, part.toConst());
+            const n = std.math.big.int.calcTwosCompLimbCount(info.bits);
+            var space: [2]std.math.big.Limb = undefined;
+            var r: std.math.big.int.Mutable = .{ .limbs = if (n <= space.len) &space else try sema.arena.alloc(std.math.big.Limb, n), .positive = undefined, .len = undefined };
+            r.readPackedTwosComplement(bits, @intCast(offset), info.bits, .little, info.signedness);
+            return sema.bigToValue(ty, r.toConst());
         },
     }
 }

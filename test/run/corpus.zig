@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n41\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -250,6 +250,11 @@ fn optCStrLen(s: ?[*:0]const u8) u64 {
     return cStrLen(c);
 }
 
+// zig-libs (strRepeat): a comptime @bitCast of a nested array costs time
+// and memory linear in its length (quadratic ran out of memory).
+const repeat_grid: [30000][4]u8 = @splat("(?:)".*);
+const repeated: [4 * 30000]u8 = @bitCast(repeat_grid);
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -330,5 +335,8 @@ fn main() callconv(.c) noreturn {
     _ = &one;
     const c_one: [*c]const u8 = one;
     rt.printInt(c_one[1]);
+    var last: usize = repeated.len - 1;
+    _ = &last;
+    rt.printInt(repeated[last]);
     rt.exit(0);
 }
