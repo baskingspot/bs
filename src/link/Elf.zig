@@ -455,6 +455,10 @@ pub const ReusedOutput = struct {
     executable: bool = true,
     file: ?std.Io.File = null,
     map: []align(std.heap.page_size_min) u8 = &.{},
+    /// Reused with pwrite: how many of the old output's bytes the new one
+    /// keeps, which the link reads back to write only the pages that
+    /// changed (`Link.writeChanged`).
+    old_len: u64 = 0,
 
     pub fn target(o: *ReusedOutput, io: std.Io, len: usize) !Target {
         const in_place = builtin.os.tag == .linux and o.reuse(io, len);
@@ -495,6 +499,7 @@ pub const ReusedOutput = struct {
             if (!mostlyCached(map)) return closed(io, file);
         }
         o.file = file;
+        if (o.writes != .map) o.old_len = @min(len, st.size);
         return true;
     }
 
@@ -1148,6 +1153,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
     const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 3 * @as(u16, @intFromBool(has_arrays)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug)) + n_extra + 8 * @as(u16, @intFromBool(has_dyn)) + @as(u16, @intFromBool(exe_dyn)) + 2 * @as(u16, @intFromBool(has_versions));
     l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
+    if (@hasField(@TypeOf(out.*), "old_len")) l.old_len = out.old_len;
     switch (l.target) {
         .memory => |buf| {
             adviseHugePages(buf);
@@ -1593,6 +1599,9 @@ fn LinkOf(comptime Input: type) type {
         // Set before `copy`.
         values: *const SymbolTable = undefined,
         target: Target = undefined,
+        /// With a `.file` target, the bytes of the old output it overwrites
+        /// (`ReusedOutput.old_len`).
+        old_len: u64 = 0,
         /// With a `.file` target, `scratch_len` bytes per thread for the parts
         /// of the output a task writes.
         scratch: []u8 = &.{},
@@ -1749,7 +1758,7 @@ fn LinkOf(comptime Input: type) type {
         fn put(l: *Link, offset: u64, bytes: []const u8) Error!void {
             switch (l.target) {
                 .memory => |buf| @memcpy(buf[offset..][0..bytes.len], bytes),
-                .file => |fd| try pwriteAll(fd, bytes, offset),
+                .file => |fd| try l.writeChanged(fd, bytes, offset),
             }
         }
 
@@ -1791,7 +1800,40 @@ fn LinkOf(comptime Input: type) type {
                 .memory => return,
                 .file => |fd| fd,
             };
-            for (offsets, bufs) |off, b| pwriteAll(fd, b, off) catch return l.fail(task, atom, error.WriteFailed, .{});
+            for (offsets, bufs) |off, b| l.writeChanged(fd, b, off) catch return l.fail(task, atom, error.WriteFailed, .{});
+        }
+
+        /// Writes `bytes` at `offset` of the file, skipping the pages the
+        /// old output it overwrites already has the same: an edit's relink
+        /// leaves most of them as they were, and pwrite dirties every page
+        /// it writes under the inode lock, which serializes the threads.
+        /// The old bytes are read back with pread, which maps nothing that
+        /// would have to be torn down.
+        fn writeChanged(l: *const Link, fd: std.posix.fd_t, bytes: []const u8, offset: u64) Error!void {
+            var old: [16 * page_size]u8 = undefined;
+            var at: usize = 0;
+            var run: ?usize = null;
+            while (at < bytes.len and offset + at < l.old_len) {
+                // A block of whole file pages, as far as the old output goes.
+                const off = offset + at;
+                const block_end: usize = @intCast(@min(bytes.len, l.old_len - offset, (off / page_size + 16) * page_size - offset));
+                const n = preadAll(fd, old[0 .. block_end - at], off) catch 0;
+                var p = at;
+                while (p < block_end) {
+                    const next: usize = @intCast(@min(block_end, ((offset + p) / page_size + 1) * page_size - offset));
+                    const same = next - at <= n and std.mem.eql(u8, bytes[p..next], old[p - at .. next - at]);
+                    if (!same) {
+                        if (run == null) run = p;
+                    } else if (run) |r| {
+                        try pwriteAll(fd, bytes[r..p], offset + r);
+                        run = null;
+                    }
+                    p = next;
+                }
+                at = block_end;
+            }
+            const r = run orelse at;
+            if (r < bytes.len) try pwriteAll(fd, bytes[r..], offset + r);
         }
 
         fn gatherKeys(l: *Link, chunk: usize, _: usize) void {
@@ -2420,6 +2462,25 @@ fn nonAlloc(name: u32, ty: elf.SHT, offset: u64, size: u64) elf.Elf64.Shdr {
     return .{ .name = name, .type = ty, .flags = .{ .shf = .{} }, .addr = 0, .offset = offset, .size = size, .link = 0, .info = 0, .addralign = 1, .entsize = 0 };
 }
 
+/// Reads up to `buf.len` bytes at `offset` of `fd`; returns how many,
+/// fewer at the end of the file.
+fn preadAll(fd: std.posix.fd_t, buf: []u8, offset: u64) error{ReadFailed}!usize {
+    var at: usize = 0;
+    while (at < buf.len) {
+        const sys = std.posix.system;
+        const rc = sys.pread(fd, buf[at..].ptr, buf.len - at, @intCast(offset + at));
+        switch (sys.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) break;
+                at += @intCast(rc);
+            },
+            .INTR => {},
+            else => return error.ReadFailed,
+        }
+    }
+    return at;
+}
+
 pub fn pwriteAll(fd: std.posix.fd_t, bytes: []const u8, offset: u64) Error!void {
     var at: usize = 0;
     while (at < bytes.len) {
@@ -2751,6 +2812,19 @@ test "links and runs a program that writes from rodata and exits with 42" {
         const created = try tmp.dir.readFileAlloc(io, "hello", gpa, .unlimited);
         defer gpa.free(created);
         try std.testing.expectEqualSlices(u8, bytes, created);
+        // An old output that is mostly the new one, with one wrong byte
+        // and longer, or cut short: the pages pwrite skips as unchanged
+        // must really be.
+        const longer = try std.mem.concat(gpa, u8, &.{ bytes, garbage[0..4096] });
+        defer gpa.free(longer);
+        longer[bytes.len / 2] ^= 1;
+        for ([_][]const u8{ longer, bytes[0 .. bytes.len / 2 + 1] }) |old| {
+            try tmp.dir.writeFile(io, .{ .sub_path = "hello", .data = old, .flags = .{ .permissions = .executable_file } });
+            try link(gpa, io, tmp.dir, "hello", &atoms, file_options);
+            const fixed = try tmp.dir.readFileAlloc(io, "hello", gpa, .unlimited);
+            defer gpa.free(fixed);
+            try std.testing.expectEqualSlices(u8, bytes, fixed);
+        }
     }
     const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/hello", .{tmp.sub_path});
     defer gpa.free(path);

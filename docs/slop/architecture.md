@@ -2417,6 +2417,29 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
   reproduced on demand), the mapping's worst case outweighs its best, so
   `auto` is pwrite everywhere. A
   small program links on 1 thread (fewer than 2048 atoms is one chunk).
+- Relinking in place (2026-11-04). An edit build's relink lays out what
+  the last one did with one function changed, so most of the output's
+  pages come out as they were. When the old output is reused, each
+  pwrite reads its range back with pread, compares it page by page, and
+  writes only the runs that differ (`Link.writeChanged`): the pages left
+  alone are not dirtied, and the threads no longer queue on the inode
+  lock for them. pread rather than a mapping of the old file, whose
+  faults and teardown cost 2 ms on zls. The copy phase starts the debug
+  chunks, which take longer each, before the atom chunks; the copy
+  threads' scratch is 2 MiB-aligned and advised for huge pages; and a
+  debug chunk records the file-table index of each entry's local files
+  when `layOutChunk` inserts them (`Chunk.locals`), so writing it
+  hashes no paths. Bytes and layout are unchanged: relinks after
+  same-size and size-changing edits that add no atoms equal a fresh
+  full build (an edit that adds one appends it, as `verifyNodes`
+  notes, before and after this change). zls lazy
+  body edit (src/Server.zig:1529), median of 10, same tree with and
+  without: link 18.3 → 14.1 ms, of which after gathering the inputs
+  14.9 → 11.4 (layout 2.4, address resolution and debug layout 2.1,
+  copy 3.7); vaxis (src/Vaxis.zig:407) link 7.0 → 6.1 ms. The copy
+  phase's pread costs one more read of the output, which a new file or
+  an edit that changes everything pays for nothing; on zls it is a
+  fraction of a millisecond across the threads.
 - Debug info (`src/link/Dwarf.zig`, shared with the Mach-O linker) is
   DWARF 5: .debug_abbrev; in .debug_info a compile unit per
   `Debug.unit` (the path of the module's root file; as upstream does, the
