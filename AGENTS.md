@@ -9,17 +9,25 @@ not track upstream: it compiles exactly one pinned Zig release (currently
 - Targets: `x86_64-linux` (static ELF first) and `aarch64-macos` (Mach-O,
   dynamically linked against libSystem, ad-hoc code signed).
 - One optimization level, as in Go: no `-O` modes. Every build has Debug
-  semantics (safety checks on, `builtin.mode == .Debug`) and always-on
+  semantics (safety checks on, `builtin.mode == .debug`) and always-on
   optimization sized to compile fast (SSA, register allocation, inlining
   within a budget). Output stays debuggable: line tables, frame pointers,
   inlined frames. LLVM-class optimization (vectorization, heavy loop work)
   stays upstream's job; users run upstream `zig` for ReleaseFast and friends.
-- C interop is in scope: `-lc`, `@cImport`, and C source files. translate-c
-  (upstream's Aro-based Zig program in `lib/compiler/translate-c`) is built
-  by zap itself, so `@cImport` needs no LLVM. C source files are compiled by
-  the user's upstream `zig cc` (Clang); zap never compiles C itself.
-- Out of scope unless the user asks: other targets, release modes, LLVM,
-  the C backend, a C compiler inside zap.
+- One exception: `-OReleaseSafe` (which `zig build` steps such as Ghostty's
+  tool executables pass) is accepted and compiled with the same code
+  generation, with `builtin.mode == .safe` and upstream's
+  ReleaseSafe defaults (safety on, no error return traces), so std and the
+  program take the same paths as upstream's ReleaseSafe build. ReleaseFast
+  and ReleaseSmall stay refused.
+- C interop is in scope: `-lc`, `@cImport`, and C and C++ source files.
+  translate-c (upstream's Aro-based Zig program in `lib/compiler/translate-c`)
+  is built by zap itself, so `@cImport` needs no LLVM. C and C++ source files
+  are compiled by the user's upstream `zig cc`/`zig c++` (Clang), and C++
+  links against libc++ and libc++abi built from the zig lib directory's
+  sources as upstream builds them; zap never compiles C or C++ itself.
+- Out of scope unless the user asks: other targets, ReleaseFast and
+  ReleaseSmall, LLVM, the C backend, a C or C++ compiler inside zap.
 - CLI: drop-in for `zig build-exe`, `zig build-obj`, `zig run`, `zig test`, and `zig build`
   (zap compiles and runs the build runner and serves its compile steps over the
   `--listen=-` compiler protocol).
