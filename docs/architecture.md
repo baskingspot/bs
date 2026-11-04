@@ -1150,7 +1150,8 @@ link-time value is ever needed in code.
   the position changes, as `Encoder.line` does today. Cold blocks keep
   their positions, so a panic call still maps to its check's line.
 - **Inlined frames.** `dbg_inline_begin`/`end` (Sema's runtime inline
-  calls today, the backend's inlining later) set the position's inline
+  calls, and the backend's inlining, which splices calls into that
+  shape) set the position's inline
   index. Layout can split an inline call's code (its cold blocks move to
   the end), so emission writes one `Debug.Inline` entry per contiguous
   range, all with the same call information, as the link thread's
@@ -1192,85 +1193,132 @@ link-time value is ever needed in code.
   meantime (accepted by the owner, 2026-11-03), and it argues for landing
   locations soon after registers.
 
-#### Inlining within a budget (later step)
+#### Inlining within a budget
 
-Not in the first version; the cache edge it needs is fixed now, so the
-replay format can carry it.
+Built on the IR, before the SSA: Emit splices small callees' IR into the
+caller's IR in the shape Sema gives runtime inline calls, so the SSA
+build, the passes, and the debug info treat them as Sema's inline calls
+(`src/codegen/inline.zig`; Emit schedules it).
 
-- **What inlines.** First, leaf functions: `.auto` functions whose SSA,
-  after their own passes, has at most a fixed number of values (start
-  with 30) and calls nothing except cold noreturn functions (panic
-  handlers). Not recursive, not `noinline`, not called through `@call(
-  .never_inline, ...)`, no `@returnAddress`/`@frameAddress`, and never
-  into a cold block. The decision reads only the callee's own SSA, so it
-  is the same in every build and independent of scheduling, and leaf-only
-  inlining cannot wait in a cycle. Inlining callees that themselves inline
-  (Go's mid-stack inlining) comes after, ordered bottom-up over the
-  call graph's strongly connected components.
-- **Where.** In the caller's construction (pass 1): the callee's SSA is
-  copied in with its arguments substituted, its positions marked with a
-  new inline call (`Debug.Inline`, with the callee as `inline_callees`
-  already records for Sema's inline calls), and the passes run over the
-  result.
-- **The cache edge** (reviewed by the cache thread). A new dependee,
-  `func_inline: f`, appended to the dependee and manifest `Tag`s, with
-  its producer edge to `f`'s `func` unit as `func_ies` has:
-  - **Who records it.** Every call site that passes the caller-side
-    rules (`.auto`, not `never_inline`, not in a cold block) records it,
-    whether or not `f` turned out inlinable. Otherwise an edit that makes
-    `f` inlinable would leave a green caller with its call while a full
-    build inlines, and the outputs would differ.
-  - **Its result hash** is a constant "not inlinable" marker when `f` is
-    over the budget or not a leaf, and otherwise the stable hash of `f`'s
-    inlinable SSA in a canonical encoding. So edits to a large `f` do not
-    touch its callers; only edits that change what would be inlined do.
-    Positions in the encoding are relative to `f`'s base line, as
-    `Debug.lines` are, so adding a line above `f` does not make its
-    callers red (their inline records' base lines are refreshed at relink
-    through `inline_callees`, as designed). Types and constants are named
-    by stable hash and callees by Nav key, never by InternPool index.
-  - **Recording comes from CodeGen**, not Sema: the caller's construction
-    pass finds the edges after Sema has recorded its dependencies. Emit
-    keeps a per-caller list, as `Emit.unit_refs` does for references,
-    deduplicated in first-occurrence (IR) order, and the recorder appends
-    it to the caller's dependencies.
-  - **Replay.** The result hash is stored per node like any other: a
-    green `f` needs no recomputation, and a red `f`'s new hash gives early
-    cutoff. In replay step 4, a queued function's green/red decision waits
-    on its `func_inline` dependencies as on an inferred-error-set claim
-    (`f` is compiled first when it is red). A caller that is red only
-    through `func_inline` still re-runs Sema, since IR is not cached.
-    Delta records carry dependencies generically. `ZAP_CACHE_CHECK` covers
-    the edge without changes: a missing edge shows as a caller whose
-    result changed without being predicted, so conformance runs with
-    edit-and-verify passes are its test.
-- **Getting the body on an edit build.** When a caller is re-analyzed
-  and `f` is green, the caller needs `f`'s SSA, which the cache does not
-  store (it stores Atoms). zap re-runs Sema and passes 1–3 on `f` without
-  emitting it: `f` is under the budget by definition, its dependencies
-  are loaded, and no format changes. `f`'s atom, dependencies, and
-  references stay the manifest's and nothing is recorded anew; since `f`
-  is green its analysis is deterministic and its side effects (error
-  names, which atoms name symbolically anyway) are ones a full build has
-  too. Each inlinable SSA is kept for the rest of the build, outside the
-  per-function arena. Storing `f`'s SSA in its store entry instead would
-  freeze an SSA closure encoding while Sema's types and the SSA still
-  move, and add store bytes for every inlinable function; it is the
-  fallback if edit-build profiles ever show the re-analysis. With
-  mid-stack inlining the re-analysis recurses bottom-up, still bounded by
-  the budget. In parallel CodeGen a caller waits for its callee's
-  inlinable form as it waits for a callee's inferred error set, a claim
-  like the others.
-- **What users see.** std 0.17's stack traces print one frame per
-  return address, named after the innermost inline range
-  (`Dwarf.getSymbols` ignores inline callers), so a panic inside an
-  inlined function shows the callee's line and loses the caller's frame.
-  Debuggers show both (they read `DW_TAG_inlined_subroutine`). Upstream
-  Debug never inlines, so this changes zap's panic traces relative to
-  upstream's. The owner accepted this (2026-11-03): functions containing
-  safety checks inline like any other, since nearly all arithmetic is
-  checked; step 6 reports how much inlining such functions buys, to
-  confirm the call with numbers.
+- **What inlines.** A direct call of an `.auto` function, not
+  `never_inline`, not inside a cold body (one ending in `unreach` or
+  `trap`: safety checks, `unreachable`), of a callee that is not
+  recursive, not `noinline`, not variadic, has no inferred error set, and
+  uses only instructions the splice maps (no `@returnAddress`,
+  `@frameAddress`, inline assembly, error return trace access). Its size is its instructions with code
+  outside cold bodies, plus the sizes of the callees inlined into it
+  (mid-stack inlining); the budget is 30. A function whose callees are
+  not all inlined is not inlinable itself, so only leaves and functions
+  that become leaves inline, and every decision reads the callee's own
+  IR, the same in every build and schedule.
+- **Variants.** *Full* inlines any such callee. *Safe* (the default for
+  now) also requires that the callee can start no panic: no call of a
+  cold `noreturn` function (safety checks, `@panic`, `unreachable`) and
+  no trap, which also excludes `try` adding to an error return trace. A
+  panic then never starts in inlined code, so every function on a panic
+  stack keeps its own frame and traces stay complete. Full becomes the
+  default once synthetic panic frames (below) land and a kept trace test
+  matches a non-inlining build frame for frame. `ZAP_INLINE=<budget>`
+  sets the budget (`0` turns inlining off) and `ZAP_INLINE_FULL=1`
+  selects full; a non-default setting gets its own cache target
+  (`Job.cacheTarget`).
+- **When.** On the Sema thread, as Sema hands a function to the sink
+  (`Emit.functionOwned`), before CodeGen gets it: `inline.scan` finds the
+  candidate sites and the size, and `Emit.inlineFate` decides each
+  callee, depth first. A callee not analyzed yet is analyzed out of queue
+  order (`Zcu.takeFuncBody`, as `ensureFuncIes` does), and its own fate
+  is decided and its IR handed to CodeGen in turn. A cycle of calls makes
+  the call stay a call; a callee whose analysis is in progress or waits on
+  a speculation stays a call when the caller is generated now, or defers
+  the caller to `ready_irs` when it was itself analyzed out of order. Each
+  inlinable function keeps its body, already inlined into itself, for the
+  rest of the build (`Emit.inline_bodies`); there is no waiting on other
+  threads.
+- **Splicing.** Each inlined call becomes a `block` with
+  `dbg_inline_begin`/`end`, the arguments substituted for the callee's
+  `arg`s, and each `ret` a `br` out of the block; the callee's `dbg_stmt`s
+  are already relative to its declaration, as inline records want. In
+  CodeGen, a memory-class block with exactly one `br` computes its value
+  in the block's own slot (`planCopies`, `slot_alias`); without that,
+  inlining made nbody 26% slower. The rule is general and stays on with
+  inlining off.
+- **The cache edge.** A dependee `func_inline: f`, appended to the
+  dependee and manifest `Tag`s, with its producer edge to `f`'s `func`
+  unit as `func_ies` has:
+  - **Who records it.** Emit adds one for every candidate site's callee,
+    inlined or not, to the caller's dependencies (`Zcu.addDeps`, after the
+    ones Sema recorded). Otherwise an edit that makes `f` inlinable would
+    leave a green caller with its call while a full build inlines.
+  - **Its result.** `Zcu.inline_results` holds every inlinable function's
+    size and hash; the hash mixes `f`'s canonical IR hash (`inline.
+    hashBody`: instructions numbered by first appearance, InternPool
+    indices by stable hash, names by their bytes, positions relative to
+    `f`'s declaration), its inlined callees' hashes, its size, and the
+    variant (`Emit.inlineSalt`: budget and full/safe). A function that is
+    not inlinable has the result `salt ^ 1`, so edits to a large `f` do
+    not touch its callers. The size is the node's one result word, and
+    every inlinable function's node is recorded, as an inferred error
+    set's is, so a loaded function without one is not inlinable.
+  - **Replay.** Loading a function reads its `func_inline` node back into
+    `inline_results`. When a caller's `func_inline` dependee is outdated,
+    replay decides it with `Emit.inlineFate`, which loads or analyzes `f`
+    first; if `f` cannot be decided now the caller is analyzed again. A
+    caller that is red only through `func_inline` re-runs Sema, since IR
+    is not cached. `ZAP_CACHE_CHECK` covers the edge without changes.
+- **Getting the body on an edit build.** When a caller is analyzed and an
+  inlinable `f` was loaded from the cache, Sema analyzes `f` again
+  (`Emit.inlineBody`) and its own callees are inlined into it, without
+  generating it: its atom, references, and dependencies stay the
+  manifest's (the dependencies Sema records again are put back, since a
+  lazy build takes a unit's from the manifest only when it has none).
+  When a loaded caller's inlined callee moved and its declaration is not
+  in this build (a struct in a test), the caller is analyzed again
+  (`Replay.refreshInlines`).
+  Storing IR in the cache instead would freeze an IR encoding and add
+  store bytes for every inlinable function; it is the fallback if
+  edit-build profiles ever show the re-analysis.
+- **Cost and win** (4-core orb, ReleaseFast zap, cache off, medians):
+  run time against inlining off, safe / full: sort −10% / −23%, hash −7% /
+  −15%, nbody −13% / −12%, fmt 0 / +6%, fib and sieve unchanged. The zig
+  workload's cold build costs +3.3% / +4.8% (9.29 s off), std's test
+  build is within noise (7.2–7.4 s), and std's test binary grows 6% /
+  19%. On the Sema thread the scan costs 90 ms on the zig workload, the
+  body hashes 44 ms, and splicing 37 ms; the rest is CodeGen's 7% / 20%
+  more IR. A call list from Sema would not save the scan: whether a call
+  is in cold code and the hot size both need the body structure.
+- **What users see.** std 0.17's stack traces print one frame per return
+  address, named after the innermost inline range (`Dwarf.getSymbols`
+  ignores inline callers, and `resolve_inline_callers` cannot help on
+  ELF), so a panic inside an inlined function would show the callee's
+  line and lose its callers' frames. Debuggers show both (they read
+  `DW_TAG_inlined_subroutine`). Upstream Debug never inlines. The safe
+  variant avoids the loss; synthetic panic frames remove it for full.
+  Error return traces are unaffected: their return-site addresses
+  already map to the callee's lines.
+- **Synthetic panic frames (next).** Only cold code changes. Where a
+  check in code inlined `d` levels deep fails, the cold path calls a
+  chain of small stubs placed after the function's epilogue instead of
+  calling the panic handler directly. The cold block's line row is the
+  outermost inline call site; each stub's row is the next call site
+  inward, and the innermost stub's row is the check's line; it calls the
+  handler. Each stub is a frameless region with CFI `CFA = rsp+8`
+  (`DW_CFA_restore` of rbp and the saved registers, from the link
+  thread's epilogue rows), so std's `SelfUnwinder` steps through them,
+  and the return addresses map to the innermost callee's line, then each
+  call site outward, then the real caller frames: every frame appears,
+  under the physical function's symbol with the right file and line.
+  The cold block does `sub rsp, 8` first when `d` is odd, so the handler
+  is entered with an aligned stack. The hot path is untouched; the cost
+  is a few bytes of cold code and CFI rows per inlined panic site and
+  depth. A function with `@trap` becomes non-inlinable (a trap has no
+  return address to stub), and a panic call with arguments
+  passed in memory keeps the direct call (its frame is lost; such
+  handlers are not std's). Limit: a hardware fault (a segfault from a bad
+  pointer, a division trap) in inlined code has no stub, so the signal
+  handler's trace shows the callee's line under the caller's frame and
+  loses the inlined callers. aarch64 stubs save the link register,
+  `str x30, [sp, #-16]!; bl next`, with the row `CFA = sp+16` and x30
+  at `CFA-16`.
 
 #### Compile-time budget and how it is measured
 

@@ -28,6 +28,9 @@ const Glibc = @import("link/Glibc.zig");
 const ElfInput = @import("link/ElfInput.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
 const Ssa = @import("codegen/Ssa.zig");
+const inline_ir = @import("codegen/inline.zig");
+const Sema = @import("Sema.zig");
+const cache = @import("cache.zig");
 
 const Emit = @This();
 
@@ -160,6 +163,23 @@ codegen_errors: std.ArrayList(Zcu.ErrorMsg) = .empty,
 /// function being generated.
 exports_view: ExportsView = .{ .list = &.{}, .resolved = &.{} },
 
+/// Whether calls of small functions are inlined (`codegen/inline.zig`),
+/// with which budget, and whether only callees that cannot panic are
+/// (`Scan.panics`). The rest of this group is the Sema thread's: a
+/// function's candidate callees are decided before it is generated
+/// (`inlineFate`), bringing them to the end of their analysis out of
+/// queue order if needed, as a function's inferred error set is.
+inlining: bool = false,
+inline_safe: bool = false,
+inline_budget: u32 = inline_ir.budget,
+/// Each decided function's fate.
+inline_fates: std.AutoHashMapUnmanaged(Index, Fate) = .empty,
+/// The inlinable bodies, already inlined into themselves.
+inline_bodies: std.ArrayList(Ir) = .empty,
+/// The functions whose fate is being decided, which a cycle of calls
+/// reaches again.
+inline_active: std.ArrayList(Index) = .empty,
+
 /// The CodeGen workers. Sema hands each analyzed function over as a job
 /// (`functionOwned`); workers take jobs in order, and `mergeJobs` waits
 /// for all jobs handed over and merges their output in job order. Jobs not
@@ -203,6 +223,25 @@ pub const Pool = struct {
     fuzz_rng: std.Random.DefaultPrng = .init(0),
     batch_target: usize = batch_len,
 };
+
+const Fate = union(enum) {
+    no,
+    yes: struct {
+        size: u32,
+        hash: cache.Hash,
+        /// Index into `inline_bodies`, or `no_body` for a function loaded
+        /// from the cache whose body no caller generated now needed yet.
+        body: u32,
+    },
+};
+
+const no_body = std.math.maxInt(u32);
+
+/// What deciding a function's fate came to: a fate, or not yet, because a
+/// cycle of calls reached a function being decided (which makes every
+/// function on the cycle not inlinable) or because analysis is busy with
+/// the function (an edit build's check, which then analyzes its caller).
+const FateResult = union(enum) { fate: Fate, cycle, busy };
 
 const Job = struct {
     ir: Ir,
@@ -359,6 +398,10 @@ pub fn deinit(emit: *Emit) void {
     emit.side.deinit(gpa);
     emit.rt_keys.deinit(gpa);
     emit.codegen_errors.deinit(gpa);
+    emit.inline_fates.deinit(gpa);
+    for (emit.inline_bodies.items) |*b| b.deinit(gpa);
+    emit.inline_bodies.deinit(gpa);
+    emit.inline_active.deinit(gpa);
     if (emit.pool) |pool| {
         stopWorkers(pool);
         for (pool.workers) |*w| w.deinit();
@@ -466,8 +509,190 @@ fn runJob(w: *Emit, ir: Ir, exports: ExportsView) Allocator.Error!Out {
 }
 
 /// Sink callback from `Zcu.analyzeAll`, which hands over the IR: generates
-/// the function, on a worker if there is a pool.
+/// the function, on a worker if there is a pool, with the calls it
+/// inlines inlined.
 pub fn functionOwned(emit: *Emit, zcu: *Zcu, ir: Ir) !void {
+    _ = zcu;
+    if (!emit.inlining) return emit.submit(ir, if (emit.pool != null) try emit.exportsSnapshot() else undefined);
+    _ = try emit.inlineProcess(ir, .generate);
+}
+
+const ProcessMode = enum {
+    /// Generate the function; callees that cannot be decided now stay
+    /// calls.
+    generate,
+    /// Generate it, unless a callee cannot be decided now: then hand the
+    /// IR back to the Zcu (`ready_irs`) for later.
+    generate_or_defer,
+    /// Only make its inlinable body: it was loaded from the cache.
+    body,
+};
+
+/// Decides what `ir`'s function inlines and whether it is inlinable,
+/// splices the inlinable callees in, and hands it on as `mode` says.
+/// Returns false if it handed the IR back.
+fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool {
+    const gpa = emit.gpa;
+    const zcu = emit.zcu;
+    var ir = ir_in;
+    var ir_owned = true;
+    defer if (ir_owned) ir.deinit(gpa);
+    const func = ir.func;
+    try emit.inline_active.append(gpa, func);
+    defer emit.inline_active.items.len -= 1;
+
+    var sites: std.ArrayList(inline_ir.Site) = .empty;
+    defer sites.deinit(gpa);
+    var s = try inline_ir.scan(gpa, zcu, &ir, &sites);
+    if (emit.inline_safe and s.panics) s.inlinable = false;
+    // Every candidate call reads its callee's `func_inline`, inlined or
+    // not: an edit that makes the callee inlinable changes the caller.
+    var deps: std.ArrayList(Zcu.Dependee) = .empty;
+    defer deps.deinit(gpa);
+    var seen: std.AutoHashMapUnmanaged(Index, void) = .empty;
+    defer seen.deinit(gpa);
+    for (sites.items, 0..) |site, i| {
+        // Functions with hundreds of calls (big switches) are common.
+        const dup = if (i < 16) for (sites.items[0..i]) |prev| {
+            if (prev.callee == site.callee) break true;
+        } else false else (try seen.getOrPut(gpa, site.callee)).found_existing;
+        if (i == 15) for (sites.items[0..16]) |prev| try seen.put(gpa, prev.callee, {});
+        if (!dup) try deps.append(gpa, .{ .func_inline = site.callee });
+    }
+    var splices: std.ArrayList(inline_ir.Splice) = .empty;
+    defer splices.deinit(gpa);
+    // Each splice's body until `inline_bodies` is final.
+    var bodies: std.ArrayList(u32) = .empty;
+    defer bodies.deinit(gpa);
+    var callee_hash: cache.Hash = 0;
+    var size = s.size;
+    var all = s.inlinable;
+    for (sites.items) |site| {
+        const fate = switch (try emit.inlineFate(site.callee)) {
+            .fate => |f| f,
+            .cycle => Fate.no,
+            .busy => if (mode == .generate_or_defer) {
+                try zcu.ready_irs.append(gpa, ir);
+                ir_owned = false;
+                return false;
+            } else Fate.no,
+        };
+        const yes = switch (fate) {
+            .no => {
+                all = false;
+                continue;
+            },
+            .yes => |y| y,
+        };
+        const body = try emit.inlineBody(site.callee) orelse {
+            all = false;
+            continue;
+        };
+        size += yes.size;
+        callee_hash = cache.hash(@truncate(callee_hash), std.mem.asBytes(&yes.hash)) ^ callee_hash;
+        try bodies.append(gpa, body);
+        try splices.append(gpa, .{ .site = site, .body = undefined });
+    }
+    const inlinable = all and size <= emit.inline_budget;
+    // Of its own body, before the splices.
+    const loaded = emit.inline_fates.contains(func);
+    const own_hash: cache.Hash = if (inlinable and !loaded) try inline_ir.hashBody(gpa, &zcu.ip, &ir) else 0;
+    // `inline_bodies` is final now.
+    for (splices.items, bodies.items) |*sp, b| sp.body = &emit.inline_bodies.items[b];
+    // Sema recorded the rest of them.
+    if (mode != .body) try zcu.addDeps(.{ .func = func }, deps.items);
+    if (splices.items.len != 0) try inline_ir.splice(gpa, &ir, splices.items);
+
+    if (loaded) {
+        const fate = emit.inline_fates.getPtr(func).?;
+        // A function loaded from the cache: make its body.
+        if (mode == .body and inlinable and fate.* == .yes) {
+            try emit.inline_bodies.append(gpa, ir);
+            ir_owned = false;
+            fate.yes.body = @intCast(emit.inline_bodies.items.len - 1);
+        }
+        return true;
+    }
+    if (inlinable) {
+        const hash = cache.hash(size, std.mem.asBytes(&[2]cache.Hash{ own_hash, callee_hash })) ^ emit.inlineSalt();
+        var copy = ir.instructions.toMultiArrayList();
+        try emit.inline_bodies.append(gpa, .{
+            .instructions = (try copy.clone(gpa)).slice(),
+            .extra = try gpa.dupe(u32, ir.extra),
+            .func = func,
+            .main_block = ir.main_block,
+            .rbrace_line = ir.rbrace_line,
+            .rbrace_column = ir.rbrace_column,
+        });
+        try emit.inline_fates.put(gpa, func, .{ .yes = .{ .size = size, .hash = hash, .body = @intCast(emit.inline_bodies.items.len - 1) } });
+        try zcu.inline_results.put(gpa, func, .{ .size = size, .hash = hash });
+    } else try emit.inline_fates.put(gpa, func, .no);
+    if (mode == .body) return true;
+    ir_owned = false;
+    try emit.submit(ir, if (emit.pool != null) try emit.exportsSnapshot() else undefined);
+    return true;
+}
+
+/// Mixed into every `func_inline` result, so a different budget or
+/// variant changes every caller's.
+fn inlineSalt(emit: *const Emit) cache.Hash {
+    return cache.hash(emit.inline_budget, if (emit.inline_safe) "safe" else "full");
+}
+
+/// Turns inlining on, with `budget` and the variant (`inline_safe`).
+pub fn enableInlining(emit: *Emit, budget: u32, safe: bool) void {
+    emit.inlining = true;
+    emit.inline_budget = budget;
+    emit.inline_safe = safe;
+    emit.zcu.inline_salt = emit.inlineSalt();
+}
+
+/// Decides whether `func` is inlinable, bringing it to the end of its
+/// analysis first if needed.
+pub fn inlineFate(emit: *Emit, func: Index) Allocator.Error!FateResult {
+    if (emit.inline_fates.get(func)) |f| return .{ .fate = f };
+    if (std.mem.indexOfScalar(Index, emit.inline_active.items, func) != null) return .cycle;
+    switch (try emit.zcu.takeFuncBody(func)) {
+        .busy => return .busy,
+        .failed => try emit.inline_fates.put(emit.gpa, func, .no),
+        // Loaded from the cache: its recorded result.
+        .done => try emit.inline_fates.put(emit.gpa, func, if (emit.zcu.inline_results.get(func)) |r|
+            .{ .yes = .{ .size = r.size, .hash = r.hash, .body = no_body } }
+        else
+            .no),
+        .analyzed => |ir| if (!try emit.inlineProcess(ir, .generate_or_defer)) return .busy,
+    }
+    return .{ .fate = emit.inline_fates.get(func).? };
+}
+
+/// The inlinable body of `func`, whose fate is `yes`; for one loaded from
+/// the cache, Sema analyzes it again (as it did, and recording nothing
+/// new) and its own callees are inlined into it. Null if that failed.
+fn inlineBody(emit: *Emit, func: Index) Allocator.Error!?u32 {
+    const yes = emit.inline_fates.get(func).?.yes;
+    if (yes.body != no_body) return yes.body;
+    // What Sema records is the cache's already, which a lazy build reads
+    // from the manifest only for units without dependencies here.
+    const zcu = emit.zcu;
+    const unit: Zcu.AnalUnit = .{ .func = func };
+    const deps = zcu.deps.get(unit);
+    const conditional = zcu.conditional_deps.get(unit);
+    defer {
+        if (deps) |d| zcu.deps.putAssumeCapacity(unit, d) else _ = zcu.deps.orderedRemove(unit);
+        if (conditional) |c| zcu.conditional_deps.putAssumeCapacity(unit, c) else _ = zcu.conditional_deps.remove(unit);
+    }
+    const ir = Sema.analyzeFuncBody(zcu, func) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    _ = try emit.inlineProcess(ir, .body);
+    const b = emit.inline_fates.get(func).?.yes.body;
+    return if (b == no_body) null else b;
+}
+
+/// Generates a function whose inlining is done.
+fn submit(emit: *Emit, ir: Ir, exports: ExportsView) !void {
+    const zcu = emit.zcu;
     if (emit.bench_irs) |*irs| {
         var list = ir.instructions.toMultiArrayList();
         try irs.append(emit.gpa, .{
@@ -484,7 +709,6 @@ pub fn functionOwned(emit: *Emit, zcu: *Zcu, ir: Ir) !void {
         defer owned.deinit(emit.gpa);
         return emit.generateFunction(&owned);
     };
-    const exports = try emit.exportsSnapshot();
     if (pool.threads == 0) {
         const t0 = std.Io.Timestamp.now(zcu.io, .awake);
         defer emit.codegen_ns += @intCast(t0.durationTo(.now(zcu.io, .awake)).nanoseconds);
@@ -1565,7 +1789,6 @@ fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {
 test "a relink in the manifest's order reproduces the fresh link, with mixed alignments and duplicates" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const cache = @import("cache.zig");
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

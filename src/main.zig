@@ -8,6 +8,7 @@ const BuildWeb = @import("BuildWeb.zig");
 const Zcu = @import("Zcu.zig");
 const Ir = @import("Ir.zig");
 const Emit = @import("Emit.zig");
+const inline_ir = @import("codegen/inline.zig");
 const Incremental = @import("Incremental.zig");
 const Builtin = @import("Builtin.zig");
 const Archive = @import("link/Archive.zig");
@@ -244,15 +245,31 @@ pub fn main(init_std: std.process.Init) !void {
 /// modules that fuzz gets store entries of its own: `+fuzz`, then each
 /// module whose flag differs from the root module's, as `+name` or
 /// `-name` (`-root` if the root module does not fuzz).
-fn cacheTarget(arena: std.mem.Allocator, opts: *const Options) ![]const u8 {
-    if (!opts.fuzz) return "x86_64-linux";
+/// Atoms inlined other than by default (`inlining`) get entries of their
+/// own too, as `+inline<budget>` and `s` for the safe variant.
+fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.process.Environ.Map) ![]const u8 {
+    const inl = inlining(env);
+    const default_inl = inl.budget == inline_ir.budget and inl.safe;
+    if (!opts.fuzz and default_inl) return "x86_64-linux";
     var s: std.ArrayList(u8) = .empty;
-    try s.appendSlice(arena, "x86_64-linux+fuzz");
-    if (!opts.root_fuzz) try s.appendSlice(arena, "-root");
-    for (opts.modules) |m| {
-        if (m.fuzz.? != opts.root_fuzz) try s.print(arena, "{c}{s}", .{ @as(u8, if (m.fuzz.?) '+' else '-'), m.name });
+    try s.appendSlice(arena, "x86_64-linux");
+    if (opts.fuzz) {
+        try s.appendSlice(arena, "+fuzz");
+        if (!opts.root_fuzz) try s.appendSlice(arena, "-root");
+        for (opts.modules) |m| {
+            if (m.fuzz.? != opts.root_fuzz) try s.print(arena, "{c}{s}", .{ @as(u8, if (m.fuzz.?) '+' else '-'), m.name });
+        }
     }
+    if (!default_inl) try s.print(arena, "+inline{d}{s}", .{ inl.budget, if (inl.safe) "s" else "" });
     return s.items;
+}
+
+/// How calls are inlined (docs/architecture.md, "Inlining within a
+/// budget"): `ZAP_INLINE=<budget>` sets the budget, 0 turns inlining off,
+/// and `ZAP_INLINE_FULL=1` inlines callees that can panic too.
+fn inlining(env: *const std.process.Environ.Map) struct { budget: u32, safe: bool } {
+    const budget = if (env.get("ZAP_INLINE")) |v| std.fmt.parseInt(u32, v, 10) catch fatal("invalid ZAP_INLINE '{s}': expected a number", .{v}) else inline_ir.budget;
+    return .{ .budget = budget, .safe = env.get("ZAP_INLINE_FULL") == null };
 }
 
 /// What one compilation needs besides its output path, resolved from the
@@ -326,7 +343,7 @@ pub const Job = struct {
             .cache_dirs = cache_dirs,
             .builtin_dir = builtin_dir,
             .fuzzer_builtin_dir = fuzzer_builtin_dir,
-            .cache_target = try cacheTarget(arena, &opts),
+            .cache_target = try cacheTarget(arena, &opts, init_.environ_map),
             .compile_args = compile_args.items,
             .stem = opts.name orelse if (is_test) "test" else std.fs.path.stem(opts.root_src_path),
             .run_test = is_test and !opts.test_no_exec and !opts.listen,
@@ -534,6 +551,8 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // n more times (`zig build bench-codegen`).
     const bench_runs: u32 = if (env.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
     if (bench_runs != 0) emit.bench_irs = .empty;
+    const inl = inlining(job.environ_map);
+    if (inl.budget != 0) emit.enableInlining(inl.budget, inl.safe);
     // `ZAP_THREADS=n`: analysis and CodeGen on n threads, Sema on one and
     // CodeGen on the others; 1 generates on the Sema thread. The output
     // is the same for every n.

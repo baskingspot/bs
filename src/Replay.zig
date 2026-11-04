@@ -16,6 +16,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Zir = std.zig.Zir;
 const cache = @import("cache.zig");
+const inline_ir = @import("codegen/inline.zig");
 const Manifest = cache.Manifest;
 const Pack = cache.Pack;
 const results = cache.results;
@@ -408,12 +409,20 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
             ies = try results.decodeIes(ip, zcu.arena.allocator(), words);
         }
     }
+    // Whether it is inlinable, from its node, which every inlinable
+    // function has (`Incremental.record`).
+    var inline_result: ?Zcu.InlineResult = null;
+    if (zcu.inline_salt != 0) if (m.find(try r.keyer.keyOf(.func_inline, &.{try r.keyer.unitKeyString(unit)}))) |n| {
+        const words = m.result(n);
+        if (words.len == 1) inline_result = .{ .size = words[0], .hash = m.node(n).result_hash };
+    };
     if (r.lazy) {
         if (ies) |got| {
             if (got.is_anyerror) try zcu.anyerror_ies.put(zcu.gpa, func, {});
             if (!got.is_anyerror or got.names.len != 0) try zcu.inferred_errors.put(zcu.gpa, func, got.names);
         }
         try r.commitLazy(g, false);
+        if (inline_result) |res| try zcu.inline_results.put(zcu.gpa, func, res);
         r.stats.loaded_funcs += 1;
         return true;
     }
@@ -462,6 +471,7 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
         try emit.addAtom(a);
     }
     try r.commit(unit, g, refs);
+    if (inline_result) |res| try zcu.inline_results.put(zcu.gpa, func, res);
     r.stats.loaded_funcs += 1;
     return true;
 }
@@ -765,6 +775,7 @@ fn decodeDependee(r: *Replay, d: u32, tag: Tag) !?Zcu.Dependee {
         .struct_defaults => .{ .struct_defaults = if (s == .ty) s.ty else return null },
         .func, .func_body => .{ .func_body = if (s == .func) s.func else return null },
         .func_ies => .{ .func_ies = if (s == .func) s.func else return null },
+        .func_inline => .{ .func_inline = if (s == .func) s.func else return null },
         .namespace_name => blk: {
             if (s != .namespace_name) return null;
             const ns = zcu.ip.structInfo(s.namespace_name.owner).namespace;
@@ -799,6 +810,9 @@ fn ensure(r: *Replay, dep: Zcu.Dependee) bool {
         .type_layout => |ty| zcu.ensureStructLayout(ty) catch return false,
         .struct_defaults => |ty| zcu.ensureStructDefaults(ty) catch return false,
         .func_ies => |func| _ = zcu.ensureFuncIes(func) catch return false,
+        // Decided now, analyzing the function out of order if needed; when
+        // that cannot happen now, the reader is analyzed again.
+        .func_inline => |func| if ((r.emit.inlineFate(func) catch return false) != .fate) return false,
         .func_body, .namespace_name, .namespace, .embed_file => {},
     }
     return true;
@@ -891,12 +905,44 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
         for (m.deps(n)) |e| {
             const d = Manifest.Edge.nodeOf(e);
             const dtag = std.enums.fromInt(Tag, m.node(d).tag) orelse continue;
-            if (dtag != .func_body or !r.inChangedInput(d)) continue;
+            // Sema's inline calls depend on the callee's body, the
+            // backend's on whether it inlines (whose producer is the
+            // callee's unit).
+            const in_changed = switch (dtag) {
+                .func_body => r.inChangedInput(d),
+                .func_inline => try r.inlineMoved(d, inline_ir.budget),
+                else => continue,
+            };
+            if (!in_changed) continue;
             moved = true;
             _ = try r.dependee(d, dtag);
         }
         if (moved) r.refresh.set(n);
     }
+}
+
+/// Whether the function of `func_inline` node `d` is inlined, and it, or
+/// one it inlines in turn (at most `depth` levels down, which the budget
+/// bounds), is in a changed input; makes the dependees of those it
+/// inlines that are.
+fn inlineMoved(r: *Replay, d: u32, depth: u32) !bool {
+    const m = r.m;
+    // Not inlinable (no size): its callers keep the call.
+    if (m.result(d).len == 0) return false;
+    for (m.deps(d)) |pe| {
+        const p = Manifest.Edge.nodeOf(pe);
+        if (r.inChangedInput(p)) return true;
+        if (depth == 0) continue;
+        var moved = false;
+        for (m.deps(p)) |e| {
+            const dd = Manifest.Edge.nodeOf(e);
+            if (m.node(dd).tag != @backingInt(Tag.func_inline) or !try r.inlineMoved(dd, depth - 1)) continue;
+            moved = true;
+            _ = try r.dependee(dd, .func_inline);
+        }
+        if (moved) return true;
+    }
+    return false;
 }
 
 fn inChangedInput(r: *Replay, n: u32) bool {

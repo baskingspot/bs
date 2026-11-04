@@ -150,7 +150,7 @@ fn isSeed(
             if (o == null or w == null) return (o == null) != (w == null);
             return o.? != w.?;
         },
-        .nav_ty, .func_ies, .content, .link, .embed_file => return true,
+        .nav_ty, .func_ies, .func_inline, .content, .link, .embed_file => return true,
     }
 }
 

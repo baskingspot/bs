@@ -78,6 +78,12 @@ func_refs: std.AutoArrayHashMapUnmanaged(FuncRef, void) = .empty,
 /// the reference trace of its errors.
 referenced_by: std.AutoHashMapUnmanaged(AnalUnit, Reference) = .empty,
 next_func: usize = 0,
+/// The inlinable functions (Emit, `codegen/inline.zig`): their size and
+/// the `func_inline` result hash. A function not here is not inlinable.
+inline_results: std.AutoHashMapUnmanaged(InternPool.Index, InlineResult) = .empty,
+/// The `func_inline` result of a function that is not inlinable is this
+/// `^ 1`: the inlining variant (`Emit.inlineSalt`).
+inline_salt: cache.Hash = 0,
 /// Function bodies analyzed out of queue order (to resolve an inferred
 /// error set), waiting to be passed to the sink.
 ready_irs: std.ArrayList(Ir) = .empty,
@@ -337,6 +343,9 @@ pub const Dependee = union(enum) {
     func_body: InternPool.Index,
     /// The resolved inferred error set of a function instance.
     func_ies: InternPool.Index,
+    /// Whether a function instance is inlinable, and its body if so
+    /// (`inline_results`). Recorded by Emit for each call it may inline.
+    func_inline: InternPool.Index,
     /// Whether namespace `namespace` has a declaration named `name`. Recorded
     /// by name lookups and `@hasDecl`, so adding an unrelated declaration
     /// does not invalidate the unit.
@@ -439,6 +448,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.referenced_by.deinit(gpa);
     zcu.funcs.deinit(gpa);
     zcu.func_queue.deinit(gpa);
+    zcu.inline_results.deinit(gpa);
     for (zcu.ready_irs.items) |*ir| ir.deinit(gpa);
     zcu.ready_irs.deinit(gpa);
     zcu.comptime_decls.deinit(gpa);
@@ -1167,6 +1177,64 @@ pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !bool {
     gop.value_ptr.* = .queued;
     try zcu.func_queue.append(zcu.gpa, func);
     return true;
+}
+
+pub const InlineResult = struct { size: u32, hash: cache.Hash };
+
+pub const FuncBody = union(enum) {
+    /// Its analysis failed.
+    failed,
+    /// Analysis is in progress, or would have to wait for a speculation.
+    busy,
+    /// Loaded from the cache, or already handed to the sink.
+    done,
+    /// Analyzed now or earlier, its IR not handed to the sink yet; the
+    /// caller owns it now.
+    analyzed: Ir,
+};
+
+/// Brings `func` to the end of its analysis out of queue order, as
+/// `ensureFuncIes` does, for Emit to decide whether calls of it inline.
+pub fn takeFuncBody(zcu: *Zcu, func: InternPool.Index) !FuncBody {
+    const gop = try zcu.funcs.getOrPut(zcu.gpa, func);
+    const gop_existed = gop.found_existing;
+    if (!gop.found_existing) gop.value_ptr.* = .queued;
+    switch (gop.value_ptr.*) {
+        .failed => return .failed,
+        .in_progress => return .busy,
+        .done => {
+            for (zcu.ready_irs.items, 0..) |ir, i| if (ir.func == func) return .{ .analyzed = zcu.ready_irs.orderedRemove(i) };
+            return .done;
+        },
+        .queued => {
+            gop.value_ptr.* = .in_progress;
+            if (zcu.replay) |r| if (r.loadFunc(func)) {
+                zcu.funcs.getPtr(func).?.* = .done;
+                return .done;
+            };
+            const ir = Sema.analyzeFuncBody(zcu, func) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Speculation => {
+                    if (gop_existed) zcu.funcs.getPtr(func).?.* = .queued else _ = zcu.funcs.orderedRemove(func);
+                    return .busy;
+                },
+                else => {
+                    zcu.funcs.getPtr(func).?.* = .failed;
+                    return .failed;
+                },
+            };
+            zcu.funcs.getPtr(func).?.* = .done;
+            return .{ .analyzed = ir };
+        },
+    }
+}
+
+/// Adds dependencies Sema does not record to the ones it recorded for
+/// `unit` (`recordDeps`).
+pub fn addDeps(zcu: *Zcu, unit: AnalUnit, more: []const Dependee) !void {
+    if (more.len == 0) return;
+    const old = zcu.deps.get(unit) orelse &.{};
+    try zcu.deps.put(zcu.gpa, unit, try std.mem.concat(zcu.arena.allocator(), Dependee, &.{ old, more }));
 }
 
 /// The stable key of compiler_rt function `name`, declared in

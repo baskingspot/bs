@@ -657,6 +657,7 @@ pub const Tag = enum(u8) {
     link,
     embed_file,
     struct_defaults,
+    func_inline,
 };
 
 /// Keys that are hashes already.
@@ -704,6 +705,7 @@ pub const DependeeContext = struct {
             .type_layout => |t| mix(2, @backingInt(t)),
             .func_body => |f| mix(3, @backingInt(f)),
             .func_ies => |f| mix(4, @backingInt(f)),
+            .func_inline => |f| mix(9, @backingInt(f)),
             .namespace_name => |nn| mix(5 | @as(u64, nn.namespace) << 8, @backingInt(nn.name)),
             .namespace => |ns| mix(6, ns),
             .embed_file => |i| mix(7, i),
@@ -802,7 +804,7 @@ pub const Recorder = struct {
             .struct_defaults => |ty| return .{ .unit = try r.addUnit(.{ .struct_defaults = ty }) },
             // With an edge to the unit that produces them.
             .nav_ty => |nav| try r.addUnit(.{ .nav_val = nav }),
-            .func_ies => |func| try r.addUnit(.{ .func = func }),
+            .func_ies, .func_inline => |func| try r.addUnit(.{ .func = func }),
             .func_body, .namespace_name, .namespace, .embed_file => no_node,
         };
         const gop = try r.dependees.getOrPut(r.gpa, d);
@@ -868,6 +870,7 @@ pub const Recorder = struct {
             .nav_val, .type_layout, .struct_defaults => unreachable,
             .nav_ty => .nav_ty,
             .func_ies => .func_ies,
+            .func_inline => .func_inline,
             .func_body => .func_body,
             .namespace_name => .namespace_name,
             .namespace => .namespace,
@@ -1075,6 +1078,10 @@ pub const Keyer = struct {
                     for (names) |name| h +%= cache.hash(3, ip.stringSlice(name));
                 }
                 return .{ .key = try k.keyOf(.func_ies, &.{try k.unitKeyString(.{ .func = func })}), .result_hash = h };
+            },
+            .func_inline => |func| return .{
+                .key = try k.keyOf(.func_inline, &.{try k.unitKeyString(.{ .func = func })}),
+                .result_hash = if (k.zcu.inline_results.get(func)) |res| res.hash else k.zcu.inline_salt ^ 1,
             },
             .namespace_name => |nn| {
                 const ns = k.zcu.namespacePtr(nn.namespace);
@@ -2029,6 +2036,10 @@ const Graph = struct {
             };
             var it_any = zcu.anyerror_ies.keyIterator();
             while (it_any.next()) |f| try g.ies_items.append(gpa, try r.addDependee(.{ .func_ies = f.* }));
+            // Every inlinable function's result too: an edit build loading
+            // the function reads no node as not inlinable.
+            var it_inline = zcu.inline_results.keyIterator();
+            while (it_inline.next()) |f| try g.ies_items.append(gpa, try r.addDependee(.{ .func_inline = f.* }));
         }
         g.use_units = try gpa.alloc(u32, emit.content_uses.items.len);
         for (emit.content_uses.items, g.use_units) |use, *u| u.* = try r.addUnit(use.unit);
@@ -2548,7 +2559,7 @@ fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.
         const subject: results.Subject = switch (d) {
             .nav_val, .type_layout, .struct_defaults => unreachable, // Units.
             .nav_ty => |nav| .{ .nav = nav },
-            .func_body, .func_ies => |func| .{ .func = func },
+            .func_body, .func_ies, .func_inline => |func| .{ .func = func },
             .namespace_name => |nn| .{ .namespace_name = .{ .owner = zcu.namespacePtr(nn.namespace).owner_type, .name = ip.stringSlice(nn.name) } },
             .namespace => |ns| .{ .namespace = zcu.namespacePtr(ns).owner_type },
             .embed_file => |i| .{ .embed_file = zcu.embed_files.values()[i].key },
@@ -2563,6 +2574,11 @@ fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.
             range.result = .{ @intCast(start), @intCast(words.items.len - start) };
             e.units += 1;
         }
+        // An inlinable function's size; none when it is not inlinable.
+        if (d == .func_inline) if (zcu.inline_results.get(d.func_inline)) |res| {
+            range.result = .{ @intCast(words.items.len), 1 };
+            try words.append(gpa, res.size);
+        };
     }
     e.ms = ms(t0, now(io));
     return e;
@@ -3047,7 +3063,7 @@ fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const resul
         const want: results.Subject = switch (dep) {
             .nav_val, .type_layout, .struct_defaults => unreachable,
             .nav_ty => |nav| .{ .nav = nav },
-            .func_body, .func_ies => |func| .{ .func = func },
+            .func_body, .func_ies, .func_inline => |func| .{ .func = func },
             .namespace_name => |nn| .{ .namespace_name = .{ .owner = zcu.namespacePtr(nn.namespace).owner_type, .name = ip.stringSlice(nn.name) } },
             .namespace => |ns| .{ .namespace = zcu.namespacePtr(ns).owner_type },
             .embed_file => |i| .{ .embed_file = zcu.embed_files.values()[i].key },
@@ -3152,7 +3168,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
             for (rec.dependee_list.items, rec.dependee_info) |d, info| if (info.node == ni) {
                 switch (d) {
                     .nav_ty => |nav| w.writeAll(z.ip.stringSlice(z.ip.getNav(nav).key)) catch {},
-                    .func_body, .func_ies => |f| z.unitKey(.{ .func = f }, w) catch {},
+                    .func_body, .func_ies, .func_inline => |f| z.unitKey(.{ .func = f }, w) catch {},
                     .namespace_name => |nn| w.print("{s} {s}", .{ z.namespacePtr(nn.namespace).key, z.ip.stringSlice(nn.name) }) catch {},
                     .namespace => |ns| w.writeAll(z.namespacePtr(ns).key) catch {},
                     .embed_file => |i| w.writeAll(z.embed_files.values()[i].key) catch {},
@@ -3193,7 +3209,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         fn isDependee(tag: u8) bool {
             const t = std.enums.fromInt(Tag, tag) orelse return false;
             return switch (t) {
-                .nav_ty, .func_body, .func_ies, .namespace_name, .namespace, .embed_file => true,
+                .nav_ty, .func_body, .func_ies, .func_inline, .namespace_name, .namespace, .embed_file => true,
                 else => false,
             };
         }
