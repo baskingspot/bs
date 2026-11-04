@@ -300,6 +300,10 @@ pub const Ref = extern struct {
         /// In an object, a symbol another object defines, which the unit's
         /// code refers to (`Emit.useImport`).
         import,
+        /// On a struct's `type_layout` node: its `struct_defaults` unit
+        /// (`value`), which a build that resolves the layout analyzes
+        /// (`Zcu.queueDefaults`).
+        defaults,
     };
 };
 
@@ -1946,7 +1950,7 @@ pub const Builder = struct {
             ref_starts[i] = @intCast(node_refs.items.len);
             for (b.refs.items[range[0]..][0..range[1]]) |r| {
                 switch (r.kind) {
-                    .func, .nav, .effects, .root => if (r.value >= nodes.len) return error.InvalidNodeIndex,
+                    .func, .nav, .effects, .root, .defaults => if (r.value >= nodes.len) return error.InvalidNodeIndex,
                     .ext, .ext_weak, .rt, .import => if (r.value >= b.ref_names.items.len) return error.InvalidRefName,
                     .err, .error_names, .analyze, .quota => {},
                 }

@@ -321,8 +321,9 @@ pub const ContainerInfo = struct {
     field_defaults: []const Index = &.{},
     /// Structs only: the `struct_defaults` unit's progress, which fills in
     /// the defaults of non-`comptime` fields after the layout. Reified
-    /// structs have theirs from the start.
-    defaults_status: enum { none, wip, resolved, failed } = .none,
+    /// structs have theirs from the start. `queued` once its layout was
+    /// resolved (`Zcu.queueDefaults`); as `none` otherwise.
+    defaults_status: enum { none, queued, wip, resolved, failed } = .none,
     /// Structs: byte offsets, or bit offsets in the backing integer for
     /// packed structs. Unions with a runtime tag: the tag's and the
     /// payload's byte offsets (`Type.unionLayout`); empty for other unions.

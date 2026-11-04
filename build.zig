@@ -467,6 +467,9 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
         const block = std.mem.lastIndexOf(u8, source, "\n// error\n") orelse
             std.debug.panic("{s}: missing '// error' block", .{src_path});
         var args: []const u8 = "";
+        // `edit-from: "text" "earlier text"`: also an edit build from the
+        // earlier version, which compiles, through the cache.
+        var earlier: ?[]const u8 = null;
         var expected: std.ArrayList(u8) = .empty;
         var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, source[block + "\n// error\n".len ..], "\n"), '\n');
         while (lines.next()) |line| {
@@ -475,6 +478,16 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
             const text = if (line.len > 2) line[3..] else "";
             if (expected.items.len == 0 and std.mem.startsWith(u8, text, "args: ")) {
                 args = text["args: ".len..];
+                continue;
+            }
+            if (expected.items.len == 0 and std.mem.startsWith(u8, text, "edit-from: ")) {
+                const value = text["edit-from: ".len..];
+                const end = 1 + (std.mem.indexOfPos(u8, value, 1, "\" \"") orelse std.debug.panic("{s}: bad edit-from", .{src_path}));
+                const now = std.zig.string_literal.parseAlloc(b.allocator, value[0..end]) catch std.debug.panic("{s}: bad string", .{src_path});
+                const then = std.zig.string_literal.parseAlloc(b.allocator, value[end + 1 ..]) catch std.debug.panic("{s}: bad string", .{src_path});
+                const code = earlier orelse source[0..block];
+                const at = std.mem.indexOf(u8, code, now) orelse std.debug.panic("{s}: edit-from text not found", .{src_path});
+                earlier = b.fmt("{s}{s}{s}", .{ code[0..at], then, code[at + now.len ..] });
                 continue;
             }
             expected.appendSlice(b.allocator, text) catch @panic("OOM");
@@ -494,6 +507,34 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
         run.addCheck(.{ .expect_stderr_exact = expected.items });
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
         test_step.dependOn(&run.step);
+        if (earlier) |text| {
+            // The same errors from an edit build, whose cache holds the
+            // earlier version's build.
+            const files = b.addWriteFiles();
+            const before = files.add(file, text);
+            const edit = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
+                \\set -e
+                \\before=$(realpath "$1"); now=$(realpath "$2"); zap=$(realpath "$4")
+                \\cd "$3"
+                \\cp "$before" {[file]s}
+                \\"$zap" build-exe -target x86_64-linux {[file]s} -femit-bin=out --cache-dir l --global-cache-dir g{[args]s} 2>log || {{ cat log >&2; exit 2; }}
+                \\cp "$now" {[file]s}
+                \\exec "$zap" build-exe -target x86_64-linux {[file]s} -femit-bin=out --cache-dir l --global-cache-dir g{[args]s}
+            , .{ .file = file, .args = if (args.len == 0) "" else b.fmt(" {s}", .{args}) }), "sh" });
+            edit.setName(b.fmt("diag {s} (edit build)", .{file}));
+            edit.addFileArg(before);
+            edit.addFileArg(b.path(src_path));
+            _ = edit.addOutputDirectoryArg("edit");
+            edit.addArtifactArg(zap);
+            // Every line but the reference traces, whose frames for units
+            // loaded green the edit build lacks (docs/architecture.md).
+            var edit_lines = std.mem.splitScalar(u8, expected.items, '\n');
+            while (edit_lines.next()) |line| {
+                if (line.len != 0 and !std.mem.startsWith(u8, line, "  ref: ")) edit.addCheck(.{ .expect_stderr_match = b.fmt("{s}\n", .{line}) });
+            }
+            edit.addCheck(.{ .expect_term = .{ .exited = 1 } });
+            test_step.dependOn(&edit.step);
+        }
 
         const up = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-emit-bin" });
         up.setName(b.fmt("diag {s} (upstream rejects)", .{file}));

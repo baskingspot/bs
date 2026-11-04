@@ -63,6 +63,10 @@ func_queue: std.ArrayList(InternPool.Index) = .empty,
 /// Declarations whose address code took (`ensureNavTy`), whose values
 /// `analyzeAll` resolves later, as upstream queues a `nav_val` unit.
 nav_queue: std.ArrayList(InternPool.NavIndex) = .empty,
+/// Structs whose layout this build resolved and that have non-`comptime`
+/// field defaults: their `struct_defaults` units, which `analyzeAll`
+/// analyzes whether or not anything reads a default (`queueDefaults`).
+defaults_queue: std.ArrayList(InternPool.Index) = .empty,
 /// Nonzero while Sema resolves something it may do without
 /// (`Sema.resolveFieldTypesDeep`): a dependency loop then ends that
 /// instead of being reported (`error.Speculation`).
@@ -463,6 +467,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.dep_maps.deinit(gpa);
     gpa.free(zcu.string_cache);
     zcu.nav_queue.deinit(gpa);
+    zcu.defaults_queue.deinit(gpa);
     zcu.phase_deps.deinit(gpa);
     zcu.nav_ptrs.deinit(gpa);
     zcu.uav_refs.deinit(gpa);
@@ -1181,7 +1186,8 @@ pub fn ensureNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) Sema.CompileError
 pub fn ensureStructLayout(zcu: *Zcu, ty: InternPool.Index) Sema.CompileError!void {
     const info = zcu.ip.structInfo(ty);
     switch (info.status) {
-        .have_layout => return,
+        // `ensureFieldTypes` may have loaded the layout from the cache.
+        .have_layout => return if (info.defaults_status == .none) zcu.queueDefaults(ty),
         .failed => return error.AnalysisFail,
         .field_types_wip, .layout_wip => return zcu.loop(),
         .none, .have_field_types => {},
@@ -1189,13 +1195,39 @@ pub fn ensureStructLayout(zcu: *Zcu, ty: InternPool.Index) Sema.CompileError!voi
     const status = info.status;
     if (zcu.replay) |r| {
         info.status = .layout_wip;
-        if (r.loadLayout(ty)) return;
+        if (r.loadLayout(ty)) return zcu.queueDefaults(ty);
         info.status = status;
     }
     Sema.analyzeStructLayout(zcu, ty) catch |err| {
         info.status = if (err == error.Speculation) status else .failed;
         return err;
     };
+    try zcu.queueDefaults(ty);
+}
+
+/// Queues the `struct_defaults` unit of `ty`, whose layout was resolved,
+/// if it is a declared struct with non-`comptime` field defaults. As
+/// upstream, a struct's defaults are analyzed once its layout is, whether
+/// or not anything reads one, so a bad default is an error. The layout
+/// unit is the defaults unit's first reference.
+fn queueDefaults(zcu: *Zcu, ty: InternPool.Index) !void {
+    const ip = &zcu.ip;
+    const info = ip.structInfo(ty);
+    if (info.defaults_status != .none or ip.keyTag(ty) != .struct_type) return;
+    info.defaults_status = .queued;
+    const key = ip.containerType(ty).?;
+    const code = &zcu.file(key.file).zir;
+    const inst = code.instructions.get(@backingInt(key.zir_inst));
+    if (inst.tag != .extended or inst.data.extended.opcode != .struct_decl) return;
+    const decl = code.getStructDecl(key.zir_inst);
+    var it = decl.iterateFields();
+    while (it.next()) |field| {
+        if (field.is_comptime or field.default_body == null) continue;
+        try zcu.defaults_queue.append(zcu.gpa, ty);
+        const gop = try zcu.referenced_by.getOrPut(zcu.gpa, .{ .struct_defaults = ty });
+        if (!gop.found_existing) gop.value_ptr.* = .{ .from = .{ .type_layout = ty }, .file = key.file, .src = .{ .base = decl.src_node, .loc = .{ .node = .zero } } };
+        return;
+    }
 }
 
 /// Resolves the field types of a struct or union without its layout: the
@@ -1230,15 +1262,16 @@ pub fn ensureStructDefaults(zcu: *Zcu, ty: InternPool.Index) Sema.CompileError!v
         .resolved => return,
         .failed => return error.AnalysisFail,
         .wip => return zcu.loop(),
-        .none => {},
+        .none, .queued => {},
     }
+    const prev = info.defaults_status;
     info.defaults_status = .wip;
     if (zcu.replay) |r| if (r.loadDefaults(ty)) {
         info.defaults_status = .resolved;
         return;
     };
     Sema.analyzeStructDefaults(zcu, ty) catch |err| {
-        info.defaults_status = if (err == error.Speculation) .none else .failed;
+        info.defaults_status = if (err == error.Speculation) prev else .failed;
         return err;
     };
     info.defaults_status = .resolved;
@@ -1487,6 +1520,7 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
     var done_tests: usize = 0;
     var done_rt: usize = 0;
     var done_navs: usize = 0;
+    var done_defaults: usize = 0;
     while (true) {
         if (lazy and zcu.replay.?.walking()) {
             try zcu.replay.?.walk();
@@ -1534,6 +1568,15 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
             };
             continue;
         }
+        if (done_defaults < zcu.defaults_queue.items.len) {
+            const ty = zcu.defaults_queue.items[done_defaults];
+            done_defaults += 1;
+            zcu.ensureStructDefaults(ty) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {},
+            };
+            continue;
+        }
         if (done_rt < zcu.rt_helpers.count()) {
             const key = zcu.rt_helpers.keys()[done_rt];
             done_rt += 1;
@@ -1546,7 +1589,7 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
         }
         if (zcu.next_func == zcu.func_queue.items.len) {
             if (@hasDecl(@TypeOf(sink.*), "sync")) try sink.sync(zcu);
-            if (done_rt != zcu.rt_helpers.count() or done_navs != zcu.nav_queue.items.len) continue;
+            if (done_rt != zcu.rt_helpers.count() or done_navs != zcu.nav_queue.items.len or done_defaults != zcu.defaults_queue.items.len) continue;
             if (lazy and try zcu.replay.?.settle()) continue;
             break;
         }

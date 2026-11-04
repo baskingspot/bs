@@ -1550,6 +1550,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "negative infinity requires a known result type", .@"no-result-type" },
     .{ "unable to infer variable type", .@"no-result-type" },
     .{ "variable not accessible from inner function", .@"not-accessible" },
+    .{ "'{s}' not accessible outside function scope", .@"not-accessible" },
     .{ "'{s}' is not marked 'pub'", .@"not-pub" },
     .{ "null pointer casted to type '{f}'", .@"null-value" },
     .{ "unable to unwrap null", .@"null-value" },

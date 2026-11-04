@@ -1713,7 +1713,7 @@ fn mappedRefs(gpa: Allocator, refs: []const NodeRef, final: []const u32, out: *s
     for (refs) |nr| {
         var ref = nr.ref;
         switch (ref.kind) {
-            .func, .nav, .effects, .root => ref.value = final[ref.value],
+            .func, .nav, .effects, .root, .defaults => ref.value = final[ref.value],
             else => {},
         }
         try out.append(gpa, ref);
@@ -2116,6 +2116,12 @@ const Graph = struct {
             .from = .{ .ref = .{ .unit = try r.addUnit(use.unit) } },
             .kind = .effects,
             .to = try r.addDependee(.{ .namespace = ip.structInfo(use.ty).namespace }),
+        });
+        // A struct's layout reaches its defaults, which analysis queued.
+        for (zcu.defaults_queue.items) |ty| if (ip.structInfo(ty).defaults_status == .resolved) try g.reach_items.append(gpa, .{
+            .from = .{ .ref = .{ .unit = try r.addUnit(.{ .type_layout = ty }) } },
+            .kind = .defaults,
+            .to = .{ .unit = try r.addUnit(.{ .struct_defaults = ty }) },
         });
         for (zcu.comptime_decls.keys()) |c| try g.reach_items.append(gpa, .{
             .from = .{ .ref = try r.addDependee(.{ .namespace = c.namespace }) },
@@ -3028,7 +3034,7 @@ pub fn reachNext(deps: []const u32, refs: []const Manifest.Ref, next: *std.Array
         if (edge.kind == .plain) try next.append(gpa, edge.node);
     }
     for (refs) |ref| switch (ref.kind) {
-        .func, .nav, .effects, .root => try next.append(gpa, ref.value),
+        .func, .nav, .effects, .root, .defaults => try next.append(gpa, ref.value),
         else => {},
     };
 }
@@ -3293,14 +3299,14 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         }
         fn refKey(bb: *const Manifest.Builder, rec: *const Recorder, ref: Manifest.Ref) [2]Hash {
             return .{ @backingInt(ref.kind), switch (ref.kind) {
-                .func, .nav, .effects, .root => rec.nodes.items[ref.value].key,
+                .func, .nav, .effects, .root, .defaults => rec.nodes.items[ref.value].key,
                 .ext, .ext_weak, .rt, .import => cache.hash(0, bb.strings.items[bb.ref_names.items[ref.value].off..][0..bb.ref_names.items[ref.value].len]),
                 .err, .error_names, .analyze, .quota => ref.value,
             } };
         }
         fn prevRefKey(mm: *const Manifest, ref: Manifest.Ref) [2]Hash {
             return .{ @backingInt(ref.kind), switch (ref.kind) {
-                .func, .nav, .effects, .root => mm.node(ref.value).key,
+                .func, .nav, .effects, .root, .defaults => mm.node(ref.value).key,
                 .ext, .ext_weak, .rt, .import => cache.hash(0, mm.refName(ref.value)),
                 .err, .error_names, .analyze, .quota => ref.value,
             } };

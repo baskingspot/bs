@@ -3464,7 +3464,15 @@ layout unit, was a dependency loop (`union { a: struct { x: u32 =
 `type_layout(S)`; Sema reads defaults only after
 `resolveStructDefaults`, which records `Dependee.struct_defaults`: struct
 inits that omit a field, `@typeInfo`, and std.lang values Sema builds.
-`comptime` field values stay in the layout (a struct's one possible value
+As upstream, the unit also runs once the struct's layout is resolved
+(through `Zcu.ensureStructLayout`), whether or not anything reads a
+default, so a bad default is an error (`Zcu.queueDefaults`, drained by
+`analyzeAll`; upstream's `exported_function_uses_invalid_type`). Only
+declared structs with a non-`comptime` default are queued, and the
+layout unit is the first reference in the trace. The layout's node
+references the defaults' node (`defaults`), so that an edit build's
+walk reaches defaults whose own dependencies changed while the layout
+did not. `comptime` field values stay in the layout (a struct's one possible value
 and field reads need them, never the other defaults). The node's source
 hash is the container's, and its result hash is the defaults' stable
 hashes, 0 for a field without one, or the type's identity before they are
@@ -3642,10 +3650,11 @@ records only what changed, and links from the manifest.
 - *The walk.* `Zcu.analyzeAll` starts `Replay.startWalk` from the root
   files' namespace nodes and the link node, and follows what a full
   build's analysis would reach (`Incremental.reachNext`: plain
-  dependencies, and the `func`, `nav`, `effects` and `root` references).
-  Record adds the edges reach needs: `effects` (a unit to the namespace
-  it evaluated), `root` (a namespace to its `comptime`, exported and test
-  declarations), `func` from exported, test and compiler_rt declarations
+  dependencies, and the `func`, `nav`, `effects`, `root` and `defaults`
+  references). Record adds the edges reach needs: `effects` (a unit to
+  the namespace it evaluated), `root` (a namespace to its `comptime`,
+  exported and test declarations), `defaults` (a struct's layout to its
+  defaults, which analysis queues), `func` from exported, test and compiler_rt declarations
   to their functions, and the link's own requests on the link node.
   `ZAP_CACHE_CHECK` checks that reach finds every node with atoms. A node
   the walk reaches that no edit reached is live and is not loaded. An

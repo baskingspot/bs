@@ -4740,7 +4740,15 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             if (sema.ip.keyTag(cap) == .runtime_capture) {
                 // Only its type is known; as upstream, only `@TypeOf` reads it.
                 const src = block.nodeSrc(@enumFromInt(@as(i32, @bitCast(ext.operand))));
-                if (!block.is_typeof) return sema.fail(block, src, "variable not accessible from inner function", .{});
+                if (!block.is_typeof) {
+                    // Outside any function: a type's field (a default, say).
+                    if (sema.func == .none) {
+                        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+                        const node = src.loc.node.toAbsolute(src.base);
+                        return sema.fail(block, src, "'{s}' not accessible outside function scope", .{tree.tokenSlice(tree.nodeMainToken(node))});
+                    }
+                    return sema.fail(block, src, "variable not accessible from inner function", .{});
+                }
                 break :blk sema.addTyOp(block, .bitcast, sema.ip.keyPayload(.runtime_capture, cap), .fromInterned(try sema.undefValue(sema.ip.keyPayload(.runtime_capture, cap))));
             }
             break :blk .fromInterned(cap);

@@ -682,7 +682,8 @@ fn resolveRefs(r: *Replay, g: Green, is_func: bool) !?[]Ref {
             const dep = try r.dependee(ref.value, .namespace) orelse return null;
             try out.append(r.gpa, .{ .effects = r.zcu.namespaces.items[dep.namespace].owner_type });
         },
-        .analyze, .quota, .root => {},
+        // `Zcu.ensureStructLayout` queues the defaults again.
+        .analyze, .quota, .root, .defaults => {},
         else => if (is_func) try out.append(r.gpa, .{ .other = ref }),
     };
     return try out.toOwnedSlice(r.gpa);
@@ -728,7 +729,7 @@ fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
                 _ = try emit.requestCompilerRt(file, name);
             },
             .error_names => try emit.useErrorNames(),
-            .func, .nav, .analyze, .quota, .effects, .root => unreachable,
+            .func, .nav, .analyze, .quota, .effects, .root, .defaults => unreachable,
         },
     };
 }
