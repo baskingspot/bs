@@ -2919,6 +2919,10 @@ it and can flush every CPU's TLB.
   share a store. `zap run`'s program directories (`zap/o/<hash>`) count
   and go with the compilation directories, by the program's mtime, which
   every run renews by relinking it, so a program run daily stays. `zap
+  translate-c`'s records (`zap/tc/<key>`) count with their outputs
+  (`o/<key>/`) and go the same way, by the record's mtime, which every
+  hit renews; eviction deletes the record first, so that a half-deleted
+  translation is a miss. `zap
   test` deletes its binary (`zap/tmp`) once it ran; ones a killed build
   left go after a day. A store pack that a compilation directory
   links keeps its space until the directory goes, which is why the local

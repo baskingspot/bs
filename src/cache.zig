@@ -16,6 +16,8 @@
 //!   <global cache>/zap/store/<32 hex>.zsp       Store packs
 //!   <local cache>/zap/c/<32 hex>/               one compilation (`compilationDir`)
 //!       lock, manifest, manifest.log, pack
+//!   <local cache>/zap/tc/<32 hex>               a translate-c record, whose
+//!   <local cache>/o/<32 hex>/                   output is in `o/<same hex>`
 //!
 //! Files are written once to an unnamed temporary file and linked or
 //! renamed into place, so readers never see a partial file. Their contents
@@ -93,7 +95,10 @@ pub fn parseSize(text: []const u8) ?u64 {
 /// relinking it or, when nothing changed, by touching it
 /// (`Incremental.renew_output`); one is not locked, so a run that relinks the least
 /// recently used program at the moment it goes fails, and the next run
-/// builds it again. Test binaries in `zap/tmp` that a killed build left
+/// builds it again. `zap translate-c`'s records (`zap/tc/<key>`) count
+/// with their outputs (`o/<key>/`) and go the same way, by the record's
+/// mtime, which every hit renews; the record goes first, so a half-deleted
+/// translation is a miss. Test binaries in `zap/tmp` that a killed build left
 /// go after a day. Runs at most once a minute, so that it costs a build
 /// a few stats, and with `force`, which `Incremental` passes for a build
 /// that started a directory. `Incremental` runs it once the build's new
@@ -115,16 +120,21 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
     // `zap run`'s programs, one directory per compilation.
     var o: ?Io.Dir = local_cache.openDir(io, "zap/o", .{ .iterate = true }) catch null;
     defer if (o) |*d| d.close(io);
+    // `zap translate-c`'s records.
+    var tc: ?Io.Dir = local_cache.openDir(io, "zap/tc", .{ .iterate = true }) catch null;
+    defer if (tc) |*d| d.close(io);
     trimTemporary(io, local_cache, now);
 
     const File = struct { inode: u64, size: u64 };
+    const Kind = enum { compilation, run, translation };
     const Entry = struct {
-        /// `zap/c/<name>` or `zap/o/<name>`.
+        /// `zap/c/<name>`, `zap/o/<name>`, or `zap/tc/<name>`.
         name_buf: [32]u8,
         name_len: u8,
-        run: bool,
+        kind: Kind,
         /// A compilation's lock file's mtime (null without one: it is
-        /// being created), or a program's mtime (null without one).
+        /// being created), a program's mtime (null without one), or a
+        /// translation record's.
         used: ?Io.Timestamp = null,
         files: std.ArrayList(File) = .empty,
         bytes: u64 = 0,
@@ -138,12 +148,12 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
         for (entries.items) |*e| e.files.deinit(gpa);
         entries.deinit(gpa);
     }
-    for ([_]?Io.Dir{ c, o }, [_]bool{ false, true }) |maybe_dir, run| {
+    for ([_]?Io.Dir{ c, o, tc }, [_]Kind{ .compilation, .run, .translation }) |maybe_dir, kind| {
         const dir = maybe_dir orelse continue;
         var it = dir.iterate();
         while (try it.next(io)) |e| {
-            if (e.kind != .directory or e.name.len > 32 or (!run and e.name.len != 32)) continue;
-            var entry: Entry = .{ .name_buf = undefined, .name_len = @intCast(e.name.len), .run = run };
+            if (e.kind != (if (kind == .translation) Io.File.Kind.file else .directory) or e.name.len > 32 or (kind != .run and e.name.len != 32)) continue;
+            var entry: Entry = .{ .name_buf = undefined, .name_len = @intCast(e.name.len), .kind = kind };
             @memcpy(entry.name_buf[0..e.name.len], e.name);
             try entries.append(gpa, entry);
         }
@@ -151,22 +161,37 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
     // Each directory's files, stat'ed on several threads: hundreds of
     // directories take milliseconds on one.
     const Worker = struct {
-        fn run(gpa_: std.mem.Allocator, io_: Io, c_: Io.Dir, o_: ?Io.Dir, entries_: []Entry, first: usize, stride: usize) void {
+        fn run(gpa_: std.mem.Allocator, io_: Io, local: Io.Dir, c_: Io.Dir, o_: ?Io.Dir, tc_: ?Io.Dir, entries_: []Entry, first: usize, stride: usize) void {
             var i = first;
             while (i < entries_.len) : (i += stride) {
                 const entry = &entries_[i];
-                const parent = if (entry.run) o_.? else c_;
-                var d = parent.openDir(io_, entry.name(), .{ .iterate = true }) catch continue;
+                var path_buf: [64]u8 = undefined;
+                if (entry.kind == .translation) {
+                    const stat = tc_.?.statFile(io_, entry.name(), .{}) catch continue;
+                    entry.files.append(gpa_, .{ .inode = @intCast(stat.inode), .size = stat.size }) catch return;
+                    entry.used = stat.mtime;
+                }
+                var d = switch (entry.kind) {
+                    .compilation => c_.openDir(io_, entry.name(), .{ .iterate = true }),
+                    .run => o_.?.openDir(io_, entry.name(), .{ .iterate = true }),
+                    .translation => local.openDir(io_, std.fmt.bufPrint(&path_buf, "o/{s}", .{entry.name()}) catch unreachable, .{ .iterate = true }),
+                } catch continue;
                 defer d.close(io_);
                 var files = d.iterate();
                 while (files.next(io_) catch null) |e| {
                     if (e.kind != .file) continue;
                     const stat = d.statFile(io_, e.name, .{}) catch continue;
-                    if (entry.run) {
+                    switch (entry.kind) {
                         // A run that reuses the program renews its
                         // mtime.
-                        if (entry.used == null or stat.mtime.compare(.gt, entry.used.?)) entry.used = stat.mtime;
-                    } else if (std.mem.eql(u8, e.name, "lock")) entry.used = stat.mtime;
+                        .run => if (entry.used == null or stat.mtime.compare(.gt, entry.used.?)) {
+                            entry.used = stat.mtime;
+                        },
+                        .compilation => if (std.mem.eql(u8, e.name, "lock")) {
+                            entry.used = stat.mtime;
+                        },
+                        .translation => {},
+                    }
                     entry.files.append(gpa_, .{ .inode = @intCast(stat.inode), .size = stat.size }) catch return;
                 }
             }
@@ -174,8 +199,8 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
     };
     const n_threads = @max(1, @min(16, std.Thread.getCpuCount() catch 1, entries.items.len / 32));
     var group: Io.Group = .init;
-    for (1..n_threads) |t| group.async(io, Worker.run, .{ gpa, io, c, o, entries.items, t, n_threads });
-    Worker.run(gpa, io, c, o, entries.items, 0, n_threads);
+    for (1..n_threads) |t| group.async(io, Worker.run, .{ gpa, io, local_cache, c, o, tc, entries.items, t, n_threads });
+    Worker.run(gpa, io, local_cache, c, o, tc, entries.items, 0, n_threads);
     try group.await(io);
     var n_entries: usize = 0;
     for (entries.items) |*e| {
@@ -213,15 +238,20 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
         const e = &entries.items[i];
         const old = e.used.?.durationTo(now).toNanoseconds() > max_unused_compilation_ns;
         if (!old and (!over or total <= target)) break;
-        if (e.run) {
-            o.?.deleteTree(io, e.name()) catch continue;
-        } else {
-            var buf: [64]u8 = undefined;
-            const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{e.name()}) catch unreachable;
-            const f = c.openFile(io, lock_path, .{ .mode = .read_write }) catch continue;
-            defer f.close(io);
-            if (!(f.tryLock(io, .exclusive) catch false)) continue;
-            c.deleteTree(io, e.name()) catch continue;
+        var buf: [64]u8 = undefined;
+        switch (e.kind) {
+            .run => o.?.deleteTree(io, e.name()) catch continue,
+            .compilation => {
+                const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{e.name()}) catch unreachable;
+                const f = c.openFile(io, lock_path, .{ .mode = .read_write }) catch continue;
+                defer f.close(io);
+                if (!(f.tryLock(io, .exclusive) catch false)) continue;
+                c.deleteTree(io, e.name()) catch continue;
+            },
+            .translation => {
+                tc.?.deleteFile(io, e.name()) catch continue;
+                local_cache.deleteTree(io, std.fmt.bufPrint(&buf, "o/{s}", .{e.name()}) catch unreachable) catch {};
+            },
         }
         total -= e.bytes;
         result.deleted += 1;
@@ -329,6 +359,45 @@ test "maintainCompilations evicts the least recently used unlocked directories p
         const hex = std.fmt.hex(key);
         if (kept) _ = try c.statFile(io, &hex, .{}) else try t.expectError(error.FileNotFound, c.statFile(io, &hex, .{}));
     }
+}
+
+test "maintainCompilations counts translate-c records with their outputs and evicts them by the record's mtime" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const t = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const now = Io.Clock.real.now(io);
+    var d = try compilationDir(io, tmp.dir, 0xc);
+    defer d.close(io);
+    (try lock(io, d)).close(io);
+    // The old translation's output is newer than its record, which alone
+    // says when it was last used.
+    const old = std.fmt.hex(@as(Hash, 0x01d));
+    const new = std.fmt.hex(@as(Hash, 0x2e3));
+    for ([_][]const u8{ &old, &new }, [_]i64{ 6 * std.time.ns_per_day, std.time.ns_per_hour }) |hex, age| {
+        var buf: [64]u8 = undefined;
+        const record = try std.fmt.bufPrint(&buf, "zap/tc/{s}", .{hex});
+        try tmp.dir.createDirPath(io, "zap/tc");
+        try tmp.dir.writeFile(io, .{ .sub_path = record, .data = &(@as([10]u8, @splat(0))) });
+        try tmp.dir.setTimestamps(io, record, .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-age)) } });
+        var buf2: [64]u8 = undefined;
+        const out = try std.fmt.bufPrint(&buf2, "o/{s}", .{hex});
+        try tmp.dir.createDirPath(io, out);
+        var od = try tmp.dir.openDir(io, out, .{});
+        defer od.close(io);
+        try od.writeFile(io, .{ .sub_path = "x.zig", .data = &(@as([100]u8, @splat(0))) });
+    }
+
+    const r = (try maintainCompilations(gpa, io, tmp.dir, 1 << 30, true)).?;
+    try t.expectEqual(3, r.scanned);
+    try t.expectEqual(1, r.deleted);
+    try t.expectEqual(r.bytes - 110, r.bytes_after);
+    var buf: [64]u8 = undefined;
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "zap/tc/{s}", .{&old}), .{}));
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "o/{s}", .{&old}), .{}));
+    _ = try tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "zap/tc/{s}", .{&new}), .{});
+    _ = try tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "o/{s}/x.zig", .{&new}), .{});
 }
 
 test {
