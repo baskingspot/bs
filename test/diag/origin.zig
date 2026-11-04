@@ -41,6 +41,7 @@ pub fn main() !void {
     assign();
     _ = try field();
     _ = useTable();
+    _ = best(&.{1.0});
     _ = try sliced();
 }
 fn useTable() u8 {
@@ -57,6 +58,11 @@ fn bytes() ![]const u8 {
 fn sliced() !u8 {
     const b = bytes();
     return b[0..1][0];
+}
+fn best(xs: []const f64) f64 {
+    var b: ?f64 = null;
+    for (xs) |x| b = if (b == null) x else b + x;
+    return b orelse 0;
 }
 
 // error
@@ -91,14 +97,19 @@ fn sliced() !u8 {
 //   fix? origin.zig:35:12-35:12: "(try "
 //   fix? origin.zig:35:20-35:20: ")"
 //   ref: main origin.zig:42:18 (+3 std frames)
-// origin.zig:51:6: error[assign-to-const]: cannot assign to constant
+// origin.zig:52:6: error[assign-to-const]: cannot assign to constant
 //   | t[1] = 2;
-//   note origin.zig:50:11: 't' is declared 'const'; declare it with 'var' to modify it: const t: [4]u8 = @splat(0);
-//   fix? origin.zig:50:5-50:10: "var"
-//   ref: useTable origin.zig:47:12 <- main origin.zig:43:17 (+3 std frames)
-// origin.zig:59:13: error[bad-access]: slice of non-array type '@typeInfo(@typeInfo(@TypeOf(origin.bytes)).@"fn".return_type.?).error_union.error_set![]const u8'
+//   note origin.zig:51:11: 't' is declared 'const'; declare it with 'var' to modify it: const t: [4]u8 = @splat(0);
+//   fix? origin.zig:51:5-51:10: "var"
+//   ref: useTable origin.zig:48:12 <- main origin.zig:43:17 (+3 std frames)
+// origin.zig:60:13: error[bad-access]: slice of non-array type '@typeInfo(@typeInfo(@TypeOf(origin.bytes)).@"fn".return_type.?).error_union.error_set![]const u8'
 //   | return b[0..1][0];
-//   note origin.zig:58:20: 'b' holds the error union returned by 'bytes'; consider using 'try' or 'catch' here
-//   fix? origin.zig:58:15-58:15: "try "
-//   ref: main origin.zig:44:19 (+3 std frames)
-// 7 errors
+//   note origin.zig:59:20: 'b' holds the error union returned by 'bytes'; consider using 'try' or 'catch' here
+//   fix? origin.zig:59:15-59:15: "try "
+//   ref: main origin.zig:45:19 (+3 std frames)
+// origin.zig:64:46: error[bad-operands]: invalid operands to binary expression: '?f64' and 'f64'
+//   | for (xs) |x| b = if (b == null) x else b + x;
+//   note origin.zig:64:44: consider using '.?', 'orelse', or 'if'
+//   fix? origin.zig:64:45-64:45: ".?"
+//   ref: main origin.zig:44:13 (+3 std frames)
+// 8 errors

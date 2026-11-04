@@ -1177,6 +1177,9 @@ pub const Local = struct {
     /// comptime-only, so that `var` keeps it valid (`const a = 1;` needs
     /// a type as well).
     var_ok: bool,
+    /// Whether it is a `var` with a type, which may hold what it is
+    /// assigned later.
+    typed_var: bool,
 };
 
 /// Where a value comes from: the expression that holds it, and the local
@@ -1257,7 +1260,7 @@ fn localNamed(tree: *const Ast, use: Ast.TokenIndex) ?Local {
             .number_literal, .char_literal, .enum_literal => true,
             else => false,
         } else false;
-        best = .{ .name = name, .mut_tok = mut_tok, .init = decl.ast.init_node, .var_ok = decl.ast.type_node != .none or !literal };
+        best = .{ .name = name, .mut_tok = mut_tok, .init = decl.ast.init_node, .var_ok = decl.ast.type_node != .none or !literal, .typed_var = tree.tokenTag(mut_tok) == .keyword_var and decl.ast.type_node != .none };
     }
     return best;
 }
@@ -1328,7 +1331,10 @@ pub fn originNote(arena: std.mem.Allocator, tree: *const Ast, origin: Origin, ki
             const what, const how = if (kind == .error_union) .{ "error union", "'try' or 'catch'" } else .{ "optional", "'.?' or 'orelse'" };
             var node = origin.node;
             var msg: ?[]const u8 = null;
-            if (origin.local) |local| {
+            // A typed `var` (`var best: ?f64 = null;`) is meant to hold an
+            // optional or error union, which is unwrapped where it is used.
+            if (origin.local != null and !origin.local.?.typed_var) {
+                const local = origin.local.?;
                 node = local.init.unwrap() orelse return null;
                 var buf: [1]Ast.Node.Index = undefined;
                 const callee: ?[]const u8 = if (tree.fullCall(&buf, node)) |call| tree.getNodeSource(call.ast.fn_expr) else null;
