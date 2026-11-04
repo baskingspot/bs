@@ -370,6 +370,37 @@ MIGRATIONS = [
         since="0.12",
     ),
     R(
+        "arraylist-managed-gen",
+        [
+            (r"var buffer: std\.ArrayList\(u8\) = \.empty;", "var buffer = std.ArrayList(u8).init(allocator);"),
+            (r"buffer\.append\(allocator, ", "buffer.append("),
+            (r"buffer\.toOwnedSlice\(allocator\)", "buffer.toOwnedSlice()"),
+        ],
+        [[".empty"], ["allocator"]],
+        seeds=["test_wave"],
+        since="0.15",
+    ),
+    R(
+        "fixed-buffer-stream-wav",
+        [
+            (
+                r"var writer: std\.Io\.Writer = \.fixed\(&buffer\);",
+                "var fbs = std.io.fixedBufferStream(&buffer);\n    const writer = fbs.writer();",
+            ),
+            (r"try encode\(&writer, ", "try encode(writer, "),
+        ],
+        [[".fixed"]],
+        seeds=["test_wave"],
+        since="0.15",
+    ),
+    R(
+        "endian-case",
+        [(r"std\.builtin\.Endian\.little", "std.builtin.Endian.Little")],
+        [[".little", '"little"']],
+        seeds=["test_wave"],
+        since="0.12",
+    ),
+    R(
         "format-old-signature",
         [
             (
