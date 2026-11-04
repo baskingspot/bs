@@ -883,6 +883,11 @@
     },
     {
      "name": "example-text_input"
+    },
+    {
+     "name": "example-c-tty",
+     "run": [],
+     "note": "Bug in upstream std, not zap (docs/architecture.md, \"Deliberate differences from upstream\"): with -lc on x86_64-linux-gnu, std.c.termios is linux.termios (NCCS 19, 44 bytes) while glibc's tcgetattr writes its own struct termios (NCCS 32 plus ispeed/ospeed, 60 bytes). The 16 extra bytes land on posix.tcgetattr's spilled result pointer in zap's frame, so the forked child segfaults in PosixTty.makeRaw and main's WIFEXITED assert fails; upstream's frames (LLVM and -fno-llvm) put dead slots there and pass. Expected to fail under zap until std sizes termios for glibc."
     }
    ]
   },

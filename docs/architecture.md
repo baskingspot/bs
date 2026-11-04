@@ -7464,6 +7464,22 @@ computes the right one instead of copying the bug:
   as LLVM lowers them. `@atomicRmw` arithmetic on f80 and f128, which
   upstream allows and miscomputes, stays refused.
 
+- *`std.posix.tcgetattr` with glibc overflows its buffer.* With `-lc`
+  on x86_64-linux-gnu, `std.c.termios` is `linux.termios` (NCCS 19, 44
+  bytes), but `system.tcgetattr` is glibc's, which writes glibc's
+  `struct termios` (NCCS 32 plus `c_ispeed`/`c_ospeed`, 60 bytes): 16
+  bytes past `term`, an upstream std bug. Upstream's frames happen to
+  absorb them: with -fno-llvm `term` sits at `0xb4(%rsp)` and the
+  overflow lands on slots already dead (the handle's copy, the return
+  value before it is stored, the 0xaa fill byte), and with LLVM on
+  padding. In zap's frame the next slot is the spilled result pointer
+  (`-0x28(%rbp)`), which becomes `0x7f0000000000` and faults on the
+  store of the result: libvaxis's example-c-tty (a forked child in
+  `PosixTty.makeRaw`, through the C API) segfaults under zap and passes
+  under both upstream backends. zap does not lay out frames to absorb
+  an out-of-bounds write; the corpus marks the step as expected to
+  fail (tools/corpus/manifest.json).
+
 Where upstream supports more than zap generates code for, zap narrows
 the choice instead of failing:
 
