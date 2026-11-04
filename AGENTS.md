@@ -14,12 +14,13 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   semantics (safety checks on, `builtin.mode == .debug`) and always-on
   optimization sized to compile fast (SSA, register allocation, inlining
   within a budget). Output stays debuggable: line tables, frame pointers,
-  inlined frames. LLVM-class optimization (auto-vectorization, unrolling,
-  scheduling, heavy loop work) stays upstream's job; users run upstream
+  inlined frames. LLVM-class optimization (auto-vectorization, general
+  loop unrolling, scheduling, heavy loop work) stays upstream's job; users run upstream
   `zig` for ReleaseFast and friends. Explicit `@Vector` code is lowered to
   SIMD registers (SSE/NEON), as upstream's Debug backend does, not
   scalarized. Cheap analyses that remove provably redundant work (bounds
-  checks proven true, common subexpressions, invariant loads) are allowed
+  checks proven true, common subexpressions, invariant loads, full unrolling
+  of tiny constant-trip loops) are allowed
   within the compile-time budget; safety checks are never removed unless
   proven, and never move across source lines.
 - One exception: `-OReleaseSafe` (which `zig build` steps such as Ghostty's
