@@ -416,7 +416,9 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     for (m.link_symbols) |ls| {
         const name = m.string(ls.name);
         switch (ls.kind) {
-            .@"export" => try exports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name }),
+            // Flag 1: hidden, which a shared library binding to the
+            // executable's definitions does not see (`Glibc.dynamicOptions`).
+            .@"export" => try exports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name, .visibility = if (ls.flags & 1 != 0) .hidden else .default }),
             .import => {
                 const f: Emit.ImportFlags = .fromBits(@truncate(ls.flags));
                 try imports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls });
@@ -443,6 +445,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     defer if (glibc_loaded) |*g| g.deinit();
     var dynamic: ElfDynamic.Options = .{};
     var dynamic_imports: []u32 = &.{};
+    var dynamic_exports: []u32 = &.{};
     const exe_dyn = inc.output == .exe and inc.glibc_version != null;
     const glibc: ?*const Glibc = if (!exe_dyn) null else inc.glibc orelse g: {
         const path = try std.fs.path.join(arena, &.{ inc.glibc_lib_dir, Glibc.abilists_path });
@@ -459,7 +462,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     const shared: []const ElfShared = if (!exe_dyn) &.{} else inc.shared orelse (try inc.loadShared(arena, &maps)) orelse return null;
     if (inc.link_objects.len != 0 and inc.output == .exe) return inc.linkWithInputs(arena, &maps, m, &input, in.numbered, exports.items, imports.items, glibc, shared, out_dir, sub_path, cwd, gathered);
     if (glibc) |g| {
-        dynamic = g.dynamicOptions(arena, imports.items, &.{}, shared) catch |err| switch (err) {
+        dynamic = g.dynamicOptions(arena, imports.items, &.{}, exports.items, shared) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.NotInGlibc => return inc.noLink("an import no shared library or glibc defines", .{}),
         };
@@ -467,6 +470,10 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
         dynamic_imports = try arena.alloc(u32, imports.items.len);
         for (dynamic_imports, imports.items) |*n, imp| n.* = m.symbol(@backingInt(imp.key)) orelse
             return inc.noLink("import '{s}' has no symbol number", .{imp.name});
+        // The exports a shared library names (no copies without objects).
+        dynamic_exports = try arena.alloc(u32, dynamic.exports.len);
+        for (dynamic_exports, dynamic.exports) |*n, x| n.* = m.symbol(@backingInt(x.key)) orelse
+            return inc.noLink("export '{s}' has no symbol number", .{x.name});
     }
 
     const aliases = try externAliases(arena, m, &input, in.numbered);
@@ -489,6 +496,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             .entry = m.entry_symbol,
             .len = m.symbolLen(),
             .dynamic_imports = dynamic_imports,
+            .dynamic_exports = dynamic_exports,
             .aliases = numbered_aliases,
         },
         .diag = &diag,
@@ -728,7 +736,10 @@ fn linkWithInputs(
             std.mem.swap(ElfObject.Import, &imports[n], &imports[i]);
             n += 1;
         };
-        dynamic = g.dynamicOptions(arena, imports[0..n], imports[n..], shared) catch |err| switch (err) {
+        // The Zig exports and the objects' definitions, which the shared
+        // libraries may name, as `Emit.convertInputs` gathers them.
+        const defined = if (shared.len == 0) exports else try std.mem.concat(arena, ElfObject.Export, &.{ exports, try objects.dynamicExports(resolver) });
+        dynamic = g.dynamicOptions(arena, imports[0..n], imports[n..], defined, shared) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.NotInGlibc => return inc.noLink("an import no shared library or glibc defines", .{}),
         };
@@ -3247,7 +3258,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     b.item_starts = enc.starts.items;
     b.entry = if (emit.entry) |e| @backingInt(e) else 0;
     b.output = inc.output;
-    for (emit.exports.items) |x| try b.addLinkSymbol(.@"export", @backingInt(x.key), x.name, 0);
+    for (emit.exports.items) |x| try b.addLinkSymbol(.@"export", @backingInt(x.key), x.name, @intFromBool(x.visibility == .hidden));
     for (emit.imports.keys(), emit.imports.values()) |name, flags| try b.addLinkSymbol(.import, @backingInt(Emit.importKey(name)), name, flags.bits());
     for (ip.error_names.items[1..]) |name| _ = try b.addErrorName(ip.stringSlice(name), @backingInt(Emit.errorKey(ip, name)));
     const t3 = now(io);

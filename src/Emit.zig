@@ -120,8 +120,12 @@ imports: std.StringArrayHashMapUnmanaged(ImportFlags) = .empty,
 /// The imports the executable copies (R_X86_64_COPY) and their sizes, a
 /// subset of `imports`, for data C objects reach without the GOT.
 copies: std.StringArrayHashMapUnmanaged(u64) = .empty,
-/// In an object, its exports, once `finish` found them.
+/// In an object, its exports, once `finish` found them; in an executable
+/// with link inputs or shared libraries, its Zig exports.
 exports: std.ArrayList(ElfObject.Export) = .empty,
+/// An executable's input objects' global definitions, when it has shared
+/// libraries, which may name them (`Glibc.dynamicOptions`).
+input_exports: []const ElfDynamic.Export = &.{},
 /// What produced each atom, for the on-disk cache (`Incremental`).
 atom_owners: std.ArrayList(Owner) = .empty,
 /// After `finish`, parallel to `atoms`: where each atom's name comes from
@@ -978,6 +982,7 @@ fn convertInputs(emit: *Emit, in: *ElfInput) !bool {
     emit.input_sections = converted.sections;
     // A shared object exports the objects' globals too, as upstream's.
     if (emit.shared) try emit.exports.appendSlice(emit.gpa, try in.dynamicExports(InputResolver{ .emit = emit }));
+    if (!emit.shared and emit.shared_libs.len != 0) emit.input_exports = try in.dynamicExports(InputResolver{ .emit = emit });
     return true;
 }
 
@@ -1240,8 +1245,9 @@ pub fn finish(emit: *Emit) !bool {
     if (!try emit.lowerExternSlots()) return false;
     if (emit.inputs) |in| if (!try emit.convertInputs(in)) return false;
     // An executable's too, with inputs: the cache resolves their
-    // references to Zig's exports again when it relinks.
-    if (emit.obj or emit.inputs != null) try emit.findExports();
+    // references to Zig's exports again when it relinks; and with shared
+    // libraries, which may name them (`Glibc.dynamicOptions`).
+    if (emit.obj or emit.inputs != null or emit.shared_libs.len != 0) try emit.findExports();
     try emit.lowerNavs();
     if (emit.uses_error_names) try emit.emitErrorNameTable();
 
@@ -1365,7 +1371,9 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         };
         var arena_state: std.heap.ArenaAllocator = .init(emit.gpa);
         defer arena_state.deinit();
-        var dynamic = g.dynamicOptions(arena_state.allocator(), imports[0..n_imports], imports[n_imports..], emit.shared_libs) catch |err| switch (err) {
+        const arena = arena_state.allocator();
+        const defined = try std.mem.concat(arena, ElfDynamic.Export, &.{ emit.exports.items, emit.input_exports });
+        var dynamic = g.dynamicOptions(arena, imports[0..n_imports], imports[n_imports..], defined, emit.shared_libs) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             // Imports come from the shared libraries and glibc only
             // (`libraryDefines`), but a unit an edit build loaded may
@@ -1386,7 +1394,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         // With glibc, its libraries are needed and its symbols versioned.
         var arena_state: std.heap.ArenaAllocator = .init(emit.gpa);
         defer arena_state.deinit();
-        var dynamic: ElfDynamic.Options = if (emit.glibc) |g| try g.sharedObjectOptions(arena_state.allocator(), imports, emit.shared_libs) else .{ .imports = imports };
+        var dynamic: ElfDynamic.Options = if (emit.glibc) |g| try g.sharedObjectOptions(arena_state.allocator(), imports, emit.exports.items, emit.shared_libs) else .{ .imports = imports };
         dynamic.exports = emit.exports.items;
         dynamic.soname = emit.soname;
         dynamic.runpath = emit.runpath;

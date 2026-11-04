@@ -170,33 +170,63 @@ pub fn deinit(g: *Glibc) void {
 /// `copies` are the imports the executable copies instead (`Emit.copies`),
 /// which become its exports, each with its aliases that nothing imports.
 /// A name one of the `shared` libraries defines comes from the first
-/// such library, before glibc. Strings are allocated in `arena`.
-pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import, shared: []const ElfShared) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
-    return g.options(arena, imports, copies, shared, true);
+/// such library, before glibc. `defined` are the compilation's own
+/// global definitions, which the libraries' references bind to first:
+/// those a needed library names are exported too, as upstream's linker
+/// exports them (`SharedObject.markImportExports`), unless hidden.
+/// Strings are allocated in `arena`.
+pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import, defined: []const ElfDynamic.Export, shared: []const ElfShared) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
+    return g.options(arena, imports, copies, defined, shared, true);
 }
 
 /// The dynamic tables of a shared object that links glibc, as
 /// `dynamicOptions`' for an executable, except that it copies nothing,
 /// has no interpreter, and imports a name neither the `shared` libraries
 /// nor glibc define unversioned, for the program that loads it to define.
-/// The caller adds the exports and the soname.
-pub fn sharedObjectOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, shared: []const ElfShared) Allocator.Error!ElfDynamic.Options {
-    return g.options(arena, imports, &.{}, shared, false) catch |err| switch (err) {
+/// The caller adds the exports, `defined`, and the soname.
+pub fn sharedObjectOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, defined: []const ElfDynamic.Export, shared: []const ElfShared) Allocator.Error!ElfDynamic.Options {
+    return g.options(arena, imports, &.{}, defined, shared, false) catch |err| switch (err) {
         error.OutOfMemory => |e| e,
         error.NotInGlibc => unreachable,
     };
 }
 
-fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import, shared: []const ElfShared, executable: bool) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
+fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import, defined: []const ElfDynamic.Export, shared: []const ElfShared, executable: bool) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
     std.mem.sortUnstable(ElfObject.Import, imports, {}, struct {
         fn lt(_: void, a: ElfObject.Import, b: ElfObject.Import) bool {
             return std.mem.lessThan(u8, a.name, b.name);
         }
     }.lt);
-    // The shared libraries come first, each needed whether used or not, as
-    // upstream links them; then glibc's.
+    // The shared libraries come first, those alive, as upstream's linker
+    // keeps them (`Object.markLive`, `SharedObject.markLive`): one that a
+    // strong reference resolves to, from the compilation (`imports`, the
+    // copies) or from a live library. A weak reference keeps none alive,
+    // nor one to a name the compilation defines. Then glibc's.
+    var own: std.StringHashMapUnmanaged(void) = .empty;
+    if (shared.len != 0) for (defined) |x| try own.put(arena, x.name, {});
+    const alive = try arena.alloc(bool, shared.len);
+    @memset(alive, false);
+    var work: std.ArrayList(u32) = .empty;
+    for ([_][]const ElfObject.Import{ imports, copies }, [_]bool{ false, true }) |list, copied| for (list) |imp| {
+        if (imp.weak and !copied) continue;
+        const s = sharedSymbol(shared, imp.name) orelse continue;
+        if (alive[s.lib]) continue;
+        alive[s.lib] = true;
+        try work.append(arena, s.lib);
+    };
+    while (work.pop()) |lib| for (shared[lib].undefs) |u| {
+        if (u.weak or own.contains(u.name)) continue;
+        const s = sharedSymbol(shared, u.name) orelse continue;
+        if (alive[s.lib]) continue;
+        alive[s.lib] = true;
+        try work.append(arena, s.lib);
+    };
     var needed: std.ArrayList([]const u8) = .empty;
-    for (shared) |lib| try needed.append(arena, lib.soname);
+    const shared_index = try arena.alloc(u32, shared.len);
+    for (shared, alive, shared_index) |lib, a, *index| if (a) {
+        index.* = @intCast(needed.items.len);
+        try needed.append(arena, lib.soname);
+    };
     var used: [libs.len]bool = @splat(false);
     used[lib_c] = true;
     for ([_][]const ElfObject.Import{ imports, copies }) |list| for (list) |imp| {
@@ -211,14 +241,16 @@ fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copie
     };
     const Place = struct { version: ?[]const u8, library: u32 };
     const place = struct {
-        fn f(gl: *const Glibc, a: Allocator, sh: []const ElfShared, li: *const [libs.len]u32, name: []const u8) !?Place {
-            if (sharedSymbol(sh, name)) |s| return .{ .version = s.sym.version, .library = s.lib };
+        fn f(gl: *const Glibc, a: Allocator, sh: []const ElfShared, live: []const bool, si: []const u32, li: *const [libs.len]u32, name: []const u8) !?Place {
+            // A weak import of a library nothing keeps alive stays
+            // unversioned, as it binds to no needed library.
+            if (sharedSymbol(sh, name)) |s| return if (live[s.lib]) .{ .version = s.sym.version, .library = si[s.lib] } else .{ .version = null, .library = 0 };
             const sym = gl.get(name) orelse return null;
             return .{ .version = try gl.versionName(a, sym.version), .library = li[sym.lib] };
         }
     }.f;
     for (imports) |*imp| {
-        const p = try place(g, arena, shared, &lib_index, imp.name) orelse continue;
+        const p = try place(g, arena, shared, alive, shared_index, &lib_index, imp.name) orelse continue;
         imp.version = p.version;
         imp.library = p.library;
     }
@@ -233,9 +265,21 @@ fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copie
             if (alias and (std.mem.eql(u8, n, name) or for (imports) |imp| {
                 if (std.mem.eql(u8, imp.name, n)) break true;
             } else false)) continue;
-            const p = try place(g, arena, shared, &lib_index, n) orelse continue;
+            const p = try place(g, arena, shared, alive, shared_index, &lib_index, n) orelse continue;
             try exports.append(arena, .{ .key = c.key, .name = n, .copy = .{ .version = p.version, .library = p.library, .alias = alias } });
         };
+    }
+    // The definitions a needed library names, defining or referencing
+    // them, which it binds to the executable's.
+    if (executable and own.count() != 0) {
+        var named: std.StringHashMapUnmanaged(void) = .empty;
+        for (shared, alive) |lib, a| if (a) for (lib.undefs) |u| try named.put(arena, u.name, {});
+        for (defined) |x| {
+            if (x.visibility == .hidden) continue;
+            if (named.contains(x.name) or for (shared, alive) |lib, a| {
+                if (a and lib.symbols.contains(x.name)) break true;
+            } else false) try exports.append(arena, x);
+        }
     }
     return .{ .exports = exports.items, .imports = imports, .interp = if (executable) interp else null, .needed = needed.items };
 }

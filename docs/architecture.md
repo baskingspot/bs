@@ -3228,9 +3228,26 @@ thread's abilists imports. No bytes come from it.
   the shared libraries in input order, then glibc (`Emit.libraryDefines`
   answers for the last two; `exportTarget`, `InputResolver.importSym`
   and the PC-relative import error use it).
-- `Glibc.dynamicOptions` puts every given `.so` in DT_NEEDED, in input
-  order and before glibc's libraries; zap does not drop unused ones,
-  and neither does upstream. Upstream's native link lists libm, libc
+- `Glibc.dynamicOptions` puts the given `.so` files that are alive in
+  DT_NEEDED, in input order and before glibc's libraries, as upstream's
+  linker keeps them (`Object.markLive`, `SharedObject.markLive`; fixed
+  2026-11-04, when zap listed every one): a library is alive when a
+  strong reference resolves to it, from the compilation's imports and
+  copies or from a live library's undefined symbols (`ElfShared.undefs`),
+  transitively. Weak references from C keep no library alive, and a weak
+  import of a library that is not alive is unversioned; a Zig `@extern`
+  with weak linkage is imported strong in an executable, as upstream's
+  linker binds it, and keeps its library. A library's reference to a
+  name the compilation defines binds to the compilation's definition and
+  keeps no other library alive; the executable exports each of its
+  definitions, Zig's and its objects', that a needed library names
+  (references or defines), unless hidden, as upstream's
+  `SharedObject.markImportExports`, so the loader binds the library to
+  it (fixed with the liveness: zap exported none, and a library
+  calling back into the program failed at run time). glibc's libraries,
+  which zap knows only from abilists, name nothing here. `-rdynamic`,
+  which exports every definition, is still accepted and ignored.
+  `-needed-l`, which would keep a library regardless, is `[unsupported]`. Upstream's native link lists libm, libc
   and ld-linux first; its `-target x86_64-linux-gnu` link lists them
   last, as zap does.
 - Copy relocations: a non-PIC or PIE C object reading `.so` data gets a

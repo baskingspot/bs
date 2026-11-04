@@ -1672,6 +1672,35 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         test_step.dependOn(&r.step);
     }
 
+    // DT_NEEDED liveness: of four shared libraries, the program needs a,
+    // which it calls, and b, which a calls without needing it itself; c
+    // (defining only a name the program defines) and d (referenced weakly
+    // from C) are left out, so their constructors never print. a and b
+    // call back into the program's Zig and C definitions, which it
+    // exports. Upstream links the same.
+    {
+        const libs = b.addSystemCommand(&.{ "sh", "-c",
+            \\set -e; z=$1; d=$2; s=$3
+            \\for x in a b c; do "$z" cc -shared -fPIC -Wl,-soname,libneeded_$x.so "$s/needed_$x.c" -o "$d/libneeded_$x.so"; done
+            \\"$z" cc -shared -fPIC -DNEEDED_D -Wl,-soname,libneeded_d.so "$s/needed_c.c" -o "$d/libneeded_d.so"
+        , "sh", zig });
+        const lib_dir = libs.addOutputDirectoryArg("needed");
+        libs.addDirectoryArg(b.path("test/link_input"));
+        const so_exe = b.addRunArtifact(zap);
+        so_exe.addArgs(&.{ "build-exe", "-lc", "-lneeded_a", "-lneeded_b", "-lneeded_c", "-lneeded_d" });
+        so_exe.addPrefixedDirectoryArg("-L", lib_dir);
+        so_exe.addFileArg(b.path("test/link_input/needed_main.zig"));
+        so_exe.addFileArg(b.path("test/link_input/needed_ref.c"));
+        so_exe.setEnvironmentVariable("ZAP_ZIG", upstreamZig(b));
+        so_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, "run zap link of unneeded shared libraries");
+        r.addFileArg(so_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addCheck(.{ .expect_stdout_exact = "" });
+        r.addCheck(.{ .expect_stderr_exact = "42 0\n" });
+        r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&r.step);
+    }
+
     // Constructors run in priority order across two objects, before main;
     // the destructor runs only with -lc, whose exit runs the fini array.
     var ctors: [2]std.Build.LazyPath = undefined;

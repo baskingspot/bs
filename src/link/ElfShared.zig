@@ -15,6 +15,11 @@ soname: []const u8,
 /// Its defined dynamic symbols, by name: the default version of each, as
 /// an unversioned reference binds to it.
 symbols: std.StringHashMapUnmanaged(Symbol) = .empty,
+/// The symbols it references and does not define, whose definitions keep
+/// their libraries needed when it is (`Glibc.dynamicOptions`).
+undefs: []const Undef = &.{},
+
+pub const Undef = struct { name: []const u8, weak: bool };
 
 pub const Symbol = struct {
     /// The version the symbol is defined in (`ZLIB_1.2.9`), which an
@@ -96,8 +101,15 @@ pub fn parse(arena: Allocator, path: []const u8, bytes: []const u8) Error!Shared
     for (dynamic) |d| if (d.d_tag == elf.DT_SONAME) {
         lib.soname = str(strtab, d.d_val);
     };
+    var undefs: std.ArrayList(Undef) = .empty;
     for (syms, 0..) |sym, i| {
-        if (sym.st_shndx == elf.SHN_UNDEF) continue;
+        if (sym.st_shndx == elf.SHN_UNDEF) {
+            const bind = sym.st_bind();
+            const name = str(strtab, sym.st_name);
+            if ((bind == elf.STB_GLOBAL or bind == elf.STB_WEAK) and name.len != 0)
+                try undefs.append(arena, .{ .name = name, .weak = bind == elf.STB_WEAK });
+            continue;
+        }
         switch (sym.st_bind()) {
             elf.STB_GLOBAL, elf.STB_WEAK, elf.STB_GNU_UNIQUE => {},
             else => continue,
@@ -117,6 +129,7 @@ pub fn parse(arena: Allocator, path: []const u8, bytes: []const u8) Error!Shared
         if (gop.found_existing) continue;
         gop.value_ptr.* = .{ .version = version, .object = sym.st_type() == elf.STT_OBJECT, .tls = sym.st_type() == elf.STT_TLS, .size = sym.st_size, .value = sym.st_value };
     }
+    lib.undefs = undefs.items;
     return lib;
 }
 
