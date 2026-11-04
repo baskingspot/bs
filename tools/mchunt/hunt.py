@@ -15,6 +15,7 @@ import argparse
 import concurrent.futures as cf
 import hashlib
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -52,6 +53,30 @@ def classify(up, res):
     if any(res[n].status in ("compile-error", "compile-timeout") for n in bad):
         return "bs-reject", bad
     return "miscompile", bad
+
+
+def known_bug(text, outs):
+    """The name of an open bug a miscompile matches, from .work/known.txt
+    (`name<TAB>regex` lines, matched against the eight source lines that
+    end at the first panic location of any outcome), or None. Matches
+    are saved and logged but not reduced."""
+    path = os.path.join(H.WORK, "known.txt")
+    if not os.path.exists(path):
+        return None
+    lines = text.splitlines()
+    ctxs = []
+    for o in outs:
+        m = re.search(r"\.zig:(\d+):\d+: ", o.detail or "")
+        if m:
+            n = int(m.group(1))
+            ctxs.append("\n".join(lines[max(0, n - 8):n]))
+    for l in open(path):
+        if "\t" not in l or l.startswith("#"):
+            continue
+        name, rx = l.rstrip("\n").split("\t", 1)
+        if any(re.search(rx, c) for c in ctxs):
+            return name
+    return None
 
 
 def signature(cls, bad, up, res):
@@ -99,6 +124,11 @@ def check(seed, tools, size, branch=None, base=None, text=None):
             return rec
         sig = signature(cls, bad, up, res)
         extra = {}
+        if cls == "miscompile":
+            kb = known_bug(text, [up] + [res[n] for n in bad])
+            if kb:
+                sig = f"known:{kb}|{sig}"
+                extra["known"] = kb
         if branch:
             extra["branch"] = branch
             if base is not None and cls in ("miscompile", "bs-crash", "bs-reject"):
@@ -426,7 +456,8 @@ def main():
                         save_queue()
                 if rec["result"] not in ("pass", "discard"):
                     log(f"seed {rec['seed']}: {rec['result']} {rec.get('sig', rec.get('why', ''))}")
-                if rec["result"].replace("branch-", "") in ("miscompile", "bs-crash", "bs-reject") and not args.no_reduce:
+                if rec["result"].replace("branch-", "") in ("miscompile", "bs-crash", "bs-reject") and not args.no_reduce \
+                        and not rec["sig"].startswith("known:"):
                     n = sig_reduced.get(rec["sig"], 0)
                     if n < args.per_sig:
                         sig_reduced[rec["sig"]] = n + 1
