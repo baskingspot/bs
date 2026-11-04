@@ -95,7 +95,10 @@ stores() {
 [ "$(stores 'greet\\.pick')" -eq 0 ] || fail "greet.pick (-fno-fuzz) stores to no coverage counter"
 
 # Unlimited fuzzing serves the web UI; its client is the wasm bs embeds,
-# built with upstream zig ($4).
+# built with upstream zig ($4). The background job opens its redirect
+# after the fork, so the log is created first: the loop below could
+# otherwise read it before it exists (sed's exit 2 ends the script).
+: >"$work/web"
 setsid "$bs" build test --fuzz --webui=127.0.0.1:0 >"$work/web" 2>&1 &
 web=$!
 trap 'kill -- -$web 2>/dev/null || true' EXIT
