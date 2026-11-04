@@ -1,7 +1,7 @@
 //! exit: 0
-//! stdout: "6319276624752600098\n8823866333948789538\n8823866333948789538\n7042984655872\n18446720048716682209\n6319276624752600098\n8823866333948789538\n6319276624752600098\n18446744072903100400\n19184\n19184\n46351\n27640\n135\n120\n135\n143\n"
+//! stdout: "6319276624752600098\n8823866333948789538\n8823866333948789538\n7042984655872\n18446720048716682209\n6319276624752600098\n8823866333948789538\n8823866333948789538\n7042984655872\n6319276624752600098\n8823866333948789538\n6319276624752600098\n18446744072903100400\n19184\n19184\n46351\n27640\n135\n120\n135\n143\n"
 // Vector `@intCast` that widens and `@truncate`, lowered as SSE unpacks
-// and packs, and compares against a constant that splits the lanes at
+// and packs, the same widenings as implicit coercions, and compares against a constant that splits the lanes at
 // their sign bit, lowered as the sign bits (`signTest`). Each line is a
 // lane-by-lane result folded into one number, so a lane out of place, a
 // wrong extension, or a constant off by one changes it.
@@ -44,6 +44,11 @@ fn main() callconv(.c) noreturn {
     rt.printInt(fold(i64, 16, @intCast(bytes(i8, 16))));
     rt.printInt(fold(i16, 9, @intCast(bytes(u8, 9))));
     rt.printInt(fold(i64, 8, @intCast(bytes(i16, 8))));
+    // The same widenings as coercions of the argument.
+    rt.printInt(fold(u32, 16, bytes(u8, 16)));
+    rt.printInt(fold(i32, 16, bytes(i8, 16)));
+    rt.printInt(fold(i64, 16, bytes(i8, 16)));
+    rt.printInt(fold(i16, 9, bytes(u8, 9)));
     // Truncating: one to three halvings, an odd length, and more source
     // chunks than one result chunk holds.
     rt.printInt(fold(u8, 16, @truncate(bytes(u16, 16))));

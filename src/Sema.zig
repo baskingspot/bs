@@ -9061,6 +9061,9 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 // (vectors only add padding at the end).
                 if (same and dest_elem != .bool_type) return try sema.addTyOp(block, .bitcast, dest_ty, inst);
                 if (sema.elemCoercionWidens(dest_elem, src_elem) and dc == .vector and sc == .vector) {
+                    // An integer widening is one native `intcast` where
+                    // the backend has it, as `@intCast` makes.
+                    if (try sema.vectorIntCast(block, dest_ty, inst, false)) |r| return r;
                     return try sema.vectorMap(block, src, @intCast(len), dest_ty, &.{inst}, VectorCast{ .f = coerceElem, .elem_ty = dest_elem });
                 }
             }
