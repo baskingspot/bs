@@ -167,6 +167,74 @@ DISABLED = set(filter(None, __import__("os").environ.get("MCHUNT_DISABLE", "").s
 BOOST = {k: float(v) for k, v in (x.split("=") for x in filter(None, __import__("os").environ.get("MCHUNT_BOOST", "").split(",")))}
 
 
+# Struct results of 32 to 256 bytes from non-inlined calls (s_retbig).
+# Fields: (name, int type, array length or 0).
+RB_TYPES = {
+    "R32": [("a", "u64", 0), ("b", "u32", 0), ("c", "u16", 0), ("d", "u8", 0), ("e", "u8", 13)],
+    "R72": [("a", "u64", 3), ("b", "u32", 0), ("c", "i16", 0), ("d", "u16", 5), ("e", "u8", 0), ("f", "u64", 0)],
+    "R136": [("a", "u64", 16), ("b", "u8", 0)],
+    "R256": [("a", "u64", 31), ("b", "u32", 0), ("c", "u16", 0), ("d", "u8", 0)],
+}
+
+
+def _rb_decl():
+    out = []
+    for tn, fs in RB_TYPES.items():
+        ty = lambda t, n: f"[{n}]{t}" if n else t
+        out.append(f"const {tn} = struct {{ {', '.join(f'{f}: {ty(t, n)}' for f, t, n in fs)} }};")
+        out.append(f"var g{tn}: {tn} = undefined;")
+        cv = lambda t, e: f"@as({t}, @truncate({e}))" if t[0] == "u" else f"@as({t}, @bitCast(@as(u{t[1:]}, @truncate({e}))))"
+        # Every field written, some twice; an early return after a partial overwrite.
+        out.append(f"noinline fn mk{tn}(x: u64, c: bool) {tn} {{")
+        out.append(f"    var r: {tn} = undefined;")
+        for k, (f, t, n) in enumerate(fs):
+            if n:
+                out.append(f"    for (&r.{f}, 0..) |*p, i| p.* = {cv(t, f'x +% @as(u64, i) *% {0x9E37 + k}')};")
+            else:
+                out.append(f"    r.{f} = {cv(t, f'x >> {k * 5}')};")
+        f0, t0, n0 = fs[-1]
+        out.append(f"    if (c) {{")
+        out.append(f"        r.{f0}{'[1]' if n0 else ''} = {cv(t0, 'x *% 3')};")
+        out.append("        return r;")
+        out.append("    }")
+        f1, t1, n1 = fs[0]
+        out.append(f"    r.{f1}{'[0]' if n1 else ''} ^= {cv(t1, '~x')};")
+        out.append("    return r;")
+        out.append("}")
+        # A result built in place from an aggregate literal.
+        lit = []
+        for k, (f, t, n) in enumerate(fs):
+            if n:
+                lit.append(f".{f} = @splat({cv(t, f'x +% {k}')})")
+            else:
+                lit.append(f".{f} = {cv(t, f'x ^ {k * 0x1111}')}")
+        out.append(f"noinline fn mk2{tn}(x: u64) {tn} {{ return .{{ {', '.join(lit)} }}; }}")
+        # By value in, result out (callers pass the location they assign to).
+        f2, t2, n2 = fs[len(fs) // 2]
+        out.append(f"noinline fn ed{tn}(v: {tn}, x: u64) {tn} {{")
+        out.append(f"    var r = v;")
+        out.append(f"    r.{f2}{'[' + str(n2 - 1) + ']' if n2 else ''} +%= {cv(t2, 'x')};")
+        out.append(f"    r.{f1}{'[0]' if n1 else ''} +%= 1;")
+        out.append("    return r;")
+        out.append("}")
+        terms = []
+        for f, t, n in fs:
+            w = (lambda e: f"@as(u64, {e})") if t[0] == "u" else (lambda e: f"@as(u64, @as(u{t[1:]}, @bitCast({e})))")
+            if n:
+                terms.append(f"for (v.{f}) |e| h = (h ^ {w('e')}) *% 0x100000001b3;")
+            else:
+                terms.append(f"h = (h ^ {w(f'v.{f}')}) *% 0x9E3779B97F4A7C15;")
+        out.append(f"fn fold{tn}(v: *const {tn}) u64 {{")
+        out.append(f"    var h: u64 = 0;")
+        for t_ in terms:
+            out.append(f"    {t_}")
+        out.append("    return h;")
+        out.append("}")
+    return out
+
+
+RB_DECL = _rb_decl()
+
 SE_DECL = [
     "const SE = struct {",
     "    a: u64,",
@@ -1080,7 +1148,7 @@ class Gen:
             (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"), (3, "prove"),
             (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"), (2, "window"),
             (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
-            (2, "sroaesc"),
+            (2, "sroaesc"), (2, "retbig"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -2413,6 +2481,58 @@ class Gen:
         if self.chance(0.3):
             self.sink(ctx, f"@as(u64, {n}.e[{self.r.randint(0, 2)}])", U64)
 
+    def s_retbig(self, ctx):
+        """Large struct results of non-inlined calls copied into locals,
+        globals and array elements, then read field by field."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        tn = self.pick(list(RB_TYPES))
+        fs = RB_TYPES[tn]
+        e = lambda s_: self.emit(ctx, s_)
+        u64 = lambda: self.int_expr(ctx, U64, 1)
+
+        def field(v):
+            f, t, n = self.pick(fs)
+            at = f"{v}.{f}[{self.r.randrange(n)}]" if n else f"{v}.{f}"
+            return f"@as(u64, @as(u{t[1:]}, @bitCast({at})))" if t[0] == "i" else f"@as(u64, {at})"
+
+        v = self.fresh("rv")
+        call = lambda: f"mk{tn}({u64()}, {self.bool_expr(ctx, 1)})" if self.chance(0.6) else f"mk2{tn}({u64()})"
+        e(f"const {v}: {tn} = {call()};")
+        for _ in range(self.r.randint(1, 3)):
+            self.sink(ctx, field(v), U64)
+        k = self.r.randrange(5)
+        w = self.fresh("rw")
+        if k == 0:
+            # The assigned location is also the argument.
+            e(f"var {w}: {tn} = {call()};")
+            e(f"{w} = ed{tn}({w}, {u64()});")
+            self.sink(ctx, field(w), U64)
+            self.sink(ctx, f"fold{tn}(&{w})", U64)
+        elif k == 1:
+            e(f"g{tn} = {call()};")
+            e(f"g{tn} = ed{tn}(g{tn}, {u64()});")
+            self.sink(ctx, field(f"g{tn}"), U64)
+        elif k == 2:
+            i = self.fresh("ri")
+            e(f"var {w}: [2]{tn} = undefined;")
+            e(f"for (0..2) |{i}| {w}[{i}] = mk{tn}(@as(u64, {i}) +% {u64()}, ({i} & 1) == 0);")
+            e(f"{w}[{self.r.randint(0, 1)}] = ed{tn}({w}[{self.r.randint(0, 1)}], {u64()});")
+            self.sink(ctx, field(f"{w}[{self.r.randint(0, 1)}]"), U64)
+            self.sink(ctx, f"fold{tn}(&{w}[1])", U64)
+        elif k == 3:
+            # Overwrite a local in a loop; the previous result feeds the next call.
+            i = self.fresh("ri")
+            e(f"var {w}: {tn} = mk2{tn}({u64()});")
+            e(f"for (0..{self.r.randint(1, 4)}) |{i}| {{")
+            ctx["indent"] += 1
+            e(f"{w} = mk{tn}(fold{tn}(&{w}) +% {i}, ({i} & 1) == 1);")
+            ctx["indent"] -= 1
+            e("}")
+            self.sink(ctx, field(w), U64)
+        else:
+            self.sink(ctx, f"fold{tn}(&{v})", U64)
+
     def s_bigcopy(self, ctx):
         """Whole copies of a 64-256 byte struct: into locals, globals and
         through pointers, by value into callees that write the source, and
@@ -3110,6 +3230,7 @@ class Gen:
         out.append(f"var gH: SH = {self.global_init(hs)};")
         # A local struct worked through an inlined self pointer (s_sroaesc).
         out.extend(SE_DECL)
+        out.extend(RB_DECL)
         for i in range(self.r.randint(0, 3)):
             t = self.rand_int_type()
             v = Var(f"K{i}", t, "cglobal", ro=True, ct=True)
