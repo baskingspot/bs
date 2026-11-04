@@ -942,11 +942,17 @@ fn generateFunction(emit: *Emit, ir: *const Ir) Allocator.Error!void {
     const io = emit.zcu.io;
     const t0 = std.Io.Timestamp.now(io, .awake);
     defer emit.codegen_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
-    // The IR is this job's own.
-    const st = try prove.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.prove_scratch);
-    emit.codegen_stats.prove_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
-    emit.codegen_stats.checks += st.checks;
-    emit.codegen_stats.proven += st.proven;
+    // Off until its rules are sound: it removed bounds checks it had not
+    // proven (`x +% 1 <= n` taken as `x < n`; a load read against a later
+    // store).
+    const prove_enabled = false;
+    if (prove_enabled) {
+        // The IR is this job's own.
+        const st = try prove.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.prove_scratch);
+        emit.codegen_stats.prove_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
+        emit.codegen_stats.checks += st.checks;
+        emit.codegen_stats.proven += st.proven;
+    }
     CodeGen.generate(emit, ir) catch |err| switch (err) {
         error.CodegenFail => emit.failed = true,
         else => |e| return e,

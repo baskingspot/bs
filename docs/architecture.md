@@ -1516,6 +1516,10 @@ from inlining, where a parameter becomes the caller's constant.
 
 #### Proving checks
 
+**Off** (`prove_enabled` in `Emit.generateFunction`) until its rules are
+shown sound: the miscompile hunter found it removing bounds checks it had
+not proven.
+
 Built on the IR, after the rewrite rules (`src/codegen/prove.zig`), as
 Go's `prove` and `loopbce`: one forward walk per function on its CodeGen
 worker (`Emit.generateFunction`, before `CodeGen.generate`) keeps the
