@@ -15121,6 +15121,42 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
 // ---------------------------------------------------------------------------
 // Inline assembly
 
+/// The callee-saved registers an `asm`'s clobbers (`.{ .rbx = true }`)
+/// name, as `Ir.Asm.callee_saved_clobbers` bits.
+fn asmCalleeSavedClobbers(sema: *Sema, ref: Zir.Inst.Ref) u32 {
+    const code = sema.code;
+    // The `comptime` block around the struct literal.
+    var r = ref;
+    const ci = while (r != .none) {
+        const i = r.toIndex() orelse return 0;
+        switch (code.instructions.items(.tag)[@backingInt(i)]) {
+            .struct_init => break i,
+            .block_comptime => {
+                const b = code.extraData(Zir.Inst.BlockComptime, code.instructions.items(.data)[@backingInt(i)].pl_node.payload_index);
+                const body = code.bodySlice(b.end, b.data.body_len);
+                const last = body[body.len - 1];
+                if (code.instructions.items(.tag)[@backingInt(last)] != .break_inline) return 0;
+                r = code.instructions.items(.data)[@backingInt(last)].@"break".operand;
+            },
+            else => return 0,
+        }
+    } else return 0;
+    const extra = code.extraData(Zir.Inst.StructInit, code.instructions.items(.data)[@backingInt(ci)].pl_node.payload_index);
+    var mask: u32 = 0;
+    var i = extra.end;
+    for (0..extra.data.fields_len) |_| {
+        const item = code.extraData(Zir.Inst.StructInit.Item, i);
+        i = item.end;
+        if (sema.resolveValue(sema.resolveInst(item.data.init)) != .bool_true) continue;
+        const ft = code.extraData(Zir.Inst.FieldType, code.instructions.items(.data)[@backingInt(item.data.field_type)].pl_node.payload_index).data;
+        const name = sema.zirString(ft.name_start);
+        for (Ir.Asm.callee_saved_names, 0..) |n, bit| {
+            if (std.mem.eql(u8, n, name)) mask |= @as(u32, 1) << @intCast(bit);
+        }
+    }
+    return mask;
+}
+
 fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const ext = sema.code.instructions.items(.data)[@backingInt(inst)].extended;
     const extra = sema.code.extraData(Zir.Inst.Asm, ext.operand);
@@ -15170,8 +15206,8 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             .operand = operand,
         });
     }
-    // Clobbers need no handling: CodeGen keeps no values in registers
-    // across instructions.
+    // CodeGen keeps no values in registers across instructions, but a
+    // clobbered callee-saved register is the caller's to keep.
     const payload = try sema.addExtra(Ir.Asm{
         .source = if (ext.opcode == .asm_expr)
             try sema.getString(try sema.resolveConstString(block, src, sema.resolveInst(@fromBackingInt(@backingInt(extra.data.asm_source)))))
@@ -15180,6 +15216,7 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         .outputs_len = small.outputs_len,
         .inputs_len = small.inputs_len,
         .is_volatile = @intFromBool(small.is_volatile),
+        .callee_saved_clobbers = sema.asmCalleeSavedClobbers(extra.data.clobbers),
     });
     for (operands.items) |op| _ = try sema.addExtra(op);
     return sema.addInst(block, .{ .tag = .assembly, .data = .{ .ty_pl = .{ .ty = result_ty, .payload = payload } } });

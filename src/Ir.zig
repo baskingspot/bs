@@ -486,6 +486,11 @@ pub const Asm = struct {
     outputs_len: u32,
     inputs_len: u32,
     is_volatile: u32,
+    /// The callee-saved registers the clobbers name, as bits in the order
+    /// of `callee_saved_names`, which the function must save.
+    callee_saved_clobbers: u32,
+
+    pub const callee_saved_names = [_][]const u8{ "rbx", "r12", "r13", "r14", "r15" };
 
     pub const Operand = struct {
         name: InternPool.String,

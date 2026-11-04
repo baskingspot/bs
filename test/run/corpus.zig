@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n1\n42\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n1\n42\n39\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -186,6 +186,22 @@ fn jumpViaLabel() callconv(.naked) void {
     );
 }
 
+// zio (coro/coroutines.zig): a function whose asm clobbers callee-saved
+// registers saves them for its caller.
+noinline fn clobberCalleeSaved() void {
+    asm volatile (
+        \\ xorl %%ebx, %%ebx
+        \\ xorl %%r12d, %%r12d
+        \\ xorl %%r15d, %%r15d
+        ::: .{ .rbx = true, .r12 = true, .r15 = true });
+}
+noinline fn liveAcrossClobber(x: u64) u64 {
+    const a = x *% 3;
+    const b = x +% 11;
+    clobberCalleeSaved();
+    return a +% b;
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -247,5 +263,8 @@ fn main() callconv(.c) noreturn {
     rt.printInt(@intFromBool(@hasDecl(Schema, "jsonStringify") and !@hasDecl(Tag, "jsonStringify")));
     const jump: *const fn () callconv(.c) u64 = @ptrCast(&jumpViaLabel);
     rt.printInt(jump());
+    var seven: u64 = 7;
+    _ = &seven;
+    rt.printInt(liveAcrossClobber(seven));
     rt.exit(0);
 }

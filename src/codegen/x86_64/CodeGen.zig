@@ -1124,11 +1124,15 @@ fn planRegisters(cg: *CodeGen) Error!void {
             if (fate[@backingInt(inst)] == .dead) cg.homes[@backingInt(inst)] = .dead;
         }
         // No value gets a register, but a `{reg}` operand that names a
-        // callee-saved register (cpuid's `={ebx}`) writes it, so the
-        // prologue saves it.
+        // callee-saved register (cpuid's `={ebx}`) or a clobber of one
+        // (zio's context switch) writes it, so the prologue saves it.
+        comptime for (Ir.Asm.callee_saved_names, alloc_regs[0..@popCount(callee_saved)]) |name, r| {
+            std.debug.assert(std.mem.eql(u8, name, @tagName(r)));
+        };
         for (f.values.items(.inst)) |inst| {
             if (ir.instructions.items(.tag)[@backingInt(inst)] != .assembly) continue;
             const extra = ir.extraData(Ir.Asm, ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload);
+            cg.saved |= extra.data.callee_saved_clobbers;
             var i = extra.end;
             for (0..extra.data.outputs_len + extra.data.inputs_len) |_| {
                 const op = ir.extraData(Ir.Asm.Operand, i).data;
