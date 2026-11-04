@@ -5020,6 +5020,12 @@ fn setupCParams(cg: *CodeGen) Error!void {
 /// `@cVaStart()`: a SysV `va_list` past the named parameters.
 fn cVaStart(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!void {
     const dst = try cg.resultMem(inst, ty) orelse return;
+    if (cg.fn_ty.cc == .x86_64_win) {
+        // Win64's: the address of the first variadic argument, in the
+        // first field of the target's `VaList`, as upstream.
+        try cg.e.lea(.qword, .rax, Mem.at(.rbp, @intCast(16 + cg.va.stack)));
+        return cg.e.mov(.qword, .{ .mem = dst }, .{ .reg = .rax });
+    }
     try cg.e.mov(.dword, .{ .mem = dst }, .{ .imm = @as(i32, cg.va.gp) * 8 });
     try cg.e.mov(.dword, .{ .mem = offsetMem(dst, 4) }, .{ .imm = 48 + @as(i32, cg.va.sse) * 16 });
     try cg.e.lea(.qword, .rax, Mem.at(.rbp, @intCast(16 + cg.va.stack)));
@@ -5036,6 +5042,19 @@ fn cVaArg(cg: *CodeGen, inst: Inst.Index, ty: Index, list: Ref) Error!void {
     const ip = cg.ip;
     const size = Type.abiSize(ip, ty);
     try cg.load(.rcx, list);
+    if (cg.fn_ty.cc == .x86_64_win) {
+        // Win64's: each argument in an 8-byte slot, a value passed by
+        // reference through its pointer.
+        try cg.e.mov(.qword, .{ .reg = .rdx }, .{ .mem = Mem.at(.rcx, 0) });
+        try cg.e.alu(.add, .qword, .{ .mem = Mem.at(.rcx, 0) }, .{ .imm = 8 });
+        if (cg.winClass(ty, false) == .ref) try cg.e.mov(.qword, .{ .reg = .rdx }, .{ .mem = Mem.at(.rdx, 0) });
+        const dst = try cg.resultMem(inst, ty) orelse return;
+        if (ty == .f32_type) {
+            try cg.e.cvts2s(.f32, .xmm0, .{ .mem = Mem.at(.rdx, 0) });
+            return cg.storeXmm(dst, .xmm0, 4);
+        }
+        return cg.copyMem(dst, Mem.at(.rdx, 0), size);
+    }
     const class = cg.cClass(ty);
     const on_stack = try cg.e.newLabel();
     const done = try cg.e.newLabel();
@@ -5238,6 +5257,10 @@ fn winCallResult(cg: *CodeGen, ret_ty: Index, dst: ?Mem) Error!void {
 /// register arguments to slots and copying by-reference ones.
 fn setupWinParams(cg: *CodeGen) Error!void {
     const ip = cg.ip;
+    // A variadic function's register arguments go to the home area its
+    // caller reserved, after which all its arguments are in order in
+    // memory, where `cVaStart` points.
+    if (cg.fn_ty.is_var_args) for (win_arg_regs, 0..) |r, i| try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, @intCast(16 + 8 * i)) }, .{ .reg = r });
     const save = try cg.allocSlot(16 + 16 * win_saved_xmms.len, 16);
     try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, save) }, .{ .reg = .rsi });
     try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, save + 8) }, .{ .reg = .rdi });
@@ -5284,6 +5307,7 @@ fn setupWinParams(cg: *CodeGen) Error!void {
         try cg.copyMem(m, Mem.at(.r11, 0), size);
         cg.homes[@backingInt(ref.inst)] = .{ .slot = m.disp };
     }
+    if (cg.fn_ty.is_var_args) cg.va = .{ .stack = 8 * p };
 }
 
 /// Returns `operand` from a Win64 function.

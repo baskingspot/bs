@@ -1123,8 +1123,8 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     win_exe.setEnvironmentVariable("ZAP_ZIG", zig);
     const win_run = std.Build.Step.Run.create(b, "run zap build with Win64 calls");
     win_run.addFileArg(win_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
-    win_run.addCheck(.{ .expect_stdout_exact = "c_win_mix 1 2.5 3 4 5.5 6 7 8 9.5 10.5 11 12.5\nva u64 1\nva f64 2.5\nva u64 3\nva f64 4.5\nzig via ptr 32.5\nzig byref 15 77\n" });
-    win_run.addCheck(.{ .expect_stderr_exact = "byref 42 9 mix 32.5 s8 2 1 u128 80000000000000000\nzig_win_mix 1 2.5 3 4 5.5 6 7 8 9.5 10.5 11 12.5\n" });
+    win_run.addCheck(.{ .expect_stdout_exact = "c_win_mix 1 2.5 3 4 5.5 6 7 8 9.5 10.5 11 12.5\nva u64 1\nva f64 2.5\nva u64 3\nva f64 4.5\nzig via ptr 32.5\nzig byref 15 77\nzig va 109.75 42\n" });
+    win_run.addCheck(.{ .expect_stderr_exact = "byref 42 9 mix 32.5 s8 2 1 u128 80000000000000000\nzig_win_mix 1 2.5 3 4 5.5 6 7 8 9.5 10.5 11 12.5\nsum 42\n" });
     win_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&win_run.step);
 

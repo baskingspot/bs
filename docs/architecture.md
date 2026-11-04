@@ -750,8 +750,13 @@ comptime arguments are run-time values in the lowered code (uucode's
   returned in rax. A variadic callee also gets each float argument in
   its position's GPR. Functions zap defines with it save rsi, rdi, and
   xmm6-15 in frame slots with plain moves (they are not in the unwind
-  info, which only records pushed GPRs); defining a variadic one is
-  `[unsupported]`. Measured by upstream's test/c_abi (`run.py --c-abi`).
+  info, which only records pushed GPRs). A variadic one stores rcx,
+  rdx, r8, and r9 in its caller's home area, so its arguments are in
+  order in 8-byte slots: its `va_list` (the first field of the
+  target's `VaList`, as upstream) points past the named ones, and
+  `@cVaArg` reads the next slot (through the pointer for a value passed
+  by reference, which upstream does not support yet; an f32 as the f64
+  C promotes it to). Measured by upstream's test/c_abi (`run.py --c-abi`).
   Zap-to-zap calls (`.auto`) pass every argument in
   memory at 8-byte aligned offsets of the caller's outgoing area, return
   1-, 2-, 4-, and 8-byte results in rax, and return anything else through a

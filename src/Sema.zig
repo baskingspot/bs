@@ -17960,8 +17960,6 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     if (is_var_args) {
         const var_src: Src = .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(params.len) } } };
         if (cc != .c and cc != .x86_64_win) return sema.failVarArgsCc(block, var_src, cc);
-        // zap calls variadic Win64 functions but does not define them.
-        if (cc == .x86_64_win and body_len != 0) return sema.fail(block, var_src, "zap does not support defining variadic functions with calling convention 'x86_64_win' yet", .{});
     }
 
     // Errors about a parameter or the return type point at it, as upstream.

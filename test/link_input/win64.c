@@ -1,7 +1,7 @@
 // The Win64 convention (ms_abi) between C and Zig (build.zig, "zap
 // build-exe with Win64 calls"): by-reference structs and results, mixed
 // positions, a 16-byte integer, variadic calls, and Zig functions C calls
-// directly and through a pointer.
+// directly and through a pointer, variadic ones too.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -28,10 +28,13 @@ MS void c_win_va(int n, ...) {
 }
 typedef MS double (*ZigFn)(int, double, S8, float, S3, D2, long long, double);
 extern MS ByRef zig_win_byref(ByRef);
+extern MS double zig_win_va(int, ...);
+extern MS int zig_win_sum(int, ...);
 void c_calls(ZigFn f) {
     printf("zig via ptr %g\n", f(1, 2.5, (S8){3, 4}, 5.5f, (S3){6, 7, 8}, (D2){9.5, 10.5}, 11, 12.5));
     ByRef b = { 5 }; b.arr[14] = 77;
     ByRef r = zig_win_byref(b);
     printf("zig byref %d %d\n", r.val, r.arr[14]);
+    printf("zig va %g %d\n", zig_win_va(2, 0.5, 7ull, 1.25, 9ull, b, 5), zig_win_sum(5, 1, 2, 3, 4, 32));
     fflush(stdout);
 }

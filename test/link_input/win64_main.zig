@@ -21,6 +21,30 @@ export fn zig_win_byref(in: ByRef) callconv(win) ByRef {
     r.val *= 3;
     return r;
 }
+// Variadic: C passes `b` (a ByRef) by reference, floats in both
+// registers.
+export fn zig_win_va(n: c_int, ...) callconv(win) f64 {
+    var ap = @cVaStart();
+    defer @cVaEnd(&ap);
+    var s: f64 = 0;
+    var i: c_int = 0;
+    while (i < n) : (i += 1) {
+        s += @cVaArg(&ap, f64);
+        s += @floatFromInt(@cVaArg(&ap, u64));
+    }
+    var cp = @cVaCopy(&ap);
+    defer @cVaEnd(&cp);
+    const b = @cVaArg(&ap, ByRef);
+    return s + @as(f64, @floatFromInt(b.val + b.arr[14] + @cVaArg(&ap, c_int) + @cVaArg(&cp, ByRef).val));
+}
+export fn zig_win_sum(n: c_int, ...) callconv(win) c_int {
+    var ap = @cVaStart();
+    defer @cVaEnd(&ap);
+    var s: c_int = 0;
+    var i: c_int = 0;
+    while (i < n) : (i += 1) s += @cVaArg(&ap, c_int);
+    return s;
+}
 pub fn main() void {
     var b: ByRef = .{ .val = 1, .arr = undefined };
     b.arr[3] = 9;
@@ -32,4 +56,5 @@ pub fn main() void {
     _ = fflush(null);
     std.debug.print("byref {} {} mix {d} s8 {} {} u128 {x}\n", .{ r.val, r.arr[3], m, s.a, s.b, u });
     c_calls(&zig_win_mix);
+    std.debug.print("sum {}\n", .{zig_win_sum(3, @as(c_int, 1), @as(c_int, 2), @as(c_int, 39))});
 }
