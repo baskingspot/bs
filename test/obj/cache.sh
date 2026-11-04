@@ -78,6 +78,14 @@ if [ $cmd = build-lib ]; then
     ZAP_CACHE=off "$zap" build-obj lib.zig libd.a --global-cache-dir global -femit-bin=with-archive.o >log 2>&1 || fail "build-obj with an archive"
     ZAP_CACHE=off "$zap" build-obj lib.zig --global-cache-dir global -femit-bin=without-archive.o >log 2>&1 || fail "build-obj"
     cmp -s with-archive.o without-archive.o || fail "build-obj leaves archive inputs out"
+    # Objects alone, without a Zig root or C (libvaxis's C API library):
+    # archived every build, so a changed object shows up.
+    "$zap" build-lib -static --name o d.o --cache-dir local --global-cache-dir global -femit-bin=libo.a >log 2>&1 || fail "build-lib of an object"
+    [ "$(ar t libo.a)" = "d.o" ] || fail "libo.a holds d.o"
+    printf 'export fn d_one() u32 { return 11; }\n' >d.zig
+    ZAP_CACHE=off "$zap" build-obj d.zig --global-cache-dir global -femit-bin=d.o >log 2>&1 || fail "build-obj of the edited d.zig"
+    "$zap" build-lib -static --name o d.o --cache-dir local --global-cache-dir global -femit-bin=libo.a >log 2>&1 || fail "build-lib of the changed object"
+    ar p libo.a d.o | cmp -s - d.o || fail "libo.a holds the changed d.o"
 fi
 
 # As upstream's: an object merges its object inputs and C objects after the

@@ -491,7 +491,7 @@ pub const Job = struct {
             .compile_args = compile_args.items,
             .link_objects = link_objects,
             .link_shared = link_shared,
-            .stem = opts.name orelse if (is_test) "test" else if (opts.c_only or opts.c_exe) std.fs.path.stem(opts.c_sources[0].path) else std.fs.path.stem(opts.root_src_path),
+            .stem = opts.name orelse if (is_test) "test" else if (opts.c_only or opts.c_exe) std.fs.path.stem(if (opts.c_sources.len != 0) opts.c_sources[0].path else if (opts.link_inputs.len != 0) opts.link_inputs[0] else opts.root_name) else std.fs.path.stem(opts.root_src_path),
             .run_test = is_test and !opts.test_no_exec and !opts.listen,
             .environ_map = init_.environ_map,
             .full_args = args,
@@ -593,7 +593,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     // C sources compile while the build analyzes, once for every attempt.
     const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0 or cxxRuntime(&job.opts) or libcNonshared(&job.opts)) try startC(init, job) else null;
     defer if (c_batch) |b| CSource.destroy(b);
-    if (job.opts.c_only) return compileCOnly(init, job, c_batch.?, out_path, alt_path, inputs);
+    if (job.opts.c_only) return compileCOnly(init, job, c_batch, out_path, alt_path, inputs);
     // The C objects are link-only inputs of the cache, after the object
     // and archive arguments, as `ElfInput` takes them.
     if (c_batch) |b| if (inc_opt) |i| {
@@ -797,7 +797,7 @@ const InputsRecord = struct {
 /// archive stays when no source compiled and neither it nor an object
 /// changed since it was written (`CSource.archiveStamp`, kept under the
 /// compilation's key), as upstream's cache hit: SDL3's is 70 MB.
-fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_path: ?[]const u8, alt_path: ?[]const u8, inputs: ?*std.ArrayList(u8)) !Outcome {
+fn compileCOnly(init: std.process.Init, job: *const Job, batch: ?*CSource.Batch, out_path: ?[]const u8, alt_path: ?[]const u8, inputs: ?*std.ArrayList(u8)) !Outcome {
     const arena = init.arena.allocator();
     const io = init.io;
     // The stamp covers the C objects and the output, not object inputs.
@@ -805,7 +805,8 @@ fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_
         _, const key = try Incremental.compilationKey(arena, io, job.compile_args, job.zig_lib_dir, "c archive");
         break :path try std.fs.path.join(arena, &.{ job.zapLocal(arena), "car", &std.fmt.bytesToHex(@as([16]u8, @bitCast(key)), .lower) });
     } else null;
-    if (b.misses == 0) if (stamp_path) |sp| if (try CSource.archiveStamp(b, arena, out_path.?)) |stamp| {
+    // Object inputs alone (no batch) go into the output every build.
+    if (batch) |b| if (b.misses == 0) if (stamp_path) |sp| if (try CSource.archiveStamp(b, arena, out_path.?)) |stamp| {
         var buf: [16]u8 = undefined;
         const old = Io.Dir.cwd().readFile(io, sp, &buf) catch "";
         if (old.len == 16 and std.mem.readInt(u128, buf[0..16], .little) == stamp) {
@@ -814,7 +815,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_
             return .{ .ok = .{ .cache_hit = true } };
         }
     };
-    const c = try b.wait();
+    const c: *const CSource.Batch.Result = if (batch) |b| try b.wait() else &.{ .objects = &.{}, .errors = &.{}, .inputs = "" };
     if (inputs) |list| try appendCInputs(arena, list, c.inputs);
     if (c.errors.len != 0) return .{ .errors = try dupeDiagnostics(arena, c.errors) };
     const bin_path = alt_path orelse out_path orelse return .{ .ok = .{ .cache_hit = false } };
@@ -830,7 +831,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_
         };
     }
     // Best effort: without the stamp, the next build writes the archive.
-    if (stamp_path) |sp| if (CSource.archiveStamp(b, arena, bin_path) catch null) |stamp| {
+    if (stamp_path) |sp| if (CSource.archiveStamp(batch.?, arena, bin_path) catch null) |stamp| {
         var bytes: [16]u8 = undefined;
         std.mem.writeInt(u128, &bytes, stamp, .little);
         Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = &bytes, .flags = .{} }) catch |err| switch (err) {
@@ -2093,8 +2094,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         setUnsupported(&opts, arena, "zap does not link shared libraries against glibc yet ('-dynamic' with '-lc'); build this step with upstream zig", .{});
     if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena, io);
     // C sources without any module: a library or executable of C only, as
-    // upstream's.
-    if (root == null and !rootless_root and c_files.items.len != 0 and command != .@"test") rootless_root = true;
+    // upstream's; so are object inputs alone in a library or object.
+    if (root == null and !rootless_root and command != .@"test" and
+        (c_files.items.len != 0 or (link_inputs.items.len != 0 and (command == .build_lib or command == .build_obj)))) rootless_root = true;
     if (root == null and rootless_root) {
         // An executable whose main is C's, as upstream's; zap needs glibc
         // for its start code (`Builtin.glibc_start`).
@@ -2102,8 +2104,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             opts.c_exe = true
         else if ((command != .build_lib and command != .build_obj) or opts.dynamic)
             setUnsupported(&opts, arena, "zap builds modules without a Zig root source file only into static libraries and objects of C and executables of C that link glibc ('-M{s}'); build this step with upstream zig", .{opts.root_name})
-        else if (c_files.items.len == 0)
-            setUnsupported(&opts, arena, "zap builds a library or object without a Zig root source file only from C sources ('-M{s}')", .{opts.root_name})
+        else if (c_files.items.len == 0 and link_inputs.items.len == 0)
+            setUnsupported(&opts, arena, "zap builds a library or object without a Zig root source file only from C sources and objects ('-M{s}')", .{opts.root_name})
         else
             opts.c_only = true;
     }

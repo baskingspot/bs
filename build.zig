@@ -1194,6 +1194,39 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         test_step.dependOn(&src_run.step);
     }
 
+    // A static library and an object of objects alone, as libvaxis's C API
+    // step makes one: no Zig root and no C sources. The library holds the
+    // objects, the object merges them; upstream links a program with each.
+    {
+        const lib = b.addRunArtifact(zap);
+        lib.setName("zap build-lib -static of objects only");
+        lib.addArgs(&.{ "build-lib", "-static", "--name", "a12" });
+        const obj_only = b.addRunArtifact(zap);
+        obj_only.setName("zap build-obj of objects only");
+        obj_only.addArgs(&.{ "build-obj", "--name", "a12" });
+        for ([_][]const u8{ "a1", "a2" }) |stem| {
+            const o = b.addSystemCommand(&.{ zig, "cc", "-c" });
+            o.addFileArg(b.path(b.fmt("test/link_input/{s}.c", .{stem})));
+            const o_file = o.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{stem}));
+            lib.addFileArg(o_file);
+            obj_only.addFileArg(o_file);
+        }
+        const outputs = [_]std.Build.LazyPath{
+            lib.addPrefixedOutputFileArg("-femit-bin=", "liba12.a"),
+            obj_only.addPrefixedOutputFileArg("-femit-bin=", "a12.o"),
+        };
+        for (outputs, [_][]const u8{ "library", "object" }) |out, what| {
+            const exe = b.addSystemCommand(&.{ zig, "build-exe" });
+            exe.addFileArg(b.path("test/link_input/a12_main.zig"));
+            exe.addFileArg(out);
+            const r = std.Build.Step.Run.create(b, b.fmt("run upstream's link of zap's {s} of objects only", .{what}));
+            r.addFileArg(exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            r.addCheck(.{ .expect_stderr_exact = "12\n" });
+            r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+            test_step.dependOn(&r.step);
+        }
+    }
+
     // A C object calling glibc, in a -lc executable: its calls go through
     // stubs, its GOT loads through the imports' slots. Upstream compiles
     // C as -fPIC under -lc.

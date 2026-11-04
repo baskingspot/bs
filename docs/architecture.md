@@ -6485,7 +6485,11 @@ libraries as inputs. To be agreed with that thread.
   the root module, or with C files and no module at all, it makes a
   library of C only (`Options.c_only`): zap compiles the C, analyzes no
   Zig, and writes the archive of the objects, named after `--name` or
-  the first C file. Libraries do not root ubsan_rt or ssp; an executable
+  the first C file. Object inputs alone, with no root and no C (libvaxis's
+  C API library, 2026-11-04), make the same kind of library or object:
+  the archive holds them, or the object merges them, named after the
+  first object, and every build writes it again from them, so there is
+  no cache entry to relink (test/obj/cache.sh). Libraries do not root ubsan_rt or ssp; an executable
   that links them does. The member headers' mode is `0` and odd sizes are
   padded with a zero byte, as upstream's (zap wrote `644` and `\n`
   before), so an archive of C is upstream's byte for
