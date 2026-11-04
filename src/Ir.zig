@@ -419,6 +419,14 @@ pub const Call = struct {
     /// the callee's own (`inferred_error_set_type`).
     ret_ty: InternPool.Index,
     args_len: u32,
+    flags: Flags = .{},
+
+    pub const Flags = packed struct(u32) {
+        /// `@call(.always_tail, ...)`, only on aarch64-macos: a `ret` of
+        /// the result follows, and CodeGen must reuse the caller's frame.
+        always_tail: bool = false,
+        _: u31 = 0,
+    };
 };
 
 pub const Bin = struct {

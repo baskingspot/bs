@@ -4785,8 +4785,8 @@ fn atomicElemType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!
     };
     if (!ok) return sema.fail(block, src, "expected bool, integer, float, enum, packed struct, or pointer type; found '{f}'", .{sema.fmtType(ty)});
     // As upstream's `atomicPtrAlignment`: x86_64 without cx16 (zap's
-    // baseline CPU) has 64-bit atomics at most.
-    const max_bits = 64;
+    // baseline CPU) has 64-bit atomics at most, aarch64 128-bit ones.
+    const max_bits: u16 = if (ip.target == .aarch64_macos) 128 else 64;
     switch (Type.class(ip, ty)) {
         .float => if (Type.floatBits(ip, ty) > max_bits)
             return sema.fail(block, src, "expected {d}-bit float type or smaller; found {d}-bit float type", .{ max_bits, Type.floatBits(ip, ty) }),
@@ -14718,11 +14718,14 @@ fn analyzeCall(
         try sema.requireRuntime(block, src);
         for (fn_ty.param_types) |pt| try sema.resolveLayout(block, src, pt);
         try sema.resolveLayout(block, src, ret_ty);
-        if (modifier == .always_tail) return sema.failTailCall(block, src);
+        if (modifier == .always_tail) try sema.bcRefuse();
+        if (modifier == .always_tail and ip.target != .aarch64_macos) return sema.failTailCall(block, src);
         if (fn_ty.cc == .auto) sema.has_error_trace = true;
-        const payload = try sema.addExtra(Ir.Call{ .ret_ty = ret_ty, .args_len = @intCast(args.len) });
+        const payload = try sema.addExtra(Ir.Call{ .ret_ty = ret_ty, .args_len = @intCast(args.len), .flags = .{ .always_tail = modifier == .always_tail } });
         try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(args));
-        return sema.endIfNoReturn(block, try sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = callee_ptr, .payload = payload } } }));
+        const call = try sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = callee_ptr, .payload = payload } } });
+        if (modifier == .always_tail) return sema.tailRet(block, src, fn_ty_index, call);
+        return sema.endIfNoReturn(block, call);
     }
     if (comptime_call) {
         const vals = try sema.arena.alloc(Index, args.len);
@@ -14784,16 +14787,38 @@ fn analyzeCall(
             call_ret_ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = ies, .payload_type = eu.payload_type } });
         }
     }
-    if (modifier == .always_tail) return sema.failTailCall(block, src);
+    if (modifier == .always_tail) try sema.bcRefuse();
+    if (modifier == .always_tail and ip.target != .aarch64_macos) return sema.failTailCall(block, src);
     if (callee_fn_ty.cc == .auto) sema.has_error_trace = true;
-    const payload = try sema.addExtra(Ir.Call{ .ret_ty = call_ret_ty, .args_len = @intCast(call_args.len) });
+    const payload = try sema.addExtra(Ir.Call{ .ret_ty = call_ret_ty, .args_len = @intCast(call_args.len), .flags = .{ .always_tail = modifier == .always_tail } });
     try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(call_args));
-    return sema.endIfNoReturn(block, try sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = .fromInterned(callee_func), .payload = payload } } }));
+    const call = try sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = .fromInterned(callee_func), .payload = payload } } });
+    if (modifier == .always_tail) return sema.tailRet(block, src, try sema.typeOfWithIes(.fromInterned(callee_func)), call);
+    return sema.endIfNoReturn(block, call);
 }
 
-/// A runtime `@call(.always_tail, ...)`. Upstream's self-hosted backends
-/// support no tail calls (`target_util.supportsTailCall`); comptime and
-/// inline calls are not tail calls and get here only at runtime.
+/// Ends the function with the result of the tail call `call` to a function
+/// of type `callee_ty`, as upstream's `handleTailCall`: the callee's type
+/// must be the calling function's (with its own inferred error set, so
+/// only a function calling itself matches one), and the result is the
+/// function's own, even from a call inlined into it. The error return
+/// trace is left as the callee left it, as upstream (its TODO). Bodies
+/// lowered for the comptime evaluator refuse tail calls, so the walker
+/// runs them as comptime calls, which upstream's are.
+fn tailRet(sema: *Sema, block: *Block, src: Src, callee_ty: Index, call: Ref) CompileError!Ref {
+    const owner_ty = try sema.typeOfWithIes(.fromInterned(sema.func));
+    if (callee_ty != owner_ty)
+        return sema.fail(block, src, "unable to perform tail call: type of function being called '{f}' does not match type of calling function '{f}'", .{ sema.fmtType(callee_ty), sema.fmtType(owner_ty) });
+    try sema.recordInferredErrors(block, src, call);
+    const result = try sema.coerceCtx(block, sema.fn_ret_ty, call, src, .{ .ret = sema.func });
+    _ = try sema.addUnOp(block, .ret, result);
+    return .unreachable_value;
+}
+
+/// A runtime `@call(.always_tail, ...)` on x86_64. Upstream's self-hosted
+/// backends support no tail calls (`target_util.supportsTailCall`), while
+/// LLVM, aarch64-macos's Debug backend, does; comptime and inline calls are
+/// not tail calls and get here only at runtime.
 fn failTailCall(sema: *Sema, block: *Block, src: Src) CompileError {
     return sema.fail(block, src, "unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags", .{});
 }
