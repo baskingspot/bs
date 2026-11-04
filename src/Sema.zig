@@ -18413,6 +18413,9 @@ fn calleeRetTy(sema: *Sema, callee_block: *Block, src: Src, func: Index) Compile
         try sema.analyzeAsType(callee_block, src, try sema.resolveInlineBody(callee_block, fn_info.ret_ty_body, f.zir_inst))
     else
         try sema.resolveType(callee_block, src, fn_info.ret_ty_ref);
+    // As for a declared return type, at the callee's.
+    if (Type.class(ip, ty) == .@"opaque")
+        return sema.fail(callee_block, .{ .base = callee_block.src_base, .loc = .{ .fn_ret_ty = .zero } }, "opaque return type '{s}{f}' not allowed", .{ if (fn_info.inferred_error_set) "!" else "", sema.fmtType(ty) });
     if (fn_info.inferred_error_set) {
         ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = .adhoc_inferred_error_set_type, .payload_type = ty } });
     }
