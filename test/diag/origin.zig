@@ -40,13 +40,24 @@ pub fn main() !void {
     receiver();
     assign();
     _ = try field();
-    _ = table;
+    _ = useTable();
+    _ = try sliced();
+}
+fn useTable() u8 {
+    return table[1];
 }
 const table = blk: {
     const t: [4]u8 = @splat(0);
     t[1] = 2;
     break :blk t;
 };
+fn bytes() ![]const u8 {
+    return "abc";
+}
+fn sliced() !u8 {
+    const b = bytes();
+    return b[0..1][0];
+}
 
 // error
 // origin.zig:19:20: error[type-mismatch]: expected type 'u32', found '@typeInfo(@typeInfo(@TypeOf(origin.get)).@"fn".return_type.?).error_union.error_set!u32'
@@ -80,9 +91,14 @@ const table = blk: {
 //   fix? origin.zig:35:12-35:12: "(try "
 //   fix? origin.zig:35:20-35:20: ")"
 //   ref: main origin.zig:42:18 (+3 std frames)
-// origin.zig:47:6: error[assign-to-const]: cannot assign to constant
+// origin.zig:51:6: error[assign-to-const]: cannot assign to constant
 //   | t[1] = 2;
-//   note origin.zig:46:11: 't' is declared 'const'; declare it with 'var' to modify it: const t: [4]u8 = @splat(0);
-//   fix? origin.zig:46:5-46:10: "var"
-//   ref: main origin.zig:43:9 (+3 std frames)
-// 6 errors
+//   note origin.zig:50:11: 't' is declared 'const'; declare it with 'var' to modify it: const t: [4]u8 = @splat(0);
+//   fix? origin.zig:50:5-50:10: "var"
+//   ref: useTable origin.zig:47:12 <- main origin.zig:43:17 (+3 std frames)
+// origin.zig:59:13: error[bad-access]: slice of non-array type '@typeInfo(@typeInfo(@TypeOf(origin.bytes)).@"fn".return_type.?).error_union.error_set![]const u8'
+//   | return b[0..1][0];
+//   note origin.zig:58:20: 'b' holds the error union returned by 'bytes'; consider using 'try' or 'catch' here
+//   fix? origin.zig:58:15-58:15: "try "
+//   ref: main origin.zig:44:19 (+3 std frames)
+// 7 errors

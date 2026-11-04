@@ -15468,7 +15468,15 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                 },
             }
         },
-        else => return sema.fail(block, src, "slice of non-array type '{f}'", .{sema.fmtType(child)}),
+        else => {
+            const err = sema.fail(block, src, "slice of non-array type '{f}'", .{sema.fmtType(child)});
+            switch (Type.class(ip, child)) {
+                .error_union => try sema.noteOrigin(block, src, .operand, .error_union),
+                .optional => try sema.noteOrigin(block, src, .operand, .optional),
+                else => {},
+            }
+            return err;
+        },
     }
     try sema.resolveLayout(block, src, elem_ty);
     // Where errors about the start, end and sentinel point, as upstream's

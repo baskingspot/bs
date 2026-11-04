@@ -1190,9 +1190,9 @@ pub const Origin = struct {
 pub const OriginDepth = enum {
     /// The expression itself.
     self,
-    /// The operand of a field access, an indexing expression or a
-    /// dereference (`x` in `x.f`, `x[i]` and `x.*`), an error about which
-    /// points at the whole.
+    /// The operand of a field access, an indexing or slicing expression or
+    /// a dereference (`x` in `x.f`, `x[i]`, `x[a..b]` and `x.*`), an error
+    /// about which points at the whole.
     operand,
     /// The variable whose memory a place expression names: `x` in `x`,
     /// `x.f.g`, `x[i]`, `&x`, and in a method call's callee `x.m`.
@@ -1208,6 +1208,7 @@ pub fn valueOrigin(tree: *const Ast, start: u32, end: u32, depth: OriginDepth) ?
             .field_access => node = tree.nodeData(node).node_and_token[0],
             .array_access => node = tree.nodeData(node).node_and_node[0],
             .deref => node = tree.nodeData(node).node,
+            .slice_open, .slice, .slice_sentinel => node = tree.fullSlice(node).?.ast.sliced,
             else => {},
         },
         .root => while (true) switch (tree.nodeTag(node)) {
