@@ -40,7 +40,7 @@ pub fn main() void {}
 //   | _ = [2]noreturn;
 // uninstantiable.zig:18:22: error[bad-container]: empty exhaustive enums must be backed by 'noreturn'
 //   | _ = @sizeOf(enum(u8) {});
-//   ref: comptime uninstantiable.zig:18:9
+//   ref: comptime uninstantiable.zig:18:17
 // uninstantiable.zig:22:18: error[type-mismatch]: expected type 'uninstantiable.S', found '@TypeOf(undefined)'
 //   | const s: S = undefined;
 //   note uninstantiable.zig:22:18: cannot coerce to uninstantiable type 'uninstantiable.S'

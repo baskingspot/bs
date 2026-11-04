@@ -58,6 +58,11 @@ inst_map: InstMap = .{},
 insts_pool: std.ArrayList(std.ArrayList(Ir.Inst.Index)) = .empty,
 /// Stop a `type_layout` unit after its field types (`Zcu.ensureFieldTypes`).
 field_types_only: bool = false,
+/// Why this unit's next layout request asks (`resolveLayoutFor`).
+dep_reason: DepReason = .none,
+/// Resolving the declared type of `owner`'s declaration: its `nav_ty` in
+/// a dependency loop.
+nav_ty_phase: bool = false,
 /// Emptied `SwitchSeen`s to reuse: a switch evaluated in a comptime loop
 /// would otherwise allocate its sets from the arena every time.
 switch_seen_pool: std.ArrayList(SwitchSeen) = .empty,
@@ -1093,7 +1098,17 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
         try sema.takePhaseDeps();
         break :blk nav.ty;
     } else blk: {
-        if (nav.has_type) nav.ty_status = .resolving;
+        // As upstream, the value asks for its declared type, at the
+        // initializer it coerces (a step of a dependency loop).
+        if (nav.has_type) {
+            nav.ty_status = .resolving;
+            try sema.pushDep(.{ .base = decl.src_node, .loc = .var_init }, .{ .nav_ty = nav_index });
+            sema.nav_ty_phase = true;
+        }
+        defer if (nav.has_type) {
+            sema.nav_ty_phase = false;
+            sema.popDep();
+        };
         const ty = sema.navTypePhase(&block, src, nav, decl) catch |err| {
             if (nav.has_type) nav.ty_status = if (err == error.Speculation) .unresolved else .failed;
             return err;
@@ -1177,6 +1192,7 @@ pub fn analyzeNavTy(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!void
     const decl = sema.code.getDeclaration(nav.zir_inst);
     var block = sema.rootBlock(nav.namespace, decl.src_node, true);
     defer block.deinitInsts();
+    sema.nav_ty_phase = true;
     _ = try sema.navTypePhase(&block, block.nodeSrc(.zero), nav, decl);
     try sema.keepPhaseDeps();
 }
@@ -1498,10 +1514,9 @@ fn structLayout(sema: *Sema, block: *Block, cont_src: Src, info: *InternPool.Con
     info.status = .layout_wip;
     if (layout == .@"packed") {
         // Fields are packed into the backing integer from bit 0.
-        const src = block.nodeSrc(.zero);
         var bits: u64 = 0;
         for (types, 0..) |ft, i| {
-            try sema.resolveLayout(block, src, ft);
+            try sema.resolveLayoutFor(block, cont_src.fieldSrc(@intCast(i), .type), ft, .field);
             if (Type.class(ip, ft) == .@"opaque") return sema.failOpaqueField(block, cont_src.fieldSrc(@intCast(i), .type), ft, .@"struct");
             const fb = sema.packedFieldBits(ft) orelse
                 return sema.failUnpackable(block, cont_src.fieldSrc(@intCast(i), .type), "packed structs cannot contain fields of type '{f}'", ft);
@@ -1545,7 +1560,7 @@ fn structLayout(sema: *Sema, block: *Block, cont_src: Src, info: *InternPool.Con
                 o.* = omitted;
                 continue;
             }
-            try sema.resolveLayout(block, block.nodeSrc(.zero), ft);
+            try sema.resolveLayoutFor(block, cont_src.fieldSrc(@intCast(i), .type), ft, .field);
             fa.* = if (aligns.len != 0 and aligns[i] != 0) aligns[i] else Type.abiAlignment(ip, ft);
             alignment = @max(alignment, fa.*);
             o.* = @intCast(i);
@@ -1809,7 +1824,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                 info.status = .layout_wip;
                 if (n == 0) return sema.fail(&block, src, "packed union has no fields", .{});
                 for (types, 0..) |ft, i| {
-                    try sema.resolveLayout(&block, src, ft);
+                    try sema.resolveLayoutFor(&block, cont_src.fieldSrc(@intCast(i), .type), ft, .field);
                     if (Type.class(ip, ft) == .@"opaque") return sema.failOpaqueField(&block, cont_src.fieldSrc(@intCast(i), .type), ft, .@"union");
                 }
                 const field_bits = try sema.arena.alloc(u16, n);
@@ -1861,7 +1876,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
     var possible_tags: u32 = 0;
     var comptime_state = false;
     for (types, 0..) |ft, i| {
-        try sema.resolveLayout(&block, src, ft);
+        try sema.resolveLayoutFor(&block, cont_src.fieldSrc(@intCast(i), .type), ft, .field);
         if (Type.class(ip, ft) == .@"opaque") return sema.failOpaqueField(&block, cont_src.fieldSrc(@intCast(i), .type), ft, .@"union");
         if (info.layout == .@"extern") try sema.checkExtern(&block, cont_src.fieldSrc(i, .type), ft, .union_field, "extern unions cannot contain fields of type '{f}'", .{FmtType{ .ip = ip, .ty = ft, .decl_note = false }});
         // As upstream, every field counts toward the size and alignment,
@@ -2361,9 +2376,188 @@ fn returnOperandSrc(sema: *Sema, src: Src) Src {
 /// Converts a dependency loop reported by the Zcu into a compile error here.
 fn depLoop(sema: *Sema, block: *Block, src: Src, err: CompileError) CompileError {
     return switch (err) {
-        error.DependencyLoop => sema.fail(block, src, "dependency loop detected", .{}),
+        error.DependencyLoop => sema.failDepLoop(block, src),
         else => err,
     };
+}
+
+/// Why a unit asks for a type's layout, for a dependency loop's error:
+/// upstream's `LayoutResolveReason`, where zap tells them apart.
+pub const DepReason = enum {
+    none,
+    field,
+    field_used,
+    field_queried,
+    size_of,
+    align_of,
+    type_info,
+
+    fn msg(r: DepReason) []const u8 {
+        return switch (r) {
+            .none => "here",
+            .field => "for field declared here",
+            .field_used => "for field usage here",
+            .field_queried => "for field query here",
+            .size_of => "for size query here",
+            .align_of => "for alignment query here",
+            .type_info => "for type information query here",
+        };
+    }
+};
+
+/// A unit of a dependency loop, with upstream's `nav_ty` and `nav_val`
+/// apart: a declaration's type phase is its `nav_ty`. `other` units
+/// (functions, `comptime` blocks) are never part of one.
+pub const DepUnit = union(enum) {
+    nav_val: InternPool.NavIndex,
+    nav_ty: InternPool.NavIndex,
+    type_layout: Index,
+    struct_defaults: Index,
+    other,
+
+    /// The same unit, or with `loose`, the same declaration's type or
+    /// value: zap resolves a declaration's type in its value's unit when
+    /// nothing asked for the type first.
+    fn same(a: DepUnit, b: DepUnit, loose: bool) bool {
+        if (std.meta.eql(a, b)) return a != .other;
+        if (!loose) return false;
+        const an: InternPool.NavIndex = switch (a) {
+            .nav_val, .nav_ty => |n| n,
+            else => return false,
+        };
+        return switch (b) {
+            .nav_val, .nav_ty => |n| n == an,
+            else => false,
+        };
+    }
+};
+
+/// A unit in progress asking for another, at `src` of `file`
+/// (`Zcu.dep_stack`).
+pub const DepFrame = struct { owner: DepUnit, wants: DepUnit, file: u32, src: Src, reason: DepReason };
+
+fn depOwner(sema: *const Sema) DepUnit {
+    return switch (sema.owner) {
+        .nav_val => |n| if (sema.nav_ty_phase) .{ .nav_ty = n } else .{ .nav_val = n },
+        .type_layout => |t| .{ .type_layout = t },
+        .struct_defaults => |t| .{ .struct_defaults = t },
+        else => .other,
+    };
+}
+
+/// Records that this unit asks for `wants` at `src`, until `popDep`.
+fn pushDep(sema: *Sema, src: Src, wants: DepUnit) !void {
+    try sema.zcu.dep_stack.append(sema.gpa, .{ .owner = sema.depOwner(), .wants = wants, .file = sema.file, .src = src, .reason = sema.dep_reason });
+}
+
+fn popDep(sema: *Sema) void {
+    _ = sema.zcu.dep_stack.pop();
+}
+
+/// Resolves the layout of `ty` for `reason` (see `DepReason`).
+fn resolveLayoutFor(sema: *Sema, block: *Block, src: Src, ty: Index, reason: DepReason) CompileError!void {
+    const prev = sema.dep_reason;
+    sema.dep_reason = reason;
+    defer sema.dep_reason = prev;
+    return sema.resolveLayout(block, src, ty);
+}
+
+/// The dependency loop this unit's latest request closed, as upstream
+/// reports it: from the unit the loop came back to, each unit's request
+/// of the next. One unit asking for itself is one error at the request;
+/// a longer loop is an error without a location whose notes are the
+/// requests. Falls back to "dependency loop detected" at `src` when the
+/// requests in progress do not form the loop.
+fn failDepLoop(sema: *Sema, block: *Block, src: Src) CompileError {
+    const zcu = sema.zcu;
+    const stack = zcu.dep_stack.items;
+    const frames: []const DepFrame = frames: {
+        if (stack.len == 0) break :frames &.{};
+        const wants = stack[stack.len - 1].wants;
+        for ([_]bool{ false, true }) |loose| {
+            var i = stack.len;
+            while (i > 0) {
+                i -= 1;
+                if (stack[i].owner.same(wants, loose)) break :frames stack[i..];
+            }
+        }
+        break :frames &.{};
+    };
+    const chained = frames.len != 0 and for (frames, 0..) |f, i| {
+        const next = frames[if (i + 1 < frames.len) i + 1 else 0].owner;
+        if (f.owner == .other or !f.wants.same(next, true)) break false;
+    } else true;
+    if (!chained) return sema.fail(block, src, "dependency loop detected", .{});
+
+    const arena = zcu.arena.allocator();
+    const msgs = try arena.alloc([]const u8, frames.len);
+    for (frames, msgs) |f, *m| {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        sema.writeDepEdge(&aw.writer, f, frames.len == 1) catch return error.OutOfMemory;
+        m.* = aw.written();
+    }
+    const first = frames[0];
+    const first_span = first.src.span(try zcu.fe.tree(@fromBackingInt(first.file)));
+    // As upstream, the reference trace is the first unit's.
+    const unit: Zcu.AnalUnit = switch (first.owner) {
+        .nav_val, .nav_ty => |n| .{ .nav_val = n },
+        .type_layout => |t| .{ .type_layout = t },
+        .struct_defaults => |t| .{ .struct_defaults = t },
+        .other => unreachable,
+    };
+    if (frames.len == 1) {
+        try zcu.errors.append(zcu.gpa, .{ .file = first.file, .span = first_span, .msg = msgs[0], .code = .@"dependency-loop", .unit = unit });
+        return error.AnalysisFail;
+    }
+    try zcu.errors.append(zcu.gpa, .{
+        .file = first.file,
+        .span = first_span,
+        .msg = try std.fmt.allocPrint(arena, "dependency loop with length {d}", .{frames.len}),
+        .code = .@"dependency-loop",
+        .unit = unit,
+        .no_loc = true,
+    });
+    for (frames, msgs) |f, m| try zcu.appendNote(.{ .file = f.file, .span = f.src.span(try zcu.fe.tree(@fromBackingInt(f.file))), .msg = m });
+    try zcu.appendNote(.{ .file = first.file, .span = first_span, .msg = "eliminate any one of these dependencies to break the loop", .no_loc = true });
+    return error.AnalysisFail;
+}
+
+/// Upstream's wording of request `f` in a dependency loop.
+fn writeDepEdge(sema: *Sema, w: *std.Io.Writer, f: DepFrame, alone: bool) std.Io.Writer.Error!void {
+    try sema.writeDepUnit(w, f.owner);
+    if (alone) return switch (f.wants) {
+        .type_layout => w.print(" depends on itself {s}", .{f.reason.msg()}),
+        .struct_defaults => w.writeAll(" depends on itself for initialization here"),
+        else => w.writeAll(" depends on itself here"),
+    };
+    switch (f.wants) {
+        .nav_val => |n| {
+            try w.writeAll(" uses value of declaration '");
+            try print.writeNavName(sema.ip, n, w, .read);
+            try w.writeAll("' here");
+        },
+        .nav_ty => |n| {
+            try w.writeAll(" uses type of declaration '");
+            try print.writeNavName(sema.ip, n, w, .read);
+            try w.writeAll("' here");
+        },
+        .type_layout => |t| try w.print(" depends on type '{f}' {s}", .{ FmtType{ .ip = sema.ip, .ty = t, .decl_note = false }, f.reason.msg() }),
+        .struct_defaults => |t| try w.print(" uses default field values of '{f}' here", .{FmtType{ .ip = sema.ip, .ty = t, .decl_note = false }}),
+        .other => unreachable,
+    }
+}
+
+fn writeDepUnit(sema: *Sema, w: *std.Io.Writer, u: DepUnit) std.Io.Writer.Error!void {
+    switch (u) {
+        .nav_val, .nav_ty => |n| {
+            try w.writeAll(if (u == .nav_val) "value of declaration '" else "type of declaration '");
+            try print.writeNavName(sema.ip, n, w, .read);
+            try w.writeAll("'");
+        },
+        .type_layout => |t| try w.print("type '{f}'", .{FmtType{ .ip = sema.ip, .ty = t, .decl_note = false }}),
+        .struct_defaults => |t| try w.print("default field value of '{f}'", .{FmtType{ .ip = sema.ip, .ty = t, .decl_note = false }}),
+        .other => unreachable,
+    }
 }
 
 /// While lowering for the comptime evaluator, fails the lowering unless
@@ -2713,6 +2907,9 @@ fn ensureNavVal(sema: *Sema, block: *Block, src: Src, nav: InternPool.NavIndex) 
     };
     try sema.bcRequire(status == .resolved);
     if (status == .unresolved) try sema.noteReference(.{ .nav_val = nav }, src);
+    if (status == .resolved) return;
+    try sema.pushDep(src, .{ .nav_val = nav });
+    defer sema.popDep();
     sema.zcu.ensureNavVal(nav) catch |err| return sema.depLoop(block, src, err);
 }
 
@@ -2756,8 +2953,10 @@ fn resolveFieldTypesDeep(sema: *Sema, block: *Block, src: Src, ty: Index, seen: 
             // *const fn (@This()) void;` read by the struct's own field)
             // is no error. The type is then taken without its fields, as
             // `comptimeOnlySema` takes one whose fields are being resolved.
+            try sema.pushDep(src, .{ .type_layout = ty });
             sema.zcu.speculating += 1;
             const res = sema.zcu.ensureFieldTypes(ty);
+            sema.popDep();
             sema.zcu.speculating -= 1;
             res catch |err| switch (err) {
                 error.Speculation => return,
@@ -2777,6 +2976,9 @@ fn ensureNavTy(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIn
     const nav = sema.ip.getNav(nav_index);
     try sema.bcRequire(nav.ty_status == .resolved or nav.status == .resolved);
     if (nav.status == .unresolved) try sema.noteReference(.{ .nav_val = nav_index }, src);
+    if (nav.ty_status == .resolved or nav.status == .resolved) return;
+    try sema.pushDep(src, .{ .nav_ty = nav_index });
+    defer sema.popDep();
     sema.zcu.ensureNavTy(nav_index) catch |err| return sema.depLoop(block, src, err);
 }
 
@@ -2789,6 +2991,9 @@ fn resolveLayout(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!v
             const status = ip.structInfo(ty).status;
             try sema.bcRequire(status == .have_layout);
             if (status == .none) try sema.noteReference(.{ .type_layout = ty }, src);
+            if (status == .have_layout) return sema.zcu.ensureStructLayout(ty);
+            try sema.pushDep(src, .{ .type_layout = ty });
+            defer sema.popDep();
             sema.zcu.ensureStructLayout(ty) catch |err| return sema.depLoop(block, src, err);
         },
         .array_type => try sema.resolveLayout(block, src, ip.keyPayload(.array_type, ty).child),
@@ -2850,6 +3055,9 @@ fn resolveStructDefaults(sema: *Sema, block: *Block, src: Src, ty: Index) Compil
     try sema.resolveLayout(block, src, ty);
     try sema.declareDependency(.{ .struct_defaults = ty });
     try sema.bcRequire(sema.ip.structInfo(ty).defaults_status == .resolved);
+    if (sema.ip.structInfo(ty).defaults_status == .resolved) return;
+    try sema.pushDep(src, .{ .struct_defaults = ty });
+    defer sema.popDep();
     sema.zcu.ensureStructDefaults(ty) catch |err| return sema.depLoop(block, src, err);
 }
 
@@ -4934,7 +5142,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .size_of, .bit_size_of => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
             const ty = try sema.resolveType(block, src, data.un_node.operand);
-            try sema.resolveLayout(block, src, ty);
+            try sema.resolveLayoutFor(block, sema.callArgSrc(src, false, 0), ty, .size_of);
             if (tag == .size_of and Type.hasNoPossibleValue(sema.ip, ty))
                 return sema.fail(block, sema.callArgSrc(src, false, 0), "no size available for uninstantiable type '{f}'", .{sema.fmtType(ty)});
             if (tag == .size_of and try sema.isComptimeOnlyResolved(block, src, ty))
@@ -4946,7 +5154,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .align_of => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
             const ty = try sema.resolveType(block, src, data.un_node.operand);
-            try sema.resolveLayout(block, src, ty);
+            try sema.resolveLayoutFor(block, sema.callArgSrc(src, false, 0), ty, .align_of);
             if (Type.hasNoPossibleValue(sema.ip, ty))
                 return sema.fail(block, sema.callArgSrc(src, false, 0), "no align available for uninstantiable type '{f}'", .{sema.fmtType(ty)});
             break :blk .fromInterned(try sema.intValue(.comptime_int_type, Type.abiAlignment(sema.ip, ty)));
@@ -4958,13 +5166,17 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const ty = try sema.resolveType(block, src, extra.lhs);
             const name = try sema.resolveConstString(block, src, sema.resolveInst(extra.rhs));
             const ip = sema.ip;
+            const prev_reason = sema.dep_reason;
+            sema.dep_reason = .field_queried;
+            defer sema.dep_reason = prev_reason;
+            const ty_src = sema.callArgSrc(src, false, 0);
             break :blk .fromInterned(boolValue(switch (ip.indexToKey(ty)) {
                 .struct_type => has: {
-                    try sema.resolveStructFields(block, src, ty);
+                    try sema.resolveStructFields(block, ty_src, ty);
                     break :has ip.structInfo(ty).fieldIndex(ip, name) != null;
                 },
                 .union_type, .enum_type => has: {
-                    try sema.resolveLayout(block, src, ty);
+                    try sema.resolveLayout(block, ty_src, ty);
                     break :has ip.structInfo(ty).fieldIndex(ip, name) != null;
                 },
                 .tuple_type => |t| has: {
@@ -5566,7 +5778,13 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
     if (sema.zcu.comptime_memo.get(key)) |memo| return .fromInterned(try sema.memoHit(memo));
     const scope = sema.memoEnter();
     defer sema.memoLeave(scope);
-    const result = try sema.typeInfo(block, src, ty);
+    const prev_reason = sema.dep_reason;
+    sema.dep_reason = .type_info;
+    const result = sema.typeInfo(block, src, ty) catch |err| {
+        sema.dep_reason = prev_reason;
+        return err;
+    };
+    sema.dep_reason = prev_reason;
     const names = try sema.memoNames(scope.start);
     try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.start), .effects = try sema.memoEffects(scope.start), .funcs = try sema.memoFuncs(scope.start), .names = names[0], .name_reads = names[1] });
     return .fromInterned(result);
@@ -13418,13 +13636,14 @@ fn namespaceLookupVal(sema: *Sema, block: *Block, src: Src, container: Index, na
         const tag_ty: Index = switch (ip.keyTag(container)) {
             .enum_type => container,
             .union_type => blk: {
-                try sema.resolveLayout(block, src, container);
+                try sema.resolveLayoutFor(block, src, container, .field_used);
                 const t = ip.structInfo(container).tag_type;
                 break :blk if (t != .none and ip.keyTag(t) == .enum_type) t else .none;
             },
             else => .none,
         };
         if (tag_ty != .none) {
+            try sema.resolveLayoutFor(block, src, tag_ty, .field_used);
             if (try sema.enumFieldIndex(block, src, tag_ty, name)) |i| return .fromInterned(try sema.enumTagValue(tag_ty, i));
         }
         const miss_src = switch (Type.class(ip, container)) {

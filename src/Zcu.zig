@@ -71,6 +71,9 @@ defaults_queue: std.ArrayList(InternPool.Index) = .empty,
 /// (`Sema.resolveFieldTypesDeep`): a dependency loop then ends that
 /// instead of being reported (`error.Speculation`).
 speculating: u32 = 0,
+/// What each unit in progress asked for, innermost last: the edges a
+/// dependency loop's error reports (`Sema.failDepLoop`).
+dep_stack: std.ArrayList(Sema.DepFrame) = .empty,
 /// The dependencies a unit's first phase recorded when it ran on its own
 /// (`ensureNavTy`, `ensureFieldTypes`), which the rest of the unit
 /// declares first instead of analyzing the phase again.
@@ -431,11 +434,14 @@ pub const ErrorMsg = struct {
     hint: ?[]const u8 = null,
     /// A fix in `file` (in `arena`).
     fix: ?diag.RawFix = null,
+    /// Rendered without a location (a dependency loop's); `file` and
+    /// `span` only sort it.
+    no_loc: bool = false,
 
     /// `count` repeats of the same note in a row (a recursive call's
     /// frames) render once, as upstream. `call` marks a call-site frame of
     /// the comptime or inline call chain.
-    pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8, count: u32 = 1, call: ?diag.CallKind = null, decl: bool = false, embed: bool = false };
+    pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8, count: u32 = 1, call: ?diag.CallKind = null, decl: bool = false, embed: bool = false, no_loc: bool = false };
 };
 
 pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
@@ -497,6 +503,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.rt_helpers.deinit(gpa);
     zcu.test_functions.deinit(gpa);
     zcu.errors.deinit(gpa);
+    zcu.dep_stack.deinit(gpa);
     zcu.compile_logs.deinit(gpa);
     zcu.file_root_types.deinit(gpa);
     zcu.ip.deinit();
@@ -606,7 +613,7 @@ pub fn addCallFrame(zcu: *Zcu, file_index: u32, span: Ast.Span, kind: diag.CallK
     }, .call = kind });
 }
 
-fn appendNote(zcu: *Zcu, note: ErrorMsg.Note) !void {
+pub fn appendNote(zcu: *Zcu, note: ErrorMsg.Note) !void {
     const arena = zcu.arena.allocator();
     const e = &zcu.errors.items[zcu.errors.items.len - 1];
     if (e.notes.len != 0) {
@@ -660,12 +667,12 @@ pub fn diagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths) ![]diag
     }.lessThan);
     for (errors) |e| {
         const notes = try arena.alloc(diag.Note, e.notes.len);
-        for (notes, e.notes) |*n, en| n.* = .{ .loc = try zcu.diagLocIn(arena, paths, en.file, en.embed, en.span), .msg = en.msg, .count = en.count, .call = en.call, .decl = en.decl };
+        for (notes, e.notes) |*n, en| n.* = .{ .loc = if (en.no_loc) null else try zcu.diagLocIn(arena, paths, en.file, en.embed, en.span), .msg = en.msg, .count = en.count, .call = en.call, .decl = en.decl };
         const fixes: []const diag.Fix = if (e.fix) |f|
             try arena.dupe(diag.Fix, &.{try paths.fix(arena, zcu.file(e.file).display_path, try zcu.fe.source(@fromBackingInt(e.file)), f)})
         else
             &.{};
-        try out.append(arena, .{ .code = e.code, .loc = try zcu.diagLocIn(arena, paths, e.file, e.embed, e.span), .msg = e.msg, .notes = notes, .refs = try zcu.referenceTrace(arena, paths, e.unit), .candidates = e.candidates, .hint = e.hint, .fixes = fixes });
+        try out.append(arena, .{ .code = e.code, .loc = if (e.no_loc) null else try zcu.diagLocIn(arena, paths, e.file, e.embed, e.span), .msg = e.msg, .notes = notes, .refs = try zcu.referenceTrace(arena, paths, e.unit), .candidates = e.candidates, .hint = e.hint, .fixes = fixes });
     }
     if (zcu.compile_logs.items.len != 0) try zcu.compileLogDiagnostics(arena, paths, &out);
     return out.items;
