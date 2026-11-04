@@ -221,6 +221,13 @@ pub const Reloc = extern struct {
         /// S@tlsgd]`, which must be followed by the padded `call
         /// __tls_get_addr`. A = -4.
         x86_64_tlsgd,
+        /// 32-bit absolute addresses, in non-PIE code from C objects
+        /// (docs/architecture.md, "Object, archive and shared-library
+        /// inputs"), which only non-PIE executables take: S + A,
+        /// zero-extended and checked to fit u32 (ELF R_X86_64_32), and
+        /// sign-extended and checked to fit i32 (R_X86_64_32S).
+        x86_64_abs32,
+        x86_64_abs32s,
     };
 };
 

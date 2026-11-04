@@ -25,6 +25,7 @@ const Elf = @import("link/Elf.zig");
 const ElfObject = @import("link/ElfObject.zig");
 const ElfDynamic = @import("link/ElfDynamic.zig");
 const Glibc = @import("link/Glibc.zig");
+const ElfInput = @import("link/ElfInput.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
 const Ssa = @import("codegen/Ssa.zig");
 
@@ -82,6 +83,9 @@ fuzz: bool = false,
 /// An executable that links glibc (`-lc`): names neither the compilation
 /// nor compiler_rt exports resolve to glibc's symbols, imported.
 glibc: ?*const Glibc = null,
+/// An executable's object and archive inputs, which `sync` pulls archive
+/// members for and `finish` converts into atoms.
+inputs: ?*ElfInput = null,
 /// In an object, the symbols other objects define, by name.
 imports: std.StringArrayHashMapUnmanaged(ImportFlags) = .empty,
 /// In an object, its exports, once `finish` found them.
@@ -130,6 +134,8 @@ pool: ?*Pool = null,
 /// Whether analysis still runs: the main Emit collects compiler_rt
 /// requests in `rt_pending` until then.
 analyzing: bool = false,
+/// How many of `inputs`' objects `pullInputs` requested compiler_rt for.
+inputs_requested: usize = 0,
 /// Compiler_rt functions requested while analysis runs, which `sync`
 /// hands to the Zcu once its function queue is empty, in request order.
 /// So the point where Sema learns of them does not depend on when CodeGen
@@ -518,8 +524,49 @@ fn publish(pool: *Pool, gpa: Allocator) !void {
 /// functions requested so far to the Zcu.
 pub fn sync(emit: *Emit, zcu: *Zcu) !void {
     try emit.mergeJobs();
+    if (emit.inputs) |in| try emit.pullInputs(in);
     for (emit.rt_pending.keys()) |key| _ = try zcu.requestCompilerRtKey(key);
     emit.rt_pending.clearRetainingCapacity();
+}
+
+/// Pulls the archive members the inputs and the Zig code's externs need so
+/// far, and requests the compiler_rt functions that the new objects call
+/// and nothing else defines, so that analysis generates them.
+fn pullInputs(emit: *Emit, in: *ElfInput) !void {
+    const ctx: InputResolver = .{ .emit = emit };
+    const first = try in.pull(emit.externs.keys(), ctx);
+    if (first == emit.inputs_requested) return;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(emit.gpa);
+    try in.undefinedSince(emit.inputs_requested, &names, emit.gpa);
+    emit.inputs_requested = in.objects.items.len;
+    for (names.items) |name| _ = try emit.rtExport(name);
+}
+
+/// How names the objects reference but do not define resolve on the Zig
+/// side (`ElfInput.convert`).
+const InputResolver = struct {
+    emit: *Emit,
+
+    pub fn zigExport(r: InputResolver, name: []const u8) !?SymbolKey {
+        return r.emit.userExport(name);
+    }
+
+    pub fn rtExport(r: InputResolver, name: []const u8) !?SymbolKey {
+        if (Zcu.compilerRtExport(name) == null) return null;
+        return r.emit.rtExport(name);
+    }
+};
+
+/// Converts the inputs into atoms, after the externs' slots took their
+/// definitions. Returns false after reporting what it could not link.
+fn convertInputs(emit: *Emit, in: *ElfInput) !bool {
+    const converted = try in.convert(InputResolver{ .emit = emit });
+    for (in.errors.items) |msg| try emit.zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{msg});
+    if (in.errors.items.len != 0) return false;
+    for (converted.atoms) |atom| try emit.addAtom(atom);
+    try emit.error_values.appendSlice(emit.gpa, converted.values);
+    return true;
 }
 
 /// Generates a function into this Emit.
@@ -727,6 +774,7 @@ pub fn finish(emit: *Emit) !bool {
     }
     // Before the declarations: a slot can request an exported one.
     if (!try emit.lowerExternSlots()) return false;
+    if (emit.inputs) |in| if (!try emit.convertInputs(in)) return false;
     if (emit.obj) try emit.findExports();
     try emit.lowerNavs();
     if (emit.uses_error_names) try emit.emitErrorNameTable();
@@ -876,7 +924,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     else
         Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, options);
     result catch |err| {
-        std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
+        std.debug.print("error: link failed: {t} (atom '{s}' target {x})\n", .{ err, diag.atom, if (diag.target) |t| @backingInt(t) else 0 });
         return false;
     };
     return true;
@@ -1064,7 +1112,13 @@ fn lowerExternSlots(emit: *Emit) !bool {
         }
     }{ .names = emit.externs.keys() });
     for (emit.externs.keys(), emit.externs.values()) |name, weak| {
-        const target = if (emit.shared)
+        // An object's definition comes after the compilation's exports
+        // and before compiler_rt, at an offset in its section's atom.
+        var addend: i32 = 0;
+        const target = if (emit.inputs) |in| if (try emit.userExport(name)) |key| key else if (try in.lookup(name)) |t| obj: {
+            addend = std.math.cast(i32, t.offset) orelse return error.Overflow;
+            break :obj t.key;
+        } else sectionBound(name) orelse try emit.exportTarget(name) else if (emit.shared)
             try emit.userExport(name) orelse try emit.rtExport(name) orelse
                 if (std.mem.eql(u8, name, "_DYNAMIC")) ElfDynamic.dynamic_key else try emit.useImport(name, .{ .weak = weak })
         else if (emit.obj)
@@ -1079,7 +1133,7 @@ fn lowerExternSlots(emit: *Emit) !bool {
         const bytes = try arena.alloc(u8, 8);
         @memset(bytes, 0);
         const targets: []const SymbolKey = if (target) |t| try arena.dupe(SymbolKey, &.{t}) else &.{};
-        const relocs: []const Atom.Reloc = if (target != null) try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, 0)}) else &.{};
+        const relocs: []const Atom.Reloc = if (target != null) try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, addend)}) else &.{};
         try emit.addAtom(.{
             .key = externSlotKey(name),
             .name = try std.fmt.allocPrint(arena, "extern.{s}", .{name}),

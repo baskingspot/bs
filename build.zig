@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
     const upstream_step = b.step("test-upstream", "Run the run tests with upstream zig, the oracle");
     addRunTests(b, exe, test_step, upstream_step);
     addObjAndRunTests(b, exe, test_step);
+    addLinkInputTests(b, exe, test_step);
     addDiagTests(b, exe, test_step, upstream_step);
     addBuildTest(b, exe, build_web_wasm);
 
@@ -741,6 +742,61 @@ fn buildWebWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
 /// Upstream zig, the oracle the tests compare zap with: the zig running
 /// this build, or under `zap build` (no zig release next to the
 /// compiler) `zig` on PATH.
+/// C objects and archives that zap links into an executable
+/// (docs/architecture.md, "Object, archive and shared-library inputs"):
+/// upstream's `zig cc` and the system's `cc` compile them, non-PIC and
+/// -fPIC, and the program must print what upstream's link of the same
+/// inputs prints.
+fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const host = b.graph.host.result;
+    if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return;
+    const expect = "44 108 12 gamma hello from C 0 4 9 copied\nthread 712\n712 4 23\n";
+    const zig = upstreamZig(b);
+    const cc = b.findProgram(.{ .names = &.{"cc"} });
+    // Without ubsan and the stack protector, whose runtimes zap does not
+    // link yet.
+    const variants = [_]struct { name: []const u8, cc: []const []const u8 }{
+        .{ .name = "zig cc", .cc = &.{ zig, "cc", "-fno-sanitize=undefined", "-fno-stack-protector" } },
+        .{ .name = "zig cc -fPIC", .cc = &.{ zig, "cc", "-fno-sanitize=undefined", "-fno-stack-protector", "-fPIC" } },
+        .{ .name = "cc", .cc = &.{ cc orelse "", "-fno-stack-protector" } },
+    };
+    for (variants) |v| {
+        if (v.cc[0].len == 0) continue;
+        const compile = struct {
+            fn f(bb: *std.Build, args: []const []const u8, src: []const u8, extra: []const []const u8) std.Build.LazyPath {
+                const c = bb.addSystemCommand(args);
+                c.addArgs(extra);
+                c.addArg("-c");
+                c.addFileArg(bb.path(bb.fmt("test/link_input/{s}", .{src})));
+                return c.addPrefixedOutputFileArg("-o", bb.fmt("{s}.o", .{src}));
+            }
+        }.f;
+        const lib = compile(b, v.cc, "lib.c", &.{"-fcommon"});
+        // Thread-locals through the dynamic models, which the link relaxes.
+        const tls = compile(b, v.cc, "tls.c", &.{"-fPIC"});
+        const tlsie = compile(b, v.cc, "tlsie.c", &.{"-fPIC"});
+        // Two archives whose members call each other.
+        var archives: [2]std.Build.LazyPath = undefined;
+        for (&archives, [_][]const u8{ "a1.c", "a2.c" }) |*a, src| {
+            const ar = b.addSystemCommand(&.{ zig, "ar", "rcs" });
+            a.* = ar.addOutputFileArg(b.fmt("lib{s}.a", .{src[0..2]}));
+            ar.addFileArg(compile(b, v.cc, src, &.{}));
+        }
+        const exe = b.addRunArtifact(zap);
+        exe.setName(b.fmt("zap build-exe with {s} objects", .{v.name}));
+        exe.addArg("build-exe");
+        exe.addFileArg(b.path("test/link_input/main.zig"));
+        for ([_]std.Build.LazyPath{ lib, tls, tlsie, archives[0], archives[1] }) |input| exe.addFileArg(input);
+        exe.setEnvironmentVariable("ZAP_CACHE", "off");
+        const bin = exe.addPrefixedOutputFileArg("-femit-bin=", "main");
+        const run = std.Build.Step.Run.create(b, b.fmt("run zap link of {s} objects", .{v.name}));
+        run.addFileArg(bin);
+        run.addCheck(.{ .expect_stderr_exact = expect });
+        run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&run.step);
+    }
+}
+
 fn upstreamZig(b: *std.Build) []const u8 {
     const io = b.graph.io;
     const zig_exe = b.graph.zig_exe;

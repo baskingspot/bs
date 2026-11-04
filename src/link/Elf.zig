@@ -1455,6 +1455,11 @@ fn LinkOf(comptime Input: type) type {
                 if (dynamic) {
                     for (a.relocs) |r| c.n_rela += @intFromBool(l.needsDynamicReloc(a, r));
                 }
+                // Non-PIE code (`x86_64_abs32`/`abs32s`) needs a fixed address.
+                if (pic) for (a.relocs) |r| if (r.info.kind == .x86_64_abs32 or r.info.kind == .x86_64_abs32s) {
+                    l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name, .target = a.targets[r.info.target] });
+                    break;
+                };
             }
         }
 
@@ -1933,6 +1938,14 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
             .x86_64_abs64 => {
                 const f = try relocField(a, dst, r.offset, 8, diag);
                 std.mem.writeInt(u64, f, s +% @as(u64, @bitCast(@as(i64, r.addend))), .little);
+            },
+            .x86_64_abs32 => {
+                const f = try relocField(a, dst, r.offset, 4, diag);
+                std.mem.writeInt(u32, f, std.math.cast(u32, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
+            },
+            .x86_64_abs32s => {
+                const f = try relocField(a, dst, r.offset, 4, diag);
+                std.mem.writeInt(i32, f, std.math.cast(i32, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
             },
             .x86_64_tpoff32 => try tpoff32(a, r, dst, s, tls, diag),
             .x86_64_tlsld, .x86_64_dtpoff32 => try tlsDynamic(a, r, dst, p_base, s, tls, diag),

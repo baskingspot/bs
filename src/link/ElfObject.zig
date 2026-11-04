@@ -246,7 +246,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbo
                 .x86_64_dtpoff32 => .DTPOFF32,
                 .x86_64_gottpoff => .GOTTPOFF,
                 .x86_64_tlsgd => .TLSGD,
-                .value32 => .@"32",
+                .value32, .x86_64_abs32 => .@"32",
+                .x86_64_abs32s => .@"32S",
                 .value16 => .@"16",
                 .value8 => .@"8",
                 else => unreachable, // the image's link rejected it

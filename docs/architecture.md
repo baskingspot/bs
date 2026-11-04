@@ -2529,6 +2529,29 @@ inputs must stay dominated by copying bytes. Measure linking SQLite's
 amalgamation (one 9 MB object) and zlib's 15 objects, with a small Zig
 main, against upstream's link of the same objects.
 
+**Built so far (stage A, 2026-11-04).** `src/link/ElfInput.zig` and
+`Archive.Reader`; `build-exe`, `run` and `test` take `.o` and `.a`
+arguments (objects and libraries do not yet). Sections, merged strings
+and constants, COMMON, weak undefined names (a link-time value 0),
+absolute symbols, R_X86_64_64/PC32/PLT32/32/32S (`x86_64_abs32` and
+`x86_64_abs32s`, which pic links reject), GOTPCREL with ld's mov, call
+and jmp relaxations and a content-addressed slot otherwise, the TLS
+relaxations, COMDAT dropping, and lld-style archive pulling. Where it
+differs from the design above:
+- compiler_rt functions that only the objects call must be generated, so
+  `Emit.sync` pulls archive members for the objects' and the Zig
+  externs' names as analysis goes, and requests compiler_rt for what
+  stays undefined. Object contents therefore do influence analysis, and
+  builds with inputs skip the cache until the manifest records which
+  compiler_rt functions the objects asked for (the cache thread's part).
+- A C GOT slot is content-addressed by its target, not shared with the
+  Zig extern slot of the same name.
+- Not yet: init and fini arrays (an error names the section),
+  ubsan_rt and compiler_rt's stack protector for `zig cc`'s Debug
+  objects (until then the tests compile with `-fno-sanitize=undefined
+  -fno-stack-protector`), the symbol side list for .symtab, `-l`/`-L`,
+  and a COMDAT test.
+
 **Stages and checks.**
 1. A: objects and archives into zap's static and `-lc` executables (the
    latter once the C thread's step 1 lands): sections, symbols,

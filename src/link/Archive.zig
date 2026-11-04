@@ -4,6 +4,9 @@
 //! weak symbols (empty when it has none), then the member, named after the
 //! root source file (`protobuf.o` for `-Mroot=src/protobuf.zig`), with a
 //! `//` name table when the name does not fit the header.
+//!
+//! `Reader` reads archives given as link inputs: GNU and BSD-style
+//! `ar` files with a `/` or `/SYM64/` symbol index and `//` long names.
 
 const std = @import("std");
 const Io = std.Io;
@@ -82,4 +85,124 @@ fn definedSymbols(gpa: Allocator, obj: []const u8, names: *std.ArrayList(u8), co
 fn readAt(comptime T: type, bytes: []const u8, offset: u64) !T {
     if (offset + @sizeOf(T) > bytes.len) return error.InvalidObject;
     return std.mem.bytesToValue(T, bytes[@intCast(offset)..][0..@sizeOf(T)]);
+}
+
+/// An archive given as a link input, read in place: its symbol index, and
+/// members on demand (see "Object, archive and shared-library inputs" in
+/// docs/architecture.md).
+pub const Reader = struct {
+    bytes: []const u8,
+    /// Each indexed symbol's name and its member's header offset.
+    symbols: []const Symbol,
+    /// The `//` table, or empty.
+    long_names: []const u8,
+
+    pub const Symbol = struct { name: []const u8, member: u64 };
+
+    pub const Member = struct {
+        /// The name without the trailing `/`.
+        name: []const u8,
+        bytes: []const u8,
+    };
+
+    pub const Error = error{ InvalidArchive, ThinArchive, OutOfMemory };
+
+    pub fn init(arena: Allocator, bytes: []const u8) Error!Reader {
+        if (std.mem.startsWith(u8, bytes, "!<thin>\n")) return error.ThinArchive;
+        if (!std.mem.startsWith(u8, bytes, "!<arch>\n")) return error.InvalidArchive;
+        var r: Reader = .{ .bytes = bytes, .symbols = &.{}, .long_names = "" };
+        var symbols: std.ArrayList(Symbol) = .empty;
+        var off: u64 = 8;
+        // The index and the name table come first.
+        while (off < bytes.len) {
+            const h = try r.headerAt(off);
+            if (std.mem.eql(u8, h.raw_name, "/") or std.mem.eql(u8, h.raw_name, "/SYM64/")) {
+                const wide = h.raw_name.len > 1;
+                const w: usize = if (wide) 8 else 4;
+                const data = h.data;
+                if (data.len < w) return error.InvalidArchive;
+                const n = if (wide) std.mem.readInt(u64, data[0..8], .big) else std.mem.readInt(u32, data[0..4], .big);
+                if (n > (data.len - w) / w) return error.InvalidArchive;
+                var names_at: usize = w + @as(usize, @intCast(n)) * w;
+                try symbols.ensureUnusedCapacity(arena, @intCast(n));
+                for (0..@intCast(n)) |i| {
+                    const at = if (wide) std.mem.readInt(u64, data[w + 8 * i ..][0..8], .big) else std.mem.readInt(u32, data[w + 4 * i ..][0..4], .big);
+                    const end = std.mem.indexOfScalarPos(u8, data, names_at, 0) orelse return error.InvalidArchive;
+                    symbols.appendAssumeCapacity(.{ .name = data[names_at..end], .member = at });
+                    names_at = end + 1;
+                }
+            } else if (std.mem.eql(u8, h.raw_name, "//")) {
+                r.long_names = h.data;
+            } else break;
+            off = h.next;
+        }
+        r.symbols = symbols.items;
+        return r;
+    }
+
+    /// The member whose header is at `offset`.
+    pub fn member(r: *const Reader, offset: u64) Error!Member {
+        const h = try r.headerAt(offset);
+        var name = h.raw_name;
+        if (name.len > 1 and name[0] == '/' and std.ascii.isDigit(name[1])) {
+            const at = std.fmt.parseInt(usize, name[1..], 10) catch return error.InvalidArchive;
+            if (at >= r.long_names.len) return error.InvalidArchive;
+            const end = std.mem.indexOfScalarPos(u8, r.long_names, at, '\n') orelse r.long_names.len;
+            name = r.long_names[at..end];
+        }
+        if (name.len > 0 and name[name.len - 1] == '/') name = name[0 .. name.len - 1];
+        return .{ .name = name, .bytes = h.data };
+    }
+
+    const Header = struct { raw_name: []const u8, data: []const u8, next: u64 };
+
+    fn headerAt(r: *const Reader, offset: u64) Error!Header {
+        if (offset > r.bytes.len or r.bytes.len - offset < 60) return error.InvalidArchive;
+        const h = r.bytes[@intCast(offset)..][0..60];
+        if (!std.mem.eql(u8, h[58..60], "`\n")) return error.InvalidArchive;
+        const size = std.fmt.parseInt(u64, std.mem.trimEnd(u8, h[48..58], " "), 10) catch return error.InvalidArchive;
+        const start = offset + 60;
+        if (size > r.bytes.len - start) return error.InvalidArchive;
+        return .{
+            .raw_name = std.mem.trimEnd(u8, h[0..16], " "),
+            .data = r.bytes[@intCast(start)..][0..@intCast(size)],
+            .next = start + size + (size & 1),
+        };
+    }
+};
+
+test Reader {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A GNU archive with a 32-bit index, a long name and an odd-sized
+    // member, as `ar rcs` writes it.
+    var b: std.ArrayList(u8) = .empty;
+    try b.appendSlice(arena, "!<arch>\n");
+    const index = "\x00\x00\x00\x02" ++ "\x00\x00\x00\x00" ++ "\x00\x00\x00\x00" ++ "foo\x00bar\x00";
+    try header(arena, &b, "/", index.len);
+    try b.appendSlice(arena, index);
+    const names = "a_rather_long_member.o/\n";
+    try header(arena, &b, "//", names.len);
+    try b.appendSlice(arena, names);
+    const m0: u32 = @intCast(b.items.len);
+    try header(arena, &b, "/0", 3);
+    try b.appendSlice(arena, "abc\n");
+    const m1: u32 = @intCast(b.items.len);
+    try header(arena, &b, "s.o/", 2);
+    try b.appendSlice(arena, "xy");
+    std.mem.writeInt(u32, b.items[8 + 60 + 4 ..][0..4], m0, .big);
+    std.mem.writeInt(u32, b.items[8 + 60 + 8 ..][0..4], m1, .big);
+
+    const r: Reader = try .init(arena, b.items);
+    try std.testing.expectEqual(2, r.symbols.len);
+    try std.testing.expectEqualStrings("bar", r.symbols[1].name);
+    const a = try r.member(r.symbols[0].member);
+    try std.testing.expectEqualStrings("a_rather_long_member.o", a.name);
+    try std.testing.expectEqualStrings("abc", a.bytes);
+    const s = try r.member(r.symbols[1].member);
+    try std.testing.expectEqualStrings("s.o", s.name);
+    try std.testing.expectEqualStrings("xy", s.bytes);
+    try std.testing.expectError(error.ThinArchive, Reader.init(arena, "!<thin>\n"));
 }

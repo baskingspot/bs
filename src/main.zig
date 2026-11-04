@@ -11,6 +11,7 @@ const Emit = @import("Emit.zig");
 const Incremental = @import("Incremental.zig");
 const Builtin = @import("Builtin.zig");
 const Archive = @import("link/Archive.zig");
+const ElfInput = @import("link/ElfInput.zig");
 const Docs = @import("Docs.zig");
 const Glibc = @import("link/Glibc.zig");
 
@@ -97,6 +98,10 @@ pub const Options = struct {
     glibc_version: ?std.SemanticVersion = null,
     /// `-dynamic` on an executable, which only `-lc` makes one.
     exe_dynamic: bool = false,
+    /// ELF objects (`.o`) and archives (`.a`) to link into the executable,
+    /// in command-line order (docs/architecture.md, "Object, archive and
+    /// shared-library inputs").
+    link_inputs: []const []const u8 = &.{},
     /// `-fsoname=<name>` and `-fno-soname`; by default the shared object's
     /// file name, as upstream's.
     soname: union(enum) { default, name: []const u8, none } = .default,
@@ -343,8 +348,9 @@ pub const Job = struct {
         // The numbered link has no position-independent layout yet (`Elf`);
         // -fPIE and -dynamic imply -fPIC. Nor do executables that link libc
         // use the cache yet: the manifest does not keep their dynamic
-        // imports.
-        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and !job.opts.link_libc and
+        // imports. Builds with object or archive inputs skip it until the
+        // manifest keeps them (the cache thread's part of stage A).
+        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and !job.opts.link_libc and job.opts.link_inputs.len == 0 and
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
@@ -508,6 +514,21 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     var glibc: ?Glibc = if (links_glibc) try loadGlibc(init, job) else null;
     defer if (glibc) |*g| g.deinit();
     if (glibc) |*g| emit.glibc = g;
+    var link_inputs: ElfInput = .{ .arena = arena };
+    if (opts.link_inputs.len != 0) {
+        for (opts.link_inputs) |path| {
+            const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
+                fatal("unable to read '{s}': {t}", .{ path, err });
+            const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");
+            (if (is_archive) link_inputs.addArchive(path, bytes) else link_inputs.addObject(path, bytes)) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.InvalidObject => fatal("'{s}' is not an x86_64 ELF relocatable object", .{path}),
+                error.InvalidArchive => fatal("'{s}' is not a valid archive", .{path}),
+                error.ThinArchive => fatal("zap does not link thin archives ('{s}') yet", .{path}),
+            };
+        }
+        emit.inputs = &link_inputs;
+    }
     // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
     // n more times (`zig build bench-codegen`).
     const bench_runs: u32 = if (env.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
@@ -1053,6 +1074,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     var positional_root = false;
     var opts: Options = .{ .command = command, .root_src_path = undefined };
     var test_filters: std.ArrayList([]const u8) = .empty;
+    var link_inputs: std.ArrayList([]const u8) = .empty;
     var deps: std.ArrayList([]const u8) = .empty;
     var modules: std.ArrayList(Frontend.ModuleArg) = .empty;
     // `-ffuzz` and `-fno-fuzz` are per module, as upstream's: each `-M`
@@ -1217,7 +1239,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             setUnsupported(&opts, arena, "zap does not support the option '{s}'", .{arg});
         } else if (!std.mem.endsWith(u8, arg, ".zig")) {
             const ext = std.fs.path.extension(arg);
-            if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.indexOf(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib"))
+            if ((std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a")) and command != .build_obj and command != .build_lib) {
+                try link_inputs.append(arena, arg);
+            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a"))
+                setUnsupported(&opts, arena, "zap does not link object files into objects or libraries yet ('{s}'); build this step with upstream zig", .{arg})
+            else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.indexOf(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib"))
                 setUnsupported(&opts, arena, "zap does not link object files or libraries ('{s}'); build this step with upstream zig", .{arg})
             else
                 setUnsupported(&opts, arena, "zap does not compile C, C++, or assembly sources ('{s}'); build this step with upstream zig", .{arg});
@@ -1242,6 +1268,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena, io);
     opts.root_src_path = root orelse if (opts.unsupported != null) "" else fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
+    opts.link_inputs = link_inputs.items;
     opts.modules = modules.items;
     // As upstream, a root file given without `-M` names its module "test"
     // under `zap test`, else after the file (not `--name`).
@@ -1388,6 +1415,8 @@ test {
     _ = @import("link/Elf.zig");
     _ = @import("link/ElfObject.zig");
     _ = @import("link/Glibc.zig");
+    _ = @import("link/ElfInput.zig");
+    _ = @import("link/Archive.zig");
     _ = @import("codegen/x86_64/Encoder.zig");
     _ = @import("link/MachO.zig");
     _ = @import("codegen/aarch64/Encoder.zig");
