@@ -168,10 +168,12 @@ branch:
   and a cached compile step answers in about 2 ms against upstream's 7.
 
 Over the corpus (`--projects corpus`, every git project in
-tools/corpus/manifest.json; results/2026-11-04-corpus-phases.md, Zig
-0.17.0), zap's geomean against upstream is 0.10 for a first build, 0.45
-for no change, 0.12 for a Zig edit and 0.08 for a build.zig edit, over 25
-projects both compilers build. Two kinds of step had made zap lose:
+tools/corpus/manifest.json; results/2026-11-04-corpus-phases-0.17.1.md),
+zap's geomean against upstream 0.17.1 is 0.10 for a first build, 0.35 for
+no change, 0.11 for a Zig edit and 0.08 for a build.zig edit, over 29
+projects; zap is slower only on zio's no-change build, whose tests run on
+every build and run 12.2 s against 11.0 s (0.17.0:
+results/2026-11-04-corpus-phases.md). Two kinds of step had made zap lose:
 `-fno-emit-bin` check steps (superhtml's recompiled for 1.2 s on every
 build), which now link a hidden output the cache can answer from, and
 `-fPIC` steps (libxev's libraries, 214 ms of a 249 ms no-change build),
