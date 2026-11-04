@@ -72,9 +72,22 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
     mtime also makes superseded ZIR the first to go past the size limit.
   - `superseded` (both caches): `Superseded` records (content hash,
     when), replaced whole.
-- A file is first *probed*: stat it and, if the index matches, read the
-  blob's header with one `pread` and map the rest without touching it. A
-  probe miss reads and hashes the source; a known content hash is mapped,
+- A file is first *probed*: stat it and, if the index matches, take its
+  imports and whether it has AstGen errors from the index (each entry
+  keeps its summary, ZAPZIX02), without opening its ZIR. The ZIR is mapped
+  on first use (`Frontend.file`, once per file under its mutex): most files
+  a build reaches are never analyzed, or replay from the cache without
+  their ZIR (a zls body edit uses the ZIR of 59 of its 610 files). A file
+  with errors is mapped at once, for its messages. A stat hit renews its
+  ZIR's mtime once a day (`IndexEntry.renewed_ns`), as mapping it would,
+  so the global cache's maintenance keeps it; ZIR that is gone by its
+  first use (trimmed, or superseded by another worktree's edit) is
+  lowered again from the source, which must still have the indexed
+  content, and cached again. Measured on the zls body edit (2026-11-04,
+  ReleaseFast, median of 15, two rounds): frontend 6.1 / 6.2 → 4.5 /
+  4.7 ms, sema 35.2 / 37.3 → 37.1 / 37.7 ms (the 59 files are now mapped
+  there), wall 71.5 / 73.9 → 69.7 / 71.3 ms; the rest of the frontend's
+  time is lowering the edited file. A probe miss reads and hashes the source; a known content hash is mapped,
   otherwise the file is parsed and lowered into a per-thread arena, written
   to the cache, and mapped. Only the main thread probes (mapping files from
   several threads contended on the address-space lock and made a warm build

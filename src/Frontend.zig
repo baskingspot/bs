@@ -146,11 +146,15 @@ pub const File = struct {
     sub_path: []const u8,
     /// Path shown in diagnostics.
     display_path: []const u8,
+    /// Valid once `zir_ready` is set: a file whose stat matched the index
+    /// is mapped on first use (`Frontend.file`).
     zir: Zir,
     /// Hash of the source `zir` was lowered from.
     content_hash: Hash,
     /// Set when `zir` points into a mapped cache file rather than `gpa` memory.
     mapping: ?Io.File.MemoryMap,
+    zir_ready: std.atomic.Value(bool) = .init(true),
+    zir_mutex: Io.Mutex = .init,
     /// Source and syntax tree, loaded on first use by `Frontend.tree` and
     /// `Frontend.source`.
     syntax: ?Syntax,
@@ -392,7 +396,9 @@ pub fn deinit(fe: *Frontend) void {
 }
 
 fn freeFile(gpa: Allocator, io: Io, f: *File) void {
-    if (f.mapping) |*m| m.destroy(io) else f.zir.deinit(gpa);
+    if (f.zir_ready.load(.acquire)) {
+        if (f.mapping) |*m| m.destroy(io) else f.zir.deinit(gpa);
+    }
     if (f.syntax) |*s| {
         s.tree.deinit(gpa);
         gpa.free(s.source);
@@ -401,8 +407,60 @@ fn freeFile(gpa: Allocator, io: Io, f: *File) void {
     gpa.free(f.display_path);
 }
 
+/// File `index`, with its ZIR mapped. Thread-safe.
 pub fn file(fe: *const Frontend, index: File.Index) *const File {
-    return &fe.files.items[@backingInt(index)];
+    const f = &fe.files.items[@backingInt(index)];
+    if (!f.zir_ready.load(.acquire)) fe.ensureZir(f);
+    return f;
+}
+
+/// Maps the cached ZIR of a file whose stat matched the index, which
+/// `probeFile` left for its first use: most files a build reaches are
+/// never analyzed, or replay from the cache without their ZIR. If the ZIR
+/// is gone (the global cache's maintenance trims it), lowers the source
+/// again, which must still have the content the index named.
+fn ensureZir(fe: *const Frontend, f: *File) void {
+    f.zir_mutex.lockUncancelable(fe.io);
+    defer f.zir_mutex.unlock(fe.io);
+    if (f.zir_ready.load(.acquire)) return;
+    fe.mapOrLower(f) catch |err| switch (err) {
+        error.OutOfMemory => std.process.fatal("out of memory", .{}),
+    };
+    f.zir_ready.store(true, .release);
+}
+
+fn mapOrLower(fe: *const Frontend, f: *File) Allocator.Error!void {
+    const gpa = fe.gpa;
+    const io = fe.io;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    if (fe.blobCache()) |blobs| {
+        if (blobs.loadZir(gpa, io, f.content_hash, &buf, false)) |loaded| {
+            f.zir, f.mapping, _ = loaded;
+            return;
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        }
+    }
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const src = Io.Dir.cwd().readFileAllocOptions(io, f.display_path, arena, .unlimited, .of(u8), 0) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => fatalFile(f.display_path, err),
+    };
+    if (!std.mem.eql(u8, &hashSource(src), &f.content_hash))
+        std.process.fatal("'{s}' changed during compilation", .{f.display_path});
+    const ast = try Ast.parse(arena, src, .{ .mode = .zig });
+    const zir = try AstGen.generate(arena, ast);
+    if (fe.blobCache()) |blobs| blobs.saveZir(gpa, io, f.content_hash, &zir, try .of(arena, &zir)) catch {};
+    var insts = try zir.instructions.toMultiArrayList().clone(gpa);
+    errdefer insts.deinit(gpa);
+    const extra = try gpa.dupe(u32, zir.extra);
+    errdefer gpa.free(extra);
+    f.zir = .{ .instructions = insts.toOwnedSlice(), .extra = extra, .string_bytes = try gpa.dupe(u8, zir.string_bytes) };
+    f.mapping = null;
 }
 
 /// A module's name as upstream shows it (in diagnostics and `@src()`):
@@ -578,6 +636,8 @@ const CacheDir = struct {
     /// Entries loaded at `open`, sorted by `path_hash`; they point into
     /// `index_bytes`, the whole index file.
     index: []const IndexEntry,
+    /// The entries' import names (`IndexEntry.names_off`).
+    index_names: []const u8,
     index_bytes: []align(@alignOf(IndexEntry)) u8,
     /// The global cache's: its ZIR is every project's, which the store's
     /// maintenance counts and trims, not `trim`.
@@ -606,6 +666,7 @@ const CacheDir = struct {
         var cd: CacheDir = .{
             .dir = dir,
             .index = &.{},
+            .index_names = &.{},
             .index_bytes = &.{},
             .global = global,
             .renew_before_ns = Io.Clock.real.now(io).toNanoseconds() - std.time.ns_per_day,
@@ -639,7 +700,7 @@ const CacheDir = struct {
         var named: std.AutoHashMapUnmanaged(Hash, void) = .empty;
         defer named.deinit(gpa);
         {
-            var index: CacheDir = .{ .dir = cd.dir, .index = &.{}, .index_bytes = &.{}, .global = false, .renew_before_ns = 0 };
+            var index: CacheDir = .{ .dir = cd.dir, .index = &.{}, .index_names = &.{}, .index_bytes = &.{}, .global = false, .renew_before_ns = 0 };
             try index.loadIndex(gpa, io);
             defer gpa.free(index.index_bytes);
             cd.sweepSuperseded(gpa, io, blobs, index.index, &.{}, now) catch {};
@@ -669,10 +730,17 @@ const CacheDir = struct {
         errdefer gpa.free(bytes);
         if (bytes.len < @sizeOf(IndexHeader)) return error.CorruptCache;
         const header: *const IndexHeader = @ptrCast(bytes.ptr);
-        if (!std.mem.eql(u8, &header.magic, &index_magic) or
-            bytes.len != @sizeOf(IndexHeader) + header.len * @sizeOf(IndexEntry)) return error.CorruptCache;
-        cd.index = @ptrCast(@alignCast(bytes[@sizeOf(IndexHeader)..]));
+        const entries_end = @sizeOf(IndexHeader) + header.len * @sizeOf(IndexEntry);
+        if (!std.mem.eql(u8, &header.magic, &index_magic) or bytes.len != entries_end + header.names_len) return error.CorruptCache;
+        const index: []const IndexEntry = @ptrCast(@alignCast(bytes[@sizeOf(IndexHeader)..entries_end]));
+        for (index) |e| if (e.names_off > header.names_len or e.names_len > header.names_len - e.names_off) return error.CorruptCache;
+        cd.index = index;
+        cd.index_names = bytes[entries_end..];
         cd.index_bytes = bytes;
+    }
+
+    fn names(cd: *const CacheDir, e: *const IndexEntry) []const u8 {
+        return cd.index_names[e.names_off..][0..e.names_len];
     }
 
     fn lookup(cd: *const CacheDir, path_hash: u64) ?*const IndexEntry {
@@ -746,28 +814,36 @@ const CacheDir = struct {
     /// hashes that updates replaced with others. Concurrent builds race
     /// benignly: the last rename wins and the loser's entries are relearned
     /// by hashing.
-    fn writeIndex(cd: *const CacheDir, gpa: Allocator, io: Io, updates: []const IndexEntry, merged: *std.ArrayList(IndexEntry), superseded: *std.ArrayList(Hash)) !void {
+    fn writeIndex(cd: *const CacheDir, gpa: Allocator, io: Io, updates: []const IndexUpdate, merged: *std.ArrayList(IndexEntry), superseded: *std.ArrayList(Hash)) !void {
         try merged.ensureTotalCapacity(gpa, cd.index.len + updates.len);
+        var all_names: std.ArrayList(u8) = .empty;
+        defer all_names.deinit(gpa);
+        try all_names.ensureTotalCapacity(gpa, cd.index_names.len);
         var i: usize = 0;
         var j: usize = 0;
         while (i < cd.index.len or j < updates.len) {
-            if (j == updates.len or (i < cd.index.len and cd.index[i].path_hash < updates[j].path_hash)) {
-                merged.appendAssumeCapacity(cd.index[i]);
-                i += 1;
-            } else {
-                if (i < cd.index.len and cd.index[i].path_hash == updates[j].path_hash) {
-                    if (!std.mem.eql(u8, &cd.index[i].content_hash, &updates[j].content_hash)) try superseded.append(gpa, cd.index[i].content_hash);
+            var e: IndexEntry, const entry_names: []const u8 = e: {
+                if (j == updates.len or (i < cd.index.len and cd.index[i].path_hash < updates[j].entry.path_hash)) {
+                    i += 1;
+                    break :e .{ cd.index[i - 1], cd.names(&cd.index[i - 1]) };
+                }
+                if (i < cd.index.len and cd.index[i].path_hash == updates[j].entry.path_hash) {
+                    if (!std.mem.eql(u8, &cd.index[i].content_hash, &updates[j].entry.content_hash)) try superseded.append(gpa, cd.index[i].content_hash);
                     i += 1;
                 }
-                merged.appendAssumeCapacity(updates[j]);
                 j += 1;
-            }
+                break :e .{ updates[j - 1].entry, updates[j - 1].names };
+            };
+            e.names_off = @intCast(all_names.items.len);
+            e.names_len = @intCast(entry_names.len);
+            try all_names.appendSlice(gpa, entry_names);
+            merged.appendAssumeCapacity(e);
         }
-        const header: IndexHeader = .{ .len = merged.items.len };
+        const header: IndexHeader = .{ .len = merged.items.len, .names_len = all_names.items.len };
         var af = try cd.dir.createFileAtomic(io, "index", .{ .replace = true });
         defer af.deinit(io);
         var w = af.file.writerStreaming(io, &.{});
-        var vecs = [_][]const u8{ @ptrCast((&header)[0..1]), @ptrCast(merged.items) };
+        var vecs = [_][]const u8{ @ptrCast((&header)[0..1]), @ptrCast(merged.items), all_names.items };
         w.interface.writeVecAll(&vecs) catch return w.err.?;
         w.interface.flush() catch return w.err.?;
         try af.replace(io);
@@ -892,7 +968,7 @@ const CacheDir = struct {
     }
 };
 
-const index_magic = "ZAPZIX01".*;
+const index_magic = "ZAPZIX02".*;
 const blob_magic = "ZAPZIR01".*;
 
 /// A `superseded` list record (`CacheDir.sweepSuperseded`).
@@ -909,6 +985,13 @@ const superseded_grace_ns = std.time.ns_per_hour;
 const IndexHeader = extern struct {
     magic: [8]u8 = index_magic,
     len: u64,
+    names_len: u64,
+};
+
+/// A new index entry, with its summary's import names (gpa memory).
+const IndexUpdate = struct {
+    entry: IndexEntry,
+    names: []const u8,
 };
 
 const IndexEntry = extern struct {
@@ -919,6 +1002,16 @@ const IndexEntry = extern struct {
     /// Nanoseconds, or `racy_mtime` when the file was too new to trust.
     mtime: i64,
     content_hash: Hash,
+    /// The file's `Summary`: its import names at `names_off` in the
+    /// index's names, so that a stat hit learns its imports without
+    /// opening its ZIR.
+    names_off: u32 = 0,
+    names_len: u32 = 0,
+    has_errors: u32 = 0,
+    unused: u32 = 0,
+    /// When the ZIR's mtime was last renewed (real clock, nanoseconds), so
+    /// that ZIR that stat hits never map stays in the global cache.
+    renewed_ns: i64 = 0,
 
     /// A file changed within the timestamp granularity of its last read
     /// could change again without changing its mtime, so its entry is
@@ -1036,7 +1129,7 @@ const Job = struct {
     /// The files it imports, in import order.
     imports: []*Job = &.{},
     /// New stat index entry for the file's cache directory.
-    index_update: ?IndexEntry = null,
+    index_update: ?IndexUpdate = null,
     index: ?File.Index = null,
     /// Loaded by an earlier `loadAll` or `loadFile`: `index` is set and
     /// `file` is not used.
@@ -1095,6 +1188,7 @@ const Loader = struct {
                 gpa.free(e.key_ptr.*);
             }
             gpa.free(job.imports);
+            if (job.index_update) |u| gpa.free(u.names);
             gpa.destroy(job);
         }
         l.jobs.deinit(gpa);
@@ -1225,7 +1319,7 @@ const Loader = struct {
     /// Returns the files `job` imports, or null if its probe missed.
     fn run(l: *Loader, job: *Job, step: Step, arena: *std.heap.ArenaAllocator, buf: *std.ArrayList(u8)) anyerror!Outcome {
         const summary = switch (step) {
-            .probe => switch (try l.fe.probeFile(job, buf)) {
+            .probe => switch (try l.fe.probeFile(job, buf, l.start_ns)) {
                 .hit => |summary| summary,
                 .miss => return .{ .imports = &.{}, .lower = true },
                 .missing => return .{ .imports = &.{}, .lower = false },
@@ -1234,6 +1328,10 @@ const Loader = struct {
             .lower => try l.fe.lowerFile(l, job, arena, buf),
         };
         job.has_errors = summary.has_errors;
+        if (step == .lower) if (job.index_update) |*u| {
+            u.names = try l.fe.gpa.dupe(u8, summary.names);
+            u.entry.has_errors = @intFromBool(summary.has_errors);
+        };
         return .{ .imports = try l.fe.collectImports(&job.file, summary.names), .lower = false };
     }
 
@@ -1442,16 +1540,16 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
     // Record what this build learned about file stats.
     for (&fe.caches) |*slot| {
         const cd = if (slot.*) |*cd| cd else continue;
-        var updates: std.ArrayList(IndexEntry) = .empty;
+        var updates: std.ArrayList(IndexUpdate) = .empty;
         defer updates.deinit(gpa);
         for (order.items) |job| {
             const update = job.index_update orelse continue;
             if (fe.cacheFor(fe.module(job.file.module)) == cd) try updates.append(gpa, update);
         }
         if (updates.items.len == 0) continue;
-        std.mem.sortUnstable(IndexEntry, updates.items, {}, struct {
-            fn lessThan(_: void, a: IndexEntry, b: IndexEntry) bool {
-                return a.path_hash < b.path_hash;
+        std.mem.sortUnstable(IndexUpdate, updates.items, {}, struct {
+            fn lessThan(_: void, a: IndexUpdate, b: IndexUpdate) bool {
+                return a.entry.path_hash < b.entry.path_hash;
             }
         }.lessThan);
         var merged: std.ArrayList(IndexEntry) = .empty;
@@ -1487,7 +1585,7 @@ fn pathHash(mod: *const Module, sub_path: []const u8) u64 {
 
 /// Maps a file's ZIR from the cache if the index says the file is unchanged.
 /// Returns null if the file must be lowered.
-fn probeFile(fe: *Frontend, job: *Job, buf: *std.ArrayList(u8)) !union(enum) {
+fn probeFile(fe: *Frontend, job: *Job, buf: *std.ArrayList(u8), loader_start_ns: i96) !union(enum) {
     hit: Summary,
     miss,
     /// The file could not be stat'ed (`Job.missing`).
@@ -1505,19 +1603,39 @@ fn probeFile(fe: *Frontend, job: *Job, buf: *std.ArrayList(u8)) !union(enum) {
     job.stat = stat;
     const entry = cd.lookup(pathHash(mod, f.sub_path)) orelse return .miss;
     const blobs = fe.blobCache().?;
-    if (!entry.matches(stat)) {
-        return .{ .changed = blobs.loadSummary(fe.gpa, fe.io, entry.content_hash, buf) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return .miss,
-        } };
-    }
-    f.zir, f.mapping, const summary = blobs.loadZir(fe.gpa, fe.io, entry.content_hash, buf, true) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .miss,
-    };
+    const summary: Summary = .{ .has_errors = entry.has_errors != 0, .names = cd.names(entry) };
+    if (!entry.matches(stat)) return .{ .changed = summary };
     f.content_hash = entry.content_hash;
     job.how = .stat_hit;
     job.loaded = true;
+    // The ZIR is mapped on first use (`file`), except a file with errors,
+    // whose messages the build reports now.
+    if (summary.has_errors) {
+        f.zir, f.mapping, _ = blobs.loadZir(fe.gpa, fe.io, entry.content_hash, buf, true) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                job.loaded = false;
+                return .miss;
+            },
+        };
+        return .{ .hit = summary };
+    }
+    f.zir_ready = .init(false);
+    // Renewed once a day, as mapping it would: the global cache's
+    // maintenance trims ZIR by mtime. ZIR that is gone is lowered again now.
+    if (entry.renewed_ns < loader_start_ns - std.time.ns_per_day) {
+        const name = std.fmt.bytesToHex(entry.content_hash, .lower);
+        const zf = blobs.dir.openFile(fe.io, &name, .{}) catch {
+            f.zir_ready = .init(true);
+            job.loaded = false;
+            return .miss;
+        };
+        defer zf.close(fe.io);
+        zf.setTimestampsNow(fe.io) catch {};
+        var e = entry.*;
+        e.renewed_ns = @intCast(loader_start_ns);
+        job.index_update = .{ .entry = e, .names = try fe.gpa.dupe(u8, summary.names) };
+    }
     return .{ .hit = summary };
 }
 
@@ -1543,13 +1661,14 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
     if (cache != null) {
         const stat = job.stat.?;
         const mtime: i64 = @intCast(stat.mtime.toNanoseconds());
-        job.index_update = .{
+        job.index_update = .{ .entry = .{
             .path_hash = pathHash(mod, f.sub_path),
             .inode = @intCast(stat.inode),
             .size = stat.size,
             .mtime = if (mtime >= l.start_ns - IndexEntry.racy_window_ns) IndexEntry.racy_mtime else mtime,
             .content_hash = f.content_hash,
-        };
+            .renewed_ns = @intCast(l.start_ns),
+        }, .names = "" };
         if (fe.blobCache().?.loadZir(gpa, io, f.content_hash, buf, true)) |loaded| {
             f.zir, f.mapping, const summary = loaded;
             job.how = .content_hit;
@@ -1634,6 +1753,7 @@ fn resolveImport(fe: *const Frontend, f: *const File, name: []const u8) !?Import
 fn addMissingFile(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, importer: *const Job, job: *const Job, err: anyerror) !void {
     const gpa = fe.gpa;
     const f = &importer.file;
+    if (!f.zir_ready.load(.acquire)) fe.ensureZir(@constCast(f));
     // The import's token and name, as written.
     const token: ?Ast.TokenIndex, const name: []const u8 = tok: {
         const imports_index = f.zir.extra[@backingInt(Zir.ExtraIndex.imports)];
@@ -1792,11 +1912,34 @@ test "reuses cached ZIR, drops stale guessed imports, and reports errors in cach
     try warm.init(root, cache);
     defer warm.deinit();
     try std.testing.expectEqual(3, warm.fe.stats.stat_hits);
-    for (cold.fe.files.items, warm.fe.files.items) |c, w| {
+    for (0..cold.fe.files.items.len) |fi| {
+        const c = cold.fe.file(@fromBackingInt(@intCast(fi)));
+        // A stat hit maps its ZIR on first use.
+        try std.testing.expect(!warm.fe.files.items[fi].zir_ready.load(.monotonic));
+        const w = warm.fe.file(@fromBackingInt(@intCast(fi)));
         try std.testing.expectEqualStrings(c.sub_path, w.sub_path);
         try std.testing.expectEqualSlices(u8, @ptrCast(c.zir.instructions.items(.tag)), @ptrCast(w.zir.instructions.items(.tag)));
         try std.testing.expectEqualSlices(u32, c.zir.extra, w.zir.extra);
         try std.testing.expectEqualSlices(u8, c.zir.string_bytes, w.zir.string_bytes);
+    }
+
+    // ZIR that the cache's maintenance deleted after the frontend found its
+    // stat unchanged is lowered again on first use, and cached again.
+    {
+        var gone: Run = undefined;
+        try gone.init(root, cache);
+        defer gone.deinit();
+        try std.testing.expectEqual(3, gone.fe.stats.stat_hits);
+        const g = &gone.fe.files.items[1];
+        var name_buf: [128]u8 = undefined;
+        const blob = try std.fmt.bufPrint(&name_buf, "{s}/bs/zir/{s}", .{ cache, &std.fmt.bytesToHex(g.content_hash, .lower) });
+        try Io.Dir.cwd().deleteFile(io, blob);
+        const c = cold.fe.file(@fromBackingInt(1));
+        const w = gone.fe.file(@fromBackingInt(1));
+        try std.testing.expect(w.mapping == null);
+        try std.testing.expectEqualSlices(u32, c.zir.extra, w.zir.extra);
+        try std.testing.expectEqualSlices(u8, c.zir.string_bytes, w.zir.string_bytes);
+        _ = try Io.Dir.cwd().statFile(io, blob, .{});
     }
 
     // An edit that drops an import and has an AstGen error is lowered and
@@ -1884,7 +2027,7 @@ test "drops the ZIR of edited sources once no build maps it" {
     defer other.deinit();
     try t.expectEqual(1, other.stats.content_hits);
     const cd = &fe2.caches[@backingInt(CacheKind.local)].?;
-    var index: CacheDir = .{ .dir = cd.dir, .index = &.{}, .index_bytes = &.{}, .global = false, .renew_before_ns = 0 };
+    var index: CacheDir = .{ .dir = cd.dir, .index = &.{}, .index_names = &.{}, .index_bytes = &.{}, .global = false, .renew_before_ns = 0 };
     try index.loadIndex(gpa, io);
     defer gpa.free(index.index_bytes);
     try cd.sweepSuperseded(gpa, io, fe2.blobCache().?, index.index, &.{}, now.addDuration(.fromNanoseconds(2 * std.time.ns_per_hour)));
