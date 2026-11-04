@@ -72,6 +72,9 @@ rvo_alloc: ?Inst.Index = null,
 /// not shared.
 copy_of: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 copy_private: std.AutoHashMapUnmanaged(u32, void) = .empty,
+/// From `planCopies`: values whose slot is that of the block their `br`
+/// exits, by value.
+slot_alias: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 /// rbp offset of the slot holding the error return trace pointer: an
 /// `.auto` function's from r9, another's from `set_err_return_trace`.
 /// Null in a function that has none, whose `.auto` calls pass null.
@@ -226,6 +229,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.pair_spills.deinit(gpa);
         cg.copy_of.deinit(gpa);
         cg.copy_private.deinit(gpa);
+        cg.slot_alias.deinit(gpa);
         cg.cold_starts.deinit(gpa);
         cg.cold_open.deinit(gpa);
         cg.cover_pcs.deinit(gpa);
@@ -432,6 +436,11 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
         cg.homes[@backingInt(inst)] = .none;
         return .none;
     }
+    // The result of the block it exits (`planCopies`), once that has its slot.
+    if (cg.slot_alias.count() != 0) if (cg.slot_alias.get(@backingInt(inst))) |blk| if (cg.homes[blk] == .slot) {
+        cg.homes[@backingInt(inst)] = cg.homes[blk];
+        return cg.homes[blk];
+    };
     // A value's home is only copied from and to, never addressed as a `*T`
     // (Sema takes addresses of `alloc`s, which realign themselves), so 16
     // bytes suffice for any type, as for arguments, which have 8.
@@ -1240,6 +1249,25 @@ fn planCopies(cg: *CodeGen) Error!void {
         if ((try cg.copy_private.getOrPut(gpa, @backingInt(v))).found_existing) continue;
         gop.value_ptr.* = @backingInt(v);
     }
+    // Block results in memory: the value the block's only `br` passes is
+    // computed in the block's slot (`slot_alias`), which is not shared.
+    var brs: std.AutoArrayHashMapUnmanaged(u32, u32) = .empty;
+    defer brs.deinit(gpa);
+    for (f.layout.items) |block| {
+        const t = f.blocks.items[@backingInt(block)].term;
+        if (t.tag != .jump or tags[@backingInt(t.inst)] != .br) continue;
+        const br = datas[@backingInt(t.inst)].br;
+        const gop = try brs.getOrPut(gpa, @backingInt(br.block_inst));
+        gop.value_ptr.* = if (gop.found_existing) no_copy else if (br.operand.toIndex()) |v| @backingInt(v) else no_copy;
+    }
+    for (brs.keys(), brs.values()) |blk, v| {
+        if (v == no_copy) continue;
+        const ty = datas[blk].ty_pl.ty;
+        if (ir.typeOfIndex(@fromBackingInt(v), ip) != ty) continue;
+        if (Type.abiSize(ip, ty) == 0 or cg.passInRegs(ty) or cg.inPair(ty) or cg.inFloat(ty)) continue;
+        try cg.copy_private.put(gpa, blk, {});
+        try cg.slot_alias.put(gpa, v, blk);
+    }
 }
 
 /// Before allocation: a load of a value that lives in memory whose only
@@ -1849,7 +1877,7 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
         .jump => {
             try cg.checkNaked(tag);
             if (tag == .br) switch (cg.homes[@backingInt(data.br.block_inst)]) {
-                .slot => |off| try cg.copyTo(Mem.at(.rbp, off), data.br.operand),
+                .slot => |off| if (!cg.inSlot(data.br.operand, off)) try cg.copyTo(Mem.at(.rbp, off), data.br.operand),
                 .reg => |r| try cg.load(r, data.br.operand),
                 .regs => |p| try cg.loadRegs(p, data.br.operand),
                 .xmm => |x| try cg.loadXmm(x, try cg.valOf(data.br.operand)),
@@ -1882,6 +1910,15 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
         },
         .unreach => try cg.e.ud2(),
     }
+}
+
+/// Whether `ref` is a value whose home is slot `off`.
+fn inSlot(cg: *CodeGen, ref: Ref, off: i32) bool {
+    const v = ref.toIndex() orelse return false;
+    return switch (cg.homes[@backingInt(v)]) {
+        .slot => |o| o == off,
+        else => false,
+    };
 }
 
 /// Jumps to block `target` unless it goes to `next`, the block emitted
