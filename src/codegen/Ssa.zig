@@ -904,6 +904,9 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                     if (f.termReadsShared(ir, pb.term, @fromBackingInt(v))) break false;
                     if (def[w] >= valuePos(pb.start)) {
                         start = valuePos(pb.start);
+                        // A jump only here, as at the end of an inlined
+                        // body.
+                        if (pb.term.tag == .jump or pb.term.tag == .fallthrough) break f.fwd.items[pb.term.succ[0]] == block;
                         if (pb.term.tag != .branch) break false;
                         var here = false;
                         for (pb.term.succ) |succ| {
@@ -931,25 +934,32 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
 /// (`Live.share`), else `no_tie`. A store of the load itself writes back
 /// what the register holds.
 fn shareable(f: *const Func, ir: *const Ir, load: Inst.Index, v: Inst.Index) u32 {
+    return if (f.sharesUntil(ir, load, v, f.live.items(.end)[@backingInt(load)])) @backingInt(v) else no_tie;
+}
+
+/// Whether load `load` of promoted variable `v` may share its register
+/// (`Live.share`) up to position `until`, as for an architecture that
+/// lengthens the load's interval after `plan`.
+pub fn sharesUntil(f: *const Func, ir: *const Ir, load: Inst.Index, v: Inst.Index, until: u32) bool {
     const live = f.live.slice();
     const def = live.items(.def);
     const end = live.items(.end);
     const l = @backingInt(load);
-    if (end[l] > end[@backingInt(v)]) return no_tie;
+    if (until > end[@backingInt(v)]) return false;
     // Value `i` is at position `2 * i + 2`: scan the values after the load
-    // up to its interval's end, which is usually close.
+    // up to `until`, which is usually close.
     const first = (def[l] - 2) / 2 + 1;
-    const stop = @min(end[l] / 2, f.values.len);
-    if (stop > first + 64) return no_tie;
+    const stop = @min(until / 2, f.values.len);
+    if (stop > first + 64) return false;
     const insts = f.values.items(.inst);
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
     for (insts[@min(first, stop)..stop]) |inst| {
         if (tags[@backingInt(inst)] != .store) continue;
         const bin = datas[@backingInt(inst)].bin_op;
-        if (bin.lhs == v.toRef() and bin.rhs != load.toRef()) return no_tie;
+        if (bin.lhs == v.toRef() and bin.rhs != load.toRef()) return false;
     }
-    return @backingInt(v);
+    return true;
 }
 
 /// Lets value `w` share `v`'s register (`Live.share`), and so the chain

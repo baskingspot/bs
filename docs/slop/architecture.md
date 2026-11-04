@@ -2633,7 +2633,10 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      and no terminator on the way. The store is in the value's block, or
      in the arm its block's branch takes when the other arm, between
      them in the layout, ends the function (the failing check of
-     `i += 1`). A value whose only use is its block's `br` shares the
+     `i += 1`), or in the block its block jumps to (the end of an inlined
+     body, `v1 = math.rotl(u64, v1, 13)`). A rotate (`rol`) reads a load
+     sharing the variable's register as long as no store to the variable
+     comes between them. A value whose only use is its block's `br` shares the
      block result's register the same way; nothing reads that register
      before the block ends.
    - An overflow operation at a native width adds or subtracts in its

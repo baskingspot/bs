@@ -2732,9 +2732,14 @@ fn planRotates(cg: *CodeGen) Error!void {
         const sb = datas[@backingInt(s)].bin_op;
         const rb = datas[@backingInt(r)].bin_op;
         if (sb.lhs != rb.lhs) continue;
-        // A load sharing a variable's register holds its value only until
-        // its end (`Live.share`).
-        if (sb.lhs.toIndex()) |x| if (fate[@backingInt(x)] != .normal or live.items(.share)[@backingInt(x)] != Ssa.no_tie) continue;
+        // A load sharing a variable's register holds its value only while
+        // no store to the variable intervenes (`Live.share`).
+        if (sb.lhs.toIndex()) |x| {
+            const xi = @backingInt(x);
+            if (fate[xi] != .normal) continue;
+            const var_v = live.items(.share)[xi];
+            if (var_v != Ssa.no_tie and !f.sharesUntil(ir, x, @fromBackingInt(var_v), @max(end[xi], def[vi]))) continue;
+        }
         for ([_]Inst.Index{ s, r }) |x| {
             if (uses[@backingInt(x)] != 1 or fate[@backingInt(x)] != .normal or cg.homes[@backingInt(x)] != .none) break;
         } else {
