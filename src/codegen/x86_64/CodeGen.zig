@@ -89,6 +89,11 @@ const_alias: std.AutoHashMapUnmanaged(u32, Index) = .empty,
 /// From `planCopies`: values whose slot is that of the block their `br`
 /// exits, by value.
 slot_alias: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+/// From `planPayloadRegions`: allocs that share one frame region with the
+/// error union of the call whose payload initializes them, by alloc: the
+/// call and the block that unwraps it. The region holds the error union,
+/// and the alloc and the block are its payload.
+payload_region: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
 /// From `planDeferred`: aggregates built in the memory of the store that
 /// is their only user, with the store's pointer, by value.
 in_place: std.AutoHashMapUnmanaged(u32, Ref) = .empty,
@@ -308,6 +313,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.ref_alias.deinit(gpa);
         cg.const_alias.deinit(gpa);
         cg.slot_alias.deinit(gpa);
+        cg.payload_region.deinit(gpa);
         cg.in_place.deinit(gpa);
         cg.rotates.deinit(gpa);
         cg.mul_dead.deinit(gpa);
@@ -528,6 +534,14 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
     if (!Type.hasRuntimeBits(cg.ip, ty)) {
         cg.homes[@backingInt(inst)] = .none;
         return .none;
+    }
+    // Part of an alloc's frame region (`payload_region`), set when the
+    // alloc was emitted.
+    if (cg.payload_region.count() != 0 and cg.homes[@backingInt(inst)] == .slot) {
+        var it = cg.payload_region.valueIterator();
+        while (it.next()) |r| {
+            if (r[0] == @backingInt(inst) or r[1] == @backingInt(inst)) return cg.homes[@backingInt(inst)];
+        }
     }
     // The result of the block it exits (`planCopies`), once that has its slot.
     if (cg.slot_alias.count() != 0) if (cg.slot_alias.get(@backingInt(inst))) |blk| if (cg.homes[blk] == .slot) {
@@ -1099,16 +1113,31 @@ fn copyTo(cg: *CodeGen, dst: Mem, ref: Ref) Error!void {
         return cg.e.mov(.qword, .{ .mem = offsetMem(dst, 8) }, .{ .reg = p.hi });
     }
     if (cg.xmmOf(ref)) |x| return cg.storeXmm(dst, x, size);
+    // An error: its code, without the undefined payload, which may be
+    // large (a constant `return error.X` of a big result).
+    if (ref.toInterned()) |v| if (cg.ip.keyTag(v) == .error_union and !cg.passInRegs(ty)) {
+        const eu = cg.ip.keyPayload(.error_union, v);
+        if (eu.val == .err_name) {
+            const layout = Type.errorUnionLayout(cg.ip, ty);
+            try cg.loadError(.rax, eu.val.err_name);
+            return cg.e.mov(errFieldSize(layout), .{ .mem = offsetMem(dst, layout.err_offset) }, .{ .reg = .rax });
+        }
+    };
     const loc = try cg.locOf(ref);
     switch (loc) {
         .xmm => unreachable, // `locOf` gives memory
         .none => {},
         .reg => |r| try cg.storeReg(dst, r, size),
         .mem => |src| {
+            const tags = cg.ir.instructions.items(.tag);
+            // An error: its code, without the undefined payload.
+            if (ref.toIndex()) |i| if (tags[@backingInt(i)] == .wrap_errunion_err) {
+                const layout = Type.errorUnionLayout(cg.ip, ty);
+                return cg.copyMem(offsetMem(dst, layout.err_offset), offsetMem(src, layout.err_offset), errFieldSize(layout).bytes());
+            };
             // A call's result was just stored by the callee 8 bytes at a
             // time, and a 16-byte load of two such stores cannot be
             // forwarded from them: it waits for both to retire.
-            const tags = cg.ir.instructions.items(.tag);
             const just_stored = if (ref.toIndex()) |i| tags[@backingInt(i)] == .call else false;
             if (just_stored and size <= copy_inline_max) return cg.copyTail(dst, src, size);
             try cg.copyMem(dst, src, size);
@@ -1136,6 +1165,9 @@ const copy_inline_max = 256;
 /// after the copies a call makes), and above `copy_inline_max` bytes rsi,
 /// rdi and rcx.
 fn copyMem(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
+    // A value already in place (`payload_region`).
+    if (dst.base == .reg and src.base == .reg and dst.base.reg == .rbp and src.base.reg == .rbp and
+        dst.index == null and src.index == null and dst.disp == src.disp) return;
     if (size >= 32 and size <= copy_inline_max) {
         var off: u64 = 0;
         while (size - off >= 16) : (off += 16) {
@@ -2032,12 +2064,16 @@ fn planCopies(cg: *CodeGen) Error!void {
         for (f.layout.items) |block| {
             const b = f.blocks.items[@backingInt(block)];
             if (b.term.tag != .ret) continue;
-            const l = datas[@backingInt(b.term.inst)].un_op.toIndex() orelse break :rvo;
-            const last = for (0..b.len) |k| {
+            // A constant is copied to the result's memory as usual.
+            const l = datas[@backingInt(b.term.inst)].un_op.toIndex() orelse continue;
+            const last: ?Inst.Index = for (0..b.len) |k| {
                 const v = f.blockInsts(block)[b.len - 1 - k];
                 if (tags[@backingInt(v)] != .dbg_stmt) break v;
-            } else break :rvo;
-            if (last != l or tags[@backingInt(l)] != .load) break :rvo;
+            } else null;
+            // An error in a slot of its own is copied as usual: it does not
+            // overlap the result's memory.
+            if (tags[@backingInt(l)] == .wrap_errunion_err) continue;
+            if (tags[@backingInt(l)] != .load) break :rvo;
             const a = datas[@backingInt(l)].ty_op.operand.toIndex() orelse break :rvo;
             if (tags[@backingInt(a)] != .alloc or datas[@backingInt(a)].ty == .none) break :rvo;
             const a_ty = datas[@backingInt(a)].ty;
@@ -2046,13 +2082,23 @@ fn planCopies(cg: *CodeGen) Error!void {
             if (Type.ptrInfo(ip, a_ty).child != ret_ty or flags.is_volatile or flags.is_const) break :rvo;
             if (cg.allocAlignment(a_ty) > @min(Type.abiAlignment(ip, ret_ty), 16)) break :rvo;
             if (rvo != null and rvo.? != a) break :rvo;
+            if (last != l and !cg.rvoEarlyLoad(l, a)) break :rvo;
             rvo = a;
         }
         const a = rvo orelse break :rvo;
         cg.rvo_alloc = a;
         for (f.layout.items) |block| {
             const b = f.blocks.items[@backingInt(block)];
-            if (b.term.tag == .ret) cg.homes[@backingInt(datas[@backingInt(b.term.inst)].un_op.toIndex().?)] = .dead;
+            if (b.term.tag != .ret) continue;
+            const l = datas[@backingInt(b.term.inst)].un_op.toIndex() orelse continue;
+            if (tags[@backingInt(l)] != .load) continue;
+            // A load read before its block (an error union's check for
+            // the error return trace) reads the result's memory.
+            const last: ?Inst.Index = for (0..b.len) |k| {
+                const v = f.blockInsts(block)[b.len - 1 - k];
+                if (tags[@backingInt(v)] != .dbg_stmt) break v;
+            } else null;
+            if (cg.homes[@backingInt(l)] != .deferred) cg.homes[@backingInt(l)] = if (last == l) .dead else .deferred;
         }
     }
     if (f.has_asm) return;
@@ -2112,6 +2158,216 @@ fn planCopies(cg: *CodeGen) Error!void {
         try cg.copy_private.put(gpa, blk, {});
         try cg.slot_alias.put(gpa, v, blk);
     }
+    try cg.planPayloadRegions();
+}
+
+/// `var x = f() catch unreachable` and the like, with a result in memory:
+/// alloc `x` stored once, outside loops, with a block whose only `br`
+/// passes the payload of call `f()`'s error union, which is otherwise only
+/// tested for an error. The call's result, the block's and `x` share one
+/// frame region (`payload_region`): the error union, whose payload is the
+/// block's result and `x`, so neither the unwrap nor the store copies.
+/// The call is the block's and the alloc's first writer: every other use of
+/// `x` comes after the store in the layout, and outside loops a block
+/// comes after the ones that reach it.
+fn planPayloadRegions(cg: *CodeGen) Error!void {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const f = cg.ssa;
+    const gpa = cg.gpa;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    var any = false;
+    var it = cg.slot_alias.iterator();
+    while (it.next()) |e| {
+        const v = e.key_ptr.*;
+        if (tags[v] != .unwrap_errunion_payload) continue;
+        const w = datas[v].ty_op.operand.toIndex() orelse continue;
+        if (tags[@backingInt(w)] == .call) any = true;
+    }
+    if (!any) return;
+    // Uses by instruction, and the one user of those used once (the last
+    // one seen otherwise), with the user's layout position.
+    const n = ir.instructions.len;
+    const scratch = try gpa.alloc(u32, 3 * n);
+    defer gpa.free(scratch);
+    const uses = scratch[0..n];
+    const user = scratch[n .. 2 * n];
+    const pos = scratch[2 * n ..];
+    @memset(uses, 0);
+    @memset(pos, std.math.maxInt(u32));
+    const Count = struct {
+        uses: []u32,
+        user: []u32,
+        at: u32,
+        pub fn use(c: @This(), r: Ref) void {
+            const i = @backingInt(r.toIndex() orelse return);
+            c.uses[i] += 1;
+            c.user[i] = c.at;
+        }
+    };
+    var p: u32 = 0;
+    for (f.layout.items) |block| {
+        for (f.blockInsts(block)) |inst| {
+            pos[@backingInt(inst)] = p;
+            p += 1;
+            Ssa.forEachOperand(ir, inst, Count{ .uses = uses, .user = user, .at = @backingInt(inst) });
+        }
+        const t = f.blocks.items[@backingInt(block)].term;
+        if (t.tag != .fallthrough and t.tag != .noreturn) Ssa.forEachOperand(ir, t.inst, Count{ .uses = uses, .user = user, .at = @backingInt(t.inst) });
+        p += 1;
+    }
+    var it2 = cg.slot_alias.iterator();
+    while (it2.next()) |e| {
+        const v = e.key_ptr.*;
+        const blk = e.value_ptr.*;
+        if (tags[v] != .unwrap_errunion_payload or uses[v] != 1 or uses[blk] != 1) continue;
+        const w = @backingInt(datas[v].ty_op.operand.toIndex() orelse continue);
+        if (tags[w] != .call or pos[w] == std.math.maxInt(u32)) continue;
+        const eu_ty = ir.typeOfIndex(@fromBackingInt(w), ip);
+        if (cg.passInRegs(eu_ty) or cg.inPair(eu_ty) or Type.abiAlignment(ip, eu_ty) > 16) continue;
+        const st = user[blk];
+        if (tags[st] != .store or datas[st].bin_op.rhs.toIndex() != @as(Inst.Index, @fromBackingInt(blk))) continue;
+        const x = @backingInt(datas[st].bin_op.lhs.toIndex() orelse continue);
+        if (tags[x] != .alloc or datas[x].ty == .none or pos[x] == std.math.maxInt(u32) or pos[x] > pos[w]) continue;
+        if (cg.rvo_alloc) |r| if (@backingInt(r) == x) continue;
+        const info = Type.ptrInfo(ip, datas[x].ty);
+        if (info.flags.is_volatile or info.child != ir.typeOfIndex(@fromBackingInt(v), ip) or cg.allocAlignment(datas[x].ty) > 16) continue;
+        if (cg.copy_of.get(x)) |c| if (c != no_copy) continue;
+        if (cg.ref_alias.contains(x) or cg.const_alias.contains(x)) continue;
+        // The store is outside loops; the call's other users test it.
+        const ok = for (f.layout.items) |block| {
+            const values = f.blockInsts(block);
+            if (values.len != 0 and pos[@backingInt(values[0])] <= pos[st] and pos[st] <= pos[@backingInt(values[values.len - 1])]) {
+                break f.block_loop.items[@backingInt(block)] == Ssa.no_loop;
+            }
+        } else false;
+        if (!ok) continue;
+        // Every use of `x` other than the store comes after it, and the
+        // call's users are the unwrap and error tests.
+        const Check = struct {
+            x: u32,
+            w: u32,
+            v: u32,
+            st: u32,
+            at: u32,
+            pos: []const u32,
+            tags: []const Inst.Tag,
+            bad: *bool,
+            pub fn use(c: @This(), r: Ref) void {
+                const i = @backingInt(r.toIndex() orelse return);
+                if (i == c.x and c.at != c.st and !(c.pos[c.at] != std.math.maxInt(u32) and c.pos[c.at] > c.pos[c.st])) c.bad.* = true;
+                if (i == c.w and c.at != c.v) switch (c.tags[c.at]) {
+                    .is_err, .is_non_err, .unwrap_errunion_err => {},
+                    else => c.bad.* = true,
+                };
+            }
+        };
+        var bad = false;
+        for (f.layout.items) |block| {
+            for (f.blockInsts(block)) |inst| {
+                Ssa.forEachOperand(ir, inst, Check{ .x = x, .w = w, .v = v, .st = st, .at = @backingInt(inst), .pos = pos, .tags = tags, .bad = &bad });
+            }
+            const t = f.blocks.items[@backingInt(block)].term;
+            if (t.tag != .fallthrough and t.tag != .noreturn) {
+                // A terminator that reads `x` or the call (other than the
+                // unwrap's `br`, which passes `v`) keeps the copies.
+                var tr = false;
+                const Reads = struct {
+                    a: u32,
+                    b: u32,
+                    found: *bool,
+                    pub fn use(c: @This(), r: Ref) void {
+                        const i = @backingInt(r.toIndex() orelse return);
+                        if (i == c.a or i == c.b) c.found.* = true;
+                    }
+                };
+                Ssa.forEachOperand(ir, t.inst, Reads{ .a = x, .b = w, .found = &tr });
+                if (tr) bad = true;
+            }
+            if (bad) break;
+        }
+        if (bad) continue;
+        try cg.payload_region.put(gpa, x, .{ w, blk });
+        try cg.copy_private.put(gpa, w, {});
+    }
+}
+
+/// Whether load `l` of alloc `a`, returned by a `ret` in a later block,
+/// still holds `a`'s memory wherever it is used, so that `a` can be the
+/// result's memory (`rvo_alloc`) with `l` read in place: `l` is in no
+/// loop, its other users only test it for an error, and `a`'s address
+/// (or one derived from it) is only loaded from, or stored to before `l`,
+/// in the layout, which puts a block after the ones that reach it outside
+/// loops.
+fn rvoEarlyLoad(cg: *CodeGen, l: Inst.Index, a: Inst.Index) bool {
+    const ir = cg.ir;
+    const f = cg.ssa;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const Uses = struct {
+        target: Inst.Index,
+        found: bool = false,
+        pub fn use(u: *@This(), r: Ref) void {
+            if (r.toIndex() == u.target) u.found = true;
+        }
+    };
+    var before = true;
+    // The pointers derived from `a`, by layout position; few.
+    var derived: [128]Inst.Index = undefined;
+    derived[0] = a;
+    var n: usize = 1;
+    for (f.layout.items) |block| {
+        const values = f.blockInsts(block);
+        for (values) |v| {
+            const vi = @backingInt(v);
+            if (v == l) {
+                if (f.block_loop.items[@backingInt(block)] != Ssa.no_loop) return false;
+                before = false;
+                continue;
+            }
+            var u: Uses = .{ .target = l };
+            Ssa.forEachOperand(ir, v, &u);
+            if (u.found) switch (tags[vi]) {
+                .is_err, .is_non_err => {},
+                else => return false,
+            };
+            for (derived[0..n]) |d| {
+                var du: Uses = .{ .target = d };
+                Ssa.forEachOperand(ir, v, &du);
+                if (!du.found) continue;
+                switch (tags[vi]) {
+                    .load => {},
+                    .store => if (datas[vi].bin_op.lhs != d.toRef() or datas[vi].bin_op.rhs == d.toRef() or !before) return false,
+                    .struct_field_ptr, .errunion_payload_ptr_set, .optional_payload_ptr_set, .ptr_elem_ptr, .ptr_add => {
+                        if (tags[vi] == .errunion_payload_ptr_set or tags[vi] == .optional_payload_ptr_set) {
+                            if (!before) return false;
+                        }
+                        if (tags[vi] == .ptr_elem_ptr or tags[vi] == .ptr_add) {
+                            if (ir.extraData(Ir.Bin, datas[vi].ty_pl.payload).data.lhs != d.toRef()) return false;
+                        }
+                        if (n == derived.len) return false;
+                        derived[n] = v;
+                        n += 1;
+                    },
+                    else => return false,
+                }
+                break;
+            }
+        }
+        const t = f.blocks.items[@backingInt(block)].term;
+        if (t.tag != .ret) {
+            var u: Uses = .{ .target = l };
+            Ssa.forEachOperand(ir, t.inst, &u);
+            if (u.found and t.tag != .fallthrough and t.tag != .noreturn) return false;
+            for (derived[0..n]) |d| {
+                var du: Uses = .{ .target = d };
+                Ssa.forEachOperand(ir, t.inst, &du);
+                if (du.found and t.tag != .fallthrough and t.tag != .noreturn) return false;
+            }
+        }
+    }
+    return !before;
 }
 
 /// Before allocation, copies decided with liveness:
@@ -3719,6 +3975,16 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 cg.homes[@backingInt(inst)] = .{ .slot = cg.ret_ptr_slot.? };
                 return;
             }
+            if (cg.payload_region.count() != 0) if (cg.payload_region.get(@backingInt(inst))) |r| {
+                // The error union its initializer unwraps, around it.
+                const eu_ty = ir.typeOfIndex(@fromBackingInt(r[0]), ip);
+                const region = try cg.allocSlot(Type.abiSize(ip, eu_ty), Type.abiAlignment(ip, eu_ty));
+                const off = region + @as(i32, @intCast(Type.errorUnionLayout(ip, eu_ty).payload_offset));
+                cg.homes[r[0]] = .{ .slot = region };
+                cg.homes[r[1]] = .{ .slot = off };
+                cg.homes[@backingInt(inst)] = .{ .frame_addr = off };
+                return;
+            };
             if (cg.copy_of.count() != 0) if (cg.copy_of.get(@backingInt(inst))) |v| if (v != no_copy) switch (cg.homes[v]) {
                 // The memory of its initializer, already in place.
                 .slot => |off| if (@rem(off, @as(i32, @intCast(alignment))) == 0) {
@@ -5051,7 +5317,12 @@ fn ret(cg: *CodeGen, operand: Ref, next: Ssa.Block.Index) Error!void {
         .sse => try cg.loadXmm(.xmm0, try cg.valOf(operand)),
         .memory => {
             // A load of the result's own alloc is not emitted (`planCopies`).
-            const rvo = if (operand.toIndex()) |l| cg.homes[@backingInt(l)] == .dead else false;
+            const rvo = if (operand.toIndex()) |l| switch (cg.homes[@backingInt(l)]) {
+                .dead => true,
+                // Read in place from the result's own alloc (`planCopies`).
+                .deferred => cg.ir.instructions.items(.data)[@backingInt(l)].ty_op.operand.toIndex() == cg.rvo_alloc,
+                else => false,
+            } else false;
             if (!rvo) {
                 try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
                 try cg.copyTo(Mem.at(.r10, 0), operand);

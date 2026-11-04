@@ -2193,7 +2193,23 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      one alloc, so addresses stay distinct. In a function returning
      through memory, a non-const alloc of the result type whose load every
      `ret` returns as its block's last value is the result memory: its home
-     is the caller's pointer, and the load and the copy go.
+     is the caller's pointer, and the load and the copy go. Other `ret`s
+     may return a constant or an error (`wrap_errunion_err`), copied as
+     usual, and the load may come before the `ret`'s block, where an error
+     union's check for the error return trace reads it, when it is in no
+     loop, its other users only test it for an error, and the alloc's
+     address is only loaded from, or stored to before the load
+     (`rvoEarlyLoad`); then the load reads the result in place. An error
+     is copied as its code alone, without its undefined payload. A
+     variable initialized once, outside loops, by `f() catch unreachable`
+     (a block whose only `br` passes the payload of a call's error union
+     in memory, which is otherwise only tested for an error), with every
+     other use after that store, shares one frame region with the call's
+     result and the block (`payload_region`): the error union, of which
+     the variable is the payload. flate's `Compress.init`, a 230 KB
+     result: its frame 0xa88f8 → 0x38348 bytes (upstream 0x383f0), and a
+     `var c = Compress.init(...) catch unreachable` caller's 0xb8928 →
+     0x48388 (upstream 0xb8990).
    - Call arguments and results (`planDeferred`, before allocation): a
      load of a value in memory whose only user is a later `.auto` call, or
      the `ret` of a function returning through memory, in the same block,
