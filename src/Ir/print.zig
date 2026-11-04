@@ -249,6 +249,7 @@ const Printer = struct {
                     try p.ref(arg);
                 }
                 try w.writeAll("]");
+                if (c.data.flags.always_tail) try w.writeAll(", tail");
             },
             .aggregate_init => {
                 const a = ir.extraData(Ir.Aggregate, data.ty_pl.payload);

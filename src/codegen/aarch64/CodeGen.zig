@@ -2391,6 +2391,9 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const ip = cg.ip;
     const ir = cg.ir;
     const extra = ir.extraData(Ir.Call, data.pl_op.payload);
+    // TODO: reuse the caller's frame; a plain call would overflow the
+    // stack where upstream's LLVM build does not.
+    if (extra.data.flags.always_tail) return cg.fail("tail calls", .{});
     const args = ir.refSlice(extra.end, extra.data.args_len);
     const callee_ref = data.pl_op.operand;
     const callee_val: ?Index = if (callee_ref.toInterned()) |v| switch (ip.indexToKey(v)) {

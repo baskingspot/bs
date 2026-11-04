@@ -489,7 +489,10 @@ pub const Call = struct {
     pub const Flags = packed struct(u32) {
         /// `@call(.never_inline, ...)`: CodeGen must not inline the callee.
         never_inline: bool = false,
-        _: u31 = 0,
+        /// `@call(.always_tail, ...)`, only on aarch64-macos: a `ret` of
+        /// the result follows, and CodeGen must reuse the caller's frame.
+        always_tail: bool = false,
+        _: u30 = 0,
     };
 };
 

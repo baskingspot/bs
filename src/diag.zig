@@ -2089,6 +2089,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "expected bool, integer, float, enum, packed struct, or pointer type; found '{f}'", .@"operand-type" },
     .{ "expected {d}-bit float type or smaller; found {d}-bit float type", .@"operand-type" },
     .{ "expected {d}-bit integer type or smaller; found {d}-bit integer type", .@"operand-type" },
+    .{ "unable to perform tail call: type of function being called '{f}' does not match type of calling function '{f}'", .@"bad-call" },
     .{ "unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags", .unsupported },
     .{ "expected calling convention, found '{f}'", .@"operand-type" },
     .{ "expected enum or tagged union, found '{f}'", .@"operand-type" },
