@@ -3003,7 +3003,12 @@ value model:
   of its value alone: an edited object moves the definition, so a
   `nav_val` node's store entry (`exact_hash`) mixes in its atoms'
   relocations, and an eager build with inputs writes the new record. A
-  lazy build has no inputs, and falls back when the exports change.
+  lazy build keeps the data it does not lower, as the last build bound
+  it (its inputs are unchanged, else it is eager, and it falls back when
+  the exports change). It does not load link inputs, so one that lowers
+  data naming an extern symbol builds again eagerly
+  (`Emit.inputs_deferred`). An undefined symbol in data is a compile
+  error (`lowerNav` records it as `Emit.failed`).
 - Not yet: such an address in a constant that a function reads (a
   content atom CodeGen writes while analysis runs, before the exports
   and inputs are complete, and which an eager build loads with the

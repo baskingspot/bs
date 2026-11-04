@@ -1511,10 +1511,13 @@ fn externTarget(emit: *Emit, name: []const u8, weak: bool) !?ExternTarget {
 }
 
 /// The relocation target of the address of external symbol `name` in a
-/// declaration's data, which `lowerNavs` writes once analysis is done (a
-/// lazy build with link inputs goes eager instead: `inputs_deferred`).
-/// Constants that functions read are written while analysis runs, so
-/// they reach such an address through a slot instead (`useExtern`).
+/// declaration's data, which `lowerNavs` writes once analysis is done. A
+/// lazy build keeps the data it does not lower, bound as the last build
+/// bound it (its inputs are those, and it falls back if the exports
+/// change); one with link inputs that lowers such data goes eager
+/// (`inputs_deferred`). Constants that functions read are written while
+/// analysis runs, before the exports and inputs are complete, and are not
+/// supported yet.
 pub fn externDataTarget(emit: *Emit, name: []const u8) !ExternTarget {
     const fail = switch (emit.owner) {
         .unit => |u| u != .nav_val,
@@ -1964,7 +1967,14 @@ fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {
     const bytes = try arena.alloc(u8, Type.abiSize(ip, ty));
     var refs: Atom.RelocList = .{};
     defer refs.deinit(emit.gpa);
-    try CodeGen.lowerValue(emit, nav.val, bytes, &refs, 0);
+    // A failure has reported its error (an undefined symbol).
+    CodeGen.lowerValue(emit, nav.val, bytes, &refs, 0) catch |err| switch (err) {
+        error.CodegenFail => {
+            emit.failed = true;
+            return;
+        },
+        else => |e| return e,
+    };
     refs.sort();
     try emit.addAtom(.{
         .key = .fromName(try emit.unitName(.{ .nav_val = nav_index })),
