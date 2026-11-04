@@ -5417,19 +5417,26 @@ libraries as inputs. To be agreed with that thread.
   .gnu.version and .gnu.version_r get section headers after the shared
   object's, and their names extend the section name table, whose
   shorter prefixes the other outputs keep.
-- **Not cached yet.** A `-lc` build skips the on-disk cache
-  (`Job.openCache`), and the manifest does not keep the imports. `Elf`
-  takes numbered dynamic executables (2026-11-04): the imports' numbers
-  (`Symbols.dynamic_imports`) map to `import_tag + i` in the address
-  table, which stands for the key-based stand-in address, since that
-  lies outside the image and is no offset from its base; which absolute
+- **Cached (step 1b).** A `-lc` executable uses the on-disk cache like
+  any other; `-lc` objects and libraries are position-independent and
+  skip it as other pic builds do. The manifest needs nothing new: it
+  already lists every import with its flags (`.import` link symbols), and
+  the dynamic tables follow from their names and the glibc version, so a
+  relink (`Incremental.linkFrom`) rebuilds them with the function
+  `Emit.link` uses (`Glibc.dynamicOptions`: imports sorted by name, each
+  with its library and version; DT_NEEDED; the interpreter) and numbers
+  the imports for the numbered link (`Elf.Symbols.dynamic_imports`; the
+  i-th import's address-table entry is `import_tag + i`, standing for the
+  key-based stand-in address outside the image, and which absolute
   relocations need the loader is still decided by the targets' keys,
-  which numbered atoms keep. A unit test links an executable calling
-  `puts` and `exit` through slots both ways, compares the bytes, and runs
-  it under ld.so. The cache thread's `objcache`
-  branch adds `Manifest.link_symbols`; on it, step 1b adds `needed`,
-  `interp` and versioned import kinds (ZAPMAN13), numbered dynamic links,
-  and `-lc` with the glibc version in the donor key and compilation key.
+  which numbered atoms keep; a unit test links an executable keyed and
+  numbered, compares the bytes and runs it under ld.so). It
+  takes the glibc the build loaded, or reads abilists (0.6 ms) for a
+  relink without CodeGen. `Job.compile_args` gains `--zap-glibc=<version>`
+  (not `full_args`), so the compilation key covers the native version,
+  and `donorKey` hashes it: CodeGen resolves names glibc defines to
+  imports. The store seed stays: store entries match by their atoms'
+  hashes.
 - **Checks**: `run.py --std --libc` 3350/3350 (upstream 3350 pass, 37
   skip; compiled in 8.5 s against upstream's 17.8 s);
   test/run/libc.zig (functions, a variadic call, libm, `environ` and

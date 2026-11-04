@@ -1117,33 +1117,14 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     defer emit.gpa.free(imports);
     for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls };
     const result = if (emit.glibc) |g| exe: {
-        // Imports in name order, so the dynamic tables do not depend on
-        // the order code requested them.
-        std.mem.sortUnstable(ElfObject.Import, imports, {}, struct {
-            fn lt(_: void, a: ElfObject.Import, b: ElfObject.Import) bool {
-                return std.mem.lessThan(u8, a.name, b.name);
-            }
-        }.lt);
         var arena_state: std.heap.ArenaAllocator = .init(emit.gpa);
         defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        // libc.so.6 always, as upstream; the others when used, in
-        // upstream's link order.
-        var used: [Glibc.libs.len]bool = @splat(false);
-        used[Glibc.lib_c] = true;
-        for (imports) |imp| used[g.get(imp.name).?.lib] = true;
-        var needed: std.ArrayList([]const u8) = .empty;
-        var lib_index: [Glibc.libs.len]u32 = undefined;
-        for (Glibc.libs, used, &lib_index) |lib, u, *index| if (u) {
-            index.* = @intCast(needed.items.len);
-            try needed.append(arena, lib.soname);
+        const dynamic = g.dynamicOptions(arena_state.allocator(), imports) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            // Imports in an executable come from glibc only (exportTarget,
+            // ElfInput).
+            error.NotInGlibc => unreachable,
         };
-        for (imports) |*imp| {
-            const sym = g.get(imp.name).?;
-            imp.version = try g.versionName(arena, sym.version);
-            imp.library = lib_index[sym.lib];
-        }
-        const dynamic: ElfDynamic.Options = .{ .imports = imports, .interp = Glibc.interp, .needed = needed.items };
         var exe_options = options;
         exe_options.dynamic = &dynamic;
         break :exe Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, exe_options);

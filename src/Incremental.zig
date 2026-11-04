@@ -35,6 +35,8 @@ const Emit = @import("Emit.zig");
 const Atom = @import("link/Atom.zig");
 const Elf = @import("link/Elf.zig");
 const ElfObject = @import("link/ElfObject.zig");
+const ElfDynamic = @import("link/ElfDynamic.zig");
+const Glibc = @import("link/Glibc.zig");
 const Archive = @import("link/Archive.zig");
 const Replay = @import("Replay.zig");
 
@@ -86,6 +88,14 @@ stack_size: u64 = 16 * 1024 * 1024,
 /// source file's).
 output: Manifest.Output = .exe,
 archive_stem: []const u8 = "",
+/// An executable that links glibc (`-lc`): its glibc version (in the
+/// compilation's key, `Job.compile_args`) and zig lib directory, from
+/// whose abilists a relink rebuilds the dynamic tables for the manifest's
+/// imports (`Glibc.dynamicOptions`), and the symbols the build already
+/// loaded, if it ran CodeGen.
+glibc_version: ?std.SemanticVersion = null,
+glibc_lib_dir: []const u8 = "",
+glibc: ?*const Glibc = null,
 /// Whether a build that does not relink renews the output's mtime, as a
 /// relink would: `zap run`'s programs are trimmed by it.
 renew_output: bool = false,
@@ -315,7 +325,9 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             .import => {
                 const f: Emit.ImportFlags = .fromBits(@truncate(ls.flags));
                 try imports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls });
-                if (m.symbol(ls.key)) |n| values.appendAssumeCapacity(.{ .symbol = n, .value = 0 });
+                // A dynamic executable's imports get their addresses from
+                // the linker (`Symbols.dynamic_imports`).
+                if (inc.glibc_version == null) if (m.symbol(ls.key)) |n| values.appendAssumeCapacity(.{ .symbol = n, .value = 0 });
             },
             _ => return inc.noLink("unknown link symbol kind", .{}),
         }
@@ -328,9 +340,37 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     var bounds: [Elf.bound_sections.len * 2]u32 = @splat(Elf.no_bound);
     for (&bounds, Elf.boundKeys()) |*b, key| b.* = m.symbol(@backingInt(key)) orelse Elf.no_bound;
 
+    // A dynamic executable's tables, as `Emit.link` builds them.
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var glibc_loaded: ?Glibc = null;
+    defer if (glibc_loaded) |*g| g.deinit();
+    var dynamic: ElfDynamic.Options = .{};
+    var dynamic_imports: []u32 = &.{};
+    const exe_dyn = inc.output == .exe and inc.glibc_version != null;
+    if (exe_dyn) {
+        const g = inc.glibc orelse g: {
+            const path = try std.fs.path.join(arena, &.{ inc.glibc_lib_dir, Glibc.abilists_path });
+            const contents = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err|
+                return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
+            glibc_loaded = Glibc.load(gpa, contents, inc.glibc_version.?) catch |err|
+                return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
+            break :g &glibc_loaded.?;
+        };
+        dynamic = g.dynamicOptions(arena, imports.items) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.NotInGlibc => return inc.noLink("an import glibc does not define", .{}),
+        };
+        dynamic_imports = try arena.alloc(u32, imports.items.len);
+        for (dynamic_imports, imports.items) |*n, imp| n.* = m.symbol(@backingInt(imp.key)) orelse
+            return inc.noLink("import '{s}' has no symbol number", .{imp.name});
+    }
+
     var diag: Elf.Diagnostic = .{};
     const options: Elf.Options = .{
         .entry = if (inc.output == .exe) @fromBackingInt(m.entry) else null,
+        .dynamic = if (exe_dyn) &dynamic else null,
         .symbols = .{
             .atoms = in.numbered,
             .targets = in.targets,
@@ -339,6 +379,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             .bounds = bounds,
             .entry = m.entry_symbol,
             .len = m.symbolLen(),
+            .dynamic_imports = dynamic_imports,
         },
         .diag = &diag,
         .comp_dir = cwd,
@@ -434,7 +475,8 @@ const donor_renew_ns = std.time.ns_per_hour;
 /// in every compilation so that `@import("root")` carries over), and
 /// whether the build links an object (`build-obj`, `build-lib`), whose
 /// code CodeGen generates differently: a symbol the build does not export
-/// is an import, not compiler_rt's.
+/// is an import, not compiler_rt's; and the glibc a `-lc` executable links,
+/// for the same reason.
 /// The builtin module is an input, so a donor whose builtin differs is
 /// valid, but loses most of std; `useDonor` ranks those last.
 fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, root_name: []const u8, args: []const []const u8) !Hash {
@@ -460,6 +502,13 @@ fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, r
         if (std.mem.eql(u8, a, "--test-filter") and i + 1 < args.len) {
             h.update("\x00filter\x00");
             h.update(args[i + 1]);
+        }
+        // -lc and its glibc version (`Job.compile_args`): CodeGen resolves
+        // names glibc defines to imports instead of compiler_rt
+        // (`Emit.exportTarget`).
+        if (std.mem.startsWith(u8, a, "--zap-glibc=")) {
+            h.update("\x00glibc\x00");
+            h.update(a);
         }
     }
     h.update(if (single_threaded) "\x00st" else "\x00mt");

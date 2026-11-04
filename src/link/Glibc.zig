@@ -12,6 +12,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Version = std.SemanticVersion;
 const Glibc = @This();
+const ElfObject = @import("ElfObject.zig");
+const ElfDynamic = @import("ElfDynamic.zig");
 
 pub const Lib = struct {
     name: []const u8,
@@ -135,6 +137,35 @@ pub fn load(gpa: Allocator, contents: []const u8, target: Version) Error!Glibc {
 
 pub fn deinit(g: *Glibc) void {
     g.arena.deinit();
+}
+
+/// The dynamic tables of an executable that imports `imports` from glibc
+/// (`Emit.link`, and `Incremental` relinking from the cache): sorts them by
+/// name, so the tables do not depend on the order code requested them, and
+/// gives each its library and version. DT_NEEDED lists libc.so.6 always,
+/// as upstream, and the other libraries used, in upstream's link order.
+/// Strings are allocated in `arena`.
+pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
+    std.mem.sortUnstable(ElfObject.Import, imports, {}, struct {
+        fn lt(_: void, a: ElfObject.Import, b: ElfObject.Import) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+    var used: [libs.len]bool = @splat(false);
+    used[lib_c] = true;
+    for (imports) |imp| used[(g.get(imp.name) orelse return error.NotInGlibc).lib] = true;
+    var needed: std.ArrayList([]const u8) = .empty;
+    var lib_index: [libs.len]u32 = undefined;
+    for (libs, used, &lib_index) |lib, u, *index| if (u) {
+        index.* = @intCast(needed.items.len);
+        try needed.append(arena, lib.soname);
+    };
+    for (imports) |*imp| {
+        const sym = g.get(imp.name).?;
+        imp.version = try g.versionName(arena, sym.version);
+        imp.library = lib_index[sym.lib];
+    }
+    return .{ .imports = imports, .interp = interp, .needed = needed.items };
 }
 
 pub fn get(g: *const Glibc, name: []const u8) ?Symbol {

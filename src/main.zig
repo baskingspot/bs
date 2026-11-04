@@ -337,6 +337,9 @@ pub const Job = struct {
         for (args[1 .. args.len - opts.run_args.len]) |a| {
             if (!std.mem.eql(u8, a, "--listen=-")) try compile_args.append(arena, a);
         }
+        // The glibc version a -lc build links, which the arguments do not
+        // spell for the native target. Keys only: `full_args` stay as given.
+        if (opts.link_libc) try compile_args.append(arena, try std.fmt.allocPrint(arena, "--zap-glibc={f}", .{opts.glibc_version.?}));
         return .{
             .opts = opts,
             .zig_lib_dir = zig_lib_dir,
@@ -364,11 +367,10 @@ pub const Job = struct {
     pub fn openCache(job: *const Job, out_path: ?[]const u8) ?Incremental {
         const env = job.environ_map;
         // The numbered link has no position-independent layout yet (`Elf`);
-        // -fPIE and -dynamic imply -fPIC. Nor do executables that link libc
-        // use the cache yet: the manifest does not keep their dynamic
-        // imports. Builds with object or archive inputs skip it until the
-        // manifest keeps them (the cache thread's part of stage A).
-        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and !job.opts.link_libc and job.opts.link_inputs.len == 0 and
+        // -fPIE and -dynamic imply -fPIC (and -lc on objects and
+        // libraries). Builds with object or archive inputs skip it until
+        // the manifest keeps them (the cache thread's part of stage A).
+        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and job.opts.link_inputs.len == 0 and
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
@@ -379,6 +381,10 @@ pub const Job = struct {
         i.check = env.get("ZAP_CACHE_CHECK") != null;
         i.donors = !std.mem.eql(u8, env.get("ZAP_CACHE_DONOR") orelse "", "off");
         i.stack_size = job.opts.stack_size;
+        if (job.opts.link_libc and !job.opts.pic) {
+            i.glibc_version = job.opts.glibc_version;
+            i.glibc_lib_dir = job.zig_lib_dir;
+        }
         i.output = switch (job.opts.command) {
             .build_obj => .obj,
             .build_lib => .lib,
@@ -540,6 +546,13 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     var glibc: ?Glibc = if (links_glibc) try loadGlibc(init, job) else null;
     defer if (glibc) |*g| g.deinit();
     if (glibc) |*g| emit.glibc = g;
+    if (glibc) |*g| if (inc_opt) |i| {
+        i.glibc = g;
+    };
+    // `glibc` goes with this attempt (`compile` may try again).
+    defer if (inc_opt) |i| {
+        i.glibc = null;
+    };
     var link_inputs: ElfInput = .{ .arena = arena };
     if (opts.link_inputs.len != 0) {
         for (opts.link_inputs) |path| {
