@@ -472,10 +472,21 @@ fn typeIn(cx: Ctx, ty: InternPool.Index, w: *Writer) Writer.Error!void {
             try typeIn(cx, e.payload_type, w);
         },
         .error_set_type => |names| {
+            // In name order, as upstream (its key keeps declaration order,
+            // which `@typeInfo` shows): each step writes the least name
+            // after the last one written.
             try w.writeAll("error{");
-            for (names, 0..) |n, i| {
+            var last: ?[]const u8 = null;
+            for (0..names.len) |i| {
+                var next: ?[]const u8 = null;
+                for (names) |n| {
+                    const name = cx.ip.stringSlice(n);
+                    if (last != null and !std.mem.lessThan(u8, last.?, name)) continue;
+                    if (next == null or std.mem.lessThan(u8, name, next.?)) next = name;
+                }
                 if (i != 0) try w.writeAll(",");
-                try w.writeAll(cx.ip.stringSlice(n));
+                try w.writeAll(next.?);
+                last = next;
             }
             try w.writeAll("}");
         },
