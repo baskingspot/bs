@@ -10456,6 +10456,25 @@ fn resolvePeerTypesInner(sema: *Sema, block: *Block, src: Src, refs: []const Ref
         many_first = sorted;
         break;
     }
+    // Likewise numbers next to a fixed-width float become that float,
+    // whatever their order (`comptime_float`, `i1`, `f16` gives `f16`):
+    // float peers go first.
+    if (many_first.ptr == refs.ptr) number: {
+        var any_float = false;
+        for (refs) |r| switch (Type.class(sema.ip, sema.typeOf(r))) {
+            .float => any_float = true,
+            .int, .comptime_int, .comptime_float, .noreturn, .undefined => {},
+            else => break :number,
+        };
+        if (!any_float) break :number;
+        const sorted = try sema.arena.dupe(Ref, refs);
+        std.mem.sort(Ref, sorted, sema, struct {
+            fn lt(s: *Sema, x: Ref, y: Ref) bool {
+                return Type.class(s.ip, s.typeOf(x)) == .float and Type.class(s.ip, s.typeOf(y)) != .float;
+            }
+        }.lt);
+        many_first = sorted;
+    }
     for (many_first) |r| {
         const ty = sema.typeOf(r);
         if (ty == .noreturn_type) continue;

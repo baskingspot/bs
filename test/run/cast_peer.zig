@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "97\n1\n1\n1\n1\n1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\nerror{Foo}!?[*:0]const u8\nerror{Foo}!?[*:0]const u8\n?[*:0]const u8\n[*c]c_int\n[*c]c_int\n[*c]const u8\n[*c]const u8\n[3]*const u8\n[*:0]align(2) const volatile u8\n[3]i32\n[]const u8\n[]const u8\nstruct { u32, i16 }\n*align(4) u32\n?*align(4) u32\n*align(1) anyopaque\n232\n232\n12502050\n1\n1\n1\n1\n1\n2\n"
+//! stdout: "f16\nf64\n97\n1\n1\n1\n1\n1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\nerror{Foo}!?[*:0]const u8\nerror{Foo}!?[*:0]const u8\n?[*:0]const u8\n[*c]c_int\n[*c]c_int\n[*c]const u8\n[*c]const u8\n[3]*const u8\n[*:0]align(2) const volatile u8\n[3]i32\n[]const u8\n[]const u8\nstruct { u32, i16 }\n*align(4) u32\n?*align(4) u32\n*align(1) anyopaque\n232\n232\n12502050\n1\n1\n1\n1\n1\n2\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 pub export fn _start() callconv(.naked) noreturn { asm volatile ("call %[main:P]" : : [main] "X" (&main)); }
@@ -236,7 +236,16 @@ fn fnCoerce() void {
     const g: ?*const fn (?[*:0]const u8) callconv(.c) u8 = &cfn;
     rt.printInt(g.?("a"));
 }
+// Numbers next to a fixed-width float peer as that float in any order,
+// as upstream: a comptime_float before an integer does not fail.
+var peer_bit: i1 = -1;
+fn floatPeers() void {
+    pt(@TypeOf(@as(comptime_float, 0.5), peer_bit, @as(f16, 3)));
+    pt(@TypeOf(@as(i1, -1), 0.5, @as(u8, 200), @as(f32, 3), @as(f64, 1)));
+}
+
 fn main() callconv(.c) noreturn {
+    floatPeers();
     fnCoerce();
     casts();
     peerAttrs();
