@@ -46,10 +46,27 @@ deltas: std.ArrayList(struct { at: u32, label: Label, base: Label }) = .empty,
 /// there directly.
 line_events: std.ArrayList(LineEvent) = .empty,
 finished: bool = false,
+/// The general-purpose registers the instructions encoded since it was
+/// last cleared write, by bit (`Reg`): their destinations and the ones
+/// they write implicitly. A call writes every caller-saved one. CodeGen
+/// checks it against the scratch registers each value may use.
+written: u16 = 0,
 
 const LineEvent = struct { offset: u32, kind: enum { row, switch_to }, a: u32, b: u32 };
 
 const unbound = std.math.maxInt(u32);
+
+/// The registers a call does not preserve.
+pub const caller_saved: u16 = Reg.bit(.rax) | Reg.bit(.rcx) | Reg.bit(.rdx) | Reg.bit(.rsi) | Reg.bit(.rdi) |
+    Reg.bit(.r8) | Reg.bit(.r9) | Reg.bit(.r10) | Reg.bit(.r11);
+
+fn writes(e: *Encoder, r: Reg) void {
+    e.written |= r.bit();
+}
+
+fn writesRm(e: *Encoder, rm: Rm) void {
+    if (rm == .reg) e.writes(rm.reg);
+}
 
 pub const Reg = enum(u4) {
     rax,
@@ -71,6 +88,9 @@ pub const Reg = enum(u4) {
 
     fn low(r: Reg) u3 {
         return @truncate(@backingInt(r));
+    }
+    pub fn bit(r: Reg) u16 {
+        return @as(u16, 1) << @backingInt(r);
     }
     /// spl, bpl, sil, and dil need a REX prefix to be addressed as bytes.
     fn needsRexAsByte(r: Reg) bool {
@@ -330,6 +350,7 @@ pub fn bind(e: *Encoder, label: Label) void {
 
 pub fn mov(e: *Encoder, size: Size, dst: Rm, src: Operand) !void {
     try e.reserve();
+    e.writesRm(dst);
     switch (src) {
         .reg => |s| try e.gprRm(size, 0x88, 0x89, .{ .reg = s }, dst, 0),
         .mem => |s| try e.gprRm(size, 0x8a, 0x8b, .{ .reg = dst.reg }, .{ .mem = s }, 0),
@@ -362,6 +383,7 @@ pub fn mov(e: *Encoder, size: Size, dst: Rm, src: Operand) !void {
 /// `movabs dst, sym + addend`: loads a symbol's absolute address.
 pub fn movAbsSym(e: *Encoder, dst: Reg, sym: SymbolKey, addend: i64) !void {
     try e.reserve();
+    e.writes(dst);
     e.prefixes(.{ .w = true, .b = ext(@backingInt(dst)) }, .{});
     e.byte(0xb8 | @as(u8, dst.low()));
     try e.reloc(.x86_64_abs64, sym, addend);
@@ -385,6 +407,7 @@ pub fn switchLines(e: *Encoder, file: u32, base: u32) !void {
 /// value of `key` (a `.value32` relocation), zero-extended into `dst`.
 pub fn movImmValue(e: *Encoder, dst: Reg, key: SymbolKey) !void {
     try e.reserve();
+    e.writes(dst);
     e.prefixes(.{ .b = ext(@backingInt(dst)) }, .{});
     e.byte(0xb8 | @as(u8, dst.low()));
     try e.reloc(.value32, key, 0);
@@ -398,6 +421,7 @@ pub fn movImmValue(e: *Encoder, dst: Reg, key: SymbolKey) !void {
 /// `x86_64_tpoff32` relocation fills.
 pub fn leaThreadLocal(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
     try e.reserve();
+    e.writes(dst);
     e.byte(0x64);
     e.prefixes(.{ .w = true, .r = ext(@backingInt(dst)) }, .{});
     e.byte(0x8b);
@@ -420,6 +444,7 @@ pub fn leaThreadLocal(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
 /// sym@dtpoff]`. A call: it clobbers the caller-saved registers.
 pub fn leaThreadLocalDynamic(e: *Encoder, dst: Reg, sym: SymbolKey, get_addr: SymbolKey) !void {
     try e.reserve();
+    e.writes(dst);
     e.bytes(&.{ 0x48, 0x8d, 0x3d }); // lea rdi, [rip + disp32]
     try e.reloc(.x86_64_tlsld, sym, -4);
     e.int(u32, 0);
@@ -449,6 +474,7 @@ pub fn leaThreadLocalSlot(e: *Encoder, dst: Reg, slot: SymbolKey) !void {
 
 fn threadLocalFromSlot(e: *Encoder, dst: Reg, sym: SymbolKey, kind: Atom.Reloc.Kind) !void {
     try e.reserve();
+    e.writes(dst);
     e.byte(0x64);
     e.prefixes(.{ .w = true, .r = ext(@backingInt(dst)) }, .{});
     e.byte(0x8b);
@@ -471,6 +497,7 @@ fn threadLocalFromSlot(e: *Encoder, dst: Reg, sym: SymbolKey, kind: Atom.Reloc.K
 /// registers.
 pub fn leaThreadLocalGeneral(e: *Encoder, sym: SymbolKey, get_addr: SymbolKey) !void {
     try e.reserve();
+    e.written |= caller_saved;
     e.bytes(&.{ 0x66, 0x48, 0x8d, 0x3d }); // data16 lea rdi, [rip + disp32]
     try e.reloc(.x86_64_tlsgd, sym, -4);
     e.int(u32, 0);
@@ -483,6 +510,7 @@ pub fn leaThreadLocalGeneral(e: *Encoder, sym: SymbolKey, get_addr: SymbolKey) !
 pub fn lea(e: *Encoder, size: Size, dst: Reg, src: Mem) !void {
     assert(size != .byte);
     try e.reserve();
+    e.writes(dst);
     try e.gprRm(size, undefined, 0x8d, .{ .reg = dst }, .{ .mem = src }, 0);
 }
 
@@ -499,6 +527,7 @@ pub fn movsx(e: *Encoder, dst_size: Size, dst: Reg, src_size: Size, src: Rm) !vo
 fn extend(e: *Encoder, dst_size: Size, dst: Reg, src_size: Size, src: Rm, op: u8) !void {
     assert(@backingInt(src_size) < @backingInt(dst_size));
     try e.reserve();
+    e.writes(dst);
     switch (src_size) {
         .byte, .word => try e.modRm(.{
             .w = dst_size == .qword,
@@ -516,6 +545,7 @@ fn extend(e: *Encoder, dst_size: Size, dst: Reg, src_size: Size, src: Rm, op: u8
 /// `lea dst, [rip + label]` (inline asm's `leaq 0f(%rip)`).
 pub fn leaLabel(e: *Encoder, dst: Reg, label: Label) !void {
     try e.reserve();
+    e.writes(dst);
     e.prefixes(.{ .w = true, .r = ext(@backingInt(dst)) }, .{});
     e.byte(0x8d);
     e.byte(modrmByte(0b00, dst.low(), 0b101)); // [rip + disp32]
@@ -550,6 +580,7 @@ pub fn push(e: *Encoder, r: Reg) !void {
 
 pub fn pop(e: *Encoder, r: Reg) !void {
     try e.reserve();
+    e.writes(r);
     e.prefixes(.{ .b = ext(@backingInt(r)) }, .{});
     e.byte(0x58 | @as(u8, r.low()));
 }
@@ -557,12 +588,14 @@ pub fn pop(e: *Encoder, r: Reg) !void {
 pub fn cmov(e: *Encoder, cond: Cond, size: Size, dst: Reg, src: Rm) !void {
     assert(size != .byte);
     try e.reserve();
+    e.writes(dst);
     try e.modRm(.{ .w = size == .qword, .op16 = size == .word }, &.{ 0x0f, 0x40 | @as(u8, @backingInt(cond)) }, @backingInt(dst), rmGpr(src), 0);
 }
 
 /// Sets the byte `dst` to 1 if `cond` holds, else 0.
 pub fn setcc(e: *Encoder, cond: Cond, dst: Rm) !void {
     try e.reserve();
+    e.writesRm(dst);
     try e.modRm(.{ .force_rex = dst == .reg and dst.reg.needsRexAsByte() }, &.{ 0x0f, 0x90 | @as(u8, @backingInt(cond)) }, 0, rmGpr(dst), 0);
 }
 
@@ -574,6 +607,7 @@ pub const AluOp = enum(u3) { add, @"or", adc, sbb, @"and", sub, xor, cmp };
 /// immediate must fit in i32.
 pub fn alu(e: *Encoder, op: AluOp, size: Size, dst: Rm, src: Operand) !void {
     try e.reserve();
+    if (op != .cmp) e.writesRm(dst);
     const base = @as(u8, @backingInt(op)) << 3;
     switch (src) {
         .reg => |s| try e.gprRm(size, base, base | 1, .{ .reg = s }, dst, 0),
@@ -618,6 +652,10 @@ pub const UnaryOp = enum(u3) { not = 2, neg = 3, mul = 4, imul = 5, div = 6, idi
 
 pub fn unary(e: *Encoder, op: UnaryOp, size: Size, dst: Rm) !void {
     try e.reserve();
+    switch (op) {
+        .not, .neg => e.writesRm(dst),
+        .mul, .imul, .div, .idiv => e.written |= Reg.bit(.rax) | Reg.bit(.rdx),
+    }
     try e.gprRm(size, 0xf6, 0xf7, .{ .ext = @backingInt(op) }, dst, 0);
 }
 
@@ -625,6 +663,7 @@ pub fn unary(e: *Encoder, op: UnaryOp, size: Size, dst: Rm) !void {
 pub fn imul(e: *Encoder, size: Size, dst: Reg, src: Rm, imm: ?i32) !void {
     assert(size != .byte);
     try e.reserve();
+    e.writes(dst);
     const i = imm orelse return e.modRm(.{ .w = size == .qword, .op16 = size == .word }, &.{ 0x0f, 0xaf }, @backingInt(dst), rmGpr(src), 0);
     if (std.math.cast(i8, i) != null) {
         try e.gprRm(size, undefined, 0x6b, .{ .reg = dst }, src, 1);
@@ -639,6 +678,8 @@ pub fn imul(e: *Encoder, size: Size, dst: Reg, src: Rm, imm: ?i32) !void {
 /// `idiv`: cbw (al into ah), cwd, cdq, cqo.
 pub fn cqo(e: *Encoder, size: Size) !void {
     try e.reserve();
+    // cbw writes ah.
+    e.writes(if (size == .byte) .rax else .rdx);
     switch (size) {
         .byte => e.bytes(&.{ 0x66, 0x98 }),
         .word => e.bytes(&.{ 0x66, 0x99 }),
@@ -652,6 +693,7 @@ pub const ShiftOp = enum(u3) { rol = 0, ror = 1, shl = 4, shr = 5, sar = 7 };
 /// Shifts `dst` by `count`, or by cl when `count` is null.
 pub fn shift(e: *Encoder, op: ShiftOp, size: Size, dst: Rm, count: ?u8) !void {
     try e.reserve();
+    e.writesRm(dst);
     if (count) |c| {
         if (c == 1) return e.gprRm(size, 0xd0, 0xd1, .{ .ext = @backingInt(op) }, dst, 0);
         try e.gprRm(size, 0xc0, 0xc1, .{ .ext = @backingInt(op) }, dst, 1);
@@ -665,12 +707,14 @@ pub fn shift(e: *Encoder, op: ShiftOp, size: Size, dst: Rm, count: ?u8) !void {
 /// `dst` by cl, filling with bits of `src`.
 pub fn shiftDouble(e: *Encoder, left: bool, dst: Rm, src: Reg) !void {
     try e.reserve();
+    e.writesRm(dst);
     try e.modRm(.{ .w = true }, &.{ 0x0f, if (left) 0xa5 else 0xad }, @backingInt(src), rmGpr(dst), 0);
 }
 
 /// `shld dst, src, count` (`left`) or `shrd dst, src, count` on qwords.
 pub fn shiftDoubleImm(e: *Encoder, left: bool, dst: Rm, src: Reg, count: u8) !void {
     try e.reserve();
+    e.writesRm(dst);
     try e.modRm(.{ .w = true }, &.{ 0x0f, if (left) 0xa4 else 0xac }, @backingInt(src), rmGpr(dst), 1);
     e.byte(count);
 }
@@ -680,6 +724,7 @@ pub fn shiftDoubleImm(e: *Encoder, left: bool, dst: Rm, src: Reg, count: u8) !vo
 pub fn bitScan(e: *Encoder, reverse: bool, size: Size, dst: Reg, src: Rm) !void {
     assert(size != .byte);
     try e.reserve();
+    e.writes(dst);
     try e.modRm(.{ .w = size == .qword, .op16 = size == .word }, &.{ 0x0f, if (reverse) 0xbd else 0xbc }, @backingInt(dst), rmGpr(src), 0);
 }
 
@@ -687,6 +732,7 @@ pub fn bitScan(e: *Encoder, reverse: bool, size: Size, dst: Reg, src: Rm) !void 
 pub fn bswap(e: *Encoder, size: Size, r: Reg) !void {
     assert(size == .dword or size == .qword);
     try e.reserve();
+    e.writes(r);
     e.prefixes(.{ .w = size == .qword, .b = ext(@backingInt(r)) }, .{});
     e.bytes(&.{ 0x0f, 0xc8 | @as(u8, r.low()) });
 }
@@ -694,12 +740,15 @@ pub fn bswap(e: *Encoder, size: Size, r: Reg) !void {
 /// Exchanges `a` with register `b`.
 pub fn xchg(e: *Encoder, size: Size, a: Rm, b: Reg) !void {
     try e.reserve();
+    e.writesRm(a);
+    e.writes(b);
     try e.gprRm(size, 0x86, 0x87, .{ .reg = b }, a, 0);
 }
 
 /// `lock cmpxchg [dst], src`: if [dst] equals al/ax/eax/rax, stores `src`
 /// there (ZF set); else loads [dst] into it (ZF clear).
 pub fn lockCmpxchg(e: *Encoder, size: Size, dst: Mem, src: Reg) !void {
+    e.writes(.rax);
     try e.lock0f(size, 0xb0, 0xb1, dst, src);
 }
 
@@ -708,6 +757,7 @@ pub fn lockCmpxchg(e: *Encoder, size: Size, dst: Mem, src: Reg) !void {
 /// rdx:rax (ZF clear).
 pub fn lockCmpxchg16b(e: *Encoder, dst: Mem) !void {
     try e.reserve();
+    e.written |= Reg.bit(.rax) | Reg.bit(.rdx);
     e.byte(0xf0);
     try e.modRm(.{ .w = true }, &.{ 0x0f, 0xc7 }, 1, rmGpr(.{ .mem = dst }), 0);
 }
@@ -715,6 +765,7 @@ pub fn lockCmpxchg16b(e: *Encoder, dst: Mem) !void {
 /// `lock xadd [dst], src`: adds `src` to [dst] and leaves the old value
 /// in `src`.
 pub fn lockXadd(e: *Encoder, size: Size, dst: Mem, src: Reg) !void {
+    e.writes(src);
     try e.lock0f(size, 0xc0, 0xc1, dst, src);
 }
 
@@ -737,6 +788,8 @@ fn lock0f(e: *Encoder, size: Size, op8: u8, op: u8, dst: Mem, src: Reg) !void {
 /// operands get a REX prefix.
 pub fn asmModRm(e: *Encoder, size: ?Size, prefix: u8, opcode: []const u8, reg: RegField, rm: Rm, imm: i64, imm_len: u8) !void {
     try e.reserve();
+    // Inline assembly's instructions are not modeled.
+    e.written |= caller_saved;
     const byte_regs = size == .byte and ((reg == .reg and reg.reg.needsRexAsByte()) or (rm == .reg and rm.reg.needsRexAsByte()));
     const reg_num: u4 = switch (reg) {
         .reg => |r| @backingInt(r),
@@ -756,6 +809,7 @@ pub fn asmModRm(e: *Encoder, size: ?Size, prefix: u8, opcode: []const u8, reg: R
 /// opcode byte (`bswap`, the accumulator `xchg`); `size` as `asmModRm`'s.
 pub fn asmO(e: *Encoder, size: Size, opcode: []const u8, r: Reg) !void {
     try e.reserve();
+    e.written |= caller_saved;
     e.prefixes(.{ .w = size == .qword, .b = ext(@backingInt(r)) }, .{ .op16 = size == .word });
     e.bytes(opcode[0 .. opcode.len - 1]);
     e.byte(opcode[opcode.len - 1] | r.low());
@@ -765,17 +819,20 @@ pub fn asmO(e: *Encoder, size: Size, opcode: []const u8, r: Reg) !void {
 
 /// `rep movsb`: copies rcx bytes from [rsi] to [rdi], backwards if DF is set.
 pub fn repMovsb(e: *Encoder) !void {
+    e.written |= Reg.bit(.rcx) | Reg.bit(.rsi) | Reg.bit(.rdi);
     try e.code.appendSlice(e.gpa, &.{ 0xf3, 0xa4 });
 }
 
 /// `rep stosb`: stores al to rcx bytes at [rdi].
 pub fn repStosb(e: *Encoder) !void {
+    e.written |= Reg.bit(.rcx) | Reg.bit(.rdi);
     try e.code.appendSlice(e.gpa, &.{ 0xf3, 0xaa });
 }
 
 /// `rep stos{w,d,q}`: stores ax, eax or rax to rcx words, dwords or
 /// qwords at [rdi].
 pub fn repStos(e: *Encoder, size: Size) !void {
+    e.written |= Reg.bit(.rcx) | Reg.bit(.rdi);
     try e.code.appendSlice(e.gpa, switch (size) {
         .byte => &.{ 0xf3, 0xaa },
         .word => &.{ 0x66, 0xf3, 0xab },
@@ -807,6 +864,7 @@ pub fn jcc(e: *Encoder, cond: Cond, target: Target) !void {
 
 pub fn call(e: *Encoder, target: Target) !void {
     try e.reserve();
+    e.written |= caller_saved;
     e.byte(0xe8);
     // Shortening moves the code between the call and its label (the
     // panic stubs after the epilogue).
@@ -823,6 +881,7 @@ pub fn jmpIndirect(e: *Encoder, target: Rm) !void {
 /// `call r/m64`
 pub fn callIndirect(e: *Encoder, target: Rm) !void {
     try e.reserve();
+    e.written |= caller_saved;
     try e.modRm(.{}, &.{0xff}, 2, rmGpr(target), 0);
 }
 
@@ -831,6 +890,7 @@ pub fn ret(e: *Encoder) !void {
 }
 
 pub fn syscall(e: *Encoder) !void {
+    e.written |= Reg.bit(.rax) | Reg.bit(.rcx) | Reg.bit(.r11);
     try e.code.appendSlice(e.gpa, &.{ 0x0f, 0x05 });
 }
 
@@ -888,6 +948,7 @@ pub fn cvtsi2s(e: *Encoder, ty: Float, dst: Xmm, src_size: Size, src: Rm) !void 
 pub fn cvtts2si(e: *Encoder, ty: Float, dst_size: Size, dst: Reg, src: XmmRm) !void {
     assert(dst_size == .dword or dst_size == .qword);
     try e.reserve();
+    e.writes(dst);
     try e.modRm(.{ .prefix = scalarPrefix(ty), .w = dst_size == .qword }, &.{ 0x0f, 0x2c }, @backingInt(dst), rmXmm(src), 0);
 }
 
@@ -909,6 +970,7 @@ pub fn movToXmm(e: *Encoder, size: Size, dst: Xmm, src: Rm) !void {
 pub fn movFromXmm(e: *Encoder, size: Size, dst: Rm, src: Xmm) !void {
     assert(size == .dword or size == .qword);
     try e.reserve();
+    e.writesRm(dst);
     try e.modRm(.{ .op16 = true, .w = size == .qword }, &.{ 0x0f, 0x7e }, @backingInt(src), rmGpr(dst), 0);
 }
 
@@ -1052,6 +1114,7 @@ pub fn vex66(e: *Encoder, map: VexMap, opcode: u8, reg: u4, vvvv: u4, rm: XmmRm,
 /// the low 32 bits of `dst` (`dst_size` is `.dword` or `.qword`).
 pub fn crc32(e: *Encoder, dst_size: Size, src_size: Size, dst: Reg, src: Rm) !void {
     try e.reserve();
+    e.writes(dst);
     try e.modRm(.{
         .prefix = 0xf2,
         .op16 = src_size == .word,
@@ -1117,12 +1180,14 @@ pub fn pshift(e: *Encoder, op: PshiftOp, dst: Xmm, count: u8) !void {
 /// `dst`, the rest zero.
 pub fn pmovmskb(e: *Encoder, dst: Reg, src: Xmm) !void {
     try e.reserve();
+    e.writes(dst);
     try e.modRm(.{ .op16 = true }, &.{ 0x0f, 0xd7 }, @backingInt(dst), .{ .reg = @backingInt(src) }, 0);
 }
 
 /// movmskps/movmskpd: the sign bit of each lane of `src` into `dst`.
 pub fn movmskp(e: *Encoder, ty: Float, dst: Reg, src: Xmm) !void {
     try e.reserve();
+    e.writes(dst);
     try e.modRm(.{ .op16 = ty == .f64 }, &.{ 0x0f, 0x50 }, @backingInt(dst), .{ .reg = @backingInt(src) }, 0);
 }
 
@@ -1243,6 +1308,7 @@ pub fn probedFrameAlloc(e: *Encoder, size: u32, resume_at: u32) !void {
 
 pub fn raw(e: *Encoder, bs: []const u8) !void {
     try e.reserve();
+    e.written |= caller_saved;
     e.bytes(bs);
 }
 
