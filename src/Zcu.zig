@@ -757,7 +757,14 @@ pub fn diagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths) ![]diag
             return std.mem.order(u8, a.msg, b.msg) == .lt;
         }
     }.lessThan);
-    for (errors) |e| {
+    for (errors, 0..) |e, k| {
+        // Once each: the backend reports an error in inline assembly in
+        // every function the inliner copied it into.
+        if (k != 0) {
+            const p = errors[k - 1];
+            if (p.file == e.file and p.embed == e.embed and std.meta.eql(p.span, e.span) and p.code == e.code and
+                p.notes.len == 0 and e.notes.len == 0 and std.mem.eql(u8, p.msg, e.msg)) continue;
+        }
         var notes: std.ArrayList(diag.Note) = try .initCapacity(arena, e.notes.len + 1);
         for (e.notes) |en| notes.appendAssumeCapacity(.{ .loc = if (en.no_loc) null else try zcu.diagLocIn(arena, paths, en.file, en.embed, en.span), .msg = en.msg, .count = en.count, .call = en.call, .decl = en.decl });
         var raw_fix = e.fix;

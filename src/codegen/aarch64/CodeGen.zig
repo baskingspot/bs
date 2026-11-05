@@ -128,6 +128,9 @@ global_asm: ?GlobalAsm.Src = null,
 /// Assembling inline assembly: the template's line being assembled, from
 /// 0, where errors go (`asm_src.find`).
 asm_line: ?u32 = null,
+/// An inline assembly statement failed and reported its error; the
+/// others still report theirs, then the function fails.
+asm_failed: bool = false,
 /// In a variadic C function: the stack bytes the named parameters use.
 va_stack: u32 = 0,
 /// Debug info, as in the x86_64 backend.
@@ -322,6 +325,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         try cg.setupParams();
     }
     try cg.emitBlocks();
+    if (cg.asm_failed) return error.CodegenFail;
     const stubs_at: u32 = @intCast(cg.e.code.items.len);
     try cg.emitStubs();
     const probes_at = if (!naked) try cg.allocFrame(frame_at, body) else null;
@@ -3155,7 +3159,15 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.e.brk(1);
             cg.e.bind(done);
         },
-        .assembly => try cg.assembly(inst, data),
+        .assembly => cg.assembly(inst, data) catch |err| switch (err) {
+            // Reported. The result gets a home, so that the code after it
+            // generates and its own statements report their errors too.
+            error.CodegenFail => {
+                cg.asm_failed = true;
+                _ = try cg.resultMem(inst, data.ty_pl.ty);
+            },
+            else => |e| return e,
+        },
     }
 }
 
