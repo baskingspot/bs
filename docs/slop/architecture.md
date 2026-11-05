@@ -8386,14 +8386,16 @@ change.
   `.init` pieces). The output is a static non-PIE ET_EXEC, and builtin
   says `link_libc`, `.static` and `abi = .musl`.
 - **Cache**: musl executables use the on-disk cache like glibc ones,
-  with libc.a and crt1.o as link inputs, but neither use nor give
-  donors: a donor whose builtin differs only in musl's `link_libc`
-  (`-target x86_64-linux-musl` against `-target x86_64-linux-musl -lc`,
-  or the native target against either) replays wrong results.
-  `BS_CACHE_CHECK` reports std's `Syscall.fail` instances as changed
-  with no changed source reaching them, and `Io.Threaded.addBuf` keeps
-  its `usize` iovlen where musl's is `u32`, so every write to stderr
-  panics. Lifting this waits for the cache to track what changes.
+  with libc.a and crt1.o as link inputs, and donors: one whose builtin
+  differs only in musl's `link_libc` (`-target x86_64-linux-musl`
+  against `-target x86_64-linux-musl -lc`, or the native target against
+  either) shares the donor key. Before two fixes it replayed wrong code:
+  `Io.Threaded.addBuf` kept its `usize` iovlen where musl's is `u32`
+  (a function's body now depends on its declaration's value,
+  `Graph.addOwnNav`), and std's `Syscall.fail` instances kept the
+  donor's offset into `Thread` from their inlined `finish` (an inline
+  result now covers the layouts the body read, `Emit.layoutsHash`), so
+  every write to stderr panicked (test/run/donor_musl_libc.sh).
 - **C and C++ sources** target `<arch>-linux-musl` without `-fPIC`.
   libc++ adds `-D_LIBCPP_HAS_MUSL_LIBC=1` and, as upstream, no
   `HAVE___CXA_THREAD_ATEXIT_IMPL`, which glibc gets only from 2.18.

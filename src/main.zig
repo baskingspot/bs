@@ -657,11 +657,7 @@ pub const Job = struct {
             return null;
         };
         i.check = env.get("BS_CACHE_CHECK") != null;
-        // A donor whose builtin differs only in musl's `link_libc` replays
-        // wrong results (std's `Syscall.fail` instances, `Io.Threaded.addBuf`
-        // with musl's `u32` iovlen), so musl builds neither use donors nor
-        // give them, until the cache tracks what that changes.
-        i.donors = !std.mem.eql(u8, env.get("BS_CACHE_DONOR") orelse "", "off") and !job.opts.musl;
+        i.donors = !std.mem.eql(u8, env.get("BS_CACHE_DONOR") orelse "", "off");
         i.stack_size = job.opts.stack_size;
         i.strip = job.opts.strip;
         i.link_objects = job.link_objects;

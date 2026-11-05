@@ -1285,6 +1285,20 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &deps.step, 10);
         test_step.dependOn(&deps.step);
     }
+    // Donors across musl's -lc: test/run/donor_musl_libc.sh.
+    {
+        const dm = b.addSystemCommand(&.{"sh"});
+        dm.setName("bs donor across musl's -lc");
+        dm.addFileArg(b.path("test/run/donor_musl_libc.sh"));
+        dm.addArtifactArg(bs);
+        _ = dm.addOutputDirectoryArg("work");
+        dm.addDirectoryArg(std_zir);
+        dm.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+        dm.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        // With a cold global cache, libc.a's thousand sources.
+        takes(b, &dm.step, 40);
+        test_step.dependOn(&dm.step);
+    }
     // A compiler_rt edit without its old ZIR: test/run/edit_rt_old_zir.sh.
     {
         const rt = b.addSystemCommand(&.{"sh"});
