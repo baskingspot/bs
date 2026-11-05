@@ -2635,7 +2635,9 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    assumes emission in position order). Each cold block starts with the
    row and the inlined calls open where it was (new `Debug.Inline`
    entries with the same call information). An overflow operation whose
-   bit only its block's branch tests leaves it in the flags: at 8, 16,
+   bit only its block's branch tests, itself or through the one load of
+   the variable a tuple `const` stores it to (forwarded, as SROA splits
+   std.math.add's tuple), leaves it in the flags: at 8, 16,
    32, and 64 bits the operation runs at that width and the branch reads
    its carry or overflow flag (8-bit multiplication excepted), other
    widths compare against the truncation. Pass 2 leaves out values

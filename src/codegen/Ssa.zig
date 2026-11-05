@@ -76,10 +76,18 @@ candidates: std.ArrayList(u32) = .empty,
 var_loads: std.ArrayList(u32) = .empty,
 /// The innermost loop around each of `var_loads`.
 var_load_loops: std.ArrayList(u32) = .empty,
+/// Scratch for `plan`: overflow pairs whose bit only their block's branch
+/// tests, decided once forwarding is.
+ovf_bits: std.ArrayList(OvfBit) = .empty,
 /// Scratch for `deadFills`.
 fills: Fills = .{},
 
 pub const no_loop = std.math.maxInt(u32);
+
+/// An overflow operation, its bit, the value its block's branch compares
+/// (the bit or a load of it), that compare, and the values between the
+/// operation and the branch (`plan`).
+const OvfBit = struct { op: u32, bit: u32, tested: u32, cond: u32, from: u32, to: u32 };
 
 /// A loop's blocks are contiguous in the layout: positions `start` (its
 /// header's first value) through `end` (its last block's terminator).
@@ -256,6 +264,7 @@ pub fn deinit(f: *Ssa, gpa: Allocator) void {
     f.candidates.deinit(gpa);
     f.var_loads.deinit(gpa);
     f.var_load_loops.deinit(gpa);
+    f.ovf_bits.deinit(gpa);
     f.fills.deinit(gpa);
     f.* = undefined;
 }
@@ -678,8 +687,10 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
 /// - An overflow operation whose fields only `struct_field_val`s later in
 ///   its block read is a `pair`: the fields' intervals start at the
 ///   operation, which writes them, and `allocate` takes them there. Its
-///   bit is `fused` when only its block's branch tests it, if nothing
-///   between sets the flags and `ctx.ovfFlagsOnly(tag, bits)`.
+///   bit is `fused` when only its block's branch tests it, directly or
+///   through a load forwarded from the variable it is stored to (which
+///   is fused too), if nothing between has code and
+///   `ctx.ovfFlagsOnly(tag, bits)`.
 /// - A condition only its block's branch reads is `fused` if
 ///   `ctx.fusable(inst)`.
 /// - Arguments are all moved at the entry, so an unused one, whose interval
@@ -738,6 +749,7 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
     f.candidates.clearRetainingCapacity();
     f.var_loads.clearRetainingCapacity();
     f.var_load_loops.clearRetainingCapacity();
+    f.ovf_bits.clearRetainingCapacity();
     // A candidate's `fwd` holds its only store while forwarding is
     // possible, then `no_fwd`.
     const no_fwd = no_tie - 1;
@@ -781,18 +793,16 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
                         def[j] = def[i];
                     };
                     try f.pairs.put(gpa, i, fields);
+                    // The branch may test the bit itself or a load of the
+                    // variable it is stored to, if that is forwarded.
                     const bit = fields[1];
-                    if (bit != no_tie and uses[bit] == 1 and cond != null and uses[@backingInt(cond.?)] == 1 and
-                        ovfBitCmp(ir, ip, cond.?, bit) != null and ctx.ovfFlagsOnly(tags[i], Type.intInfo(ip, op_ty).bits) and
-                        for (values[k + 1 ..]) |next| switch (tags[@backingInt(next)]) {
-                            .dbg_stmt, .block => {},
-                            .struct_field_val => if (ir.extraData(Ir.StructField, datas[@backingInt(next)].ty_pl.payload).data.operand != inst.toRef()) break false,
-                            else => if (next != cond.?) break false,
-                        } else true)
-                    {
-                        fate[bit] = .fused;
-                        reg[bit] = no_reg;
-                    }
+                    const tested: ?u32 = if (cond) |c| switch (tags[@backingInt(c)]) {
+                        .cmp_eq, .cmp_neq => if (datas[@backingInt(c)].bin_op.lhs.toIndex()) |x| @backingInt(x) else null,
+                        else => null,
+                    } else null;
+                    if (bit != no_tie and uses[bit] == 1 and tested != null and uses[@backingInt(cond.?)] == 1 and
+                        ovfBitCmp(ir, ip, cond.?, tested.?) != null and ctx.ovfFlagsOnly(tags[i], Type.intInfo(ip, op_ty).bits))
+                        try f.ovf_bits.append(gpa, .{ .op = i, .bit = bit, .tested = tested.?, .cond = @backingInt(cond.?), .from = @intCast(b.start + k + 1), .to = b.start + b.len });
                 },
                 .arg => if (uses[i] == 0) {
                     reg[i] = no_reg;
@@ -890,6 +900,31 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
             // the definition and the load counts too, also in a block that
             // does not continue.
             crosses[w] = crosses[w] or crosses[l] or cl[end[w]][0] != cl[def[w]][0] or cl[def[l]][1] != cl[def[w]][1];
+        }
+    }
+    // An overflow bit only its block's branch tests, itself or through a
+    // load forwarded from it, is `fused` (with that load) if nothing with
+    // code lies between: the fields' reads, debug markers, forwarded loads,
+    // and values that go, such as the stores of a tuple's split variables.
+    for (f.ovf_bits.items) |o| {
+        // Through a load, the only one of its variable, whose other use is
+        // the store of the bit: a second load would read the bit later.
+        if (o.tested != o.bit and (tags[o.tested] != .load or fwd[o.tested] != o.bit or uses[o.tested] != 1 or
+            uses[@backingInt(datas[o.tested].ty_op.operand.toIndex().?)] != 2)) continue;
+        if (for (insts[o.from..o.to]) |next| {
+            const j = @backingInt(next);
+            if (j == o.cond or fate[j] == .dead) continue;
+            switch (tags[j]) {
+                .dbg_stmt, .block => {},
+                .load => if (fwd[j] == no_tie) break false,
+                .struct_field_val => if (ir.extraData(Ir.StructField, datas[j].ty_pl.payload).data.operand.toIndex() != @as(Inst.Index, @fromBackingInt(o.op))) break false,
+                else => break false,
+            }
+        } else true) {
+            fate[o.bit] = .fused;
+            reg[o.bit] = no_reg;
+            fate[o.tested] = .fused;
+            reg[o.tested] = no_reg;
         }
     }
     // The architecture may lengthen intervals too, before they decide
