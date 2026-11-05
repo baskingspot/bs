@@ -2165,9 +2165,12 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         },
         // A value in memory is copied to its slot (`copyMem`).
         .load => !want and Type.abiSize(cg.ip, data.ty_op.ty) > copy_inline_max,
+        // `returnError` writes none of the registers values get but r11
+        // (`planRegisters`), which `usesR11` covers.
+        .call => data.pl_op.operand.toInterned() != cg.emit.zcu.return_error,
         // Inline assembly writes the registers it names and takes its
         // operands' from rax-r11.
-        .call, .atomic_rmw, .assembly => true,
+        .atomic_rmw, .assembly => true,
         // Its fields are copied through rax.
         .aggregate_init => switch (cg.ip.keyTag(data.ty_pl.ty)) {
             .struct_type, .tuple_type => Type.abiSize(cg.ip, data.ty_pl.ty) > 128,
@@ -2209,6 +2212,13 @@ fn planRegisters(cg: *CodeGen) Error!void {
     } else false;
     // `clobbers` marks the values that want a register.
     try f.liveness(cg.gpa, ir, cg);
+    // A value in memory is read and written through the scalar lowerings'
+    // rax, rcx, rdx, r10, and r11, so `returnError` keeps every other
+    // register its callers' values may hold (`clobbers`).
+    if (ir.func == cg.emit.zcu.return_error) {
+        f.no_regs = true;
+        @memset(reg, Ssa.no_reg);
+    }
     cg.live = true;
     try cg.exemptArgs();
     try f.plan(cg.gpa, ir, cg.ip, cg);
