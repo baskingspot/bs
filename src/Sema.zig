@@ -9589,17 +9589,17 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
     // C pointers coerce to and from single and many pointers of the same child.
     // Differently named integers of the same bits are one (`i32` and
     // `c_int`), as upstream's `coerceInMemoryAllowed`.
-    if (s.flags.size == .c and d.flags.size != .slice) return s.child == d.child or sema.sameScalarRepr(s.child, d.child) or d.child == .anyopaque_type or (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child));
+    if (s.flags.size == .c and d.flags.size != .slice) return s.child == d.child or sema.sameScalarRepr(s.child, d.child) or d.child == .anyopaque_type or sema.pointeeCoercible(s.child, d.child, d.flags.is_const);
     if (d.flags.size == .c and s.flags.size != .slice)
         return s.child == d.child or sema.sameScalarRepr(s.child, d.child) or d.child == .anyopaque_type or
             (s.flags.size == .one and s_array != null and (s_array.?.child == d.child or sema.sameScalarRepr(s_array.?.child, d.child))) or
-            (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child));
+            sema.pointeeCoercible(s.child, d.child, d.flags.is_const);
     if (s.flags.size == d.flags.size) {
         if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return false;
         if (s.child == d.child or sema.sameScalarRepr(s.child, d.child)) return true;
         // Through a const pointer, a child may gain qualifiers itself
         // (`[]?[*:0]u8` to `[]const ?[*:0]const u8`).
-        if (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child)) return true;
+        if (sema.pointeeCoercible(s.child, d.child, d.flags.is_const)) return true;
         if (d.child == .anyopaque_type and s.flags.size != .slice) return !sema.isDoublePtr(s.child);
         if (Type.class(ip, s.child) == .@"fn" and Type.class(ip, d.child) == .@"fn") return sema.fnTypeCoercibleInMemory(s.child, d.child);
         if (s.flags.size == .one and ip.keyTag(d.child) == .array_type) {
@@ -9615,7 +9615,7 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
     if (s.flags.size == .many and d.flags.size == .one and d.child == .anyopaque_type) return !sema.isDoublePtr(s.child);
     // `*[N]T` to `[*]T`.
     if (s.flags.size == .one and d.flags.size == .many) {
-        if (s_array) |a| return (a.child == d.child or sema.sameScalarRepr(a.child, d.child) or (d.flags.is_const and sema.childCoercibleInMemory(a.child, d.child))) and
+        if (s_array) |a| return (a.child == d.child or sema.sameScalarRepr(a.child, d.child) or sema.pointeeCoercible(a.child, d.child, d.flags.is_const)) and
             (d.sentinel == .none or d.sentinel == a.sentinel);
     }
     return false;
@@ -9687,6 +9687,14 @@ fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     if (sk == .error_union_type and dk == .error_union_type)
         return sema.childCoercibleInMemory(sk.error_union_type.error_set_type, dk.error_union_type.error_set_type) and
             sema.childCoercibleInMemory(sk.error_union_type.payload_type, dk.error_union_type.payload_type);
+    // Arrays of the same length whose elements coerce, as upstream.
+    if (sk == .array_type and dk == .array_type) {
+        const sa = sk.array_type;
+        const da = dk.array_type;
+        if (sa.len != da.len) return false;
+        if (da.sentinel != .none and !sema.sentinelsMatch(sa.sentinel, da.sentinel)) return false;
+        return sema.childCoercibleInMemory(sa.child, da.child);
+    }
     if (sk == .opt_type and dk == .opt_type) {
         const sc = sk.opt_type;
         const dc = dk.opt_type;
@@ -9725,7 +9733,16 @@ fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     }
     if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return false;
     if (s.child == d.child) return true;
-    return d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child);
+    return sema.pointeeCoercible(s.child, d.child, d.flags.is_const);
+}
+
+/// Whether a pointer to `s` reads in place as a pointer to `d` (const
+/// when `d_const`). Through a mutable pointer a store goes the other way,
+/// so the coercion must hold both ways, as upstream's `dest_is_mut`
+/// (`*?*S` to `[*c][*c]S`, `*[2]i32` to `*[2]c_int`).
+fn pointeeCoercible(sema: *Sema, s: Index, d: Index, d_const: bool) bool {
+    if (s == d or sema.sameScalarRepr(s, d)) return true;
+    return sema.childCoercibleInMemory(s, d) and (d_const or sema.childCoercibleInMemory(d, s));
 }
 
 fn isOptionalNonC(ip: *const InternPool, child: Index) bool {
@@ -9750,7 +9767,7 @@ fn cPtrMatches(sema: *Sema, s: InternPool.PtrType, d: InternPool.PtrType) bool {
     if (s.flags.is_volatile and !d.flags.is_volatile) return false;
     if (s.flags.alignment != d.flags.alignment) return false;
     if (@as(u32, @bitCast(s.packed_offset)) != @as(u32, @bitCast(d.packed_offset))) return false;
-    return s.child == d.child or (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child));
+    return s.child == d.child or sema.pointeeCoercible(s.child, d.child, d.flags.is_const);
 }
 
 /// Whether sentinel `s` satisfies sentinel `d`, which may be of a
@@ -9762,6 +9779,13 @@ fn sentinelsMatch(sema: *Sema, s: Index, d: Index) bool {
     const ip = sema.ip;
     const sk = ip.indexToKey(s);
     const dk = ip.indexToKey(d);
+    // Integers of one value and differently named types (`0` of `i32`
+    // and of `c_int`), which upstream coerces before comparing.
+    if (sk == .int and dk == .int) {
+        var sa: [2]std.math.big.Limb = undefined;
+        var da: [2]std.math.big.Limb = undefined;
+        return ip.intToBig(s, &sa).eql(ip.intToBig(d, &da));
+    }
     return sk == .opt and dk == .opt and sk.opt.val == .none and dk.opt.val == .none;
 }
 
@@ -9774,7 +9798,7 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
     // `*[N]T` to `[]T`.
     if (s.flags.size == .one and d.flags.size == .slice and ip.keyTag(s.child) == .array_type) {
         const a = ip.keyPayload(.array_type, s.child);
-        if (a.child != d.child and !sema.sameScalarRepr(a.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(a.child, d.child))) return null;
+        if (a.child != d.child and !sema.sameScalarRepr(a.child, d.child) and !sema.pointeeCoercible(a.child, d.child, d.flags.is_const)) return null;
         // A pointer to a zero-length array coerces to any slice, even a
         // mutable one, as upstream, unless both have a sentinel (which is
         // memory).
@@ -9813,7 +9837,7 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
     }
     // `[]T` to `[*]T`, keeping a sentinel.
     if (s.flags.size == .slice and d.flags.size == .many) {
-        if (s.child != d.child and !sema.sameScalarRepr(s.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child))) return null;
+        if (s.child != d.child and !sema.sameScalarRepr(s.child, d.child) and !sema.pointeeCoercible(s.child, d.child, d.flags.is_const)) return null;
         if (s.flags.is_const and !d.flags.is_const) return null;
         if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return null;
         if (!sema.ptrAlignOk(s, d)) return null;
@@ -9822,7 +9846,7 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
     }
     // A zero-terminated `[:0]T` to `[*c]T`, as upstream.
     if (s.flags.size == .slice and d.flags.size == .c) {
-        if (s.child != d.child and !sema.sameScalarRepr(s.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child))) return null;
+        if (s.child != d.child and !sema.sameScalarRepr(s.child, d.child) and !sema.pointeeCoercible(s.child, d.child, d.flags.is_const)) return null;
         if (s.flags.is_const and !d.flags.is_const) return null;
         if (s.sentinel == .none or Type.class(ip, s.child) != .int or s.sentinel != try sema.intValue(s.child, 0)) return null;
         const raw = try sema.slicePtr(block, inst);
