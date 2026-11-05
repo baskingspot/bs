@@ -20329,14 +20329,17 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
         .aborted => |body_key| blk: {
             // The run hit something the evaluator does not reproduce
             // (else the walker fails the same way below): leave this
-            // function to the walker.
-            const r = try sema.walkComptimeCall(caller, src, func, args);
+            // function to the walker, already for the calls of it the
+            // walker makes now. Were they to run lowered, each would
+            // abort the same way and run again in the walker, which for
+            // a recursion that exceeds the branch quota doubles the work
+            // at every level.
             const state = sema.zcu.comptime_bodies.getPtr(body_key).?;
             if (state.* == .ready) {
                 const b = state.ready;
                 state.* = .{ .off = b };
             }
-            break :blk r;
+            break :blk try sema.walkComptimeCall(caller, src, func, args);
         },
     };
     if (memoizable and !sema.refersToComptimeAlloc(result)) {
