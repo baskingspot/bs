@@ -53,8 +53,10 @@ def target_for(target=None, mcpu=None):
             if q is None:
                 raise SystemExit("no qemu-aarch64: .agents/setup installs qemu-user-static")
             runner = [q, "-cpu", "cortex-a53"]
-    if mcpu:
-        flags.append(f"-mcpu={mcpu}")
+    # The native target's CPU is the host's, which bs clamps to what it
+    # supports and upstream does not: pin both compilers to one.
+    if mcpu or not target:
+        flags.append(f"-mcpu={mcpu or 'baseline'}")
     return flags, runner
 
 

@@ -84,8 +84,8 @@ pub const Options = struct {
     /// `-femit-docs[=path]`: the autodocs directory (Docs.zig).
     emit_docs: union(enum) { default, path: []const u8, none } = .none,
     target: ?[]const u8 = null,
-    /// `-mcpu`, resolved (`cpu.resolve`): the baseline unless it names a
-    /// CPU up to x86-64-v2.
+    /// `-mcpu`, resolved (`cpu.resolve`); without it the clamped host CPU
+    /// for the native target, else the baseline.
     cpu: std.Target.Cpu = cpu_mod.baseline,
     /// The target `target` names (`checkTarget`).
     bs_target: InternPool.Target = .x86_64_linux,
@@ -2397,6 +2397,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         const r = cpu_mod.resolve(arena, io, text);
         opts.cpu = r.cpu;
         if (r.refused) |msg| setUnsupported(&opts, arena, "{s}", .{msg});
+    } else if (opts.target == null or std.mem.eql(u8, opts.target.?, "native")) {
+        // As upstream, the native target's CPU is the host's (as
+        // `-mcpu=native`, clamped); an explicit target's is its baseline.
+        opts.cpu = cpu_mod.resolve(arena, io, "native").cpu;
     }
     // The last of `-static` and `-dynamic` (upstream's `link_mode`). Shared
     // objects are position-independent; executables stay static unless

@@ -1,15 +1,16 @@
-//! The CPU bs generates code for (`-mcpu`): x86_64's baseline by
-//! default, or a CPU model and features up to x86-64-v2 (SSE4.2), plus
-//! AES-NI and PCLMULQDQ, which only inline assembly uses. AVX changes the
-//! vector ABI and is refused; `-mcpu=native` is clamped to the supported
-//! subset (docs/slop/architecture.md, "Deliberate differences from
-//! upstream").
+//! The CPU bs generates code for (`-mcpu`): by default the host's,
+//! clamped, for the native target and x86_64's baseline for an explicit
+//! one, as upstream; or a CPU model and features up to x86-64-v2
+//! (SSE4.2), plus AES-NI and PCLMULQDQ, which only inline assembly uses.
+//! AVX changes the vector ABI and is refused; the host's CPU is clamped
+//! to the supported subset (docs/slop/architecture.md, "Where upstream
+//! supports more").
 
 const std = @import("std");
 const Cpu = std.Target.Cpu;
 const x86 = std.Target.x86;
 
-/// x86_64's baseline CPU, bs's default (upstream's default is native).
+/// x86_64's baseline CPU, the default for an explicit target.
 pub const baseline: Cpu = x86.cpu.x86_64.toCpu(.x86_64);
 
 /// The instruction set features bs accepts: x86-64-v2's, and aes and

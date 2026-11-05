@@ -85,6 +85,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
     var cc_args: std.ArrayList([]const u8) = .empty;
     var named_libs = false;
     var opts: main.Options = .{ .command = .build_exe, .root_src_path = "" };
+    var mcpu = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -95,6 +96,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         } else if (std.mem.eql(u8, arg, "-mcpu") or std.mem.startsWith(u8, arg, "-mcpu=")) {
             const r = @import("cpu.zig").resolve(arena, io, if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else next(args, &i));
             opts.cpu = r.cpu;
+            mcpu = true;
             if (r.refused) |msg| main.setUnsupported(&opts, arena, "{s}", .{msg});
         } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {
             opts.zig_lib_dir = next(args, &i);
@@ -151,6 +153,8 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         if (!(host.cpu.arch == .x86_64 and host.os.tag == .linux))
             main.setUnsupported(&opts, arena, "bs translates C only for x86_64-linux and aarch64-macos so far ('native'); pass -target x86_64-linux", .{})
         else if (std.zig.system.resolveTargetQuery(io, .{})) |native| {
+            // The host's CPU, clamped, as a compilation's without -mcpu.
+            if (!mcpu) opts.cpu = @import("cpu.zig").resolve(arena, io, "native").cpu;
             if (native.abi.isGnu()) opts.glibc_version = native.os.version_range.linux.glibc;
             if (named_libs) if (std.zig.system.NativePaths.detect(arena, io, &native, init.environ_map)) |paths| {
                 native_includes = paths.include_dirs.items;

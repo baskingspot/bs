@@ -7893,8 +7893,9 @@ libraries as inputs. To be agreed with that thread.
   `-lc`; the generic CPU), whose output matches upstream's.
 - **Aro's arguments** are upstream's (`Compilation.translateC`, read from
   the argv upstream's zig passes its translate-c binary) for bs's
-  target: `-mcpu` is bs's CPU (the baseline unless `-mcpu` says
-  otherwise), so CPU feature macros are its; the triple is the native
+  target: `-mcpu` is bs's CPU (`cpu.zig`: the clamped host CPU for
+  the native target, else the baseline, unless `-mcpu` says otherwise),
+  so CPU feature macros are its; the triple is the native
   one without `-target` (glibc's
   ABI and detected version, with or without `-lc`, as upstream's native
   target), `x86_64-linux-none` for `-target x86_64-linux`. `-lc` adds
@@ -8120,8 +8121,8 @@ libraries as inputs. To be agreed with that thread.
   with notes), which become ordinary diagnostics. The objects are byte
   for byte upstream's for `-target x86_64-linux-gnu.2.36 -lc
   -mcpu=baseline` and for the native target with and without `-lc`
-  (with `-mcpu=baseline`, since bs's default CPU is the baseline and
-  upstream's native).
+  (with `-mcpu=baseline`, since the native target's CPU is the host's,
+  which bs clamps).
 - **Running**: upstream zig is `BS_ZIG`, else `zig` on PATH, else
   `~/.cache/bs/zig-0.17.1/zig` or `zig-<host>-0.17.1/zig`; its
   version is checked (`zig version`, 5 ms) only when something must
@@ -9239,16 +9240,21 @@ the choice instead of failing:
   instructions inline assembly may use (in their SSE and VEX forms; bs's
   own code is SSE only), puts them in `builtin.cpu` as upstream does,
   and keys the cache on them. std's AES and GHASH take their asm paths
-  only with AVX as well, so they stay on their software ones. The
-  default is the baseline CPU, also where upstream defaults to the
-  native one (no `-mcpu`, which is also what `zig build` passes for its
-  native default and `-Dcpu=native`). An explicit AVX feature or a model
-  that has one (`haswell`, `x86_64_v3`), or any other feature past
-  those (`sha`), is refused with a message naming the features. Only
-  `-mcpu=native` is clamped: the host's model becomes `x86_64_v2` when
-  the host has all of its instructions, else `x86_64`, plus the host's
-  features bs accepts; std takes its SSE paths, as upstream's on a CPU
-  without AVX.
+  only with AVX as well, so they stay on their software ones. As
+  upstream, no `-mcpu` means the host's CPU for the native target (also
+  what `zig build` passes for its native default) and the baseline for
+  an explicit `-target`, which tools/conformance and the hunters pass
+  (tools/mchunt pins `-mcpu=baseline` without one). An explicit AVX
+  feature or a model that has one (`haswell`, `x86_64_v3`), or any other
+  feature past those (`sha`), is refused with a message naming the
+  features. The host's CPU (`-mcpu=native`, or no `-mcpu` natively) is
+  clamped instead: its model becomes `x86_64_v2` when the host has all
+  of its instructions, else `x86_64`, plus the host's features bs
+  accepts; std takes its SSE paths, as upstream's on a CPU without AVX.
+  aarch64 has no such choice yet: bs generates code for `apple_m1` on
+  aarch64-macos and the generic ARMv8.0 core on aarch64-linux, with or
+  without `-mcpu=native`, where upstream's native target uses the
+  host's CPU.
   With `cx16` (x86-64-v2) 128-bit atomics are allowed, as upstream
   (`Sema.atomicElemType`), and lowered with `lock cmpxchg16b`
   (`codegen/x86_64/atomic128.zig`).
