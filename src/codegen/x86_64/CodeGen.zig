@@ -2739,8 +2739,12 @@ fn ptrRoot(cg: *CodeGen, ref: Ref) PtrRoot {
                 switch (ip.keyPayload(.ptr, v).base) {
                     .nav => |n| {
                         // Extern declarations of one name are one object.
-                        const val = ip.getNav(n).val;
-                        if (val == .none or ip.keyTag(val) == .extern_var) return .none;
+                        // By the declaration, not its value: a variable
+                        // whose address code took may have only its type
+                        // resolved (see `ptrToZeroBit`), and the Sema
+                        // thread resolves the value whenever it gets to
+                        // it, so the code must not depend on when.
+                        if (ip.getNav(n).linkage == .@"extern") return .none;
                         return .{ .nav = n };
                     },
                     .uav => |u| return if (ip.keyTag(u.val) == .extern_var or ip.keyTag(u.val) == .extern_func) .none else .{ .uav = u.val },
