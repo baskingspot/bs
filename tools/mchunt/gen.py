@@ -1586,7 +1586,7 @@ class Gen:
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
             (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
             (2, "swx"), (2, "scopenum"), (2, "argbase"), (2, "mulbound"), (2, "retlen"),
-            (2, "sharefwd"), (2, "fwdalias"), (2, "storefwd"), (2, "unrollswap"),
+            (2, "sharefwd"), (2, "fwdalias"), (2, "storefwd"), (2, "unrollswap"), (1, "storelen"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -3574,7 +3574,11 @@ class Gen:
             for j in range(L):
                 sk(f"@as(u64, {buf}[{j}])")
 
-    def s_storefwd(self, ctx):
+    def s_storelen(self, ctx):
+        """s_storefwd's slice-length cases only."""
+        return self.s_storefwd(ctx, slen=True)
+
+    def s_storefwd(self, ctx, slen=False):
         """A store through a pointer, then a load of the same address used
         as an index or a slice length, with writes in between that must
         invalidate it (an aliasing pointer, a byte pointer, a call, inline
@@ -3592,7 +3596,7 @@ class Gen:
         e(f"var {sel} = [_]usize{{ {', '.join(map(str, vals))} }};")
         e(f"_ = &{sel};")
         pv = lambda: f"{sel}[@as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % {len(vals)}]"
-        k = self.r.randrange(13)
+        k = self.r.randrange(6, 12) if slen else self.r.randrange(13)
         if k <= 5 or k == 12:
             # A usize index held in a local, an array element, a struct
             # field or a global, stored and loaded through p.
@@ -3736,7 +3740,7 @@ class Gen:
             sk(f"@as(u32, @truncate({sl}.len))")
             return
         e(f"{lenp} = {n};")
-        w = self.r.randrange(8)
+        w = self.r.randrange(16)
         if w == 0:
             lnp = self.fresh("fln")
             e(f"const {lnp}: *usize = &{lenp};")
@@ -3752,6 +3756,43 @@ class Gen:
             e(f"sfPutG({pv()});")
         elif w == 4:
             e(f"if ({self.bool_expr(ctx, 1)}) {lenp} = {n} -| 1;")
+        elif w == 5:
+            bp = self.fresh("fb")
+            e(f"const {bp}: *u8 = @ptrCast(&{lenp});")
+            e(f"{bp}.* = @truncate({pv()});")
+        elif w == 6:
+            e(f'asm volatile ("movq %[v], (%%rdi)" : : [p] "{{rdi}}" (&{lenp}), [v] "r" ({pv()}) : .{{ .memory = true }});')
+        elif w == 7:
+            vp = self.fresh("fv")
+            e(f"const {vp}: *volatile usize = &{lenp};")
+            e(f"{vp}.* = {pv()};")
+        elif w == 8:
+            e(f"_ = sfRead(&{lenp});")
+        elif w == 9:
+            ws = self.fresh("fw")
+            e(f"const {ws}: *[]u32 = &{sl};")
+            e(f"{ws}.* = {buf}[1..][0..{pv()}];")
+        elif w == 10:
+            e(f"switch ({pv()} % 3) {{")
+            e(f"    0 => {lenp} = {n} -| 1,")
+            e("    1 => {},")
+            e(f"    else => {sl} = {buf}[0..{n} + 1],")
+            e("}")
+        elif w == 11:
+            e(f"{lenp} = undefined;")
+            e(f"{lenp} = {n} -| {self.r.randint(0, 1)};")
+        elif w == 12:
+            i = self.fresh("fi")
+            e(f"for (0..{self.r.randint(1, 4)}) |{i}| {{")
+            ctx["indent"] += 1
+            e(f"if ({i} > 0 and {n} > 0) {{")
+            ctx["indent"] += 1
+            sk(f"{sl}[{n} - 1]")
+            ctx["indent"] -= 1
+            e("}")
+            e(f"{lenp} = {sel}[({i} + {self.r.randint(0, 11)}) % {len(vals)}];")
+            ctx["indent"] -= 1
+            e("}")
         # otherwise nothing in between
         u = self.r.randrange(4)
         if u == 0:
