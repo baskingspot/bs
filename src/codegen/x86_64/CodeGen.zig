@@ -2016,7 +2016,6 @@ fn genSplit(cg: *CodeGen, inst: Inst.Index, q: u32) Error!void {
         const m: Mem = if (fixed and sv.stored == cg.cur_block) .at(.rbp, cg.pair_spills.get(v).?) else switch (home) {
             .reg => |r| try cg.spillReg(@fromBackingInt(v), r),
             .xmm => |x| try cg.spillXmm(@fromBackingInt(v), x),
-            // Moved to memory by its lowering (a float block result).
             else => continue,
         };
         if (fixed) sv.stored = cg.cur_block;
@@ -4337,8 +4336,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.setResult(inst, ir.typeOfIndex(inst, ip), d);
         },
 
-        // The block's result, which each `br` writes (see `genTerm`).
-        .block => if (cg.homes[@backingInt(inst)] != .reg and cg.homes[@backingInt(inst)] != .regs) {
+        // The block's result, which each `br` writes (see `genTerm`). A
+        // float result keeps its XMM register: values computed in it
+        // (`Live.share`) count on that, and are saved with it around
+        // calls (`genSplit`).
+        .block => if (cg.homes[@backingInt(inst)] != .reg and cg.homes[@backingInt(inst)] != .regs and cg.homes[@backingInt(inst)] != .xmm) {
             _ = try cg.slotFor(inst, data.ty_pl.ty);
         },
         .loop => {},
