@@ -42,7 +42,6 @@ const ElfMerge = @import("link/ElfMerge.zig");
 const ElfInput = @import("link/ElfInput.zig");
 const ElfShared = @import("link/ElfShared.zig");
 const Replay = @import("Replay.zig");
-const build_options = @import("build_options");
 
 const Incremental = @This();
 
@@ -174,10 +173,11 @@ replay: ?*Replay = null,
 
 /// Opens and locks the directory of the compilation that `args` (the
 /// command line after `bs`) describes, run from the current directory.
-/// `zig_lib_dir` is the std that compilation uses; `root_name` is
+/// `zig_lib_dir` is the std that compilation uses, and `trusted_lib`
+/// whether it is the default one (`trustedLib`); `root_name` is
 /// `Frontend.Options.root_name`; `tests_std` is whether it tests the std
 /// module itself (`Frontend.testsStd`).
-pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []const u8, zig_lib_dir: []const u8, root_name: []const u8, tests_std: bool, target: []const u8, timing: bool) !Incremental {
+pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []const u8, zig_lib_dir: []const u8, trusted_lib: bool, root_name: []const u8, tests_std: bool, target: []const u8, timing: bool) !Incremental {
     const build_start = Io.Clock.real.now(io);
     const store_seed, const key = try compilationKey(gpa, io, args, zig_lib_dir, target);
 
@@ -203,7 +203,7 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .build_start = build_start,
         .timing = timing,
         .local_is_global = local_is_global,
-        .trusted_lib = try trustedLib(gpa, io, zig_lib_dir),
+        .trusted_lib = try trustedLib(gpa, io, zig_lib_dir, trusted_lib),
     };
     inc.prev = Manifest.open(gpa, io, dir) catch |err| prev: {
         if (timing) std.debug.print("cache: unable to open the manifest: {t}\n", .{err});
@@ -212,29 +212,20 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
     return inc;
 }
 
-/// `zig_lib_dir` resolved, if it is bs's own: the pinned release's, which
-/// bs owns and its users do not edit, so that a no-change build does not
-/// stat the hundreds of std and compiler_rt files it reads (the build
-/// runner's stamp trusts it the same way, BuildRunner.zig). Edit builds
-/// still notice a changed file there: the frontend hashes what it loads.
-/// Any other lib directory (`--zig-lib-dir`, ZIG_LIB_DIR) may be a source
-/// tree under edit and is checked in full.
-fn trustedLib(gpa: Allocator, io: Io, zig_lib_dir: []const u8) !?[:0]const u8 {
-    const lib = Io.Dir.cwd().realPathFileAlloc(io, zig_lib_dir, gpa) catch |err| switch (err) {
+/// `zig_lib_dir` resolved, if it is `trusted`: the default one
+/// (`toolchain.LibDir`), upstream zig 0.17.1's, which its users do not
+/// edit, so that a no-change build does not stat the hundreds of std and
+/// compiler_rt files it reads (the build runner's stamp trusts it the same
+/// way, BuildRunner.zig). Edit builds still notice a changed file there:
+/// the frontend hashes what it loads. Any other lib directory
+/// (`--zig-lib-dir`, ZIG_LIB_DIR) may be a source tree under edit and is
+/// checked in full.
+fn trustedLib(gpa: Allocator, io: Io, zig_lib_dir: []const u8, trusted: bool) !?[:0]const u8 {
+    if (!trusted) return null;
+    return Io.Dir.cwd().realPathFileAlloc(io, zig_lib_dir, gpa) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => return null,
     };
-    errdefer gpa.free(lib);
-    const pinned = Io.Dir.cwd().realPathFileAlloc(io, build_options.zig_lib_dir, gpa) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        else => null,
-    };
-    defer if (pinned) |p| gpa.free(p);
-    if (pinned == null or !std.mem.eql(u8, lib, pinned.?)) {
-        gpa.free(lib);
-        return null;
-    }
-    return lib;
 }
 
 /// The store seed (the compiler's identity and the target) and the key of

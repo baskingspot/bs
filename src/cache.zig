@@ -14,6 +14,8 @@
 //! Layout:
 //!
 //!   <global cache>/bs/store/<32 hex>.zsp       Store packs
+//!   <global cache>/bs/zig/<32 hex>             upstream zig's lib directory
+//!                                               (`toolchain`)
 //!   <local cache>/bs/c/<32 hex>/               one compilation (`compilationDir`)
 //!       lock, manifest, manifest.log, pack
 //!   <local cache>/bs/tc/<32 hex>               a translate-c record, whose

@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
-const build_options = @import("build_options");
 const diag = @import("diag.zig");
 const Frontend = @import("Frontend.zig");
 const BlockCache = @import("BlockCache.zig");
@@ -24,6 +23,7 @@ const ElfShared = @import("link/ElfShared.zig");
 const Docs = @import("Docs.zig");
 const Glibc = @import("link/Glibc.zig");
 const CSource = @import("CSource.zig");
+const toolchain = @import("toolchain.zig");
 const cpu_mod = @import("cpu.zig");
 const InternPool = @import("InternPool.zig");
 
@@ -35,7 +35,10 @@ const thread_stack_size = 60 << 20;
 const usage =
     \\Usage: bs [command] [options]
     \\
-    \\bs is a fast Debug-mode compiler for Zig 0.17.1.
+    \\bs is a fast Debug-mode compiler for Zig 0.17.1. It needs upstream
+    \\zig 0.17.1 on PATH (or in BS_ZIG): bs compiles that zig's std and
+    \\runs its `zig cc` for C. --zig-lib-dir or ZIG_LIB_DIR name another
+    \\lib directory.
     \\
     \\Commands:
     \\  build            Build project from build.zig
@@ -489,6 +492,8 @@ fn inlining(env: *const std.process.Environ.Map) struct { budget: u32, safe: boo
 pub const Job = struct {
     opts: Options,
     zig_lib_dir: []const u8,
+    /// Whether `zig_lib_dir` is the default one (`toolchain.LibDir`).
+    trusted_lib: bool,
     cache_dirs: Frontend.CacheDirs,
     builtin_dir: []const u8,
     /// The fuzzer's `builtin` (`-ffuzz` on an executable), else null.
@@ -510,13 +515,14 @@ pub const Job = struct {
 
     pub fn init(init_: std.process.Init, args: []const []const u8, opts: Options) !Job {
         const arena = init_.arena.allocator();
-        const zig_lib_dir = opts.zig_lib_dir orelse init_.environ_map.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir;
         const command = opts.command;
         const cache_dirs = Frontend.resolveCacheDirs(arena, init_.io, init_.environ_map, .{
             .local = opts.cache_dir,
             .global = opts.global_cache_dir,
             .local_is_global = command == .run,
         });
+        const lib = try toolchain.libDir(arena, init_.io, init_.environ_map, cache_dirs.global, opts.zig_lib_dir);
+        const zig_lib_dir = lib.path;
         const is_test = command.isTest();
         const builtin_opts: Builtin.Options = .{
             .output_mode = switch (command) {
@@ -611,6 +617,7 @@ pub const Job = struct {
         return .{
             .opts = job_opts,
             .zig_lib_dir = zig_lib_dir,
+            .trusted_lib = lib.trusted,
             .cache_dirs = cache_dirs,
             .builtin_dir = builtin_dir,
             .fuzzer_builtin_dir = fuzzer_builtin_dir,
@@ -652,7 +659,7 @@ pub const Job = struct {
         const tests_std = job.opts.command.isTest() and
             (Frontend.testsStd(job.gpa, job.zig_lib_dir, job.opts.root_src_path) catch fatal("out of memory", .{}));
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
-        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.opts.root_name, tests_std, job.cache_target, env.get("BS_CACHE_TIMING") != null) catch |err| {
+        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.trusted_lib, job.opts.root_name, tests_std, job.cache_target, env.get("BS_CACHE_TIMING") != null) catch |err| {
             std.log.warn("unable to use the cache: {t}", .{err});
             return null;
         };
@@ -1488,8 +1495,8 @@ fn printEnv(init: std.process.Init) !void {
     const io = init.io;
     const env = init.environ_map;
     const cwd = try std.process.currentPathAlloc(io, arena);
-    const lib_dir = try std.fs.path.resolve(arena, &.{ cwd, env.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir });
     const dirs = Frontend.resolveCacheDirs(arena, io, env, .{ .local_is_global = true });
+    const lib_dir = try std.fs.path.resolve(arena, &.{ cwd, (try toolchain.libDir(arena, io, env, dirs.global, null)).path });
     var buf: [4096]u8 = undefined;
     var out = Io.File.stdout().writerStreaming(io, &buf);
     var serializer: std.zon.Serializer = .{ .writer = &out.interface };
@@ -1687,7 +1694,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
                 const outcome = try compile(init, j, if (inc) |*i| i else null, out_path, alt_path, root_node, &inputs);
                 if (outcome == .ok and outcome.ok.at_alt) current = 1 - current;
                 const docs_path = outs[current].docs;
-                const prefixed = try prefixInputs(arena, io, inputs.items, .{ .zig_lib_dir = j.zig_lib_dir, .cache_dirs = j.cache_dirs, .build_root = j.opts.build_root });
+                const prefixed = try prefixInputs(arena, io, inputs.items, .{ .zig_lib_dir = j.zig_lib_dir, .trusted_lib = j.trusted_lib, .cache_dirs = j.cache_dirs, .build_root = j.opts.build_root });
                 if (prefixed.len != 0) try server.serveStringMessage(.file_system_inputs, prefixed);
                 switch (outcome) {
                     .ok => |r| {
@@ -1757,13 +1764,13 @@ fn serveErrors(server: *std.zig.Server, gpa: std.mem.Allocator, diags: []const d
 /// separated by zero bytes; empty when there is nothing to report, which
 /// is then not sent (the runner cannot parse an empty list).
 ///
-/// Files of bs's own zig lib directory (the pinned release's, which
-/// nobody edits; see `BuildRunner`) are left out, about 700 of a
+/// Files of a trusted zig lib directory (the default one, upstream zig
+/// 0.17.1's, which nobody edits; see `toolchain.LibDir`) are left out, about 700 of a
 /// configure script's 720: the runner would otherwise stat them for every
 /// configuration cache check, hash them all whenever its build script
 /// cannot be cached, and record each as a `--watch` input. With another
 /// lib directory (`--zig-lib-dir`, ZIG_LIB_DIR), every file is reported.
-pub fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: struct { zig_lib_dir: []const u8, cache_dirs: Frontend.CacheDirs, build_root: ?[]const u8 }) ![]const u8 {
+pub fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: struct { zig_lib_dir: []const u8, trusted_lib: bool, cache_dirs: Frontend.CacheDirs, build_root: ?[]const u8 }) ![]const u8 {
     if (inputs.len == 0) return "";
     const cwd = try std.process.currentPathAlloc(io, arena);
     const Prefix = std.zig.Server.Message.PathPrefix;
@@ -1774,7 +1781,7 @@ pub fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: s
     try roots.append(arena, .{ .prefix = .global_cache, .path = try std.fs.path.resolve(arena, &.{ cwd, job.cache_dirs.global }) });
     if (job.build_root) |br| try roots.append(arena, .{ .prefix = .build_root, .path = try std.fs.path.resolve(arena, &.{ cwd, br }) });
     try roots.append(arena, .{ .prefix = .cwd, .path = cwd });
-    const trusted_lib = std.mem.eql(u8, roots.items[0].path, try std.fs.path.resolve(arena, &.{ cwd, build_options.zig_lib_dir }));
+    const trusted_lib = job.trusted_lib;
     var out: std.ArrayList(u8) = .empty;
     var it = std.mem.splitScalar(u8, inputs, 0);
     while (it.next()) |raw| {
@@ -1804,15 +1811,15 @@ test prefixInputs {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const io = std.testing.io;
-    const lib = try std.fs.path.resolve(arena, &.{build_options.zig_lib_dir});
+    const lib = "/z/lib";
     const dirs: Frontend.CacheDirs = .{ .local = "/p/.zig-cache", .global = "/g" };
     const inputs = try std.mem.join(arena, "\x00", &.{ try std.fs.path.join(arena, &.{ lib, "std/std.zig" }), "/p/build.zig", "/g/p/dep/build.zig" });
-    // bs's own lib directory: its files are left out.
-    try std.testing.expectEqualStrings("\x05build.zig\x00\x04p/dep/build.zig", try prefixInputs(arena, io, inputs, .{ .zig_lib_dir = lib, .cache_dirs = dirs, .build_root = "/p" }));
+    // The default lib directory: its files are left out.
+    try std.testing.expectEqualStrings("\x05build.zig\x00\x04p/dep/build.zig", try prefixInputs(arena, io, inputs, .{ .zig_lib_dir = lib, .trusted_lib = true, .cache_dirs = dirs, .build_root = "/p" }));
     // Nothing else to report: nothing to send.
-    try std.testing.expectEqualStrings("", try prefixInputs(arena, io, inputs[0..std.mem.indexOfScalar(u8, inputs, 0).?], .{ .zig_lib_dir = lib, .cache_dirs = dirs, .build_root = "/p" }));
+    try std.testing.expectEqualStrings("", try prefixInputs(arena, io, inputs[0..std.mem.indexOfScalar(u8, inputs, 0).?], .{ .zig_lib_dir = lib, .trusted_lib = true, .cache_dirs = dirs, .build_root = "/p" }));
     // Another lib directory: every file.
-    try std.testing.expectEqualStrings("\x02std/std.zig\x00\x05build.zig", try prefixInputs(arena, io, "/l/std/std.zig\x00/p/build.zig", .{ .zig_lib_dir = "/l", .cache_dirs = dirs, .build_root = "/p" }));
+    try std.testing.expectEqualStrings("\x02std/std.zig\x00\x05build.zig", try prefixInputs(arena, io, "/l/std/std.zig\x00/p/build.zig", .{ .zig_lib_dir = "/l", .trusted_lib = false, .cache_dirs = dirs, .build_root = "/p" }));
 }
 
 fn cleanExit(io: Io) void {

@@ -52,8 +52,8 @@
             }
             .${system};
 
-          # The binary needs its lib/ beside it: bs bakes that directory in
-          # as its default std, and the build finds upstream zig by it.
+          # The binary needs its lib/ beside it: bs finds its std there
+          # (`zig env`), and the build finds upstream zig by it.
           zig = pkgs.stdenvNoCC.mkDerivation {
             pname = "zig";
             inherit version;

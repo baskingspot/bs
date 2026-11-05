@@ -5082,9 +5082,9 @@ it and can flush every CPU's TLB.
   numbered symbols, entry, and error codes. Frontend, Sema, and CodeGen do not run. A
   conformance unit loading 562 files (std in test mode): 0.64–0.9 ms in
   bs (0.4–0.6 of it the stats), 2 ms wall, against 14–19 ms for a full build.
-  Inputs in bs's own lib directory (`Incremental.trusted_lib`: the
-  compilation's `zig_lib_dir` resolves to the pinned release's, the one
-  bs was built with) are not statted: that is the trust the build
+  Inputs in the default lib directory (`Incremental.trusted_lib`: the
+  compilation's `zig_lib_dir` is upstream zig 0.17.1's, see "Finding the
+  zig lib directory at run time") are not statted: that is the trust the build
   runner's stamp and `main.prefixInputs` place in it, and it saves a
   cached compile step of libvaxis's example 700 of its 860 stats. Edit builds
   still see a changed file there (Replay compares the frontend's content
@@ -7255,16 +7255,16 @@ state. Built for step 1:
   built yet; nothing scans `o/`, which upstream's outputs share).
   bs also creates `<local cache>/tmp`, which upstream's compiler creates
   and the runner writes into.
-- **Inputs under bs's own lib directory are not reported.** Of the
-  `file_system_inputs`, files of the pinned release's lib directory, the
-  one bs was built with, are left out (`main.prefixInputs`); they are
+- **Inputs under the default lib directory are not reported.** Of the
+  `file_system_inputs`, files of the default lib directory (upstream zig
+  0.17.1's) are left out (`main.prefixInputs`); they are
   about 700 of a configure script's 720 (std and std.Build). The runner
   records the configure script's inputs in its configuration cache
   manifest: it stats them on every build, and when the build script
   cannot be cached (it runs a process, such as ziggy's `git describe` or
   monstar's pkg-config) it hashes every one of them again on every build.
   It also records each compile step's inputs for `--watch`. Nobody edits
-  the pinned lib directory, so the runner gains nothing from them: with
+  the default lib directory, so the runner gains nothing from them: with
   them, the runner's own time in a no-change `bs build` of ziggy was
   58 ms, without them 8 ms (bench/README.md). This is the
   trust the runner's stamp already places in that directory (an edit
@@ -7293,8 +7293,8 @@ state. Built for step 1:
   for byte upstream's), and the viewer `main.wasm`. The viewer is
   lib/docs/wasm compiled for wasm32 in ReleaseSmall, the same for every
   project, and bs has no wasm backend: bs's `build.zig` compiles it once
-  with the upstream zig that builds bs, from the zig lib directory baked
-  into bs, and bs embeds it (identical to upstream's). A build with
+  with the upstream zig that builds bs, from that zig's lib directory,
+  and bs embeds it (identical to upstream's). A build with
   another `--zig-lib-dir` takes the html and js from that directory and
   keeps the embedded viewer. zig-clap needs it: its test compile emits
   docs (`getEmittedDocs`) for every step.
@@ -7316,6 +7316,38 @@ state. Built for step 1:
   `bs build test` passes the same 169 steps and 47 of 48 unit tests (1
   skipped) as `zig build test`; its oracle steps find upstream zig on
   PATH when the build's compiler is not a zig release.
+
+### Finding the zig lib directory at run time (built 2026-11-05)
+
+A released bs (`just release-build`, shipped by the org's release
+workflow) runs where its build tree is not, so the lib directory it
+compiles against (std, compiler_rt, the build runner, translate-c,
+libc's and libc++'s sources) is found when it runs (`src/toolchain.zig`):
+
+- `--zig-lib-dir` (`--zig-lib=` for `bs build`), else `ZIG_LIB_DIR`,
+  else the lib directory of upstream zig: `BS_ZIG`, else `zig` on PATH,
+  else `~/.cache/bs/zig-<host>-0.17.1/zig` (`toolchain.findZig`, which
+  C compiles use too). That zig must report 0.17.1 (`zig version`), and
+  `zig env`, run without ZIG_LIB_DIR, names its lib directory, which
+  copes with every install layout (release tarball, Homebrew, mise, Nix).
+  The answer is kept in `<global cache>/bs/zig/<hash>`, keyed by the
+  binary's real path, inode, size, mtime and ctime, so a build reads one
+  small file instead of running zig twice (about 5 ms).
+- Only then the lib directory bs was built with
+  (`build_options.zig_lib_dir`), if it is still there: a development
+  build keeps working with no zig, or another version, on PATH.
+- Otherwise bs exits with one error that says it needs upstream zig
+  0.17.1, what it found (no zig, and where it looked; or the version of
+  the one it found), and the fix.
+- The default lib directory is the trusted one (`toolchain.LibDir`):
+  `Incremental.trusted_lib`, the build runner's stamp, translate-c's
+  binary, and `main.prefixInputs` skip its files. A lib directory given
+  explicitly is trusted when it resolves to the default, as under
+  `bs build`, which passes the default to the runner and every step.
+
+Nothing else in a bs binary depends on where it was built: C and C++
+compiles find upstream zig as above, and the docs viewer and build web
+UI wasm are embedded.
 
 ## Fuzzing (designed and built 2026-11-03; x86_64-linux)
 
@@ -7780,8 +7812,9 @@ so static links compile as before.
   `zig` with the same arguments: they are Clang and LLVM tools, which bs
   never runs itself. `objcopy` stays `[unsupported]` until needed.
 - **Finding upstream zig**: `BS_ZIG`, else `zig` on PATH, else
-  `~/.cache/bs/zig-<host>-0.17.1/zig`, accepted only if it reports
-  0.17.1 (checked once per binary, by stat, in the global cache). Without
+  `~/.cache/bs/zig-<host>-0.17.1/zig` (`toolchain.findZig`), accepted
+  only if it reports 0.17.1 (`zig version`, when something must
+  compile). Without
   one, a step with C fails with one `[unsupported]` diagnostic saying C
   sources need upstream zig 0.17.1 and where bs looked. Pure Zig and
   `-lc`-only programs never look.

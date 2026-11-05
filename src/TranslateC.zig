@@ -20,7 +20,6 @@
 
 const std = @import("std");
 const Io = std.Io;
-const build_options = @import("build_options");
 const main = @import("main.zig");
 const cache = @import("cache.zig");
 const Frontend = @import("Frontend.zig");
@@ -28,6 +27,7 @@ const Incremental = @import("Incremental.zig");
 const BuildRunner = @import("BuildRunner.zig");
 const ToolRecord = @import("ToolRecord.zig");
 const CSource = @import("CSource.zig");
+const toolchain = @import("toolchain.zig");
 const InternPool = @import("InternPool.zig");
 
 const Request = struct {
@@ -58,7 +58,7 @@ const Request = struct {
     /// (`CSource.libcIncludeDirs`), as upstream's.
     native_abi: bool = false,
     listen: bool,
-    zig_lib_dir: []const u8,
+    zig_lib: toolchain.LibDir,
     cache_dirs: Frontend.CacheDirs,
     build_root: ?[]const u8,
     unsupported: ?[]const u8,
@@ -176,6 +176,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
         opts.link_libc = true;
     }
+    const cache_dirs = Frontend.resolveCacheDirs(arena, io, init.environ_map, .{ .local = opts.cache_dir, .global = opts.global_cache_dir });
     return .{
         .source = source orelse if (opts.unsupported != null) "" else main.fatal("expected a C source file to translate", .{}),
         .target = opts.bs_target,
@@ -188,8 +189,8 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         .native_includes = native_includes,
         .native_abi = std.mem.eql(u8, target, "native"),
         .listen = opts.listen,
-        .zig_lib_dir = opts.zig_lib_dir orelse init.environ_map.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir,
-        .cache_dirs = Frontend.resolveCacheDirs(arena, io, init.environ_map, .{ .local = opts.cache_dir, .global = opts.global_cache_dir }),
+        .zig_lib = try toolchain.libDir(arena, io, init.environ_map, cache_dirs.global, opts.zig_lib_dir),
+        .cache_dirs = cache_dirs,
         .build_root = opts.build_root,
         .unsupported = opts.unsupported,
     };
@@ -249,7 +250,8 @@ fn serve(init: std.process.Init, req: *const Request) !void {
                 }
                 const r = try translate(init, req);
                 const prefixed = try main.prefixInputs(arena, io, r.inputs, .{
-                    .zig_lib_dir = req.zig_lib_dir,
+                    .zig_lib_dir = req.zig_lib.path,
+                    .trusted_lib = req.zig_lib.trusted,
                     .cache_dirs = req.cache_dirs,
                     .build_root = req.build_root,
                 });
@@ -281,16 +283,14 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     const cwd_path = try std.process.currentPathAlloc(io, arena);
     const cwd = Io.Dir.cwd();
     const start_ns = Io.Clock.real.now(io).toNanoseconds();
-    const lib = try std.fs.path.resolve(arena, &.{ cwd_path, req.zig_lib_dir });
+    const lib = try std.fs.path.resolve(arena, &.{ cwd_path, req.zig_lib.path });
     const global = try std.fs.path.resolve(arena, &.{ cwd_path, req.cache_dirs.global });
     const local = req.cache_dirs.local;
     const source = try std.fs.path.resolve(arena, &.{ cwd_path, req.source });
 
-    // As the build runner, translate-c from the pinned release's lib
-    // directory is trusted not to change.
-    const trusted = init.environ_map.get("ZIG_LIB_DIR") == null and
-        std.mem.eql(u8, lib, try std.fs.path.resolve(arena, &.{ cwd_path, build_options.zig_lib_dir }));
-    const exe, const exe_hash, const use = try ensureBinary(init, lib, global, trusted);
+    // As the build runner, translate-c from the default lib directory is
+    // trusted not to change.
+    const exe, const exe_hash, const use = try ensureBinary(init, lib, global, req.zig_lib.trusted);
     defer if (use) |f| f.close(io);
 
     // Upstream's arguments, with the depfile and output paths left for

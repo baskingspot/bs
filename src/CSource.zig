@@ -20,6 +20,7 @@ const Io = std.Io;
 const cache = @import("cache.zig");
 const diag = @import("diag.zig");
 const ToolRecord = @import("ToolRecord.zig");
+const toolchain = @import("toolchain.zig");
 
 const CSource = @This();
 
@@ -621,7 +622,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     const local = try std.fs.path.resolve(s, &.{ cwd_path, o.local_cache });
     const start_ns = Io.Clock.real.now(io).toNanoseconds();
 
-    const zig = findZig(s, io, environ);
+    const zig = toolchain.findZig(s, io, environ);
     // Upstream zig's identity goes into the key: another Clang compiles
     // other bytes.
     const zig_id = if (zig.found) |p| id: {
@@ -1321,8 +1322,6 @@ fn runtimeJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Ru
     };
 }
 
-const Found = struct { found: ?[]const u8, looked: []const u8 };
-
 /// libc's header directories: `-isystem` and `-iframework`, in order.
 pub const LibcDirs = struct {
     includes: []const []const u8,
@@ -1537,27 +1536,6 @@ fn runCc(arena: std.mem.Allocator, io: Io, argv: []const []const u8, env: *const
     };
     if (!res.term.success()) return error.CCompilerFailed;
     return res;
-}
-
-/// Upstream zig: `BS_ZIG`, else `zig` on PATH, else where `.agents/setup`
-/// installs it.
-fn findZig(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map) Found {
-    const cwd = Io.Dir.cwd();
-    if (environ.get("BS_ZIG")) |p| return .{ .found = p, .looked = p };
-    if (environ.get("PATH")) |path| {
-        var it = std.mem.tokenizeScalar(u8, path, ':');
-        while (it.next()) |dir| {
-            const p = std.fs.path.join(arena, &.{ dir, "zig" }) catch continue;
-            if (cwd.access(io, p, .{ .execute = true })) |_| return .{ .found = p, .looked = p } else |_| {}
-        }
-    }
-    const home = environ.get("HOME") orelse return .{ .found = null, .looked = "~/.cache/bs" };
-    const host = @tagName(@import("builtin").cpu.arch) ++ "-" ++ @tagName(@import("builtin").os.tag);
-    for ([_][]const u8{ "zig-0.17.1", "zig-" ++ host ++ "-0.17.1" }) |sub| {
-        const p = std.fs.path.join(arena, &.{ home, ".cache", "bs", sub, "zig" }) catch continue;
-        if (cwd.access(io, p, .{ .execute = true })) |_| return .{ .found = p, .looked = p } else |_| {}
-    }
-    return .{ .found = null, .looked = std.fs.path.join(arena, &.{ home, ".cache", "bs", "zig-" ++ host ++ "-0.17.1" }) catch "~/.cache/bs" };
 }
 
 /// Null when `zig` is upstream's 0.17.1, else why not.

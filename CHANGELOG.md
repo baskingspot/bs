@@ -17,6 +17,7 @@ Changes a user of bs notices, newest first, in the
 
 ### Changed
 
+- bs finds Zig 0.17.1's lib directory when it runs, not where it was built: `--zig-lib-dir`, then `ZIG_LIB_DIR`, then the lib directory of upstream zig (`BS_ZIG`, else `zig` on `PATH`), which must be 0.17.1. Without one, bs fails with an error that names the version it needs.
 - C sources for `-target x86_64-linux` and `aarch64-linux` compile for the musl ABI those targets resolve to, as upstream's do, and `bs translate-c` uses it in the target triple.
 - On aarch64, a call whose target is beyond the ±128 MiB branch range is an `error[branch-range]` that names the caller and the target (bs adds no range-extension thunks), instead of `link failed: RelocationOverflow`.
 - zap is now bs. The binary is `bs`, the environment variables are `BS_*`, and the caches are `<global cache>/bs`, `.zig-cache/bs`, and `~/.cache/bs`. Old `ZAP_*` variables are ignored; delete `~/.cache/zig/zap`, `.zig-cache/zap`, and `~/.cache/zap`.

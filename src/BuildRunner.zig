@@ -13,11 +13,11 @@
 
 const std = @import("std");
 const Io = std.Io;
-const build_options = @import("build_options");
 const main = @import("main.zig");
 const cache = @import("cache.zig");
 const Frontend = @import("Frontend.zig");
 const Incremental = @import("Incremental.zig");
+const toolchain = @import("toolchain.zig");
 
 pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const arena = init.arena.allocator();
@@ -31,9 +31,10 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
         user_args = user_args[1..];
     }
     const cwd = try std.process.currentPathAlloc(io, arena);
-    const zig_lib_dir = try std.fs.path.resolve(arena, &.{ cwd, lib_override orelse env.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir });
     const dirs = Frontend.resolveCacheDirs(arena, io, env, .{ .local_is_global = true });
     const global = try std.fs.path.resolve(arena, &.{ cwd, dirs.global });
+    const lib = try toolchain.libDir(arena, io, env, global, lib_override);
+    const zig_lib_dir = try std.fs.path.resolve(arena, &.{ cwd, lib.path });
 
     // One runner per bs binary, zig lib directory and mode.
     const mode = "-OReleaseSafe";
@@ -45,15 +46,14 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     // Held until the runner replaces this process (the file closes on
     // exec), so that maintenance keeps the runner it finds.
     _ = cache.useTool(io, runner_dir) catch {};
-    // With bs's own zig lib directory, the pinned release's, which nobody
-    // edits, a runner that is as the last check left it is current: that
-    // saves the check's stat of every source the runner imports (about
-    // 3 ms of a 38 ms no-change build). A lib directory given with
-    // `--zig-lib=` or ZIG_LIB_DIR may be a source tree under edit, so it
-    // is always checked.
+    // With the default zig lib directory, upstream zig 0.17.1's, which
+    // nobody edits, a runner that is as the last check left it is current:
+    // that saves the check's stat of every source the runner imports
+    // (about 3 ms of a 38 ms no-change build). Another lib directory, given
+    // with `--zig-lib=` or ZIG_LIB_DIR, may be a source tree under edit,
+    // so it is always checked.
     const stamp_path = try std.fs.path.join(arena, &.{ runner_dir, "maker.stat" });
-    const trusted_lib = lib_override == null and env.get("ZIG_LIB_DIR") == null;
-    if (!(trusted_lib and toolUnchanged(io, runner_path, stamp_path))) {
+    if (!(lib.trusted and toolUnchanged(io, runner_path, stamp_path))) {
         try compileTool(init, runner_dir, &.{
             "bs",                 "build-exe",
             mode,                 try std.fmt.allocPrint(arena, "-Mroot={s}/compiler/Maker.zig", .{zig_lib_dir}),

@@ -23,7 +23,7 @@ zig build -Doptimize=ReleaseFast
 
 The compiler is `zig-out/bin/bs`. A Debug build of bs is about ten times slower, so time only a ReleaseFast one.
 
-C and C++ sources, `-lc`, and `@cImport` go through upstream's `zig cc` and translate-c. bs looks for upstream `zig` in `BS_ZIG`, then on `PATH`.
+C and C++ sources, `-lc`, and `@cImport` go through upstream's `zig cc` and translate-c. bs looks for upstream `zig` in `BS_ZIG`, then on `PATH`. bs compiles the std library of that zig, which must be 0.17.1; a bs built from source falls back to the lib directory of the zig that built it.
 
 ## Use it
 
