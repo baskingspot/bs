@@ -1046,8 +1046,8 @@ fn storeBytes(cg: *CodeGen, m: Mem, reg: Reg, n: u64) Error!void {
     }
 }
 
-/// Copies the value `ref` to `dst`. Uses x9, x10, x11, x16, and x17; `dst`
-/// must not be based on those.
+/// Copies the value `ref` to `dst`. Uses x9, x10, x16, x17, v30, and v31;
+/// `dst` must not be based on those.
 fn copyTo(cg: *CodeGen, dst: Mem, ref: Ref) Error!void {
     try cg.copyVal(dst, try cg.valOf(ref));
 }
@@ -1073,7 +1073,8 @@ fn copyVal(cg: *CodeGen, dst: Mem, v: Val) Error!void {
     }
 }
 
-/// Copies `size` bytes. Uses x9, x10, x11, x16, and x17.
+/// Copies `size` bytes. Uses x9, x10, x16, x17, v30, and v31: 16 bytes
+/// at a time through q registers, the rest through x10.
 fn copyMem(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
     if (size == 0) return;
     var s = src;
@@ -1090,18 +1091,22 @@ fn copyMem(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
     if (size > 128) {
         try cg.addrTo(.x16, s);
         try cg.addrTo(.x17, d);
-        try cg.e.movImm(.x, .x9, size / 16);
+        try cg.e.movImm(.x, .x9, size / 32);
         const top = try cg.e.newLabel();
         cg.e.bind(top);
-        try cg.e.ldp(.dword, .x10, .x11, .{ .base = .x16, .offset = .{ .post = 16 } });
-        try cg.e.stp(.dword, .x10, .x11, .{ .base = .x17, .offset = .{ .post = 16 } });
+        try cg.e.ldpQ(.v30, .v31, .{ .base = .x16, .offset = .{ .post = 32 } });
+        try cg.e.stpQ(.v30, .v31, .{ .base = .x17, .offset = .{ .post = 32 } });
         try cg.e.addSub(.subs, .x, .x9, .x9, .{ .imm = 1 });
         try cg.e.bcond(.ne, top);
         s = .at(.x16, 0);
         d = .at(.x17, 0);
-        left = size % 16;
+        left = size % 32;
     }
     var off: u64 = 0;
+    while (left - off >= 16) : (off += 16) {
+        try cg.e.ldrQ(.v31, try cg.access(s.plus(off), 16, .x16));
+        try cg.e.strQ(.v31, try cg.access(d.plus(off), 16, .x17));
+    }
     while (off < left) {
         const chunk: u64 = if (left - off >= 8) 8 else if (left - off >= 4) 4 else if (left - off >= 2) 2 else 1;
         try cg.e.ldr(sizeOf(chunk), .x10, try cg.access(s.plus(off), @intCast(chunk), .x16));
@@ -1110,7 +1115,8 @@ fn copyMem(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
     }
 }
 
-/// Fills `size` bytes with `byte`. Uses x9, x10, x16, and x17.
+/// Fills `size` bytes with `byte`. Uses x9, x10, x16, x17, and v31: 16
+/// bytes at a time from a q register, the rest from x10.
 fn fillMem(cg: *CodeGen, dst: Mem, size: u64, byte: u8) Error!void {
     if (size == 0) return;
     var d = dst;
@@ -1122,19 +1128,29 @@ fn fillMem(cg: *CodeGen, dst: Mem, size: u64, byte: u8) Error!void {
     pattern *%= 0x0101_0101_0101_0101;
     const r: Reg = if (pattern == 0) .zr else .x10;
     if (pattern != 0) try cg.e.movImm(.x, .x10, pattern);
+    if (size >= 16) {
+        if (pattern == 0) {
+            try cg.e.raw(0x6f00e400 | 31); // movi v31.2d, #0
+        } else {
+            try cg.e.raw(0x4e010c00 | 10 << 5 | 31); // dup v31.16b, w10
+        }
+    }
     var left = size;
     if (size > 128) {
         try cg.addrTo(.x17, d);
-        try cg.e.movImm(.x, .x9, size / 16);
+        try cg.e.movImm(.x, .x9, size / 32);
         const top = try cg.e.newLabel();
         cg.e.bind(top);
-        try cg.e.stp(.dword, r, r, .{ .base = .x17, .offset = .{ .post = 16 } });
+        try cg.e.stpQ(.v31, .v31, .{ .base = .x17, .offset = .{ .post = 32 } });
         try cg.e.addSub(.subs, .x, .x9, .x9, .{ .imm = 1 });
         try cg.e.bcond(.ne, top);
         d = .at(.x17, 0);
-        left = size % 16;
+        left = size % 32;
     }
     var off: u64 = 0;
+    while (left - off >= 16) : (off += 16) {
+        try cg.e.strQ(.v31, try cg.access(d.plus(off), 16, .x16));
+    }
     while (off < left) {
         const chunk: u64 = if (left - off >= 8) 8 else if (left - off >= 4) 4 else if (left - off >= 2) 2 else 1;
         try cg.e.str(sizeOf(chunk), r, try cg.access(d.plus(off), @intCast(chunk), .x16));
