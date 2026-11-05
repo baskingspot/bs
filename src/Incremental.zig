@@ -3097,7 +3097,8 @@ const Graph = struct {
     use_units: []u32 = &.{},
     func_ref_items: [][2]u32 = &.{},
     unit_ref_items: [][2]u32 = &.{},
-    ies_items: std.ArrayList(Recorder.Ref) = .empty,
+    /// Dependees that get a node whether or not an edge names them.
+    node_items: std.ArrayList(Recorder.Ref) = .empty,
     analyze_items: std.ArrayList(u32) = .empty,
     reach_items: std.ArrayList(ReachItem) = .empty,
     quota_items: std.ArrayList([2]u32) = .empty,
@@ -3138,7 +3139,7 @@ const Graph = struct {
         gpa.free(g.use_units);
         gpa.free(g.func_ref_items);
         gpa.free(g.unit_ref_items);
-        g.ies_items.deinit(gpa);
+        g.node_items.deinit(gpa);
         g.analyze_items.deinit(gpa);
         g.reach_items.deinit(gpa);
         g.quota_items.deinit(gpa);
@@ -3186,14 +3187,14 @@ const Graph = struct {
         {
             var it = zcu.inferred_errors.iterator();
             while (it.next()) |e| if (e.value_ptr.len != 0) {
-                try g.ies_items.append(gpa, try r.addDependee(.{ .func_ies = e.key_ptr.* }));
+                try g.node_items.append(gpa, try r.addDependee(.{ .func_ies = e.key_ptr.* }));
             };
             var it_any = zcu.anyerror_ies.keyIterator();
-            while (it_any.next()) |f| try g.ies_items.append(gpa, try r.addDependee(.{ .func_ies = f.* }));
+            while (it_any.next()) |f| try g.node_items.append(gpa, try r.addDependee(.{ .func_ies = f.* }));
             // Every inlinable function's result too: an edit build loading
             // the function reads no node as not inlinable.
             var it_inline = zcu.inline_results.keyIterator();
-            while (it_inline.next()) |f| try g.ies_items.append(gpa, try r.addDependee(.{ .func_inline = f.* }));
+            while (it_inline.next()) |f| try g.node_items.append(gpa, try r.addDependee(.{ .func_inline = f.* }));
         }
         g.use_units = try gpa.alloc(u32, emit.content_uses.items.len);
         for (emit.content_uses.items, g.use_units) |use, *u| u.* = try r.addUnit(use.unit);
@@ -3266,6 +3267,10 @@ const Graph = struct {
             const ty = zcu.file_root_types.items[file];
             if (ty != .none) try g.root_ns_items.append(gpa, try r.addDependee(.{ .namespace = ip.structInfo(ty).namespace }));
         };
+        // A lazy build's namespaces that an edit reached, decided now.
+        if (zcu.replay) |rp| for (rp.made_namespaces.items) |ns| {
+            try g.node_items.append(gpa, try r.addDependee(.{ .namespace = ns }));
+        };
         try r.prepare(io);
         // Every item is listed: free the tables that found them.
         r.units.clearAndFree(gpa);
@@ -3320,7 +3325,7 @@ const Graph = struct {
         for (g.quota_items.items) |*it| it[0] = try r.unitNode(it[0]);
         g.root_nodes = try gpa.alloc(u32, g.root_ns_items.items.len);
         for (g.root_ns_items.items, g.root_nodes) |ref, *n| n.* = try r.dependeeNode(ref);
-        for (g.ies_items.items) |ref| _ = try r.dependeeNode(ref);
+        for (g.node_items.items) |ref| _ = try r.dependeeNode(ref);
         g.reach_nodes = try gpa.alloc([2]u32, g.reach_items.items.len);
         for (g.reach_items.items, g.reach_nodes) |it, *rn| rn.* = .{ switch (it.from) {
             .ref => |f| try r.dependeeNode(f),

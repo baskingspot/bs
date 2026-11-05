@@ -65,6 +65,10 @@ late_unmapped: bool = false,
 rt_waiting: std.ArrayList(u32) = .empty,
 /// (namespace node, requester node) of those that are files' namespaces.
 rt_effects: std.ArrayList([2]u32) = .empty,
+/// The namespaces `walkNode` made again, which the lazy build records as a
+/// full build would (`Incremental.Graph.collect`): a green unit that
+/// evaluated the container is not loaded, so nothing else lists them.
+made_namespaces: std.ArrayList(u32) = .empty,
 changed: std.ArrayList(seeds.Changed) = .empty,
 /// Each input's file in this build, once looked up: its index + 1, or 0
 /// if not looked up yet, or `no_file`.
@@ -454,6 +458,7 @@ pub fn destroy(r: *Replay) void {
     r.late_mapped.deinit(gpa);
     r.rt_waiting.deinit(gpa);
     r.rt_effects.deinit(gpa);
+    r.made_namespaces.deinit(gpa);
     if (r.debug_paths) |*d| {
         var it = d.keyIterator();
         while (it.next()) |k| gpa.free(k.*);
@@ -1196,7 +1201,8 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
     // it did, is made again: its scan queues the roots as they are now,
     // and analysis decides each.
     if (tag == .namespace and r.namespaceOutdated(n)) {
-        _ = try r.dependee(n, .namespace) orelse return r.die(n);
+        const dep = try r.dependee(n, .namespace) orelse return r.die(n);
+        try r.made_namespaces.append(r.gpa, dep.namespace);
     }
     try Incremental.reachNext(m.deps(n), m.nodeRefs(n), next, r.gpa);
     for (m.nodeRefs(n)) |ref| if (ref.kind == .nav) r.data_refs.set(ref.value);

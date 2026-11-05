@@ -5138,7 +5138,13 @@ records only what changed, and links from the manifest.
   outdated one goes to analysis (`ensure*`, `queueFunc`, a namespace's
   scan), which decides it, and the walk goes on from it if it is green.
   A namespace whose container or roots an edit reached is made again, so
-  that its scan queues the roots as they are now.
+  that its scan queues the roots as they are now, and its node is
+  recorded with its names as they are now (`Replay.made_namespaces`):
+  the green unit that evaluated the container is not loaded, so without
+  it nothing would list the namespace, and an edit that only adds or
+  removes a public declaration in an imported file left the node
+  undecided with its old names (`BS_CACHE_VERIFY` on zls's Server.zig;
+  test/run/edit_ns_decl.zig).
 - *Walking only the edits' cone* (2026-11-04). Every node records
   whether a walk from the roots reaches it (`Flags.reached`: a full
   build's record sets it from reach, a lazy one's from `reachedNow`),
