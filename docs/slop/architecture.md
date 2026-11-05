@@ -2998,7 +2998,7 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
   (2026-11-03; 12.4 ms with the shared mapping; ELF, with DWARF:
   13.3 ms). SHA-256 of the 27 MiB output alone takes 8.8 ms on one thread,
   most of the gap to stripped ELF; the rest is the extra relocations.
-- Relocatable objects (`bs build-obj`, x86_64-linux;
+- Relocatable objects (`bs build-obj`, x86_64-linux and aarch64-linux;
   `src/link/ElfObject.zig`, built 2026-11-03) come from the same Atoms.
   The object is the executable image `Elf.emit` lays out (with no entry,
   and imports resolved to 0), kept at the same file offsets, plus a new
@@ -3028,6 +3028,17 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
     .debug_rnglists R_X86_64_32 against those sections, found by walking
     the sections as `Dwarf` wrote them (`Dwarf.relocatableFields`); each
     FDE's pc_begin becomes R_X86_64_PC32 against .text.
+  - aarch64-linux (2026-11-05): the same object with EM_AARCH64 and
+    R_AARCH64_ABS64 (ABS32 and ABS16 for `value*`), CALL26 or JUMP26 by
+    the branch's link bit, ADR_PREL_PG_HI21, ADD_ABS_LO12_NC or the
+    LDST{8,16,32,64,128}_ABS_LO12_NC matching the instruction's access
+    size, ADR_GOT_PAGE and LD64_GOT_LO12_NC (the image relaxed the `ldr`
+    to an `add`, so the object puts the atom's `ldr` back), and
+    TLSLE_ADD_TPREL_HI12/LO12_NC; debug info uses ABS64/ABS32 and FDEs
+    PREL32. `ElfMerge` merges aarch64 objects too (`.eh_frame` stays
+    PROGBITS there). Checked: upstream's aarch64-linux link (LLD) of
+    test/obj's object and of its static library runs and prints a
+    panic's trace through the object's debug info, under qemu.
   - Without `-fPIC`/`-fPIE`, code is not position-independent (absolute
     addresses in .rodata): link with upstream `zig build-exe` (static,
     non-PIE), `ld`, or `cc -no-pie`; a PIE link works with text

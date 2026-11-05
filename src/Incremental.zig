@@ -648,7 +648,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             inputs[0] = .{ .path = sub_path, .bytes = obj };
             for (inputs[1..], inc.link_objects) |*in_obj, path| in_obj.* = .{ .path = path, .bytes = try inc.mapInput(arena, &maps, path) orelse return null };
             var why: []const u8 = "";
-            const merged = ElfMerge.merge(gpa, arena, inputs, &why) catch |err| switch (err) {
+            const merged = ElfMerge.merge(gpa, arena, inputs, inc.arch, &why) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
                 else => return inc.noLink("{s}", .{why}),
             };

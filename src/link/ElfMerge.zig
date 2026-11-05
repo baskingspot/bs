@@ -1,4 +1,4 @@
-//! Relocatable links (`ld -r`): one x86_64 ET_REL from several, for
+//! Relocatable links (`ld -r`): one x86_64 or aarch64 ET_REL from several, for
 //! `bs build-obj` with object inputs or C sources, as upstream's
 //! `flushObject` merges its Zig object with them (docs/slop/architecture.md,
 //! "Relocatable links").
@@ -32,6 +32,7 @@ const std = @import("std");
 const elf = std.elf;
 const Allocator = std.mem.Allocator;
 const ElfInput = @import("ElfInput.zig");
+const Atom = @import("Atom.zig");
 
 pub const Input = struct { path: []const u8, bytes: []const u8 };
 
@@ -73,12 +74,12 @@ const Global = struct {
 
 /// The merged object, allocated with `gpa`. `diag` gets a message for
 /// `DuplicateSymbol` and `UnsupportedObject`, allocated with `arena`.
-pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]const u8) Error![]u8 {
+pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, arch: Atom.Unwind.Arch, diag: *[]const u8) Error![]u8 {
     const objects = try arena.alloc(Object, inputs.len);
-    for (objects, inputs) |*o, in| o.* = ElfInput.parseObject(arena, in.path, in.bytes) catch |err| switch (err) {
+    for (objects, inputs) |*o, in| o.* = ElfInput.parseObjectFor(arena, in.path, in.bytes, arch) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => {
-            diag.* = try std.fmt.allocPrint(arena, "{s}: not an x86_64 ELF relocatable object", .{in.path});
+            diag.* = try std.fmt.allocPrint(arena, "{s}: not an {t} ELF relocatable object", .{ in.path, arch });
             return error.InvalidObject;
         },
     };
@@ -139,7 +140,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]c
                 gop.value_ptr.* = @intCast(outs.items.len);
                 try outs.append(arena, .{
                     .name = name,
-                    .type = if (is_eh) elf.SHT_X86_64_UNWIND else sh.sh_type,
+                    .type = if (is_eh and arch == .x86_64) elf.SHT_X86_64_UNWIND else sh.sh_type,
                     .flags = sh.sh_flags & ~@as(u64, elf.SHF_GROUP),
                     .entsize = sh.sh_entsize,
                     .group = group,
@@ -303,7 +304,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]c
         }
     }
 
-    return write(gpa, arena, objects, outs.items, kept_groups.items, sym_map, locals.items, globals.items, first_global, strtab.items);
+    return write(gpa, arena, objects, outs.items, kept_groups.items, sym_map, locals.items, globals.items, first_global, strtab.items, arch);
 }
 
 /// Section header index of output section `i`: after the null section
@@ -323,6 +324,7 @@ fn write(
     globals: []const Global,
     first_global: u32,
     strtab: []const u8,
+    arch: Atom.Unwind.Arch,
 ) Error![]u8 {
     const n_groups = groups.len;
     // Output sections with relocations get a .rela section each, after the
@@ -470,7 +472,10 @@ fn write(
     const eh: elf.Elf64_Ehdr = .{
         .e_ident = .{ 0x7f, 'E', 'L', 'F', elf.ELFCLASS64, elf.ELFDATA2LSB, 1, 0 } ++ @as([8]u8, @splat(0)),
         .e_type = .REL,
-        .e_machine = .X86_64,
+        .e_machine = switch (arch) {
+            .x86_64 => .X86_64,
+            .aarch64 => .AARCH64,
+        },
         .e_version = 1,
         .e_entry = 0,
         .e_phoff = 0,

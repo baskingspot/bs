@@ -7,7 +7,7 @@ Changes a user of bs notices, newest first, in the
 
 ### Added
 
-- `-target aarch64-linux` for `bs build-exe`, `bs test`, and `bs run`: static executables for the generic ARMv8.0 CPU, with C sources, objects, and archives but without libc yet, and `bs translate-c -target aarch64-linux`. They use the on-disk cache as x86_64-linux builds do.
+- `-target aarch64-linux` for `bs build-exe`, `bs build-obj`, `bs build-lib`, `bs test`, and `bs run`: static executables, objects, and static libraries for the generic ARMv8.0 CPU, with C sources, objects, and archives but without libc yet, and `bs translate-c -target aarch64-linux`. They use the on-disk cache as x86_64-linux builds do.
 
 ### Changed
 

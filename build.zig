@@ -813,6 +813,35 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
 /// as an object and a library (test/obj/cache.sh). `bs run`: test/obj/args.zig,
 /// whose arguments and exit status must pass through.
 fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
+    // The aarch64-linux object and static library, linked by upstream
+    // (with LLD).
+    if (aarch64LinuxRunner(b)) |runner| for ([_][]const u8{ "build-obj", "build-lib" }) |cmd| {
+        const obj = b.addRunArtifact(bs);
+        obj.setName(b.fmt("bs {s} -target aarch64-linux", .{cmd}));
+        obj.addArgs(&.{ cmd, "-target", "aarch64-linux" });
+        obj.addFileArg(b.path("test/obj/lib.zig"));
+        const out = obj.addPrefixedOutputFileArg("-femit-bin=", if (cmd[6] == 'l') "liblib.a" else "lib.o");
+        const exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-target", "aarch64-linux" });
+        exe.addFileArg(b.path("test/obj/main.zig"));
+        exe.addFileArg(out);
+        const bin = exe.addPrefixedOutputFileArg("-femit-bin=", "main");
+        for ([_]bool{ false, true }) |panic| {
+            const run = std.Build.Step.Run.create(b, b.fmt("run aarch64-linux {s} main{s}", .{ cmd[6..], if (panic) " (panic)" else "" }));
+            run.addArgs(runner);
+            run.addFileArg(bin);
+            if (panic) {
+                run.addArg("panic");
+                run.addCheck(.{ .expect_stderr_match = "panic: integer overflow\n" });
+                run.addCheck(.{ .expect_stderr_match = "lib.zig:25:14: 0x" });
+                run.addCheck(.{ .expect_stderr_match = " in bs_overflow (lib.zig)\n    return x + 250;\n" });
+                run.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
+            } else {
+                run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
+                run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+            }
+            test_step.dependOn(&run.step);
+        }
+    };
     const host = b.graph.host.result;
     if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return;
     const obj = b.addRunArtifact(bs);

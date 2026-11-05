@@ -1,5 +1,5 @@
-//! Relocatable x86_64 ELF objects (ET_REL, `bs build-obj`) from the same
-//! Atoms as an executable.
+//! Relocatable x86_64 and aarch64 ELF objects (ET_REL, `bs build-obj`)
+//! from the same Atoms as an executable.
 //!
 //! The object is the image `Elf.emit` lays out, with its section contents
 //! kept in place at the same file offsets, and a new tail: a .rela section
@@ -24,7 +24,13 @@
 //!   .debug_line against .text, the units' offsets in other debug sections
 //!   against those, and each FDE's pc_begin in .eh_frame against .text.
 //!
-//! Only x86_64 relocation kinds exist so far: R_X86_64_64, PC32 (PLT32 to
+//! aarch64's kinds map onto R_AARCH64_ABS64 (ABS32 and ABS16 for `value*`),
+//! CALL26 or JUMP26, ADR_PREL_PG_HI21, the ADD and LDST ABS_LO12_NC forms,
+//! ADR_GOT_PAGE and LD64_GOT_LO12_NC (whose `ldr` the image relaxed to an
+//! `add`, which the object puts back), and TLSLE_ADD_TPREL_HI12 and
+//! LO12_NC (local-exec, so the final link must be an executable).
+//!
+//! x86_64's: R_X86_64_64, PC32 (PLT32 to
 //! an import), TPOFF32 (local-exec TLS, which requires the final link to be
 //! an executable), TLSLD and DTPOFF32 (local-dynamic TLS, in
 //! position-independent code), GOTTPOFF and TLSGD (initial- and
@@ -42,6 +48,7 @@ const Dwarf = @import("Dwarf.zig");
 const Elf = @import("Elf.zig");
 const ElfDynamic = @import("ElfDynamic.zig");
 const SymbolKey = Atom.SymbolKey;
+const a64_fields = @import("aarch64.zig");
 
 /// A symbol the object defines for other objects: the atom `key`, as
 /// `name`.
@@ -226,6 +233,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbo
     }
 
     // The atoms' relocations.
+    const a64 = options.arch == .aarch64;
     for (c.image_symtab[1..], atom_of[1..]) |s, i| {
         const av = input.atom(i);
         const a = Elf.ref(&av);
@@ -238,6 +246,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbo
             const local = sym_of.get(t);
             const imp = if (local == null) import_index.get(t) orelse continue else null;
             const sym = if (local) |ts| index[ts] else imp.?.index;
+            if (a64) {
+                const ty = try aarch64Type(a, r, image, c.sections.items[k - 1].shdr.offset + base, diag);
+                try relas.append(arena, .{ .offset = base + r.offset, .info = .{ .type = @backingInt(ty), .sym = sym }, .addend = r.addend });
+                continue;
+            }
             const ty: elf.R_X86_64 = switch (r.info.kind) {
                 .x86_64_abs64, .value64 => .@"64",
                 // An import reached PC-relative is a call (to
@@ -261,7 +274,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbo
     }
 
     // Debug info's and call frame information's.
-    if (DebugCtx.init(&c, arena)) |d| try Dwarf.relocatableFields(c.contents(d.info), c.contents(d.line), d, DebugCtx.add);
+    if (DebugCtx.init(&c, arena, options.arch)) |d| try Dwarf.relocatableFields(c.contents(d.info), c.contents(d.line), d, DebugCtx.add);
     if (c.find(".eh_frame")) |eh_k| {
         const eh = c.sections.items[eh_k - 1].shdr;
         const text = c.find(".text").?;
@@ -273,7 +286,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbo
         while (off + 4 < eh.size) : (off += 4 + std.mem.readInt(u32, bytes[off..][0..4], .little)) {
             const field = off + 8;
             const target = c.image_addr.items[eh_k - 1] + field +% @as(u64, @bitCast(@as(i64, std.mem.readInt(i32, bytes[field..][0..4], .little))));
-            try relas.append(arena, .{ .offset = field, .info = .{ .type = @backingInt(elf.R_X86_64.PC32), .sym = @intCast(text) }, .addend = @intCast(target - text_addr) });
+            try relas.append(arena, .{ .offset = field, .info = .{ .type = if (a64) @backingInt(elf.R_AARCH64.PREL32) else @backingInt(elf.R_X86_64.PC32), .sym = @intCast(text) }, .addend = @intCast(target - text_addr) });
         }
     }
 
@@ -338,7 +351,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbo
     Elf.writeStruct(image, elf.Elf64.Ehdr{
         .ident = .{ .class = .@"64", .data = .@"2LSB", .version = 1, .osabi = .NONE, .abiversion = 0 },
         .type = .REL,
-        .machine = .X86_64,
+        .machine = if (a64) .AARCH64 else .X86_64,
         .version = 1,
         .entry = 0,
         .phoff = 0,
@@ -352,6 +365,40 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbo
         .shstrndx = @intCast(shdrs.items.len - 1),
     });
     return .{ .image = image, .prefix = image[0..tail_start], .tail = tail };
+}
+
+/// The ELF type of aarch64 relocation `r` of atom `a`, whose field is at
+/// `file_offset` in `image`. A GOT load's `ldr`, which the image relaxed
+/// to an `add`, is put back from the atom's bytes.
+fn aarch64Type(a: *const Atom, r: Atom.Reloc, image: []u8, file_offset: u64, diag: *Elf.Diagnostic) Elf.Error!elf.R_AARCH64 {
+    const insn = if (r.offset + 4 <= a.bytes.len) std.mem.readInt(u32, a.bytes[r.offset..][0..4], .little) else 0;
+    return switch (r.info.kind) {
+        .aarch64_abs64, .value64 => .ABS64,
+        .value32 => .ABS32,
+        .value16 => .ABS16,
+        .aarch64_branch26 => if (insn & 0x80000000 != 0) .CALL26 else .JUMP26,
+        .aarch64_page21 => .ADR_PREL_PG_HI21,
+        .aarch64_pageoff12 => if (insn & 0x7fc00000 == 0x11000000) .ADD_ABS_LO12_NC else switch (a64_fields.pageOffScale(insn) orelse return badReloc(a, diag)) {
+            0 => .LDST8_ABS_LO12_NC,
+            1 => .LDST16_ABS_LO12_NC,
+            2 => .LDST32_ABS_LO12_NC,
+            3 => .LDST64_ABS_LO12_NC,
+            else => .LDST128_ABS_LO12_NC,
+        },
+        .aarch64_got_load_page21 => .ADR_GOT_PAGE,
+        .aarch64_got_load_pageoff12 => ty: {
+            std.mem.writeInt(u32, image[@intCast(file_offset + r.offset)..][0..4], insn, .little);
+            break :ty .LD64_GOT_LO12_NC;
+        },
+        .aarch64_tprel_hi12 => .TLSLE_ADD_TPREL_HI12,
+        .aarch64_tprel_lo12_nc => .TLSLE_ADD_TPREL_LO12_NC,
+        else => badReloc(a, diag),
+    };
+}
+
+fn badReloc(a: *const Atom, diag: *Elf.Diagnostic) Elf.Error {
+    diag.* = .{ .atom = a.name };
+    return error.InvalidRelocation;
 }
 
 const KeyContext = struct {
@@ -469,11 +516,13 @@ const DebugCtx = struct {
     abbrev: u32,
     str: u32,
     ranges: u32,
+    arch: Atom.Unwind.Arch,
 
-    fn init(c: *Converter, arena: Allocator) ?DebugCtx {
+    fn init(c: *Converter, arena: Allocator, arch: Atom.Unwind.Arch) ?DebugCtx {
         return .{
             .c = c,
             .arena = arena,
+            .arch = arch,
             .info = c.find(".debug_info") orelse return null,
             .line = c.find(".debug_line").?,
             .text = c.find(".text").?,
@@ -490,12 +539,12 @@ const DebugCtx = struct {
         const rela: elf.Elf64.Rela = switch (field) {
             .addr => .{
                 .offset = offset,
-                .info = .{ .type = @backingInt(elf.R_X86_64.@"64"), .sym = d.text },
+                .info = .{ .type = if (d.arch == .aarch64) @backingInt(elf.R_AARCH64.ABS64) else @backingInt(elf.R_X86_64.@"64"), .sym = d.text },
                 .addend = @intCast(std.mem.readInt(u64, bytes[offset..][0..8], .little) - c.image_addr.items[d.text - 1]),
             },
             .abbrev, .str, .line, .ranges => |f| .{
                 .offset = offset,
-                .info = .{ .type = @backingInt(elf.R_X86_64.@"32"), .sym = switch (f) {
+                .info = .{ .type = if (d.arch == .aarch64) @backingInt(elf.R_AARCH64.ABS32) else @backingInt(elf.R_X86_64.@"32"), .sym = switch (f) {
                     .abbrev => d.abbrev,
                     .str => d.str,
                     .line => d.line,

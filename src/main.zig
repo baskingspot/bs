@@ -896,7 +896,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, batch: ?*CSource.Batch,
     if (c.errors.len != 0) return .{ .errors = try dupeDiagnostics(arena, c.errors) };
     const bin_path = alt_path orelse out_path orelse return .{ .ok = .{ .cache_hit = false } };
     if (job.opts.command == .build_obj) {
-        if (!try writeMerged(init, bin_path, null, job.opts.link_inputs, c.objects)) return .failed;
+        if (!try writeMerged(init, bin_path, null, job.opts.link_inputs, c.objects, job.opts.bs_target)) return .failed;
     } else {
         var members: std.ArrayList(Archive.Input) = .empty;
         for (job.opts.link_inputs) |path| try members.append(arena, .{ .name = std.fs.path.basename(path), .bytes = try readInput(init, path) });
@@ -930,14 +930,14 @@ fn readInput(init: std.process.Init, path: []const u8) ![]u8 {
 /// Writes the object merging the Zig object `zig_obj` (if any), the object
 /// inputs and the C objects, in that order, as upstream's `build-obj`
 /// does (link/ElfMerge.zig). Returns false after reporting an error.
-fn writeMerged(init: std.process.Init, bin_path: []const u8, zig_obj: ?[]const u8, link_inputs: []const []const u8, c_objects: []const CSource.Object) !bool {
+fn writeMerged(init: std.process.Init, bin_path: []const u8, zig_obj: ?[]const u8, link_inputs: []const []const u8, c_objects: []const CSource.Object, target: InternPool.Target) !bool {
     const arena = init.arena.allocator();
     var inputs: std.ArrayList(ElfMerge.Input) = .empty;
     if (zig_obj) |bytes| try inputs.append(arena, .{ .path = bin_path, .bytes = bytes });
     for (link_inputs) |path| try inputs.append(arena, .{ .path = path, .bytes = try readInput(init, path) });
     for (c_objects) |o| try inputs.append(arena, .{ .path = o.path, .bytes = o.bytes });
     var why: []const u8 = "";
-    const merged = ElfMerge.merge(init.gpa, arena, inputs.items, &why) catch |err| switch (err) {
+    const merged = ElfMerge.merge(init.gpa, arena, inputs.items, if (target.arch() == .aarch64) .aarch64 else .x86_64, &why) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => {
             std.log.err("{s}", .{why});
@@ -1293,7 +1293,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     if (linked and lazy_linked == null and merged) {
         defer Io.Dir.cwd().deleteFile(init.io, link_path) catch {};
         const obj = try Io.Dir.cwd().readFileAlloc(init.io, link_path, arena, .unlimited);
-        linked = try writeMerged(init, bin_path, obj, opts.link_inputs, if (c_batch) |b| (try b.wait()).objects else &.{});
+        linked = try writeMerged(init, bin_path, obj, opts.link_inputs, if (c_batch) |b| (try b.wait()).objects else &.{}, opts.bs_target);
     }
     if (linked and lazy_linked == null and archive) {
         defer Io.Dir.cwd().deleteFile(init.io, link_path) catch {};
@@ -2247,11 +2247,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
         opts.link_libc = false;
     } else if (opts.bs_target == .aarch64_linux) {
-        // Static executables and tests, with C sources, objects, and
-        // archives but no libc, so far.
-        if (command == .build_obj or command == .build_lib)
-            setUnsupported(&opts, arena, "bs builds only executables and tests for aarch64-linux so far; build this step with upstream zig", .{})
-        else if (opts.link_libc or opts.link_libcpp)
+        // Static executables, tests, objects, and static libraries, with C
+        // sources, objects, and archives but no libc, so far.
+        if (opts.link_libc or opts.link_libcpp)
             setUnsupported(&opts, arena, "bs does not link libc or libc++ for aarch64-linux yet; build this step with upstream zig", .{})
         else if (for (link_inputs.items) |p| (if (isSharedLib(p)) break true) else false)
             setUnsupported(&opts, arena, "bs does not link shared libraries for aarch64-linux yet; build this step with upstream zig", .{})

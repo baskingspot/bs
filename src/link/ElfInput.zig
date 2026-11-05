@@ -123,7 +123,7 @@ pub fn parseObject(arena: Allocator, path: []const u8, bytes: []const u8) Error!
 }
 
 /// Parses an ELF64 ET_REL of `arch` in place.
-fn parseObjectFor(arena: Allocator, path: []const u8, bytes: []const u8, arch: Atom.Unwind.Arch) Error!Object {
+pub fn parseObjectFor(arena: Allocator, path: []const u8, bytes: []const u8, arch: Atom.Unwind.Arch) Error!Object {
     if (bytes.len < @sizeOf(elf.Elf64_Ehdr) or !std.mem.eql(u8, bytes[0..4], elf.MAGIC)) return error.InvalidObject;
     const eh = std.mem.bytesToValue(elf.Elf64_Ehdr, bytes[0..@sizeOf(elf.Elf64_Ehdr)]);
     if (eh.e_ident[elf.EI.CLASS] != elf.ELFCLASS64 or eh.e_ident[elf.EI.DATA] != elf.ELFDATA2LSB) return error.InvalidObject;
