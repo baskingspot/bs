@@ -1375,7 +1375,7 @@ class Gen:
             (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"), (2, "window"),
             (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
-            (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"),
+            (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -2882,6 +2882,123 @@ class Gen:
         if self.chance(0.4):
             f, k, _ = self.pick(fs)
             self.sink(ctx, pk_to_u64(f"{p}.{f}", k), U64)
+
+    def s_prove3(self, ctx):
+        """Checks a prover may drop from facts: asserts and `if (!ok)
+        unreachable` before a use, the same load twice with or without a
+        store between, a facts-carrying bool block, a counted-down loop,
+        ranges of %, &, >>, @min/@max and casts, and facts at a block's
+        single br. Near misses keep their check."""
+        x = self.rt_int(ctx, U64)
+        if x is None:
+            return self.s_prove(ctx)
+        ctx["fn"].risky = True
+        e = lambda s_: self.emit(ctx, s_)
+        near = self.chance(0.35)
+        n = self.r.randint(2, 9)
+        a = self.fresh("pa")
+        e(f"var {a}: [{n}]u32 = @splat({self.int_expr(ctx, U32, 1)});")
+        e(f"{a}[{self.r.randrange(n)}] ^= {self.lit(U32)};")
+        sl = self.fresh("ps")
+        lo = self.r.randint(0, n - 1)
+        e(f"var {sl}: []u32 = {a}[{lo}..];")
+        e(f"_ = &{sl};")
+        i = self.fresh("pi")
+        k = self.r.randrange(9)
+        if k == 0:
+            # assert, then use; near: the assert can fail (it panics).
+            bound = f"{sl}.len" if not near else f"{sl}.len + 1"
+            e(f"const {i}: usize = @as(usize, @truncate({x})) % ({n} + 1);")
+            e(f"if ({i} < {bound}) {{")
+            ctx["indent"] += 1
+            e(f"std.debug.assert({i} < {sl}.len);" if not near else f"std.debug.assert({i} <= {sl}.len);")
+            self.sink(ctx, f"{sl}[{i}]", U32)
+            ctx["indent"] -= 1
+            e("}")
+        elif k == 1:
+            e(f"const {i}: usize = @as(usize, @truncate({x})) & 7;")
+            if self.chance(0.5) or ctx.get("in_defer") or ctx["fn"].err:
+                e(f"if (!({i} < {sl}.len{' + 1' if near else ''})) unreachable;")
+            else:
+                e(f"if ({i} >= {sl}.len{' + 1' if near else ''}) return {self.ret_value(ctx)};")
+            self.sink(ctx, f"{sl}[{i}]", U32)
+        elif k == 2:
+            # The same load twice; a store between may change it.
+            p = self.fresh("pp")
+            j = self.fresh("pj")
+            e(f"const {p}: *[{n}]u32 = &{a};")
+            e(f"const {i}: usize = {p}[0] % {n};")
+            if self.chance(0.6):
+                e(f"{p}[{self.r.randrange(n)}] = {self.int_expr(ctx, U32, 1)};")
+            e(f"const {j}: usize = {p}[0] % {n + (1 if near else 0)};")
+            self.sink(ctx, f"{a}[{i}] +% {a}[{j}]", U32)
+        elif k == 3:
+            # A bool block that carries the bound.
+            ok = self.fresh("pk")
+            e(f"const {i}: usize = @as(usize, @truncate({x})) % 12;")
+            e(f"const {ok} = blk: {{")
+            ctx["indent"] += 1
+            e(f"if ({self.bool_expr(ctx, 1)}) break :blk {i} < {sl}.len{' + 1' if near else ''};")
+            e(f"break :blk {i} < {max(0, n - lo - 1)};")
+            ctx["indent"] -= 1
+            e("};")
+            e(f"if ({ok}) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"{sl}[{i}]", U32)
+            ctx["indent"] -= 1
+            e("}")
+        elif k == 4:
+            # Counted down; near: one past the end.
+            v = self.fresh("pv")
+            e(f"var {v}: usize = {sl}.len{' + 1' if near else ''};")
+            e(f"while ({v} > 0) {{")
+            ctx["indent"] += 1
+            e(f"{v} -= 1;")
+            self.sink(ctx, f"{sl}[{v}]", U32)
+            if self.chance(0.4):
+                e(f"if ({sl}[{v}] & 3 == 1) break;")
+            ctx["indent"] -= 1
+            e("}")
+        elif k == 5:
+            # Ranges of %, &, >>, @min, @max and casts.
+            m = n - lo
+            r = self.pick([f"@as(usize, @truncate({x})) % {m + (1 if near else 0)}",
+                           f"@as(usize, @truncate({x})) & {(1 << max(0, m.bit_length() - 1)) - 1 + (m if near else 0)}",
+                           f"@as(usize, @truncate({x} >> {64 - max(1, (m - 1).bit_length()) - (1 if near else 0)}))" if m > 1 else "0",
+                           f"@min(@as(usize, @truncate({x})), {m - 1 + (1 if near else 0)})",
+                           f"@max(@as(usize, @as(u3, @truncate({x}))), 1) - 1" if m >= 7 + (1 if near else 0) else "0",
+                           f"@as(usize, @as(u2, @truncate({x})))" if m >= 4 + (1 if near else 0) else "0"])
+            e(f"const {i}: usize = {r};")
+            self.sink(ctx, f"{sl}[{i}]", U32)
+        elif k == 6:
+            # Exact add/sub ranges.
+            e(f"const {i}: usize = (@as(usize, @as(u2, @truncate({x}))) + 1) - {0 if near else 1};")
+            self.sink(ctx, f"{a}[{i} % {n}] +% {sl}[@min({i}, {sl}.len - 1)]", U32)
+            if 4 + (1 if near else 0) <= n:
+                self.sink(ctx, f"{a}[{i}]", U32)
+        elif k == 7:
+            # Facts at a block's single br; a store between the check and the use.
+            b = self.fresh("pb")
+            e(f"var {i}: usize = @as(usize, @truncate({x})) % 10;")
+            e(f"_ = &{i};")
+            e(f"{b}: {{")
+            ctx["indent"] += 1
+            e(f"if ({i} >= {sl}.len) break :{b};")
+            if self.chance(0.5):
+                e(f"{i} {'+= 1' if near else '-|= 1'};")
+            self.sink(ctx, f"{sl}[{i}]", U32)
+            ctx["indent"] -= 1
+            e("}")
+        else:
+            # A loop whose bound shrinks; the check must follow the shrink.
+            j = self.fresh("pj")
+            e(f"var {j}: usize = 0;")
+            e(f"while ({j} < {sl}.len) : ({j} += 1) {{")
+            ctx["indent"] += 1
+            e(f"if ({sl}[{j}] & 1 == 0 and {sl}.len > 1) {sl} = {sl}[0 .. {sl}.len - 1];")
+            self.sink(ctx, f"{sl}[{j}]" if not near else f"{sl}[{j} + 1]", U32)
+            ctx["indent"] -= 1
+            e("}")
 
     def s_rvoglob(self, ctx):
         """Aggregates over 16 bytes returned early straight from a global;
