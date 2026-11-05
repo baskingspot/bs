@@ -2052,9 +2052,15 @@ user branches are coverage points and are only learned from.
   `x + 1 <= y`, and back from `x + 1 <= y` for `x < y` only when the
   addition cannot have wrapped (an overflow operation whose check the
   walk passed, not `+%`). A block exited only with constants is bounded
-  by them, and a wrapping addition or subtraction whose operands' bounds
-  keep the result within its own type by the sum or difference of
-  theirs (two levels deep). A check of `a and b` (a switch prong's
+  by them, a value by its own type's limits (a `u32` widened to `u64`
+  stays below 2^32), and a wrapping addition, subtraction, or unsigned
+  multiplication whose operands' bounds keep the result within its own
+  type by the sum, difference, or product of theirs (two levels deep).
+  An unsigned product wider than 64 bits (at most 128) of two widened
+  values of at most 64 bits, or constants, cannot overflow when the
+  product of their bounds fits, so `@as(u128, a) * b` for `u64`s loses
+  its check and CodeGen's `mulWide` lowers the wrapping product left
+  behind to one `mul`. A check of `a and b` (a switch prong's
   range) holds when both do; when only `a` is proven, the check tests
   `b` alone (`digitToChar`'s `10...35` prong after `0...9` checks
   `digit <= 35`). An overflow check of an addition, subtraction, or
@@ -2068,7 +2074,7 @@ user branches are coverage points and are only learned from.
   for an exact unsigned addition; and `(x - k) + k` after an exact `x -
   k` cannot overflow. Constant bounds come from exact additions and
   subtractions, `%`, `@mod`, `&`, `>>` of unsigned values, `@intCast`,
-  `@truncate`, `@min`, `@max`, from facts whose other side has bounds
+  `@truncate`, `@min`, `@max`, exact unsigned products, from facts whose other side has bounds
   (transitively, depth-limited), and `t != k` at an end of `t`'s range
   moves that end.
 - **Offsets.** An unsigned value that is a chain of constant additions
@@ -2107,8 +2113,9 @@ user branches are coverage points and are only learned from.
   `prove_offset_wrap`, `prove_offset_store`, `prove_offset_loop`,
   `prove_offset_retry`, `prove_mem`, `prove_mem_merge`,
   `prove_mem_loop`, `prove_wrap_end`, `prove_sub`, `prove_bool`,
-  `prove_assert`, and `prove_rem` one that a wrong offset, loop,
-  memory, range, or `bool` rule would remove.
+  `prove_assert`, `prove_rem`, `prove_mul_narrow`, and `prove_mul_wide`
+  one that a wrong offset, loop, memory, range, product, or `bool` rule
+  would remove.
 
 #### Compile-time budget and how it is measured
 
