@@ -2207,6 +2207,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "slice of null pointer", .@"null-value" },
     .{ "non-zero length slice of undefined pointer", .@"undefined-value" },
     .{ "non-scalar sentinel type '{f}'", .@"bad-type" },
+    .{ "comptime dereference requires '{f}' to have a well-defined layout", .@"bad-type" },
     .{ "dereference of '{f}' exceeds bounds of containing decl of type '{f}'", .@"out-of-bounds" },
     .{ "index '{d}' out of bounds of tuple '{f}'", .@"out-of-bounds" },
     .{ "index {d} outside array of length {d}", .@"out-of-bounds" },

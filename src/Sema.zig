@@ -14015,7 +14015,26 @@ fn reinterpretLoad(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileErro
     const root_val = (try sema.memRootValue(block, src, root.base)) orelse return null;
     try sema.resolveLayout(block, src, ty);
     try sema.resolveLayout(block, src, sema.ip.typeOf(root_val));
+    // Out of bounds, named by the pointer's own type, as upstream.
+    const root_ty = sema.ip.typeOf(root_val);
+    if (root.offset > Type.abiSize(sema.ip, root_ty) or Type.abiSize(sema.ip, ty) > Type.abiSize(sema.ip, root_ty) - root.offset)
+        return sema.fail(block, src, "dereference of '{f}' exceeds bounds of containing decl of type '{f}'", .{ sema.fmtType(sema.ip.typeOf(ptr)), sema.fmtType(root_ty) });
     return try sema.readMem(block, src, root_val, root.offset, ty);
+}
+
+/// Whether the bytes of `ty`'s values are defined, so memory can be
+/// reinterpreted as or from it, as upstream's `Type.hasWellDefinedLayout`.
+fn wellDefinedLayout(sema: *Sema, ty: Index) bool {
+    const ip = sema.ip;
+    return switch (Type.class(ip, ty)) {
+        .int, .float, .bool, .void => true,
+        .array => sema.wellDefinedLayout(Type.childType(ip, ty)),
+        .optional => Type.optionalReprIsPtr(ip, Type.childType(ip, ty)),
+        .pointer => Type.ptrInfo(ip, ty).flags.size != .slice,
+        .@"struct", .@"union" => ip.structInfo(ty).layout != .auto,
+        .@"enum" => sema.explicitIntTag(ty),
+        else => false,
+    };
 }
 
 /// The value at the root of a pointer, or null if it is only known at
@@ -14134,6 +14153,9 @@ fn readMem(sema: *Sema, block: *Block, src: Src, val: Index, offset: u64, ty: In
         if (offset >= co and offset + size <= co + cs and (cs != 0 or size == 0))
             return sema.readMem(block, src, try sema.elemValue(val, i), offset - co, ty);
     };
+    // Reinterpreting bytes: both types must define theirs, as upstream.
+    for ([_]Index{ ty, val_ty }) |t| if (!sema.wellDefinedLayout(t))
+        return sema.fail(block, src, "comptime dereference requires '{f}' to have a well-defined layout", .{sema.fmtType(t)});
     const n: usize = @intCast(Type.abiSize(ip, val_ty));
     const buf = try sema.arena.alloc(u8, n);
     const undef = try sema.arena.alloc(bool, n);
@@ -18362,7 +18384,7 @@ fn catValue(sema: *Sema, block: *Block, src: Src, operand: Ref, len: u64) Compil
             // A comptime slice reads as one array, not element by element.
             .slice => if (sema.isUndef(v)) null else try sema.comptimeLoadOrNull(block, src, try sema.retypePtrValue(
                 ip.keyPayload(.slice, v).ptr,
-                try sema.ptrType(.{ .child = try sema.intern(.{ .array_type = .{ .len = len, .child = p.child } }), .flags = .{ .is_const = true } }),
+                try sema.ptrType(.{ .child = try sema.intern(.{ .array_type = .{ .len = len, .child = p.child } }), .flags = .{ .is_const = p.flags.is_const } }),
             )),
             else => null,
         },
