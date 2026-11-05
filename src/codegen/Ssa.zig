@@ -661,6 +661,20 @@ fn countsOf(f: *const Ssa, gpa: Allocator, ir: *const Ir, counts: *?[]u32, what:
     return counts.*.?[@as(usize, @backingInt(what)) * n + @backingInt(inst)];
 }
 
+/// Whether the branch ending the block whose values end `values` may read
+/// the memory of load `l` (in that block) instead of `l`'s result: the
+/// load is not volatile, nothing after it in the block writes memory, and
+/// it loads no variable `plan` may promote (`count`, `no_tie` for none).
+fn fusesLoad(ir: *const Ir, ip: *const InternPool, live: std.MultiArrayList(Live).Slice, count: []const u32, values: []const Inst.Index, l: u32) bool {
+    if (!removable(ir, ip, @fromBackingInt(l))) return false;
+    if (ir.instructions.items(.data)[l].ty_op.operand.toIndex()) |p| if (count[@backingInt(p)] != no_tie) return false;
+    const tags = ir.instructions.items(.tag);
+    for (values[live.items(.def)[l] / 2 ..]) |v| {
+        if (!noCode(tags[@backingInt(v)]) and live.items(.fate)[@backingInt(v)] != .dead and !removable(ir, ip, v)) return false;
+    }
+    return true;
+}
+
 /// Whether a value with tag `tag` emits no code: a block's result, which
 /// gets its home from the architecture's `emitBlocks` also in a block that
 /// is not emitted, or debug state, which it keeps in place there.
@@ -842,7 +856,9 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
 ///   them. Its bit is `fused` when only its block's branch tests it, if
 ///   nothing between sets the flags and `ctx.ovfFlagsOnly(tag, bits)`.
 /// - A condition only its block's branch reads is `fused` if
-///   `ctx.fusable(inst)`, and so are, when fusable, the condition a fused
+///   `ctx.fusable(inst)` (a load also only when nothing after it in the
+///   block writes memory, `fusesLoad`), and so are,
+///   when fusable, the condition a fused
 ///   `not` negates and the operands of a fused bool `|` or `&` (each its
 ///   own jump), when read only by it.
 /// - Arguments are all moved at the entry, so an unused one, whose interval
@@ -970,6 +986,11 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
                     try f.candidates.append(gpa, i | class << 29);
                 },
                 .load => if (fate[i] != .dead) {
+                    if (cond == inst and uses[i] == 1 and ctx.fusable(inst) and fusesLoad(ir, ip, live, count, insts[0 .. b.start + b.len], i)) {
+                        fate[i] = .fused;
+                        reg[i] = no_reg;
+                        continue;
+                    }
                     const v = @backingInt(datas[i].ty_op.operand.toIndex() orelse continue);
                     if (count[v] == no_tie) continue;
                     count[v] -%= 1;
@@ -990,7 +1011,9 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
                     // flags.
                     if (tags[i] == .not) if (datas[i].ty_op.operand.toIndex()) |x| {
                         const xi = @backingInt(x);
-                        if (uses[xi] == 1 and fate[xi] == .normal and tags[xi] != .not and tags[xi] != .bit_or and tags[xi] != .bit_and and def[xi] > 2 * b.start and ctx.fusable(x)) {
+                        if (uses[xi] == 1 and fate[xi] == .normal and tags[xi] != .not and tags[xi] != .bit_or and tags[xi] != .bit_and and def[xi] > 2 * b.start and ctx.fusable(x) and
+                            (tags[xi] != .load or fusesLoad(ir, ip, live, count, insts[0 .. b.start + b.len], xi)))
+                        {
                             fate[xi] = .fused;
                             reg[xi] = no_reg;
                         }
@@ -1002,7 +1025,9 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
                         for ([2]Inst.Ref{ bo.lhs, bo.rhs }) |x| if (x.toIndex()) |xx| {
                             const xi = @backingInt(xx);
                             const reads: u32 = if (bo.lhs == bo.rhs) 2 else 1;
-                            if (uses[xi] == reads and fate[xi] == .normal and tags[xi] != .bit_or and tags[xi] != .bit_and and def[xi] > 2 * b.start and ctx.fusable(xx)) {
+                            if (uses[xi] == reads and fate[xi] == .normal and tags[xi] != .bit_or and tags[xi] != .bit_and and def[xi] > 2 * b.start and ctx.fusable(xx) and
+                                (tags[xi] != .load or fusesLoad(ir, ip, live, count, insts[0 .. b.start + b.len], xi)))
+                            {
                                 fate[xi] = .fused;
                                 reg[xi] = no_reg;
                             }

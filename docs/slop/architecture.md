@@ -1378,7 +1378,9 @@ leaves the loop (after the last `repeat`). In the same walk:
   Any other use materializes it as a bool (`setcc`), as today. On x86_64
   (2026-11-05) a bool `|` or `&` the branch alone reads jumps on each
   operand, both fused when only it reads them (Sema's `@memcpy` alias
-  check: `cmp; jae; cmp; jb` instead of two `setcc`, `or`, `test`).
+  check: `cmp; jae; cmp; jb` instead of two `setcc`, `or`, `test`), and
+  a bool load the branch alone reads, with nothing after it in the block
+  that may write memory (`Ssa.fusesLoad`), is `cmp byte [mem], 0`.
 - **Cold blocks.** A block whose terminator is a call to a noreturn
   function (the panic handlers, `@panic`, `unreachable` in safe mode) is
   marked cold.

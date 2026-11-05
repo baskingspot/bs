@@ -1,5 +1,5 @@
 //! exit: 0
-//! stderr: "2551021288 54238937\n"
+//! stderr: "2728338536 54238937\n"
 //! Branches on `and`/`or` conditions go to the condition's parts
 //! directly, and a labeled switch `continue` with a constant goes to its
 //! case: short-circuit order, a condition that is also a value, nested and
@@ -8,6 +8,8 @@
 //! through enclosing calls, one `return` or several, also read as values.
 //! Branches on bool `|` and `&` jump on each operand: compares, the same
 //! compare twice, negations, floats, loaded bools and nested operators.
+//! A branch on a bool in memory reads the memory unless something between
+//! the load and the branch may write it.
 const std = @import("std");
 
 var calls: u32 = 0;
@@ -104,6 +106,40 @@ fn bitops(x: u32, y: u32, p: *const [4]bool) u32 {
     return acc;
 }
 
+const Flags = struct { a: bool, b: bool, done: bool, n: u32 };
+var global_flag: bool = false;
+
+noinline fn flip(f: *Flags) void {
+    f.a = !f.a;
+    f.n +%= 1;
+    if (f.n % 3 == 0) f.done = true;
+}
+
+fn loads(f: *Flags, g: *Flags, v: *volatile bool) u32 {
+    var acc: u32 = 0;
+    if (f.a) acc += 1;
+    if (!f.b) acc += 2;
+    const a = f.a;
+    f.a = !a;
+    if (a) acc += 4;
+    const b = g.b;
+    flip(g);
+    if (b) acc += 8;
+    if (f.a | g.b) acc += 16;
+    if (!g.a & f.b) acc += 32;
+    if (global_flag) acc += 64;
+    global_flag = !global_flag;
+    if (v.*) acc += 128;
+    var local = f.n > 2;
+    if (g.done) local = !local;
+    if (local) acc += 256;
+    while (!g.done) {
+        flip(g);
+        acc += 512;
+    }
+    return acc;
+}
+
 fn machine(start: u8) u32 {
     var steps: u32 = 0;
     var n: u8 = 0;
@@ -143,6 +179,13 @@ pub fn main() void {
         h = h *% 16777619 ^ conds(@intCast(x), @intCast(y));
     };
     for (0..12) |s| h = h *% 16777619 ^ machine(@intCast(s));
+    for (0..64) |m| {
+        var f: Flags = .{ .a = m & 1 != 0, .b = m & 2 != 0, .done = m & 4 != 0, .n = @intCast(m >> 3) };
+        var g: Flags = .{ .a = m & 8 != 0, .b = m & 16 != 0, .done = m & 32 != 0, .n = @intCast(m & 7) };
+        var vb: bool = m & 5 == 5;
+        h = h *% 16777619 ^ loads(&f, &g, &vb);
+        h = h *% 16777619 ^ @as(u32, @bitCast([4]u8{ @intFromBool(f.a), @intFromBool(f.b), @intFromBool(g.a), @intFromBool(g.done) }));
+    }
     for (0..10) |x| for (0..10) |y| for (0..16) |m| {
         const p: [4]bool = .{ m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0 };
         h = h *% 16777619 ^ chains(@intCast(x), @intCast(y), &p);

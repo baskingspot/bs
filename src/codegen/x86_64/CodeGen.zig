@@ -3751,6 +3751,8 @@ pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
         .not => cg.typeOf(data.ty_op.operand) == .bool_type,
         // Each operand gets its own jump (`genTerm`).
         .bit_or, .bit_and => cg.typeOf(data.bin_op.lhs) == .bool_type,
+        // `cmp byte [ptr], 0` (`condFlags`).
+        .load => data.ty_op.ty == .bool_type,
         else => false,
     };
 }
@@ -4089,6 +4091,11 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
                 .cmp_neq => .ne,
                 else => unreachable,
             };
+        },
+        // A bool in memory (`Ssa.plan`). May use r10.
+        .load => {
+            try cg.e.alu(.cmp, .byte, .{ .mem = try cg.ptrMem(data.ty_op.operand) }, .{ .imm = 0 });
+            return .ne;
         },
         .cmp_lt_errors_len => {
             // The count of codes is a link-time value; a code is below it
@@ -4594,7 +4601,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .load => {
             const ty = data.ty_op.ty;
-            if (cg.homes[@backingInt(inst)] == .deferred) return;
+            if (cg.homes[@backingInt(inst)] == .deferred or cg.homes[@backingInt(inst)] == .fused) return;
             if (cg.live) {
                 // A forwarded constant is the value stored (`Live.fwd`).
                 const w = cg.ssa.live.items(.fwd)[@backingInt(inst)];
