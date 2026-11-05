@@ -4,8 +4,9 @@
 //! bs's targets, Debug or ReleaseSafe: x86_64-linux-none with the
 //! self-hosted x86_64 backend, linked statically unless it links glibc,
 //! aarch64-linux-none (CPU `generic`) with LLVM, linked statically, and
-//! aarch64-macos (CPU `apple_m1`, macOS 15.0 to 27.0, as
-//! `-target aarch64-macos` gives) with LLVM, linked against libSystem.
+//! aarch64-macos (CPU `apple_m1`, macOS 15.0 to 27.0 as `-target
+//! aarch64-macos` gives, or the versions the target names) with LLVM,
+//! linked against libSystem.
 //! `zig_backend` is upstream's Debug default for the target, so std takes
 //! the code paths it takes with upstream.
 //! Copyright (c) Zig contributors. MIT licensed (see LICENSE-ZIG).
@@ -16,6 +17,10 @@ const Allocator = std.mem.Allocator;
 const InternPool = @import("InternPool.zig");
 
 pub const OutputMode = enum { Exe, Obj, Lib };
+
+/// `-target aarch64-macos`'s versions, as upstream's
+/// (`std.Target.Os.VersionRange.default`).
+pub const macos_default: std.SemanticVersion.Range = .{ .min = .{ .major = 15, .minor = 0, .patch = 0 }, .max = .{ .major = 27, .minor = 0, .patch = 0 } };
 
 pub const Options = struct {
     output_mode: OutputMode,
@@ -48,6 +53,8 @@ pub const Options = struct {
     /// whose ABI, kernel and glibc versions and dynamic linker builtin
     /// states; without one, x86_64-linux-none.
     linux: ?std.Target = null,
+    /// aarch64-macos: the macOS versions (`main.checkTarget`).
+    macos: std.SemanticVersion.Range = macos_default,
     /// `-lc++`.
     link_libcpp: bool = false,
     /// `-mcpu` (`cpu.resolve`).
@@ -300,14 +307,14 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\    .tag = .macos,
         \\    .version_range = .{{ .semver = .{{
         \\        .min = .{{
-        \\            .major = 15,
-        \\            .minor = 0,
-        \\            .patch = 0,
+        \\            .major = {d},
+        \\            .minor = {d},
+        \\            .patch = {d},
         \\        }},
         \\        .max = .{{
-        \\            .major = 27,
-        \\            .minor = 0,
-        \\            .patch = 0,
+        \\            .major = {d},
+        \\            .minor = {d},
+        \\            .patch = {d},
         \\        }},
         \\    }}}},
         \\}};
@@ -341,6 +348,12 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         @tagName(opts.unwind_tables),
         if (opts.is_test) "true" else "false",
         if (opts.single_threaded) "true" else "false",
+        opts.macos.min.major,
+        opts.macos.min.minor,
+        opts.macos.min.patch,
+        opts.macos.max.major,
+        opts.macos.max.minor,
+        opts.macos.max.patch,
         @tagName(opts.optimize),
         if (opts.link_libcpp) "true" else "false",
         if (opts.error_tracing) "true" else "false",

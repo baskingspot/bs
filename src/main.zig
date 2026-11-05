@@ -155,6 +155,9 @@ pub const Options = struct {
     /// glibc and dynamic linker this system decides.
     linux: ?std.Target = null,
     native_os: bool = false,
+    /// aarch64-macos: the macOS versions, the default or those the target
+    /// names (`-target aarch64-macos.13.0`), as upstream resolves them.
+    macos_version: std.SemanticVersion.Range = Builtin.macos_default,
     /// `-lc++` (or `-lstdc++`, `-lc++abi`, `-lsupc++`, as upstream): libc++'s
     /// headers for the C and C++ sources, and in an executable libc++,
     /// libc++abi and libunwind, built from the lib directory (CSource.zig).
@@ -507,6 +510,7 @@ pub const Job = struct {
             .dynamic = opts.dynamic,
             .glibc = if (opts.link_libc) opts.glibc_version else null,
             .linux = opts.linux,
+            .macos = opts.macos_version,
             .link_libcpp = opts.link_libcpp,
             .cpu = opts.cpu,
             .target = opts.bs_target,
@@ -1196,6 +1200,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     emit.install_name = opts.install_name;
     if (opts.version) |v| emit.dylib_version = @as(u32, @intCast(@min(v.major, 0xffff))) << 16 | @as(u32, @intCast(@min(v.minor, 0xff))) << 8 | @as(u32, @intCast(@min(v.patch, 0xff)));
     emit.stack_size = opts.stack_size;
+    emit.macos_min = opts.macos_version.min;
     emit.strip = opts.strip;
     emit.entry_name = opts.entry;
     emit.fuzz = opts.fuzz;
@@ -2550,9 +2555,7 @@ fn inheritFlags(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []con
 /// `x86_64-native-gnu`) takes the kernel version, and without an ABI the
 /// ABI, glibc and dynamic linker, of this system.
 pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []const u8) void {
-    if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none") or
-        (std.mem.eql(u8, target, "native") and builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos))
-    {
+    if (std.mem.eql(u8, target, "native") and builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
         opts.bs_target = .aarch64_macos;
         return;
     }
@@ -2561,6 +2564,18 @@ pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []c
         return;
     };
     const arch = query.cpu_arch orelse builtin.cpu.arch;
+    // aarch64-macos, with the versions the target may name
+    // (`aarch64-macos.13.0`, `aarch64-macos.13.0...14.1`): the minimum
+    // replaces the default's, as upstream's.
+    if (arch == .aarch64 and query.os_tag == .macos and (query.abi orelse .none) == .none) {
+        const default = std.Target.Os.VersionRange.default(arch, .macos, .none).semver;
+        opts.macos_version = .{
+            .min = if (query.os_version_min) |v| v.semver else default.min,
+            .max = if (query.os_version_max) |v| v.semver else default.max,
+        };
+        opts.bs_target = .aarch64_macos;
+        return;
+    }
     if ((arch != .x86_64 and arch != .aarch64) or (query.os_tag orelse builtin.os.tag) != .linux) {
         if (std.mem.eql(u8, target, "native"))
             setUnsupported(opts, arena, "bs does not support the native target; pass -target x86_64-linux, -target aarch64-linux, or -target aarch64-macos", .{})
@@ -2738,4 +2753,30 @@ test {
     _ = @import("diag.zig");
     _ = Ir;
     _ = Emit;
+}
+
+test "checkTarget reads the macOS versions an aarch64-macos target names" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    // As upstream 0.17.1's builtin.os.version_range: a version is the
+    // minimum, with the default maximum unless `...` names one.
+    const cases = [_]struct { []const u8, [2]u32, [2]u32 }{
+        .{ "aarch64-macos", .{ 15, 0 }, .{ 27, 0 } },
+        .{ "aarch64-macos-none", .{ 15, 0 }, .{ 27, 0 } },
+        .{ "aarch64-macos.13.0", .{ 13, 0 }, .{ 27, 0 } },
+        .{ "aarch64-macos.13.0...14.1", .{ 13, 0 }, .{ 14, 1 } },
+        .{ "aarch64-macos.12.3-none", .{ 12, 3 }, .{ 27, 0 } },
+    };
+    for (cases) |c| {
+        var opts: Options = .{ .command = .build_exe, .root_src_path = "a.zig" };
+        checkTarget(&opts, arena.allocator(), std.testing.io, c[0]);
+        try std.testing.expectEqual(null, opts.unsupported);
+        try std.testing.expectEqual(.aarch64_macos, opts.bs_target);
+        const v = opts.macos_version;
+        try std.testing.expectEqual(c[1], [2]u32{ @intCast(v.min.major), @intCast(v.min.minor) });
+        try std.testing.expectEqual(c[2], [2]u32{ @intCast(v.max.major), @intCast(v.max.minor) });
+    }
+    var opts: Options = .{ .command = .build_exe, .root_src_path = "a.zig" };
+    checkTarget(&opts, arena.allocator(), std.testing.io, "aarch64-macos-gnu");
+    try std.testing.expect(opts.unsupported != null);
 }
