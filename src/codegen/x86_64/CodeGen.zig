@@ -91,6 +91,9 @@ copy_private: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// `copy_of` allocs whose initializer is a by-reference argument: the
 /// alloc's value is the argument's pointer (`planCopies`).
 ref_alias: std.AutoHashMapUnmanaged(u32, void) = .empty,
+/// `*const` allocs whose address escapes (`sealedRef`), computed for
+/// the first call that asks: empty until then.
+escaped: std.DynamicBitSetUnmanaged = .{},
 /// From `planConstAliases`: `*const` allocs initialized with a constant
 /// in memory that are that constant's memory.
 const_alias: std.AutoHashMapUnmanaged(u32, Index) = .empty,
@@ -385,6 +388,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.copy_private.deinit(gpa);
         cg.ref_alias.deinit(gpa);
         cg.const_alias.deinit(gpa);
+        cg.escaped.deinit(gpa);
         cg.slot_alias.deinit(gpa);
         cg.payload_region.deinit(gpa);
         cg.in_place.deinit(gpa);
@@ -955,6 +959,70 @@ fn argRef(cg: *CodeGen, ref: Ref) Error!?ArgRef {
         .mem => |m| .{ .addr = m },
         else => null,
     };
+}
+
+/// The memory of a `*const` alloc that by-reference argument `ref`, a
+/// load read in place (`deferLoad`), reads, if nothing can write it
+/// during the call: a by-reference argument's copy (`ref_alias`), or an
+/// alloc whose address no instruction uses but its stores and its loads,
+/// directly or through field and element pointers. The callee cannot
+/// reach such an alloc but through this argument, and its stores are its
+/// initializers, none of which `deferLoad` saw between the load and the
+/// call. Its slot outlives the call (`deferLoad`).
+fn sealedRef(cg: *CodeGen, ref: Ref) Error!?ArgRef {
+    const l = ref.toIndex() orelse return null;
+    if (cg.homes[@backingInt(l)] != .deferred) return null;
+    const ir = cg.ir;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const a = datas[@backingInt(l)].ty_op.operand.toIndex() orelse return null;
+    // A copy of a by-reference argument is the argument's memory, which
+    // nothing writes during this function's call, so nothing writes it
+    // during this one either.
+    if (cg.ref_alias.count() != 0 and cg.ref_alias.contains(@backingInt(a))) return .{ .addr = try cg.deferredMem(a.toRef()) };
+    if (tags[@backingInt(a)] != .alloc or datas[@backingInt(a)].ty == .none) return null;
+    const info = Type.ptrInfo(cg.ip, datas[@backingInt(a)].ty);
+    if (!info.flags.is_const or info.flags.is_volatile or info.child != datas[@backingInt(l)].ty_op.ty) return null;
+    if (cg.escaped.bit_length == 0) {
+        cg.escaped = try .initEmpty(cg.gpa, ir.instructions.len + 1);
+        // The last bit says the set is computed.
+        cg.escaped.set(ir.instructions.len);
+        const Escapes = struct {
+            const Self = @This();
+            ir: *const Ir,
+            escaped: *std.DynamicBitSetUnmanaged,
+            user: u32,
+            /// The alloc a field or element pointer chain `p` starts at.
+            fn root(ir_: *const Ir, p: u32) ?u32 {
+                const t = ir_.instructions.items(.tag);
+                var q = p;
+                for (0..8) |_| switch (t[q]) {
+                    .alloc => return q,
+                    // The base is the first word of both payloads.
+                    .struct_field_ptr, .ptr_elem_ptr => q = @backingInt(@as(Ref, @fromBackingInt(ir_.extra[ir_.instructions.items(.data)[q].ty_pl.payload])).toIndex() orelse return null),
+                    else => return null,
+                };
+                return null;
+            }
+            pub fn use(e: Self, r: Ref) void {
+                const t = e.ir.instructions.items(.tag);
+                const d = e.ir.instructions.items(.data);
+                const p = @backingInt(r.toIndex() orelse return);
+                const base = root(e.ir, p) orelse return;
+                const ok = switch (t[e.user]) {
+                    .load => true,
+                    // Its initializer.
+                    .store => p == base and d[e.user].bin_op.lhs == r and d[e.user].bin_op.rhs != r,
+                    .struct_field_ptr, .ptr_elem_ptr => @as(Ref, @fromBackingInt(e.ir.extra[d[e.user].ty_pl.payload])) == r,
+                    else => false,
+                };
+                if (!ok) e.escaped.set(base);
+            }
+        };
+        for (0..ir.instructions.len) |i| Ssa.forEachOperand(ir, @fromBackingInt(@intCast(i)), Escapes{ .ir = ir, .escaped = &cg.escaped, .user = @intCast(i) });
+    }
+    if (cg.escaped.isSet(@backingInt(a))) return null;
+    return .{ .addr = try cg.deferredMem(a.toRef()) };
 }
 
 /// Buffers for `n` argument types and locations, reused by every call.
@@ -4223,12 +4291,19 @@ pub fn deferLoad(cg: *CodeGen, arg: Ref, before: []const Inst.Index, prev: []con
     if (!found) return;
     const ptr = datas[li].ty_op.operand;
     if (ptr.toIndex()) |p0| {
-        // A folded address keeps its base, not itself, alive.
-        if (cg.addr_base[@backingInt(p0)] != no_base) return;
         var p = @backingInt(p0);
-        // A variable `Ssa.plan` may keep in a register (a 16-byte vector)
-        // has no memory to read.
-        if (tags[p] == .alloc and Ssa.wants(live.items(.reg)[p])) return;
+        // A copy of a by-reference argument (`ref_alias`) is the
+        // argument's pointer, in its register or folded into the
+        // argument's (`addr_base`), which then stays alive instead.
+        if (cg.ref_alias.count() != 0 and cg.ref_alias.contains(p)) {
+            if (cg.addr_base[p] != no_base) p = cg.addr_base[p];
+        } else {
+            // A folded address keeps its base, not itself, alive.
+            if (cg.addr_base[p] != no_base) return;
+            // A variable `Ssa.plan` may keep in a register (a 16-byte
+            // vector) has no memory to read.
+            if (tags[p] == .alloc and Ssa.wants(live.items(.reg)[p])) return;
+        }
         if (fwd[p] != Ssa.no_tie) p = fwd[p];
         if (share[p] != Ssa.no_tie or fate[p] != .normal) return;
         end[p] = @max(end[p], at);
@@ -7531,7 +7606,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
                 try cg.copyTo(Mem.at(.rsp, @intCast(off)), arg);
             },
             .ref, .ref_stack => {
-                ref.* = try cg.argRef(arg) orelse copy: {
+                ref.* = try cg.argRef(arg) orelse try cg.sealedRef(arg) orelse copy: {
                     out = std.mem.alignForward(u32, out, @intCast(@min(16, @max(8, Type.abiAlignment(ip, ty)))));
                     const m = Mem.at(.rsp, @intCast(out));
                     try cg.copyTo(m, arg);
