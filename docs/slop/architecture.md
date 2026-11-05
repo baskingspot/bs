@@ -872,7 +872,12 @@ comptime arguments are run-time values in the lowered code (uucode's
   call compiler_rt (see below). Integers wider than 64 bits live in memory
   as 64-bit limbs, normalized like narrow integers (the bits above the width
   are sign or zero copies); CodeGen operates on them limb by limb, inline
-  except for 128-bit division (`__udivti3` and friends).
+  except for 128-bit division (`__udivti3` and friends). On x86_64,
+  exactly 128-bit integers are register-allocated as pairs instead
+  (`want_pair`, low half in `reg`, high half in `reg2`; `int128.zig`
+  lowers addition, subtraction, bitwise operations, multiplication,
+  constant shifts, casts, comparisons and their overflow forms there),
+  and the rest reads them from memory.
 - Vector operations that the backend lowers in SIMD registers stay whole
   vectors in the IR; Sema scalarizes the rest (see "Vectors" below). In
   memory, vectors are laid out as upstream's x86_64 backend lays them

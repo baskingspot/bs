@@ -667,6 +667,13 @@ pub fn shiftDouble(e: *Encoder, left: bool, dst: Rm, src: Reg) !void {
     try e.modRm(.{ .w = true }, &.{ 0x0f, if (left) 0xa5 else 0xad }, @backingInt(src), rmGpr(dst), 0);
 }
 
+/// `shld dst, src, count` (`left`) or `shrd dst, src, count` on qwords.
+pub fn shiftDoubleImm(e: *Encoder, left: bool, dst: Rm, src: Reg, count: u8) !void {
+    try e.reserve();
+    try e.modRm(.{ .w = true }, &.{ 0x0f, if (left) 0xa4 else 0xac }, @backingInt(src), rmGpr(dst), 1);
+    e.byte(count);
+}
+
 /// `bsf dst, src` (forward) or `bsr dst, src` (reverse): index of the lowest
 /// or highest set bit. Sets ZF and leaves `dst` undefined when `src` is 0.
 pub fn bitScan(e: *Encoder, reverse: bool, size: Size, dst: Reg, src: Rm) !void {

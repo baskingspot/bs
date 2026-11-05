@@ -731,7 +731,7 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
             switch (tags[i]) {
                 .add_with_overflow, .sub_with_overflow, .mul_with_overflow => {
                     const op_ty = ir.typeOf(ir.extraData(Ir.Bin, datas[i].ty_pl.payload).data.lhs, ip);
-                    if (!ctx.inGpr(op_ty)) continue;
+                    if (!ctx.inGpr(op_ty) and !ctx.inPair(op_ty)) continue;
                     var fields: [2]u32 = .{ no_tie, no_tie };
                     var n: u32 = 0;
                     // The fields' reads anywhere later in the block: the
