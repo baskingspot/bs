@@ -3121,6 +3121,12 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref, d: Reg) Err
             try e.shiftImm(if (tag == .shl) .lsl else if (s) .asr else .lsr, .x, d, a, @intCast(v & 63));
             return cg.normalize(d, ty);
         },
+        // The results are at most the dividend: they stay normalized.
+        .div_trunc, .div_floor, .div_ceil, .rem, .mod => if (imm) |v| {
+            const bits = Type.intInfo(cg.ip, ty).bits;
+            if (!s and v != 0) return cg.divConst(tag, a, v, bits, d);
+            if (s and @as(i64, @bitCast(v)) >= 1 and tag != .div_ceil) return cg.divConstSigned(tag, a, v, bits, d);
+        },
         else => {},
     }
     const b = try cg.use(rhs, .x10);
@@ -3133,42 +3139,121 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref, d: Reg) Err
         .xor => return e.logic(.eor, .x, d, a, .r(b)),
         .shl => try e.shiftReg(.lsl, .x, d, a, b),
         .shr => try e.shiftReg(if (s) .asr else .lsr, .x, d, a, b),
-        .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
-            // x11 = quotient, x13 = remainder. Safety checks before this
-            // rule out division by zero and minInt / -1.
-            try e.div(s, .x, .x11, a, b);
-            try e.mulAdd(.msub, .x, .x13, .x11, b, a);
-            if (s and (tag == .div_floor or tag == .mod)) {
-                // Adjust when the remainder is non-zero and its sign
-                // differs from the divisor's.
-                const done = try e.newLabel();
-                try e.cbz(false, .x, .x13, done);
-                try e.logic(.eor, .x, .x14, .x13, .r(b));
-                try e.tbz(false, .x14, 63, done);
-                if (tag == .div_floor) {
-                    try e.addSub(.sub, .x, .x11, .x11, .{ .imm = 1 });
-                } else {
-                    try e.addSub(.add, .x, .x13, .x13, .r(b));
-                }
-                e.bind(done);
-            }
-            if (tag == .div_ceil) {
-                // Round up when the remainder is non-zero and the exact
-                // quotient is positive (dividend and divisor signs agree).
-                const done = try e.newLabel();
-                try e.cbz(false, .x, .x13, done);
-                if (s) {
-                    try e.logic(.eor, .x, .x14, .x13, .r(b));
-                    try e.tbz(true, .x14, 63, done);
-                }
-                try e.addSub(.add, .x, .x11, .x11, .{ .imm = 1 });
-                e.bind(done);
-            }
-            try e.mov(.x, d, if (tag == .rem or tag == .mod) .x13 else .x11);
-        },
+        .div_trunc, .div_floor, .div_ceil, .rem, .mod => try cg.divide(tag, s, a, b, d),
         else => unreachable,
     }
     try cg.normalize(d, ty);
+}
+
+/// `d = a op b` for division `tag` of 64-bit extended registers, signed
+/// or not by `s`, writing `d` after reading both. Uses x11, x13, and x14.
+fn divide(cg: *CodeGen, tag: Inst.Tag, s: bool, a: Reg, b: Reg, d: Reg) Error!void {
+    const e = &cg.e;
+    // x11 = quotient, x13 = remainder. Safety checks before this
+    // rule out division by zero and minInt / -1.
+    try e.div(s, .x, .x11, a, b);
+    try e.mulAdd(.msub, .x, .x13, .x11, b, a);
+    if (s and (tag == .div_floor or tag == .mod)) {
+        // Adjust when the remainder is non-zero and its sign
+        // differs from the divisor's.
+        const done = try e.newLabel();
+        try e.cbz(false, .x, .x13, done);
+        try e.logic(.eor, .x, .x14, .x13, .r(b));
+        try e.tbz(false, .x14, 63, done);
+        if (tag == .div_floor) {
+            try e.addSub(.sub, .x, .x11, .x11, .{ .imm = 1 });
+        } else {
+            try e.addSub(.add, .x, .x13, .x13, .r(b));
+        }
+        e.bind(done);
+    }
+    if (tag == .div_ceil) {
+        // Round up when the remainder is non-zero and the exact
+        // quotient is positive (dividend and divisor signs agree).
+        const done = try e.newLabel();
+        try e.cbz(false, .x, .x13, done);
+        if (s) {
+            try e.logic(.eor, .x, .x14, .x13, .r(b));
+            try e.tbz(true, .x14, 63, done);
+        }
+        try e.addSub(.add, .x, .x11, .x11, .{ .imm = 1 });
+        e.bind(done);
+    }
+    try e.mov(.x, d, if (tag == .rem or tag == .mod) .x13 else .x11);
+}
+
+/// x11 = `x / c` for the `bits`-bit unsigned value in `x` and constant `c`
+/// (not zero) without a divide: a shift for a power of two, a compare when
+/// the quotient is 0 or 1, else a multiply by `Ssa.divMagic`'s number.
+/// Uses x10.
+fn udivConst(cg: *CodeGen, x: Reg, c: u64, bits: u16) Error!void {
+    const e = &cg.e;
+    if (std.math.isPowerOfTwo(c)) {
+        const k: u6 = @intCast(@ctz(c));
+        if (k == 0) return e.mov(.x, .x11, x);
+        return e.shiftImm(.lsr, .x, .x11, x, k);
+    }
+    if (c > @as(u64, 1) << @intCast(bits - 1)) {
+        try e.movImm(.x, .x10, c);
+        try e.cmp(.x, x, .r(.x10));
+        return e.csel(.csinc, .x, .x11, .zr, .zr, .lo);
+    }
+    const magic = Ssa.divMagic(c, bits);
+    try e.movImm(.x, .x10, @truncate(magic.m));
+    try e.mulHigh(false, .x11, x, .x10);
+    if (magic.m >> 64 == 0) {
+        if (magic.p > 64) try e.shiftImm(.lsr, .x, .x11, .x11, @intCast(magic.p - 64));
+        return;
+    }
+    try e.addSub(.sub, .x, .x10, x, .r(.x11));
+    try e.addSub(.add, .x, .x11, .x11, .{ .reg = .{ .reg = .x10, .shift = .lsr, .amount = 1 } });
+    if (magic.p > 65) try e.shiftImm(.lsr, .x, .x11, .x11, @intCast(magic.p - 65));
+}
+
+/// `d = a op c` for unsigned division `tag` of the `bits`-bit value in `a`
+/// by constant `c` (not zero), writing `d` last. Uses x10, x11, and x13.
+fn divConst(cg: *CodeGen, tag: Inst.Tag, a: Reg, c: u64, bits: u16, d: Reg) Error!void {
+    const e = &cg.e;
+    const want_q = tag == .div_trunc or tag == .div_floor;
+    if (!want_q and tag != .div_ceil and std.math.isPowerOfTwo(c)) {
+        if (c == 1) return e.movImm(.x, d, 0);
+        return e.logic(.@"and", .x, d, a, .{ .imm = c - 1 });
+    }
+    try cg.udivConst(a, c, bits);
+    if (want_q) return e.mov(.x, d, .x11);
+    try e.movImm(.x, .x10, c);
+    if (tag != .div_ceil) return e.mulAdd(.msub, .x, d, .x11, .x10, a);
+    // Up by one when the remainder is not zero.
+    try e.mulAdd(.msub, .x, .x13, .x11, .x10, a);
+    try e.cmp(.x, .x13, .{ .imm = 0 });
+    try e.csel(.csinc, .x, d, .x11, .x11, .eq);
+}
+
+/// `d = a op c` for signed division `tag` (not ceil) of the `bits`-bit
+/// value in `a`, extended to 64 bits, by positive constant `c`, through
+/// `udivConst` on a non-negative value: with `s = a >> 63`, floor's
+/// quotient is `((a ^ s) / c) ^ s`, and trunc's is `((|a| / c) ^ s) - s`;
+/// the remainder is `a - q * c`. Writes `d` last. Uses x10, x11, x13, and
+/// x14.
+fn divConstSigned(cg: *CodeGen, tag: Inst.Tag, a: Reg, c: u64, bits: u16, d: Reg) Error!void {
+    const e = &cg.e;
+    const floor = tag == .div_floor or tag == .mod;
+    if (floor and std.math.isPowerOfTwo(c)) {
+        // Two's complement shifts and masks round toward minus infinity.
+        if (c == 1) return if (tag == .mod) e.movImm(.x, d, 0) else e.mov(.x, d, a);
+        if (tag == .mod) return e.logic(.@"and", .x, d, a, .{ .imm = c - 1 });
+        return e.shiftImm(.asr, .x, d, a, @intCast(@ctz(c)));
+    }
+    try e.shiftImm(.asr, .x, .x14, a, 63);
+    try e.logic(.eor, .x, .x13, a, .r(.x14));
+    if (!floor) try e.addSub(.sub, .x, .x13, .x13, .r(.x14));
+    // `a ^ s` has `bits - 1` bits; `|a|` has `bits` (|minInt|).
+    try cg.udivConst(.x13, c, if (floor) bits - 1 else bits);
+    try e.logic(.eor, .x, .x11, .x11, .r(.x14));
+    if (!floor) try e.addSub(.sub, .x, .x11, .x11, .r(.x14));
+    if (tag == .div_trunc or tag == .div_floor) return e.mov(.x, d, .x11);
+    try e.movImm(.x, .x10, c);
+    try e.mulAdd(.msub, .x, d, .x11, .x10, a);
 }
 
 /// `{ T, u1 }` results: the wrapped value and whether it overflowed `T`.
@@ -5298,6 +5383,65 @@ fn strLimb(cg: *CodeGen, m: Mem, i: u32, reg: Reg) Error!void {
     try cg.storeReg(limb(m, i), reg, 8);
 }
 
+/// The fast path of a 2-limb division `lhs op rhs` into `dst`: when both
+/// operands fit in 64 bits (and, signed, the divisor is not -1, whose
+/// quotient of `minInt(i64)` does not), divides them as 64-bit integers
+/// and branches to `end`; otherwise falls through to the compiler_rt call
+/// after it. A constant divisor is checked here and divided by without a
+/// divide where it can be. Uses x9, x10, x11, x13, and x14.
+fn wideDivFast(cg: *CodeGen, tag: Inst.Tag, s: bool, lhs: Mem, rhs: Mem, rhs_ref: Ref, dst: Mem, end: Encoder.Label) Error!void {
+    const e = &cg.e;
+    const d: ?u64 = if (rhs_ref.toInterned()) |v| blk: {
+        const d = if (s) @as(u64, @bitCast(cg.ip.intValue(i64, v) orelse return)) else cg.ip.intValue(u64, v) orelse return;
+        if (d == 0 or (s and d == std.math.maxInt(u64))) return;
+        break :blk d;
+    } else null;
+    const slow = try e.newLabel();
+    const sign_of_x9: Encoder.AddOperand = .{ .reg = .{ .reg = .x9, .shift = .asr, .amount = 63 } };
+    if (s) {
+        try cg.ldrLimb(.x9, lhs, 0);
+        try cg.ldrLimb(.x10, lhs, 1);
+        try e.cmp(.x, .x10, sign_of_x9);
+        try e.bcond(.ne, slow);
+        if (d == null) {
+            try cg.ldrLimb(.x10, rhs, 0);
+            try cg.ldrLimb(.x11, rhs, 1);
+            try e.cmp(.x, .x11, .{ .reg = .{ .reg = .x10, .shift = .asr, .amount = 63 } });
+            try e.bcond(.ne, slow);
+            // Divisors -1 and 0 (unsigned x10 + 1 <= 1) take the call.
+            try e.addSub(.add, .x, .x11, .x10, .{ .imm = 1 });
+            try e.cmp(.x, .x11, .{ .imm = 1 });
+            try e.bcond(.ls, slow);
+        }
+    } else {
+        try cg.ldrLimb(.x10, lhs, 1);
+        if (d == null) {
+            try cg.ldrLimb(.x11, rhs, 1);
+            try e.logic(.orr, .x, .x10, .x10, .r(.x11));
+        }
+        try e.cbz(true, .x, .x10, slow);
+        try cg.ldrLimb(.x9, lhs, 0);
+        if (d == null) try cg.ldrLimb(.x10, rhs, 0);
+    }
+    if (d) |c| {
+        if (!s) {
+            try cg.divConst(tag, .x9, c, 64, .x9);
+        } else if (@as(i64, @bitCast(c)) >= 1 and tag != .div_ceil) {
+            try cg.divConstSigned(tag, .x9, c, 64, .x9);
+        } else {
+            try e.movImm(.x, .x10, c);
+            try cg.divide(tag, s, .x9, .x10, .x9);
+        }
+    } else try cg.divide(tag, s, .x9, .x10, .x9);
+    try cg.strLimb(dst, 0, .x9);
+    if (s) {
+        try e.shiftImm(.asr, .x, .x9, .x9, 63);
+        try cg.strLimb(dst, 1, .x9);
+    } else try cg.strLimb(dst, 1, .zr);
+    try e.b(.{ .label = end });
+    e.bind(slow);
+}
+
 /// Sets x9 to zero when wide integers `a` and `b` of the same type are
 /// equal: the OR of every limb's XOR. Uses x10.
 fn wideEq(cg: *CodeGen, a_ref: Ref, b_ref: Ref) Error!void {
@@ -5601,14 +5745,21 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
             const want_q = tag == .div_trunc or tag == .div_floor or tag == .div_ceil;
             const adjust = tag == .div_ceil or (s and (tag == .div_floor or tag == .mod));
             const rem = if (want_q and adjust) try cg.allocSlot(@as(u64, n) * 8, 16) else dst;
+            const end = try e.newLabel();
             if (n == 2) {
+                try cg.wideDivFast(tag, s, lhs.loc.mem, rhs.loc.mem, data.bin_op.rhs, dst, end);
                 const rt_ty: Index = if (s) .i128_type else .u128_type;
                 const l: Val = .{ .ty = rt_ty, .loc = lhs.loc };
                 const r: Val = .{ .ty = rt_ty, .loc = rhs.loc };
-                const q_name = if (s) "__divti3" else "__udivti3";
-                const r_name = if (s) "__modti3" else "__umodti3";
-                if (adjust or !want_q) try cg.rtCall("udivmod.zig", r_name, &.{ l, r }, rt_ty, rem);
-                if (want_q) try cg.rtCall("udivmod.zig", q_name, &.{ l, r }, rt_ty, dst);
+                if (want_q and adjust) {
+                    // One call for both the quotient and the remainder.
+                    const rem_ptr: Val = .{ .ty = .usize_type, .loc = .{ .addr = rem } };
+                    if (s) {
+                        try cg.rtCall("int.zig", "__divmodti4", &.{ l, r, rem_ptr }, rt_ty, dst);
+                    } else try cg.rtCall("udivmod.zig", "__udivmodti4", &.{ l, r, rem_ptr }, rt_ty, dst);
+                } else if (want_q) {
+                    try cg.rtCall("udivmod.zig", if (s) "__divti3" else "__udivti3", &.{ l, r }, rt_ty, dst);
+                } else try cg.rtCall("udivmod.zig", if (s) "__modti3" else "__umodti3", &.{ l, r }, rt_ty, rem);
             } else {
                 const file = if (s) "divmodei4.zig" else "udivmodei4.zig";
                 const q_name = if (s) "__divei4" else "__udivei4";
@@ -5616,7 +5767,7 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
                 if (adjust or !want_q) try cg.divEi4(file, r_name, rem, lhs.loc.mem, rhs.loc.mem, ty);
                 if (want_q) try cg.divEi4(file, q_name, dst, lhs.loc.mem, rhs.loc.mem, ty);
             }
-            if (!adjust) return;
+            if (!adjust) return e.bind(end);
             // Adjust when the remainder is non-zero and, for floor and mod,
             // its sign differs from the divisor's; for ceil, when the exact
             // quotient is positive.
@@ -5647,6 +5798,7 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
                 try cg.strLimb(dst, i, .x9);
             }
             e.bind(done);
+            e.bind(end);
         },
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => {
             const bin = cg.ir.extraData(Ir.Bin, data.ty_pl.payload).data;

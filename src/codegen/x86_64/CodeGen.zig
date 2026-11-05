@@ -5507,10 +5507,13 @@ fn intOp(cg: *CodeGen, d: Reg, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Err
 fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void {
     const s = cg.signed(ty);
     try cg.load(.rax, lhs);
-    if (!s) if (rhs.toInterned()) |v| switch (tag) {
-        .div_trunc, .div_floor, .div_ceil, .rem, .mod => if (intBits(cg.ip, v) != 0) {
+    if (rhs.toInterned()) |v| switch (tag) {
+        .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
             // The result is at most the dividend: it stays normalized.
-            return cg.divConst(tag, intBits(cg.ip, v), Type.intInfo(cg.ip, ty).bits);
+            const d = intBits(cg.ip, v);
+            const bits = Type.intInfo(cg.ip, ty).bits;
+            if (!s and d != 0) return cg.divConst(tag, d, bits);
+            if (s and @as(i64, @bitCast(d)) >= 1 and tag != .div_ceil) return cg.divConstSigned(tag, d, bits);
         },
         else => {},
     };
@@ -5524,77 +5527,79 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void 
         .xor => try cg.e.alu(.xor, .qword, .{ .reg = .rax }, .{ .reg = .rcx }),
         .shl => try cg.e.shift(.shl, .qword, .{ .reg = .rax }, null),
         .shr => try cg.e.shift(if (s) .sar else .shr, .qword, .{ .reg = .rax }, null),
-        .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
-            if (s) {
-                try cg.e.cqo(.qword);
-                try cg.e.unary(.idiv, .qword, .{ .reg = .rcx });
-            } else {
-                // A 32-bit divide is faster where the operands fit (it
-                // zero-extends its results): always for types of up to 32
-                // bits, else when both values do, as LLVM bypasses slow
-                // divides.
-                try cg.e.alu(.xor, .dword, .{ .reg = .rdx }, .{ .reg = .rdx });
-                if (Type.intInfo(cg.ip, ty).bits <= 32) {
-                    try cg.e.unary(.div, .dword, .{ .reg = .rcx });
-                } else {
-                    const wide = try cg.e.newLabel();
-                    const done = try cg.e.newLabel();
-                    try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = .rax });
-                    try cg.e.alu(.@"or", .qword, .{ .reg = cg.r11() }, .{ .reg = .rcx });
-                    try cg.e.shift(.shr, .qword, .{ .reg = cg.r11() }, 32);
-                    try cg.e.jcc(.ne, .{ .label = wide });
-                    try cg.e.unary(.div, .dword, .{ .reg = .rcx });
-                    try cg.e.jmp(.{ .label = done });
-                    cg.e.bind(wide);
-                    try cg.e.unary(.div, .qword, .{ .reg = .rcx });
-                    cg.e.bind(done);
-                }
-            }
-            // rax = quotient, rdx = remainder.
-            if (s and (tag == .div_floor or tag == .mod)) {
-                // Adjust when the remainder is non-zero and its sign differs
-                // from the divisor's.
-                const done = try cg.e.newLabel();
-                try cg.e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
-                try cg.e.jcc(.e, .{ .label = done });
-                try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = .rdx });
-                try cg.e.alu(.xor, .qword, .{ .reg = cg.r11() }, .{ .reg = .rcx });
-                try cg.e.jcc(.ns, .{ .label = done });
-                if (tag == .div_floor) {
-                    try cg.e.alu(.sub, .qword, .{ .reg = .rax }, .{ .imm = 1 });
-                } else {
-                    try cg.e.alu(.add, .qword, .{ .reg = .rdx }, .{ .reg = .rcx });
-                }
-                cg.e.bind(done);
-            }
-            if (tag == .div_ceil) {
-                // Round up when the remainder is non-zero and the exact
-                // quotient is positive (dividend and divisor signs agree).
-                const done = try cg.e.newLabel();
-                try cg.e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
-                try cg.e.jcc(.e, .{ .label = done });
-                if (s) {
-                    try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = .rdx });
-                    try cg.e.alu(.xor, .qword, .{ .reg = cg.r11() }, .{ .reg = .rcx });
-                    try cg.e.jcc(.s, .{ .label = done });
-                }
-                try cg.e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = 1 });
-                cg.e.bind(done);
-            }
-            if (tag == .rem or tag == .mod) try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rdx });
-        },
+        .div_trunc, .div_floor, .div_ceil, .rem, .mod => try cg.divide(tag, s, Type.intInfo(cg.ip, ty).bits),
         else => unreachable,
     }
     try cg.normalize(.rax, ty);
 }
 
+/// Divides the `bits`-bit value in rax by the one in rcx (not zero), both
+/// extended to 64 bits, signed or not by `s`; the result, by `tag`, ends
+/// in rax. Uses rdx and r11.
+fn divide(cg: *CodeGen, tag: Inst.Tag, s: bool, bits: u16) Error!void {
+    if (s) {
+        try cg.e.cqo(.qword);
+        try cg.e.unary(.idiv, .qword, .{ .reg = .rcx });
+    } else {
+        // A 32-bit divide is faster where the operands fit (it
+        // zero-extends its results): always for types of up to 32
+        // bits, else when both values do, as LLVM bypasses slow
+        // divides.
+        try cg.e.alu(.xor, .dword, .{ .reg = .rdx }, .{ .reg = .rdx });
+        if (bits <= 32) {
+            try cg.e.unary(.div, .dword, .{ .reg = .rcx });
+        } else {
+            const wide = try cg.e.newLabel();
+            const done = try cg.e.newLabel();
+            try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = .rax });
+            try cg.e.alu(.@"or", .qword, .{ .reg = cg.r11() }, .{ .reg = .rcx });
+            try cg.e.shift(.shr, .qword, .{ .reg = cg.r11() }, 32);
+            try cg.e.jcc(.ne, .{ .label = wide });
+            try cg.e.unary(.div, .dword, .{ .reg = .rcx });
+            try cg.e.jmp(.{ .label = done });
+            cg.e.bind(wide);
+            try cg.e.unary(.div, .qword, .{ .reg = .rcx });
+            cg.e.bind(done);
+        }
+    }
+    // rax = quotient, rdx = remainder.
+    if (s and (tag == .div_floor or tag == .mod)) {
+        // Adjust when the remainder is non-zero and its sign differs
+        // from the divisor's.
+        const done = try cg.e.newLabel();
+        try cg.e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
+        try cg.e.jcc(.e, .{ .label = done });
+        try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = .rdx });
+        try cg.e.alu(.xor, .qword, .{ .reg = cg.r11() }, .{ .reg = .rcx });
+        try cg.e.jcc(.ns, .{ .label = done });
+        if (tag == .div_floor) {
+            try cg.e.alu(.sub, .qword, .{ .reg = .rax }, .{ .imm = 1 });
+        } else {
+            try cg.e.alu(.add, .qword, .{ .reg = .rdx }, .{ .reg = .rcx });
+        }
+        cg.e.bind(done);
+    }
+    if (tag == .div_ceil) {
+        // Round up when the remainder is non-zero and the exact
+        // quotient is positive (dividend and divisor signs agree).
+        const done = try cg.e.newLabel();
+        try cg.e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
+        try cg.e.jcc(.e, .{ .label = done });
+        if (s) {
+            try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = .rdx });
+            try cg.e.alu(.xor, .qword, .{ .reg = cg.r11() }, .{ .reg = .rcx });
+            try cg.e.jcc(.s, .{ .label = done });
+        }
+        try cg.e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = 1 });
+        cg.e.bind(done);
+    }
+    if (tag == .rem or tag == .mod) try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rdx });
+}
+
 /// Unsigned division of the `bits`-bit value in rax by constant `d` (not
-/// zero) without a divide: a shift for a power of two, else a multiply by
-/// a magic number (Granlund and Montgomery, 1994): the smallest `p` from
-/// 64 with `m = ceil(2^p / d)` and `m * d - 2^p <= 2^(p - bits)` gives
-/// `x / d = (x * m) >> p` for every `bits`-bit `x`; an `m` of 65 bits
-/// takes the add-and-halve fixup. The result, by `tag`, ends in rax. Uses
-/// rcx, rdx, and r11.
+/// zero) without a divide: a shift for a power of two, a compare when the
+/// quotient is 0 or 1, else a multiply by `Ssa.divMagic`'s number. The
+/// result, by `tag`, ends in rax. Uses rcx, rdx, and r11.
 fn divConst(cg: *CodeGen, tag: Inst.Tag, d: u64, bits: u16) Error!void {
     const e = &cg.e;
     const want_rem = tag == .rem or tag == .mod or tag == .div_ceil;
@@ -5616,12 +5621,9 @@ fn divConst(cg: *CodeGen, tag: Inst.Tag, d: u64, bits: u16) Error!void {
         e.bind(done);
         try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rcx });
     } else {
-        var p: u8 = 64;
-        const m: u128 = while (true) : (p += 1) {
-            const two_p = @as(u128, 1) << @intCast(p);
-            const mm = (two_p + d - 1) / d;
-            if (mm * d - two_p <= @as(u128, 1) << @intCast(p - bits)) break mm;
-        };
+        const magic = Ssa.divMagic(d, bits);
+        const m = magic.m;
+        const p = magic.p;
         try e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .rax });
         try e.mov(.qword, .{ .reg = cg.r11() }, .{ .imm = @bitCast(@as(u64, @truncate(m))) });
         try e.unary(.mul, .qword, .{ .reg = cg.r11() });
@@ -5663,11 +5665,105 @@ fn divConst(cg: *CodeGen, tag: Inst.Tag, d: u64, bits: u16) Error!void {
     }
 }
 
+/// Signed division (not ceil) of the `bits`-bit value in rax, extended to
+/// 64 bits, by positive constant `d`, through `divConst` on a non-negative
+/// value: with `s = x >> 63`, floor's quotient is `((x ^ s) / d) ^ s`, and
+/// trunc's is `((|x| / d) ^ s) - s`; the remainder is `x - q * d`. The
+/// result, by `tag`, ends in rax. Uses rcx, rdx, r10, and r11.
+fn divConstSigned(cg: *CodeGen, tag: Inst.Tag, d: u64, bits: u16) Error!void {
+    const e = &cg.e;
+    const floor = tag == .div_floor or tag == .mod;
+    if (floor and std.math.isPowerOfTwo(d)) {
+        // Two's complement shifts and masks round toward minus infinity.
+        if (tag == .mod) return cg.andImm(.rax, d - 1);
+        if (d != 1) try e.shift(.sar, .qword, .{ .reg = .rax }, @intCast(@ctz(d)));
+        return;
+    }
+    try e.mov(.qword, .{ .reg = .r10 }, .{ .reg = .rax });
+    try e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rax });
+    try e.shift(.sar, .qword, .{ .reg = .rdx }, 63);
+    try e.alu(.xor, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
+    if (!floor) try e.alu(.sub, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
+    // `x ^ s` has `bits - 1` bits; `|x|` has `bits` (|minInt|).
+    try cg.divConst(.div_trunc, d, if (floor) bits - 1 else bits);
+    try e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .r10 });
+    try e.shift(.sar, .qword, .{ .reg = .rdx }, 63);
+    try e.alu(.xor, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
+    if (!floor) try e.alu(.sub, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
+    if (tag != .rem and tag != .mod) return;
+    if (std.math.cast(i32, d)) |imm| {
+        try e.imul(.qword, .rdx, .{ .reg = .rax }, imm);
+    } else {
+        try e.mov(.qword, .{ .reg = .rdx }, .{ .imm = @bitCast(d) });
+        try e.imul(.qword, .rdx, .{ .reg = .rax }, null);
+    }
+    try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .r10 });
+    try e.alu(.sub, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
+}
+
 /// `reg &= mask`.
 fn andImm(cg: *CodeGen, reg: Reg, mask: u64) Error!void {
     if (std.math.cast(i32, mask)) |imm| return cg.e.alu(.@"and", .qword, .{ .reg = reg }, .{ .imm = imm });
     try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .imm = @bitCast(mask) });
     try cg.e.alu(.@"and", .qword, .{ .reg = reg }, .{ .reg = cg.r11() });
+}
+
+/// The fast path of a 2-limb division `lhs op rhs` into `dst`: when both
+/// operands fit in 64 bits (and, signed, the divisor is not -1, whose
+/// quotient of `minInt(i64)` does not), divides them as 64-bit integers
+/// and jumps to `end`; otherwise falls through to the compiler_rt call
+/// after it. A constant divisor is checked here and divided by without a
+/// divide where it can be. Uses rax, rcx, rdx, r10, and r11.
+fn wideDivFast(cg: *CodeGen, tag: Inst.Tag, s: bool, lhs: Mem, rhs: Mem, rhs_ref: Ref, dst: Mem, end: Encoder.Label) Error!void {
+    const e = &cg.e;
+    const d: ?u64 = if (rhs_ref.toInterned()) |v| blk: {
+        const d = if (s) @as(u64, @bitCast(cg.ip.intValue(i64, v) orelse return)) else cg.ip.intValue(u64, v) orelse return;
+        if (d == 0 or (s and d == std.math.maxInt(u64))) return;
+        break :blk d;
+    } else null;
+    const slow = try e.newLabel();
+    if (s) {
+        try e.mov(.qword, .{ .reg = .rax }, .{ .mem = lhs });
+        try e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rax });
+        try e.shift(.sar, .qword, .{ .reg = .rdx }, 63);
+        try e.alu(.cmp, .qword, .{ .reg = .rdx }, .{ .mem = limb(lhs, 1) });
+        try e.jcc(.ne, .{ .label = slow });
+        if (d == null) {
+            try e.mov(.qword, .{ .reg = .rcx }, .{ .mem = rhs });
+            try e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rcx });
+            try e.shift(.sar, .qword, .{ .reg = .rdx }, 63);
+            try e.alu(.cmp, .qword, .{ .reg = .rdx }, .{ .mem = limb(rhs, 1) });
+            try e.jcc(.ne, .{ .label = slow });
+            // Divisors -1 and 0 (unsigned rcx + 1 <= 1) take the call.
+            try e.lea(.qword, .rdx, Mem.at(.rcx, 1));
+            try e.alu(.cmp, .qword, .{ .reg = .rdx }, .{ .imm = 1 });
+            try e.jcc(.be, .{ .label = slow });
+        }
+    } else {
+        try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(lhs, 1) });
+        if (d == null) try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .mem = limb(rhs, 1) });
+        try e.@"test"(.qword, .{ .reg = .rax }, .{ .reg = .rax });
+        try e.jcc(.ne, .{ .label = slow });
+        try e.mov(.qword, .{ .reg = .rax }, .{ .mem = lhs });
+        if (d == null) try e.mov(.qword, .{ .reg = .rcx }, .{ .mem = rhs });
+    }
+    if (d) |c| {
+        if (!s) {
+            try cg.divConst(tag, c, 64);
+        } else if (@as(i64, @bitCast(c)) >= 1 and tag != .div_ceil) {
+            try cg.divConstSigned(tag, c, 64);
+        } else {
+            try e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @bitCast(c) });
+            try cg.divide(tag, s, 64);
+        }
+    } else try cg.divide(tag, s, 64);
+    try e.mov(.qword, .{ .mem = dst }, .{ .reg = .rax });
+    if (s) {
+        try e.shift(.sar, .qword, .{ .reg = .rax }, 63);
+        try e.mov(.qword, .{ .mem = limb(dst, 1) }, .{ .reg = .rax });
+    } else try e.mov(.qword, .{ .mem = limb(dst, 1) }, .{ .imm = 0 });
+    try e.jmp(.{ .label = end });
+    e.bind(slow);
 }
 
 /// `{ T, u1 }` results: the wrapped value and whether it overflowed `T`.
@@ -8799,14 +8895,21 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
             const want_q = tag == .div_trunc or tag == .div_floor or tag == .div_ceil;
             const adjust = tag == .div_ceil or (s and (tag == .div_floor or tag == .mod));
             const rem = if (want_q and adjust) Mem.at(.rbp, try cg.allocSlot(@as(u64, n) * 8, 16)) else dst;
+            const end = try e.newLabel();
             if (n == 2) {
+                try cg.wideDivFast(tag, s, lhs.loc.mem, rhs.loc.mem, data.bin_op.rhs, dst, end);
                 const rt_ty: Index = if (s) .i128_type else .u128_type;
                 const l: Val = .{ .ty = rt_ty, .loc = lhs.loc };
                 const r: Val = .{ .ty = rt_ty, .loc = rhs.loc };
-                const q_name = if (s) "__divti3" else "__udivti3";
-                const r_name = if (s) "__modti3" else "__umodti3";
-                if (adjust or !want_q) try cg.rtCall("udivmod.zig", r_name, &.{ l, r }, rt_ty, rem);
-                if (want_q) try cg.rtCall("udivmod.zig", q_name, &.{ l, r }, rt_ty, dst);
+                if (want_q and adjust) {
+                    // One call for both the quotient and the remainder.
+                    const rem_ptr: Val = .{ .ty = .usize_type, .loc = .{ .addr = rem } };
+                    if (s) {
+                        try cg.rtCall("int.zig", "__divmodti4", &.{ l, r, rem_ptr }, rt_ty, dst);
+                    } else try cg.rtCall("udivmod.zig", "__udivmodti4", &.{ l, r, rem_ptr }, rt_ty, dst);
+                } else if (want_q) {
+                    try cg.rtCall("udivmod.zig", if (s) "__divti3" else "__udivti3", &.{ l, r }, rt_ty, dst);
+                } else try cg.rtCall("udivmod.zig", if (s) "__modti3" else "__umodti3", &.{ l, r }, rt_ty, rem);
             } else {
                 // `__udivei4(q, u, v, bits)` and friends work on integers of
                 // their ABI size in memory; the signed ones clobber u and v.
@@ -8816,7 +8919,7 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
                 if (adjust or !want_q) try cg.divEi4(file, r_name, rem, lhs.loc.mem, rhs.loc.mem, ty);
                 if (want_q) try cg.divEi4(file, q_name, dst, lhs.loc.mem, rhs.loc.mem, ty);
             }
-            if (!adjust) return;
+            if (!adjust) return e.bind(end);
             // Adjust when the remainder is non-zero and, for floor and mod,
             // its sign differs from the divisor's; for ceil, when the exact
             // quotient is positive.
@@ -8842,6 +8945,7 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
                 },
             }
             e.bind(done);
+            e.bind(end);
         },
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => {
             const bin = cg.ir.extraData(Ir.Bin, data.ty_pl.payload).data;

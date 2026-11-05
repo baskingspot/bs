@@ -1852,6 +1852,22 @@ pub fn ovfBitCmp(ir: *const Ir, ip: *const InternPool, cmp: Inst.Index, bit: u32
     return (tag == .cmp_eq) == (v == 1);
 }
 
+/// The magic number for unsigned division by constant `d` of every
+/// `bits`-bit value, where `d` is not a power of two and at most
+/// `2^(bits - 1)` (Granlund and Montgomery, 1994): the smallest `p` from 64
+/// with `m = ceil(2^p / d)` and `m * d - 2^p <= 2^(p - bits)` gives
+/// `x / d = (x * m) >> p`. An `m` of 65 bits takes the add-and-halve fixup
+/// `(t + ((x - t) >> 1)) >> (p - 65)`, `t = (x * (m - 2^64)) >> 64`. Both
+/// backends lower division by a constant with it.
+pub fn divMagic(d: u64, bits: u16) struct { m: u128, p: u8 } {
+    var p: u8 = 64;
+    while (true) : (p += 1) {
+        const two_p = @as(u128, 1) << @intCast(p);
+        const m = (two_p + d - 1) / d;
+        if (m * d - two_p <= @as(u128, 1) << @intCast(p - bits)) return .{ .m = m, .p = p };
+    }
+}
+
 /// Whether a block with this terminator ends the function's execution.
 pub fn deadEnd(tag: Term.Tag) bool {
     return switch (tag) {
