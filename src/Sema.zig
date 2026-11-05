@@ -16364,7 +16364,8 @@ fn analyzeIsNonNull(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileE
 /// "expected optional type" with upstream's notes (`failWithExpectedOptionalType`),
 /// and for an error union's `orelse`, the fix `catch`.
 noinline fn failExpectedOptional(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError {
-    const err = sema.fail(block, src, "expected optional type, found '{f}'", .{sema.fmtType(ty)});
+    // Where `ty` is declared comes after the note, as upstream.
+    const err = sema.fail(block, src, "expected optional type, found '{f}'", .{FmtType{ .ip = sema.ip, .ty = ty, .decl_note = false }});
     if (Type.class(sema.ip, ty) == .error_union) {
         const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
         const span = src.span(tree);
@@ -16576,7 +16577,6 @@ fn zirTry(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_ptr: bool) Compi
     const ty = sema.typeOf(eu);
     if (Type.class(sema.ip, ty) != .error_union) {
         const err = sema.fail(parent, src.operandSrc(0), "expected error union type, found '{f}'", .{sema.fmtType(ty)});
-        try sema.addDeclaredHereNote(ty);
         const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
         const operand_span = src.operandSrc(0).span(tree);
         try sema.zcu.addNote(sema.file, operand_span, "consider omitting 'try'", .{});
