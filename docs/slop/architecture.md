@@ -1117,10 +1117,16 @@ into the module's code, on all three targets.
   at a time (`CodeGen.GlobalAsm`: a CodeGen with only `emit`, `gpa`, `e`,
   `outermost_frame` and `global_asm` set, which is all the assembler
   reads; `fail` then reports at the `asm`). The driver adds what inline
-  templates lack: named labels (`name:`), `.global`/`.globl`, and
-  accepts `.type`, `.text` and `.section .text`. Anything else, such as
+  templates lack: named labels (`name:`), `.global`/`.globl`, `.set`
+  and `.equ` with a symbol (an alias, which upstream's
+  test/behavior/asm.zig makes of a Zig export), and accepts `.type`,
+  `.text` and `.section .text`. Labels, globals and aliases are the
+  module's, as LLVM assembles all of a module's blocks as one: a `.globl`
+  in one block may name a label or alias of another, and a block of
+  directives alone has no atom. Anything else, such as
   an unknown directive, instruction or operand, a named label or an
-  external symbol as an operand, or alignment after the start, is a
+  external symbol as an operand, a `.set` of a number or of a symbol the
+  module does not define, or alignment after the start, is a
   compile error at the `asm` (test/diag/global_asm.zig), never dropped
   code. Like other code generation errors, these errors need an output:
   `-fno-emit-bin` does not assemble.

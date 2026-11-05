@@ -12,6 +12,10 @@ comptime {
     asm ("call puts");
 }
 
+comptime {
+    asm (".globl answer\n.set answer, 42");
+}
+
 pub fn main() void {}
 
 // error
@@ -21,4 +25,6 @@ pub fn main() void {}
 //   | asm (
 // global_asm.zig:12:5: error[unsupported]: bs does not support asm operand 'puts' yet
 //   | asm ("call puts");
-// 2 errors
+// global_asm.zig:16:5: error[unsupported]: bs supports only a symbol as the value of '.set answer, 42' yet
+//   | asm (".globl answer\n.set answer, 42");
+// 3 errors
