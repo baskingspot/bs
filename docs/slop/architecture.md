@@ -2016,6 +2016,13 @@ user branches are coverage points and are only learned from.
   paths one of which changed it. A check's failing side (only a call of
   its `noreturn` handler) does not change it, since nothing after it
   runs. Loading `self.len` twice with no write between is one value.
+  The table of first instructions holds only those that ran on every
+  path to the point walked: what a branch side, a switch case, a loop
+  body, or a block body adds is dropped at its end, except a straight
+  block's own and, for a block left by one `br`, what was in the table
+  at that `br`. Knowledge that holds only where an instruction ran (an
+  overflow operation's `exact`, read through the term of a later equal
+  one) so never reaches a path where it did not.
 - **Facts.** A branch's condition (a compare, `not`, the `and` of two
   in its true side, the `or` of two in its false side) holds in the
   side it leads to, negated in the other. What held at every `br` that

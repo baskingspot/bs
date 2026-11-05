@@ -74,8 +74,14 @@ pub const Scratch = struct {
     /// Per instruction numbered (`Walker.number`): the term of the first
     /// instruction that computed the same value (`Term.none` if none).
     canon: std.ArrayList(Term) = .empty,
-    /// The first instruction per value computed (`Key`).
+    /// The first instruction per value computed (`Key`), among those
+    /// that run on every path to the point walked (`Walker.number`).
     numbers: std.AutoHashMapUnmanaged(Key, Term) = .empty,
+    /// The keys of `numbers` in the order added, for `Walker.dropNumbers`.
+    nlog: std.ArrayList(Key) = .empty,
+    /// What `numbers` added in a block held at its first `br`
+    /// (`Exit.nsnap`).
+    nsnaps: std.ArrayList(NumberSnap) = .empty,
     /// Per `bool` block: what held at each of its exits with a value that
     /// may be true, and with one that may be false (`cond_exit_facts`),
     /// then, once walked, both (`block_facts`, from `start`).
@@ -90,6 +96,8 @@ pub const Scratch = struct {
     pub fn deinit(s: *Scratch, gpa: Allocator) void {
         s.canon.deinit(gpa);
         s.numbers.deinit(gpa);
+        s.nlog.deinit(gpa);
+        s.nsnaps.deinit(gpa);
         s.cond_exit_facts.deinit(gpa);
         s.snaps.deinit(gpa);
         s.vlog.deinit(gpa);
@@ -186,7 +194,14 @@ const Exit = struct {
     from: u32 = 0,
     snap: Span = .{},
     snap_mem: u32 = 0,
+    /// `nlog`'s length at the block's start, and for its first `br`, when
+    /// `numbers` added at most 64 values since: those values
+    /// (`nsnaps[nsnap.start..][0..nsnap.len]`, with `nsnap.count` 1).
+    nfrom: u32 = 0,
+    nsnap: Span = .{},
 };
+
+const NumberSnap = struct { key: Key, value: Term };
 
 const VarState = struct { v: u32, version: u32, value: Term };
 
@@ -256,6 +271,8 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *Scratch, fu
     try scratch.canon.resize(gpa, n);
     @memset(scratch.canon.items, .none);
     scratch.numbers.clearRetainingCapacity();
+    scratch.nlog.clearRetainingCapacity();
+    scratch.nsnaps.clearRetainingCapacity();
     scratch.cond_exit_facts.clearRetainingCapacity();
     scratch.snaps.clearRetainingCapacity();
     scratch.vlog.clearRetainingCapacity();
@@ -457,6 +474,7 @@ const Walker = struct {
                     .depth = @intCast(depth),
                     .is_bool = data.ty_pl.ty == .bool_type,
                     .from = @intCast(from),
+                    .nfrom = @intCast(s.nlog.items.len),
                 });
                 try w.body(insts);
                 const exit = s.exits.pop().?;
@@ -493,6 +511,17 @@ const Walker = struct {
                     try w.merge(from);
                     w.mergeMem(clock);
                 }
+                // Values numbered in the body: a straight body ran its own
+                // (those of the bodies nested in it are forgotten there);
+                // a body left by one `br` ran those numbered on the way to
+                // it; else none is known to have run.
+                if (!straight) {
+                    w.dropNumbers(exit.nfrom);
+                    if (exit.facts.count == 1 and exit.nsnap.count == 1 and closed)
+                        for (s.nsnaps.items[exit.nsnap.start..][0..exit.nsnap.len]) |n| {
+                            _ = try w.numberOf(n.key, n.value);
+                        };
+                }
                 // What held at every `br` to the block holds after it,
                 // when those are its only exits: its body ends in an
                 // instruction that does not continue.
@@ -517,10 +546,12 @@ const Walker = struct {
                 const depth = s.facts.items.len;
                 const from = s.stored.items.len;
                 const outer = w.stamp;
+                const nlen = s.nlog.items.len;
                 // A write later in the loop reaches its start.
                 w.changeMem();
                 if (w.spec == null and try w.speculate(inst, insts)) {
                     s.facts.shrinkRetainingCapacity(depth);
+                    w.dropNumbers(nlen);
                     try w.merge(from);
                     w.changeMem();
                     return;
@@ -529,6 +560,7 @@ const Walker = struct {
                 try w.body(insts);
                 w.stamp = outer;
                 s.facts.shrinkRetainingCapacity(depth);
+                w.dropNumbers(nlen);
                 try w.merge(from);
                 w.changeMem();
             },
@@ -583,15 +615,18 @@ const Walker = struct {
                 const mem = w.mem;
                 const clock = w.clock;
                 const log = s.vlog.items.len;
+                const nlen = s.nlog.items.len;
                 try w.assume(cond, true);
                 try w.side(then_body);
                 s.facts.shrinkRetainingCapacity(depth);
+                w.dropNumbers(nlen);
                 // The other side does not see the stores of this one.
                 w.rollback(log);
                 w.mem = mem;
                 try w.assume(cond, false);
                 try w.side(else_body);
                 s.facts.shrinkRetainingCapacity(depth);
+                w.dropNumbers(nlen);
                 try w.merge(from);
                 w.mergeMem(clock);
             },
@@ -601,16 +636,19 @@ const Walker = struct {
                 const mem = w.mem;
                 const clock = w.clock;
                 const log = s.vlog.items.len;
+                const nlen = s.nlog.items.len;
                 var i = x.end;
                 for (0..x.data.cases_len) |_| {
                     const items_len = ir.extra[i];
                     const body_len = ir.extra[i + 1];
                     try w.side(ir.bodySlice(i + 2 + items_len, body_len));
+                    w.dropNumbers(nlen);
                     w.rollback(log);
                     w.mem = mem;
                     i += 2 + items_len + body_len;
                 }
                 try w.side(ir.bodySlice(i, x.data.else_body_len));
+                w.dropNumbers(nlen);
                 try w.merge(from);
                 w.mergeMem(clock);
             },
@@ -696,12 +734,31 @@ const Walker = struct {
         }
         // Two undefined values need not be equal.
         for ([2]Term{ key.a, key.b }) |t| if (t.tag == .interned and w.ip.keyTag(@fromBackingInt(t.a)) == .undef) return;
-        const gop = try w.s.numbers.getOrPut(w.gpa, key);
-        if (gop.found_existing) {
-            w.s.canon.items[ii] = gop.value_ptr.*;
-        } else {
-            gop.value_ptr.* = .{ .tag = .inst, .a = ii };
-        }
+        const own: Term = .{ .tag = .inst, .a = ii };
+        const first = try w.numberOf(key, own);
+        w.s.canon.items[ii] = if (first.eql(own)) .none else first;
+    }
+
+    /// The term of the first instruction that computed the value `key`
+    /// names on every path here, else `own`, which is then that first one.
+    fn numberOf(w: *Walker, key: Key, own: Term) Allocator.Error!Term {
+        const s = w.s;
+        const gop = try s.numbers.getOrPut(w.gpa, key);
+        if (gop.found_existing) return gop.value_ptr.*;
+        gop.value_ptr.* = own;
+        try s.nlog.append(w.gpa, key);
+        return own;
+    }
+
+    /// Forgets the values `numbers` added since `nlog` had length `len`:
+    /// where the walk goes next, their instructions may not have run.
+    /// Knowledge about an instruction that holds only where it ran (an
+    /// overflow operation's `exact`, its checked overflow bit) is then
+    /// read only where it did: a later instruction is numbered as the
+    /// first one only where the first one ran.
+    fn dropNumbers(w: *Walker, len: usize) void {
+        const s = w.s;
+        while (s.nlog.items.len > len) _ = s.numbers.remove(s.nlog.pop().?);
     }
 
     /// `a op b` (wrapping, in type `ty`) as a simpler term: `(a +% b) -% a`
@@ -793,6 +850,11 @@ const Walker = struct {
                 });
                 e.snap.len = @intCast(s.snaps.items.len - e.snap.start);
                 e.snap_mem = w.mem;
+            }
+            if (e.facts.count == 0 and s.nlog.items.len - e.nfrom <= 64) {
+                e.nsnap = .{ .count = 1, .start = @intCast(s.nsnaps.items.len) };
+                for (s.nlog.items[e.nfrom..]) |key| try s.nsnaps.append(w.gpa, .{ .key = key, .value = s.numbers.get(key).? });
+                e.nsnap.len = @intCast(s.nsnaps.items.len - e.nsnap.start);
             }
             // A `bool` block: what held here, and what its value being
             // true (or false) adds, holds after it where it is true (or
@@ -944,9 +1006,7 @@ const Walker = struct {
         // Other memory: a load of the same address and type from the same
         // version of memory (`mem`) reads the same value.
         if (Type.ptrInfo(w.ip, w.ir.typeOf(data.ty_op.operand, w.ip)).flags.is_volatile) return own;
-        const gop = try s.numbers.getOrPut(w.gpa, .{ .tag = .load, .ty = data.ty_op.ty, .x = w.mem, .a = w.term(data.ty_op.operand), .b = .none });
-        if (!gop.found_existing) gop.value_ptr.* = own;
-        return gop.value_ptr.*;
+        return w.numberOf(.{ .tag = .load, .ty = data.ty_op.ty, .x = w.mem, .a = w.term(data.ty_op.operand), .b = .none }, own);
     }
 
     /// What variable `pi` holds here (`loadTerm`).
@@ -1120,6 +1180,7 @@ const Walker = struct {
         s.saved_exits.clearRetainingCapacity();
         try s.saved_exits.appendSlice(gpa, s.exits.items);
         const log = s.vlog.items.len;
+        const nlen = s.nlog.items.len;
         // A candidate with no offset is a fact, which every rule reads.
         for (s.cands.items) |g| if (g.c == 0)
             try s.facts.append(gpa, .{ .op = g.op, .signed = false, .bits = g.bits, .a = g.base, .b = g.y });
@@ -1150,6 +1211,7 @@ const Walker = struct {
         // The variables hold again what they held before the loop (the
         // exits' snapshots the walk took stay unused in `snaps`).
         w.rollback(log);
+        w.dropNumbers(nlen);
         s.stored.shrinkRetainingCapacity(from);
         return false;
     }
