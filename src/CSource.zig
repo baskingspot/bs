@@ -778,6 +778,8 @@ const Common = struct {
     lib: []const u8,
     /// The glibc headers' `-isystem` pairs, with `-lc`.
     libc_includes: []const []const u8,
+    /// The macOS SDK's `-iframework` pair, with its headers.
+    libc_frameworks: []const []const u8,
     /// The native include directories' `-isystem` pairs, for the user's
     /// sources only, as upstream's runtime libraries have none.
     native_includes: []const []const u8,
@@ -792,9 +794,11 @@ const Common = struct {
 
 fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, target: *const std.Target, lib: []const u8, o: Options) !Common {
     var libc_includes: std.ArrayList([]const u8) = .empty;
+    var libc_frameworks: std.ArrayList([]const u8) = .empty;
     if (o.link_libc) {
-        const dirs = try libcIncludeDirs(arena, io, environ, o.global_cache, lib, target, o.native_abi and !o.macos);
-        for (dirs) |d| try libc_includes.appendSlice(arena, &.{ "-isystem", d });
+        const dirs = try libcIncludeDirs(arena, io, environ, o.global_cache, lib, target, o.native_abi);
+        for (dirs.includes) |d| try libc_includes.appendSlice(arena, &.{ "-isystem", d });
+        for (dirs.frameworks) |d| try libc_frameworks.appendSlice(arena, &.{ "-iframework", d });
     }
     var native_includes: std.ArrayList([]const u8) = .empty;
     for (o.native_includes) |d| try native_includes.appendSlice(arena, &.{ "-isystem", d });
@@ -848,6 +852,7 @@ fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Envi
         .glibc_minor = if (o.glibc_version) |v| try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{v.minor}) else "",
         .lib = lib,
         .libc_includes = libc_includes.items,
+        .libc_frameworks = libc_frameworks.items,
         .native_includes = native_includes.items,
         .cxx_defines = cxx.items,
         .features = features.items,
@@ -915,6 +920,7 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
     if (m.link_libc) try argv.appendSlice(arena, common.libc_includes);
     if (m.native) try argv.appendSlice(arena, common.native_includes);
     if (m.libunwind) try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libunwind", "include" }) });
+    if (m.link_libc) try argv.appendSlice(arena, common.libc_frameworks);
     if (!assembly) {
         try argv.append(arena, "-fno-spell-checking");
         if (m.optimize != .debug) try argv.append(arena, "-Werror=date-time");
@@ -1213,16 +1219,91 @@ fn runtimeJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Ru
 
 const Found = struct { found: ?[]const u8, looked: []const u8 };
 
-/// libc's include directories for `target`, in order, as upstream's
+/// libc's header directories: `-isystem` and `-iframework`, in order.
+pub const LibcDirs = struct {
+    includes: []const []const u8,
+    frameworks: []const []const u8 = &.{},
+};
+
+/// libc's header directories for `target`, as upstream's
 /// `std.zig.LibCDirs.detect`: with the native ABI, the system libc
-/// installation's (`nativeLibcIncludes`), else, or when there is no
-/// system C compiler, the zig lib directory's glibc headers.
-pub fn libcIncludeDirs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8, lib: []const u8, target: *const std.Target, native_abi: bool) ![]const []const u8 {
-    if (native_abi) if (nativeLibcIncludes(arena, io, environ, global_cache) catch |err| switch (err) {
+/// installation's (`nativeLibcIncludes`; on macOS the SDK's,
+/// `darwinSdk`), else, or when there is no system C compiler or SDK, the
+/// zig lib directory's headers.
+pub fn libcIncludeDirs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8, lib: []const u8, target: *const std.Target, native_abi: bool) !LibcDirs {
+    if (native_abi and target.os.tag == .macos) {
+        if (try darwinSdk(arena, io, environ, global_cache)) |sdk| return .{
+            .includes = try arena.dupe([]const u8, &.{try std.fs.path.join(arena, &.{ sdk, "usr", "include" })}),
+            .frameworks = try arena.dupe([]const u8, &.{try std.fs.path.join(arena, &.{ sdk, "System", "Library", "Frameworks" })}),
+        };
+    } else if (native_abi) if (nativeLibcIncludes(arena, io, environ, global_cache) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => @import("main.zig").fatal("failed to find libc installation: {t}", .{err}),
-    }) |dirs| return dirs;
-    return (try std.zig.LibCDirs.detectFromBuilding(arena, .{ .root_dir = .cwd(), .sub_path = lib }, target)).libc_include_dir_list;
+    }) |dirs| return .{ .includes = dirs };
+    return .{ .includes = (try std.zig.LibCDirs.detectFromBuilding(arena, .{ .root_dir = .cwd(), .sub_path = lib }, target)).libc_include_dir_list };
+}
+
+/// The macOS SDK, as upstream's `LibCInstallation.findNative` finds it
+/// (`std.zig.system.darwin`): `xcode-select --print-path` must answer,
+/// so that no Command Line Tools installation prompt opens, then `xcrun
+/// --sdk macosx --show-sdk-path` names it. Null when either fails, where
+/// upstream falls back to its own headers. Kept in `<global>/bs/libc/`
+/// as `nativeLibcIncludes`'s answer, keyed by what selects the developer
+/// directory (`xcode-select -s`'s link, `DEVELOPER_DIR`) and the SDK
+/// (`SDKROOT`) and by `PATH`.
+fn darwinSdk(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8) !?[]const u8 {
+    var key: std.ArrayList(u8) = .empty;
+    try key.appendSlice(arena, "bs darwin sdk 1\x00");
+    for ([_][]const u8{ "/var/db/xcode_select_link", "/usr/share/xcode-select/xcode_dir_path" }) |link| {
+        var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const n = Io.Dir.cwd().readLink(io, link, &buf) catch 0;
+        try key.print(arena, "{s}\x00", .{buf[0..n]});
+    }
+    for ([_][]const u8{ "DEVELOPER_DIR", "SDKROOT", "PATH" }) |name|
+        try key.print(arena, "{s}={s}\x00", .{ name, environ.get(name) orelse "" });
+    const record = try libcRecordPath(arena, global_cache, key.items);
+    if (try readLibcRecord(arena, io, record)) |dirs| if (dirs.len == 1) {
+        // A record whose SDK went away is xcrun's to answer.
+        if (Io.Dir.cwd().access(io, try std.fs.path.join(arena, &.{ dirs[0], "usr", "include", "stdlib.h" }), .{})) |_| return dirs[0] else |_| {}
+    };
+
+    const select = runCc(arena, io, &.{ "xcode-select", "--print-path" }, environ) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.CCompilerFailed => return null,
+    };
+    if (select.stdout.len == 0) return null;
+    const xcrun = runCc(arena, io, &.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }, environ) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.CCompilerFailed => return null,
+    };
+    const sdk = std.mem.trimEnd(u8, xcrun.stdout, "\r\n");
+    writeLibcRecord(io, record, &.{sdk});
+    return sdk;
+}
+
+fn libcRecordPath(arena: std.mem.Allocator, global_cache: []const u8, key: []const u8) ![]const u8 {
+    const hex = std.fmt.bytesToHex(@as([16]u8, @bitCast(cache.hash(2, key))), .lower);
+    return std.fs.path.join(arena, &.{ global_cache, "bs", "libc", &hex });
+}
+
+/// The directories a libc record lists, NUL-separated.
+fn readLibcRecord(arena: std.mem.Allocator, io: Io, record: []const u8) !?[]const []const u8 {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, record, arena, .limited(64 * 1024)) catch return null;
+    var dirs: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeScalar(u8, bytes, 0);
+    while (it.next()) |d| try dirs.append(arena, d);
+    return if (dirs.items.len == 0) null else dirs.items;
+}
+
+/// Best effort: without the record, the next build asks again.
+fn writeLibcRecord(io: Io, record: []const u8, dirs: []const []const u8) void {
+    if (std.fs.path.dirname(record)) |d| Io.Dir.cwd().createDirPath(io, d) catch {};
+    var parts: [4][]const u8 = undefined;
+    for (dirs, 0..) |d, k| {
+        parts[2 * k] = d;
+        parts[2 * k + 1] = "\x00";
+    }
+    cache.writeReplace(io, Io.Dir.cwd(), record, parts[0 .. 2 * dirs.len]) catch {};
 }
 
 // The detection below follows upstream's `std.zig.LibCInstallation`
@@ -1267,15 +1348,11 @@ fn nativeLibcIncludes(arena: std.mem.Allocator, io: Io, environ: *const std.proc
     if (exe_stat) |st| try key.print(arena, "{s}\x00{d}\x00{d}\x00{d}\x00", .{ exe_path.?, st.inode, st.size, st.mtime.toNanoseconds() });
     for ([_][]const u8{ "PATH", "CPATH", "C_INCLUDE_PATH", "GCC_EXEC_PREFIX", "COMPILER_PATH", "NIX_CFLAGS_COMPILE", "NIX_CC" }) |name|
         try key.print(arena, "{s}={s}\x00", .{ name, environ.get(name) orelse "" });
-    const hex = std.fmt.bytesToHex(@as([16]u8, @bitCast(cache.hash(2, key.items))), .lower);
-    const record = try std.fs.path.join(arena, &.{ global_cache, "bs", "libc", &hex });
-    if (exe_stat != null) if (Io.Dir.cwd().readFileAlloc(io, record, arena, .limited(64 * 1024))) |bytes| {
-        var dirs: std.ArrayList([]const u8) = .empty;
-        var it = std.mem.tokenizeScalar(u8, bytes, 0);
-        while (it.next()) |d| try dirs.append(arena, d);
+    const record = try libcRecordPath(arena, global_cache, key.items);
+    if (exe_stat != null) if (try readLibcRecord(arena, io, record)) |dirs| {
         // A record whose headers went away is the compiler's to answer.
-        if (dirs.items.len != 0) if (Io.Dir.cwd().access(io, try std.fs.path.join(arena, &.{ dirs.items[0], "stdlib.h" }), .{})) |_| return dirs.items else |_| {};
-    } else |_| {};
+        if (Io.Dir.cwd().access(io, try std.fs.path.join(arena, &.{ dirs[0], "stdlib.h" }), .{})) |_| return dirs else |_| {}
+    };
 
     var env = try environ.clone(arena);
     try env.put(inf_loop_env_key, if (skip_cc_env_var) "2" else "1");
@@ -1321,22 +1398,13 @@ fn nativeLibcIncludes(arena: std.mem.Allocator, io: Io, environ: *const std.proc
         try arena.dupe([]const u8, &.{include_dir.?})
     else
         try arena.dupe([]const u8, &.{ include_dir.?, sys_include_dir.? });
-    // Best effort: without the record, the next build asks again.
-    if (exe_stat != null) {
-        if (std.fs.path.dirname(record)) |d| Io.Dir.cwd().createDirPath(io, d) catch {};
-        var parts: [4][]const u8 = undefined;
-        for (dirs, 0..) |d, k| {
-            parts[2 * k] = d;
-            parts[2 * k + 1] = "\x00";
-        }
-        cache.writeReplace(io, Io.Dir.cwd(), record, parts[0 .. 2 * dirs.len]) catch {};
-    }
+    if (exe_stat != null) writeLibcRecord(io, record, dirs);
     return dirs;
 }
 
-/// Runs the C compiler for `nativeLibcIncludes`: `CCompilerFailed` when
-/// it cannot start or does not exit with 0, where upstream falls back to
-/// its own headers.
+/// Runs the C compiler (or xcrun) for `nativeLibcIncludes` and
+/// `darwinSdk`: `CCompilerFailed` when it cannot start or does not exit
+/// with 0, where upstream falls back to its own headers.
 fn runCc(arena: std.mem.Allocator, io: Io, argv: []const []const u8, env: *const std.process.Environ.Map) !std.process.RunResult {
     const res = std.process.run(arena, io, .{
         .stdout_limit = .limited(1024 * 1024),

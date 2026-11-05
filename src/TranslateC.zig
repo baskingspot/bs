@@ -6,9 +6,10 @@
 //!
 //! The arguments that reach Aro are upstream's (`Compilation.translateC`
 //! with `addCommonCCArgs(.aro)`) for bs's target: Debug, the baseline
-//! CPU, and with `-lc` libc's headers: the system's for the native ABI,
-//! as upstream's, else glibc's from the zig lib directory
-//! (`CSource.libcIncludeDirs`; docs/slop/architecture.md, "C interop").
+//! CPU, and with `-lc` (always on macOS) libc's headers: the system's
+//! for the native ABI (on macOS the SDK's), as upstream's, else those of
+//! the zig lib directory (`CSource.libcIncludeDirs`;
+//! docs/slop/architecture.md, "C interop").
 //!
 //! A translation record, `<local cache>/bs/tc/<key>`, lists every file
 //! Aro read (from its `-MD` depfile) with its stat and content hash, and
@@ -304,11 +305,10 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     target.cpu = req.cpu;
     if (req.link_libc and !macos) try argv.append(arena, try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{req.glibc_version.?.minor}));
     try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ lib, "include" }) });
-    if (req.link_libc) {
-        const dirs = try CSource.libcIncludeDirs(arena, io, init.environ_map, global, lib, &target, req.native_abi and !macos);
-        for (dirs) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
-    }
+    const libc_dirs: CSource.LibcDirs = if (req.link_libc) try CSource.libcIncludeDirs(arena, io, init.environ_map, global, lib, &target, req.native_abi) else .{ .includes = &.{} };
+    for (libc_dirs.includes) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
     for (req.native_includes) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
+    for (libc_dirs.frameworks) |d| try argv.appendSlice(arena, &.{ "-iframework", d });
     try argv.appendSlice(arena, &.{ "-O0", "-target", try target.zigTriple(arena), try mcpuArg(arena, &target) });
     try argv.appendSlice(arena, req.cc_args);
 

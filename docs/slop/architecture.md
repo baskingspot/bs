@@ -4226,7 +4226,8 @@ nothing defines is a libSystem import, as ld64 binds it. C sources on
 aarch64-macos compile through upstream's Clang with upstream's flags
 (`CSource.Options.macos`: the `aarch64-macos` triple and apple_m1,
 `-mmacos-version-min`, `-fPIE -fPIC`, libSystem's headers from
-`any-darwin-any`, libc always on). A C `main` with no Zig entry is the
+`any-darwin-any`, libc always on; for the native target the SDK's, as
+decision 1's *as built* says). A C `main` with no Zig entry is the
 executable's entry, through an alias when it sits inside its section's
 atom. translate-c takes aarch64-macos too (the same query, headers and
 `link_libc`); its output matches upstream's byte for byte.
@@ -7139,7 +7140,18 @@ Options:
      directories go into the arguments, hence into every C record's and
      translation record's key, and the headers read under them into
      their file lists, as before. `-target x86_64-linux-gnu[.version]`
-     keeps the lib directory's headers, as upstream's. Linking does not
+     keeps the lib directory's headers, as upstream's. On macOS the
+     native libc installation is the SDK (upstream's `findNative` and
+     `std.zig.system.darwin`): when `xcode-select --print-path` answers
+     (so that no Command Line Tools prompt opens), `xcrun --sdk macosx
+     --show-sdk-path` names it, and the headers are `<sdk>/usr/include`
+     with `-iframework <sdk>/System/Library/Frameworks`; without either,
+     `any-darwin-any`, as upstream. The SDK path is kept in the same
+     records, keyed by `xcode-select -s`'s link, `DEVELOPER_DIR`,
+     `SDKROOT` and `PATH`. The translations then differ from upstream's
+     only where the headers test the macOS version: bs's native target
+     is `aarch64-macos` (15.0 minimum), upstream's the running system's.
+     Linking does not
      change: crt code, libc_nonshared.a and the glibc imports stay this
      option's.
    - **glibc version**: `-target x86_64-linux-gnu.2.28` says it; for the

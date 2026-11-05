@@ -84,6 +84,18 @@ pub fn build(b: *std.Build) void {
     addRunTests(b, exe, test_step, upstream_step, std_zir);
     addObjAndRunTests(b, exe, test_step, std_zir);
     const translate_c = addLinkInputTests(b, exe, test_step, std_zir);
+    if (b.graph.host.result.os.tag == .macos) {
+        // On macOS, libc's headers are the SDK's, frameworks included, as
+        // upstream's (`xcrun --show-sdk-path`); the lib directory has no
+        // frameworks. bs links translate-c itself here, a large program.
+        const tc_sdk = b.addRunArtifact(exe);
+        tc_sdk.setName("bs translate-c takes libc's headers and frameworks from the macOS SDK");
+        tc_sdk.addArg("translate-c");
+        tc_sdk.addFileArg(b.path("test/link_input/tc_sdk/s.h"));
+        tc_sdk.addCheck(.{ .expect_stdout_match = "pub const CFAllocatorRef = ?*const struct___CFAllocator;" });
+        takes(b, &tc_sdk.step, 13);
+        test_step.dependOn(&tc_sdk.step);
+    }
     addDiagTests(b, exe, test_step, upstream_step, std_zir);
     const build_test_step = addBuildTest(b, exe, build_web_wasm, translate_c);
     spreadBsUsers(b, &exe.step, &zir.step, &.{ test_step, build_test_step });
