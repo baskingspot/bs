@@ -40,6 +40,8 @@ const std = @import("std");
 const macho = std.macho;
 const Allocator = std.mem.Allocator;
 const MachOInput = @import("MachOInput.zig");
+const Archive = @import("Archive.zig");
+const Atom = @import("Atom.zig");
 
 pub const Input = @import("ElfMerge.zig").Input;
 
@@ -92,7 +94,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]c
     for (objects, inputs) |*o, in| o.* = MachOInput.parseObject(arena, in.path, in.bytes) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => {
-            diag.* = try std.fmt.allocPrint(arena, "{s}: not an arm64 Mach-O relocatable object", .{in.path});
+            diag.* = try arena.print("{s}: not an arm64 Mach-O relocatable object", .{in.path});
             return error.InvalidObject;
         },
     };
@@ -119,7 +121,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]c
                 @backingInt(macho.LC.DYSYMTAB) => {
                     const d = std.mem.bytesToValue(macho.dysymtab_command, raw[0..@sizeOf(macho.dysymtab_command)]);
                     if (d.nindirectsyms != 0) {
-                        diag.* = try std.fmt.allocPrint(arena, "{s}: an object with indirect symbols, which bs does not merge", .{o.path});
+                        diag.* = try arena.print("{s}: an object with indirect symbols, which bs does not merge", .{o.path});
                         return error.UnsupportedObject;
                     }
                 },
@@ -153,13 +155,13 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]c
             };
             const os = &sects.items[out];
             if (os.hdr.flags & macho.SECTION_TYPE != s.flags & macho.SECTION_TYPE) {
-                diag.* = try std.fmt.allocPrint(arena, "{s}: section {s},{s} has another type than in an earlier input", .{ o.path, std.mem.sliceTo(&s.segname, 0), std.mem.sliceTo(&s.sectname, 0) });
+                diag.* = try arena.print("{s}: section {s},{s} has another type than in an earlier input", .{ o.path, std.mem.sliceTo(&s.segname, 0), std.mem.sliceTo(&s.sectname, 0) });
                 return error.UnsupportedObject;
             }
             os.hdr.@"align" = @max(os.hdr.@"align", s.@"align");
             if (std.mem.eql(u8, std.mem.sliceTo(&s.sectname, 0), "__objc_imageinfo")) {
                 if (s.size != 8 or s.nreloc != 0) {
-                    diag.* = try std.fmt.allocPrint(arena, "{s}: section '__objc_imageinfo' is not 8 bytes of image info", .{o.path});
+                    diag.* = try arena.print("{s}: section '__objc_imageinfo' is not 8 bytes of image info", .{o.path});
                     return error.UnsupportedObject;
                 }
                 MachOInput.mergeImageInfo(&image_info, o.sectionBytes(si)[0..8]);
@@ -172,7 +174,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]c
             }
             const at = std.mem.alignForward(u64, os.hdr.size, @as(u64, 1) << @intCast(@min(s.@"align", 15)));
             if (at != os.hdr.size and std.mem.eql(u8, std.mem.sliceTo(&s.sectname, 0), "__eh_frame")) {
-                diag.* = try std.fmt.allocPrint(arena, "{s}: its __eh_frame needs padding after the earlier inputs', which would end the section for unwinders", .{o.path});
+                diag.* = try arena.print("{s}: its __eh_frame needs padding after the earlier inputs', which would end the section for unwinders", .{o.path});
                 return error.UnsupportedObject;
             }
             try os.pieces.append(arena, .{ .object = @intCast(oi), .sect = @intCast(si), .offset = at });
@@ -259,7 +261,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]c
                     const weak = sym.n_desc & macho.N_WEAK_DEF != 0;
                     switch (g.state) {
                         .def => if (!weak) {
-                            diag.* = try std.fmt.allocPrint(arena, "duplicate symbol: {s}, defined in {s} and {s}", .{ name, g.path, o.path });
+                            diag.* = try arena.print("duplicate symbol: {s}, defined in {s} and {s}", .{ name, g.path, o.path });
                             return error.DuplicateSymbol;
                         },
                         .weak_def => if (!weak) {
@@ -269,7 +271,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]c
                     }
                 },
                 else => {
-                    diag.* = try std.fmt.allocPrint(arena, "{s}: symbol '{s}' has a type bs does not merge ({x})", .{ o.path, name, sym.n_type });
+                    diag.* = try arena.print("{s}: symbol '{s}' has a type bs does not merge ({x})", .{ o.path, name, sym.n_type });
                     return error.UnsupportedObject;
                 },
             }
@@ -280,10 +282,11 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]c
     for (sorted, 0..) |*s, k| s.* = @intCast(k);
     const Order = struct {
         gs: []const Global,
+        const Self = @This();
         fn defined(g: Global) bool {
             return g.state == .def or g.state == .weak_def;
         }
-        fn less(c: @This(), a: u32, b: u32) bool {
+        fn less(c: Self, a: u32, b: u32) bool {
             const da = defined(c.gs[a]);
             const db = defined(c.gs[b]);
             if (da != db) return da;
@@ -312,7 +315,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]c
         for (0..s.nreloc) |ri| {
             const r = Reloc.read(raw[ri * 8 ..][0..8]);
             if (r.address & 0x8000_0000 != 0 or @as(u64, r.address) >= s.size) {
-                diag.* = try std.fmt.allocPrint(arena, "{s}: a relocation outside its section", .{o.path});
+                diag.* = try arena.print("{s}: a relocation outside its section", .{o.path});
                 return error.InvalidObject;
             }
             var symbolnum: u32 = r.symbolnum;
@@ -321,18 +324,18 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, diag: *[]c
             } else if (r.external) {
                 const m = if (r.symbolnum < o.syms.len) sym_map[p.object][r.symbolnum] else unmapped;
                 if (m == unmapped) {
-                    diag.* = try std.fmt.allocPrint(arena, "{s}: a relocation against a symbol of a dropped section, or a missing one", .{o.path});
+                    diag.* = try arena.print("{s}: a relocation against a symbol of a dropped section, or a missing one", .{o.path});
                     return error.UnsupportedObject;
                 }
                 symbolnum = if (m & global_bit != 0) globals.items[m & ~global_bit].index else m;
             } else {
                 if (r.type != reloc_unsigned or prev_type == reloc_subtractor or r.symbolnum == 0 or r.symbolnum >= o.sects.len) {
-                    diag.* = try std.fmt.allocPrint(arena, "{s}: a section-relative relocation of type {d}, which bs does not merge", .{ o.path, r.type });
+                    diag.* = try arena.print("{s}: a section-relative relocation of type {d}, which bs does not merge", .{ o.path, r.type });
                     return error.UnsupportedObject;
                 }
                 const target = sect_map[p.object][r.symbolnum];
                 if (target == unmapped) {
-                    diag.* = try std.fmt.allocPrint(arena, "{s}: a relocation against a dropped section", .{o.path});
+                    diag.* = try arena.print("{s}: a relocation against a dropped section", .{o.path});
                     return error.UnsupportedObject;
                 }
                 try patches.append(arena, .{ .sect = @intCast(k), .offset = p.offset + r.address, .wide = r.length == 3, .delta = delta(sects.items, sect_map, piece_off, objects, p.object, r.symbolnum) });
@@ -496,10 +499,10 @@ test "a merged object has its inputs' sections, symbols and relocations" {
     // test/link_input/macho_*.c and macho_objc_*.m from upstream's Clang
     // (build.zig's `addMachOInputs`): a constructor, GOT loads, an
     // absolute symbol, __compact_unwind and Objective-C sections.
-    const reader: @import("Archive.zig").Reader = try .init(arena, @embedFile("macho_input_lib.a"));
+    const reader: Archive.Reader = try .init(arena, @embedFile("macho_input_lib.a"));
     var inputs: std.ArrayList(Input) = .empty;
     try inputs.append(arena, .{ .path = "main.o", .bytes = @embedFile("macho_input_main.o") });
-    var members: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+    var members: std.array_hash_map.Auto(u64, void) = .empty;
     for (reader.symbols) |s| try members.put(arena, s.member, {});
     for (members.keys()) |at| {
         const m = try reader.member(at);
@@ -609,13 +612,14 @@ test "a merged object has its inputs' sections, symbols and relocations" {
     var in: MachOInput = .{ .arena = arena };
     try in.addObject("merged.o", merged);
     const Ctx = struct {
-        pub fn zigExport(_: @This(), _: []const u8) !?@import("Atom.zig").SymbolKey {
+        const Self = @This();
+        pub fn zigExport(_: Self, _: []const u8) !?Atom.SymbolKey {
             return null;
         }
-        pub fn rtExport(_: @This(), _: []const u8) !?@import("Atom.zig").SymbolKey {
+        pub fn rtExport(_: Self, _: []const u8) !?Atom.SymbolKey {
             return null;
         }
-        pub fn importSym(_: @This(), name: []const u8, _: bool) !?@import("Atom.zig").SymbolKey {
+        pub fn importSym(_: Self, name: []const u8, _: bool) !?Atom.SymbolKey {
             return .fromName(name);
         }
     };

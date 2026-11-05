@@ -3136,12 +3136,12 @@ test "a stub's re-exports are found by name in -F and -L directories first" {
     try tmp.dir.writeFile(io, .{ .sub_path = "F/Umb.framework/Umb.tbd", .data = try stub.text(arena, "/System/Library/Frameworks/Umb.framework/Versions/A/Umb", deps, "umb") });
     try tmp.dir.writeFile(io, .{ .sub_path = "F/Dep.framework/Dep.tbd", .data = try stub.text(arena, "/System/Library/Frameworks/Dep.framework/Versions/A/Dep", "", "dep") });
     try tmp.dir.writeFile(io, .{ .sub_path = "L/libdepl.tbd", .data = try stub.text(arena, "/usr/lib/libdepl.dylib", "", "depl") });
-    const root = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const umb_path = try std.fmt.allocPrint(arena, "{s}/F/Umb.framework/Umb.tbd", .{root});
+    const root = try arena.print(".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const umb_path = try arena.print("{s}/F/Umb.framework/Umb.tbd", .{root});
     const umb, const pending = try Tbd.dylib(arena, umb_path, try tmp.dir.readFileAlloc(io, "F/Umb.framework/Umb.tbd", arena, .unlimited));
     var libs: std.ArrayList(MachODylib) = .empty;
     try libs.append(arena, umb);
-    try readTbds(arena, io, &libs, &.{pending}, &.{try std.fmt.allocPrint(arena, "{s}/L", .{root})}, &.{try std.fmt.allocPrint(arena, "{s}/F", .{root})});
+    try readTbds(arena, io, &libs, &.{pending}, &.{try arena.print("{s}/L", .{root})}, &.{try arena.print("{s}/F", .{root})});
     // Both are public, so the link has them as implicit libraries of
     // their own, read from the directories rather than the system paths.
     try std.testing.expectEqual(3, libs.items.len);
