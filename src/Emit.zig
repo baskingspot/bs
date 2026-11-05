@@ -1419,12 +1419,22 @@ pub fn exportsView(emit: *const Emit) ExportsView {
 
 /// `Zcu.addError`, from CodeGen: a worker keeps the error for the merge.
 pub fn addError(emit: *Emit, file_index: u32, span: std.zig.Ast.Span, comptime fmt: []const u8, args: anytype) !void {
-    if (!emit.is_worker) return emit.zcu.addError(file_index, span, fmt, args);
+    if (!emit.is_worker) {
+        const zcu = emit.zcu;
+        return zcu.errors.append(zcu.gpa, .{
+            .file = file_index,
+            .span = span,
+            .msg = try zcu.arena.allocator().print(fmt, args),
+            .code = comptime Diag.formatCode(fmt),
+            .codegen = true,
+        });
+    }
     try emit.codegen_errors.append(emit.gpa, .{
         .file = file_index,
         .span = span,
         .msg = try emit.allocator().print(fmt, args),
         .code = comptime Diag.formatCode(fmt),
+        .codegen = true,
     });
 }
 

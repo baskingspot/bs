@@ -165,6 +165,9 @@ has_asm: bool = false,
 /// registers they arrive in, or stores them whole, writing no register
 /// but their homes and r11 (`plainArgs`).
 plain_args: bool = false,
+/// An inline assembly statement failed and reported its error; the
+/// others still report theirs, then the function fails.
+asm_failed: bool = false,
 /// From `planRegisters`: per position (as `Ssa.clobbers`), how many
 /// inline assembly statements come at or before it.
 asm_counts: std.ArrayList(u32) = .empty,
@@ -402,8 +405,9 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     @memset(cg.homes, .none);
     @memset(cg.addr_base, no_base);
     try cg.planRegisters();
-    // Inline assembly may compute offsets in the code itself.
-    cg.e.shorten = !cg.has_asm;
+    // Also with inline assembly: its jumps and label addresses go
+    // through the Encoder's labels, and it has no other relative operand.
+    cg.e.shorten = true;
     t2 = std.Io.Timestamp.now(emit.zcu.io, .awake);
 
     // The prologue belongs to the declaration's line.
@@ -432,6 +436,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         }
     }
     try cg.emitBlocks();
+    if (cg.asm_failed) return error.CodegenFail;
     // Stubs need the epilogue's frame description even in a function
     // that never returns.
     if ((cg.ret_label != null or cg.stub_chains.items.len != 0) and !cg.ret_bound) {
@@ -6625,7 +6630,15 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.e.ud2();
             cg.e.bind(done);
         },
-        .assembly => try cg.assembly(inst, data),
+        .assembly => cg.assembly(inst, data) catch |err| switch (err) {
+            // Reported. The result gets a home, so that the code after it
+            // generates and its own statements report their errors too.
+            error.CodegenFail => {
+                cg.asm_failed = true;
+                _ = try cg.resultMem(inst, data.ty_pl.ty);
+            },
+            else => |e| return e,
+        },
     }
 }
 
