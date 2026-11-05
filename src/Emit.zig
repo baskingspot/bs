@@ -1505,7 +1505,8 @@ pub fn finish(emit: *Emit) !bool {
         }.lessThan);
         const Names = struct {
             keys: []const []const u8,
-            pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+            const Self = @This();
+            pub fn lessThan(c: Self, a: usize, b: usize) bool {
                 return std.mem.lessThan(u8, c.keys[a], c.keys[b]);
             }
         };
@@ -2021,7 +2022,8 @@ fn lowerExternSlots(emit: *Emit) !bool {
     // changes: the slots' order is the link's.
     emit.externs.sort(struct {
         names: []const []const u8,
-        pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+        const Self = @This();
+        pub fn lessThan(c: Self, a: usize, b: usize) bool {
             return std.mem.order(u8, c.names[a], c.names[b]) == .lt;
         }
     }{ .names = emit.externs.keys() });
@@ -2297,7 +2299,8 @@ pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.Ar
         starts: []const u32,
         by_group: []const u32,
 
-        fn lessThan(c: @This(), x: u32, y: u32) bool {
+        const Self = @This();
+        fn lessThan(c: Self, x: u32, y: u32) bool {
             const gx = c.groups[x];
             const gy = c.groups[y];
             if ((gx == .input) != (gy == .input)) return gy == .input;

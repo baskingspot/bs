@@ -2079,7 +2079,8 @@ test "reuses cached ZIR, drops stale guessed imports, and reports errors in cach
         errors: std.zig.ErrorBundle.Wip,
         ok: bool,
 
-        fn init(r: *@This(), root_path: []const u8, cache_path: []const u8) !void {
+        const Self = @This();
+        fn init(r: *Self, root_path: []const u8, cache_path: []const u8) !void {
             r.fe = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root_path, .builtin_dir = "/nonexistent", .load_std = false });
             errdefer r.fe.deinit();
             try r.fe.enableCache(.{ .local = cache_path, .global = cache_path });
@@ -2088,12 +2089,12 @@ test "reuses cached ZIR, drops stale guessed imports, and reports errors in cach
             r.ok = try r.fe.loadAll(&r.errors);
         }
 
-        fn deinit(r: *@This()) void {
+        fn deinit(r: *Self) void {
             r.errors.deinit();
             r.fe.deinit();
         }
 
-        fn errorCount(r: *@This()) !u32 {
+        fn errorCount(r: *Self) !u32 {
             var bundle = try r.errors.toOwnedBundle("");
             defer bundle.deinit(gpa);
             r.errors = try .init(gpa);

@@ -2229,7 +2229,8 @@ fn buildExportsTrie(gpa: Allocator, entries: []const TrieEntry) Allocator.Error!
         names: []const []const u8,
         entries: []const TrieEntry,
 
-        fn node(b: *const @This(), lo_in: usize, hi: usize, depth: usize) Allocator.Error!u32 {
+        const Self = @This();
+        fn node(b: *const Self, lo_in: usize, hi: usize, depth: usize) Allocator.Error!u32 {
             var lo = lo_in;
             const index: u32 = @intCast(b.nodes.items.len);
             try b.nodes.append(b.arena, .{});
@@ -2471,14 +2472,15 @@ fn sign(io: std.Io, n_threads: usize, buf: []u8, sig_off: u32, uuid_at: usize, i
         buf: []const u8,
         hashes: []u8,
         limit: u32,
+        const Self = @This();
         const pages_per_task = 64;
-        fn task(h: *const @This(), index: usize, _: usize) void {
+        fn task(h: *const Self, index: usize, _: usize) void {
             // Page 0 holds the UUID and is hashed last.
             const first = @max(1, index * pages_per_task);
             const end = @min(h.hashes.len / Sha256.digest_length, (index + 1) * pages_per_task);
             for (first..end) |page| h.hashPage(page);
         }
-        fn hashPage(h: *const @This(), page: usize) void {
+        fn hashPage(h: *const Self, page: usize) void {
             const start = page * sig_page_size;
             const bytes = h.buf[start..@min(h.limit, start + sig_page_size)];
             Sha256.hash(bytes, h.hashes[page * Sha256.digest_length ..][0..Sha256.digest_length], .{});

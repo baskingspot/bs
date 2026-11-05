@@ -974,13 +974,14 @@ test "objects and a Darwin archive from upstream's Clang and llvm-ar" {
     try in.addObject("main.o", @embedFile("macho_input_main.o"));
     try in.addArchive("lib.a", lib);
     const Ctx = struct {
-        fn zigExport(_: @This(), _: []const u8) !?SymbolKey {
+        const Self = @This();
+        fn zigExport(_: Self, _: []const u8) !?SymbolKey {
             return null;
         }
-        fn rtExport(_: @This(), _: []const u8) !?SymbolKey {
+        fn rtExport(_: Self, _: []const u8) !?SymbolKey {
             return null;
         }
-        fn importSym(_: @This(), _: []const u8, _: bool) !?SymbolKey {
+        fn importSym(_: Self, _: []const u8, _: bool) !?SymbolKey {
             return null;
         }
     };
@@ -1070,13 +1071,14 @@ test "Objective-C sections keep their names, and the image infos merge into one"
     try in.addObject("a.o", @embedFile("macho_input_objc_a.o"));
     try in.addObject("b.o", @embedFile("macho_input_objc_b.o"));
     const Ctx = struct {
-        fn zigExport(_: @This(), _: []const u8) !?SymbolKey {
+        const Self = @This();
+        fn zigExport(_: Self, _: []const u8) !?SymbolKey {
             return null;
         }
-        fn rtExport(_: @This(), _: []const u8) !?SymbolKey {
+        fn rtExport(_: Self, _: []const u8) !?SymbolKey {
             return null;
         }
-        fn importSym(_: @This(), name: []const u8, _: bool) !?SymbolKey {
+        fn importSym(_: Self, name: []const u8, _: bool) !?SymbolKey {
             return .fromName(name);
         }
     };

@@ -1077,7 +1077,8 @@ test "entries round-trip through packs, are checked, copied forward, merged, and
 
         const Graph = struct {
             dep2: Hash,
-            pub fn resultHash(g: @This(), key: Hash) ?Hash {
+            const Self = @This();
+            pub fn resultHash(g: Self, key: Hash) ?Hash {
                 return switch (key) {
                     1 => 10,
                     2 => g.dep2,

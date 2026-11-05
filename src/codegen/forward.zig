@@ -94,7 +94,8 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
         if (loads_forwarded != 0) {
             const Subst = struct {
                 subst: []const u32,
-                pub fn use(s: @This(), ref: *Inst.Ref) void {
+                const Self = @This();
+                pub fn use(s: Self, ref: *Inst.Ref) void {
                     const i = ref.toIndex() orelse return;
                     const to = s.subst[@backingInt(i)];
                     if (to != none) ref.* = @fromBackingInt(to);

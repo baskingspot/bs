@@ -409,7 +409,8 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
         deps: []const Store.Dep,
         payload: []const u8,
 
-        fn contents(us: @This(), u: usize) Store.Contents {
+        const Self = @This();
+        fn contents(us: Self, u: usize) Store.Contents {
             const lo = u * us.atoms.len / n_units;
             const hi = (u + 1) * us.atoms.len / n_units;
             return .{ .src_hash = 1, .result_hash = 2, .deps = us.deps, .atoms = us.atoms[lo..hi], .debug = us.debug[u], .payload = us.payload };
@@ -418,7 +419,8 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
     const units: Units = .{ .atoms = atoms, .debug = unit_debug, .deps = dep_list, .payload = &payload };
     const AllValid = struct {
         deps: []const Store.Dep,
-        pub fn resultHash(c: @This(), key: cache.Hash) ?cache.Hash {
+        const Self = @This();
+        pub fn resultHash(c: Self, key: cache.Hash) ?cache.Hash {
             for (c.deps) |d| if (d.key == key) return d.result_hash;
             return null;
         }

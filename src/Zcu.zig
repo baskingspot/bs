@@ -853,7 +853,8 @@ fn compileLogDiagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, o
     }
     const Ctx = struct {
         zcu: *const Zcu,
-        fn lessThan(c: @This(), a: usize, b: usize) bool {
+        const Self = @This();
+        fn lessThan(c: Self, a: usize, b: usize) bool {
             const la = c.zcu.compile_logs.items[a];
             const lb = c.zcu.compile_logs.items[b];
             const order = std.mem.order(u8, c.zcu.file(la.file).display_path, c.zcu.file(lb.file).display_path);
@@ -1328,7 +1329,8 @@ pub fn printUnitTiming(zcu: *Zcu) void {
     const t = if (zcu.unit_timing) |*t| t else return;
     const C = struct {
         v: []const u64,
-        pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+        const Self = @This();
+        pub fn lessThan(c: Self, a: usize, b: usize) bool {
             return c.v[a] > c.v[b];
         }
     };

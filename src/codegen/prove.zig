@@ -307,7 +307,8 @@ fn classify(ip: *const InternPool, ir: *const Ir, kind: []Kind) void {
     const Escape = struct {
         kind: []Kind,
         tags: []const Inst.Tag,
-        pub fn use(e: @This(), r: Inst.Ref) void {
+        const Self = @This();
+        pub fn use(e: Self, r: Inst.Ref) void {
             const i = r.toIndex() orelse return;
             if (e.tags[@backingInt(i)] == .alloc) e.kind[@backingInt(i)] = .other;
         }

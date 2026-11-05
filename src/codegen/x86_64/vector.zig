@@ -178,7 +178,8 @@ pub fn deferOperands(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index)
         /// A bitcast reads its operand, an array or a wide integer, in
         /// place too.
         bitcast: bool,
-        pub fn use(t: @This(), ref: Ref) void {
+        const Self = @This();
+        pub fn use(t: Self, ref: Ref) void {
             const c = t.cg;
             const ip = c.ip;
             const i = ref.toIndex() orelse return;
@@ -234,7 +235,8 @@ fn viewedByNext(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index) bool
     const T = struct {
         inst: Inst.Index,
         found: *bool,
-        pub fn use(t: @This(), ref: Ref) void {
+        const Self = @This();
+        pub fn use(t: Self, ref: Ref) void {
             if (ref.toIndex() == t.inst) t.found.* = true;
         }
     };

@@ -1627,7 +1627,8 @@ fn structLayout(sema: *Sema, block: *Block, cont_src: Src, info: *InternPool.Con
         if (layout == .auto) {
             const Ctx = struct {
                 aligns: []const u64,
-                fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                const Self = @This();
+                fn lessThan(ctx: Self, a: u32, b: u32) bool {
                     if (a == omitted) return false;
                     if (b == omitted) return true;
                     return ctx.aligns[a] > ctx.aligns[b];
@@ -5938,7 +5939,8 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                     sema.vectorMap(block, src, len, dest_ty, &.{operand}, struct {
                         elem_ty: Index,
                         mode: IntFromFloatMode,
-                        fn call(o: @This(), s: *Sema, b: *Block, sr: Src, e: []const Ref) CompileError!Ref {
+                        const Self = @This();
+                        fn call(o: Self, s: *Sema, b: *Block, sr: Src, e: []const Ref) CompileError!Ref {
                             return s.analyzeFloatToInt(b, sr, o.elem_ty, e[0], o.mode);
                         }
                     }{ .elem_ty = Type.childType(sema.ip, dest_ty), .mode = mode })
@@ -6577,7 +6579,8 @@ fn analyzeBitOp(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operand
     const ty = sema.typeOf(operand);
     if (sema.vectorLen(ty)) |len| return sema.vectorMap(block, src, len, .none, &.{operand}, struct {
         tag: Zir.Inst.Tag,
-        fn call(o: @This(), s: *Sema, b: *Block, sr: Src, e: []const Ref) CompileError!Ref {
+        const Self = @This();
+        fn call(o: Self, s: *Sema, b: *Block, sr: Src, e: []const Ref) CompileError!Ref {
             return s.analyzeBitOp(b, sr, o.tag, e[0]);
         }
     }{ .tag = tag });
@@ -10945,7 +10948,8 @@ fn vectorOverflow(sema: *Sema, block: *Block, src: Src, op: Zir.Inst.Extended, l
     const Field = struct {
         op: Zir.Inst.Extended,
         index: u32,
-        fn call(o: @This(), s: *Sema, b: *Block, sr: Src, e: []const Ref) CompileError!Ref {
+        const Self = @This();
+        fn call(o: Self, s: *Sema, b: *Block, sr: Src, e: []const Ref) CompileError!Ref {
             const t = if (o.op == .shl_with_overflow) try s.analyzeShlWithOverflow(b, sr, e[0], e[1]) else try s.analyzeOverflowBuiltin(b, sr, o.op, e[0], e[1]);
             return s.tupleField(b, t, o.index);
         }
@@ -12056,7 +12060,8 @@ fn analyzeFloatUnary(sema: *Sema, block: *Block, src: Src, op: Ir.Inst.Tag, oper
         if (try sema.vectorUnaryOp(block, .sqrt, .sqrt, operand)) |r| return r;
     if (sema.vectorLen(ty)) |len| return sema.vectorMap(block, src, len, .none, &.{operand}, struct {
         op: Ir.Inst.Tag,
-        fn call(o: @This(), s: *Sema, b: *Block, sr: Src, e: []const Ref) CompileError!Ref {
+        const Self = @This();
+        fn call(o: Self, s: *Sema, b: *Block, sr: Src, e: []const Ref) CompileError!Ref {
             return s.analyzeFloatUnary(b, sr, o.op, e[0]);
         }
     }{ .op = op });
@@ -12366,7 +12371,8 @@ fn zirMulAdd(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         const a = try sema.coerce(block, ty, sema.resolveInst(extra.mulend1), src);
         const b = try sema.coerce(block, ty, sema.resolveInst(extra.mulend2), src);
         return sema.vectorMap(block, src, len, ty, &.{ a, b, addend }, struct {
-            fn call(_: @This(), s: *Sema, blk: *Block, sr: Src, e: []const Ref) CompileError!Ref {
+            const Self = @This();
+            fn call(_: Self, s: *Sema, blk: *Block, sr: Src, e: []const Ref) CompileError!Ref {
                 return s.mulAdd(blk, sr, e[0], e[1], e[2]);
             }
         }{});
@@ -21727,11 +21733,12 @@ fn bcInFrame(gpa: Allocator, ir: *const Ir) Allocator.Error!std.bit_set.Dynamic 
         set: *std.bit_set.Dynamic,
         tags: []const Ir.Inst.Tag,
         /// A use other than the ones that keep a value in the frame.
-        fn escape(s: @This(), ref: Ref) void {
+        const Self = @This();
+        fn escape(s: Self, ref: Ref) void {
             if (ref.toIndex()) |j| s.set.unset(@backingInt(j));
         }
         /// A use that keeps `ref` in the frame if it is a `want`.
-        fn use(s: @This(), ref: Ref, want: enum { alloc, overflow }) void {
+        fn use(s: Self, ref: Ref, want: enum { alloc, overflow }) void {
             const j = @backingInt(ref.toIndex() orelse return);
             const is_alloc = s.tags[j] == .alloc;
             if (is_alloc != (want == .alloc)) s.set.unset(j);
@@ -23404,7 +23411,8 @@ fn zirSelect(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstData) C
     }
     const Op = struct {
         elem_ty: Index,
-        fn call(op: @This(), s: *Sema, blk: *Block, sr: Src, e: []const Ref) CompileError!Ref {
+        const Self = @This();
+        fn call(op: Self, s: *Sema, blk: *Block, sr: Src, e: []const Ref) CompileError!Ref {
             const p = try s.coerce(blk, .bool_type, e[0], sr);
             if (s.resolveValue(p)) |pv| {
                 if (s.isUndef(pv)) return .fromInterned(try s.undefElem(op.elem_ty));
@@ -23603,7 +23611,8 @@ fn testAnalyze(source: []const u8) ![]u8 {
     defer out.deinit();
     const Sink = struct {
         w: *std.Io.Writer,
-        pub fn function(s: *@This(), z: *Zcu, ir: *const Ir) !void {
+        const Self = @This();
+        pub fn function(s: *Self, z: *Zcu, ir: *const Ir) !void {
             try print.dump(ir, &z.ip, s.w);
         }
     };
@@ -23902,7 +23911,8 @@ fn testTypeHashes(source: []const u8, out: []InternPool.Hash) !void {
     var zcu: Zcu = try .init(gpa, io, &fe);
     defer zcu.deinit();
     const NoSink = struct {
-        pub fn function(_: *@This(), _: *Zcu, _: *const Ir) !void {}
+        const Self = @This();
+        pub fn function(_: *Self, _: *Zcu, _: *const Ir) !void {}
     };
     var sink: NoSink = .{};
     try zcu.analyzeAll(&sink);

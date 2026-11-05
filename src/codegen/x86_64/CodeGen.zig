@@ -1599,7 +1599,8 @@ fn usesR11(cg: *CodeGen, inst: Inst.Index) bool {
     const Deferred = struct {
         cg: *CodeGen,
         found: *bool,
-        pub fn use(c: @This(), r: Ref) void {
+        const Self = @This();
+        pub fn use(c: Self, r: Ref) void {
             const x = r.toIndex() orelse return;
             switch (c.cg.homes[@backingInt(x)]) {
                 .deferred, .result => c.found.* = true,
@@ -1635,7 +1636,8 @@ fn usesR11(cg: *CodeGen, inst: Inst.Index) bool {
     const Wide = struct {
         cg: *CodeGen,
         found: *bool,
-        pub fn use(c: @This(), r: Ref) void {
+        const Self = @This();
+        pub fn use(c: Self, r: Ref) void {
             const t = c.cg.typeOf(r);
             if (t != .none and c.cg.isWideInt(t)) c.found.* = true;
         }
@@ -2072,7 +2074,8 @@ fn exemptArgs(cg: *CodeGen) Error!void {
         start: u32,
         pos: u32,
         own: u32,
-        pub fn use(c: @This(), ref: Ref) void {
+        const Self = @This();
+        pub fn use(c: Self, ref: Ref) void {
             const v = @backingInt(ref.toIndex() orelse return);
             const l = c.cg.ssa.live.slice();
             if (l.items(.reg2)[v] != 0) return;
@@ -2256,7 +2259,8 @@ fn planSplits(cg: *CodeGen) Error!void {
     const Weights = struct {
         uses: []u64,
         w: u64 = 0,
-        pub fn use(c: *@This(), ref: Ref) void {
+        const Self = @This();
+        pub fn use(c: *Self, ref: Ref) void {
             if (ref.toIndex()) |x| c.uses[@backingInt(x)] += c.w;
         }
     };
@@ -2530,7 +2534,8 @@ fn planPayloadRegions(cg: *CodeGen) Error!void {
         uses: []u32,
         user: []u32,
         at: u32,
-        pub fn use(c: @This(), r: Ref) void {
+        const Self = @This();
+        pub fn use(c: Self, r: Ref) void {
             const i = @backingInt(r.toIndex() orelse return);
             c.uses[i] += 1;
             c.user[i] = c.at;
@@ -2584,7 +2589,8 @@ fn planPayloadRegions(cg: *CodeGen) Error!void {
             pos: []const u32,
             tags: []const Inst.Tag,
             bad: *bool,
-            pub fn use(c: @This(), r: Ref) void {
+            const Self = @This();
+            pub fn use(c: Self, r: Ref) void {
                 const i = @backingInt(r.toIndex() orelse return);
                 if (i == c.x and c.at != c.st and !(c.pos[c.at] != std.math.maxInt(u32) and c.pos[c.at] > c.pos[c.st])) c.bad.* = true;
                 if (i == c.w and c.at != c.v) switch (c.tags[c.at]) {
@@ -2607,7 +2613,8 @@ fn planPayloadRegions(cg: *CodeGen) Error!void {
                     a: u32,
                     b: u32,
                     found: *bool,
-                    pub fn use(c: @This(), r: Ref) void {
+                    const Self = @This();
+                    pub fn use(c: Self, r: Ref) void {
                         const i = @backingInt(r.toIndex() orelse return);
                         if (i == c.a or i == c.b) c.found.* = true;
                     }
@@ -2638,7 +2645,8 @@ fn rvoEarlyLoad(cg: *CodeGen, l: Inst.Index, a: Inst.Index) bool {
     const Uses = struct {
         target: Inst.Index,
         found: bool = false,
-        pub fn use(u: *@This(), r: Ref) void {
+        const Self = @This();
+        pub fn use(u: *Self, r: Ref) void {
             if (r.toIndex() == u.target) u.found = true;
         }
     };
@@ -3462,7 +3470,8 @@ fn planConstAliases(cg: *CodeGen) Error!void {
     const Check = struct {
         cg: *CodeGen,
         from: *const std.AutoHashMapUnmanaged(u32, u32),
-        pub fn use(c: @This(), r: Ref) void {
+        const Self = @This();
+        pub fn use(c: Self, r: Ref) void {
             const i = r.toIndex() orelse return;
             if (c.from.get(@backingInt(i))) |a| _ = c.cg.const_alias.remove(a);
         }
@@ -3793,7 +3802,8 @@ fn calleeCc(cg: *CodeGen, data: Inst.Data) InternPool.CallingConvention {
 fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
     const T = struct {
         first: ?Ref = null,
-        pub fn use(t: *@This(), ref: Ref) void {
+        const Self = @This();
+        pub fn use(t: *Self, ref: Ref) void {
             if (t.first == null) t.first = ref;
         }
     };
@@ -4253,7 +4263,8 @@ fn keepSymbols(cg: *CodeGen, inst: Inst.Index) Error!void {
         refs: *std.ArrayList(Ref),
         gpa: Allocator,
         failed: *bool,
-        pub fn use(c: @This(), ref: Ref) void {
+        const Self = @This();
+        pub fn use(c: Self, ref: Ref) void {
             if (ref.toInterned() != null) c.refs.append(c.gpa, ref) catch {
                 c.failed.* = true;
             };

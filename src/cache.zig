@@ -210,12 +210,13 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
         files: std.ArrayList(File) = .empty,
         bytes: u64 = 0,
 
-        fn name(e: *const @This()) []const u8 {
+        const Self = @This();
+        fn name(e: *const Self) []const u8 {
             return e.name_buf[0..e.name_len];
         }
 
         /// When it was used, for ranking: a tool as if later.
-        fn rank(e: *const @This()) Io.Timestamp {
+        fn rank(e: *const Self) Io.Timestamp {
             return if (e.kind == .tool) e.used.?.addDuration(.fromNanoseconds(tool_bias_ns)) else e.used.?;
         }
     };

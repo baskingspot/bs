@@ -1995,7 +1995,8 @@ fn keepSymbols(cg: *CodeGen, inst: Inst.Index) Error!void {
         refs: *std.ArrayList(Ref),
         gpa: Allocator,
         failed: *bool,
-        pub fn use(c: @This(), ref: Ref) void {
+        const Self = @This();
+        pub fn use(c: Self, ref: Ref) void {
             if (ref.toInterned() != null) c.refs.append(c.gpa, ref) catch {
                 c.failed.* = true;
             };

@@ -509,7 +509,8 @@ fn dispatches(f: *const Func, ir: *const Ir, ip: *const InternPool, h: u32) bool
     const Find = struct {
         x: Inst.Ref,
         found: bool = false,
-        pub fn use(c: *@This(), ref: Inst.Ref) void {
+        const Self = @This();
+        pub fn use(c: *Self, ref: Inst.Ref) void {
             if (ref == c.x) c.found = true;
         }
     };
@@ -692,7 +693,8 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
     {
         const Uses = struct {
             uses: []u32,
-            pub fn use(c: @This(), ref: Inst.Ref) void {
+            const Self = @This();
+            pub fn use(c: Self, ref: Inst.Ref) void {
                 if (ref.toIndex()) |i| c.uses[@backingInt(i)] -= 1;
             }
         };
@@ -1370,7 +1372,8 @@ fn loopWrites(ir: *const Ir, ip: *const InternPool, uses: []const u32, x: Inst.I
     const Body = struct {
         insts: []const Inst.Index,
         i: usize = 0,
-        fn next(b: *@This(), t: []const Inst.Tag) ?Inst.Index {
+        const Self = @This();
+        fn next(b: *Self, t: []const Inst.Tag) ?Inst.Index {
             while (b.i < b.insts.len) {
                 const inst = b.insts[b.i];
                 b.i += 1;
@@ -1378,7 +1381,7 @@ fn loopWrites(ir: *const Ir, ip: *const InternPool, uses: []const u32, x: Inst.I
             }
             return null;
         }
-        fn of(irr: *const Ir, inst: Inst.Index) @This() {
+        fn of(irr: *const Ir, inst: Inst.Index) Self {
             const e = irr.extraData(Ir.Block, irr.instructions.items(.data)[@backingInt(inst)].ty_pl.payload);
             return .{ .insts = irr.bodySlice(e.end, e.data.body_len) };
         }
@@ -1475,7 +1478,8 @@ fn scanInside(ir: *const Ir, inst: Inst.Index, stack: *[16]Inst.Index, depth: us
         stack: *[16]Inst.Index,
         d: usize,
         ok: *bool,
-        fn visit(c: @This(), irr: *const Ir, body: []const Inst.Index) void {
+        const Self = @This();
+        fn visit(c: Self, irr: *const Ir, body: []const Inst.Index) void {
             const datas = irr.instructions.items(.data);
             for (body) |b| {
                 const target = switch (irr.instructions.items(.tag)[@backingInt(b)]) {
@@ -1504,7 +1508,8 @@ fn brsTo(ir: *const Ir, body: []const Inst.Index, x: Inst.Index) bool {
             forEachBody(ir, b, struct {
                 x: Inst.Index,
                 found: *bool,
-                fn visit(c: @This(), irr: *const Ir, inner: []const Inst.Index) void {
+                const Self = @This();
+                fn visit(c: Self, irr: *const Ir, inner: []const Inst.Index) void {
                     if (brsTo(irr, inner, c.x)) c.found.* = true;
                 }
             }{ .x = x, .found = &found });
@@ -1921,7 +1926,8 @@ const LiveWalk = struct {
 pub fn forEachOperand(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
     const Read = struct {
         ctx: @TypeOf(ctx),
-        pub inline fn use(r: @This(), p: *Inst.Ref) void {
+        const Self = @This();
+        pub inline fn use(r: Self, p: *Inst.Ref) void {
             r.ctx.use(p.*);
         }
     };
@@ -2491,14 +2497,15 @@ test "liveness extends over loops and ignores clobbers on paths that end" {
     // and optionally the `not` in the loop.
     const Ctx = struct {
         not_clobbers: bool,
-        pub fn clobbers(c: @This(), inst: Inst.Index) bool {
+        const Self = @This();
+        pub fn clobbers(c: Self, inst: Inst.Index) bool {
             return switch (@backingInt(inst)) {
                 7 => true,
                 5 => c.not_clobbers,
                 else => false,
             };
         }
-        pub fn termClobbers(_: @This(), _: Block.Index) bool {
+        pub fn termClobbers(_: Self, _: Block.Index) bool {
             return false;
         }
     };

@@ -569,13 +569,14 @@ test "an object and a Darwin archive of it read back with MachOInput" {
     var in: MachOInput = .{ .arena = arena_state.allocator() };
     try in.addArchive("lib.a", lib);
     const Ctx = struct {
-        pub fn zigExport(_: @This(), _: []const u8) !?SymbolKey {
+        const Self = @This();
+        pub fn zigExport(_: Self, _: []const u8) !?SymbolKey {
             return null;
         }
-        pub fn rtExport(_: @This(), _: []const u8) !?SymbolKey {
+        pub fn rtExport(_: Self, _: []const u8) !?SymbolKey {
             return null;
         }
-        pub fn importSym(_: @This(), name: []const u8, _: bool) !?SymbolKey {
+        pub fn importSym(_: Self, name: []const u8, _: bool) !?SymbolKey {
             return if (std.mem.eql(u8, name, "ext")) .fromName("import.ext") else null;
         }
     };

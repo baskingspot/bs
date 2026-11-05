@@ -173,7 +173,8 @@ pub fn tables(arena: Allocator, o: Options) Allocator.Error!Tables {
     const Ctx = struct {
         hashes: []const u32,
         n_buckets: u32,
-        fn lessThan(c: @This(), a: u32, b: u32) bool {
+        const Self = @This();
+        fn lessThan(c: Self, a: u32, b: u32) bool {
             const ba = c.hashes[a] % c.n_buckets;
             const bb = c.hashes[b] % c.n_buckets;
             return ba < bb or (ba == bb and a < b);

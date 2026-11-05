@@ -818,18 +818,19 @@ fn linkWithInputs(
         /// `Incremental.lld`, for `weakImport`.
         lld: bool,
 
-        pub fn zigExport(r: @This(), name: []const u8) !?Atom.SymbolKey {
+        const Self = @This();
+        pub fn zigExport(r: Self, name: []const u8) !?Atom.SymbolKey {
             return r.exports.get(name);
         }
 
-        pub fn rtExport(_: @This(), name: []const u8) !?Atom.SymbolKey {
+        pub fn rtExport(_: Self, name: []const u8) !?Atom.SymbolKey {
             if (Emit.arrayBound(name)) |key| return key;
             const e = Zcu.compilerRtExport(name) orelse return null;
             var buf: [128]u8 = undefined;
             return .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl));
         }
 
-        pub fn importSym(r: @This(), name: []const u8, weak: bool) !?Atom.SymbolKey {
+        pub fn importSym(r: Self, name: []const u8, weak: bool) !?Atom.SymbolKey {
             _ = weak;
             const g = r.glibc orelse return null;
             if (Glibc.sharedSymbol(r.shared, name) == null and g.get(name) == null) return null;
@@ -837,13 +838,13 @@ fn linkWithInputs(
             return Emit.importKey(name);
         }
 
-        pub fn weakImport(r: @This(), name: []const u8) !?Atom.SymbolKey {
+        pub fn weakImport(r: Self, name: []const u8) !?Atom.SymbolKey {
             if (!r.lld or r.glibc == null) return null;
             try r.requested_imports.put(r.arena, Emit.importKey(name), {});
             return Emit.importKey(name);
         }
 
-        pub fn copySym(r: @This(), name: []const u8) !?Atom.SymbolKey {
+        pub fn copySym(r: Self, name: []const u8) !?Atom.SymbolKey {
             const size: u64 = if (Glibc.sharedSymbol(r.shared, name)) |s|
                 if (s.sym.object) s.sym.size else 0
             else s: {
@@ -1780,7 +1781,8 @@ pub const Recorder = struct {
         try forChunks(io, r.unit_list.items.len + r.dependee_list.items.len, struct {
             r: *const Recorder,
 
-            fn run(c: @This(), lo: usize, hi: usize, _: usize) !void {
+            const Self = @This();
+            fn run(c: Self, lo: usize, hi: usize, _: usize) !void {
                 var k: Keyer = .{ .zcu = c.r.zcu, .key_buf = .init(c.r.gpa), .unit_buf = .init(c.r.gpa) };
                 defer k.key_buf.deinit();
                 defer k.unit_buf.deinit();
@@ -2866,7 +2868,8 @@ fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.bit_set.Dyna
         names: std.array_hash_map.String(void) = .empty,
         error_names: bool = false,
 
-        fn add(s: *@This(), a: Allocator, kind: Manifest.Ref.Kind, name: []const u8) !void {
+        const Self = @This();
+        fn add(s: *Self, a: Allocator, kind: Manifest.Ref.Kind, name: []const u8) !void {
             switch (kind) {
                 .ext => try s.names.put(a, name, {}),
                 // Weak and strong references to one name resolve alike
@@ -3125,7 +3128,8 @@ fn remapItems(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, changed: *cons
     const Ctx = struct {
         rp: *Replay,
         changed: *const std.bit_set.Dynamic,
-        pub fn map(c: @This(), input: u32, inst: u32) ?u32 {
+        const Self = @This();
+        pub fn map(c: Self, input: u32, inst: u32) ?u32 {
             if (input >= c.changed.bit_length or !c.changed.isSet(input)) return null;
             const x = c.rp.mapInst(input, @fromBackingInt(inst)) orelse return Manifest.Source.no_inst;
             return @backingInt(x);
@@ -3481,7 +3485,8 @@ const Graph = struct {
             atoms: []const Atom,
             debug_of: []const ?*const Atom.Debug,
 
-            fn run(c: @This(), lo: usize, hi: usize, _: usize) !void {
+            const Self = @This();
+            fn run(c: Self, lo: usize, hi: usize, _: usize) !void {
                 for (c.nodes[lo..hi]) |*n| switch (n.tag) {
                     .func, .link, .content => {
                         var h: Hash = 0;
@@ -3560,7 +3565,7 @@ const Graph = struct {
 const NodeRef = struct {
     node: u32,
     ref: Manifest.Ref,
-    fn lessThan(_: void, x: @This(), y: @This()) bool {
+    fn lessThan(_: void, x: NodeRef, y: NodeRef) bool {
         if (x.node != y.node) return x.node < y.node;
         if (x.ref.kind != y.ref.kind) return @backingInt(x.ref.kind) < @backingInt(y.ref.kind);
         return x.ref.value < y.ref.value;
@@ -4052,7 +4057,8 @@ fn forChunks(io: Io, len: usize, ctx: anytype) !void {
     const n = @min(max_chunks, @max(1, len / 1024), 4 * (std.Thread.getCpuCount() catch 1));
     const Chunk = struct {
         err: ?anyerror = null,
-        fn run(c: *@This(), x: @TypeOf(ctx), lo: usize, hi: usize, i: usize) void {
+        const Self = @This();
+        fn run(c: *Self, x: @TypeOf(ctx), lo: usize, hi: usize, i: usize) void {
             x.run(lo, hi, i) catch |e| {
                 c.err = e;
             };
