@@ -347,6 +347,118 @@ def _pk_decl():
 
 PK_DECL = _pk_decl()
 
+# Declarations for shapes from corpus miscompiles; a program gets the
+# ones it uses.
+EXTRA_DECL = {
+    # 1. Aggregates over 16 bytes returned early straight from a global.
+    "rvo": [
+        "const QS = struct { pad: u32, f: [4]u64, d: [4]f64 };",
+        "var gQ4: [4]u64 = .{ 0x1111, 0x2222, 0x3333, 0x4444 };",
+        "var gQD: [4]f64 = .{ 1.5, -2.25, 3.0, 0.5 };",
+        "var gQS: QS = .{ .pad = 9, .f = .{ 5, 6, 7, 8 }, .d = .{ -1.0, 2.5, 0.25, 8.0 } };",
+        "noinline fn rq0(k: u8) [4]u64 {",
+        "    if (k & 3 == 0) return gQ4;",
+        "    if (k & 3 == 1) return gQS.f;",
+        "    var r: [4]u64 = undefined;",
+        "    for (&r, 0..) |*p, i| p.* = @as(u64, k) *% (i + 1);",
+        "    return r;",
+        "}",
+        "noinline fn rq1(k: u8) [4]f64 {",
+        "    if (k % 3 == 0) return gQD;",
+        "    if (k % 3 == 1) return gQS.d;",
+        "    return .{ @floatFromInt(k), 1.0, 2.0, @floatFromInt(k >> 1) };",
+        "}",
+        "noinline fn rq2(k: u8) QS {",
+        "    if (k & 1 == 0) return gQS;",
+        "    const r: QS = .{ .pad = k, .f = .{ k, 1, 2, 3 }, .d = .{ 0.5, 1.5, 2.5, 3.5 } };",
+        "    return r;",
+        "}",
+        "noinline fn rq3(k: u8, b: bool) [4]u64 {",
+        "    if (b) {",
+        "        if (k > 100) return gQS.f;",
+        "        return gQ4;",
+        "    }",
+        "    return .{ k, k +% 1, k +% 2, k +% 3 };",
+        "}",
+    ],
+    # 2. An and/or bool live across a call returning an optional, an early
+    # return, then returned from a later block.
+    "boolret": [
+        "noinline fn qfind(s: []const u8, ch: u8) ?usize {",
+        "    for (s, 0..) |c, i| if (c == ch) return i;",
+        "    return null;",
+        "}",
+        "noinline fn bq0(a: u32, b: u32, s: []const u8) bool {",
+        "    const c = (a < b and b != 7) or s.len > 5;",
+        "    const idx = qfind(s, @truncate(a)) orelse 99;",
+        "    if (idx == b) return false;",
+        "    if (a == 3) {",
+        "        if (b & 1 == 0) return true;",
+        "    }",
+        "    return c;",
+        "}",
+        "noinline fn bq1(a: u32, b: u32, s: []const u8) bool {",
+        "    const c = a != 0 and (b > a or s.len == 0);",
+        "    var n: usize = 0;",
+        "    while (n < 3) : (n += 1) {",
+        "        if (qfind(s, @truncate(b +% @as(u32, @intCast(n))))) |i| {",
+        "            if (i == a) return !c;",
+        "        }",
+        "    }",
+        "    return c;",
+        "}",
+        "noinline fn bq2(a: u32, b: u32, s: []const u8) u8 {",
+        "    const c = a > b or (s.len > 1 and s[1] == 'q');",
+        "    const i = qfind(s, 'z') orelse return @as(u8, @intFromBool(c)) + 10;",
+        "    if (i > a) return 7;",
+        "    return @intFromBool(c);",
+        "}",
+        "const qstr = [_][]const u8{ \"\", \"qz\", \"xyz\", \"aqzzzzq\", \"zz\" };",
+    ],
+    # 3. Inline asm naming register-pinned operands.
+    "asmpin": [
+        "fn asmTarget() callconv(.c) u64 { return 0x1234; }",
+        "fn asmTarget2() callconv(.c) u64 { return 0xfeed; }",
+        "noinline fn asmNop() void { std.mem.doNotOptimizeAway(@as(u8, 1)); }",
+        "noinline fn asmCall(f: *const fn () callconv(.c) u64) u64 {",
+        "    asmNop();",
+        "    return asm volatile (\"callq *%[callee]\"",
+        "        : [ret] \"={rax}\" (-> u64),",
+        "        : [callee] \"{rax}\" (f),",
+        "        : .{ .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });",
+        "}",
+        "noinline fn asmAdd(a: u64, b: u64) u64 {",
+        "    return asm (\"addq %[b], %[a]\"",
+        "        : [ret] \"={rax}\" (-> u64),",
+        "        : [a] \"{rax}\" (a),",
+        "          [b] \"{rcx}\" (b),",
+        "    );",
+        "}",
+        "noinline fn asmXchg(a: u64, b: u64) u64 {",
+        "    var x = a;",
+        "    var y = b;",
+        "    asm (\"xchgq %[x], %[y]\"",
+        "        : [x] \"={rdx}\" (x),",
+        "          [y] \"={rsi}\" (y),",
+        "        : [xi] \"{rdx}\" (x),",
+        "          [yi] \"{rsi}\" (y),",
+        "    );",
+        "    return x -% y;",
+        "}",
+    ],
+    # 4. Calls through @extern and extern pointers whose result goes back
+    # into the variable the argument came from.
+    "xcall": [
+        "export fn mchExp1(x: u64) u64 { return x *% 3 +% 1; }",
+        "fn mchE2(x: u64) callconv(.c) u64 { return (x ^ 0x5555) +% 7; }",
+        "comptime { @export(&mchE2, .{ .name = \"mchExp2\" }); }",
+        "extern fn mchExp2(x: u64) callconv(.c) u64;",
+        "fn mchE3(x: u64, y: u64) callconv(.c) u64 { return x -% (y << 1); }",
+        "comptime { @export(&mchE3, .{ .name = \"mchExp3\" }); }",
+        "noinline fn xf(x: u64) u64 { return x +% 0x10; }",
+    ],
+}
+
 SE_DECL = [
     "const SE = struct {",
     "    a: u64,",
@@ -400,6 +512,7 @@ class Gen:
         self.n = 0
         self.out = []
         self.use_pk = False
+        self.extra = set()  # keys of EXTRA_DECL the program uses
         self.placeholders = {}  # id -> Var
         self.funcs = []
         self.globals = []
@@ -1262,6 +1375,7 @@ class Gen:
             (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"), (2, "window"),
             (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
+            (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -2769,6 +2883,88 @@ class Gen:
             f, k, _ = self.pick(fs)
             self.sink(ctx, pk_to_u64(f"{p}.{f}", k), U64)
 
+    def s_rvoglob(self, ctx):
+        """Aggregates over 16 bytes returned early straight from a global;
+        the global changes afterwards, so the result must be a copy."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        self.extra.add("rvo")
+        e = lambda s_: self.emit(ctx, s_)
+        k = f"@as(u8, @truncate({self.int_expr(ctx, U64, 1)}))"
+        v = self.fresh("rr")
+        f = self.r.randrange(4)
+        if f == 0:
+            e(f"const {v} = rq0({k});")
+            el = lambda i: f"{v}[{i}]"
+        elif f == 1:
+            e(f"const {v} = rq1({k});")
+            el = lambda i: f"@as(u64, @bitCast({v}[{i}]))"
+        elif f == 2:
+            e(f"const {v} = rq2({k});")
+            el = lambda i: self.pick([f"{v}.f[{i}]", f"@as(u64, @bitCast({v}.d[{i}]))", f"@as(u64, {v}.pad)"])
+        else:
+            e(f"const {v} = rq3({k}, {self.bool_expr(ctx, 1)});")
+            el = lambda i: f"{v}[{i}]"
+        if self.chance(0.6):
+            e(self.pick([f"gQ4[{self.r.randint(0, 3)}] +%= 1;", f"gQS.f[{self.r.randint(0, 3)}] ^= 0xff;",
+                         f"gQD[{self.r.randint(0, 3)}] += 1.0;", f"gQS.d[{self.r.randint(0, 3)}] *= 2.0;"]))
+        for i in self.r.sample(range(4), self.r.randint(1, 4)):
+            self.sink(ctx, el(i), U64)
+
+    def s_boolret(self, ctx):
+        """A short-circuit bool kept across a call returning an optional,
+        then returned after a conditional early return."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        self.extra.add("boolret")
+        a = f"@as(u32, @truncate({self.int_expr(ctx, U64, 1)}))"
+        b = f"@as(u32, @truncate({self.int_expr(ctx, U64, 1)} % 9))"
+        st = f"qstr[{self.r.randint(0, 4)}]"
+        fn = self.pick(["bq0", "bq1", "bq2"])
+        if fn == "bq2":
+            self.sink(ctx, f"bq2({a}, {b}, {st})", Int(False, 8))
+        else:
+            self.sink(ctx, f"@as(u8, @intFromBool({fn}({a}, {b}, {st})))", Int(False, 8))
+
+    def s_asmpin(self, ctx):
+        """Inline asm with register-pinned operands named in the template."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        self.extra.add("asmpin")
+        k = self.r.randrange(3)
+        if k == 0:
+            self.sink(ctx, f"asmCall(&{self.pick(['asmTarget', 'asmTarget2'])})", U64)
+        elif k == 1:
+            self.sink(ctx, f"asmAdd({self.int_expr(ctx, U64, 1)}, {self.int_expr(ctx, U64, 1)})", U64)
+        else:
+            self.sink(ctx, f"asmXchg({self.int_expr(ctx, U64, 1)}, {self.int_expr(ctx, U64, 1)})", U64)
+
+    def s_xcall(self, ctx):
+        """A chain of calls through extern and @extern function pointers on
+        one variable: x = callee(x), the callee computed just before."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        self.extra.add("xcall")
+        e = lambda s_: self.emit(ctx, s_)
+        x = self.fresh("xc")
+        e(f"var {x}: u64 = {self.pick(['0', self.int_expr(ctx, U64, 1)])};")
+        e(f"{x} = xf({x});")
+        for _ in range(self.r.randint(1, 5)):
+            k = self.r.randrange(5)
+            if k == 0:
+                e(f"{x} = @extern(*const fn (u64) callconv(.c) u64, .{{ .name = \"mchExp1\" }})({x});")
+            elif k == 1:
+                cp = self.fresh("xp")
+                e(f"const {cp} = @extern(*const fn (u64) callconv(.c) u64, .{{ .name = \"{self.pick(['mchExp1', 'mchExp2'])}\" }});")
+                e(f"{x} = {cp}({x});")
+            elif k == 2:
+                e(f"{x} = mchExp2({x});")
+            elif k == 3:
+                e(f"{x} = @extern(*const fn (u64, u64) callconv(.c) u64, .{{ .name = \"mchExp3\" }})({x}, {x} >> 3);")
+            else:
+                e(f"{x} = mchExp1(xf({x}));")
+        self.sink(ctx, x, U64)
+
     def s_bigcopy(self, ctx):
         """Whole copies of a 64-256 byte struct: into locals, globals and
         through pointers, by value into callees that write the source, and
@@ -3532,6 +3728,8 @@ class Gen:
         out.append("}")
         if self.use_pk:
             out.extend(PK_DECL)
+        for k_ in sorted(self.extra):
+            out.extend(EXTRA_DECL[k_])
         return self.resolve("\n".join(out) + "\n")
 
     def sink_value_main(self, ctx, e, t):
