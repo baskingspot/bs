@@ -351,6 +351,11 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
         if (expect.exit == null and expect.signal == null) std.debug.panic("{s}: missing '//! exit:' or '//! signal:' header", .{src_path});
         if (expect.flags.items.len != 0 and (expect.rebuild_without.items.len != 0 or expect.lib_edit != null or expect.donor_without != null or expect.donor_libc))
             std.debug.panic("{s}: '//! flags:' works only without the rebuild and donor headers", .{src_path});
+        // `-target native` and `<arch>-native-<abi>` name the host's OS, as
+        // upstream resolves them, so these tests need an x86_64-linux host.
+        if (!host_runs_bs_output and for (expect.flags.items, 0..) |f, i| {
+            if (i > 0 and std.mem.eql(u8, expect.flags.items[i - 1], "-target") and std.mem.indexOf(u8, f, "native") != null) break true;
+        } else false) continue;
 
         for ([_]bool{ false, true }) |upstream| {
             const compile = if (upstream) blk: {
