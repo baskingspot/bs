@@ -1388,7 +1388,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         const imports = try emit.gpa.alloc(MachO.Import, emit.imports.count());
         defer emit.gpa.free(imports);
         for (imports, emit.imports.keys()) |*imp, name| imp.* = .{ .key = importKey(name), .name = name };
-        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry.?, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .aliases = emit.aliases.items }) catch |err| {
+        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry.?, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .aliases = emit.aliases.items }) catch |err| {
             std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
             return false;
         };

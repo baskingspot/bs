@@ -88,6 +88,9 @@ pub const Options = struct {
     /// LC_BUILD_VERSION minimum macOS, also recorded as the SDK version.
     /// Zig 0.17.1's default minimum for aarch64-macos is 15.0.
     min_os: std.SemanticVersion = .{ .major = 15, .minor = 0, .patch = 0 },
+    /// LC_MAIN's stack size, which the kernel gives the main thread instead
+    /// of RLIMIT_STACK's 8 MiB. Upstream's default, as `Elf.Options.stack_size`.
+    stack_size: u64 = 16 * 1024 * 1024,
     /// Threads to link with, the calling thread included; null means one
     /// per CPU. The output is the same for any number.
     threads: ?usize = null,
@@ -862,7 +865,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     w.put(macho.uuid_command{ .uuid = @splat(0) });
     const version = (@as(u32, @intCast(options.min_os.major)) << 16) | (@as(u32, @intCast(options.min_os.minor)) << 8) | @as(u32, @intCast(options.min_os.patch));
     w.put(macho.build_version_command{ .cmdsize = @sizeOf(macho.build_version_command), .platform = .MACOS, .minos = version, .sdk = version, .ntools = 0 });
-    w.put(macho.entry_point_command{ .entryoff = l.atomAddr(entry_index) - base });
+    w.put(macho.entry_point_command{ .entryoff = l.atomAddr(entry_index) - base, .stacksize = options.stack_size });
     w.putWithString(macho.dylib_command{ .cmd = .LOAD_DYLIB, .cmdsize = dylib_cmd_size, .dylib = .{
         .name = @sizeOf(macho.dylib_command),
         .timestamp = 2,
@@ -2166,7 +2169,6 @@ fn sign(io: std.Io, n_threads: usize, buf: []u8, sig_off: u32, uuid_at: usize, i
 }
 
 test "links and runs a program that writes from __TEXT,__const and exits with 42" {
-    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const Encoder = @import("../codegen/aarch64/Encoder.zig");
@@ -2262,7 +2264,20 @@ test "links and runs a program that writes from __TEXT,__const and exits with 42
     });
     defer gpa.free(four);
     try std.testing.expectEqualSlices(u8, bytes, four);
+    // The main thread gets upstream's 16 MiB stack, not the kernel's 8.
+    const stacksize = s: {
+        const header = std.mem.bytesToValue(macho.mach_header_64, bytes[0..@sizeOf(macho.mach_header_64)]);
+        var at: usize = @sizeOf(macho.mach_header_64);
+        for (0..header.ncmds) |_| {
+            const lc = std.mem.bytesToValue(macho.load_command, bytes[at..][0..@sizeOf(macho.load_command)]);
+            if (lc.cmd == .MAIN) break :s std.mem.bytesToValue(macho.entry_point_command, bytes[at..][0..@sizeOf(macho.entry_point_command)]).stacksize;
+            at += lc.cmdsize;
+        }
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqual(16 * 1024 * 1024, stacksize);
 
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .macos) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try link(gpa, io, tmp.dir, "hello", &atoms, options);

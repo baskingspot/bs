@@ -2709,6 +2709,10 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
   __const), __DATA_CONST (__got, and __const for `.rodata` atoms holding
   absolute addresses), __DATA (__data, __thread_vars, __thread_data,
   __thread_bss, __bss, ld64's order), __LINKEDIT, all on 16 KiB pages.
+  LC_MAIN carries `Options.stack_size` (16 MiB unless `-stack` says
+  otherwise), as upstream writes it: the kernel gives the main thread
+  that stack instead of RLIMIT_STACK's 8 MiB, as PT_GNU_STACK does
+  through std's start code on Linux.
   Thread-locals follow ld64: `.tdata` and `.tbss` atoms make up the
   template dyld copies per thread (__thread_data, then the zero-fill
   __thread_bss, its start aligned for both), and each gets a 24-byte
