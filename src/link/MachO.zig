@@ -650,10 +650,12 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     sizes[got] = @as(u64, n_imports) * 8;
     aligns[got] = .@"8";
     if (n_debug > 0) {
-        var at = unwindPagesOff(n_debug_chunks) + unwind_lead_page_size;
+        var n_pages: usize = 0;
+        for (unwind_pages) |p| n_pages += unwindPageCount(p.count);
+        var at = unwindPagesOff(n_pages) + unwind_lead_page_size;
         for (unwind_pages) |*p| {
             p.off = at;
-            if (p.count > 0) at += unwind_page_header_size + @as(u64, p.count) * unwind_entry_size;
+            at += unwindChunkSize(p.count);
         }
         sizes[unwind_info] = at;
     }
@@ -1229,28 +1231,44 @@ fn writeDsymHeader(dsym: []u8, dl: DsymLayout, uuid: [16]u8, exe_segs: []const u
 // first-level index with room for a leading page, a page per debug chunk,
 // and the end; an empty LSDA array; the leading page, which marks code
 // before the first function as having no unwind info; then each debug
-// chunk's regular second-level page, with room for 2 entries per debug
-// entry and 1 more. A chunk writes its page in place: an entry where each
-// function starts unless it continues the previous entry's encoding, and
-// an entry with no encoding where each run of functions ends, so that code
-// without debug info between functions is not taken for theirs.
-// `writeUnwindIndex` then lists the pages that have entries. Debuggers and
-// unwinders find the page from the index and the entry by binary search.
+// chunk's regular second-level pages, as many as its entries fill (at
+// most 2 per debug entry and 1 more). A chunk writes its pages in place:
+// an entry where each function starts unless it continues the previous
+// entry's encoding, and an entry with no encoding where each run of
+// functions ends, so that code without debug info between functions is
+// not taken for theirs. Pages are 4 KiB at most, as ld64 writes them and
+// objdump and lldb read them (libunwind reads larger ones too).
+// `writeUnwindIndex` then lists every page. Debuggers and unwinders find
+// the page from the index and the entry by binary search.
 
 const unwind_header_size = @sizeOf(macho.unwind_info_section_header);
 const unwind_index_entry_size = @sizeOf(macho.unwind_info_section_header_index_entry);
 const unwind_page_header_size = @sizeOf(macho.unwind_info_regular_second_level_page_header);
 const unwind_entry_size = @sizeOf(macho.unwind_info_regular_second_level_entry);
 const unwind_lead_page_size = unwind_page_header_size + unwind_entry_size;
+/// The entries a full 4 KiB page holds.
+const unwind_page_entries = (0x1000 - unwind_page_header_size) / unwind_entry_size;
 
-/// Offset of the LSDA array and the pages, for `n_chunks` debug chunks.
-fn unwindPagesOff(n_chunks: usize) u64 {
-    return unwind_header_size + (n_chunks + 2) * unwind_index_entry_size;
+/// Offset of the LSDA array and the pages, for `n_pages` pages of the
+/// debug chunks' (the index has room for them, the leading page and the
+/// end).
+fn unwindPagesOff(n_pages: usize) u64 {
+    return unwind_header_size + (n_pages + 2) * unwind_index_entry_size;
 }
 
-/// A debug chunk's page: its number of entries (from `Link.layOutDebug`),
-/// its offset in the section, and its first function offset (from
-/// `Link.copyDebug`).
+/// The number of pages `count` entries fill.
+fn unwindPageCount(count: u32) u32 {
+    return std.math.divCeil(u32, count, unwind_page_entries) catch unreachable;
+}
+
+/// The size of a debug chunk's pages, for its `count` entries.
+fn unwindChunkSize(count: u32) u64 {
+    return @as(u64, unwindPageCount(count)) * unwind_page_header_size + @as(u64, count) * unwind_entry_size;
+}
+
+/// A debug chunk's pages: its number of entries (from `Link.layOutDebug`),
+/// the offset of its first page in the section, and its first function
+/// offset (from `Link.copyDebug`). Its pages are full but the last.
 const UnwindPage = struct { count: u32, off: u64, first: u32 };
 
 /// The compact unwind encoding of a frame. `frame_pointer` is the
@@ -1272,7 +1290,9 @@ pub fn unwindEncoding(u: Atom.Unwind) u32 {
 /// pages. Offsets are from the start of __TEXT; __text spans `text_start`
 /// to `text_end`.
 fn writeUnwindIndex(out: []u8, pages: []const UnwindPage, text_start: u32, text_end: u32) void {
-    const pages_off: u32 = @intCast(unwindPagesOff(pages.len));
+    var n_pages: usize = 0;
+    for (pages) |p| n_pages += unwindPageCount(p.count);
+    const pages_off: u32 = @intCast(unwindPagesOff(n_pages));
     var n: u32 = 0;
     var index_at: usize = unwind_header_size;
     const putIndex = struct {
@@ -1291,8 +1311,10 @@ fn writeUnwindIndex(out: []u8, pages: []const UnwindPage, text_start: u32, text_
         writeStruct(lead, macho.unwind_info_regular_second_level_page_header{ .entryPageOffset = unwind_page_header_size, .entryCount = 1 });
         writeStruct(lead[unwind_page_header_size..], macho.unwind_info_regular_second_level_entry{ .functionOffset = text_start, .encoding = 0 });
     } else @memset(lead, 0);
-    for (pages) |p| if (p.count > 0) {
-        putIndex(out, &index_at, &n, p.first, @intCast(p.off), pages_off);
+    // Each page's first function, which its chunk wrote.
+    for (pages) |p| for (0..unwindPageCount(p.count)) |k| {
+        const off: u32 = @intCast(p.off + k * 0x1000);
+        putIndex(out, &index_at, &n, std.mem.readInt(u32, out[off + unwind_page_header_size ..][0..4], .little), off, pages_off);
     };
     // The end: past it, no unwind info.
     putIndex(out, &index_at, &n, text_end, 0, pages_off);
@@ -1884,7 +1906,7 @@ fn LinkOf(comptime Input: type) type {
                 @memcpy(pieces[4 * n_u ..], pieces[0 .. 4 * n_u]);
                 w = .{ .c = c, .info = pieces[4 * n_u ..][0..n_u], .ranges = pieces[5 * n_u ..][0..n_u], .line = pieces[6 * n_u ..][0..n_u], .aranges = pieces[7 * n_u ..][0..n_u], .text_addr = l.section_addrs[text] };
             }
-            const page = if (write) l.buf[l.unwind_off + l.unwind_pages[chunk].off ..][0 .. unwind_page_header_size + l.unwind_pages[chunk].count * unwind_entry_size] else &.{};
+            const page = if (write) l.buf[l.unwind_off + l.unwind_pages[chunk].off ..][0..unwindChunkSize(l.unwind_pages[chunk].count)] else &.{};
             var n: u32 = 0;
             var first: u32 = 0;
             var encoding: u32 = 0;
@@ -1943,7 +1965,10 @@ fn LinkOf(comptime Input: type) type {
                     }
                 }
                 std.debug.assert(n == l.unwind_pages[chunk].count);
-                if (n > 0) writeStruct(page, macho.unwind_info_regular_second_level_page_header{ .entryPageOffset = unwind_page_header_size, .entryCount = @intCast(n) });
+                for (0..unwindPageCount(n)) |k| writeStruct(page[k * 0x1000 ..], macho.unwind_info_regular_second_level_page_header{
+                    .entryPageOffset = unwind_page_header_size,
+                    .entryCount = @intCast(@min(unwind_page_entries, n - k * unwind_page_entries)),
+                });
                 l.unwind_pages[chunk].first = first;
             }
             return n;
@@ -1957,8 +1982,11 @@ fn LinkOf(comptime Input: type) type {
             return false;
         }
 
-        fn putUnwindEntry(page: []u8, i: u32, function: u32, encoding: u32) void {
-            writeStruct(page[unwind_page_header_size + i * unwind_entry_size ..], macho.unwind_info_regular_second_level_entry{ .functionOffset = function, .encoding = encoding });
+        /// Writes entry `i` of a chunk's `pages`: into page i / 511, each
+        /// page a header and then its entries.
+        fn putUnwindEntry(pages: []u8, i: u32, function: u32, encoding: u32) void {
+            const at = (i / unwind_page_entries + 1) * unwind_page_header_size + i * unwind_entry_size;
+            writeStruct(pages[at..], macho.unwind_info_regular_second_level_entry{ .functionOffset = function, .encoding = encoding });
         }
 
         /// Applies `a`'s relocations to its copy `dst` at address `p_base` in
@@ -3271,6 +3299,19 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
         }
     }
     try std.testing.expectEqual(null, testUnwindEncoding(one.exe, text_sect.addr + text_sect.size));
+    // Every second-level page fits 4 KiB, as objdump and lldb read them,
+    // so chunks of more entries than that take several, each indexed.
+    const info_sect = testMachOSection(one.exe, "__unwind_info").?;
+    const uinfo = one.exe[info_sect.offset..][0..info_sect.size];
+    const header = std.mem.bytesToValue(macho.unwind_info_section_header, uinfo[0..@sizeOf(macho.unwind_info_section_header)]);
+    const indices = std.mem.bytesAsSlice(macho.unwind_info_section_header_index_entry, uinfo[header.indexSectionOffset..][0 .. header.indexCount * @sizeOf(macho.unwind_info_section_header_index_entry)]);
+    var n_pages: usize = 0;
+    for (indices) |ix| if (ix.secondLevelPagesSectionOffset != 0) {
+        const page = std.mem.bytesToValue(macho.unwind_info_regular_second_level_page_header, uinfo[ix.secondLevelPagesSectionOffset..][0..@sizeOf(macho.unwind_info_regular_second_level_page_header)]);
+        try std.testing.expect(page.entryCount > 0 and page.entryPageOffset + page.entryCount * unwind_entry_size <= 0x1000);
+        n_pages += 1;
+    };
+    try std.testing.expect(n_pages > 4);
 }
 
 fn testMachOCommand(comptime T: type, bytes: []const u8, cmd: macho.LC) ?T {

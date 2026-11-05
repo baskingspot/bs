@@ -3242,8 +3242,10 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
   lldb. `.frame_pointer` is UNWIND_ARM64_MODE_FRAME (`stp x29, x30, [sp,
   #-16]!; mov x29, sp`), as LLVM encodes such functions; `.none` and
   `.outermost` get no encoding (dyld calls `main`, so no bs frame is
-  outermost). Entries are regular second-level pages, one per chunk of
-  2048 debug entries: an entry where a function starts unless it
+  outermost). Entries are regular second-level pages, each chunk of
+  2048 debug entries filling as many 4 KiB pages (511 entries each) as
+  it needs, every one indexed, since objdump and lldb read pages as
+  4 KiB as ld64 writes them: an entry where a function starts unless it
   continues the previous encoding, and an encoding-0 entry where a run of
   functions ends, a run continuing while the next function is the next
   kept code in __text (padding takes the encoding before it, as with
