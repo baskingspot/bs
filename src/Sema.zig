@@ -20440,7 +20440,7 @@ fn analyzeCall(
     const fn_ty = ip.keyPayload(.func_type, fn_ty_index);
     if (fn_ty.cc == .naked) {
         const err = sema.fail(block, src.callFunc(), "unable to call function with calling convention '{s}'", .{"naked"});
-        if (ip.keyAs(.func, func)) |f| try sema.noteFnDeclared(f.owner_nav);
+        if (func != .none) if (ip.keyAs(.func, func)) |f| try sema.noteFnDeclared(f.owner_nav);
         return err;
     }
     const total_args = call_args_in.len() + @intFromBool(first_arg != .none);
@@ -20457,7 +20457,7 @@ fn analyzeCall(
             (if (at_least) sema.fail(block, src.callFunc(), "member function expected at least {d} argument(s), found {d}", .{ n, found }) else sema.fail(block, src.callFunc(), "member function expected {d} argument(s), found {d}", .{ n, found }))
         else
             (if (at_least) sema.fail(block, src.callFunc(), "expected at least {d} argument(s), found {d}", .{ n, found }) else sema.fail(block, src.callFunc(), "expected {d} argument(s), found {d}", .{ n, found }));
-        if (ip.keyAs(.func, func)) |f| try sema.noteFnDeclared(f.owner_nav);
+        if (func != .none) if (ip.keyAs(.func, func)) |f| try sema.noteFnDeclared(f.owner_nav);
         return err;
     }
     // Arguments are analyzed in the caller, with the call instruction
