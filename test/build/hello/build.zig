@@ -10,11 +10,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         // As ghostty's: bs accepts it and says so in builtin.unwind_tables.
         .unwind_tables = .sync,
-        .imports = &.{.{ .name = "greet", .module = b.createModule(.{
-            .root_source_file = b.path("src/greet.zig"),
-            // `zig build --fuzz` instruments the tests but not this module.
-            .fuzz = false,
-        }) }},
+        .imports = &.{.{
+            .name = "greet",
+            .module = b.createModule(.{
+                .root_source_file = b.path("src/greet.zig"),
+                // `zig build --fuzz` instruments the tests but not this module.
+                .fuzz = false,
+            }),
+        }},
     });
     // A Debug step that asks for LLVM and PIE: bs builds it with its
     // own backend, static and non-PIE.
@@ -25,18 +28,23 @@ pub fn build(b: *std.Build) void {
     run.addArgs(&.{ "a", "b" });
     b.step("run", "Run hello").dependOn(&run.step);
     // A static library: its object in an archive.
-    b.installArtifact(b.addLibrary(.{ .name = "answer", .root_module = b.createModule(.{
+    const answer = b.addLibrary(.{ .name = "answer", .root_module = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
-    }) }));
+    }) });
+    b.installArtifact(answer);
     // A shared library: -fPIC, which bs's cache does not take; its
-    // inputs record still makes a build with no change a cache hit.
-    b.installArtifact(b.addLibrary(.{ .name = "shared", .linkage = .dynamic, .root_module = b.createModule(.{
+    // inputs record still makes a build with no change a cache hit, also
+    // the first after a cold build, which wrote its link input, the
+    // archive, moments before it linked.
+    const shared = b.addLibrary(.{ .name = "shared", .linkage = .dynamic, .root_module = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
-    }) }));
+    }) });
+    shared.root_module.linkLibrary(answer);
+    b.installArtifact(shared);
     // A C header translated to Zig, imported by a program that links
     // glibc: `bs translate-c --listen=-`.
     const tc = b.addTranslateC(.{

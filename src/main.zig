@@ -737,6 +737,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
         const renew = job.opts.command == .run or (job.opts.command == .@"test" and job.opts.emit_bin == .default and !job.opts.listen);
         if (job.environ_map.get("BS_CACHE_VERIFY") == null and try r.unchanged(init.arena.allocator(), init.io, out_path.?, renew, inputs)) return .{ .ok = .{ .cache_hit = true } };
         r.forget(init.io);
+        try r.hashLinkInputs(init.arena.allocator(), init.io, job);
     }
     const n_inputs = if (inputs) |list| list.items.len else 0;
     // A lazy edit build whose changes the cache cannot record builds again
@@ -793,6 +794,11 @@ const InputsRecord = struct {
     lock: Io.File,
     /// Before the build read anything (see `racy`).
     start: Io.Timestamp,
+    /// The contents of `linkInputs` before the link read them
+    /// (`hashLinkInputs`); null if one could not be read. In `zig build`,
+    /// they are often other steps' outputs of moments ago, too new to
+    /// hash once the build is done.
+    link_hashes: ?[]const Frontend.Hash = null,
 
     const file_name = "inputs";
     const magic = "bsinp1\n";
@@ -825,6 +831,30 @@ const InputsRecord = struct {
             return null;
         };
         return .{ .dir = dir, .lock = lock, .start = start };
+    }
+
+    /// The files the build links but does not compile, in record order;
+    /// the version script is reported as an input, the others are not.
+    fn linkInputs(arena: std.mem.Allocator, job: *const Job) ![]const []const u8 {
+        const script: []const []const u8 = if (job.opts.version_script) |p| &.{p} else &.{};
+        return std.mem.concat(arena, []const u8, &.{ job.link_objects, job.link_shared, script });
+    }
+
+    /// Hashes `linkInputs` for `write`, before the build reads them: a
+    /// file that changes after this has other contents than the record's
+    /// at the next check, which builds then.
+    fn hashLinkInputs(r: *InputsRecord, arena: std.mem.Allocator, io: Io, job: *const Job) !void {
+        const paths = try linkInputs(arena, job);
+        const hashes = try arena.alloc(Frontend.Hash, paths.len);
+        for (paths, hashes) |path, *h| {
+            const src = Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                else => return,
+            };
+            defer arena.free(src);
+            h.* = Frontend.hashSource(src);
+        }
+        r.link_hashes = hashes;
     }
 
     fn close(r: *InputsRecord, io: Io) void {
@@ -913,10 +943,12 @@ const InputsRecord = struct {
         while (it.next()) |path| if (path.len != 0) {
             if (!try r.addHashed(arena, io, &buf, path, true)) return;
         };
-        for ([_][]const []const u8{ job.link_objects, job.link_shared }) |paths| for (paths) |path| {
-            if (!try r.addHashed(arena, io, &buf, path, false)) return;
-        };
-        if (job.opts.version_script) |path| if (!try r.addHashed(arena, io, &buf, path, true)) return;
+        const link_hashes = r.link_hashes orelse return;
+        const link_inputs = try linkInputs(arena, job);
+        for (link_inputs, link_hashes, 0..) |path, hash, i| {
+            const reported = job.opts.version_script != null and i == link_inputs.len - 1;
+            if (!try r.add(arena, io, &buf, path, hash, reported)) return;
+        }
         try buf.appendSlice(arena, std.mem.asBytes(&std.mem.zeroes(Entry)));
         const stat = Io.Dir.cwd().statFile(io, out_path, .{}) catch return;
         const o: Output = .{ .inode = @intCast(stat.inode), .size = stat.size, .mtime = @intCast(stat.mtime.toNanoseconds()), .path_len = out_path.len };

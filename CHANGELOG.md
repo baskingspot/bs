@@ -26,6 +26,7 @@ Changes a user of bs notices, newest first, in the
 
 ### Fixed
 
+- In `bs build`, the first build after a cold one no longer compiles shared libraries and `-fPIC` objects again when they link other steps' outputs, nor reruns every step that depends on them.
 - In an ELF object (`bs build-obj`), a constant table of extern function pointers that code copies, such as `const libs = [_]Lib{ .{ .open = c.luaopen_base }, ... }` read in a `for` loop, keeps its relocations to those functions, instead of leaving null pointers that crash when called.
 - On aarch64-macos, `__unwind_info`'s second-level pages are at most 4 KiB, as ld64 writes them, so `objdump --unwind-info` and lldb read them without "attempt to read past end of buffer" warnings.
 - On ELF targets, a global absolute symbol an object defines (`.globl sym; .set sym, 0x1234`) binds from other objects and from Zig `extern` declarations, as upstream's, instead of being an undefined symbol.
