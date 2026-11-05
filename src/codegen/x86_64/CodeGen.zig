@@ -46,6 +46,7 @@ const switch_br = @import("../switch_br.zig");
 const vector = @import("vector.zig");
 const atomic128 = @import("atomic128.zig");
 const print = @import("../../Ir/print.zig");
+const int128 = @import("int128.zig");
 const Reg = Encoder.Reg;
 const Mem = Encoder.Mem;
 const Size = Encoder.Size;
@@ -257,7 +258,7 @@ const Home = union(enum) {
     view,
 };
 
-const Regs = struct { lo: Reg, hi: Reg };
+pub const Regs = struct { lo: Reg, hi: Reg };
 
 /// Where an operand's value can be read.
 pub const Loc = union(enum) {
@@ -1480,7 +1481,7 @@ pub fn xmmOf(cg: *CodeGen, ref: Ref) ?Encoder.Xmm {
 }
 
 /// The register holding `ref` if it is a value in two (`Home.regs`).
-fn pairOf(cg: *CodeGen, ref: Ref) ?Regs {
+pub fn pairOf(cg: *CodeGen, ref: Ref) ?Regs {
     const inst = ref.toIndex() orelse return null;
     return switch (cg.homes[@backingInt(inst)]) {
         .regs => |p| p,
@@ -1508,7 +1509,8 @@ fn loadRegs(cg: *CodeGen, d: Regs, ref: Ref) Error!void {
 /// Whether `ty`'s values live in two general-purpose registers when they
 /// get registers: slices, optional slices, and error unions with an
 /// 8-byte aligned payload of up to 8 bytes (the error code in the low
-/// eightbyte, the payload in the high one); all 16 bytes.
+/// eightbyte, the payload in the high one), and 128-bit integers
+/// (`int128`); all 16 bytes.
 pub fn inPair(cg: *CodeGen, ty: Index) bool {
     const ip = cg.ip;
     return switch (Type.class(ip, ty)) {
@@ -1523,6 +1525,7 @@ pub fn inPair(cg: *CodeGen, ty: Index) bool {
             const payload = ip.keyPayload(.error_union_type, ty).payload_type;
             break :blk Type.abiAlignment(ip, payload) == 8 and Type.abiSize(ip, payload) == 8;
         },
+        .int => int128.is128(ip, ty),
         else => false,
     };
 }
@@ -1912,6 +1915,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
     try cg.planDeferred();
     try cg.planRotates();
     try cg.planMulWide();
+    try int128.plan(cg);
     @memset(live.items(.hint), .{ Ssa.no_reg, Ssa.no_reg });
     for (cg.arg_hints.items) |h| live.items(.hint)[h.v][0] = h.r;
     if (cg.fn_ty.cc == .auto) {
@@ -2922,13 +2926,13 @@ fn shiftAmount(cg: *CodeGen, ref: Ref) ?u64 {
 
 /// A factor of a `mulWide` product: a value of at most 64 bits, or a
 /// constant.
-const Factor = union(enum) { ref: Ref, imm: u64 };
+pub const Factor = union(enum) { ref: Ref, imm: u64 };
 
 /// The factors of `inst` if it is a `mul_wrap` of two unsigned values of
 /// at most 64 bits, widened to an unsigned 128-bit integer (Wyhash's
 /// `mum`, std.math.mulWide): one `mul` computes it, into rdx:rax, and its
 /// value lives in a register pair (`wantsReg`) instead of memory.
-fn mulWide(cg: *CodeGen, inst: Inst.Index) ?[2]Factor {
+pub fn mulWide(cg: *CodeGen, inst: Inst.Index) ?[2]Factor {
     const ir = cg.ir;
     const ip = cg.ip;
     const ty = ir.typeOfIndex(inst, ip);
@@ -3070,6 +3074,8 @@ fn loadFactor(cg: *CodeGen, r: Reg, fa: Factor) Error!void {
             // half of the cast.
             if (cg.mul_dead.count() != 0 and cg.mul_dead.contains(@backingInt(c))) return cg.load(r, cg.ir.instructions.items(.data)[@backingInt(c)].ty_op.operand);
             if (cg.pairOf(ref)) |p| return cg.e.mov(.qword, .{ .reg = r }, .{ .reg = p.lo });
+            // Its low half in one register (`int128.plan`).
+            if (cg.homes[@backingInt(c)] == .reg) return cg.e.mov(.qword, .{ .reg = r }, .{ .reg = cg.homes[@backingInt(c)].reg });
             try cg.e.mov(.qword, .{ .reg = r }, .{ .mem = try cg.memOf(ref) });
         },
     }
@@ -3708,7 +3714,7 @@ fn scalarOperand(cg: *CodeGen, ref: Ref) bool {
 pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
     return switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
-        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.scalarOperand(data.bin_op.lhs) or
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.scalarOperand(data.bin_op.lhs) or int128.is128(cg.ip, cg.typeOf(data.bin_op.lhs)) or
             (cg.inFloat(cg.typeOf(data.bin_op.lhs)) and floatCc(cg.ir.instructions.items(.tag)[@backingInt(inst)]) != null),
         .is_err, .is_non_err, .is_null, .is_non_null, .cmp_lt_errors_len => true,
         .reduce => vector.fusable(cg, inst),
@@ -3785,6 +3791,11 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
     if (tag == .mul_wrap and cg.mulWide(inst) != null) return .pair;
     if (tag == .trunc and cg.mulPart(inst) != null) return .gpr;
     if (tag == .shr and cg.mulHigh(inst) != null) return .pair;
+    if (int128.lowers(cg, inst)) |c| return switch (c) {
+        .pair => .pair,
+        .gpr => .gpr,
+        .tuple => .none,
+    };
     const wanted = switch (tag) {
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => cg.inGpr(cg.typeOf(data.bin_op.lhs)),
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.inGpr(cg.typeOf(data.bin_op.lhs)) or cg.inFloat(cg.typeOf(data.bin_op.lhs)),
@@ -4038,6 +4049,7 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
                 try cg.floatCompare(tag, cg.sseType(cg.typeOf(data.bin_op.lhs)).?, data.bin_op.lhs, data.bin_op.rhs);
                 return cc;
             };
+            if (int128.is128(ip, cg.typeOf(data.bin_op.lhs))) return int128.cmpFlags(cg, tag, data.bin_op.lhs, data.bin_op.rhs);
             const s = cg.signed(cg.typeOf(data.bin_op.lhs));
             const rhs = try cg.srcOperand(data.bin_op.rhs, .rcx);
             const lhs = try cg.regOf(data.bin_op.lhs, .rax);
@@ -4618,6 +4630,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             };
             if (ip.keyTag(ty) == .vector_type) return vector.gen(cg, inst, tag, data);
             if (cg.isFloat(ty)) return cg.genFloat(inst, tag, data);
+            if (int128.lowers(cg, inst) != null) return int128.gen(cg, inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
             switch (tag) {
                 .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr => {
@@ -4636,7 +4649,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 },
             }
         },
-        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => if (cg.isWideInt(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)))
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => if (int128.lowers(cg, inst) != null)
+            try int128.gen(cg, inst, tag, data)
+        else if (cg.isWideInt(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)))
             try cg.genWide(inst, tag, data)
         else
             try cg.overflowOp(inst, tag, data),
@@ -4655,6 +4670,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             if (cg.homes[@backingInt(inst)] == .fused) return;
             const ty = data.ty_op.ty;
             if (ip.keyTag(ty) == .vector_type) return vector.gen(cg, inst, tag, data);
+            if (int128.lowers(cg, inst) != null) return int128.gen(cg, inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
             const d = cg.destReg(inst);
             try cg.load(d, data.ty_op.operand);
@@ -4669,6 +4685,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
             const ty = cg.typeOf(data.bin_op.lhs);
             if (cg.isFloat(ty)) return cg.genFloat(inst, tag, data);
+            if (int128.lowers(cg, inst) != null) return int128.gen(cg, inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
             try cg.genCond(inst);
         },
@@ -4802,6 +4819,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 return cg.setResult(inst, ty, d);
             };
             if (tag != .ptr_from_int and vector.lowers(cg, inst)) return vector.gen(cg, inst, tag, data);
+            if (tag != .ptr_from_int and int128.lowers(cg, inst) != null) return int128.gen(cg, inst, tag, data);
             if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(cg.typeOf(data.ty_op.operand))) and Type.isInt(ip, ty)) return cg.genWide(inst, tag, data);
             if (cg.passInRegs(ty) and cg.passInRegs(cg.typeOf(data.ty_op.operand))) {
                 const d = cg.destReg(inst);
@@ -4885,6 +4903,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .struct_field_val => {
             const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
             if (sf.operand.toIndex()) |op| if (cg.homes[@backingInt(op)] == .pair) return; // written by the operation
+            if (int128.lowers(cg, inst) != null) return int128.gen(cg, inst, tag, data);
             const ty = data.ty_pl.ty;
             const off = Type.fieldOffset(ip, cg.typeOf(sf.operand), sf.index);
             if (cg.passInRegs(ty)) return cg.loadResult(inst, ty, offsetMem(try cg.memOf(sf.operand), off));
