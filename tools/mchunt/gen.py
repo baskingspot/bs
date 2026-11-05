@@ -471,6 +471,99 @@ EXTRA_DECL = {
     ],
 }
 
+# By-value aggregates read through a pointer parameter that stays live
+# past an sret call (s_argbase). Name: (type, fold expression over `d`,
+# literal from x).
+AB_TYPES = {
+    "S16": ("struct { s: []const u64 }", "blk: { var h: u64 = 0; for (d.s) |e| h = (h ^ e) *% 0x100000001b3; break :blk h; }",
+            None),
+    "U16": ("struct { a: u64, b: u64 }", "d.a ^ (d.b *% 3)", ".{{ .a = {x}, .b = {x} >> 7 }}"),
+    "B7": ("[7]u8", "blk: { var h: u64 = 0; for (d) |e| h = (h << 3) ^ e; break :blk h; }", "@as([7]u8, @splat(@truncate({x})))"),
+    "B15": ("[15]u8", "blk: { var h: u64 = 0; for (d) |e| h = (h *% 5) ^ e; break :blk h; }", "@as([15]u8, @splat(@truncate({x})))"),
+    "B9": ("struct { a: [8]u8, b: u8 }", "(@as(u64, d.a[0]) << 8) ^ d.a[7] ^ (@as(u64, d.b) << 16)",
+           ".{{ .a = @splat(@truncate({x})), .b = @truncate({x} >> 8) }}"),
+    "B11": ("struct { a: [8]u8, b: [3]u8 }", "@as(u64, d.a[3]) ^ (@as(u64, d.b[0]) << 8) ^ (@as(u64, d.b[2]) << 24)",
+            ".{{ .a = @splat(@truncate({x})), .b = .{{ 1, @truncate({x} >> 3), 7 }} }}"),
+    "H11": ("struct { a: u16, b: u16, c: u16, d: u16, e: u16, f: u8 }",
+            "@as(u64, d.a) ^ (@as(u64, d.c) << 16) ^ (@as(u64, d.e) << 32) ^ (@as(u64, d.f) << 48) ^ d.b ^ d.d",
+            ".{{ .a = @truncate({x}), .b = 2, .c = @truncate({x} >> 16), .d = 4, .e = 5, .f = @truncate({x} >> 40) }}"),
+    "W13": ("struct { a: u32, b: u32, c: u32, d: u8 }", "@as(u64, d.a) ^ (@as(u64, d.b) << 20) ^ d.c ^ (@as(u64, d.d) << 40)",
+            ".{{ .a = @truncate({x}), .b = @truncate({x} >> 32), .c = 9, .d = @truncate({x} >> 5) }}"),
+}
+
+
+def _ab_decl():
+    out = ["const ABl = union(enum) { inside: [2]u64, outside };",
+           "const ABb = struct { a: u64, b: u64, c: u64 };",
+           "fn abSelect(m: u64, x: u64) bool { return m % 5 == x % 5; }",
+           "var gABf: *const fn (u64) bool = &abIs;",
+           "fn abIs(x: u64) bool { return x & 3 == 1; }"]
+    for nm, (ty, fold, _) in AB_TYPES.items():
+        out.append(f"const AB{nm}D = {ty};")
+        out.append(f"const AB{nm} = struct {{")
+        out.append(f"    data: AB{nm}D,")
+        out.append("    const Self = @This();")
+        out.append(f"    fn fold(d: AB{nm}D) u64 {{ return {fold}; }}")
+        # sret union result, self first (rsi), second (rdx) and third (rcx).
+        out.append("    noinline fn lookup(self: Self, x: u64) ABl {")
+        out.append("        const h = fold(self.data);")
+        out.append("        if (abSelect(h, x)) return .{ .inside = .{ h, x } };")
+        out.append("        return .outside;")
+        out.append("    }")
+        out.append("    noinline fn lookup2(x: u64, self: Self) ABl { return lookup(self, x); }")
+        out.append("    noinline fn big(self: Self, x: u64) ABb { const h = fold(self.data); return .{ .a = h, .b = x, .c = h ^ x }; }")
+        out.append("    inline fn twice(local: ?*const Self, x: u64) u64 {")
+        out.append("        var r: u64 = 0;")
+        out.append("        if (local) |cm| switch (cm.lookup(x)) {")
+        out.append("            .inside => |v| r +%= v[0] ^ v[1],")
+        out.append("            .outside => r +%= 1,")
+        out.append("        };")
+        out.append("        if (local) |cm| switch (lookup2(x +% 1, cm.*)) {")
+        out.append("            .inside => |v| r +%= v[0] *% 3 +% v[1],")
+        out.append("            .outside => r +%= 2,")
+        out.append("        };")
+        out.append("        if (local) |cm| r ^= cm.big(x).c;")
+        out.append("        return r +% @intFromBool(gABf(x));")
+        out.append("    }")
+        # The pointer in rdi, rsi and rdx; then, with the runner's own sret
+        # result taking rdi, in rsi, rdx and rcx.
+        out.append("    noinline fn runS(local: ?*const Self, x: u64) ?ABb { if (x == 0) return null; "
+                   "return .{ .a = twice(local, x), .b = twice(local, x +% 1), .c = 2 }; }")
+        out.append("    noinline fn runR(x: u64, local: ?*const Self, y: u64) ?ABb { if (x == 0) return null; "
+                   "return .{ .a = twice(local, x), .b = twice(local, y), .c = 1 }; }")
+        out.append("    noinline fn runQ(x: u64, y: u64, local: ?*const Self) ABb { "
+                   "return .{ .a = twice(local, x), .b = twice(local, y), .c = 3 }; }")
+        out.append("    noinline fn run0(local: ?*const Self, x: u64) u64 { return twice(local, x) +% twice(local, x +% 5); }")
+        out.append("    noinline fn run1(x: u64, local: ?*const Self) u64 { return twice(local, x) ^ twice(local, x *% 3); }")
+        out.append("    noinline fn run2(x: u64, y: u64, local: ?*const Self) u64 { return twice(local, x) -% twice(local, y); }")
+        out.append("};")
+    # C callconv callees taking a 16-byte int pair or {u64, u32}, returning >16 bytes.
+    out.append("const ABcp = extern struct { a: i64, b: i64 };")
+    out.append("const ABcw = extern struct { a: u64, b: u32 };")
+    out.append("const ABcr = extern struct { a: u64, b: u64, c: u64 };")
+    out.append("fn abCp(p: ABcp, x: u64) callconv(.c) ABcr { return .{ .a = @bitCast(p.a), .b = @bitCast(p.b), .c = x }; }")
+    out.append("fn abCw(x: u64, p: ABcw) callconv(.c) ABcr { return .{ .a = p.a, .b = p.b, .c = x ^ p.a }; }")
+    out.append("noinline fn abCrunR(x: u64, local: ?*const ABcp, w: ?*const ABcw) ?ABb {")
+    out.append("    if (x == 1) return null;")
+    out.append("    var r: u64 = 0;")
+    out.append("    if (local) |p| r +%= abCp(p.*, x).a;")
+    out.append("    if (w) |q| r ^= abCw(x, q.*).c;")
+    out.append("    if (local) |p| r +%= abCp(p.*, x +% 1).b;")
+    out.append("    return .{ .a = r, .b = if (w) |q| abCw(r, q.*).b else 0, .c = 4 };")
+    out.append("}")
+    out.append("noinline fn abCrun(x: u64, local: ?*const ABcp, w: ?*const ABcw) u64 {")
+    out.append("    var r: u64 = 0;")
+    out.append("    if (local) |p| r +%= abCp(p.*, x).a;")
+    out.append("    if (w) |q| r ^= abCw(x, q.*).c;")
+    out.append("    if (local) |p| r +%= abCp(p.*, x +% 1).b;")
+    out.append("    if (w) |q| r +%= abCw(r, q.*).b;")
+    out.append("    return r;")
+    out.append("}")
+    return out
+
+
+EXTRA_DECL["argbase"] = _ab_decl()
+
 SE_DECL = [
     "const SE = struct {",
     "    a: u64,",
@@ -1388,7 +1481,7 @@ class Gen:
             (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
             (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
-            (2, "swx"), (2, "scopenum"),
+            (2, "swx"), (2, "scopenum"), (2, "argbase"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -3014,6 +3107,57 @@ class Gen:
             self.sink(ctx, f"{sl}[{j}]" if not near else f"{sl}[{j} + 1]", U32)
             ctx["indent"] -= 1
             e("}")
+
+    def s_argbase(self, ctx):
+        """By-value aggregates of 7 to 16 bytes read through an optional
+        pointer parameter that stays live past sret calls taking them."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        self.extra.add("argbase")
+        e = lambda s_: self.emit(ctx, s_)
+        u64 = lambda: self.int_expr(ctx, U64, 1)
+        if self.chance(0.2):
+            p, w = self.fresh("ap"), self.fresh("aw")
+            e(f"const {p}: ABcp = .{{ .a = @bitCast({u64()}), .b = -3 }};")
+            e(f"const {w}: ABcw = .{{ .a = {u64()}, .b = 77 }};")
+            pa = "null" if self.chance(0.15) else f"&{p}"
+            if pa == "null":
+                e(f"_ = {p};")
+            if self.chance(0.5):
+                self.sink(ctx, f"abCrun({u64()}, {pa}, &{w})", U64)
+            else:
+                rr = self.fresh("abr")
+                e(f"const {rr} = abCrunR({u64()}, {pa}, &{w});")
+                self.sink(ctx, f"(if ({rr}) |q| q.a ^ q.b ^ q.c else 99)", U64)
+            return
+        nm = self.pick(list(AB_TYPES))
+        ty, _, mk = AB_TYPES[nm]
+        v = self.fresh("ab")
+        if mk is None:
+            sl = self.fresh("abs")
+            n = self.r.randint(0, 4)
+            e(f"const {sl} = [_]u64{{ {', '.join(u64() for _ in range(n))} }};")
+            e(f"const {v}: AB{nm} = .{{ .data = .{{ .s = &{sl} }} }};")
+        else:
+            x = self.fresh("abx")
+            e(f"const {x}: u64 = {u64()};")
+            e(f"const {v}: AB{nm} = .{{ .data = {mk.format(x=x)} }};")
+        ptr = "null" if self.chance(0.1) else f"&{v}"
+        if ptr == "null":
+            e(f"_ = {v};")
+        k = self.r.randrange(6)
+        if k < 3:
+            call = [f"AB{nm}.run0({ptr}, {u64()})", f"AB{nm}.run1({u64()}, {ptr})", f"AB{nm}.run2({u64()}, {u64()}, {ptr})"][k]
+            self.sink(ctx, call, U64)
+            return
+        rr = self.fresh("abr")
+        if k == 3:
+            e(f"const {rr} = AB{nm}.runS({ptr}, {u64()});")
+        elif k == 4:
+            e(f"const {rr} = AB{nm}.runR({u64()}, {ptr}, {u64()});")
+        else:
+            e(f"const {rr}: ?ABb = AB{nm}.runQ({u64()}, {u64()}, {ptr});")
+        self.sink(ctx, f"(if ({rr}) |q| q.a ^ (q.b *% 3) ^ q.c else 99)", U64)
 
     def s_scopenum(self, ctx):
         """The same checked expression (a + K, s.len - i, i * i) computed on
