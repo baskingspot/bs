@@ -2164,6 +2164,71 @@ class Gen:
         out.append("};")
         return out, "any"
 
+    def t_zeroed(self, name):
+        """Extern structs holding pointers, zeroed at comptime with
+        `std.mem.zeroes` or `@memset` of their bytes, alone or as entries of
+        a comptime-built table, read at run time: a zero pointer field cast
+        to an optional is null, and the other fields keep their values."""
+        sn = self.fresh("Z")
+        fields = [("name", "[*:0]const u8", '"add"'), ("n", self.ch(["u8", "u16", "u32", "u64"]), "3")]
+        extra = self.r.sample(
+            [
+                ("f", "*const anyopaque", f"@ptrCast(&{sn}_f)"),
+                ("o", "?*const u32", f"&{sn}_g"),
+                ("c", "[*c]const u8", '"c"'),
+                ("fp", "*const fn () callconv(.c) void", f"&{sn}_f"),
+                ("arr", "[3]u8", "@splat(0xff)"),
+                ("ip", "*const u32", f"&{sn}_g"),
+            ],
+            self.r.randint(1, 4),
+        )
+        fields += extra
+        self.r.shuffle(fields)
+        out = [f"fn {sn}_f() callconv(.c) void {{}}", f"const {sn}_g: u32 = 9;"]
+        out.append(f"const {sn} = extern struct {{ " + " ".join(f"{f}: {t}," for f, t, _ in fields) + " };")
+        n = self.r.randint(1, 4)
+        whole = self.p(0.2)
+        out.append(f"fn {sn}_table() [{n}]{sn} {{")
+        out.append(f"    var out: [{n}]{sn} = undefined;")
+        if whole:
+            out.append("    @memset(std.mem.asBytes(&out), 0);")
+        for i in range(n):
+            how = self.ch(["full", "zeroes", "memset", "zeroes_set"] + (["keep"] if whole else []))
+            if how == "full":
+                out.append(f"    out[{i}] = .{{ " + " ".join(f".{f} = {v}," for f, _, v in fields) + " };")
+            elif how == "zeroes":
+                out.append(f"    out[{i}] = std.mem.zeroes({sn});")
+            elif how == "memset":
+                out.append(f"    @memset(std.mem.asBytes(&out[{i}]), 0);")
+            elif how == "zeroes_set":
+                out.append(f"    out[{i}] = std.mem.zeroes({sn});")
+                out.append(f"    out[{i}].n = {i + 1};")
+        out.append("    return out;")
+        out.append("}")
+        runtime = self.p(0.6)
+        out.append(f"fn {name}() [{n}]u64 {{")
+        out.append(f"    {'var' if runtime else 'const'} t = comptime {sn}_table();")
+        if runtime:
+            out.append("    _ = &t;")
+        out.append(f"    var r: [{n}]u64 = undefined;")
+        out.append("    for (t, &r) |e, *x| {")
+        out.append("        var bits: u64 = e.n;")
+        for f, t, _ in fields:
+            if not t.startswith(("*", "[*", "?*")):
+                continue
+            if t.startswith("?"):
+                v = f"e.{f}"
+            else:
+                v = f"@as({'?[*]' + t[4:] if t.startswith('[*c]') else '?' + t}, @ptrCast(e.{f}))"
+            out.append(f"        bits = bits * 2 + @intFromBool({v} == null);")
+        if any(f == "arr" for f, _, _ in fields):
+            out.append("        bits = bits * 256 + e.arr[1];")
+        out.append("        x.* = bits;")
+        out.append("    }")
+        out.append("    return r;")
+        out.append("}")
+        return out, "call"
+
     def t_target(self, name):
         """Target-dependent layout and C types: sizes, alignments and
         offsets of extern and packed structs holding C integer types,
@@ -2260,6 +2325,7 @@ class Gen:
         (t_recursion, 2),
         (t_destructure, 3),
         (t_target, 3),
+        (t_zeroed, 2),
     )
 
     def test(self, i):

@@ -61,12 +61,15 @@ enums, unions and tuples rebuilt from `@typeInfo` (`t_reify`); tuples
 `readInt`/`writeInt` and hashes (`t_std2`); many-pointer arithmetic,
 `@memmove`/`@memset` and reinterpreting bytes through pointers
 (`t_ptr_arith`); `inline else` over unions, enums, error sets and ranges
-(`t_inline_switch`); recursive functions and types (`t_recursion`); and
-destructuring of comptime-built tuples (`t_destructure`); and
+(`t_inline_switch`); recursive functions and types (`t_recursion`);
+destructuring of comptime-built tuples (`t_destructure`);
 target-dependent layouts and C types: extern and packed structs of C
-integer types, `c_longdouble`, `u128` and vectors (`t_target`). A test is a
-constant printed by `main`, or, for code that must run at run time
-(`t_destructure`'s runtime half), a function `main` calls.
+integer types, `c_longdouble`, `u128` and vectors (`t_target`); and
+extern structs holding pointers, zeroed with `std.mem.zeroes` or
+`@memset` in comptime-built tables, their pointers cast to optionals at
+run time (`t_zeroed`). A test is a constant printed by `main`, or, for
+code that must run at run time (`t_destructure`'s runtime half,
+`t_zeroed`), a function `main` calls.
 
 Programs are meant to be well defined, but a test may hit a comptime
 error upstream reports (an overflow, the branch quota): each test has a
