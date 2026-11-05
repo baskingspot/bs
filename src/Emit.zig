@@ -2222,11 +2222,20 @@ fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {
         else => |e| return e,
     };
     refs.sort();
+    const key: SymbolKey = .fromName(try emit.unitName(.{ .nav_val = nav_index }));
+    const alignment: std.mem.Alignment = .fromByteUnits(if (nav.alignment != 0) nav.alignment else Type.abiAlignment(ip, ty));
+    // A thread-local that is undefined or all zeros is zero-filled in
+    // .tbss (__thread_bss), as LLVM places it, rather than bytes in every
+    // file and every thread's copy of the template: std's 256 KiB signal
+    // stack is one.
+    if (nav.is_threadlocal and refs.relocs.items.len == 0 and
+        (ip.keyTag(nav.val) == .undef or std.mem.allEqual(u8, bytes, 0)))
+        return emit.addAtom(.{ .key = key, .name = name_later, .section = .tbss, .alignment = alignment, .zero_fill = bytes.len });
     try emit.addAtom(.{
-        .key = .fromName(try emit.unitName(.{ .nav_val = nav_index })),
+        .key = key,
         .name = name_later,
         .section = if (nav.is_threadlocal) .tdata else if (nav.is_const) .rodata else .data,
-        .alignment = .fromByteUnits(if (nav.alignment != 0) nav.alignment else Type.abiAlignment(ip, ty)),
+        .alignment = alignment,
         .bytes = bytes,
         .targets = try arena.dupe(SymbolKey, refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, refs.relocs.items),

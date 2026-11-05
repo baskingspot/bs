@@ -44,8 +44,9 @@
 //! a PT_TLS program header (filesz the .tdata bytes, memsz through the end
 //! of .tbss, align the larger alignment), which is what the static TLS
 //! setup (std.os.linux.tls.initStatic) copies each thread's block from.
-//! .tbss takes room in the image, zeros in the file, so that no other
-//! section's addresses overlap the TLS segment's. Executables use only the
+//! .tbss takes no room in the image or the file: the sections after it
+//! overlap its addresses, as with lld, which only offsets in the TLS
+//! segment use. Executables use only the
 //! local-exec model (`x86_64_tpoff32`); TLS symbols' values are offsets in the TLS
 //! segment, as ld writes them for executables. A position-independent
 //! image (an object's) also takes local-dynamic relocations
@@ -995,7 +996,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const tdata_end = tls_start + sizes[tdata];
     starts[tbss] = aligns[tbss].forward(tdata_end);
     const tls_end = starts[tbss] + sizes[tbss];
-    starts[data_rel_ro] = aligns[data_rel_ro].forward(tls_end);
+    // .tbss takes no room in the image: what follows overlaps it, as with
+    // lld, since each thread's block copies only .tdata (PT_TLS filesz).
+    starts[data_rel_ro] = aligns[data_rel_ro].forward(tdata_end);
     // The init and fini arrays are read-only once loaded, like .data.rel.ro.
     starts[preinit] = aligns[preinit].forward(starts[data_rel_ro] + sizes[data_rel_ro]);
     starts[init] = aligns[init].forward(starts[preinit] + sizes[preinit]);
@@ -1190,7 +1193,6 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     try l.fill(pcs_end, eh_off - pcs_end);
     try l.fill(r_end, starts[text] - r_end);
     try l.fill(text_end, tls_start - text_end);
-    // .tbss's room in the file is zeros.
     try l.fill(tdata_end, starts[data_rel_ro] - tdata_end);
     for ([_]usize{ data_rel_ro, preinit, init }, [_]usize{ preinit, init, fini }) |a, b| try l.fill(starts[a] + sizes[a], starts[b] - (starts[a] + sizes[a]));
     try l.fill(relro_end, starts[data] - relro_end);
@@ -3275,6 +3277,10 @@ test "thread-locals in .tdata and .tbss read back after static TLS setup" {
     for ([_][]const u8{ "a", "c", "b", "d" }, [_]u64{ 0, 16, 32, 64 }) |name, offset| {
         try std.testing.expectEqual(offset, testSymbolAddr(bytes, name).?);
     }
+    // .tbss takes no room: .data starts after .tdata, at 24, within
+    // .tbss's addresses, and the RW segment holds no zeros for it.
+    try std.testing.expectEqual(rw.?.vaddr + 24, testSymbolAddr(bytes, "counter").?);
+    try std.testing.expectEqual(rw.?.filesz, 24 + 8);
     // The first lea's displacement: a's offset minus 96.
     const lea_a = std.mem.indexOf(u8, e.code.items, &.{ 0x48, 0x8d, 0x80 }).? + 3;
     const text_off = ehdr.entry - @as(u64, @intCast(base));
@@ -3290,15 +3296,16 @@ test "thread-locals in .tdata and .tbss read back after static TLS setup" {
     defer gpa.free(result.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, result.term);
 
-    // A TLS relocation to a symbol that is not thread-local.
+    // A TLS relocation to a symbol that is not thread-local. (One whose
+    // address lies among .tbss's, which later sections overlap, passes.)
     var diag: Diagnostic = .{};
     var bad = atoms;
     var be: Encoder = .init(arena);
-    try be.leaThreadLocal(.rax, area);
+    try be.leaThreadLocal(.rax, start);
     be.finish();
     bad[0] = .{ .key = start, .name = "_start", .section = .text, .bytes = be.code.items, .targets = be.refs.targets.keys(), .relocs = be.refs.relocs.items };
     try std.testing.expectError(error.InvalidRelocation, emit(gpa, io, &bad, .{ .entry = start, .diag = &diag }));
-    try std.testing.expectEqual(area, diag.target.?);
+    try std.testing.expectEqual(start, diag.target.?);
 }
 
 test "links many chunks of atoms the same way on any number of threads" {

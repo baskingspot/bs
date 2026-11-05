@@ -2403,8 +2403,13 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
   RW (.tdata, .tbss, .data, .bss). Thread-locals start RW, covered by
   PT_TLS (filesz the .tdata bytes, memsz through .tbss, align the larger
   section alignment), which std.os.linux.tls.initStatic copies each
-  thread's block from; .tbss takes room in the image (zeros in the file)
-  so no other section overlaps the TLS segment's addresses. TPOFF32
+  thread's block from. .tbss takes no room in the image or the file:
+  the sections after it overlap its addresses, as with lld (2026-11-05;
+  until then it took room, zeros in the file, which cost every program
+  std's 256 KiB signal stack). Only TLS offsets use those addresses, so
+  the TLS relocations' check that their target lies in the TLS segment
+  no longer catches a non-thread-local target that lands among .tbss's
+  addresses. TPOFF32
   resolves to S + A - (TLS start + memsz rounded up to the alignment),
   x86_64 variant 2, and TLS symbols' values are segment offsets. A
   hand-built program with .tdata and .tbss variables of mixed alignments,
@@ -3030,7 +3035,7 @@ ET_DYN at base 0, written once like the executable;
 names, before layout, and Elf fills in the exports' values after it.
 - Layout. R: ELF header, program headers, .dynsym, .dynstr, .hash,
   .gnu.hash, .rela.dyn, .rodata, .eh_frame, .eh_frame_hdr. RX: .plt,
-  .text. RW: .tdata, .tbss (room only, as now), .data.rel.ro, .dynamic,
+  .text. RW: .tdata, .tbss (no room), .data.rel.ro, .dynamic,
   .got, the end of PT_GNU_RELRO (page-aligned, so the loader protects all
   of it), .data, .bss. Program headers: PT_PHDR, three PT_LOADs,
   PT_DYNAMIC, PT_TLS, PT_GNU_RELRO, PT_GNU_EH_FRAME, PT_GNU_STACK. The
@@ -3720,6 +3725,11 @@ value model:
   data naming an extern symbol builds again eagerly
   (`Emit.inputs_deferred`). An undefined symbol in data is a compile
   error (`lowerNav` records it as `Emit.failed`).
+- A thread-local whose value is wholly undefined, or lowers to zeros
+  with no relocations, is a zero-filled `.tbss` atom (`__thread_bss` on
+  Mach-O), as LLVM places it, instead of `.tdata` bytes: std's 256 KiB
+  `Thread.maybeAttachSignalStack` stack left every executable's file
+  (2026-11-05). Other data keeps its bytes, undefined as 0xaa.
 - A constant that a function reads is a content atom CodeGen writes
   while analysis runs, before the exports and inputs are complete. Its
   address of extern symbol `name` relocates to `Emit.externAddrKey`
