@@ -821,8 +821,13 @@ const Walker = struct {
         const ir = w.ir;
         const data = ir.instructions.items(.data)[t.a];
         switch (ir.instructions.items(.tag)[t.a]) {
-            .add_wrap, .sub_wrap => |wt| {
-                if (!w.s.exact.isSet(t.a) or (wt == .add_wrap) != (tag == .add_with_overflow)) return null;
+            .add_wrap, .sub_wrap, .mul_wrap => |wt| {
+                const want: Inst.Tag = switch (tag) {
+                    .add_with_overflow => .add_wrap,
+                    .sub_with_overflow => .sub_wrap,
+                    else => .mul_wrap,
+                };
+                if (!w.s.exact.isSet(t.a) or wt != want) return null;
                 return .{ w.term(data.bin_op.lhs), w.term(data.bin_op.rhs) };
             },
             .struct_field_val => {
@@ -1438,7 +1443,7 @@ const Walker = struct {
         if (sf.index != 1) return;
         const op = sf.operand.toIndex() orelse return;
         switch (ir.instructions.items(.tag)[@backingInt(op)]) {
-            .add_with_overflow, .sub_with_overflow => {},
+            .add_with_overflow, .sub_with_overflow, .mul_with_overflow => {},
             else => return,
         }
         const true_if_ovf = Ssa.ovfBitCmp(ir, w.ip, i, @backingInt(bit)) orelse return;
@@ -1558,6 +1563,7 @@ const Walker = struct {
             else => return false,
         }
         const bin = ir.extraData(Ir.Bin, ir.instructions.items(.data)[@backingInt(op)].ty_pl.payload).data;
+        if (tag == .mul_with_overflow) if (w.wideProduct(bin.lhs, bin.rhs)) |fits| return fits;
         const info = w.intInfo(bin.lhs) orelse return false;
         const signed = info.signedness == .signed;
         const a = w.term(bin.lhs);
@@ -1600,6 +1606,34 @@ const Walker = struct {
         }
     }
 
+    /// For a product of unsigned integers wider than 64 bits (at most
+    /// 128), whether it fits its type, when both operands are values of
+    /// at most 64 bits widened (`intcast`, or constants): from their
+    /// bounds, whose product fits a `u128`. Null for other products.
+    fn wideProduct(w: *const Walker, lhs: Inst.Ref, rhs: Inst.Ref) ?bool {
+        const ty = w.ir.typeOf(lhs, w.ip);
+        if (Type.class(w.ip, ty) != .int) return null;
+        const info = Type.intInfo(w.ip, ty);
+        if (info.signedness != .unsigned or info.bits <= 64 or info.bits > 128) return null;
+        const a = w.narrowMax(lhs) orelse return null;
+        const b = w.narrowMax(rhs) orelse return null;
+        const max = @as(u128, std.math.maxInt(u128)) >> @intCast(128 - info.bits);
+        return @as(u128, a) * b <= max;
+    }
+
+    /// The largest value of `r`, an unsigned integer wider than 64 bits,
+    /// when it is a constant or a widened value of at most 64 bits.
+    fn narrowMax(w: *const Walker, r: Inst.Ref) ?u64 {
+        const t = w.term(r);
+        if (t.isConst()) return if (t.value() >= 0) @intCast(t.value()) else null;
+        // The value's term (a variable's stored value) is the `intcast`.
+        if (t.tag != .inst or w.ir.instructions.items(.tag)[t.a] != .intcast) return null;
+        const operand = w.ir.instructions.items(.data)[t.a].ty_op.operand;
+        const from = w.intInfo(operand) orelse return null;
+        if (from.signedness != .unsigned) return null;
+        return @intCast(w.range(w.term(operand), from).hi);
+    }
+
     const Range = struct { lo: i128, hi: i128 };
 
     fn limits(info: Type.IntInfo) Range {
@@ -1634,17 +1668,29 @@ const Walker = struct {
         if (t.tag == .inst) {
             const ir = w.ir;
             const data = ir.instructions.items(.data)[t.a];
+            // A value is within its own type's bounds (a widening cast's
+            // term is its narrower operand).
+            if (w.intInfo(@as(Inst.Index, @fromBackingInt(@intCast(t.a))).toRef())) |own| {
+                const lim = limits(own);
+                r = .{ .lo = @max(r.lo, lim.lo), .hi = @min(r.hi, lim.hi) };
+            }
             blk_none: switch (ir.instructions.items(.tag)[t.a]) {
                 .block => if (w.s.results.get(t.a)) |b| if (b.lo <= b.hi) {
                     r = .{ .lo = @max(r.lo, b.lo), .hi = @min(r.hi, b.hi) };
                 },
-                .add_wrap, .sub_wrap => |tag| if (depth > 0) if (w.intInfo(@as(Inst.Index, @fromBackingInt(@intCast(t.a))).toRef())) |own| {
+                .add_wrap, .sub_wrap, .mul_wrap => |tag| if (depth > 0) if (w.intInfo(@as(Inst.Index, @fromBackingInt(@intCast(t.a))).toRef())) |own| {
                     const a = w.rangeIn(w.term(data.bin_op.lhs), own, depth - 1);
                     const b = w.rangeIn(w.term(data.bin_op.rhs), own, depth - 1);
-                    const exact: Range = if (tag == .add_wrap)
-                        .{ .lo = a.lo + b.lo, .hi = a.hi + b.hi }
-                    else
-                        .{ .lo = a.lo - b.hi, .hi = a.hi - b.lo };
+                    const exact: Range = switch (tag) {
+                        .add_wrap => .{ .lo = a.lo + b.lo, .hi = a.hi + b.hi },
+                        .sub_wrap => .{ .lo = a.lo - b.hi, .hi = a.hi - b.lo },
+                        // Unsigned operands only (a product's bounds are
+                        // its operands' then).
+                        else => if (a.lo >= 0 and b.lo >= 0) .{
+                            .lo = a.lo * b.lo,
+                            .hi = std.math.mul(i128, a.hi, b.hi) catch break :blk_none,
+                        } else break :blk_none,
+                    };
                     const lim = limits(own);
                     if (exact.lo >= lim.lo and exact.hi <= lim.hi) r = .{ .lo = @max(r.lo, exact.lo), .hi = @min(r.hi, exact.hi) };
                 },
@@ -1652,11 +1698,19 @@ const Walker = struct {
                 // the exact result.
                 .struct_field_val => if (depth > 0) {
                     const add = w.exactOperands(t, .add_with_overflow);
-                    const p = add orelse w.exactOperands(t, .sub_with_overflow) orelse break :blk_none;
+                    const sub = if (add == null) w.exactOperands(t, .sub_with_overflow) else null;
+                    const p = add orelse sub orelse w.exactOperands(t, .mul_with_overflow) orelse break :blk_none;
                     const own = w.intInfo(@as(Inst.Index, @fromBackingInt(@intCast(t.a))).toRef()) orelse break :blk_none;
                     const a = w.rangeIn(p[0], own, depth - 1);
                     const b = w.rangeIn(p[1], own, depth - 1);
-                    const exact: Range = if (add != null) .{ .lo = a.lo + b.lo, .hi = a.hi + b.hi } else .{ .lo = a.lo - b.hi, .hi = a.hi - b.lo };
+                    const exact: Range = if (add != null)
+                        .{ .lo = a.lo + b.lo, .hi = a.hi + b.hi }
+                    else if (sub != null)
+                        .{ .lo = a.lo - b.hi, .hi = a.hi - b.lo }
+                    else if (a.lo >= 0 and b.lo >= 0)
+                        .{ .lo = a.lo * b.lo, .hi = std.math.mul(i128, a.hi, b.hi) catch break :blk_none }
+                    else
+                        break :blk_none;
                     r = .{ .lo = @max(r.lo, exact.lo), .hi = @min(r.hi, exact.hi) };
                 },
                 // A value-preserving `intcast` keeps its operand's bounds,
