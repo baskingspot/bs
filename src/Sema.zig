@@ -9398,7 +9398,10 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 const d = Type.ptrInfo(ip, dest_ty);
                 const v = val orelse return null;
                 // An extern function's address is known at link time.
-                if (d.flags.size == .one and d.child == src_ty and ip.keyTag(v) == .extern_func and !block.is_comptime) {
+                // At comptime (a global's initializer), the pointer the link
+                // binds, as `&f` gives it.
+                if (d.flags.size == .one and d.child == src_ty and ip.keyTag(v) == .extern_func) {
+                    if (block.is_comptime) return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .{ .uav = .{ .val = v, .orig_ty = dest_ty } } } }));
                     return try sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = dest_ty, .payload = @backingInt(ip.keyPayload(.extern_func, v).name) } } });
                 }
                 if (d.flags.size != .one or ip.keyTag(v) != .func) return null;
