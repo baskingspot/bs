@@ -35,6 +35,7 @@ fn field() anyerror!u32 {
     return P.make().n;
 }
 pub fn main() !void {
+    _ = held();
     try errorUnion();
     _ = optional();
     receiver();
@@ -64,6 +65,12 @@ fn best(xs: []const f64) f64 {
     for (xs) |x| b = if (b == null) x else b + x;
     return b orelse 0;
 }
+fn held() u32 {
+    var v = opt(true);
+    const a = v + 1;
+    v = opt(false);
+    return a + (v orelse 0);
+}
 
 // error
 // origin.zig:19:20: error[type-mismatch]: expected type 'u32', found '@typeInfo(@typeInfo(@TypeOf(origin.get)).@"fn".return_type.?).error_union.error_set!u32'
@@ -72,44 +79,49 @@ fn best(xs: []const f64) f64 {
 //   note origin.zig:19:20: consider using 'try', 'catch', or 'if'
 //   note origin.zig:18:18: 'v' holds the error union returned by 'get'; consider using 'try' or 'catch' here
 //   fix? origin.zig:18:15-18:15: "try "
-//   ref: main origin.zig:38:19 (+3 std frames)
+//   ref: main origin.zig:39:19 (+3 std frames)
 // origin.zig:24:14: error[bad-operands]: invalid operands to binary expression: '?u32' and 'comptime_int'
 //   | return v + 1;
 //   note origin.zig:24:12: consider using '.?', 'orelse', or 'if'
 //   note origin.zig:23:18: 'v' holds the optional returned by 'opt'; consider using '.?' or 'orelse' here
 //   fix? origin.zig:23:24-23:24: ".?"
-//   ref: main origin.zig:39:17 (+3 std frames)
+//   ref: main origin.zig:40:17 (+3 std frames)
 // origin.zig:28:6: error[type-mismatch]: expected type '*origin.P', found '*const origin.P'
 //   | p.bump();
 //   note origin.zig:28:6: cast discards const qualifier
 //   note origin.zig:10:16: parameter type declared here: fn bump(p: *P) void {
 //   note origin.zig:27:11: 'p' is declared 'const'; declare it with 'var' to modify it: const p: P = .{ .n = 0 };
 //   fix? origin.zig:27:5-27:10: "var"
-//   ref: main origin.zig:40:13 (+3 std frames)
+//   ref: main origin.zig:41:13 (+3 std frames)
 // origin.zig:32:5: error[assign-to-const]: cannot assign to constant
 //   | n += 1;
 //   note origin.zig:31:11: 'n' is declared 'const'; declare it with 'var' to modify it: const n: u32 = 0;
 //   fix? origin.zig:31:5-31:10: "var"
-//   ref: main origin.zig:41:11 (+3 std frames)
+//   ref: main origin.zig:42:11 (+3 std frames)
 // origin.zig:35:20: error[bad-access]: error union type '@typeInfo(@typeInfo(@TypeOf(origin.P.make)).@"fn".return_type.?).error_union.error_set!origin.P' does not support field access
 //   | return P.make().n;
 //   note origin.zig:35:20: consider using 'try', 'catch', or 'if'
 //   fix? origin.zig:35:12-35:12: "(try "
 //   fix? origin.zig:35:20-35:20: ")"
-//   ref: main origin.zig:42:18 (+3 std frames)
-// origin.zig:52:6: error[assign-to-const]: cannot assign to constant
+//   ref: main origin.zig:43:18 (+3 std frames)
+// origin.zig:53:6: error[assign-to-const]: cannot assign to constant
 //   | t[1] = 2;
-//   note origin.zig:51:11: 't' is declared 'const'; declare it with 'var' to modify it: const t: [4]u8 = @splat(0);
-//   fix? origin.zig:51:5-51:10: "var"
-//   ref: useTable origin.zig:48:12 <- main origin.zig:43:17 (+3 std frames)
-// origin.zig:60:13: error[bad-access]: slice of non-array type '@typeInfo(@typeInfo(@TypeOf(origin.bytes)).@"fn".return_type.?).error_union.error_set![]const u8'
+//   note origin.zig:52:11: 't' is declared 'const'; declare it with 'var' to modify it: const t: [4]u8 = @splat(0);
+//   fix? origin.zig:52:5-52:10: "var"
+//   ref: useTable origin.zig:49:12 <- main origin.zig:44:17 (+3 std frames)
+// origin.zig:61:13: error[bad-access]: slice of non-array type '@typeInfo(@typeInfo(@TypeOf(origin.bytes)).@"fn".return_type.?).error_union.error_set![]const u8'
 //   | return b[0..1][0];
-//   note origin.zig:59:20: 'b' holds the error union returned by 'bytes'; consider using 'try' or 'catch' here
-//   fix? origin.zig:59:15-59:15: "try "
-//   ref: main origin.zig:45:19 (+3 std frames)
-// origin.zig:64:46: error[bad-operands]: invalid operands to binary expression: '?f64' and 'f64'
+//   note origin.zig:60:20: 'b' holds the error union returned by 'bytes'; consider using 'try' or 'catch' here
+//   fix? origin.zig:60:15-60:15: "try "
+//   ref: main origin.zig:46:19 (+3 std frames)
+// origin.zig:65:46: error[bad-operands]: invalid operands to binary expression: '?f64' and 'f64'
 //   | for (xs) |x| b = if (b == null) x else b + x;
-//   note origin.zig:64:44: consider using '.?', 'orelse', or 'if'
-//   fix? origin.zig:64:45-64:45: ".?"
-//   ref: main origin.zig:44:13 (+3 std frames)
-// 8 errors
+//   note origin.zig:65:44: consider using '.?', 'orelse', or 'if'
+//   fix? origin.zig:65:45-65:45: ".?"
+//   ref: main origin.zig:45:13 (+3 std frames)
+// origin.zig:70:17: error[bad-operands]: invalid operands to binary expression: '?u32' and 'comptime_int'
+//   | const a = v + 1;
+//   note origin.zig:70:15: consider using '.?', 'orelse', or 'if'
+//   fix? origin.zig:70:16-70:16: ".?"
+//   ref: main origin.zig:38:13 (+3 std frames)
+// 9 errors

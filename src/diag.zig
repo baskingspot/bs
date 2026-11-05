@@ -1379,8 +1379,9 @@ pub fn originNote(arena: std.mem.Allocator, tree: *const Ast, origin: Origin, ki
             var node = origin.node;
             var msg: ?[]const u8 = null;
             // A typed `var` (`var best: ?f64 = null;`) is meant to hold an
-            // optional or error union, which is unwrapped where it is used.
-            if (origin.local != null and !origin.local.?.typed_var) {
+            // optional or error union, which is unwrapped where it is used;
+            // so is a local unwrapped or assigned to elsewhere.
+            if (origin.local != null and !origin.local.?.typed_var and !holdsWrapped(tree, origin.local.?, origin.node)) {
                 const local = origin.local.?;
                 node = local.init.unwrap() orelse return null;
                 var buf: [1]Ast.Node.Index = undefined;
@@ -1402,6 +1403,31 @@ pub fn originNote(arena: std.mem.Allocator, tree: *const Ast, origin: Origin, ki
             return .{ .span = tree.nodeToSpan(node), .msg = msg, .decl = at_use, .fix = fix };
         },
     }
+}
+
+/// Whether `local` is meant to hold its optional or error union: another
+/// use than `use` unwraps it (`x.?`, `x orelse`, `x catch`, `try x`,
+/// `if (x)`, `while (x)`) or assigns to it, which unwrapping its
+/// initializer would break.
+fn holdsWrapped(tree: *const Ast, local: Local, use: Ast.Node.Index) bool {
+    const body = enclosingFnBody(tree, local.mut_tok) orelse outermostBlock(tree, local.mut_tok) orelse return false;
+    const use_tok = tree.nodeMainToken(use);
+    var tok = local.mut_tok + 2;
+    while (tok <= tree.lastToken(body)) : (tok += 1) {
+        if (tok == use_tok or tree.tokenTag(tok) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tok), local.name)) continue;
+        if (tree.tokenTag(tok - 1) == .period) continue;
+        switch (tree.tokenTag(tok + 1)) {
+            .keyword_orelse, .keyword_catch, .equal => return true,
+            .period => if (tree.tokenTag(tok + 2) == .question_mark) return true,
+            .r_paren => if (tree.tokenTag(tok - 1) == .l_paren and switch (tree.tokenTag(tok - 2)) {
+                .keyword_if, .keyword_while => true,
+                else => false,
+            }) return true,
+            else => {},
+        }
+        if (tree.tokenTag(tok - 1) == .keyword_try) return true;
+    }
+    return false;
 }
 
 /// Argument `param` of the call at `start..end` of a function with
