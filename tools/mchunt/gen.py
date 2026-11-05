@@ -564,6 +564,42 @@ def _ab_decl():
 
 EXTRA_DECL["argbase"] = _ab_decl()
 
+# Slices returned by noinline callees whose length is (or nearly is) one
+# argument (s_retlen).
+EXTRA_DECL["retlen"] = [
+    "var gRlBuf: [64]u32 = blk: { var a: [64]u32 = undefined; for (&a, 0..) |*p, i| p.* = @intCast(i * 7 + 1); break :blk a; };",
+    "var gRlN: usize = 5;",
+    "noinline fn rlAll(c: u8, n: usize) []u32 {",
+    "    const s: []u32 = gRlBuf[0..];",
+    "    if (c & 1 == 0) return s[0..n];",
+    "    if (c & 2 == 0) return gRlBuf[0..n];",
+    "    return s[0..n];",
+    "}",
+    "noinline fn rlM(c: u8, n: usize, m: usize) []u32 { if (c & 1 == 0) return gRlBuf[0..n]; return gRlBuf[0..m]; }",
+    "noinline fn rlOff(c: u8, n: usize) []u32 { if (c & 1 == 0) return gRlBuf[0..n]; return gRlBuf[1..n]; }",
+    "noinline fn rlDec(c: u8, n: usize) []u32 { if (c & 1 == 0) return gRlBuf[0..n]; return gRlBuf[0 .. n - 1]; }",
+    "noinline fn rlMin(c: u8, n: usize) []u32 { if (c & 1 == 0) return gRlBuf[0..n]; return gRlBuf[0..@min(n, 3)]; }",
+    "noinline fn rlOpt(c: u8, n: usize) ?[]u32 { if (c & 3 == 0) return null; return gRlBuf[0..n]; }",
+    "noinline fn rlBlk(c: u8, n: usize) []u32 {",
+    "    const r = blk: {",
+    "        if (c & 1 == 0) break :blk gRlBuf[0..n];",
+    "        break :blk gRlBuf[2..][0..n];",
+    "    };",
+    "    return r;",
+    "}",
+    "noinline fn rlIf(c: u8, n: usize) []u32 { return if (c & 1 == 0) gRlBuf[0..n] else gRlBuf[3..][0..n]; }",
+    "noinline fn rlErr(c: u8, n: usize) E![]u32 { if (c & 3 == 1) return error.Beta; return gRlBuf[0..n]; }",
+    "noinline fn rlErrM(c: u8, n: usize) E![]u32 { if (c & 3 == 1) return error.Beta; if (c & 4 == 0) return gRlBuf[0..n]; return gRlBuf[0 .. n / 2]; }",
+    "noinline fn rlCt(comptime k: u8, x: u64, n: usize) []u32 { if (x == 7) return gRlBuf[0..n]; return gRlBuf[k..][0..n]; }",
+    "noinline fn rlLater(a: usize, b: usize, n: usize) []u32 { if (a == b) return gRlBuf[1..][0..n]; return gRlBuf[0..n]; }",
+    "noinline fn rlGlob(c: u8) []u32 { gRlN = (gRlN +% (c & 1)) % 60; return gRlBuf[0..gRlN]; }",
+    "noinline fn rlRec(n: usize, d: u8) []u32 { if (d == 0) return gRlBuf[0..n]; return rlRec(n, d - 1); }",
+    "noinline fn rlMa(n: usize, d: u8) []u32 { if (d == 0) return gRlBuf[0..n]; return rlMb(n, d - 1); }",
+    "noinline fn rlMb(n: usize, d: u8) []u32 { if (d == 0) return gRlBuf[1..][0..n]; return rlMa(n, d - 1); }",
+    "noinline fn rlRecM(n: usize, d: u8) []u32 { if (d == 0) return gRlBuf[0..n]; const r = rlRecM(n, d - 1); return r[0 .. r.len - @intFromBool(d == 3)]; }",
+    "noinline fn rlPtr(c: u8, np: *const usize) []u32 { if (c == 9) return gRlBuf[1..np.*]; return gRlBuf[0..np.*]; }",
+]
+
 SE_DECL = [
     "const SE = struct {",
     "    a: u64,",
@@ -1481,7 +1517,7 @@ class Gen:
             (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
             (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
-            (2, "swx"), (2, "scopenum"), (2, "argbase"), (2, "mulbound"),
+            (2, "swx"), (2, "scopenum"), (2, "argbase"), (2, "mulbound"), (2, "retlen"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -3105,6 +3141,104 @@ class Gen:
             ctx["indent"] += 1
             e(f"if ({sl}[{j}] & 1 == 0 and {sl}.len > 1) {sl} = {sl}[0 .. {sl}.len - 1];")
             self.sink(ctx, f"{sl}[{j}]" if not near else f"{sl}[{j} + 1]", U32)
+            ctx["indent"] -= 1
+            e("}")
+
+    def s_retlen(self, ctx):
+        """Slices from noinline callees whose returned length is one argument
+        (or nearly: another argument, an offset, n - 1, @min), through ?, E!,
+        labeled blocks and if expressions, recursion, a global or pointer
+        length, and allocators; then indexing at n - 1, n and n + 1, loops
+        bounded by n or by another value, and n changed after the call."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        ctx["fn"].risky = True
+        self.extra.add("retlen")
+        e = lambda s_: self.emit(ctx, s_)
+        sel, n, c = self.fresh("rs"), self.fresh("rn"), self.fresh("rc")
+        vals = [0, 1, 3, 5, 17, 40, 59]
+        e(f"var {sel} = [_]usize{{ {', '.join(map(str, vals))} }};")
+        e(f"_ = &{sel};")
+        e(f"var {n}: usize = {sel}[@as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % {len(vals)}];")
+        e(f"const {c}: u8 = @truncate({self.int_expr(ctx, U64, 1)});")
+        e(f"_ = &{c};")
+        s = self.fresh("rl")
+        k = self.r.randrange(16)
+        if k <= 1:
+            e(f"const {s} = rlAll({c}, {n});")
+        elif k == 2:
+            e(f"const {s} = rlM({c}, {n}, {sel}[@as(usize, {c}) % {len(vals)}]);")
+        elif k == 3:
+            e(f"const {s} = rlOff({c}, {n} +| 1);")
+        elif k == 4:
+            e(f"const {s} = rlDec({c}, {n});")
+        elif k == 5:
+            e(f"const {s} = rlMin({c}, {n});")
+        elif k == 6:
+            e(f"const {s} = rlOpt({c}, {n}) orelse gRlBuf[0..{n}];")
+        elif k == 7:
+            e(f"const {s} = {self.pick(['rlBlk', 'rlIf'])}({c}, {n});")
+        elif k == 8:
+            if ctx["fn"].err and self.chance(0.5):
+                e(f"const {s} = try {self.pick(['rlErr', 'rlErrM'])}({c}, {n});")
+            else:
+                e(f"const {s} = {self.pick(['rlErr', 'rlErrM'])}({c}, {n}) catch gRlBuf[0..{n}];")
+        elif k == 9:
+            e(f"const {s} = rlCt({self.r.randint(0, 4)}, {self.int_expr(ctx, U64, 1)}, {n});")
+        elif k == 10:
+            e(f"const {s} = rlLater({self.int_expr(ctx, USIZE, 1)}, {n}, {n});")
+        elif k == 11:
+            e(f"const {s} = rlGlob({c});")
+            e(f"{n} = gRlN{' + 1' if self.chance(0.3) else ''};")
+        elif k == 12:
+            e(f"const {s} = {self.pick(['rlRec', 'rlMa', 'rlMb', 'rlRecM'])}({n}, {self.r.randint(0, 4)});")
+        elif k == 13:
+            e(f"const {s} = rlPtr({c}, &{n});")
+        elif k == 14:
+            al = self.pick(["std.heap.page_allocator", "arena"])
+            if al == "arena":
+                ar = self.fresh("ra")
+                e(f"var {ar} = std.heap.ArenaAllocator.init(std.heap.page_allocator);")
+                e(f"defer {ar}.deinit();")
+                al = f"{ar}.allocator()"
+            e(f"const {s} = {al}.alloc(u32, {n}) catch unreachable;")
+            if al == "std.heap.page_allocator":
+                e(f"defer std.heap.page_allocator.free({s});")
+            e(f"@memset({s}, {self.r.randint(0, 99)});")
+        else:
+            e(f"const {s} = rlAll({c}, {n});")
+            e(f"{n} {self.pick(['+= 1', '-|= 1', '= ' + n + ' *| 2'])};")
+        e(f"_ = &{n};")
+        self.sink(ctx, f"{s}.len", USIZE)
+        j = self.r.randrange(4)
+        if j == 0:
+            i = self.fresh("ri")
+            e(f"for (0..{n}) |{i}| {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"{s}[{i}]", U32)
+            ctx["indent"] -= 1
+            e("}")
+        elif j == 1:
+            off = self.pick(["-| 1", "", "+ 1"])
+            e(f"if ({n} > 0) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"{s}[{n} {off}]" if off else f"{s}[{n}]", U32)
+            ctx["indent"] -= 1
+            e("}")
+        elif j == 2:
+            # A loop bounded by a different value.
+            i = self.fresh("ri")
+            e(f"for (0..{self.pick(['@min(' + n + ', ' + s + '.len)', s + '.len', str(self.r.randint(0, 6))])}) |{i}| {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"{s}[{i}]", U32)
+            ctx["indent"] -= 1
+            e("}")
+        else:
+            i = self.fresh("ri")
+            e(f"var {i}: usize = 0;")
+            e(f"while ({i} < {n}) : ({i} += {self.r.randint(1, 3)}) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"{s}[{i}]", U32)
             ctx["indent"] -= 1
             e("}")
 
