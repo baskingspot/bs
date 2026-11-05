@@ -2640,6 +2640,14 @@ fn inheritFlags(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []con
 /// (`-target x86_64-linux`), and a native OS (`native`,
 /// `x86_64-native-gnu`) takes the kernel version, and without an ABI the
 /// ABI, glibc and dynamic linker, of this system.
+/// An unsupported target replaces any other unsupported option's message:
+/// it is the reason the build cannot work (dhi's wasm32 step, which also
+/// passes `-fno-entry`).
+fn unsupportedTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8) void {
+    opts.unsupported = null;
+    setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", .{target});
+}
+
 pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []const u8) void {
     if (std.mem.eql(u8, target, "native") and builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
         // As upstream's native target: this system's macOS version, as
@@ -2654,7 +2662,7 @@ pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []c
         return;
     }
     var query = std.Target.Query.parse(.{ .arch_os_abi = target }) catch {
-        setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", .{target});
+        unsupportedTarget(opts, arena, target);
         return;
     };
     const arch = query.cpu_arch orelse builtin.cpu.arch;
@@ -2674,7 +2682,7 @@ pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []c
         if (std.mem.eql(u8, target, "native"))
             setUnsupported(opts, arena, "bs does not support the native target; pass -target x86_64-linux, -target aarch64-linux, or -target aarch64-macos", .{})
         else
-            setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", .{target});
+            unsupportedTarget(opts, arena, target);
         return;
     }
     // bs's CPU is `-mcpu`'s (`cpu.resolve`), not the detected one.
@@ -2969,6 +2977,11 @@ test "checkTarget reads the macOS versions an aarch64-macos target names" {
     var opts: Options = .{ .command = .build_exe, .root_src_path = "a.zig" };
     checkTarget(&opts, arena.allocator(), std.testing.io, "aarch64-macos-gnu");
     try std.testing.expect(opts.unsupported != null);
+    // An unsupported target's message replaces an unsupported option's.
+    var wasm: Options = .{ .command = .build_exe, .root_src_path = "a.zig" };
+    setUnsupported(&wasm, arena.allocator(), "{s}", .{unsupported_flags.get("-fno-entry").?});
+    checkTarget(&wasm, arena.allocator(), std.testing.io, "wasm32-freestanding");
+    try std.testing.expectStringStartsWith(wasm.unsupported.?, "bs does not support the target 'wasm32-freestanding'");
     // The native target on a Mac: this system's version, both minimum and
     // maximum, as upstream's.
     if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
