@@ -875,6 +875,9 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
 
         const up = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-emit-bin" });
         up.setName(b.fmt("diag {s} (upstream rejects)", .{file}));
+        // The same target as bs's, for a diagnostic that depends on it.
+        var up_args = std.mem.tokenizeScalar(u8, args, ' ');
+        while (up_args.next()) |a| if (std.mem.eql(u8, a, "-target")) up.addArgs(&.{ a, up_args.next() orelse "" });
         up.addFileArg(b.path(src_path));
         up.addCheck(.{ .expect_stderr_match = "error: " });
         up.addCheck(.{ .expect_term = .{ .exited = 1 } });

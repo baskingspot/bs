@@ -6623,7 +6623,10 @@ fn validateExtern(sema: *Sema, ty: Index, position: ExternPosition) bool {
         .vector => position == .param_ty or position == .ret_ty,
         .void => position != .param_ty and position != .other,
         .noreturn => position == .ret_ty,
-        .@"opaque", .bool, .@"anyframe", .float => true,
+        .@"opaque", .bool, .@"anyframe" => true,
+        // As upstream, `f80` only where compiler-rt's float ABI for it is
+        // the hardware's.
+        .float => Type.floatBits(ip, ty) != 80 or ip.target == .x86_64_linux,
         .pointer => {
             const p = Type.ptrInfo(ip, ty);
             if (p.flags.size == .slice) return false;
@@ -6802,6 +6805,7 @@ fn explainWhyNotExtern(sema: *Sema, file: u32, span: Ast.Span, ty: Index, positi
         },
         .vector => try zcu.addNote(file, span, "vectors have no guaranteed in-memory representation", .{}),
         .optional => try zcu.addNote(file, span, "non-pointer optionals have no guaranteed in-memory representation", .{}),
+        .float => try zcu.addNote(file, span, "'{f}' is not extern compatible on this target", .{sema.fmtType(ty)}),
         else => {},
     }
 }
