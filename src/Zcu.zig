@@ -253,6 +253,10 @@ pub const Memo = struct {
     names: []const MemoName = &.{},
     /// The types whose names the call read (`name_reads`).
     name_reads: []const InternPool.Index = &.{},
+    /// The backward branches the call took, and the largest
+    /// `@setEvalBranchQuota` it ran, which a hit counts and applies.
+    branch_count: u32 = 0,
+    branch_quota: u32 = 0,
 };
 
 /// A name offer (`name_offers`), its template in `arena`.

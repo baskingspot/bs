@@ -543,9 +543,11 @@ section requires (no second semantic lowering): `bcLower` runs
   `@setRuntimeSafety`; a failed check lowers to `unreach` (no panic
   handler is resolved);
 - records each backward branch the walker would count in that body
-  (a `comptime` loop's iterations, an inline call's) as a
-  `comptime_tick` instruction, and `@setEvalBranchQuota` as
-  `comptime_quota`; both exist only in evaluator bodies;
+  (a `comptime` loop's iterations, an inline call's, and those a
+  comptime call folded while lowering took, which the walker's memo hit
+  adds on every run) as a `comptime_tick` instruction with a count, and
+  `@setEvalBranchQuota` as `comptime_quota`; both exist only in
+  evaluator bodies;
 - keeps packed struct accesses as `struct_field_ptr`/`struct_field_val`
   rather than bit arithmetic, which comptime memory addresses directly;
 - does not queue runtime analysis of callees;
@@ -6231,25 +6233,15 @@ analysis:
      instead of the first one, so reference traces change once.
 7. *Branch quotas.* A generic instance's quota is the largest any
    instantiating caller set, known only when all of them have run
-   (upstream has the same order dependence, ziglang/zig#22410). And a
-   memo hit counts no branches, so any unit near its quota passes or
-   fails depending on which calls another worker memoized first. A unit
-   that succeeds under a lower quota gives the same result under a
-   higher one, so failures are the problem: every "evaluation exceeded"
-   failure in a parallel build triggers a serial rerun. The reverse case
-   remains: a unit that stays under its quota only because of a memo hit
-   that a one-thread build would not have had, so a parallel build would
-   succeed where one thread fails. So a memo entry records the branches
-   its computation counted, and in a parallel build each hit adds them
-   to a shadow counter beside the real one. The real counter and quota
-   work as today, so a hit still charges nothing, as upstream. If real
-   plus shadow branches would pass the quota, the build reruns serially,
-   and the serial result is the answer. If a parallel build stays under
-   real plus shadow, a one-thread build stays under too: each of its
-   extra misses executes and counts what the hit recorded. So parallel
-   and serial builds agree, and bs never rejects what one thread would
-   accept. One thread needs no shadow counter (decided by the lead,
-   2026-11-03).
+   (upstream has the same order dependence, ziglang/zig#22410). Memo
+   hits do not add one: as upstream's memoized calls, a memo entry
+   records the branches its computation counted and the largest
+   `@setEvalBranchQuota` it ran, and a hit adds the count and raises the
+   quota (a hit that would pass the quota runs the call instead, which
+   fails at the branch that does). A hit and a miss count the same, so
+   which calls another worker memoized first does not change whether a
+   unit passes its quota. (This replaces the shadow counter the lead
+   decided on 2026-11-03, written when bs's hits charged nothing.)
 8. *Exports, tests and compiler_rt requests.* They become locked
    appends, sorted at the end: exports by declaration key, tests by file
    and source position (`populateTestFunctions` already does this), and
@@ -6452,8 +6444,8 @@ Answered in review (2026-11-03):
    results, so every hit on the logical stack reruns serially. The
    "resolved yet?" reads are classified above.
 
-6. Branch quotas and memo hits: a shadow counter of the hits' recorded
-   branches, with a serial rerun when it would pass the quota (rule 7).
+6. Branch quotas and memo hits: a hit charges the branches its entry
+   recorded, as a miss counts them (rule 7).
 
 **The completion hook, and recording as units complete.** When a unit's
 result is final (a declaration resolved, a layout resolved, a `comptime`

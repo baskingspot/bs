@@ -142,6 +142,9 @@ bool_vector_inits: std.AutoHashMapUnmanaged(Ref, Ref) = .empty,
 peers_comptime_known: bool = false,
 branch_quota: u32 = 1000,
 branch_count: u32 = 0,
+/// The largest `@setEvalBranchQuota` of the comptime call in progress,
+/// which its memo entry raises the quota to on a hit, as upstream.
+quota_request: u32 = 0,
 /// The statement position of the last `dbg_stmt` added, relative to the
 /// declaration of the function or inline call being analyzed: where an
 /// inline call made now is called from.
@@ -3949,7 +3952,7 @@ fn analyzeInlineBody(sema: *Sema, block: *Block, body: []const Zir.Inst.Index, b
 fn emitBackwardBranch(sema: *Sema, block: *Block, src: Src) CompileError!void {
     // Each run of a body lowered for the comptime evaluator counts what
     // the walker counts when it runs the body (see "Comptime evaluator").
-    if (sema.bc) |bc| if (bc.depth == 0) try sema.bcAddEvent(block, .{ .tag = .comptime_tick, .data = .{ .no_op = {} } });
+    if (sema.bc) |bc| if (bc.depth == 0) try sema.bcAddEvent(block, .{ .tag = .comptime_tick, .data = .{ .ticks = 1 } });
     sema.branch_count += 1;
     if (sema.branch_count > sema.branch_quota) {
         const err = sema.fail(block, src, "evaluation exceeded {d} backwards branches", .{sema.branch_quota});
@@ -4248,6 +4251,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                     const src = block.nodeSrc(data.un_node.src_node);
                     const quota = try sema.resolveInt(block, src, data.un_node.operand, .u32_type, "operand to '@setEvalBranchQuota' must be comptime-known");
                     sema.branch_quota = @max(sema.branch_quota, @as(u32, @intCast(quota)));
+                    sema.quota_request = @max(sema.quota_request, @as(u32, @intCast(quota)));
                     if (sema.bc) |bc| if (bc.depth == 0) try sema.bcAddEvent(block, .{ .tag = .comptime_quota, .data = .{ .quota = @intCast(quota) } });
                 }
                 i += 1;
@@ -20224,6 +20228,11 @@ fn endDbgInline(sema: *Sema, child: *Block) !void {
 /// The type of the parameter of generic `func` after `prior` arguments,
 /// evaluated with them; `generic_poison_type` for an `anytype` parameter.
 fn genericParamType(sema: *Sema, caller: *Block, src: Src, func: Index, prior: []const Ref) CompileError!Index {
+    // `instantiate` evaluates the type again, as upstream evaluates it
+    // once: only that evaluation counts against the branch quota (one
+    // that exceeds it here exceeds it there too).
+    const saved_count = sema.branch_count;
+    defer sema.branch_count = saved_count;
     const saved = CalleeScope.enter(sema, func);
     defer saved.leave(sema);
     var callee_block = sema.calleeBlock(caller, func);
@@ -20315,10 +20324,23 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
     }
     const key = hasher.final();
     try sema.declareDependency(.{ .func_body = func });
-    // What the call read, this unit reads by reusing its result.
-    if (memoizable) if (sema.zcu.comptime_memo.get(key)) |memo| return sema.memoHit(memo);
+    // What the call read, this unit reads by reusing its result. As
+    // upstream, a hit counts the backward branches the call took and
+    // raises the quota as the call did; one that would exceed the quota
+    // runs the call, which fails at the branch that does.
+    if (memoizable) if (sema.zcu.comptime_memo.get(key)) |memo| if (sema.branch_count + memo.branch_count <= sema.branch_quota) {
+        sema.branch_count += memo.branch_count;
+        sema.branch_quota = @max(sema.branch_quota, memo.branch_quota);
+        sema.quota_request = @max(sema.quota_request, memo.branch_quota);
+        try sema.bcMemoBranches(caller, memo.branch_count, memo.branch_quota);
+        return sema.memoHit(memo);
+    };
     const scope: ?MemoScope = if (memoizable) sema.memoEnter() else null;
     defer if (scope) |sc| sema.memoLeave(sc);
+    const old_branch_count = sema.branch_count;
+    const old_quota_request = sema.quota_request;
+    sema.quota_request = 0;
+    defer sema.quota_request = @max(old_quota_request, sema.quota_request);
     // A lowered body runs once what each walker run of it would evaluate
     // again, which only memoized calls make equal.
     if (sema.bc) |bc| if (bc.depth == 0 and !memoizable) try sema.bcRefuse();
@@ -20344,9 +20366,21 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
     };
     if (memoizable and !sema.refersToComptimeAlloc(result)) {
         const names = try sema.memoNames(scope.?.start);
-        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.?.start), .effects = try sema.memoEffects(scope.?.start), .funcs = try sema.memoFuncs(scope.?.start), .names = names[0], .name_reads = names[1] });
+        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.?.start), .effects = try sema.memoEffects(scope.?.start), .funcs = try sema.memoFuncs(scope.?.start), .names = names[0], .name_reads = names[1], .branch_count = sema.branch_count - old_branch_count, .branch_quota = sema.quota_request });
+        try sema.bcMemoBranches(caller, sema.branch_count - old_branch_count, sema.quota_request);
     } else if (sema.bc) |bc| if (bc.depth == 0) try sema.bcRefuse();
     return result;
+}
+
+/// While lowering for the comptime evaluator, a comptime call the walker
+/// evaluates now is a memo hit on every run, which adds the branches the
+/// call took and raises the quota as the call did.
+fn bcMemoBranches(sema: *Sema, block: *Block, count: u32, quota: u32) CompileError!void {
+    const bc = sema.bc orelse return;
+    if (bc.depth != 0) return;
+    // The count against the quota so far, as the walker's hit checks it.
+    if (count != 0) try sema.bcAddEvent(block, .{ .tag = .comptime_tick, .data = .{ .ticks = count } });
+    if (quota != 0) try sema.bcAddEvent(block, .{ .tag = .comptime_quota, .data = .{ .quota = quota } });
 }
 
 /// A comptime call evaluated by walking the callee's ZIR.
@@ -21519,11 +21553,13 @@ fn bcExec(sema: *Sema, f: *BcFrame, body: []const Ir.Inst.Index) BcError!BcExit 
             },
             .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => continue,
             .comptime_tick => {
-                try sema.bcTick();
+                sema.branch_count +|= data.ticks;
+                if (sema.branch_count > sema.branch_quota) return error.BcAbort;
                 continue;
             },
             .comptime_quota => {
                 sema.branch_quota = @max(sema.branch_quota, data.quota);
+                sema.quota_request = @max(sema.quota_request, data.quota);
                 continue;
             },
             .comptime_dep => {

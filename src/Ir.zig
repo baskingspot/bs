@@ -398,9 +398,11 @@ pub const Inst = struct {
 
         /// Only in a body lowered for the comptime evaluator (see
         /// docs/slop/architecture.md, "Comptime"), never in CodeGen's IR.
-        /// `no_op`: one backward branch against the evaluation's branch
-        /// quota, where the ZIR walker counts one (an inline call, an
-        /// `inline` loop iteration, a comptime call made while lowering).
+        /// `ticks`: backward branches against the evaluation's branch
+        /// quota, where the ZIR walker counts them: one for an inline
+        /// call, an `inline` loop iteration or a comptime call made while
+        /// lowering, and those of the call's memo entry, which the walker
+        /// adds on every memo hit.
         comptime_tick,
         /// `quota`: `@setEvalBranchQuota(quota)`.
         comptime_quota,
@@ -432,6 +434,7 @@ pub const Inst = struct {
         dbg_stmt: struct { line: u32, column: u32 },
         dbg_inline: struct { func: InternPool.Index, payload: u32 },
         quota: u32,
+        ticks: u32,
         dep: u32,
     };
 };
