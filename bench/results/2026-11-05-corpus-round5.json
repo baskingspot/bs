@@ -1,7 +1,8 @@
 {
  "date": "2026-11-05",
  "bs": {
-  "84c75e56": "all targets"
+  "84c75e56": "all targets",
+  "8b8a35e4": "siv"
  },
  "zig": "0.17.1",
  "command": "python3 tools/corpus/run.py --bs <bs> --no-edit --donors --projects eth.zig,zbullet,zstbi,zig-lmdb,hocdb,zig-graph-compiler,maxminddb.zig,zig-rbtree,archive.zig,lanes.zig,element-0,zstd.zig,forklift,ulid.zig,zoto,wamr,ssz.zig --results w5",
@@ -1054,6 +1055,1019 @@
     "run": "exit 0, All 9 tests passed.",
     "run_exit": 0,
     "run_secs": 0.002580738000688143
+   }
+  },
+  {
+   "project": "siv",
+   "target": "siv",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 13.9119466090051,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 13.33329659399169
+   },
+   "bs": {
+    "cold_local": 10.379777384005138,
+    "cold_local_donor": 10.020726675007609,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 9.480886108009145
+   }
+  },
+  {
+   "project": "siv",
+   "target": "siv-static",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 14.033677949002595,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 13.227237533996231
+   },
+   "bs": {
+    "cold_local": 9.046838551017572,
+    "cold_local_donor": 9.175094102000003,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 8.692838962000678
+   }
+  },
+  {
+   "project": "siv",
+   "target": "siv-lua:",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.15605421000509523,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.13128215400502086
+   },
+   "bs": {
+    "cold_local": 0.5574517830100376,
+    "cold_local_donor": 0.5721994440100389,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.002185228993766941
+   }
+  },
+  {
+   "project": "siv",
+   "target": "siv-lua-module:",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.11814150201098528,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.10737053600314539
+   },
+   "bs": {
+    "cold_local": 0.5753194999851985,
+    "cold_local_donor": 0.5484174019948114,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.0024191639968194067
+   }
+  },
+  {
+   "project": "siv",
+   "target": "siv-lua:src/lua/main.zig",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.4893418479914544,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.5538495809887536
+   },
+   "bs": {
+    "cold_local": 0.3492609469976742,
+    "cold_local_donor": 0.3468542030022945,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.0038167349994182587
+   }
+  },
+  {
+   "project": "siv",
+   "target": "lua:",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 2.4742400529939914,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.07219936899491586
+   },
+   "bs": {
+    "cold_local": 1.7661567610048223,
+    "cold_local_donor": 1.317238558011013,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.007031689005088992
+   }
+  },
+  {
+   "project": "siv",
+   "target": "abi",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.14495702099520713,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.06140316299570259
+   },
+   "bs": {
+    "cold_local": 0.3387127669848269,
+    "cold_local_donor": 0.21168728900374845,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.0035527739964891225
+   }
+  },
+  {
+   "project": "siv",
+   "target": "smoke",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.11055645000305958,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.06426474299223628
+   },
+   "bs": {
+    "cold_local": 0.4549569090013392,
+    "cold_local_donor": 0.29388629099412356,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.004134532995522022
+   }
+  },
+  {
+   "project": "siv",
+   "target": "app:",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.18590988099458627,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.061497145987232216
+   },
+   "bs": {
+    "cold_local": 0.5610872569959611,
+    "cold_local_donor": 0.3951399549841881,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.005751249002059922
+   }
+  },
+  {
+   "project": "siv",
+   "target": "guide-counter_test",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.12199749899446033,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.06275418899895158
+   },
+   "bs": {
+    "cold_local": 0.4642396660055965,
+    "cold_local_donor": 0.3928484039934119,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.005237146993749775
+   }
+  },
+  {
+   "project": "siv",
+   "target": "guide-zig-package",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.43973897500836756,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.5573991179990117
+   },
+   "bs": {
+    "cold_local": 0.4163214290019823,
+    "cold_local_donor": 0.25459369299642276,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "edit": 0.0043093300046166405
+   }
+  },
+  {
+   "project": "siv",
+   "target": "a11y",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 2.656998897000449,
+    "compile_exit": 0,
+    "run": "exit 0, All 14 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.929629202990327,
+    "edit": 2.127313826000318
+   },
+   "bs": {
+    "cold_local": 1.754480354997213,
+    "cold_local_donor": 1.6657645919913193,
+    "compile_exit": 0,
+    "run": "exit 0, All 14 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.8847695529984776,
+    "edit": 0.16920817201025784
+   }
+  },
+  {
+   "project": "siv",
+   "target": "abi-unit",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.6692273049993673,
+    "compile_exit": 0,
+    "run": "exit 0, All 17 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.015692160013713874,
+    "edit": 0.7857069449964911
+   },
+   "bs": {
+    "cold_local": 0.47575914999470115,
+    "cold_local_donor": 0.23878395099018235,
+    "compile_exit": 0,
+    "run": "exit 0, All 17 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005710455006919801,
+    "edit": 0.001811948008253239
+   }
+  },
+  {
+   "project": "siv",
+   "target": "abi-wrapper",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 1.65380152099533,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.013916036012233235,
+    "edit": 1.6257612659974257
+   },
+   "bs": {
+    "cold_local": 1.1135046990093542,
+    "cold_local_donor": 0.47431483698892407,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010363519002567045,
+    "edit": 0.0038940679951338097
+   }
+  },
+  {
+   "project": "siv",
+   "target": "app",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 4.12999042699812,
+    "compile_exit": 0,
+    "run": "exit 0, All 24 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.806622091011377,
+    "edit": 3.821576718997676
+   },
+   "bs": {
+    "cold_local": 2.757160067994846,
+    "cold_local_donor": 2.068138229995384,
+    "compile_exit": 0,
+    "run": "exit 0, All 24 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.7184103589970618,
+    "edit": 0.19386552298965398
+   }
+  },
+  {
+   "project": "siv",
+   "target": "compositor",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 1.9661404760117875,
+    "compile_exit": 0,
+    "run": "exit 0, All 36 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.7220613719982794,
+    "edit": 1.4787929090089165
+   },
+   "bs": {
+    "cold_local": 1.5258886510127923,
+    "cold_local_donor": 1.1398689190100413,
+    "compile_exit": 0,
+    "run": "exit 0, All 36 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.681213582996861,
+    "edit": 0.11693585501052439
+   }
+  },
+  {
+   "project": "siv",
+   "target": "css",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.7903008650027914,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014064593007788062,
+    "edit": 0.8842892200045753
+   },
+   "bs": {
+    "cold_local": 0.5511592980037676,
+    "cold_local_donor": 0.6062423520197626,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00660823799262289,
+    "edit": 0.0018795619980664924
+   }
+  },
+  {
+   "project": "siv",
+   "target": "dbus",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.7413961619895417,
+    "compile_exit": 0,
+    "run": "exit 0, All 51 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.4854750530066667,
+    "edit": 0.7882647270016605
+   },
+   "bs": {
+    "cold_local": 0.427270229003625,
+    "cold_local_donor": 0.306595814996399,
+    "compile_exit": 0,
+    "run": "exit 0, All 51 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.9593288900068728,
+    "edit": 0.0183149499935098
+   }
+  },
+  {
+   "project": "siv",
+   "target": "doc",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 2.3785997179948026,
+    "compile_exit": 0,
+    "run": "exit 0, All 23 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.45113664100063033,
+    "edit": 2.174049337001634
+   },
+   "bs": {
+    "cold_local": 1.3804776040051365,
+    "cold_local_donor": 1.0631692550086882,
+    "compile_exit": 0,
+    "run": "exit 0, All 23 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.2667894879996311,
+    "edit": 0.10368007198849227
+   }
+  },
+  {
+   "project": "siv",
+   "target": "docview",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 1.403032540998538,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.012082098997780122,
+    "edit": 0.7437761320034042
+   },
+   "bs": {
+    "cold_local": 1.0516790340043372,
+    "cold_local_donor": 0.8914938999951119,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.015451740997377783,
+    "edit": 0.11516121299064253
+   }
+  },
+  {
+   "project": "siv",
+   "target": "epub",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.610075748001691,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010917817999143153,
+    "edit": 0.6440004330070224
+   },
+   "bs": {
+    "cold_local": 0.3401676259964006,
+    "cold_local_donor": 0.13327412700164132,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00480183499166742,
+    "edit": 0.0017470129969296977
+   }
+  },
+  {
+   "project": "siv",
+   "target": "headless",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 15.681968592994963,
+    "compile_exit": 0,
+    "run": "exit 0, All 331 tests passed.",
+    "run_exit": 0,
+    "run_secs": 307.8990287170018,
+    "edit": 15.034018840000499
+   },
+   "bs": {
+    "cold_local": 11.337676427006954,
+    "cold_local_donor": 10.030978298993432,
+    "compile_exit": 0,
+    "run": "exit 0, All 331 tests passed.",
+    "run_exit": 0,
+    "run_secs": 148.08661551799742,
+    "edit": 0.8984410849952837
+   }
+  },
+  {
+   "project": "siv",
+   "target": "html",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.7706101920048241,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.25617463899834547,
+    "edit": 0.8363044770085253
+   },
+   "bs": {
+    "cold_local": 0.5004043499939144,
+    "cold_local_donor": 0.2796756480092881,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.18207061500288546,
+    "edit": 0.0023406120017170906
+   }
+  },
+  {
+   "project": "siv",
+   "target": "icon",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.588018820999423,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.020163926004897803,
+    "edit": 0.5968589019903447
+   },
+   "bs": {
+    "cold_local": 0.43300763599108905,
+    "cold_local_donor": 0.1816933749942109,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0071981479995884,
+    "edit": 0.001759086997481063
+   }
+  },
+  {
+   "project": "siv",
+   "target": "image",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.8093093579955166,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0874345140036894,
+    "edit": 0.811788922001142
+   },
+   "bs": {
+    "cold_local": 0.4897505970002385,
+    "cold_local_donor": 0.4053685679973569,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.07714166800724342,
+    "edit": 0.002079534999211319
+   }
+  },
+  {
+   "project": "siv",
+   "target": "intl",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.7799472530023195,
+    "compile_exit": 0,
+    "run": "exit 0, All 23 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.04433838900877163,
+    "edit": 0.83741991900024
+   },
+   "bs": {
+    "cold_local": 0.4959464739949908,
+    "cold_local_donor": 0.4165423599915812,
+    "compile_exit": 0,
+    "run": "exit 0, All 23 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.016523792000953108,
+    "edit": 0.0024099430011119694
+   }
+  },
+  {
+   "project": "siv",
+   "target": "loop",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.6808897449955111,
+    "compile_exit": 0,
+    "run": "exit 0, All 12 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.9486825130006764,
+    "edit": 0.9566480520006735
+   },
+   "bs": {
+    "cold_local": 0.49307809000310954,
+    "cold_local_donor": 0.19844242800900247,
+    "compile_exit": 0,
+    "run": "exit 0, All 12 tests passed.",
+    "run_exit": 0,
+    "run_secs": 2.0945860059873667,
+    "edit": 0.03673592700215522
+   }
+  },
+  {
+   "project": "siv",
+   "target": "lua-gen-types",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 11.767050445007044,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.06977474200539291,
+    "edit": 11.661182823008858
+   },
+   "bs": {
+    "cold_local": 4.804311288011377,
+    "cold_local_donor": 4.830125148015213,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0301282069995068,
+    "edit": 0.0024092330131679773
+   }
+  },
+  {
+   "project": "siv",
+   "target": "lua-notices",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.49093868500494864,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005615310001303442,
+    "edit": 0.5066765939991456
+   },
+   "bs": {
+    "cold_local": 0.3194896760105621,
+    "cold_local_donor": 0.12097144500876311,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0020454000041354448,
+    "edit": 0.0014211770030669868
+   }
+  },
+  {
+   "project": "siv",
+   "target": "markdown",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.5614970679889666,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.06973014899995178,
+    "edit": 0.5938901220069965
+   },
+   "bs": {
+    "cold_local": 0.31894722499419004,
+    "cold_local_donor": 0.202833480987465,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.03797860300983302,
+    "edit": 0.0018502129969419912
+   }
+  },
+  {
+   "project": "siv",
+   "target": "notices",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.521450427986565,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006651620002230629,
+    "edit": 0.5270168630086118
+   },
+   "bs": {
+    "cold_local": 0.300567365004099,
+    "cold_local_donor": 0.14035645801050123,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0034445010096533224,
+    "edit": 0.0014582180010620505
+   }
+  },
+  {
+   "project": "siv",
+   "target": "pdf",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 1.5159852400101954,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.07066202600253746,
+    "edit": 1.24765434100118
+   },
+   "bs": {
+    "cold_local": 1.2259673989901785,
+    "cold_local_donor": 0.9286466350022238,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.042016626000986435,
+    "edit": 0.2475492649973603
+   }
+  },
+  {
+   "project": "siv",
+   "target": "platform",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.9294198029820109,
+    "compile_exit": 0,
+    "run": "exit 0, 26 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.22249960199405905,
+    "edit": 0.9531950349919498
+   },
+   "bs": {
+    "cold_local": 0.5953618780040415,
+    "cold_local_donor": 0.5342291480046697,
+    "compile_exit": 0,
+    "run": "exit 0, 26 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.21137223800178617,
+    "edit": 0.02081999700749293
+   }
+  },
+  {
+   "project": "siv",
+   "target": "pool",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.5722050140029751,
+    "compile_exit": 0,
+    "run": "exit 0, All 7 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.08030478800355922,
+    "edit": 0.5149712139973417
+   },
+   "bs": {
+    "cold_local": 0.2839169079961721,
+    "cold_local_donor": 0.12356984699727036,
+    "compile_exit": 0,
+    "run": "exit 0, All 7 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.07436900300672278,
+    "edit": 0.021075051990919746
+   }
+  },
+  {
+   "project": "siv",
+   "target": "portal",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.7480496089992812,
+    "compile_exit": 0,
+    "run": "exit 0, All 26 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.9093325750000076,
+    "edit": 0.7220075549994363
+   },
+   "bs": {
+    "cold_local": 0.45707484100421425,
+    "cold_local_donor": 0.2536723940138472,
+    "compile_exit": 0,
+    "run": "exit 0, All 26 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.8800931890000356,
+    "edit": 0.018353790990659036
+   }
+  },
+  {
+   "project": "siv",
+   "target": "raster",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.5364956069970503,
+    "compile_exit": 0,
+    "run": "exit 0, All 22 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.012469277993659489,
+    "edit": 0.5411329210037366
+   },
+   "bs": {
+    "cold_local": 0.3123392550041899,
+    "cold_local_donor": 0.15948061698873062,
+    "compile_exit": 0,
+    "run": "exit 0, All 22 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0066420710063539445,
+    "edit": 0.0017503019917057827
+   }
+  },
+  {
+   "project": "siv",
+   "target": "render-cpu",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 1.1731921720056562,
+    "compile_exit": 0,
+    "run": "exit 0, All 23 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.39930604401160963,
+    "edit": 0.868807952007046
+   },
+   "bs": {
+    "cold_local": 0.7777576210064581,
+    "cold_local_donor": 0.5582431170041673,
+    "compile_exit": 0,
+    "run": "exit 0, All 23 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.2811208689963678,
+    "edit": 0.10253570100758225
+   }
+  },
+  {
+   "project": "siv",
+   "target": "render-vulkan",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 1.4278740500012645,
+    "compile_exit": 0,
+    "run": "exit 0, 7 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 2.300665910996031,
+    "edit": 1.0518018209986622
+   },
+   "bs": {
+    "cold_local": 1.0759723350201966,
+    "cold_local_donor": 0.907050274006906,
+    "compile_exit": 0,
+    "run": "exit 0, 7 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 3.306071825005347,
+    "edit": 0.10903488199983258
+   }
+  },
+  {
+   "project": "siv",
+   "target": "scene",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.5944345309981145,
+    "compile_exit": 0,
+    "run": "exit 0, All 9 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.011647399005596526,
+    "edit": 0.6141934170009336
+   },
+   "bs": {
+    "cold_local": 0.3648924370063469,
+    "cold_local_donor": 0.208591685994179,
+    "compile_exit": 0,
+    "run": "exit 0, All 9 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005840015001012944,
+    "edit": 0.0017299149913014844
+   }
+  },
+  {
+   "project": "siv",
+   "target": "spell",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.7528355570102576,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.2340678990003653,
+    "edit": 0.743791238986887
+   },
+   "bs": {
+    "cold_local": 0.4163315390032949,
+    "cold_local_donor": 0.27661677199648693,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.11451673100236803,
+    "edit": 0.002099432997056283
+   }
+  },
+  {
+   "project": "siv",
+   "target": "svg",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 1.025023826980032,
+    "compile_exit": 0,
+    "run": "exit 0, All 24 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.022862675992655568,
+    "edit": 0.9481647299980978
+   },
+   "bs": {
+    "cold_local": 0.6585333050024929,
+    "cold_local_donor": 0.43469874501170125,
+    "compile_exit": 0,
+    "run": "exit 0, All 24 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.011684772005537525,
+    "edit": 0.001934697007527575
+   }
+  },
+  {
+   "project": "siv",
+   "target": "text",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 1.6854282720014453,
+    "compile_exit": 0,
+    "run": "exit 0, All 71 tests passed.",
+    "run_exit": 0,
+    "run_secs": 13.396023305991548,
+    "edit": 1.6236894320027204
+   },
+   "bs": {
+    "cold_local": 0.8835858869861113,
+    "cold_local_donor": 0.8059784939978272,
+    "compile_exit": 0,
+    "run": "exit 0, All 71 tests passed.",
+    "run_exit": 0,
+    "run_secs": 8.250162602998898,
+    "edit": 0.005370404993300326
+   }
+  },
+  {
+   "project": "siv",
+   "target": "trash",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.5593381329963449,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01841053100361023,
+    "edit": 0.5676428459992167
+   },
+   "bs": {
+    "cold_local": 0.3596179750020383,
+    "cold_local_donor": 0.18747374799568206,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.011796414997661486,
+    "edit": 0.0017788789991755038
+   }
+  },
+  {
+   "project": "siv",
+   "target": "tray",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 0.6695355099946028,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.022876292001456022,
+    "edit": 0.6267101830017054
+   },
+   "bs": {
+    "cold_local": 0.3959325500036357,
+    "cold_local_donor": 0.19286495799315162,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.011843230007798411,
+    "edit": 0.017735434987116605
+   }
+  },
+  {
+   "project": "siv",
+   "target": "ui",
+   "verdict": "ok",
+   "bs_commit": "8b8a35e4",
+   "zig": {
+    "cold_local": 2.94927277698298,
+    "compile_exit": 0,
+    "run": "exit 0, All 91 tests passed.",
+    "run_exit": 0,
+    "run_secs": 7.4752693960035685,
+    "edit": 2.741094911994878
+   },
+   "bs": {
+    "cold_local": 1.9483184440032346,
+    "cold_local_donor": 1.7743347210052889,
+    "compile_exit": 0,
+    "run": "exit 0, All 91 tests passed.",
+    "run_exit": 0,
+    "run_secs": 3.538616940000793,
+    "edit": 0.18949397900723852
    }
   }
  ]

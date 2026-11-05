@@ -155,3 +155,74 @@ Verdicts are recomputed with the run.py of this change.
 | ssz.zig | test:src/lib.zig | ok | exit 0, All 9 tests passed. | exit 0, All 9 tests passed. | 11.26 s / 4.66 s (2.4x) | 11.26 s / 4.55 s (2.5x) | – / – | 5 ms / 3 ms (2.1x) |
 
 bs's translate-c tool was warmed before timing (46 ms). bs's libc++ was not yet: zbullet-tests' cold-local time includes its first build (see Summary).
+
+## siv
+
+Added after round 5: siv (github.com/rockorager/siv, 449e66f9, MIT), as
+a whole build. bs is ReleaseFast from stage-next 8b8a35e4 (main plus
+elfobj-alias and rdynamic), with donors and edit builds on. The edit
+appends a statement to `Pool.submit` in src/pool/pool.zig.
+
+- All 45 targets match upstream: the 34 test binaries pass 940 tests
+  and skip 3 under both compilers.
+- Cold-local: geomean 1.23x faster than upstream, 66 s
+  against 97 s in total. With donors: 1.80x, 56 s.
+- After the one-line edit: geomean 62.2x, 20.6 s against 89 s in
+  total.
+- Run time, over the 20 test binaries that run at least 50 ms: geomean
+  1.37x. headless, the largest, takes 307.90 s against 148.09 s.
+  render-vulkan's 0.70x in the run was its first sample (Mesa's shader
+  cache): retimed 3 times, bs is 2.19 s against 2.35 s. loop is slower,
+  0.85x over 3 samples: its stress test spins on `std.atomic.spinLoopHint`,
+  an inline `pause`, and bs keeps every value of a function containing
+  inline assembly in memory. A single-threaded loop of 50,000 random
+  runs of up to 2000 `spinLoopHint`s takes 1.17 s under bs and 0.83 s
+  under upstream, whose loop counter stays in a register.
+
+| Target | upstream run | bs run | cold-local zig / bs | with donors | edit zig / bs | run zig / bs |
+|---|---|---|---:|---:|---:|---:|
+| siv | not run | not run | 13.91 s / 10.38 s (1.3x) | 13.91 s / 10.02 s (1.4x) | 13.33 s / 9.48 s (1.4x) | – |
+| siv-static | not run | not run | 14.03 s / 9.05 s (1.6x) | 14.03 s / 9.18 s (1.5x) | 13.23 s / 8.69 s (1.5x) | – |
+| siv-lua: | not run | not run | 156 ms / 557 ms (0.3x) | 156 ms / 572 ms (0.3x) | 131 ms / 2 ms (60.1x) | – |
+| siv-lua-module: | not run | not run | 118 ms / 575 ms (0.2x) | 118 ms / 548 ms (0.2x) | 107 ms / 2 ms (44.4x) | – |
+| siv-lua:src/lua/main.zig | not run | not run | 489 ms / 349 ms (1.4x) | 489 ms / 347 ms (1.4x) | 554 ms / 4 ms (145.1x) | – |
+| lua: | not run | not run | 2.47 s / 1.77 s (1.4x) | 2.47 s / 1.32 s (1.9x) | 72 ms / 7 ms (10.3x) | – |
+| abi | not run | not run | 145 ms / 339 ms (0.4x) | 145 ms / 212 ms (0.7x) | 61 ms / 4 ms (17.3x) | – |
+| smoke | not run | not run | 111 ms / 455 ms (0.2x) | 111 ms / 294 ms (0.4x) | 64 ms / 4 ms (15.5x) | – |
+| app: | not run | not run | 186 ms / 561 ms (0.3x) | 186 ms / 395 ms (0.5x) | 61 ms / 6 ms (10.7x) | – |
+| guide-counter_test | not run | not run | 122 ms / 464 ms (0.3x) | 122 ms / 393 ms (0.3x) | 63 ms / 5 ms (12.0x) | – |
+| guide-zig-package | not run | not run | 440 ms / 416 ms (1.1x) | 440 ms / 255 ms (1.7x) | 557 ms / 4 ms (129.3x) | – |
+| a11y | exit 0, All 14 tests passed. | exit 0, All 14 tests passed. | 2.66 s / 1.75 s (1.5x) | 2.66 s / 1.67 s (1.6x) | 2.13 s / 169 ms (12.6x) | 930 ms / 885 ms (1.1x) |
+| abi-unit | exit 0, All 17 tests passed. | exit 0, All 17 tests passed. | 669 ms / 476 ms (1.4x) | 669 ms / 239 ms (2.8x) | 786 ms / 2 ms (433.6x) | 16 ms / 6 ms (2.7x) |
+| abi-wrapper | exit 0, All 5 tests passed. | exit 0, All 5 tests passed. | 1.65 s / 1.11 s (1.5x) | 1.65 s / 474 ms (3.5x) | 1.63 s / 4 ms (417.5x) | 14 ms / 10 ms (1.3x) |
+| app | exit 0, All 24 tests passed. | exit 0, All 24 tests passed. | 4.13 s / 2.76 s (1.5x) | 4.13 s / 2.07 s (2.0x) | 3.82 s / 194 ms (19.7x) | 1.81 s / 1.72 s (1.1x) |
+| compositor | exit 0, All 36 tests passed. | exit 0, All 36 tests passed. | 1.97 s / 1.53 s (1.3x) | 1.97 s / 1.14 s (1.7x) | 1.48 s / 117 ms (12.6x) | 1.72 s / 1.68 s (1.0x) |
+| css | exit 0, All 10 tests passed. | exit 0, All 10 tests passed. | 790 ms / 551 ms (1.4x) | 790 ms / 606 ms (1.3x) | 884 ms / 2 ms (470.5x) | 14 ms / 7 ms (2.1x) |
+| dbus | exit 0, All 51 tests passed. | exit 0, All 51 tests passed. | 741 ms / 427 ms (1.7x) | 741 ms / 307 ms (2.4x) | 788 ms / 18 ms (43.0x) | 1.49 s / 959 ms (1.5x) |
+| doc | exit 0, All 23 tests passed. | exit 0, All 23 tests passed. | 2.38 s / 1.38 s (1.7x) | 2.38 s / 1.06 s (2.2x) | 2.17 s / 104 ms (21.0x) | 451 ms / 267 ms (1.7x) |
+| docview | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 1.40 s / 1.05 s (1.3x) | 1.40 s / 891 ms (1.6x) | 744 ms / 115 ms (6.5x) | 12 ms / 15 ms (0.8x) |
+| epub | exit 0, All 5 tests passed. | exit 0, All 5 tests passed. | 610 ms / 340 ms (1.8x) | 610 ms / 133 ms (4.6x) | 644 ms / 2 ms (368.6x) | 11 ms / 5 ms (2.3x) |
+| headless | exit 0, All 331 tests passed. | exit 0, All 331 tests passed. | 15.68 s / 11.34 s (1.4x) | 15.68 s / 10.03 s (1.6x) | 15.03 s / 898 ms (16.7x) | 307.90 s / 148.09 s (2.1x) |
+| html | exit 0, All 8 tests passed. | exit 0, All 8 tests passed. | 771 ms / 500 ms (1.5x) | 771 ms / 280 ms (2.8x) | 836 ms / 2 ms (357.3x) | 256 ms / 182 ms (1.4x) |
+| icon | exit 0, All 6 tests passed. | exit 0, All 6 tests passed. | 588 ms / 433 ms (1.4x) | 588 ms / 182 ms (3.2x) | 597 ms / 2 ms (339.3x) | 20 ms / 7 ms (2.8x) |
+| image | exit 0, All 15 tests passed. | exit 0, All 15 tests passed. | 809 ms / 490 ms (1.7x) | 809 ms / 405 ms (2.0x) | 812 ms / 2 ms (390.4x) | 87 ms / 77 ms (1.1x) |
+| intl | exit 0, All 23 tests passed. | exit 0, All 23 tests passed. | 780 ms / 496 ms (1.6x) | 780 ms / 417 ms (1.9x) | 837 ms / 2 ms (347.5x) | 44 ms / 17 ms (2.7x) |
+| loop | exit 0, All 12 tests passed. | exit 0, All 12 tests passed. | 681 ms / 493 ms (1.4x) | 681 ms / 198 ms (3.4x) | 957 ms / 37 ms (26.0x) | 1.95 s / 2.09 s (0.9x) |
+| lua-gen-types | exit 0, All 5 tests passed. | exit 0, All 5 tests passed. | 11.77 s / 4.80 s (2.4x) | 11.77 s / 4.83 s (2.4x) | 11.66 s / 2 ms (4840.2x) | 70 ms / 30 ms (2.3x) |
+| lua-notices | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 491 ms / 319 ms (1.5x) | 491 ms / 121 ms (4.1x) | 507 ms / 1 ms (356.5x) | 6 ms / 2 ms (2.7x) |
+| markdown | exit 0, All 4 tests passed. | exit 0, All 4 tests passed. | 561 ms / 319 ms (1.8x) | 561 ms / 203 ms (2.8x) | 594 ms / 2 ms (321.0x) | 70 ms / 38 ms (1.8x) |
+| notices | exit 0, All 2 tests passed. | exit 0, All 2 tests passed. | 521 ms / 301 ms (1.7x) | 521 ms / 140 ms (3.7x) | 527 ms / 1 ms (361.4x) | 7 ms / 3 ms (1.9x) |
+| pdf | exit 0, All 11 tests passed. | exit 0, All 11 tests passed. | 1.52 s / 1.23 s (1.2x) | 1.52 s / 929 ms (1.6x) | 1.25 s / 248 ms (5.0x) | 71 ms / 42 ms (1.7x) |
+| platform | exit 0, 26 passed; 1 skipped; 0 failed. | exit 0, 26 passed; 1 skipped; 0 failed. | 929 ms / 595 ms (1.6x) | 929 ms / 534 ms (1.7x) | 953 ms / 21 ms (45.8x) | 222 ms / 211 ms (1.1x) |
+| pool | exit 0, All 7 tests passed. | exit 0, All 7 tests passed. | 572 ms / 284 ms (2.0x) | 572 ms / 124 ms (4.6x) | 515 ms / 21 ms (24.4x) | 80 ms / 74 ms (1.1x) |
+| portal | exit 0, All 26 tests passed. | exit 0, All 26 tests passed. | 748 ms / 457 ms (1.6x) | 748 ms / 254 ms (2.9x) | 722 ms / 18 ms (39.3x) | 909 ms / 880 ms (1.0x) |
+| raster | exit 0, All 22 tests passed. | exit 0, All 22 tests passed. | 536 ms / 312 ms (1.7x) | 536 ms / 159 ms (3.4x) | 541 ms / 2 ms (309.2x) | 12 ms / 7 ms (1.9x) |
+| render-cpu | exit 0, All 23 tests passed. | exit 0, All 23 tests passed. | 1.17 s / 778 ms (1.5x) | 1.17 s / 558 ms (2.1x) | 869 ms / 103 ms (8.5x) | 399 ms / 281 ms (1.4x) |
+| render-vulkan | exit 0, 7 passed; 2 skipped; 0 failed. | exit 0, 7 passed; 2 skipped; 0 failed. | 1.43 s / 1.08 s (1.3x) | 1.43 s / 907 ms (1.6x) | 1.05 s / 109 ms (9.6x) | 2.30 s / 3.31 s (0.7x) |
+| scene | exit 0, All 9 tests passed. | exit 0, All 9 tests passed. | 594 ms / 365 ms (1.6x) | 594 ms / 209 ms (2.8x) | 614 ms / 2 ms (355.0x) | 12 ms / 6 ms (2.0x) |
+| spell | exit 0, All 15 tests passed. | exit 0, All 15 tests passed. | 753 ms / 416 ms (1.8x) | 753 ms / 277 ms (2.7x) | 744 ms / 2 ms (354.3x) | 234 ms / 115 ms (2.0x) |
+| svg | exit 0, All 24 tests passed. | exit 0, All 24 tests passed. | 1.03 s / 659 ms (1.6x) | 1.03 s / 435 ms (2.4x) | 948 ms / 2 ms (490.1x) | 23 ms / 12 ms (2.0x) |
+| text | exit 0, All 71 tests passed. | exit 0, All 71 tests passed. | 1.69 s / 884 ms (1.9x) | 1.69 s / 806 ms (2.1x) | 1.62 s / 5 ms (302.3x) | 13.40 s / 8.25 s (1.6x) |
+| trash | exit 0, All 10 tests passed. | exit 0, All 10 tests passed. | 559 ms / 360 ms (1.6x) | 559 ms / 187 ms (3.0x) | 568 ms / 2 ms (319.1x) | 18 ms / 12 ms (1.6x) |
+| tray | exit 0, All 5 tests passed. | exit 0, All 5 tests passed. | 670 ms / 396 ms (1.7x) | 670 ms / 193 ms (3.5x) | 627 ms / 18 ms (35.3x) | 23 ms / 12 ms (1.9x) |
+| ui | exit 0, All 91 tests passed. | exit 0, All 91 tests passed. | 2.95 s / 1.95 s (1.5x) | 2.95 s / 1.77 s (1.7x) | 2.74 s / 189 ms (14.5x) | 7.48 s / 3.54 s (2.1x) |

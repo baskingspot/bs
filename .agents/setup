@@ -84,7 +84,8 @@ fi
 # Wayland, fontconfig, freetype, harfbuzz and xkbcommon and needs ncurses'
 # `tic`. It wants Wayland 1.25 and wayland-protocols 1.49, newer than
 # Debian 12's, so those two are built into /usr/local. raylib-zig, another
-# corpus project, links X11 and GL. qemu-user-static runs aarch64-linux
+# corpus project, links X11 and GL, and siv links Vulkan (its render tests
+# run on Mesa's lavapipe). qemu-user-static runs aarch64-linux
 # binaries (the conformance harness and run tests), and libc6-arm64-cross
 # is the glibc of those that link it (qemu -L /usr/aarch64-linux-gnu).
 # Orbs only.
@@ -108,6 +109,7 @@ if [ "$ZIG_HOST" = x86_64-linux ] && command -v apt-get >/dev/null; then
   for p in meson ninja-build pkg-config libffi-dev libexpat1-dev libxml2-dev \
     libfontconfig-dev libfreetype-dev libharfbuzz-dev libxkbcommon-dev ncurses-bin \
     libx11-dev libxrandr-dev libxinerama-dev libxi-dev libxcursor-dev libgl-dev \
+    libvulkan-dev vulkan-validationlayers mesa-vulkan-drivers \
     qemu-user-static libc6-arm64-cross; do
     dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "ok installed" || missing="$missing $p"
   done

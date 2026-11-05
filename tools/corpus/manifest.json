@@ -3544,6 +3544,340 @@
      "name": "test:src/lib.zig"
     }
    ]
+  },
+  {
+   "name": "siv",
+   "url": "https://github.com/rockorager/siv",
+   "commit": "449e66f9c512a2bc0def68088d9afa26386daaca",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "siv",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ],
+     "note": "Needs pkg-config and the system's wayland-client, xkbcommon and fontconfig headers, and Vulkan's (libvulkan-dev, vulkan-validationlayers; render-vulkan's tests run on Mesa's lavapipe, mesa-vulkan-drivers), all in .agents/setup. siv fetches and builds harfbuzz, dav1d (with NASM), libavif, lcms2, SheenBidi and Lua itself. The WebKit webview (siv-webview) is skipped when pkg-config finds no WPE WebKit 2.50. The libraries and executables (siv, siv-static, the siv-lua libraries and exe, lua, abi, smoke, app, the guide examples) are built but not run."
+    },
+    {
+     "name": "siv-static",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "siv-lua:",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "siv-lua-module:",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "siv-lua:src/lua/main.zig",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "lua:",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "abi",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "smoke",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "app:",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "guide-counter_test",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "guide-zig-package",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "a11y",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "abi-unit",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "abi-wrapper",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "app",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "compositor",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "css",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "dbus",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "doc",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "docview",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "epub",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "headless",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "html",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "icon",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "image",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "intl",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "loop",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ],
+     "note": "Run time 0.85x upstream's (3 samples: about 2.0 s against 1.75 s): the stress test 'a wake that races the loop draining an earlier one is not lost' spins on std.atomic.spinLoopHint, an inline `pause`, and bs keeps every value of a function containing inline assembly in memory (docs/slop/architecture.md, the allocator's fallback)."
+    },
+    {
+     "name": "lua-gen-types",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "lua-notices",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "markdown",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "notices",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "pdf",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "platform",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "pool",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "portal",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "raster",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "render-cpu",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "render-vulkan",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "scene",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "spell",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "svg",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "text",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "trash",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "tray",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    },
+    {
+     "name": "ui",
+     "edit": [
+      "src/pool/pool.zig",
+      "    pub fn submit(pool: *Pool, job: *Job) SubmitError!void {"
+     ]
+    }
+   ]
   }
  ],
  "excluded": [

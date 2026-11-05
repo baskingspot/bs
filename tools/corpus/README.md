@@ -164,6 +164,13 @@ records `test_user`, and wamr `test-minimal-wasi` and
 upstream, and wamr's needs an aarch64 objdump. ulid.zig's `bench` prints
 timings, so its stdout is not compared (`"compare_stdout": false`).
 
+siv (MIT), the owner's GUI toolkit for Wayland, comes after ssz.zig as
+a whole build: 45 targets of its `install` and `test`, its 34 test
+binaries and its libraries and executables. It links Vulkan, compiles
+harfbuzz, dav1d, libavif and Lua from source with upstream's `zig cc`,
+and translates headers, among them its own siv.h next to Zig files it
+generates with the same name (run.py tells them apart by content).
+
 Each run is timed once (`run_secs`, the scoreboard's "run zig / bs"
 column), so run-time ratios to upstream come from the same run as the
 verdicts.
