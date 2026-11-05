@@ -5383,6 +5383,48 @@ fn strLimb(cg: *CodeGen, m: Mem, i: u32, reg: Reg) Error!void {
     try cg.storeReg(limb(m, i), reg, 8);
 }
 
+/// The fast path of a 2-limb `@mulWithOverflow(lhs, rhs)` into the tuple
+/// at `dst`, whose bit is at `flag`: when both operands are 64-bit values
+/// extended (a constant one is checked here), their product is `mul` and
+/// `smulh`/`umulh`, exact in 128 bits, which overflows `ty` only when
+/// `ty` is narrower than that; then branches to `end`. Otherwise falls
+/// through to the general product after it. Uses x9 to x11.
+fn wideMulFast(cg: *CodeGen, ty: Index, lhs: Mem, rhs: Mem, lhs_ref: Ref, rhs_ref: Ref, dst: Mem, flag: Mem, end: Encoder.Label) Error!void {
+    const e = &cg.e;
+    const s = cg.signed(ty);
+    const ops = [2]struct { m: Mem, ref: Ref }{ .{ .m = lhs, .ref = lhs_ref }, .{ .m = rhs, .ref = rhs_ref } };
+    for (ops) |op| if (op.ref.toInterned()) |v| {
+        if ((if (s) cg.ip.intValue(i64, v) == null else cg.ip.intValue(u64, v) == null)) return;
+    };
+    const slow = try e.newLabel();
+    for (ops) |op| if (op.ref.toInterned() == null) {
+        try cg.ldrLimb(.x10, op.m, 1);
+        if (s) {
+            try cg.ldrLimb(.x9, op.m, 0);
+            try e.cmp(.x, .x10, .{ .reg = .{ .reg = .x9, .shift = .asr, .amount = 63 } });
+            try e.bcond(.ne, slow);
+        } else try e.cbz(true, .x, .x10, slow);
+    };
+    try cg.ldrLimb(.x9, lhs, 0);
+    try cg.ldrLimb(.x10, rhs, 0);
+    try e.mulHigh(s, .x11, .x9, .x10);
+    try e.mul(.x, .x9, .x9, .x10);
+    try cg.strLimb(dst, 0, .x9);
+    try cg.strLimb(dst, 1, .x11);
+    if (Type.intInfo(cg.ip, ty).bits == 128) {
+        try cg.storeReg(flag, .zr, 1);
+    } else {
+        // Overflowed iff normalizing to `ty` changes the high limb.
+        try cg.normalizeWide(dst, ty);
+        try cg.ldrLimb(.x10, dst, 1);
+        try e.cmp(.x, .x10, .r(.x11));
+        try e.cset(.x, .x9, .ne);
+        try cg.storeReg(flag, .x9, 1);
+    }
+    try e.b(.{ .label = end });
+    e.bind(slow);
+}
+
 /// The fast path of a 2-limb division `lhs op rhs` into `dst`: when both
 /// operands fit in 64 bits (and, signed, the divisor is not -1, whose
 /// quotient of `minInt(i64)` does not), divides them as 64-bit integers
@@ -5825,6 +5867,9 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
             // The exact result, in `n` limbs (add, sub) or `2n` (mul).
             const wide_n = if (tag == .mul_with_overflow) 2 * n else n;
             const raw = try cg.allocSlot(@as(u64, wide_n) * 8, 8);
+            const end = try e.newLabel();
+            defer e.bind(end);
+            if (tag == .mul_with_overflow and n == 2) try cg.wideMulFast(ty, lhs.loc.mem, rhs.loc.mem, bin.lhs, bin.rhs, dst, flag, end);
             if (tag == .mul_with_overflow) {
                 // Products of the operands extended to 2n limbs are exact.
                 const a = try cg.allocSlot(@as(u64, wide_n) * 8, 8);

@@ -5785,6 +5785,46 @@ fn wideDivFast(cg: *CodeGen, tag: Inst.Tag, s: bool, lhs: Mem, rhs: Mem, rhs_ref
     e.bind(slow);
 }
 
+/// The fast path of a 2-limb `@mulWithOverflow(lhs, rhs)` into the tuple
+/// at `dst`, whose bit is at `flag`: when both operands are 64-bit values
+/// extended (a constant one is checked here), their product is one
+/// widening multiply into rdx:rax, exact in 128 bits, which overflows
+/// `ty` only when `ty` is narrower than that; then jumps to `end`.
+/// Otherwise falls through to the general product after it. Uses rax,
+/// rcx, and rdx.
+fn wideMulFast(cg: *CodeGen, ty: Index, lhs: Mem, rhs: Mem, lhs_ref: Ref, rhs_ref: Ref, dst: Mem, flag: Mem, end: Encoder.Label) Error!void {
+    const e = &cg.e;
+    const s = cg.signed(ty);
+    const ops = [2]struct { m: Mem, ref: Ref }{ .{ .m = lhs, .ref = lhs_ref }, .{ .m = rhs, .ref = rhs_ref } };
+    for (ops) |op| if (op.ref.toInterned()) |v| {
+        if ((if (s) cg.ip.intValue(i64, v) == null else cg.ip.intValue(u64, v) == null)) return;
+    };
+    const slow = try e.newLabel();
+    for (ops) |op| if (op.ref.toInterned() == null) {
+        if (s) {
+            try e.mov(.qword, .{ .reg = .rax }, .{ .mem = op.m });
+            try e.shift(.sar, .qword, .{ .reg = .rax }, 63);
+            try e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .mem = limb(op.m, 1) });
+        } else try e.alu(.cmp, .qword, .{ .mem = limb(op.m, 1) }, .{ .imm = 0 });
+        try e.jcc(.ne, .{ .label = slow });
+    };
+    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = lhs });
+    try e.unary(if (s) .imul else .mul, .qword, .{ .mem = rhs });
+    try e.mov(.qword, .{ .mem = dst }, .{ .reg = .rax });
+    try e.mov(.qword, .{ .mem = limb(dst, 1) }, .{ .reg = .rdx });
+    if (Type.intInfo(cg.ip, ty).bits == 128) {
+        try e.mov(.byte, .{ .mem = flag }, .{ .imm = 0 });
+    } else {
+        // Overflowed iff normalizing to `ty` changes the high limb.
+        try e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .rdx });
+        try cg.normalizeWide(dst, ty);
+        try e.alu(.cmp, .qword, .{ .reg = .rcx }, .{ .mem = limb(dst, 1) });
+        try e.setcc(.ne, .{ .mem = flag });
+    }
+    try e.jmp(.{ .label = end });
+    e.bind(slow);
+}
+
 /// `{ T, u1 }` results: the wrapped value and whether it overflowed `T`.
 fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error!void {
     const ip = cg.ip;
@@ -8988,6 +9028,9 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
             // The exact result, in `n` limbs (add, sub) or `2n` (mul).
             const wide_n = if (tag == .mul_with_overflow) 2 * n else n;
             const raw = Mem.at(.rbp, try cg.allocSlot(@as(u64, wide_n) * 8, 8));
+            const end = try e.newLabel();
+            defer e.bind(end);
+            if (tag == .mul_with_overflow and n == 2) try cg.wideMulFast(ty, lhs.loc.mem, rhs.loc.mem, bin.lhs, bin.rhs, dst, flag, end);
             if (tag == .mul_with_overflow) {
                 // Products of the operands extended to 2n limbs are exact.
                 const a = Mem.at(.rbp, try cg.allocSlot(@as(u64, wide_n) * 8, 8));
