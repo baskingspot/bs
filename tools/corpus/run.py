@@ -202,8 +202,11 @@ def strip_translate(words):
 def translate(compiler, words, cmds, cache_dir, src):
     """Translates the C headers a target imports with `compiler`, into
     `cache_dir`, and returns the target's command line importing them.
-    upstream's build cache names a translation `<digest>/<stem>.zig`, so a
-    module root whose name is a translated header's stem is that header."""
+    upstream's build cache names a translation `o/<digest>/<stem>.zig`, so a
+    module root at such a path, named for a translated header's stem, is
+    that header, unless the file upstream's build left there is not a
+    translation: siv generates Zig files named siv.zig next to its
+    translated siv.h."""
     by_stem = {}
     for key, tc in cmds.items():
         if key.startswith("translate-c:"):
@@ -214,8 +217,16 @@ def translate(compiler, words, cmds, cache_dir, src):
     res = list(words)
     for i, w in enumerate(words):
         m = re.match(r"-M([^=]+)=(.*)$", w)
-        if not m or os.path.basename(m.group(2)) not in by_stem or "/o/" not in m.group(2):
+        if (
+            not m
+            or os.path.basename(m.group(2)) not in by_stem
+            or os.path.basename(os.path.dirname(os.path.dirname(m.group(2)))) != "o"
+        ):
             continue
+        if os.path.exists(m.group(2)):
+            with open(m.group(2), errors="replace") as f:
+                if "zig.c_translation" not in f.read(512):
+                    continue
         tc = by_stem[os.path.basename(m.group(2))]
         argv = [compiler, "translate-c", *strip_translate(tc), "--cache-dir", cache_dir]
         try:
