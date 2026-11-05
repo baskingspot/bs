@@ -36,6 +36,9 @@ cold_start: u32 = 0,
 /// itself, or where it jumps if it is bypassed (`place`).
 cold: std.ArrayList(bool) = .empty,
 fwd: std.ArrayList(Block.Index) = .empty,
+/// Per block, from `place`: no branch reaches it after jump threading
+/// (`thread`), so it is not emitted.
+unreached: std.ArrayList(bool) = .empty,
 /// Per block, from `place` with `cover` (`-ffuzz`): whether it is a
 /// coverage point, whose code starts by setting its counter.
 covered: std.ArrayList(bool) = .empty,
@@ -198,17 +201,23 @@ pub const Term = struct {
     /// `fallthrough` and `noreturn`, the instruction that ended the block.
     inst: Inst.Index,
     /// `jump`, `fallthrough`: the target. `branch`: the block taken when
-    /// the condition is true (which follows in the layout) and the one
-    /// taken when it is false. `switch_br`: the start in `extra` of the
-    /// case blocks, and the else block (which follows in the layout).
+    /// the condition is true (which follows in the layout before jump
+    /// threading) and the one taken when it is false. `switch_br`: the
+    /// start in `extra` of the case blocks, and the else block (which
+    /// follows in the layout).
     succ: [2]u32 = .{ 0, 0 },
 
     pub const Tag = enum(u8) {
         /// `br` (which also writes the target block's result) or `repeat`.
+        /// After jump threading (`thread`), the target may be another
+        /// block than the `br`'s or `repeat`'s.
         jump,
         /// Continues into the next block in the layout without code: the
         /// entry of a loop, or the end of an empty body.
         fallthrough,
+        /// On a condition (`branchCond`): a `cond_br`'s, or after jump
+        /// threading a `br`'s operand, which the `br` also writes to its
+        /// block's result.
         branch,
         switch_br,
         ret,
@@ -227,6 +236,7 @@ pub fn deinit(f: *Func, gpa: Allocator) void {
     f.order.deinit(gpa);
     f.cold.deinit(gpa);
     f.fwd.deinit(gpa);
+    f.unreached.deinit(gpa);
     f.covered.deinit(gpa);
     f.extra.deinit(gpa);
     f.targets.deinit(gpa);
@@ -249,6 +259,13 @@ pub fn blockInsts(f: *const Func, block: Block.Index) []const Inst.Index {
 
 pub fn switchCases(f: *const Func, term: Term, len: usize) []const Block.Index {
     return f.extra.items[term.succ[0]..][0..len];
+}
+
+/// The condition of a `branch` terminator: its `cond_br`'s, or a threaded
+/// `br`'s operand (`thread`).
+pub fn branchCond(ir: *const Ir, term: Term) Inst.Ref {
+    const data = ir.instructions.items(.data)[@backingInt(term.inst)];
+    return if (ir.instructions.items(.tag)[@backingInt(term.inst)] == .br) data.br.operand else data.pl_op.operand;
 }
 
 /// Builds `f` from `ir`, replacing what it held.
@@ -292,10 +309,13 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
 /// that Sema marked (`Ir.CondBr.cover`, the branches the user wrote) and
 /// that is not cold. Switch cases get none, as upstream's. A covered block
 /// is not bypassed.
-pub fn place(f: *Func, gpa: Allocator, ir: *const Ir, cover: bool) Allocator.Error!void {
+pub fn place(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, cover: bool) Allocator.Error!void {
     const n = f.blocks.items.len;
     f.order.clearRetainingCapacity();
     try f.order.ensureTotalCapacity(gpa, f.layout.items.len);
+    try f.unreached.resize(gpa, n);
+    @memset(f.unreached.items, false);
+    if (!cover) try f.thread(gpa, ir, ip);
     try f.cold.resize(gpa, n);
     @memset(f.cold.items, false);
     try f.fwd.resize(gpa, n);
@@ -340,7 +360,7 @@ pub fn place(f: *Func, gpa: Allocator, ir: *const Ir, cover: bool) Allocator.Err
         f.fwd.items[@backingInt(block)] = if (steps > n) block else t;
     }
     for (f.layout.items, 0..) |block, i| {
-        if (i != 0 and f.fwd.items[@backingInt(block)] != block) continue;
+        if (!f.emits(i, block)) continue;
         const cold = i != 0 and f.endsCold(ir, @backingInt(block));
         f.cold.items[@backingInt(block)] = cold;
         if (!cold) f.order.appendAssumeCapacity(block);
@@ -349,6 +369,183 @@ pub fn place(f: *Func, gpa: Allocator, ir: *const Ir, cover: bool) Allocator.Err
     for (f.layout.items) |block| {
         if (f.cold.items[@backingInt(block)]) f.order.appendAssumeCapacity(block);
     }
+}
+
+/// After `plan`: a block without values whose `br` writes a result
+/// nothing reads (after jump threading, a constant for a bool the code
+/// only branched on) only jumps, so branches to it go where it goes, as
+/// for the blocks `place` bypasses, and it is not emitted.
+pub fn bypassUnread(f: *Func, ir: *const Ir) void {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const uses = f.live.items(.uses);
+    var any = false;
+    for (f.order.items[1..]) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        if (b.len != 0 or b.term.tag != .jump or tags[@backingInt(b.term.inst)] != .br or f.covered.items[@backingInt(block)]) continue;
+        if (uses[@backingInt(datas[@backingInt(b.term.inst)].br.block_inst)] != 0) continue;
+        f.fwd.items[@backingInt(block)] = @fromBackingInt(b.term.succ[0]);
+        any = true;
+    }
+    if (!any) return;
+    const n = f.blocks.items.len;
+    for (f.layout.items) |block| {
+        var t = block;
+        var steps: usize = 0;
+        while (f.fwd.items[@backingInt(t)] != t and steps <= n) : (steps += 1) t = f.fwd.items[@backingInt(t)];
+        f.fwd.items[@backingInt(block)] = if (steps > n) block else t;
+    }
+    var kept: u32 = 0;
+    var cold_start = f.cold_start;
+    for (f.order.items, 0..) |block, i| {
+        if (i != 0 and f.fwd.items[@backingInt(block)] != block) {
+            if (i < f.cold_start) cold_start -= 1;
+            continue;
+        }
+        f.order.items[kept] = block;
+        kept += 1;
+    }
+    f.order.shrinkRetainingCapacity(kept);
+    f.cold_start = cold_start;
+}
+
+/// Jump threading (part of pass 3): a branch whose outcome a predecessor
+/// already knows goes straight to its target from there.
+/// - A block whose result is a bool that the code after it only branches
+///   on (`a and b`, `a or b`): each `br` to it with a constant goes to the
+///   side the constant selects, and any other `br` becomes a branch on its
+///   operand, so the bool is never tested. The `br`s still write the
+///   result, which is then dead unless something else reads it, and the
+///   block after the body, which nothing reaches any more, is not emitted
+///   (`unreached`).
+/// - A loop whose header only loads a local and switches on it (a labeled
+///   switch's dispatch, `continue :sw .x`): a `repeat` right after a store
+///   of a constant to the local goes to the case holding it, when nothing
+///   else reads the load. The store stays.
+/// Values are IR instructions with one register each, so a jump may skip
+/// only blocks whose values nothing past them reads; liveness then
+/// follows the new edges, which stay within the loops of the old ones.
+fn thread(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Allocator.Error!void {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const insts = f.values.items(.inst);
+    // Loop headers checked for the switch dispatch, and whether they have it.
+    var headers: std.AutoHashMapUnmanaged(u32, bool) = .empty;
+    defer headers.deinit(gpa);
+    for (f.layout.items) |block| {
+        const b = &f.blocks.items[@backingInt(block)];
+        if (b.term.tag != .jump) continue;
+        const ti = @backingInt(b.term.inst);
+        switch (tags[ti]) {
+            .br => {
+                const br = datas[ti].br;
+                const blk = @backingInt(br.block_inst);
+                if (tags[blk] != .block or datas[blk].ty_pl.ty != .bool_type) continue;
+                const x = f.targets.items[blk];
+                const xb = &f.blocks.items[@backingInt(x)];
+                if (f.unreached.items[@backingInt(x)]) {
+                    // Done for an earlier `br`.
+                } else if (xb.len != 0 or xb.term.tag != .branch or branchCond(ir, xb.term) != br.block_inst.toRef()) {
+                    continue;
+                } else {
+                    f.unreached.items[@backingInt(x)] = true;
+                }
+                const succ = f.blocks.items[@backingInt(x)].term.succ;
+                if (br.operand.toInterned() == .bool_true) {
+                    b.term.succ[0] = succ[0];
+                } else if (br.operand.toInterned() == .bool_false) {
+                    b.term.succ[0] = succ[1];
+                } else {
+                    b.term = .{ .tag = .branch, .inst = b.term.inst, .succ = succ };
+                }
+            },
+            .repeat => {
+                const h = f.targets.items[@backingInt(datas[ti].repeat.loop_inst)];
+                const hb = f.blocks.items[@backingInt(h)];
+                if (hb.len != 1 or hb.term.tag != .switch_br) continue;
+                const l = insts[hb.start];
+                if (tags[@backingInt(l)] != .load or datas[@backingInt(hb.term.inst)].pl_op.operand != l.toRef()) continue;
+                const ptr = datas[@backingInt(l)].ty_op.operand;
+                // The last value before the `repeat` stores a constant to
+                // the local.
+                const k: Inst.Index = for (0..b.len) |j| {
+                    const v = insts[b.start + b.len - 1 - j];
+                    if (tags[@backingInt(v)] != .dbg_stmt) break v;
+                } else continue;
+                if (tags[@backingInt(k)] != .store or datas[@backingInt(k)].bin_op.lhs != ptr) continue;
+                const val = datas[@backingInt(k)].bin_op.rhs.toInterned() orelse continue;
+                if (ip.keyTag(val) == .undef) continue;
+                const gop = try headers.getOrPut(gpa, @backingInt(h));
+                if (!gop.found_existing) gop.value_ptr.* = f.dispatches(ir, ip, @backingInt(h));
+                if (!gop.value_ptr.*) continue;
+                b.term.succ[0] = f.switchTarget(ir, ip, hb.term, val);
+            },
+            else => {},
+        }
+    }
+    // Every `br` to a threaded block's exit was threaded: none is left.
+    for (f.layout.items) |block| {
+        if (f.unreached.items[@backingInt(block)]) f.blocks.items[@backingInt(block)].term.tag = .unreach;
+    }
+}
+
+/// Whether loop header `h` (one load and a switch on it, `thread`) loads
+/// a local that is not volatile, and nothing but the switch reads the load.
+fn dispatches(f: *const Func, ir: *const Ir, ip: *const InternPool, h: u32) bool {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const hb = f.blocks.items[h];
+    const l = f.values.items(.inst)[hb.start];
+    const ptr = datas[@backingInt(l)].ty_op.operand.toIndex() orelse return false;
+    if (tags[@backingInt(ptr)] != .alloc or Type.ptrInfo(ip, datas[@backingInt(ptr)].ty).flags.is_volatile) return false;
+    const Find = struct {
+        x: Inst.Ref,
+        found: bool = false,
+        pub fn use(c: *@This(), ref: Inst.Ref) void {
+            if (ref == c.x) c.found = true;
+        }
+    };
+    var find: Find = .{ .x = l.toRef() };
+    // The load dominates only what follows it in the layout.
+    for (f.values.items(.inst)[hb.start + 1 ..]) |v| forEachOperand(ir, v, &find);
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        if (b.start < hb.start or @backingInt(block) == h) continue;
+        switch (b.term.tag) {
+            .jump => if (tags[@backingInt(b.term.inst)] == .br) find.use(datas[@backingInt(b.term.inst)].br.operand),
+            .branch => find.use(branchCond(ir, b.term)),
+            .switch_br => find.use(datas[@backingInt(b.term.inst)].pl_op.operand),
+            .ret => find.use(datas[@backingInt(b.term.inst)].un_op),
+            .fallthrough, .noreturn, .unreach => {},
+        }
+    }
+    return !find.found;
+}
+
+/// The block switch `term` goes to for constant `val`.
+fn switchTarget(f: *const Func, ir: *const Ir, ip: *const InternPool, term: Term, val: InternPool.Index) u32 {
+    const payload = ir.instructions.items(.data)[@backingInt(term.inst)].pl_op.payload;
+    const x = ir.extraData(Ir.SwitchBr, payload);
+    var it = ir.switchCases(payload);
+    for (f.switchCases(term, x.data.cases_len)) |case_block| {
+        const c = it.next().?;
+        for (c.items) |item| {
+            if (item.toInterned() == val) return @backingInt(case_block);
+        }
+        // Ranges hold integers of at most 64 bits (Sema).
+        var k: usize = 0;
+        while (k < c.ranges.len) : (k += 2) {
+            const v = ip.intValue(i128, val).?;
+            if (v >= ip.intValue(i128, c.ranges[k].toInterned().?).? and v <= ip.intValue(i128, c.ranges[k + 1].toInterned().?).?) return @backingInt(case_block);
+        }
+    }
+    return term.succ[1];
+}
+
+/// Whether the `i`th block of the layout, `block`, has code: it is the
+/// entry, or neither bypassed nor unreached.
+pub fn emits(f: *const Func, i: usize, block: Block.Index) bool {
+    return i == 0 or (f.fwd.items[@backingInt(block)] == block and !f.unreached.items[@backingInt(block)]);
 }
 
 /// Whether block `index` ends with a call of a noreturn function (a
@@ -410,7 +607,7 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
         w.dead_start = if (deadEnd(b.term.tag)) 2 * b.start + 1 else null;
         const term_pos = 2 * (b.start + b.len) + 1;
         const term_data = datas[@backingInt(b.term.inst)];
-        const cond: ?Inst.Index = if (b.term.tag == .branch) term_data.pl_op.operand.toIndex() else null;
+        const cond: ?Inst.Index = if (b.term.tag == .branch) branchCond(ir, b.term).toIndex() else null;
         // The condition a `not` negates may be fused into the branch with
         // it (`plan`).
         const negated: ?Inst.Index = if (cond) |c| if (tags[@backingInt(c)] == .not) datas[@backingInt(c)].ty_op.operand.toIndex() else null else null;
@@ -424,13 +621,13 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
         }
         w.pos = term_pos;
         switch (b.term.tag) {
-            .jump => if (tags[@backingInt(b.term.inst)] == .br) {
+            .jump, .branch => if (tags[@backingInt(b.term.inst)] == .br) {
                 w.use(term_data.br.operand);
                 // The `br` writes the block's result.
                 const blk = @backingInt(term_data.br.block_inst);
                 w.end[blk] = @max(w.end[blk], term_pos);
-            },
-            .branch, .switch_br => w.use(term_data.pl_op.operand),
+            } else if (b.term.tag == .branch) w.use(term_data.pl_op.operand),
+            .switch_br => w.use(term_data.pl_op.operand),
             .ret => w.use(term_data.un_op),
             .fallthrough, .noreturn, .unreach => {},
         }
@@ -512,7 +709,12 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
     const no_fwd = no_tie - 1;
     for (f.layout.items) |block| {
         const b = f.blocks.items[@backingInt(block)];
-        const cond: ?Inst.Index = if (b.term.tag == .branch) datas[@backingInt(b.term.inst)].pl_op.operand.toIndex() else null;
+        // A threaded `br` that writes a result something reads needs its
+        // condition as a value.
+        const cond: ?Inst.Index = if (b.term.tag != .branch) null else if (tags[@backingInt(b.term.inst)] == .br) cond: {
+            const br = datas[@backingInt(b.term.inst)].br;
+            break :cond if (uses[@backingInt(br.block_inst)] == 0) br.operand.toIndex() else null;
+        } else datas[@backingInt(b.term.inst)].pl_op.operand.toIndex();
         const values = insts[b.start..][0..b.len];
         for (values, 0..) |inst, k| {
             const i = @backingInt(inst);
@@ -828,7 +1030,8 @@ fn termReadsShared(f: *const Func, ir: *const Ir, term: Term, v: Inst.Index) boo
     var c: SharedReads = .{ .f = f, .ir = ir, .v = v, .tie = no_tie };
     switch (term.tag) {
         .jump => if (ir.instructions.items(.tag)[@backingInt(term.inst)] == .br) c.use(data.br.operand),
-        .branch, .switch_br => c.use(data.pl_op.operand),
+        .branch => c.use(branchCond(ir, term)),
+        .switch_br => c.use(data.pl_op.operand),
         .ret => c.use(data.un_op),
         .fallthrough, .noreturn, .unreach => {},
     }

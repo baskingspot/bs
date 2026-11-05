@@ -268,7 +268,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     const t0 = std.Io.Timestamp.now(emit.zcu.io, .awake);
     try emit.ssa.build(gpa, ir);
     const cover = emit.fuzz and instrumented(emit, ir);
-    try emit.ssa.place(gpa, ir, cover);
+    try emit.ssa.place(gpa, ir, ip, cover);
     const t1 = std.Io.Timestamp.now(emit.zcu.io, .awake);
     var t2 = t1;
     defer {
@@ -1567,6 +1567,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
     cg.live = true;
     if (!cg.has_asm) try cg.exemptArgs();
     try f.plan(cg.gpa, ir, cg.ip, cg);
+    f.bypassUnread(ir);
     const fate = live.items(.fate);
     if (cg.has_asm) {
         for (f.values.items(.inst)) |inst| {
@@ -2002,7 +2003,8 @@ fn planSplits(cg: *CodeGen) Error!void {
         const t = datas[@backingInt(b.term.inst)];
         switch (b.term.tag) {
             .jump => if (cg.ir.instructions.items(.tag)[@backingInt(b.term.inst)] == .br) ws.use(t.br.operand),
-            .branch, .switch_br => ws.use(t.pl_op.operand),
+            .branch => ws.use(Ssa.branchCond(cg.ir, b.term)),
+            .switch_br => ws.use(t.pl_op.operand),
             .ret => ws.use(t.un_op),
             .fallthrough, .noreturn, .unreach => {},
         }
@@ -3799,7 +3801,7 @@ fn emitBlocks(cg: *CodeGen) Error!void {
     for (cg.labels) |*l| l.* = try cg.e.newLabel();
     var k: usize = 0; // the next block in `order`
     for (f.layout.items, 0..) |block, i| {
-        if (i != 0 and f.fwd.items[@backingInt(block)] != block) continue;
+        if (!f.emits(i, block)) continue;
         if (f.cold.items[@backingInt(block)]) {
             try cg.cold_starts.append(cg.gpa, .{ .line = cg.dbg_line, .column = cg.dbg_column, .open_start = @intCast(cg.cold_open.items.len), .open_len = @intCast(cg.dbg_open.items.len) });
             try cg.cold_open.appendSlice(cg.gpa, cg.dbg_open.items);
@@ -3920,23 +3922,18 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
         .fallthrough => try cg.jumpTo(term.succ[0], next),
         .jump => {
             try cg.checkNaked(tag);
-            // Not for a block nothing reads (one the rewrite rules
-            // replaced with its constant result).
-            if (tag == .br and cg.ssa.live.items(.uses)[@backingInt(data.br.block_inst)] != 0) switch (cg.homes[@backingInt(data.br.block_inst)]) {
-                .slot => |off| if (!cg.inSlot(data.br.operand, off)) try cg.copyTo(Mem.at(.rbp, off), data.br.operand),
-                .reg => |r| try cg.load(r, data.br.operand),
-                .regs => |p| try cg.loadRegs(p, data.br.operand),
-                .xmm => |x| try cg.loadXmm(x, try cg.valOf(data.br.operand)),
-                else => {},
-            };
+            if (tag == .br) try cg.brResult(data.br);
             try cg.jumpTo(term.succ[0], next);
         },
         .branch => {
             try cg.checkNaked(tag);
-            const cond = data.pl_op.operand;
+            // A threaded `br` writes its block's result first, which may
+            // be in rax (`planRegisters`).
+            if (tag == .br) try cg.brResult(data.br);
+            const cond = Ssa.branchCond(ir, term);
             const fused = if (cond.toIndex()) |c| cg.homes[@backingInt(c)] == .fused else false;
             const cc: Encoder.Cond = if (fused) try cg.condFlags(cond.toIndex().?) else cc: {
-                const r = try cg.regOf(cond, .rax);
+                const r = try cg.regOf(cond, if (tag == .br) .r11 else .rax);
                 try cg.e.@"test"(.byte, .{ .reg = r }, .{ .reg = r });
                 break :cc .ne;
             };
@@ -3954,6 +3951,20 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
             try cg.ret(data.un_op, next);
         },
         .unreach => try cg.e.ud2(),
+    }
+}
+
+/// Writes a `br`'s operand to its block's result, unless nothing reads it
+/// (a block the rewrite rules replaced with its constant result, or a
+/// bool only branched on, `Ssa.thread`).
+fn brResult(cg: *CodeGen, br: @FieldType(Inst.Data, "br")) Error!void {
+    if (cg.ssa.live.items(.uses)[@backingInt(br.block_inst)] == 0) return;
+    switch (cg.homes[@backingInt(br.block_inst)]) {
+        .slot => |off| if (!cg.inSlot(br.operand, off)) try cg.copyTo(Mem.at(.rbp, off), br.operand),
+        .reg => |r| try cg.load(r, br.operand),
+        .regs => |p| try cg.loadRegs(p, br.operand),
+        .xmm => |x| try cg.loadXmm(x, try cg.valOf(br.operand)),
+        else => {},
     }
 }
 

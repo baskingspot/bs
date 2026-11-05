@@ -1247,7 +1247,21 @@ In this order, each with the measured reason it is there:
    the code of unused `save_err_return_trace_index`.
 3. **Block cleanup.** Blocks that only jump are bypassed (jump
    threading of empty blocks) and unreachable blocks (after folding) are
-   dropped. One walk in reverse postorder.
+   dropped. One walk in reverse postorder. Before it, `Ssa.thread`
+   (2026-11-05, not under `-ffuzz`, whose coverage points are these
+   branches) threads two shapes. An `and`/`or` is a bool block whose
+   exit only branches on its result: each `br` to it with a constant
+   jumps to the branch's side, and each other `br` becomes that branch,
+   on the `br`'s operand (the `br` still writes the result when the
+   result has other uses). A labeled switch's `continue` that stores a
+   constant to the switched local right before its `repeat` jumps to the
+   case that constant selects, when the loop header is only the load
+   and the `switch_br` and nothing else reads the load (a capture does,
+   so a switch with captures keeps its dispatch). The store stays. No
+   source line moves: the skipped code is the bool block's exit and the
+   loop header, which hold no statements. `prove` sees the same edges:
+   it keeps the facts known at each `br` to a bool block, per result,
+   and a branch on the block assumes the facts of the matching exits.
 4. **Layout.** Blocks are placed in reverse postorder of the hot
    successors, with each branch's cold side (the panic call, which in
    render is 374 of 636 calls) moved to the end of the function. A

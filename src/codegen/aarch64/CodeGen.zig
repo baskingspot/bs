@@ -192,7 +192,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     const gpa = emit.gpa;
     try emit.ssa.build(gpa, ir);
     // No coverage points: main.zig refuses -ffuzz for aarch64-macos.
-    try emit.ssa.place(gpa, ir, false);
+    try emit.ssa.place(gpa, ir, ip, false);
     var cg: CodeGen = .{
         .emit = emit,
         .gpa = gpa,
@@ -231,6 +231,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         // `clobbers` marks the values that want a register.
         try f.liveness(gpa, ir, &cg);
         try f.plan(gpa, ir, ip, &cg);
+        f.bypassUnread(ir);
         cg.live = true;
         if (!f.has_asm) cg.allocateRegs();
     } else @memset(f.live.items(.fate), .normal);
@@ -1577,7 +1578,7 @@ fn emitBlocks(cg: *CodeGen) Error!void {
     for (cg.labels) |*l| l.* = try cg.e.newLabel();
     var k: usize = 0;
     for (f.layout.items, 0..) |block, i| {
-        if (i != 0 and f.fwd.items[@backingInt(block)] != block) continue;
+        if (!f.emits(i, block)) continue;
         if (f.cold.items[@backingInt(block)]) {
             try cg.cold_starts.append(cg.gpa, .{ .line = cg.dbg_line, .column = cg.dbg_column, .open_start = @intCast(cg.cold_open.items.len), .open_len = @intCast(cg.dbg_open.items.len) });
             try cg.cold_open.appendSlice(cg.gpa, cg.dbg_open.items);
@@ -1689,15 +1690,14 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
         .fallthrough => try cg.jumpTo(term.succ[0], next),
         .jump => {
             try cg.checkNaked(tag);
-            if (tag == .br) switch (cg.homes[@backingInt(data.br.block_inst)]) {
-                .slot => |m| try cg.copyTo(m, data.br.operand),
-                else => {},
-            };
+            if (tag == .br) try cg.brResult(data.br);
             try cg.jumpTo(term.succ[0], next);
         },
         .branch => {
             try cg.checkNaked(tag);
-            const cond = data.pl_op.operand;
+            // A threaded `br` writes its block's result first.
+            if (tag == .br) try cg.brResult(data.br);
+            const cond = Ssa.branchCond(ir, term);
             const fused = if (cond.toIndex()) |c| cg.fate(c) == .fused else false;
             const fall = cg.ssa.fwd.items[term.succ[1]] == next;
             if (fused) {
@@ -1721,6 +1721,14 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
         },
         // As LLVM lowers `@trap` and `unreachable` on arm64.
         .unreach => try cg.e.brk(1),
+    }
+}
+
+/// Writes a `br`'s operand to its block's result.
+fn brResult(cg: *CodeGen, br: @FieldType(Inst.Data, "br")) Error!void {
+    switch (cg.homes[@backingInt(br.block_inst)]) {
+        .slot => |m| try cg.copyTo(m, br.operand),
+        else => {},
     }
 }
 
