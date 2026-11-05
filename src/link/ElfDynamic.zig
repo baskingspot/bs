@@ -10,7 +10,9 @@
 //!
 //! .dynsym holds the null symbol, the imports (undefined) in input order,
 //! then the exports with default or protected visibility, ordered by GNU
-//! hash bucket as .gnu.hash requires. Binding is eager: each import has a
+//! hash bucket as .gnu.hash requires. A version script's named nodes
+//! (`Options.versions`) become .gnu.version_d, as lld writes it, and each
+//! export's .gnu.version entry names its node. Binding is eager: each import has a
 //! GOT slot, which an R_X86_64_GLOB_DAT fills at load time, and a PLT stub
 //! that jumps through it, so the output needs no lazy-binding machinery.
 
@@ -32,6 +34,9 @@ pub const Export = struct {
     size: ?u64 = null,
     weak: bool = false,
     visibility: std.lang.SymbolVisibility = .default,
+    /// Its .gnu.version index: `VER_NDX.GLOBAL` (unversioned), or 2 and
+    /// on for `Options.versions.names`.
+    version: u16 = @backingInt(elf.VER_NDX.GLOBAL),
     /// In an executable: the atom is a copy of a library's data object,
     /// which the loader fills from the library's (R_X86_64_COPY), and
     /// which every module then uses, the library too. Versioned as the
@@ -91,6 +96,17 @@ pub const Options = struct {
     /// version name (.gnu.version, .gnu.version_r): an executable's or a
     /// shared object's that links glibc.
     needed: []const []const u8 = &.{},
+    /// A version script's named nodes, the versions the exports are
+    /// defined in (.gnu.version_d).
+    versions: ?Versions = null,
+
+    pub const Versions = struct {
+        /// The base definition's name, index 1: the soname, else the
+        /// file's name, as lld's.
+        base: []const u8,
+        /// The nodes, index 2 and on, in the script's order.
+        names: []const []const u8,
+    };
 
     pub fn executable(o: *const Options) bool {
         return o.interp != null;
@@ -126,6 +142,9 @@ pub const Tables = struct {
     versym: []const u8 = &.{},
     verneed: []const u8 = &.{},
     verneed_count: u32 = 0,
+    /// .gnu.version_d, with `Options.versions`.
+    verdef: []const u8 = &.{},
+    verdef_count: u32 = 0,
 
     pub fn symbolCount(t: *const Tables) u32 {
         return 1 + t.n_imports + @as(u32, @intCast(t.exports.len));
@@ -228,13 +247,17 @@ pub fn tables(arena: Allocator, o: Options) Allocator.Error!Tables {
         gnu_chain[k] = (h & ~@as(u32, 1)) | @intFromBool(last);
     }
 
-    // .gnu.version: one index per .dynsym entry (0 local, 1 global, 2.. a
-    // version needed); .gnu.version_r: per library with versioned imports,
-    // a Verneed and a Vernaux per version, indices in that order.
+    // .gnu.version: one index per .dynsym entry (0 local, 1 global, then
+    // the versions defined, then those needed); .gnu.version_d: a Verdef
+    // and its Verdaux per version defined, the base first;
+    // .gnu.version_r: per library with versioned imports, a Verneed and a
+    // Vernaux per version, indices in that order.
     var versym: []u16 = &.{};
+    var verdef: std.ArrayList(u8) = .empty;
+    var verdef_count: u32 = 0;
     var verneed: std.ArrayList(u8) = .empty;
     var verneed_count: u32 = 0;
-    const versioned = for (o.imports) |imp| {
+    const versioned = o.versions != null or for (o.imports) |imp| {
         if (imp.version != null) break true;
     } else for (o.exports) |x| {
         if (x.copy != null and x.copy.?.version != null) break true;
@@ -243,7 +266,28 @@ pub fn tables(arena: Allocator, o: Options) Allocator.Error!Tables {
         versym = try arena.alloc(u16, n_syms);
         @memset(versym, 1);
         versym[0] = 0;
-        var next_index: u16 = 2;
+        for (exports.items, 1 + n_imports..) |i, k| versym[k] = o.exports[i].version;
+        if (o.versions) |v| {
+            verdef_count = @intCast(1 + v.names.len);
+            for (0..verdef_count) |j| {
+                const name = if (j == 0) v.base else v.names[j - 1];
+                const def: elf.Verdef = .{
+                    .version = 1,
+                    .flags = if (j == 0) elf.VER_FLG_BASE else 0,
+                    .ndx = @fromBackingInt(@intCast(j + 1)),
+                    .cnt = 1,
+                    .hash = sysvHash(name),
+                    .aux = @sizeOf(elf.Verdef),
+                    .next = if (j + 1 < verdef_count) @sizeOf(elf.Verdef) + @sizeOf(elf.Verdaux) else 0,
+                };
+                const aux: elf.Verdaux = .{ .name = @intCast(dynstr.items.len), .next = 0 };
+                try dynstr.appendSlice(arena, name);
+                try dynstr.append(arena, 0);
+                try verdef.appendSlice(arena, std.mem.asBytes(&def));
+                try verdef.appendSlice(arena, std.mem.asBytes(&aux));
+            }
+        }
+        var next_index: u16 = @intCast(1 + verdef_count + @intFromBool(verdef_count == 0));
         var prev_need_at: usize = 0;
         for (o.needed, needed, 0..) |_, file, lib| {
             var versions: std.ArrayList([]const u8) = .empty;
@@ -302,6 +346,8 @@ pub fn tables(arena: Allocator, o: Options) Allocator.Error!Tables {
         .versym = std.mem.sliceAsBytes(versym),
         .verneed = verneed.items,
         .verneed_count = verneed_count,
+        .verdef = verdef.items,
+        .verdef_count = verdef_count,
         .exports = exports.items,
         .n_imports = n_imports,
         .dynstr = dynstr.items,
@@ -377,6 +423,7 @@ pub const Addresses = struct {
     rela_size: u64,
     versym: u64 = 0,
     verneed: u64 = 0,
+    verdef: u64 = 0,
     /// The address and size of .preinit_array, .init_array and
     /// .fini_array, which the loader runs. Empty ones get no entries.
     arrays: [3]Array = @splat(.{}),
@@ -388,13 +435,13 @@ pub const Addresses = struct {
 /// of `Addresses.arrays` not empty.
 pub fn dynamicCount(t: *const Tables, o: Options, n_arrays: u64) u64 {
     const exe: u64 = @intFromBool(o.executable());
-    const versions: u64 = 3 * @as(u64, @intFromBool(t.verneed_count > 0));
+    const versions: u64 = @as(u64, @intFromBool(t.versym.len > 0)) + 2 * @as(u64, @intFromBool(t.verneed_count > 0)) + 2 * @as(u64, @intFromBool(t.verdef_count > 0));
     return 12 + @as(u64, @intFromBool(t.soname != null)) + @intFromBool(t.runpath != null) + t.needed.len + exe + versions + 2 * n_arrays;
 }
 
 /// The size of the largest .dynamic `writeDynamic` writes without
 /// libraries.
-const max_fixed_entries = 23;
+const max_fixed_entries = 25;
 
 pub fn writeDynamic(out: []u8, t: *const Tables, o: Options, a: Addresses) void {
     var at: usize = 0;
@@ -424,9 +471,17 @@ pub fn writeDynamic(out: []u8, t: *const Tables, o: Options, a: Addresses) void 
         fixed[n] = e;
         n += 1;
     }
+    if (t.versym.len > 0) {
+        fixed[n] = .{ elf.DT_VERSYM, a.versym };
+        n += 1;
+    }
+    if (t.verdef_count > 0) {
+        fixed[n..][0..2].* = .{ .{ elf.DT_VERDEF, a.verdef }, .{ elf.DT_VERDEFNUM, t.verdef_count } };
+        n += 2;
+    }
     if (t.verneed_count > 0) {
-        fixed[n..][0..3].* = .{ .{ elf.DT_VERSYM, a.versym }, .{ elf.DT_VERNEED, a.verneed }, .{ elf.DT_VERNEEDNUM, t.verneed_count } };
-        n += 3;
+        fixed[n..][0..2].* = .{ .{ elf.DT_VERNEED, a.verneed }, .{ elf.DT_VERNEEDNUM, t.verneed_count } };
+        n += 2;
     }
     if (o.executable()) {
         // Where the loader publishes `r_debug` for debuggers.

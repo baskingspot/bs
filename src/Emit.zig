@@ -18,6 +18,7 @@ const Ir = @import("Ir.zig");
 const Type = @import("Type.zig");
 const Zcu = @import("Zcu.zig");
 const Diag = @import("diag.zig");
+const VersionScript = @import("link/VersionScript.zig");
 const Atom = @import("link/Atom.zig");
 const print = @import("Ir/print.zig");
 const SymbolKey = Atom.SymbolKey;
@@ -98,6 +99,13 @@ pic: enum { none, pic, pie } = .none,
 shared: bool = false,
 /// The shared object's DT_SONAME.
 soname: ?[]const u8 = null,
+/// A shared object's version script (`--version-script`), and whether it
+/// may name what nothing defines (`--undefined-version`).
+version_script: ?*const VersionScript = null,
+allow_undefined_version: bool = false,
+/// The input objects' definitions the version script makes local, which
+/// no longer reach the exports.
+version_locals: []const []const u8 = &.{},
 /// An aarch64-macos dylib's install name (`-install_name`; else its
 /// output path, as upstream's) and current version (`--version`, else
 /// 1.0.0), for LC_ID_DYLIB.
@@ -1117,6 +1125,25 @@ fn convertInputs(emit: *Emit, inputs: Inputs) !bool {
         .elf => |p| p,
         .macho => |p| return emit.convertMachOInputs(p),
     };
+    // What a version script makes local is hidden, as lld makes it: the
+    // objects reach it directly, not through the loader, and it is local
+    // in .symtab and out of the exports.
+    if (emit.shared) if (emit.version_script) |vs| {
+        var locals: std.ArrayList([]const u8) = .empty;
+        var defs = in.defs.keyIterator();
+        var commons = in.commons.keys();
+        while (true) {
+            const name = if (defs.next()) |k| k.* else if (commons.len > 0) n: {
+                defer commons = commons[1..];
+                break :n commons[0];
+            } else break;
+            if (vs.place(name) != VersionScript.local) continue;
+            const v = try in.visibility.getOrPut(in.arena, name);
+            if (!v.found_existing or v.value_ptr.* != 1) v.value_ptr.* = 2;
+            try locals.append(emit.allocator(), name);
+        }
+        emit.version_locals = locals.items;
+    };
     const converted = try in.convert(InputResolver{ .emit = emit });
     for (in.errors.items) |msg| try emit.zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{msg});
     if (in.errors.items.len != 0) return false;
@@ -1651,8 +1678,13 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         // With glibc, its libraries are needed and its symbols versioned.
         var arena_state: std.heap.ArenaAllocator = .init(emit.gpa);
         defer arena_state.deinit();
-        var dynamic: ElfDynamic.Options = if (emit.glibc) |g| try g.sharedObjectOptions(arena_state.allocator(), imports, emit.exports.items, emit.shared_libs) else .{ .imports = imports };
-        dynamic.exports = emit.exports.items;
+        const exports = if (emit.version_script) |vs| try emit.applyVersionScript(arena_state.allocator(), vs, sub_path) orelse return false else emit.exports.items;
+        var dynamic: ElfDynamic.Options = if (emit.glibc) |g| try g.sharedObjectOptions(arena_state.allocator(), imports, exports, emit.shared_libs) else .{ .imports = imports };
+        dynamic.exports = exports;
+        if (emit.version_script) |vs| {
+            const names = try vs.names(arena_state.allocator());
+            if (names.len != 0) dynamic.versions = .{ .base = emit.soname orelse std.fs.path.basename(sub_path), .names = names };
+        }
         dynamic.soname = emit.soname;
         dynamic.runpath = emit.runpath;
         var shared_options = options;
@@ -1668,6 +1700,58 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         return false;
     };
     return true;
+}
+
+/// The exports with the places version script `vs` gives them: a local
+/// one hidden (in no .dynsym), a versioned one with its node's index.
+/// Null after reporting a name the script gives a version that nothing
+/// defines, as lld refuses it without `--undefined-version`.
+fn applyVersionScript(emit: *Emit, arena: Allocator, vs: *const VersionScript, sub_path: []const u8) !?[]const ElfDynamic.Export {
+    const exports = try arena.dupe(ElfDynamic.Export, emit.exports.items);
+    const names = try arena.alloc([]const u8, exports.len);
+    for (names, exports) |*n, x| n.* = x.name;
+    const places = try arena.alloc(u16, exports.len);
+    const unmatched = try vs.assign(arena, names, emit.version_locals, places);
+    if (unmatched.len != 0 and !emit.allow_undefined_version) {
+        const pat = unmatched[0];
+        const node = find: for (vs.nodes) |n| {
+            for (n.globals) |p| if (p.offset == pat.offset) break :find n.name;
+            for (n.locals) |p| if (p.offset == pat.offset) break :find "local";
+        } else "";
+        const more = if (unmatched.len > 1) try std.fmt.allocPrint(arena, " (and {d} more names)", .{unmatched.len - 1}) else "";
+        emit.link_diagnostic = .{
+            .code = .@"version-script",
+            .loc = versionScriptLoc(vs.path, vs.source, pat.offset),
+            .msg = try std.fmt.allocPrint(emit.allocator(), "version script assignment of '{s}' to symbol '{s}' failed: '{s}' defines no such symbol{s}", .{ if (node.len == 0) "global" else node, pat.text, std.fs.path.basename(sub_path), more }),
+            .hint = "export it, remove it from the script, or allow it with --undefined-version (`linker_allow_undefined_version = true`)",
+        };
+        return null;
+    }
+    for (exports, places) |*x, place| switch (place) {
+        VersionScript.local => x.visibility = .hidden,
+        else => x.version = place,
+    };
+    return exports;
+}
+
+/// The location of byte `offset` of version script `path`, whose text
+/// is `src`, for messages.
+pub fn versionScriptLoc(path: []const u8, src: []const u8, offset: u32) Diag.Loc {
+    const at = @min(offset, src.len);
+    const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..at], '\n')) |nl| nl + 1 else 0;
+    const line_end = std.mem.indexOfScalarPos(u8, src, at, '\n') orelse src.len;
+    var end = at;
+    while (end < line_end and !std.ascii.isWhitespace(src[end]) and src[end] != ';') end += 1;
+    return .{
+        .path = path,
+        .line = @intCast(1 + std.mem.count(u8, src[0..line_start], "\n")),
+        .col = @intCast(1 + at - line_start),
+        .start = @intCast(at),
+        .end = @intCast(@max(end, at + @intFromBool(at < src.len))),
+        .main = @intCast(at),
+        .source_line = src[line_start..line_end],
+        .in_lib = false,
+    };
 }
 
 /// Reports link error `err`: one a program can fix as `link_diagnostic`,

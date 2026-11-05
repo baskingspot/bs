@@ -3594,6 +3594,26 @@ names, before layout, and Elf fills in the exports' values after it.
   libraries that do not link libc. `_DYNAMIC`, which std.dynamic_library
   reads through a weak hidden extern, is linker-defined
   (`ElfDynamic.dynamic_key`).
+- Version scripts (`--version-script`, `link/VersionScript.zig`), as
+  lld reads them: named nodes (parents read and ignored, as lld ignores
+  them) or one anonymous node; `global:` and `local:` patterns, names or
+  shell wildcards (`*`, `?`, `[...]`), a quoted pattern being a name;
+  `extern "C"` blocks. `extern "C++"` is refused (it needs demangled
+  names). Names with `@` versions (`.symver` in C objects) match as
+  plain names, without lld's handling of `name@node`. Each export gets its place as lld's
+  `scanVersionScript` gives it (exact names in node order, first wins;
+  then other wildcards, later nodes first; then `*`); unmatched exports
+  stay global and unversioned. A local one is hidden (out of .dynsym); a
+  versioned one gets its node's index in `.gnu.version`, and the named
+  nodes become `.gnu.version_d` (DT_VERDEF, DT_VERDEFNUM): the base
+  definition (VER_FLG_BASE, the soname, else the file name) at index 1,
+  then each node with one Verdaux, as lld writes it; needed versions
+  number after them. An exact name nothing exports fails the link with
+  `error[version-script]` at the pattern, unless `--undefined-version`.
+  Only shared objects apply a script; a bs executable or static library
+  exports nothing for one to change, and aarch64-macos refuses it (ld64
+  has none). The script is an input of the inputs record, so editing it
+  relinks.
 - TLS: `x86_64_tlsld` is PC-relative to the GOT pair (DTPMOD64, 0);
   `x86_64_dtpoff32` is the offset in the PT_TLS block.
 - Externs resolve to the compilation's exports, then to compiler_rt (a

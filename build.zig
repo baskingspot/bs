@@ -1034,6 +1034,39 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         lc_so_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&lc_so_run.step);
     }
+    // A version script: glibc's loader finds each export under the node
+    // that versions it (a C object's too, through a wildcard), not under
+    // another, and nothing that `local: *` hides. A name the script
+    // versions that nothing defines is an error at it, as lld's.
+    {
+        const vs_so = b.addRunArtifact(bs);
+        vs_so.setName("bs build-lib -dynamic -lc --version-script");
+        vs_so.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", "x86_64-linux-gnu", "--name", "so_version", "--version-script" });
+        vs_so.addFileArg(b.path("test/link_input/so_version.map"));
+        vs_so.addFileArg(b.path("test/link_input/so_version.zig"));
+        vs_so.addFileArg(b.path("test/link_input/so_version.c"));
+        vs_so.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+        const vs_file = vs_so.addPrefixedOutputFileArg("-femit-bin=", "libso_version.so");
+        const vs_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc" });
+        vs_host.addFileArg(b.path("test/link_input/so_version_main.zig"));
+        const vs_run = std.Build.Step.Run.create(b, "run so_version_main (bs shared library with a version script)");
+        vs_run.addFileArg(vs_host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        vs_run.addFileArg(vs_file);
+        vs_run.addCheck(.{ .expect_stderr_exact = "ver_old@VER_1.0 1\nver_new@VER_1.1 2\nver_new@VER_1.0 none\nver_c_one@VER_1.0 3\nver_hidden none\nc_local_fn none\nc_local_ptr none\n" });
+        vs_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&vs_run.step);
+
+        const bad_map = b.addWriteFiles().add("bad.map", "VER_1.0 {\n  global: ver_old; ver_gone;\n  local: *;\n};\n");
+        const vs_bad = b.addRunArtifact(bs);
+        vs_bad.setName("bs build-lib -dynamic --version-script naming an undefined symbol");
+        vs_bad.addArgs(&.{ "build-lib", "-dynamic", "-target", "x86_64-linux", "--version-script" });
+        vs_bad.addFileArg(bad_map);
+        vs_bad.addFileArg(b.path("test/link_input/so_version.zig"));
+        _ = vs_bad.addPrefixedOutputFileArg("-femit-bin=", "libbad.so");
+        vs_bad.addCheck(.{ .expect_stderr_match = "bad.map:2:20: error[version-script]: version script assignment of 'VER_1.0' to symbol 'ver_gone' failed: 'libbad.so' defines no such symbol" });
+        vs_bad.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        test_step.dependOn(&vs_bad.step);
+    }
     // A shared library that links another shared library, given as an
     // input: DT_NEEDED names it and its functions are imports, as
     // upstream's.

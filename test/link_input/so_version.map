@@ -1,0 +1,11 @@
+/* so_version.zig's: two nodes, the second inheriting from the first. */
+VER_1.0 {
+  global:
+    ver_old;
+    ver_c_*;
+  local:
+    *;
+};
+VER_1.1 {
+  global: ver_new;
+} VER_1.0;

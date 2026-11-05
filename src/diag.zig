@@ -94,6 +94,7 @@ pub const Code = enum(u16) {
     @"naked-fn",
     // The linkers.
     @"branch-range",
+    @"version-script",
 };
 
 /// A location, resolved for rendering.

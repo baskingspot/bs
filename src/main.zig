@@ -9,6 +9,7 @@ const BuildWeb = @import("BuildWeb.zig");
 const Zcu = @import("Zcu.zig");
 const Ir = @import("Ir.zig");
 const Emit = @import("Emit.zig");
+const VersionScript = @import("link/VersionScript.zig");
 const inline_ir = @import("codegen/inline.zig");
 const Incremental = @import("Incremental.zig");
 const cache = @import("cache.zig");
@@ -189,6 +190,11 @@ pub const Options = struct {
     /// `-rpath` arguments, then for the native target the `-L`
     /// directories, without repeats, joined with ':'; null for none.
     runpath: ?[]const u8 = null,
+    /// `--version-script`: the ld version script of a shared object
+    /// (`link/VersionScript.zig`), and `--undefined-version`, which lets
+    /// it name what nothing defines.
+    version_script: ?[]const u8 = null,
+    allow_undefined_version: bool = false,
     /// C source files, each with its module's C arguments and options,
     /// compiled by upstream's Clang (CSource.zig), and the settings they
     /// share.
@@ -896,6 +902,7 @@ const InputsRecord = struct {
         for ([_][]const []const u8{ job.link_objects, job.link_shared }) |paths| for (paths) |path| {
             if (!try r.addHashed(arena, io, &buf, path, false)) return;
         };
+        if (job.opts.version_script) |path| if (!try r.addHashed(arena, io, &buf, path, true)) return;
         try buf.appendSlice(arena, std.mem.asBytes(&std.mem.zeroes(Entry)));
         const stat = Io.Dir.cwd().statFile(io, out_path, .{}) catch return;
         const o: Output = .{ .inode = @intCast(stat.inode), .size = stat.size, .mtime = @intCast(stat.mtime.toNanoseconds()), .path_len = out_path.len };
@@ -1261,6 +1268,23 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         i.glibc = null;
     };
     if (glibc != null) emit.runpath = opts.runpath;
+    // A shared object's exports, versions and visibility; other outputs
+    // export nothing for a script to change.
+    var version_script: VersionScript = undefined;
+    if (opts.version_script) |path| if (opts.dynamic) {
+        const source = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
+            fatal("unable to read version script '{s}': {t}", .{ path, err });
+        switch (try VersionScript.parse(arena, path, source)) {
+            .ok => |vs| version_script = vs,
+            .err => |e| return .{ .errors = try dupeDiagnostics(arena, &.{.{
+                .code = .@"version-script",
+                .loc = Emit.versionScriptLoc(path, source, e.offset),
+                .msg = e.msg,
+            }}) },
+        }
+        emit.version_script = &version_script;
+        emit.allow_undefined_version = opts.allow_undefined_version;
+    };
     emit.lld = opts.c_root;
     // aarch64-macos links against Mach-O dylibs, with LC_RPATHs.
     const macos = opts.bs_target == .aarch64_macos;
@@ -1966,7 +1990,6 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"-fno-compiler-rt"},               .{"-fubsan-rt"},
     .{"-fno-ubsan-rt"},                  .{"-fdll-export-fns"},
     .{"-fno-dll-export-fns"},            .{"-rdynamic"},
-    .{"--undefined-version"},            .{"--no-undefined-version"},
     .{"--enable-new-dtags"},             .{"--disable-new-dtags"},
     .{"-feach-lib-rpath"},               .{"-fno-each-lib-rpath"},
     .{"-fno-lto"},                       .{"-fno-sanitize-coverage-trace-pc-guard"},
@@ -2015,7 +2038,6 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "--force_undefined", "bs does not support '--force_undefined' yet" },
     .{ "-mcmodel", "bs only supports the default code model ('-mcmodel')" },
     .{ "--script", "bs does not support linker scripts ('--script'); build this step with upstream zig" },
-    .{ "--version-script", "bs does not support version scripts ('--version-script')" },
     .{ "--subsystem", "bs does not target Windows ('--subsystem')" },
     .{ "-municode", "bs does not target Windows ('-municode')" },
 });
@@ -2266,6 +2288,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             try lib_dirs.append(arena, nextArg(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "-L")) {
             try lib_dirs.append(arena, arg[2..]);
+        } else if (std.mem.eql(u8, arg, "--version-script")) {
+            opts.version_script = nextArg(args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--undefined-version") or std.mem.eql(u8, arg, "--no-undefined-version")) {
+            opts.allow_undefined_version = arg[2] == 'u';
         } else if (std.mem.eql(u8, arg, "-rpath")) {
             try rpaths.append(arena, nextArg(args, &i, arg));
         } else if (std.mem.eql(u8, arg, "-install_name")) {
@@ -2413,6 +2439,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     }
     if (opts.exe_dynamic and !opts.link_libc and command != .build_lib)
         setUnsupported(&opts, arena, "bs links executables statically unless they link libc ('-dynamic'); add -lc or build this step with upstream zig", .{});
+    // ld64, which upstream's Mach-O links follow, has no version scripts.
+    if (opts.version_script != null and opts.dynamic and opts.bs_target == .aarch64_macos)
+        setUnsupported(&opts, arena, "bs does not support version scripts ('--version-script') on aarch64-macos, whose linkers have none; use symbol visibility instead", .{});
     if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena);
     // As upstream (`requiresPIC`): glibc makes objects and libraries
     // position-independent, as their builtin says; musl does not. bs
@@ -2935,6 +2964,7 @@ test {
     _ = @import("cpu.zig");
     _ = @import("link/Atom.zig");
     _ = @import("link/Elf.zig");
+    _ = @import("link/VersionScript.zig");
     _ = @import("link/ElfObject.zig");
     _ = @import("link/Glibc.zig");
     _ = @import("link/ElfInput.zig");
