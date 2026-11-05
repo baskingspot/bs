@@ -3189,6 +3189,9 @@ const Graph = struct {
     atom_units: []u32 = &.{},
     dep_units: []u32 = &.{},
     dep_refs: []Recorder.Ref = &.{},
+    /// Functions' dependencies on their declarations, where analysis did
+    /// not record one.
+    own_navs: std.ArrayList(struct { u32, Recorder.Ref }) = .empty,
     use_units: []u32 = &.{},
     func_ref_items: [][2]u32 = &.{},
     unit_ref_items: [][2]u32 = &.{},
@@ -3231,6 +3234,7 @@ const Graph = struct {
         gpa.free(g.atom_units);
         gpa.free(g.dep_units);
         gpa.free(g.dep_refs);
+        g.own_navs.deinit(gpa);
         gpa.free(g.use_units);
         gpa.free(g.func_ref_items);
         gpa.free(g.unit_ref_items);
@@ -3242,6 +3246,12 @@ const Graph = struct {
         gpa.free(g.root_nodes);
         gpa.free(g.reach_nodes);
         g.* = .{ .r = g.r, .debug_of = g.debug_of };
+    }
+
+    fn addOwnNav(g: *Graph, zcu: *Zcu, unit: u32, func: InternPool.Index, dependees: []const Zcu.Dependee) !void {
+        const nav = zcu.ip.indexToKey(func).func.owner_nav;
+        for (dependees) |d| if (d == .nav_val and d.nav_val == nav) return;
+        try g.own_navs.append(g.r.gpa, .{ unit, try g.r.addDependee(.{ .nav_val = nav }) });
     }
 
     fn collect(g: *Graph, io: Io, zcu: *Zcu, emit: *const Emit) !void {
@@ -3275,7 +3285,16 @@ const Graph = struct {
                 g.dep_refs[n_refs] = try r.addDependee(d);
                 n_refs += 1;
             }
+            if (unit == .func) try g.addOwnNav(zcu, u.*, unit.func, dependees);
         }
+        // A function depends on its declaration's value, which is the
+        // function: a new type makes it another item under the same key,
+        // and its body may read the type (a return value coerced to a
+        // changed error set) without a dependency of its own.
+        for (emit.atom_owners.items, g.atom_units) |owner, u| switch (owner) {
+            .unit => |unit| if (unit == .func and !zcu.deps.contains(unit)) try g.addOwnNav(zcu, u, unit.func, &.{}),
+            .content, .link, .input => {},
+        };
         // Every non-empty inferred error set, read or not: a loaded function
         // takes its set from this node, and an edit build may add its first
         // reader (`Replay.loadFunc` reads no node as an empty set).
@@ -3403,6 +3422,7 @@ const Graph = struct {
             }
             n_refs += dependees.len;
         }
+        for (g.own_navs.items) |it| try r.edges.append(gpa, .{ try r.unitNode(it[0]), Recorder.edge(try r.dependeeNode(it[1]), false) });
         for (emit.content_uses.items, g.use_units) |use, u| {
             const index = try r.unitNode(u);
             try r.edges.append(gpa, .{ index, Recorder.edge(r.map.get(@backingInt(use.key)).?, false) });

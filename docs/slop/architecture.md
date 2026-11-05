@@ -706,7 +706,12 @@ entry's dependencies (see "Comptime") keep their conditional flags,
 below.
 
 **Dependencies.** A plain edge U → D means U resolves D itself, so replay
-may load D for a green U. Lowering reads what other units resolved
+may load D for a green U. A function's body also depends on its own
+declaration's value (`Incremental.Graph.addOwnNav`), which is the
+function item: an error set its type names that gains a name makes it
+another item under the same key, and the body (a return value coerced
+to that set) reads the type without an edge of its own
+(test/run/edit_error_set_type.zig). Lowering reads what other units resolved
 (`bcRequire`), on every branch, so its reads are not plain edges of the
 units that run the body. They are *conditional* edges (`Sema.deps_conditional`,
 recorded in `Zcu.conditional_deps`): they count for invalidation (a changed
