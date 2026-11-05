@@ -136,7 +136,7 @@ pub fn emit(gpa: Allocator, atoms: []const Atom, options: Options) Error![]u8 {
             .tdata => .thread_data,
             .tbss => .thread_bss,
             .init_array => .mod_init_func,
-            .preinit_array, .fini_array, .sancov_cntrs, .sancov_pcs => {
+            .preinit_array, .fini_array, .sancov_cntrs, .sancov_pcs, .objc => {
                 if (diag) |d| d.* = .{ .atom = a.name };
                 return error.UnsupportedRelocation;
             },

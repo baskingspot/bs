@@ -588,7 +588,8 @@ fn shndxOf(has_tls: bool, has_relro: bool, has_arrays: bool) [n_sections]u16 {
     const r: u16 = @intFromBool(has_relro);
     const a: u16 = 3 * @as(u16, @intFromBool(has_arrays));
     const d = 3 + 2 * t + r;
-    return .{ 2, 1, d + a, d + a + 1, 3, 4, d + a + 3, d + a + 2, d, d + 1, d + 2, 3 + 2 * t };
+    // `.objc` atoms are Mach-O's only; it has no header.
+    return .{ 2, 1, d + a, d + a + 1, 3, 4, d + a + 3, d + a + 2, d, d + 1, d + 2, 0, 3 + 2 * t };
 }
 /// Output sections: one per `Atom.Section`, with the same index, then
 /// .data.rel.ro, where a position-independent image puts the .rodata atoms
@@ -596,10 +597,10 @@ fn shndxOf(has_tls: bool, has_relro: bool, has_arrays: bool) [n_sections]u16 {
 const n_sections = std.enums.values(Atom.Section).len + 1;
 const data_rel_ro = n_sections - 1;
 /// Padding within each section: int3 in code, zeros elsewhere.
-const fills = [n_sections]u8{ 0xcc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+const fills = [n_sections]u8{ 0xcc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 /// Sections with no bytes in the file.
-const zero_fill = [n_sections]bool{ false, false, false, true, false, true, true, false, false, false, false, false };
-const sym_types = [n_sections]elf.STT{ .FUNC, .OBJECT, .OBJECT, .OBJECT, .TLS, .TLS, .OBJECT, .OBJECT, .OBJECT, .OBJECT, .OBJECT, .OBJECT };
+const zero_fill = [n_sections]bool{ false, false, false, true, false, true, true, false, false, false, false, false, false };
+const sym_types = [n_sections]elf.STT{ .FUNC, .OBJECT, .OBJECT, .OBJECT, .TLS, .TLS, .OBJECT, .OBJECT, .OBJECT, .OBJECT, .OBJECT, .OBJECT, .OBJECT };
 
 /// The TLS segment's addresses [start, end), and the thread pointer, the
 /// end rounded up to the segment's alignment, as if the segment were the
@@ -1011,6 +1012,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var starts: [n_sections]u64 = undefined;
     starts[rodata] = aligns[rodata].forward(r_tables_end);
     const rodata_end = starts[rodata] + sizes[rodata];
+    // `.objc` atoms are Mach-O's only: an empty section anywhere.
+    starts[@backingInt(Atom.Section.objc)] = rodata_end;
     // The coverage PC table, if any, follows .rodata in the R segment.
     starts[pcs] = aligns[pcs].forward(rodata_end);
     const pcs_end = starts[pcs] + sizes[pcs];
@@ -1075,7 +1078,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
     l.base = base;
     l.shndx = shndxOf(has_tls, has_relro, has_arrays);
-    l.sym_bias = .{ 0, 0, 0, 0, base + tls_start, base + tls_start, 0, 0, 0, 0, 0, 0 };
+    l.sym_bias = .{ 0, 0, 0, 0, base + tls_start, base + tls_start, 0, 0, 0, 0, 0, 0, 0 };
     // The section bounds the linker defines.
     for (bound_sections, 0..) |sec, i| {
         const start = starts[@backingInt(sec)];

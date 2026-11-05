@@ -4420,8 +4420,28 @@ splits only what must be split.
   and Zig's thread-locals share the writer's descriptors.
 - Dropped: `__DWARF` (see debug info), `__LD,__compact_unwind` and
   `__TEXT,__eh_frame` (see unwind), `__LLVM`, `__llvm_addrsig`,
-  `__apple_*` accelerator tables. Objective-C sections (`__objc_*`,
-  `__cfstring`) are an error.
+  `__apple_*` accelerator tables.
+- Objective-C (decided 2026-11-05). The sections libobjc finds by name
+  (`__objc_classlist`, `__objc_nlclslist`, `__objc_catlist`,
+  `__objc_nlcatlist`, `__objc_protolist`, `__objc_imageinfo`,
+  `__objc_selrefs`, `__objc_classrefs`, `__objc_superrefs`,
+  `__objc_protorefs`) become `Atom.Section.objc` atoms named
+  `.<section>`, and MachO.zig gives each its own output section where
+  ld64 puts it: the lists and image info in __DATA_CONST, the
+  references the runtime rewrites (selector uniquing, class remapping)
+  in __DATA. One `Atom.Section` kind and the name, rather than a kind
+  per section, keeps ELF's per-section arrays (one output section per
+  kind) from growing. The objects' `__objc_imageinfo` merge into one
+  atom, as ld64 merges them: the class-properties and signed-class_ro
+  flags only if every object has them, the Swift bits from the first
+  object with any. What the runtime reaches only through those
+  pointers goes where its kind does: `__objc_const`, `__objc_data`,
+  `__objc_ivar` and `__cfstring` to `__data` (the runtime writes class
+  and method data), the name strings to merged C strings. Upstream
+  keeps those under their own names; nothing finds them by name.
+  Other `__objc_*` sections are an error, and so are references to
+  `objc_msgSend$<selector>` stubs (Clang's
+  `-fobjc-msgsend-selector-stubs`), which bs does not synthesize.
 
 **Symbols.** N_SECT (external, private external, local), N_UNDF (COMMON
 when n_value > 0), N_ABS, N_WEAK_DEF and N_WEAK_REF (`n_desc`), and

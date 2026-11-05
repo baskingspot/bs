@@ -1454,6 +1454,12 @@ fn addMachOInputs(b: *std.Build, m: *std.Build.Module) void {
     const lib = ar.addOutputFileArg("lib.a");
     ar.addFileArg(objs[1]);
     ar.addFileArg(objs[2]);
+    for ([_][]const u8{ "a", "b" }) |x| {
+        const cc = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-macos", "-c" });
+        cc.addFileArg(b.path(b.fmt("test/link_input/macho_objc_{s}.m", .{x})));
+        cc.addArg("-o");
+        m.addAnonymousImport(b.fmt("macho_input_objc_{s}.o", .{x}), .{ .root_source_file = cc.addOutputFileArg(b.fmt("objc_{s}.o", .{x})) });
+    }
     m.addAnonymousImport("macho_input_main.o", .{ .root_source_file = objs[0] });
     m.addAnonymousImport("macho_input_lib.a", .{ .root_source_file = lib });
 }

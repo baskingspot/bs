@@ -11,7 +11,7 @@ Changes a user of bs notices, newest first, in the
 - Container-level assembly (`comptime { asm (...); }`) is assembled into the program on all targets, so its `.global` labels satisfy `extern fn` declarations and C references, as with upstream's LLVM backend (upstream's self-hosted backends drop it). What bs cannot assemble is a compile error at the `asm`.
 - On aarch64-linux and aarch64-macos, C calls pass homogeneous float aggregates, vectors, and bool vectors as Clang does, and `callconv(.{ .aarch64_preserve_none = .{} })` works; upstream's C ABI tests pass.
 - On aarch64-macos, `-framework X`, `-needed_framework X` and `-F<dir>` link frameworks, and `-l` finds the macOS SDK's text-based stubs (`-lz`, `-lobjc`), as upstream does.
-- On aarch64-macos, libraries that linked frameworks re-export, such as libobjc and CoreFoundation, are linked in their own right, and imports bind to them, as upstream does.
+- On aarch64-macos, C objects compiled as Objective-C link: classes, protocols, selector references and constant CFStrings work as with upstream (raylib-zig's GLFW backend), and libraries that linked frameworks re-export, such as libobjc and CoreFoundation, are linked in their own right, as upstream does.
 
 ### Changed
 

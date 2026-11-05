@@ -112,6 +112,13 @@ pub const Section = enum(u8) {
     preinit_array,
     init_array,
     fini_array,
+    /// Objective-C metadata from aarch64-macos C objects that libobjc
+    /// finds by section name (`__objc_classlist`, `__objc_selrefs`, ...),
+    /// which keeps a Mach-O output section of that name. The atom's name
+    /// is the section's, after a `.` (`.__objc_classlist`), so it writes
+    /// no symbol. The ObjC sections reached only through pointers go to
+    /// `.data` and `.rodata`. ELF links never get these.
+    objc,
 
     /// Whether atoms in the section are zero-filled, with no `bytes`.
     pub fn isZeroFill(s: Section) bool {

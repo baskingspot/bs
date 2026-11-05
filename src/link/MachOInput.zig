@@ -496,6 +496,7 @@ fn sectionOf(o: *const Object, index: usize) ?Atom.Section {
     const sect = name16(&s.sectname);
     if (s.flags & macho.S_ATTR_DEBUG != 0 or std.mem.eql(u8, seg, "__DWARF") or std.mem.eql(u8, seg, "__LD") or std.mem.eql(u8, seg, "__LLVM")) return null;
     if (std.mem.eql(u8, sect, "__eh_frame") or std.mem.eql(u8, sect, "__llvm_addrsig")) return null;
+    if (objc_named.has(sect)) return .objc;
     return switch (sectionType(s)) {
         macho.S_ZEROFILL, macho.S_GB_ZEROFILL => .bss,
         macho.S_CSTRING_LITERALS, macho.S_4BYTE_LITERALS, macho.S_8BYTE_LITERALS, macho.S_16BYTE_LITERALS => .rodata,
@@ -512,10 +513,29 @@ fn sectionOf(o: *const Object, index: usize) ?Atom.Section {
     };
 }
 
+/// The Objective-C sections libobjc finds by name, which keep their own
+/// output sections (`Atom.Section.objc`). The objects' `__objc_imageinfo`
+/// are merged into one (`Converter.imageInfo`).
+const objc_named: std.StaticStringMap(void) = .initComptime(.{
+    .{"__objc_classlist"}, .{"__objc_nlclslist"}, .{"__objc_catlist"},
+    .{"__objc_nlcatlist"}, .{"__objc_protolist"}, .{"__objc_imageinfo"},
+    .{"__objc_selrefs"},   .{"__objc_classrefs"}, .{"__objc_superrefs"},
+    .{"__objc_protorefs"},
+});
+
+/// The other Objective-C sections bs links, which the runtime reaches
+/// only through pointers: class and method data, which the runtime
+/// writes (`.data`), and the name strings (C strings, `.rodata`).
+/// `__cfstring`'s constant strings are plain data too.
+const objc_plain: std.StaticStringMap(void) = .initComptime(.{
+    .{"__objc_const"},    .{"__objc_data"},     .{"__objc_ivar"},
+    .{"__objc_methname"}, .{"__objc_methtype"}, .{"__objc_classname"},
+});
+
 /// The section types and names bs does not link, with why.
 fn unsupportedSection(s: macho.section_64) ?[]const u8 {
     const sect = name16(&s.sectname);
-    if (std.mem.startsWith(u8, sect, "__objc_") or std.mem.eql(u8, sect, "__cfstring")) return "Objective-C";
+    if (std.mem.startsWith(u8, sect, "__objc_") and !objc_named.has(sect) and !objc_plain.has(sect)) return "Objective-C";
     return switch (sectionType(s)) {
         macho.S_MOD_TERM_FUNC_POINTERS => "termination functions (ld64 rejects them too)",
         macho.S_THREAD_LOCAL_VARIABLE_POINTERS, macho.S_THREAD_LOCAL_INIT_FUNCTION_POINTERS => "thread-local pointers or initializers",
@@ -578,6 +598,12 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
             .zero_fill = common.size,
         });
     }
+    if (c.image_info) |info| {
+        const bytes = try arena.alloc(u8, 8);
+        std.mem.writeInt(u32, bytes[0..4], info[0], .little);
+        std.mem.writeInt(u32, bytes[4..8], info[1], .little);
+        try atoms.append(arena, .{ .key = .fromName("mobj:objc_imageinfo"), .name = ".__objc_imageinfo", .section = .objc, .alignment = .@"4", .bytes = bytes });
+    }
     try c.reportUndefined();
     if (weak_used) try values.append(arena, .{ .key = undefined_weak_key, .value = 0 });
     try values.appendSlice(arena, c.abs_values.items);
@@ -592,6 +618,9 @@ fn Converter(comptime Ctx: type) type {
         atoms: *std.ArrayList(Atom),
         weak_used: *bool,
         abs_values: std.ArrayList(Elf.Value) = .empty,
+        /// The merged `__objc_imageinfo` (version, flags), if an object
+        /// has one.
+        image_info: ?[2]u32 = null,
         /// How each external name the objects reference resolved.
         resolved: std.StringHashMapUnmanaged(?Target) = .empty,
         /// The strong names nothing defines, each with the objects that
@@ -641,6 +670,10 @@ fn Converter(comptime Ctx: type) type {
             const s = o.sects[index];
             if (unsupportedSection(s)) |why| return c.fail("{s}: bs does not link section '{s}' ({s})", .{ o.path, c.sectName(index), why });
             const kind = sectionOf(o, index) orelse return;
+            if (kind == .objc) {
+                const sect = name16(&s.sectname);
+                if (std.mem.eql(u8, sect, "__objc_imageinfo")) return c.imageInfo(index);
+            }
             const literal = switch (sectionType(s)) {
                 macho.S_CSTRING_LITERALS, macho.S_4BYTE_LITERALS, macho.S_8BYTE_LITERALS, macho.S_16BYTE_LITERALS => true,
                 else => false,
@@ -656,7 +689,7 @@ fn Converter(comptime Ctx: type) type {
             const pieces = o.pieces[index];
             if (pieces.len == 0) return c.addAtom(.{
                 .key = o.keys[index],
-                .name = c.atomName(index),
+                .name = if (kind == .objc) try std.fmt.allocPrint(c.in.arena, ".{s}", .{name16(&s.sectname)}) else c.atomName(index),
                 .section = kind,
                 .alignment = sectionAlignment(s),
                 .bytes = if (kind.isZeroFill()) &.{} else bytes,
@@ -673,6 +706,22 @@ fn Converter(comptime Ctx: type) type {
                     .zero_fill = if (kind.isZeroFill()) p.end - p.start else 0,
                 }, rels.items, p.start, p.end);
             }
+        }
+
+        /// Merges object `c.o`'s `__objc_imageinfo` into `image_info`, as
+        /// ld64 does: a class-properties or signed-class_ro flag only if
+        /// every object has it, the Swift version bits from the first
+        /// object that has them, the rest from the first object.
+        fn imageInfo(c: *C, index: u32) !void {
+            const bytes = c.o.sectionBytes(index);
+            if (bytes.len != 8 or c.o.sects[index].nreloc != 0) return c.fail("{s}: section '{s}' is not 8 bytes of image info", .{ c.o.path, c.sectName(index) });
+            const next: [2]u32 = .{ std.mem.readInt(u32, bytes[0..4], .little), std.mem.readInt(u32, bytes[4..8], .little) };
+            const all_of: u32 = 1 << 4 | 1 << 6;
+            const swift: u32 = 0xffff_ff00;
+            if (c.image_info) |*info| {
+                info[1] &= ~all_of | next[1];
+                if (info[1] & swift == 0) info[1] |= next[1] & swift;
+            } else c.image_info = next;
         }
 
         /// The largest power of two, up to the section's alignment, that
@@ -985,4 +1034,64 @@ test "objects and a Darwin archive from upstream's Clang and llvm-ar" {
     }
     try testing.expectEqual(4, got_loads);
     try testing.expectEqual(1, calls);
+}
+
+test "Objective-C sections keep their names, and the image infos merge into one" {
+    const testing = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    // test/link_input/macho_objc_{a,b}.m, two root classes compiled by
+    // build.zig's `addMachOInputs`.
+    var in: Inputs = .{ .arena = arena_state.allocator() };
+    try in.addObject("a.o", @embedFile("macho_input_objc_a.o"));
+    try in.addObject("b.o", @embedFile("macho_input_objc_b.o"));
+    const Ctx = struct {
+        fn zigExport(_: @This(), _: []const u8) !?SymbolKey {
+            return null;
+        }
+        fn rtExport(_: @This(), _: []const u8) !?SymbolKey {
+            return null;
+        }
+        fn importSym(_: @This(), name: []const u8, _: bool) !?SymbolKey {
+            return .fromName(name);
+        }
+    };
+    const c = try in.convert(Ctx{});
+    try testing.expectEqual(0, in.errors.items.len);
+    var named: std.StringArrayHashMapUnmanaged(u32) = .empty;
+    var image_info: ?Atom = null;
+    for (c.atoms) |a| switch (a.section) {
+        .objc => {
+            const gop = try named.getOrPut(arena_state.allocator(), a.name);
+            gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+            if (std.mem.eql(u8, a.name, ".__objc_imageinfo")) image_info = a;
+        },
+        else => {},
+    };
+    // One class list entry, class reference and selector reference per
+    // object, each its own atom, and one image info for both.
+    for ([_][]const u8{ ".__objc_classlist", ".__objc_classrefs", ".__objc_selrefs" }) |name|
+        try testing.expectEqual(2, named.get(name).?);
+    try testing.expectEqual(1, named.get(".__objc_imageinfo").?);
+    try testing.expectEqual(4, named.count());
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0x40, 0, 0, 0 }, image_info.?.bytes);
+    // The classes themselves are data the runtime writes; each selector
+    const class = (try in.lookup("OBJC_CLASS_$_RootA")).?;
+    for (c.atoms) |a| if (a.key == class.key) try testing.expectEqual(.data, a.section);
+    // reference points at its method name, a C string both objects'
+    // atoms for which share a key, so the link keeps one.
+    var targets: [2]SymbolKey = undefined;
+    var n: usize = 0;
+    for (c.atoms) |a| if (std.mem.eql(u8, a.name, ".__objc_selrefs")) {
+        targets[n] = a.targets[a.relocs[0].info.target];
+        n += 1;
+    };
+    try testing.expectEqual(targets[0], targets[1]);
+    var names: usize = 0;
+    for (c.atoms) |a| if (a.key == targets[0]) {
+        try testing.expectEqual(.rodata, a.section);
+        try testing.expectEqualStrings("answer\x00", a.bytes);
+        names += 1;
+    };
+    try testing.expect(names > 0);
 }

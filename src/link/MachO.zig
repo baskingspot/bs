@@ -11,9 +11,11 @@
 //!   __PAGEZERO    4 GiB, no access, not in the file (not in a dylib)
 //!   __TEXT        r-x  header and load commands, __text, __stubs, __const,
 //!                      __unwind_info (with debug info)
-//!   __DATA_CONST  rw-, read-only after fixups  __got, __const
-//!   __DATA        rw-  __data, __thread_vars, __thread_data, then memory
-//!                      only: __thread_bss, __bss
+//!   __DATA_CONST  rw-, read-only after fixups  __got, __mod_init_func,
+//!                      __const, the Objective-C lists and image info
+//!   __DATA        rw-  the Objective-C references, __data, __thread_vars,
+//!                      __thread_data, then memory only: __thread_bss,
+//!                      __bss
 //!   __LINKEDIT    r--  chained fixups, exports trie, function starts,
 //!                      symbol table, indirect symbol table, string table,
 //!                      code signature
@@ -306,8 +308,31 @@ const sig_page_size = 0x1000;
 const stub_size = 12;
 
 /// Output sections, in layout order.
-const Sect = enum(u4) { text, stubs, text_const, unwind_info, got, mod_init_func, data_const, data, thread_vars, thread_data, thread_bss, bss };
-const n_sects = 12;
+const Sect = enum(u5) {
+    text,
+    stubs,
+    text_const,
+    unwind_info,
+    got,
+    mod_init_func,
+    data_const,
+    objc_classlist,
+    objc_nlclslist,
+    objc_catlist,
+    objc_nlcatlist,
+    objc_protolist,
+    objc_imageinfo,
+    objc_selrefs,
+    objc_protorefs,
+    objc_classrefs,
+    objc_superrefs,
+    data,
+    thread_vars,
+    thread_data,
+    thread_bss,
+    bss,
+};
+const n_sects = std.enums.values(Sect).len;
 const Seg = enum(u2) { text, data_const, data };
 const sect_info = [n_sects]struct { seg: Seg, name: []const u8, flags: u32 }{
     .{ .seg = .text, .name = "__text", .flags = macho.S_REGULAR | macho.S_ATTR_PURE_INSTRUCTIONS | macho.S_ATTR_SOME_INSTRUCTIONS },
@@ -317,6 +342,19 @@ const sect_info = [n_sects]struct { seg: Seg, name: []const u8, flags: u32 }{
     .{ .seg = .data_const, .name = "__got", .flags = macho.S_NON_LAZY_SYMBOL_POINTERS },
     .{ .seg = .data_const, .name = "__mod_init_func", .flags = macho.S_MOD_INIT_FUNC_POINTERS },
     .{ .seg = .data_const, .name = "__const", .flags = macho.S_REGULAR },
+    // Objective-C metadata libobjc finds by name, where ld64 puts it: the
+    // lists and image info read-only after fixups, the references the
+    // runtime rewrites (selector uniquing, class remapping) writable.
+    .{ .seg = .data_const, .name = "__objc_classlist", .flags = macho.S_REGULAR | macho.S_ATTR_NO_DEAD_STRIP },
+    .{ .seg = .data_const, .name = "__objc_nlclslist", .flags = macho.S_REGULAR | macho.S_ATTR_NO_DEAD_STRIP },
+    .{ .seg = .data_const, .name = "__objc_catlist", .flags = macho.S_REGULAR | macho.S_ATTR_NO_DEAD_STRIP },
+    .{ .seg = .data_const, .name = "__objc_nlcatlist", .flags = macho.S_REGULAR | macho.S_ATTR_NO_DEAD_STRIP },
+    .{ .seg = .data_const, .name = "__objc_protolist", .flags = macho.S_REGULAR | macho.S_ATTR_NO_DEAD_STRIP },
+    .{ .seg = .data_const, .name = "__objc_imageinfo", .flags = macho.S_REGULAR },
+    .{ .seg = .data, .name = "__objc_selrefs", .flags = macho.S_LITERAL_POINTERS | macho.S_ATTR_NO_DEAD_STRIP },
+    .{ .seg = .data, .name = "__objc_protorefs", .flags = macho.S_REGULAR },
+    .{ .seg = .data, .name = "__objc_classrefs", .flags = macho.S_REGULAR | macho.S_ATTR_NO_DEAD_STRIP },
+    .{ .seg = .data, .name = "__objc_superrefs", .flags = macho.S_REGULAR | macho.S_ATTR_NO_DEAD_STRIP },
     .{ .seg = .data, .name = "__data", .flags = macho.S_REGULAR },
     .{ .seg = .data, .name = "__thread_vars", .flags = macho.S_THREAD_LOCAL_VARIABLES },
     .{ .seg = .data, .name = "__thread_data", .flags = macho.S_THREAD_LOCAL_REGULAR },
@@ -347,16 +385,31 @@ fn zeroFill(s: usize) bool {
     return s == bss or s == thread_bss;
 }
 
+/// The output section of an `.objc` atom, named `.<section name>`.
+fn objcSect(name: []const u8) ?u5 {
+    if (name.len == 0 or name[0] != '.') return null;
+    for (sect_info, 0..) |info, s| {
+        if (s >= @backingInt(Sect.objc_classlist) and s <= @backingInt(Sect.objc_superrefs) and std.mem.eql(u8, name[1..], info.name)) return @intCast(s);
+    }
+    return null;
+}
+
+/// Whether atoms in section `s` may hold absolute addresses, which become
+/// chained fixups: the file-backed data sections but the linker's own.
+fn takesFixups(s: usize) bool {
+    return sect_info[s].seg != .text and !zeroFill(s) and s != got and s != thread_vars;
+}
+
 /// Where pass 1 placed an atom. A thread-local atom's place is its
 /// descriptor's, in `__thread_vars`; `copy` places its bytes in the
 /// template again, in the same order as `layOut`.
 const Place = packed struct(u64) {
     /// Offset within the chunk's part of the section.
-    offset: u39,
+    offset: u38,
     /// Alignment padding between the previous atom of the section and this
     /// one, which the copy pass fills.
     gap: u21,
-    section: u4,
+    section: u5,
 
     const duplicate: Place = @bitCast(@as(u64, std.math.maxInt(u64)));
 
@@ -468,8 +521,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var strtab_len: u64 = 1;
     var max_targets: usize = 0;
     const n_imports: u32 = std.math.cast(u32, options.imports.len) orelse return error.OutOfMemory;
-    // Fixups in address order: GOT slots, __mod_init_func, __DATA_CONST,__const,
-    // then __data, the descriptors' binds, and __thread_data, each section's in
+    // Fixups in address order, which is `Sect` order: GOT slots,
+    // __mod_init_func, __DATA_CONST,__const, the ObjC sections, then
+    // __data, the descriptors' binds, and __thread_data, each section's in
     // chunk order.
     var n_fixups: [n_sects]u64 = @splat(0);
     n_fixups[got] = n_imports;
@@ -683,8 +737,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // rounded to a page; the zero-fill sections follow in memory.
     {
         var end = seg_start[@backingInt(Seg.data)];
-        for ([_]usize{ data, thread_vars, thread_data }) |s| {
-            if (sizes[s] > 0) end = starts[s] + sizes[s];
+        for (sect_info, 0..) |info, s| {
+            if (info.seg == .data and !zeroFill(s) and sizes[s] > 0) end = starts[s] + sizes[s];
         }
         seg_file_end[@backingInt(Seg.data)] = std.mem.alignForward(u64, end, page_size);
     }
@@ -696,7 +750,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const linkedit_vm = seg_mem_end[last_seg];
 
     // __LINKEDIT contents.
-    const fixups_seg = [3]bool{ false, n_fixups[got] + n_fixups[mod_init_func] + n_fixups[data_const] > 0, n_fixups[data] + n_fixups[thread_vars] + n_fixups[thread_data] > 0 };
+    var fixups_seg: [3]bool = @splat(false);
+    for (sect_info, n_fixups) |info, n| fixups_seg[@backingInt(info.seg)] = fixups_seg[@backingInt(info.seg)] or n > 0;
     // Page starts cover only the file-backed pages: under page-in linking
     // the kernel maps every page the starts list from the file, so a
     // listed zero-fill page (__bss, __thread_bss) would read the bytes
@@ -808,22 +863,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // sections and segments and within __LINKEDIT. Padding within a section
     // is filled by the atom or chunk after it.
     {
-        const written = [_][2]u64{
-            .{ 0, cmds_end },
-            .{ starts[text], starts[text] + sizes[text] },
-            .{ starts[stubs], starts[stubs] + sizes[stubs] },
-            .{ starts[text_const], starts[text_const] + sizes[text_const] },
-            .{ starts[unwind_info], starts[unwind_info] + sizes[unwind_info] },
-            .{ starts[got], starts[got] + sizes[got] },
-            .{ starts[mod_init_func], starts[mod_init_func] + sizes[mod_init_func] },
-            .{ starts[data_const], starts[data_const] + sizes[data_const] },
-            .{ starts[data], starts[data] + sizes[data] },
-            .{ starts[thread_vars], starts[thread_vars] + sizes[thread_vars] },
-            .{ starts[thread_data], starts[thread_data] + sizes[thread_data] },
-            .{ fixups_off, func_starts_off + func_starts_len },
-            .{ symtab_off, strtab_end },
-            .{ sig_off, file_len },
-        };
+        // In file order: the header, the file-backed sections, then
+        // __LINKEDIT's parts.
+        var written: [1 + n_sects + 3][2]u64 = undefined;
+        written[0] = .{ 0, cmds_end };
+        for (written[1..][0..n_sects], starts, sizes, 0..) |*w, start, size, s| {
+            w.* = if (zeroFill(s)) .{ start, start } else .{ start, start + size };
+        }
+        written[1 + n_sects ..].* = .{ .{ fixups_off, func_starts_off + func_starts_len }, .{ symtab_off, strtab_end }, .{ sig_off, file_len } };
         var at: u64 = 0;
         for (written) |w| {
             if (w[1] == w[0]) continue;
@@ -1580,10 +1627,10 @@ fn LinkOf(comptime Input: type) type {
                     continue;
                 }
                 var n_abs: u32 = 0;
-                if (a.section == .rodata or a.section == .data or a.section == .tdata or a.section == .init_array) {
+                if (a.section != .text and !a.section.isZeroFill()) {
                     for (a.relocs) |r| n_abs += @intFromBool(r.info.kind == .aarch64_abs64);
                 }
-                var s: u4 = switch (a.section) {
+                var s: u5 = switch (a.section) {
                     .text => text,
                     .rodata => if (n_abs > 0) data_const else text_const,
                     .data => data,
@@ -1597,6 +1644,10 @@ fn LinkOf(comptime Input: type) type {
                     // the other arrays only from ELF objects.
                     .init_array => mod_init_func,
                     .preinit_array, .fini_array => unreachable,
+                    .objc => objcSect(a.name) orelse {
+                        l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
+                        continue;
+                    },
                 };
                 c.n_fixups[s] += n_abs;
                 var off = a.alignment.forward(c.sizes[s]);
@@ -1610,7 +1661,7 @@ fn LinkOf(comptime Input: type) type {
                     c.sizes[s] += tlv_descriptor_size;
                     c.aligns[s] = .@"8";
                     c.n_fixups[s] += 1;
-                    p.* = .{ .offset = std.math.cast(u39, off) orelse {
+                    p.* = .{ .offset = std.math.cast(u38, off) orelse {
                         l.fail(chunk, i, error.OutOfMemory, .{ .atom = a.name });
                         continue;
                     }, .gap = 0, .section = s };
@@ -1622,7 +1673,7 @@ fn LinkOf(comptime Input: type) type {
                     continue;
                 }
                 p.* = .{
-                    .offset = std.math.cast(u39, off) orelse {
+                    .offset = std.math.cast(u38, off) orelse {
                         l.fail(chunk, i, error.OutOfMemory, .{ .atom = a.name });
                         continue;
                     },
@@ -1912,7 +1963,7 @@ fn LinkOf(comptime Input: type) type {
 
         /// Applies `a`'s relocations to its copy `dst` at address `p_base` in
         /// section `sect`, recording fixups from `fixups.*` on.
-        fn applyRelocs(l: *const Link, a: *const Atom, dst: []u8, p_base: u64, sect: u4, resolved: []const Resolved, fixups: *u64, diag: *Diagnostic) Error!void {
+        fn applyRelocs(l: *const Link, a: *const Atom, dst: []u8, p_base: u64, sect: u5, resolved: []const Resolved, fixups: *u64, diag: *Diagnostic) Error!void {
             for (a.relocs) |r| {
                 const width: u4 = switch (r.info.kind) {
                     .aarch64_abs64, .value64 => 8,
@@ -1978,7 +2029,7 @@ fn LinkOf(comptime Input: type) type {
                         std.mem.writeInt(u32, field[0..4], v, .little);
                     },
                     .aarch64_abs64 => {
-                        if ((sect != mod_init_func and sect != data_const and sect != data and sect != thread_data) or p & 3 != 0) return invalid;
+                        if (!takesFixups(sect) or p & 3 != 0) return invalid;
                         const v = switch (t.kind) {
                             .addr => rebase: {
                                 const target = @as(i128, t.v) + addend - base_address;
@@ -3456,4 +3507,51 @@ test "a dylib has its install name, exports and fixups, and no __PAGEZERO or ent
 /// A version as LC_BUILD_VERSION packs it: xxxx.yy.zz.
 pub fn packVersion(v: std.SemanticVersion) u32 {
     return @as(u32, @intCast(@min(v.major, 0xffff))) << 16 | @as(u32, @intCast(@min(v.minor, 0xff))) << 8 | @as(u32, @intCast(@min(v.patch, 0xff)));
+}
+
+test "Objective-C atoms keep the sections libobjc finds by name, with rebased pointers" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const main: SymbolKey = .fromName("main");
+    const cls: SymbolKey = .fromName("cls");
+    const sel_a: SymbolKey = .fromName("sel_a");
+    const sel_b: SymbolKey = .fromName("sel_b");
+    const zero8: [8]u8 = @splat(0);
+    // Two objects' selector references, which must stay one contiguous
+    // array, a class list entry, and the merged image info.
+    const atoms = [_]Atom{
+        .{ .key = main, .name = "main", .section = .text, .alignment = .@"4", .bytes = &.{ 0xc0, 0x03, 0x5f, 0xd6 } },
+        .{ .key = cls, .name = "cls", .section = .data, .alignment = .@"8", .bytes = &@as([40]u8, @splat(0)) },
+        .{ .key = sel_a, .name = "sel_a", .section = .rodata, .bytes = "alloc\x00" },
+        .{ .key = sel_b, .name = "sel_b", .section = .rodata, .bytes = "init\x00" },
+        .{ .key = .fromName("refs1"), .name = ".__objc_selrefs", .section = .objc, .alignment = .@"8", .bytes = &zero8, .targets = &.{sel_a}, .relocs = &.{.init(0, .aarch64_abs64, 0, 0)} },
+        .{ .key = .fromName("list"), .name = ".__objc_classlist", .section = .objc, .alignment = .@"8", .bytes = &zero8, .targets = &.{cls}, .relocs = &.{.init(0, .aarch64_abs64, 0, 0)} },
+        .{ .key = .fromName("refs2"), .name = ".__objc_selrefs", .section = .objc, .alignment = .@"8", .bytes = &zero8, .targets = &.{sel_b}, .relocs = &.{.init(0, .aarch64_abs64, 0, 0)} },
+        .{ .key = .fromName("info"), .name = ".__objc_imageinfo", .section = .objc, .alignment = .@"4", .bytes = &.{ 0, 0, 0, 0, 0x40, 0, 0, 0 } },
+    };
+    const out = try emit(gpa, io, &atoms, .{ .entry = main });
+    defer gpa.free(out);
+
+    const Found = struct { seg: []const u8, sect: macho.section_64 };
+    var found: std.StringHashMapUnmanaged(Found) = .empty;
+    defer found.deinit(gpa);
+    var it: macho.LoadCommandIterator = try .init(@ptrCast(@alignCast(out.ptr)), out[@sizeOf(macho.mach_header_64)..]);
+    while (try it.next()) |lc| if (lc.hdr.cmd == .SEGMENT_64) {
+        for (lc.getSections()) |*s| try found.put(gpa, std.mem.sliceTo(&s.sectname, 0), .{ .seg = std.mem.sliceTo(lc.data[8..24], 0), .sect = s.* });
+    };
+    const selrefs = found.get("__objc_selrefs").?;
+    try std.testing.expectEqualStrings("__DATA", selrefs.seg);
+    try std.testing.expectEqual(16, selrefs.sect.size);
+    try std.testing.expectEqualStrings("__DATA_CONST", found.get("__objc_classlist").?.seg);
+    const info = found.get("__objc_imageinfo").?;
+    try std.testing.expectEqualStrings("__DATA_CONST", info.seg);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0x40, 0, 0, 0 }, out[info.sect.offset..][0..8]);
+    // Each reference is a chained rebase (DYLD_CHAINED_PTR_64_OFFSET:
+    // the target's offset from the header in the low 36 bits) to its
+    // selector's string.
+    for ([_][]const u8{ "alloc\x00", "init\x00" }, 0..) |name, k| {
+        const ptr = std.mem.readInt(u64, out[selrefs.sect.offset + 8 * k ..][0..8], .little);
+        try std.testing.expectEqual(0, ptr >> 63);
+        try std.testing.expectEqualStrings(name, out[@intCast(ptr & 0xf_ffff_ffff)..][0..name.len]);
+    }
 }
