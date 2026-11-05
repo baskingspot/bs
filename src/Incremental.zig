@@ -2547,7 +2547,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     for (zcu.embed_files.values(), embed_inputs) |f, *ei| {
         try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
         const content_hash: Hash = @bitCast(Frontend.hashSource(f.bytes));
-        try embedKey(gpa, &key_buf, fe, f);
+        try embedKey(gpa, &key_buf, fe, f.module, f.sub_path);
         const known = embedInput(m, rp, path_buf.items, key_buf.items);
         ei.* = known orelse n_inputs;
         if (known) |in| {
@@ -2555,6 +2555,21 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         } else n_inputs += 1;
         const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch return inc.lazyFallback("{s} is gone", .{path_buf.items});
         try d.setInput(known, path_buf.items, key_buf.items, stat, content_hash, inc.build_start);
+    }
+    // ZON files imported but not analyzed, which must exist all the same:
+    // as embedded files, which they are once analyzed, with no nodes.
+    for (fe.zon_imports.items) |z| {
+        if (zonEmbedded(zcu, z)) continue;
+        try inputPath(gpa, &path_buf, fe, z.module, z.sub_path);
+        try embedKey(gpa, &key_buf, fe, z.module, z.sub_path);
+        const known = embedInput(m, rp, path_buf.items, key_buf.items);
+        if (known) |in| {
+            if (!changed_input.isSet(in)) continue;
+        } else n_inputs += 1;
+        const bytes = Io.Dir.cwd().readFileAlloc(io, path_buf.items, gpa, .unlimited) catch return inc.lazyFallback("{s} is gone", .{path_buf.items});
+        defer gpa.free(bytes);
+        const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch return inc.lazyFallback("{s} is gone", .{path_buf.items});
+        try d.setInput(known, path_buf.items, key_buf.items, stat, @bitCast(Frontend.hashSource(bytes)), inc.build_start);
     }
 
     // Results, with this build's items after the manifest's: those it
@@ -3779,7 +3794,24 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     for (zcu.embed_files.values()) |f| {
         try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
         const content_hash: Hash = @bitCast(Frontend.hashSource(f.bytes));
-        try embedKey(gpa, &key_buf, fe, f);
+        try embedKey(gpa, &key_buf, fe, f.module, f.sub_path);
+        if (Io.Dir.cwd().statFile(io, path_buf.items, .{})) |stat|
+            try b.addInput(path_buf.items, key_buf.items, stat, content_hash, inc.build_start)
+        else |_|
+            try b.addUnstattedInput(path_buf.items, key_buf.items, content_hash);
+    }
+    // ZON files imported but not analyzed, which must exist all the same
+    // (`Frontend.zon_imports`): as embedded files, with no nodes.
+    for (fe.zon_imports.items) |z| {
+        if (zonEmbedded(zcu, z)) continue;
+        try inputPath(gpa, &path_buf, fe, z.module, z.sub_path);
+        try embedKey(gpa, &key_buf, fe, z.module, z.sub_path);
+        const bytes = Io.Dir.cwd().readFileAlloc(io, path_buf.items, gpa, .unlimited) catch {
+            try b.addUnstattedInput(path_buf.items, key_buf.items, 0);
+            continue;
+        };
+        defer gpa.free(bytes);
+        const content_hash: Hash = @bitCast(Frontend.hashSource(bytes));
         if (Io.Dir.cwd().statFile(io, path_buf.items, .{})) |stat|
             try b.addInput(path_buf.items, key_buf.items, stat, content_hash, inc.build_start)
         else |_|
@@ -4185,11 +4217,20 @@ pub fn inputKey(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, mo
 /// `Manifest.Input.key` of an embedded file: its `Zcu.EmbedFile.key` with
 /// the module's `--dep`s after its name, as a file's (`inputKey`), so
 /// that `inputKeyHolds` finds it this build's too.
-fn embedKey(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, f: Zcu.EmbedFile) !void {
-    const mod = fe.module(f.module);
+fn embedKey(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, module: Frontend.Module.Index, sub_path: []const u8) !void {
+    const mod = fe.module(module);
     buf.clearRetainingCapacity();
     const tag = depsTag(fe, mod);
-    try buf.print(gpa, "{s}{s}:{s}", .{ mod.name, std.mem.sliceTo(&tag, 0), f.sub_path });
+    try buf.print(gpa, "{s}{s}:{s}", .{ mod.name, std.mem.sliceTo(&tag, 0), sub_path });
+}
+
+/// Whether the ZON file `z` imports is embedded (Sema analyzed the import),
+/// which makes it an input already.
+fn zonEmbedded(zcu: *const Zcu, z: Frontend.ZonImport) bool {
+    for (zcu.embed_files.values()) |f| {
+        if (f.module == z.module and std.mem.eql(u8, f.sub_path, z.sub_path)) return true;
+    }
+    return false;
 }
 
 /// `#` and a hash of the names a module's `--dep`s give and the modules
@@ -4282,7 +4323,7 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
         gop.value_ptr.* = .{ .file = @fromBackingInt(@as(u32, @intCast(i))), .hash = @bitCast(f.content_hash) };
     }
     for (r.zcu.embed_files.values()) |f| {
-        try embedKey(gpa, &path_buf, fe, f);
+        try embedKey(gpa, &path_buf, fe, f.module, f.sub_path);
         const gop = try now_inputs.getOrPut(gpa, path_buf.items);
         if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, path_buf.items);
         gop.value_ptr.* = .{ .file = null, .hash = @bitCast(Frontend.hashSource(f.bytes)) };

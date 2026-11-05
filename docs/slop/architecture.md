@@ -128,7 +128,11 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
   syntax and ZonGen errors with ZonGen's notes, lowering errors with an
   "imported here" note at the import. A result type ZON cannot express is
   an error at the import, checked before any value is lowered (upstream's
-  `checkType`).
+  `checkType`). As upstream, a ZON file the files import by path must
+  exist even if no import is analyzed: the frontend checks each
+  (`Frontend.zon_imports`), and the cache records those Sema did not
+  read as inputs with no nodes, keyed as embedded files, so that the
+  up-to-date check sees one deleted (test/run/edit_zon_unreferenced.sh).
 
 ### Analysis units
 

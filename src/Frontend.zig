@@ -43,6 +43,10 @@ files: std.ArrayList(File) = .empty,
 /// Maps `"<module index>:<sub_path>"` to its file.
 file_map: std.StringHashMapUnmanaged(File.Index) = .empty,
 modules: std.ArrayList(Module) = .empty,
+/// The ZON files the loaded files import by path (`Job.zon_imports`), each
+/// once: Sema reads only those it analyzes, but each must exist, so the
+/// cache records them all as inputs (`Incremental`).
+zon_imports: std.ArrayList(ZonImport) = .empty,
 /// The module whose tests `bs test` runs; `root` outside of tests.
 main_module: Module.Index = .root,
 /// `Options.root_name`: what `displayName` calls `main_module`.
@@ -407,6 +411,8 @@ pub fn deinit(fe: *Frontend) void {
         gpa.free(m.deps);
     }
     fe.modules.deinit(gpa);
+    for (fe.zon_imports.items) |z| gpa.free(z.sub_path);
+    fe.zon_imports.deinit(gpa);
     for (&fe.caches) |*c| if (c.*) |*cd| cd.deinit(gpa, fe.io);
     for (fe.late_errors.items) |*b| b.deinit(gpa);
     fe.late_errors.deinit(gpa);
@@ -1478,6 +1484,8 @@ const Root = struct {
     optional: bool = false,
 };
 
+pub const ZonImport = struct { module: Module.Index, sub_path: []const u8 };
+
 /// Loads `roots` and every file they reach that is not loaded yet, and
 /// numbers the new files breadth-first after the loaded ones. Stores each
 /// root's index in `indices`.
@@ -1539,7 +1547,11 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
             _ = Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
                 try fe.addMissingZon(errors, job, sub_path, err);
                 any_missing = true;
+                continue;
             };
+            for (fe.zon_imports.items) |z| {
+                if (z.module == job.file.module and std.mem.eql(u8, z.sub_path, sub_path)) break;
+            } else try fe.zon_imports.append(gpa, .{ .module = job.file.module, .sub_path = try gpa.dupe(u8, sub_path) });
         }
         for (job.imports) |imp| {
             if (imp.index != null) continue;

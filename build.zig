@@ -1323,6 +1323,19 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &ek.step, 10);
         test_step.dependOn(&ek.step);
     }
+    // A deleted ZON file that the program imports but does not analyze:
+    // test/run/edit_zon_unreferenced.sh.
+    {
+        const zu = b.addSystemCommand(&.{"sh"});
+        zu.setName("bs build after an unanalyzed ZON import is deleted");
+        zu.addFileArg(b.path("test/run/edit_zon_unreferenced.sh"));
+        zu.addArtifactArg(bs);
+        _ = zu.addOutputDirectoryArg("work");
+        zu.addDirectoryArg(std_zir);
+        zu.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &zu.step, 10);
+        test_step.dependOn(&zu.step);
+    }
     // An edit to a compiler_rt helper's requester: test/run/edit_rt_request.sh.
     {
         const rq = b.addSystemCommand(&.{"sh"});
