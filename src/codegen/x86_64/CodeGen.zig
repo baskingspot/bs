@@ -6162,10 +6162,23 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
     }
     var operands: [2]AsmOperand = undefined;
     var n: usize = 0;
-    var it = std.mem.tokenizeScalar(u8, line[sp..], ',');
-    while (it.next()) |tok| {
+    // Split at commas outside a memory operand's parentheses.
+    const rest = line[sp..];
+    var depth: u32 = 0;
+    var start: usize = 0;
+    for (rest, 0..) |c, k| {
+        switch (c) {
+            '(' => depth += 1,
+            ')' => depth -|= 1,
+            else => {},
+        }
+        const split = c == ',' and depth == 0;
+        if (!split and k != rest.len - 1) continue;
+        const tok = std.mem.trim(u8, rest[start..if (split) k else k + 1], " \t");
+        start = k + 1;
+        if (tok.len == 0) continue;
         if (n == 2) return cg.fail("asm instruction with more than two operands: '{s}'", .{line});
-        operands[n] = try cg.asmOperand(std.mem.trim(u8, tok, " \t"), names, line);
+        operands[n] = try cg.asmOperand(tok, names, line);
         n += 1;
     }
     try cg.asmInst(mnemonic, operands[0..n], line);

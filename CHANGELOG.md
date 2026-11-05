@@ -16,4 +16,5 @@ Changes a user of bs notices, newest first, in the
 
 ### Fixed
 
+- x86_64 inline assembly accepts memory operands with an index register, such as `lea (%rdi,%rsi,1), %eax`.
 - `callconv` takes a `std.builtin.CallingConvention` value computed at comptime, such as `callconv(cc orelse .c)`.
