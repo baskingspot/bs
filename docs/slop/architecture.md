@@ -1032,7 +1032,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   it recorded (line rows, inline ranges, the code size) through
   `Encoder.finalOffset` afterwards, so it builds its `LineProgram` after
   `finish`. `adr` to a label and label-difference words (`labelDelta`)
-  serve jump tables. Both were checked against the system assembler (GNU
+  serve jump tables, as x86_64's `leaLabel` and `labelDelta` do (written
+  after branch shortening, so a table needs no relocation; see
+  "Switches"). Both were checked against the system assembler (GNU
   as for x86_64; clang's for aarch64, 32,771 instructions byte-identical,
   including every encodable logical immediate, plus 2,748 for the
   step-5 additions: LSE atomics, ldar/stlr, dmb, ccmp, clz/rbit/rev, cnt,
@@ -1975,6 +1977,28 @@ as the result of an inlined call's block) becomes a store per field. A
 block exited by one `br` that ends it is that `br`'s value, and its `br`
 then writes nothing. Instructions are inserted by appending them and
 rebuilding the bodies once, only in functions with something to split.
+
+#### Switches
+
+A `switch_br` whose case values are constants (`src/codegen/switch_br.zig`,
+shared; built 2026-11-05) is lowered from its cases sorted by value, with
+neighbors that go to one block merged: a greedy scan picks dense runs (at
+least 4 cases covering at least 40% of a span of under 4096 values,
+LLVM's thresholds) as jump tables, and a binary search over the runs
+reaches them, ending in compares with immediates when 3 or fewer runs are
+left. The search tracks the values still possible, from the operand's ABI
+size (an undefined `u4` is 0xaa) and the compares made, so a case at an
+end of that range is one compare (`<= hi`), a table that covers it needs
+no bounds check, and a compare already in the flags is not repeated. A
+table is 32-bit offsets of the targets from the table itself, in the
+code right after the indirect jump (x86_64 `lea r11, [rip + T]; movsxd
+rcx, [r11 + idx*4]; add rcx, r11; jmp rcx`; aarch64 `adr x16, T; ldrsw
+x17, [x16, idx, lsl #2]; add x16, x16, x17; br x16`); the encoder writes
+the offsets once the code's layout is final, so the table is position
+independent and no linker sees it. A value no case holds goes to the
+else block, which keeps a corrupt or out-of-range operand on the safety
+check's path. Items whose values the linker assigns (error codes) and
+integers over 64 bits keep a compare per item, in order.
 
 #### Proving checks
 

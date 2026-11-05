@@ -38,6 +38,9 @@ label_addrs: std.ArrayList(struct { at: u32, label: Label }) = .empty,
 /// After `finish` shortened branches: per branch, the bytes saved by the
 /// branches before it (one more entry for the total), for `mapOffset`.
 saved: std.ArrayList(u32) = .empty,
+/// Jump table entries (`labelDelta`): the 4 bytes at `at` hold `label`'s
+/// offset minus `base`'s, written once the labels' offsets are final.
+deltas: std.ArrayList(struct { at: u32, label: Label, base: Label }) = .empty,
 /// With `shorten`: line rows and file switches until `finishShortened`,
 /// which writes them to `lines` at their final offsets; afterwards they go
 /// there directly.
@@ -185,13 +188,23 @@ pub fn deinit(e: *Encoder) void {
     e.branches.deinit(e.gpa);
     e.label_addrs.deinit(e.gpa);
     e.saved.deinit(e.gpa);
+    e.deltas.deinit(e.gpa);
     e.line_events.deinit(e.gpa);
 }
 
-/// Patches branches to labels. Every label must be bound.
+/// Patches branches to labels and jump table entries. Every label must be
+/// bound.
 pub fn finish(e: *Encoder) void {
     for (e.fixups.items) |f| e.patchRel32(f.at, e.labels.items[@backingInt(f.label)]);
     e.fixups.clearRetainingCapacity();
+    e.patchDeltas();
+}
+
+fn patchDeltas(e: *Encoder) void {
+    for (e.deltas.items) |d| {
+        const v: i32 = @intCast(@as(i64, e.labels.items[@backingInt(d.label)]) - e.labels.items[@backingInt(d.base)]);
+        std.mem.writeInt(i32, e.code.items[e.mapOffset(d.at)..][0..4], v, .little);
+    }
 }
 
 /// `finish`, and with `shorten`, a `jmp` or `jcc` whose target is within
@@ -296,6 +309,7 @@ fn shortenBranches(e: *Encoder) Allocator.Error!void {
     for (e.refs.relocs.items) |*r| r.offset = e.mapAscending(&cursor, r.offset);
     for (e.labels.items, before) |*l, n| l.* -= saved[n];
     for (e.label_addrs.items) |a| e.patchRel32(e.mapOffset(a.at), e.labels.items[@backingInt(a.label)]);
+    e.patchDeltas();
 }
 
 pub fn newLabel(e: *Encoder) Allocator.Error!Label {
@@ -506,6 +520,14 @@ pub fn leaLabel(e: *Encoder, dst: Reg, label: Label) !void {
     e.byte(modrmByte(0b00, dst.low(), 0b101)); // [rip + disp32]
     if (e.shorten) try e.label_addrs.append(e.gpa, .{ .at = @intCast(e.code.items.len), .label = label });
     try e.rel32(.{ .label = label });
+}
+
+/// A jump table entry: the 32-bit offset of `label` from `base`, as data in
+/// the code (`finish` writes it).
+pub fn labelDelta(e: *Encoder, label: Label, base: Label) !void {
+    try e.reserve();
+    try e.deltas.append(e.gpa, .{ .at = @intCast(e.code.items.len), .label = label, .base = base });
+    e.int(u32, 0);
 }
 
 /// `push imm32`, sign-extended to 64 bits.

@@ -42,6 +42,7 @@ const Atom = @import("../../link/Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
 const Ssa = @import("../Ssa.zig");
+const switch_br = @import("../switch_br.zig");
 const vector = @import("vector.zig");
 const atomic128 = @import("atomic128.zig");
 const Reg = Encoder.Reg;
@@ -3883,8 +3884,7 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
         },
         .switch_br => {
             try cg.checkNaked(tag);
-            try cg.switchBr(data, term);
-            try cg.jumpTo(term.succ[1], next);
+            if (try cg.switchBr(data, term)) try cg.jumpTo(term.succ[1], next);
         },
         .ret => {
             try cg.checkNaked(tag);
@@ -5285,14 +5285,47 @@ pub fn ovfFlagsOnly(_: *CodeGen, tag: Inst.Tag, bits: u16) bool {
     return tag != .mul_with_overflow or bits <= 32 or bits == 64;
 }
 
-/// A compare and branch per case item; the else block follows.
-fn switchBr(cg: *CodeGen, data: Inst.Data, term: Ssa.Term) Error!void {
+/// Branches to the case holding the operand's value; the else block
+/// follows. Cases with constant values are sorted and lowered as a binary
+/// search over them, with a jump table for each dense enough run and
+/// compares with immediates at the leaves (`SwitchLowering`). Items whose
+/// values only the linker knows (error codes) and wide integers get a
+/// compare and branch per item, in order. Returns whether the code falls
+/// through to what follows, the jump to the else block.
+fn switchBr(cg: *CodeGen, data: Inst.Data, term: Ssa.Term) Error!bool {
     const ir = cg.ir;
     const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
-    const wide = cg.isWideInt(cg.typeOf(data.pl_op.operand));
+    const op_ty = cg.typeOf(data.pl_op.operand);
+    const wide = cg.isWideInt(op_ty);
+    const blocks = cg.ssa.switchCases(term, extra.data.cases_len);
+    if (!wide) sorted: {
+        var cases: std.ArrayList(switch_br.Case) = .empty;
+        defer cases.deinit(cg.gpa);
+        const flip: u64 = if (cg.signed(op_ty)) @as(u64, 1) << 63 else 0;
+        var i = extra.end;
+        for (blocks) |case_block| {
+            const items_len = ir.extra[i];
+            const items = ir.refSlice(i + 2, items_len);
+            i += 2 + items_len + ir.extra[i + 1];
+            const label = cg.blockLabel(@backingInt(case_block));
+            for (items) |item| {
+                const v = switch (try cg.locOf(item)) {
+                    .imm => |v| v,
+                    else => break :sorted,
+                };
+                try cases.append(cg.gpa, .{ .lo = v ^ flip, .hi = v ^ flip, .label = @backingInt(label) });
+            }
+        }
+        const r = try cg.regOf(data.pl_op.operand, .rax);
+        const size = Type.abiSize(cg.ip, op_ty);
+        const else_label = cg.blockLabel(term.succ[1]);
+        const em: SwitchEmit = .{ .cg = cg, .reg = r, .flip = flip, .narrow = size <= 4 and flip == 0, .else_label = else_label };
+        const b = switch_br.bounds(size, flip != 0);
+        return switch_br.lower(cg.gpa, em, switch_br.prepare(cases.items), b[0], b[1], @backingInt(else_label));
+    }
     if (!wide) try cg.load(.rax, data.pl_op.operand);
     var i = extra.end;
-    for (cg.ssa.switchCases(term, extra.data.cases_len)) |case_block| {
+    for (blocks) |case_block| {
         const items_len = ir.extra[i];
         const items = ir.refSlice(i + 2, items_len);
         i += 2 + items_len + ir.extra[i + 1];
@@ -5308,7 +5341,117 @@ fn switchBr(cg: *CodeGen, data: Inst.Data, term: Ssa.Term) Error!void {
             try cg.e.jcc(.e, .{ .label = label });
         }
     }
+    return true;
 }
+
+/// Emits `switch_br.lower`'s steps for a switch on the value in `reg`.
+/// Uses rcx and r11.
+const SwitchEmit = struct {
+    cg: *CodeGen,
+    reg: Reg,
+    /// The sign bit, for a signed operand: a key is the value with it
+    /// flipped.
+    flip: u64,
+    /// The operand's keys fit in 32 bits, so 32-bit compares see all of
+    /// it.
+    narrow: bool,
+    else_label: Encoder.Label,
+
+    fn label(l: Encoder.Label) u32 {
+        return @backingInt(l);
+    }
+
+    pub fn newLabel(s: SwitchEmit) Error!u32 {
+        return label(try s.cg.e.newLabel());
+    }
+
+    pub fn bind(s: SwitchEmit, l: u32) void {
+        s.cg.e.bind(@fromBackingInt(l));
+    }
+
+    pub fn jump(s: SwitchEmit, l: u32) Error!void {
+        try s.cg.e.jmp(.{ .label = @fromBackingInt(l) });
+    }
+
+    pub fn branch(s: SwitchEmit, key: u64, cond: std.math.CompareOperator, l: u32, again: bool) Error!void {
+        const cg = s.cg;
+        const v: i64 = @bitCast(key ^ s.flip);
+        if (again) {} else if (s.narrow) {
+            try cg.e.alu(.cmp, .dword, .{ .reg = s.reg }, .{ .imm = v });
+        } else if (std.math.cast(i32, v) != null) {
+            try cg.e.alu(.cmp, .qword, .{ .reg = s.reg }, .{ .imm = v });
+        } else {
+            try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = v });
+            try cg.e.alu(.cmp, .qword, .{ .reg = s.reg }, .{ .reg = .rcx });
+        }
+        const is_signed = s.flip != 0;
+        const cc: Encoder.Cond = switch (cond) {
+            .lt => if (is_signed) .l else .b,
+            .lte => if (is_signed) .le else .be,
+            .eq => .e,
+            .gte => if (is_signed) .ge else .ae,
+            else => unreachable,
+        };
+        try cg.e.jcc(cc, .{ .label = @fromBackingInt(l) });
+    }
+
+    /// The register holding the key minus `lo` (as values), whose keys
+    /// `lo` through `lo + n` are then 0 through n unsigned: `reg` itself
+    /// when `lo` is 0, else rcx.
+    fn offset(s: SwitchEmit, lo: u64) Error!Reg {
+        const cg = s.cg;
+        const v: i64 = @bitCast(lo ^ s.flip);
+        if (v == 0) return s.reg;
+        if (std.math.cast(i32, -%v)) |d| {
+            try cg.e.lea(.qword, .rcx, Mem.at(s.reg, d));
+        } else {
+            try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = v });
+            try cg.e.unary(.neg, .qword, .{ .reg = .rcx });
+            try cg.e.alu(.add, .qword, .{ .reg = .rcx }, .{ .reg = s.reg });
+        }
+        return .rcx;
+    }
+
+    /// `cmp r, n`, compared unsigned.
+    fn cmpOffset(s: SwitchEmit, r: Reg, n: u64) Error!void {
+        const cg = s.cg;
+        if (std.math.cast(i32, n)) |x| return cg.e.alu(.cmp, if (s.narrow) .dword else .qword, .{ .reg = r }, .{ .imm = x });
+        try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast(n) });
+        try cg.e.alu(.cmp, .qword, .{ .reg = r }, .{ .reg = .r11 });
+    }
+
+    pub fn branchIn(s: SwitchEmit, lo: u64, hi: u64, l: u32) Error!void {
+        const r = try s.offset(lo);
+        try s.cmpOffset(r, hi - lo);
+        try s.cg.e.jcc(.be, .{ .label = @fromBackingInt(l) });
+    }
+
+    /// 32-bit offsets of the targets from the table, which follows the
+    /// indirect jump.
+    pub fn table(s: SwitchEmit, cases: []const switch_br.Case, lo: u64, hi: u64, check: bool, out: u32) Error!void {
+        const cg = s.cg;
+        const r = try s.offset(lo);
+        if (check) {
+            try s.cmpOffset(r, hi - lo);
+            try cg.e.jcc(.a, .{ .label = @fromBackingInt(out) });
+        }
+        const tab = try cg.e.newLabel();
+        try cg.e.leaLabel(.r11, tab);
+        try cg.e.movsx(.qword, .rcx, .dword, .{ .mem = .{ .base = .{ .reg = .r11 }, .index = .{ .reg = r, .scale = .@"4" } } });
+        try cg.e.alu(.add, .qword, .{ .reg = .rcx }, .{ .reg = .r11 });
+        try cg.e.jmpIndirect(.{ .reg = .rcx });
+        cg.e.bind(tab);
+        var k = lo;
+        for (cases) |c| {
+            while (k < c.lo) : (k += 1) try cg.e.labelDelta(s.else_label, tab);
+            while (true) : (k += 1) {
+                try cg.e.labelDelta(@fromBackingInt(c.label), tab);
+                if (k == c.hi) break;
+            }
+            k += 1;
+        }
+    }
+};
 
 /// Returns `operand`: in the block emitted last (`next` is none), through
 /// the epilogue in place, and elsewhere by jumping to it.
