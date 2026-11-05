@@ -2352,9 +2352,9 @@ const ChainedFixupsLayout = struct {
 
     const header_size = 28;
     const starts_off = 32;
-    const DYLD_CHAINED_PTR_64_OFFSET = 6;
-    const DYLD_CHAINED_PTR_START_NONE = 0xffff;
-    const DYLD_CHAINED_IMPORT = 1;
+    const dyld_chained_ptr_64_offset = 6;
+    const dyld_chained_ptr_start_none = 0xffff;
+    const dyld_chained_import = 1;
 
     /// `first_ordinal` is __TEXT's segment index: 1 after an executable's
     /// __PAGEZERO, 0 in a dylib.
@@ -2401,7 +2401,7 @@ const ChainedFixupsLayout = struct {
         put32(out, 8, cf.imports_off);
         put32(out, 12, cf.symbols_off);
         put32(out, 16, @intCast(imports.len));
-        put32(out, 20, DYLD_CHAINED_IMPORT);
+        put32(out, 20, dyld_chained_import);
         put32(out, 24, 0); // uncompressed symbol names
         // dyld_chained_starts_in_image
         const image = out[starts_off..];
@@ -2414,12 +2414,12 @@ const ChainedFixupsLayout = struct {
             const s = image[info..];
             put32(s, 0, 22 + 2 * @as(u32, page_count));
             std.mem.writeInt(u16, s[4..6], page_size, .little);
-            std.mem.writeInt(u16, s[6..8], DYLD_CHAINED_PTR_64_OFFSET, .little);
+            std.mem.writeInt(u16, s[6..8], dyld_chained_ptr_64_offset, .little);
             std.mem.writeInt(u64, s[8..16], seg_start, .little);
             put32(s, 16, 0); // max_valid_pointer
             std.mem.writeInt(u16, s[20..22], page_count, .little);
             const page_starts = s[22..][0 .. 2 * @as(usize, page_count)];
-            @memset(page_starts, 0xff); // DYLD_CHAINED_PTR_START_NONE
+            @memset(page_starts, 0xff); // dyld_chained_ptr_start_none
             const seg_end = seg_start + @as(u64, page_count) * page_size;
             var prev: ?u64 = null;
             while (next_fixup < fixups.len and fixups[next_fixup] < seg_end) : (next_fixup += 1) {

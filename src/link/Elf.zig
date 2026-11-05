@@ -2467,8 +2467,8 @@ pub fn populate(bytes: []u8) void {
     if (builtin.os.tag != .linux) return;
     const begin = std.mem.alignForward(usize, @intFromPtr(bytes.ptr), std.heap.page_size_min);
     const end = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr) + bytes.len, std.heap.page_size_min);
-    const MADV_POPULATE_WRITE = 23; // Linux 5.14; older kernels just fault.
-    if (begin < end) std.posix.madvise(@ptrFromInt(begin), end - begin, MADV_POPULATE_WRITE) catch {}; // ziglint-ignore: Z026 -- only a hint to the kernel
+    const madv_populate_write = 23; // Linux 5.14; older kernels just fault.
+    if (begin < end) std.posix.madvise(@ptrFromInt(begin), end - begin, madv_populate_write) catch {}; // ziglint-ignore: Z026 -- only a hint to the kernel
 }
 
 pub fn prefetchSlice(comptime T: type, slice: []const T) void {

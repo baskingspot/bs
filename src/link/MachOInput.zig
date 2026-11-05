@@ -92,8 +92,6 @@ const Reloc = struct {
     }
 };
 
-const R = macho.reloc_type_arm64;
-
 /// One object, read in place.
 pub const Object = struct {
     /// As errors name it: the path, or `archive(member)`.
@@ -343,7 +341,7 @@ fn readTlvs(in: *MachOInput, o: *Object) Error!void {
         const relocs = o.bytes[s.reloff..][0 .. @as(usize, s.nreloc) * 8];
         for (0..s.nreloc) |k| {
             const r = Reloc.read(relocs[k * 8 ..][0..8]);
-            if (r.address % 24 != 16 or r.type != @backingInt(R.ARM64_RELOC_UNSIGNED) or !r.external or r.address / 24 >= list.len) continue;
+            if (r.address % 24 != 16 or r.type != @backingInt(macho.reloc_type_arm64.ARM64_RELOC_UNSIGNED) or !r.external or r.address / 24 >= list.len) continue;
             if (r.symbolnum >= o.syms.len) return error.InvalidObject;
             const sym = o.syms[r.symbolnum];
             if (sym.kind() != macho.N_SECT) continue;
@@ -882,7 +880,7 @@ fn Converter(comptime Ctx: type) type {
             var k: usize = 0;
             while (k < s.nreloc) : (k += 1) {
                 const r = Reloc.read(raw[k * 8 ..][0..8]);
-                const ty = std.enums.fromInt(R, r.type) orelse return c.fail("{s}: unknown relocation type {d} in '{s}'", .{ o.path, r.type, c.sectName(index) });
+                const ty = std.enums.fromInt(macho.reloc_type_arm64, r.type) orelse return c.fail("{s}: unknown relocation type {d} in '{s}'", .{ o.path, r.type, c.sectName(index) });
                 if (ty == .ARM64_RELOC_ADDEND) {
                     addend = @as(i24, @bitCast(r.symbolnum));
                     continue;
@@ -908,7 +906,7 @@ fn Converter(comptime Ctx: type) type {
                         if (k + 1 >= s.nreloc) return c.fail("{s}: SUBTRACTOR without its UNSIGNED in '{s}'", .{ o.path, c.sectName(index) });
                         const n = Reloc.read(raw[(k + 1) * 8 ..][0..8]);
                         k += 1;
-                        if (n.type != @backingInt(R.ARM64_RELOC_UNSIGNED) or n.address != r.address or !r.external or !n.external)
+                        if (n.type != @backingInt(macho.reloc_type_arm64.ARM64_RELOC_UNSIGNED) or n.address != r.address or !r.external or !n.external)
                             return c.fail("{s}: malformed SUBTRACTOR pair in '{s}'", .{ o.path, c.sectName(index) });
                         const b = try c.target(r.symbolnum) orelse continue;
                         const a = try c.target(n.symbolnum) orelse continue;
