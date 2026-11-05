@@ -14,7 +14,7 @@ const Zir = std.zig.Zir;
 
 /// The most instructions with hot code (`Scan.size`) a body inlined at a
 /// call outside loops has, after its own callees are inlined.
-pub const budget = 30;
+pub const budget = 24;
 /// A call inside a loop inlines callees up to this many times the budget:
 /// its cost is paid once per iteration, the code once.
 pub const loop_factor = 2;
@@ -167,7 +167,7 @@ const Scanner = struct {
                 },
                 else => {},
             }
-            if (!cold and !free(ir, tag, data)) s.out.size += 1;
+            if (!cold and !s.free(tag, data)) s.out.size += 1;
         }
     }
 
@@ -176,10 +176,21 @@ const Scanner = struct {
     /// which mostly emit no code, and a field of an overflow operation's
     /// result, which reads one of its two registers. With them counted,
     /// leaves such as `std.fmt.digitToChar` measured over the budget on
-    /// code that prove mostly removes.
-    fn free(ir: *const Ir, tag: Inst.Tag, data: Inst.Data) bool {
+    /// code that prove mostly removes. Likewise `ret`s, pointer casts and
+    /// the slots of `const` locals and parameters, which made accessors
+    /// such as `Ast.tokenTag` measure 34.
+    fn free(s: *const Scanner, tag: Inst.Tag, data: Inst.Data) bool {
+        const ir = s.ir;
         return switch (tag) {
             .block, .br => true,
+            // A `ret` becomes a `br` out of the inlined block.
+            .ret => true,
+            // A `const` local or parameter's slot, which Sema writes once
+            // and the SSA promotes to a register.
+            .alloc => s.constSlot(data.ty),
+            .store => if (data.bin_op.lhs.toIndex()) |p| s.isConstSlot(p) else false,
+            .load => if (data.ty_op.operand.toIndex()) |p| s.isConstSlot(p) else false,
+            .bitcast => s.ip.keyTag(data.ty_op.ty) == .ptr_type,
             .struct_field_val => {
                 const op = ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand.toIndex() orelse return false;
                 return switch (ir.instructions.items(.tag)[@backingInt(op)]) {
@@ -189,6 +200,16 @@ const Scanner = struct {
             },
             else => false,
         };
+    }
+
+    fn constSlot(s: *const Scanner, ptr_ty: Index) bool {
+        // `.none`: an inferred alloc Sema left unused.
+        return ptr_ty == .none or s.ip.keyPayload(.ptr_type, ptr_ty).flags.is_const;
+    }
+
+    fn isConstSlot(s: *const Scanner, inst: Inst.Index) bool {
+        const i = @backingInt(inst);
+        return s.ir.instructions.items(.tag)[i] == .alloc and s.constSlot(s.ir.instructions.items(.data)[i].ty);
     }
 
     fn call(s: *Scanner, inst: Inst.Index, cold: bool) Allocator.Error!void {

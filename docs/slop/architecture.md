@@ -1676,13 +1676,16 @@ build, the passes, and the debug info treat them as Sema's inline calls
   recursive, not `noinline`, not variadic, has no inferred error set, and
   uses only instructions the splice maps (no `@returnAddress`,
   `@frameAddress`, inline assembly, error return trace access). Its size is its instructions with code
-  outside cold bodies, less `block`s, their `br`s and the fields of an
-  overflow operation's result (`Scanner.free`), plus each element of an
+  outside cold bodies, less `block`s, their `br`s, `ret`s (a `br` once
+  inlined), the fields of an overflow operation's result, pointer
+  `bitcast`s, and the `alloc`s of `const` locals and parameters with the
+  loads and stores through them, which the SSA promotes to registers
+  (`Scanner.free`), plus each element of an
   `aggregate_init` with more than 8 (`@splat` of a runtime value has an
   operand per element: `std.mem.zeroes` of a 1 MiB array counted as one
   instruction, and its inlined copies cost 22 ms each in rewrite and
   sroa), plus the sizes of the
-  callees inlined into it (mid-stack inlining); the budget is 30, and
+  callees inlined into it (mid-stack inlining); the budget is 24, and
   twice that for a call inside a loop of the caller (`loop_factor`: its
   cost is paid each iteration, its code once). A function whose callees are
   not all inlined is not inlinable itself, so only leaves and functions
@@ -1794,6 +1797,19 @@ build, the passes, and the debug info treat them as Sema's inline calls
   all), the other runtime benchmarks 0; std's test build +0.3% and the
   zig workload 0, IR +3%, binaries +3%. 100 adds little more (sort and
   hash within 0.1%).
+- **Free slots and returns** (against the size measure above at budget
+  30, with the loop budget; the same way): most small accessors measured
+  over 30 on Sema's boilerplate, not on code (`Ast.tokenTag` 34 is 16
+  instructions plus `MultiArrayList.Slice.items`' 18, half of them the
+  `alloc`/`store`/`load` of `const` parameters and locals and `ret`s).
+  Counting those free at budget 24 inlines `tokenTag`, `tokenStart`,
+  `nodeTag`, hash_map's `capacity` and `Wyhash.init` (all 32–38 before):
+  hash −4.0%, zig fmt −2.6%, sort −0.9%, vaxis and the other runtime
+  benchmarks 0, the zls tests +2.0% (the unwinder, as above); std's test
+  build 0.0% and the zig workload +0.1%, IR +1.8% (std tests) and +2.1%
+  (zig), binaries +1.8% and +2.7%. At budget 30 the same measure adds
+  hash and zig fmt −0.5% more, vaxis −0.6% and zls +1.9% for binaries
+  +4.5% / +7%; at 20 sort loses its loop inlines (+7.5%).
 - **What users see.** std 0.17's stack traces print one frame per return
   address, named after the innermost inline range (`Dwarf.getSymbols`
   ignores inline callers, and `resolve_inline_callers` cannot help on
