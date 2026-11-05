@@ -10223,8 +10223,10 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
     if (ca == .pointer and cb == .pointer) {
         // A C pointer wins over other pointers to its element type.
         if (try sema.peerCPtr(a, b)) |t| return t;
-        if (sema.ptrCoercibleInPlace(a, b)) return sema.withPeerAlignment(b, a, b);
+        // The earlier peer first, when each reads as the other (`*u32`
+        // and `*c_uint` give `*u32`), as upstream.
         if (sema.ptrCoercibleInPlace(b, a)) return sema.withPeerAlignment(a, a, b);
+        if (sema.ptrCoercibleInPlace(a, b)) return sema.withPeerAlignment(b, a, b);
         if (try sema.peerPtrs(a, b)) |t| return t;
         // A pointer to a tuple (`&.{ 'x', 'y' }`) is a pointer to an array
         // of the other peer's elements.
@@ -10266,7 +10268,17 @@ fn peerPtrs(sema: *Sema, a: Index, b: Index) !?Index {
     var sb = seq(ip, b) orelse return null;
     if (sa.elem == .noreturn_type) sa.elem = sb.elem;
     if (sb.elem == .noreturn_type) sb.elem = sa.elem;
-    if (sa.elem != sb.elem or sa.elem == .noreturn_type) return null;
+    if (sa.elem == .noreturn_type) return null;
+    // Element types that differ merge when one coerces to the other in
+    // memory (`[:0]u8` to `[:0]const u8`), as upstream's
+    // resolvePairInMemoryCoercible.
+    if (sa.elem != sb.elem) {
+        if (sema.childCoercibleInMemory(sb.elem, sa.elem)) {
+            sb.elem = sa.elem;
+        } else if (sema.childCoercibleInMemory(sa.elem, sb.elem)) {
+            sa.elem = sb.elem;
+        } else return null;
+    }
     if (sa.p.flags.address_space != sb.p.flags.address_space) return null;
     // Single pointers to one non-array type merge only their qualifiers.
     const single = sa.size == .one and !sa.array;
