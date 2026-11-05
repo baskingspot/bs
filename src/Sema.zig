@@ -5671,6 +5671,8 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .size_of, .bit_size_of => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
             const ty = try sema.resolveType(block, src, data.un_node.operand);
+            if (tag == .bit_size_of and !Type.hasBitSize(sema.ip, ty))
+                return sema.fail(block, sema.callArgSrc(src, false, 0), "no bit size available for type '{f}'", .{sema.fmtType(ty)});
             try sema.resolveLayoutFor(block, sema.callArgSrc(src, false, 0), ty, .size_of);
             if (tag == .size_of and Type.hasNoPossibleValue(sema.ip, ty))
                 return sema.fail(block, sema.callArgSrc(src, false, 0), "no size available for uninstantiable type '{f}'", .{sema.fmtType(ty)});

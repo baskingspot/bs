@@ -601,6 +601,19 @@ pub fn log2IntBits(bits: u16) u16 {
     return std.math.log2_int_ceil(u16, bits);
 }
 
+/// Whether `@bitSizeOf` accepts `ty`: upstream's `hasBitRepresentation`,
+/// plus every enum and error set, which upstream allows for now.
+pub fn hasBitSize(ip: *const InternPool, ty: Index) bool {
+    return switch (class(ip, ty)) {
+        .void, .bool, .int, .float, .@"enum", .error_set => true,
+        .pointer => ptrInfo(ip, ty).flags.size != .slice,
+        .optional => optionalReprIsPtr(ip, childType(ip, ty)),
+        .@"struct", .@"union" => isPacked(ip, ty),
+        .array, .vector => hasBitSize(ip, childType(ip, ty)),
+        else => false,
+    };
+}
+
 pub fn isPackedStruct(ip: *const InternPool, ty: Index) bool {
     return ip.keyTag(ty) == .struct_type and ip.structInfo(ty).layout == .@"packed";
 }
