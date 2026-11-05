@@ -4869,6 +4869,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 // Bit-packed: element i is bit i % 8 of byte i / 8.
                 try cg.fillMem(dst, Type.abiSize(ip, ty), 0);
                 for (elems, 0..) |elem, i| {
+                    // An undefined lane's bits (0xaa) would spill into its neighbors'.
+                    if (elem.toInterned()) |v| if (ip.keyTag(v) == .undef) continue;
                     try cg.load(.rax, elem);
                     if (i % 8 != 0) try cg.e.shift(.shl, .byte, .{ .reg = .rax }, @intCast(i % 8));
                     try cg.e.alu(.@"or", .byte, .{ .mem = offsetMem(dst, i / 8) }, .{ .reg = .rax });

@@ -2362,6 +2362,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 while (byte * 8 < elems.len) : (byte += 1) {
                     try cg.e.movImm(.x, .x11, 0);
                     for (elems[byte * 8 .. @min(elems.len, byte * 8 + 8)], 0..) |elem, bit| {
+                        // An undefined lane's bits (0xaa) would spill into its neighbors'.
+                        if (elem.toInterned()) |v| if (ip.keyTag(v) == .undef) continue;
                         try cg.load(.x9, elem);
                         try cg.e.logic(.orr, .x, .x11, .x11, .{ .reg = .{ .reg = .x9, .amount = @intCast(bit) } });
                     }
