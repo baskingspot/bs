@@ -1,10 +1,11 @@
 //! exit: 0
-//! stdout: "2931\n10\n7\n3\n4\n4\n2\n4\n18446744073709551611\n5\n1\n2\n104\n255\n"
+//! stdout: "2931\n10\n7\n3\n4\n4\n2\n4\n18446744073709551611\n5\n1\n2\n104\n255\n11\n5\n"
 //! Scalar replacement (docs/slop/architecture.md, "Rewrite rules") splits the
 //! local structs below into one local per field. The values are chosen
 //! where a plausible wrong split differs: a copy that shares its fields'
 //! locals with the original, a store of a struct to memory it was loaded
-//! from, a struct carried around a loop, and fields of mixed sizes.
+//! from, a struct carried around a loop, fields of mixed sizes, and an
+//! inlined result stored to a global read before.
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -77,6 +78,21 @@ noinline fn mixed(i: u8, s: []const u8, p: *const u64) M {
     return m;
 }
 
+const G = struct {
+    xi: u64,
+    a: u64,
+    fn init(xi: u64, a: u64) G {
+        return .{ .xi = xi, .a = a };
+    }
+};
+var g: G = .init(7, 3);
+
+/// The struct `init` returns is stored to `g`, a constant address.
+noinline fn reseed(x: u64) void {
+    const y = g.xi + x;
+    g = .init(y, 5);
+}
+
 pub fn main() void {
     out(@bitCast(loop(100)));
     out(copy(4));
@@ -98,5 +114,8 @@ pub fn main() void {
     out(@intFromEnum(m.e));
     out(m.s[0]);
     out(m.c);
+    reseed(4);
+    out(g.xi);
+    out(g.a);
     rt.exit(0);
 }

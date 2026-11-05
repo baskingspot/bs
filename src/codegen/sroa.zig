@@ -157,8 +157,9 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
                 e.insts.set(ii, .{ .tag = .aggregate_init, .data = .{ .ty_pl = .{ .ty = agg, .payload = payload } } });
             },
             .store => {
-                const r = @backingInt(data.bin_op.lhs.toIndex().?);
-                if (s.root[r] != r) {
+                // A constant address (a global's) is other memory too.
+                const lhs = data.bin_op.lhs.toIndex();
+                if (lhs == null or s.root[@backingInt(lhs.?)] != @backingInt(lhs.?)) {
                     // A store to other memory of a split struct's load.
                     const l = s.fields[ii];
                     // 0 if the struct was not split.
@@ -175,6 +176,7 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
                     changed = true;
                     continue;
                 }
+                const r = @backingInt(lhs.?);
                 if (s.fields[r] == 0) continue;
                 changed = true;
                 const agg = s.agg[r];
