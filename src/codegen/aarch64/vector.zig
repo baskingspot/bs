@@ -550,8 +550,8 @@ fn loadChunk(cg: *CodeGen, r: VReg, ref: Ref, k: u32) Error!void {
         },
         .none => try zero(cg, r),
         .vreg => |v| try move(cg, r, v),
-        // Vectors have no general register (`CodeGen.inGpr`).
-        .addr, .err, .reg => unreachable,
+        // Vectors have no general register (`CodeGen.inGpr`, `CodeGen.inPair`).
+        .addr, .err, .reg, .regs => unreachable,
     }
 }
 
