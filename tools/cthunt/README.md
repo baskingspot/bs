@@ -37,8 +37,15 @@ and nested aggregates (`t_slices`, `t_memory`); optionals and error
 unions (`t_opt_err`); `@typeInfo` and `@Int`/`@Struct`/`@Enum` round
 trips (`t_typeinfo`); generic functions and `anytype` (`t_generic`);
 strings (`t_strings`); vectors (`t_vector`); std code run at comptime:
-sorting, parsing, formatting, hashing (`t_stdlib`); and labeled switch
-`continue`, recursion, `defer` and `errdefer` (`t_control`).
+sorting, parsing, formatting, hashing (`t_stdlib`); labeled switch
+`continue`, recursion, `defer` and `errdefer` (`t_control`); packed
+structs and unions of odd widths with explicit backing integers, enums
+and bit pointers (`t_packed_odd`); error sets, their merges and
+`@intFromError`/`@errorFromInt` round trips (`t_errors`); structs,
+enums, unions and tuples rebuilt from `@typeInfo` (`t_reify`); tuples
+(`t_tuples`); slices of slices (`t_slices2`); peer types from
+`@TypeOf(a, b, ...)` and each peer coerced to it (`t_peer`); and
+`std.fmt.comptimePrint` of integers and floats (`t_fmt`).
 
 Programs are meant to be well defined, but a test may hit a comptime
 error upstream reports (an overflow, the branch quota): each test has a
@@ -76,6 +83,9 @@ is not is a backend bug; route it to whoever owns the backend.
 
 - NaN sign and payload differ between compilers; the hunter prints no
   bits for a NaN and normalizes `-nan` to `nan`.
+- A many pointer prints its address (`u8@1290b7`), which the hunter
+  normalizes to `u8@addr`; error values' integers differ between
+  compilers, so tests print only their relations.
 - Upstream folds f80 `@exp`, `@exp2`, `@log`, `@log2` and `@log10`
   with its host's libm (musl's x87 code), which can differ in the last
   bit from compiler_rt and so from upstream's own run time result; the

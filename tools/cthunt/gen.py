@@ -1391,6 +1391,394 @@ class Gen:
         out.append("};")
         return out, "any"
 
+    def odd_int(self, max_bits=40):
+        return f"{self.ch(['u', 'i'])}{self.r.randint(1, max_bits)}"
+
+    def t_packed_odd(self, name):
+        """Packed structs and unions of odd widths: explicit backing
+        integers, nested packed types, enums, bit pointers to fields
+        written through a function, and @bitCast both ways."""
+        out = []
+        en = self.fresh("PE")
+        ebits = self.r.randint(1, 5)
+        out.append(
+            f"const {en} = enum(u{ebits}) {{ " + ", ".join(f"v{i}" for i in range(min((1 << ebits) - 1, 3))) + ", _ };"
+        )
+        nested = self.fresh("PN")
+        nb = [self.odd_int(7) for _ in range(self.r.randint(1, 3))]
+        nbits = sum(int(t[1:]) for t in nb)
+        out.append(f"const {nested} = packed struct {{ " + ", ".join(f"a{i}: {t}" for i, t in enumerate(nb)) + " };")
+        un = self.fresh("PU")
+        out.append(
+            f"const {un} = packed union {{ n: {nested}, r: u{nbits}, s: i{nbits}"
+            + (f", e: @Int(.unsigned, {nbits})" if self.p(0.5) else "")
+            + " };"
+        )
+        fts = []
+        for _ in range(self.r.randint(1, 6)):
+            k = self.r.random()
+            fts.append(
+                "bool" if k < 0.15 else en if k < 0.3 else nested if k < 0.45 else un if k < 0.55 else self.odd_int()
+            )
+
+        def bits(t):
+            return {"bool": 1, en: ebits, nested: nbits, un: nbits}.get(t) or int(t[1:])
+
+        total = sum(bits(t) for t in fts)
+        if total > 128:
+            fts = fts[:1]
+            total = bits(fts[0])
+        sn = self.fresh("PS")
+        backing = f"(u{total})" if self.p(0.4) else ""
+        out.append(
+            f"const {sn} = packed struct{backing} {{ " + ", ".join(f"f{i}: {t}" for i, t in enumerate(fts)) + " };"
+        )
+
+        def lit(t):
+            if t == "bool":
+                return self.ch(["true", "false"])
+            if t == en:
+                return f"@as({en}, @enumFromInt({self.r.randint(0, (1 << ebits) - 1)}))"
+            if t == nested:
+                return f"{nested}{{ " + ", ".join(f".a{i} = {self.scalar_lit(x)}" for i, x in enumerate(nb)) + " }"
+            if t == un:
+                return self.ch(
+                    [
+                        f"{un}{{ .r = {self.scalar_lit(f'u{nbits}')} }}",
+                        f"{un}{{ .s = {self.scalar_lit(f'i{nbits}')} }}",
+                        f"{un}{{ .n = {lit(nested)} }}",
+                    ]
+                )
+            return self.scalar_lit(t)
+
+        setter = self.fresh("setp")
+        out.append(f"fn {setter}(comptime T: type, p: anytype, v: T) void {{ p.* = v; }}")
+        out.append(f"const {name} = blk: {{")
+        out.append(f"    var x: {sn} = .{{ " + ", ".join(f".f{i} = {lit(t)}" for i, t in enumerate(fts)) + " };")
+        out.append("    _ = &x;")
+        for _ in range(self.r.randint(1, 5)):
+            i = self.r.randrange(len(fts))
+            t = fts[i]
+            k = self.r.random()
+            if k < 0.3:
+                out.append(f"    x.f{i} = {lit(t)};")
+            elif k < 0.55:
+                out.append(f"    {setter}({t}, &x.f{i}, {lit(t)});")
+            elif k < 0.7 and t == nested:
+                j = self.r.randrange(len(nb))
+                out.append(f"    x.f{i}.a{j} = {self.scalar_lit(nb[j])};")
+            elif k < 0.8 and t == un:
+                out.append(f"    x.f{i}.r +%= {self.r.randint(0, 9)};")
+            elif k < 0.9 and t not in (en, nested, un, "bool"):
+                op = self.ch(["+%=", "-%=", "*%=", "^=", ">>="])
+                amt = self.r.randint(0, min(3, bits(t) - 1)) if op == ">>=" else self.r.randint(0, 3)
+                out.append(f"    x.f{i} {op} {amt};")
+            else:
+                out.append(
+                    f"    x = @bitCast(@as(u{total}, @bitCast(x)) {self.ch(['^', '|', '+%'])} {self.r.randint(0, 255)});"
+                )
+        out.append(f"    const raw: u{total} = @bitCast(x);")
+        out.append(f"    const back: {sn} = @bitCast(raw);")
+        offs = ", ".join(f'@bitOffsetOf({sn}, "f{i}")' for i in range(len(fts)))
+        out.append(f"    break :blk .{{ x, raw, back == x, @bitSizeOf({sn}), @sizeOf({sn}), .{{ {offs} }} }};")
+        out.append("};")
+        return out, "any"
+
+    def t_errors(self, name):
+        """Error sets: merging, coercion, switching on errors, @errorName,
+        @typeInfo names, and @intFromError/@errorFromInt round trips (the
+        integers themselves differ between compilers, so only their
+        relations are printed)."""
+        names = [f"E{i}" for i in range(self.r.randint(1, 6))]
+        a = self.fresh("ES")
+        b = self.fresh("ES")
+        sa = sorted(self.r.sample(names, self.r.randint(1, len(names))))
+        sb = sorted(self.r.sample(names, self.r.randint(1, len(names))))
+        out = [f"const {a} = error{{ {', '.join(sa)} }};", f"const {b} = error{{ {', '.join(sb)} }};"]
+        f = self.fresh("ef")
+        pick = self.ch(sa)
+        out.append(f"fn {f}(x: u32) ({a} || {b})!u32 {{")
+        out.append(f"    if (x % 3 == 0) return error.{pick};")
+        out.append(f"    if (x % 3 == 1) return error.{self.ch(sb)};")
+        out.append("    return x * 2;")
+        out.append("}")
+        out.append(f"const {name} = blk: {{")
+        out.append(f"    const M = {a} || {b};")
+        out.append("    const info = @typeInfo(M).error_set.error_names.?;")
+        out.append("    var names_len: usize = 0;")
+        out.append("    for (info) |n| names_len += n.len;")
+        out.append(f"    const e: M = error.{self.ch(sa)};")
+        out.append("    const as_any: anyerror = e;")
+        out.append("    const n = @intFromError(e);")
+        out.append("    const back: M = @errorCast(@errorFromInt(n));")
+        out.append("    var log: [6]u8 = undefined;")
+        out.append("    for (&log, 0..) |*l, i| {")
+        out.append(f"        l.* = if ({f}(@intCast(i))) |v| @intCast(v) else |err| switch (err) {{")
+        cases = sorted(set(sa) | set(sb))
+        sub = self.r.sample(cases, self.r.randint(0, len(cases) - 1))
+        if sub:
+            out.append("            " + ", ".join(f"error.{c}" for c in sorted(sub)) + " => 100,")
+        out.append("            else => @intCast(@errorName(err).len),")
+        out.append("        };")
+        out.append("    }")
+        out.append(f"    const narrowed: ?{a} = if (@as(anyerror, e) == error.{pick}) error.{pick} else null;")
+        out.append(
+            "    break :blk .{ info.len, names_len, @errorName(e), back == e, as_any == e, "
+            f"@intFromError(error.{pick}) == @intFromError(@as({a}, error.{pick})), log, narrowed == null, "
+            f'@typeInfo(@typeInfo(@TypeOf({f})).@"fn".return_type.?).error_union.error_set == M }};'
+        )
+        out.append("};")
+        return out, "any"
+
+    def t_reify(self, name):
+        """@typeInfo of a struct, enum or union, changed and rebuilt with
+        @Struct/@Enum/@Union/@Tuple, then used: defaults, field access by
+        name, switching on a reified union's tag."""
+        out = []
+        k = self.r.random()
+        nf = self.r.randint(1, 4)
+        fts = [self.ch(["u8", "i16", "u5", "bool", "u32", "f32", "u64"]) for _ in range(nf)]
+        if k < 0.35:
+            sn = self.fresh("RS")
+            out.append(
+                f"const {sn} = struct {{ "
+                + ", ".join(f"f{i}: {t} = {self.scalar_lit(t)}" for i, t in enumerate(fts))
+                + " };"
+            )
+            out.append(f"const {name} = blk: {{")
+            out.append(f'    const info = @typeInfo({sn}).@"struct";')
+            out.append("    var names: [info.field_names.len + 1][:0]const u8 = undefined;")
+            out.append("    var types: [info.field_names.len + 1]type = undefined;")
+            out.append("    var attrs: [info.field_names.len + 1]std.lang.Type.Struct.FieldAttributes = undefined;")
+            out.append("    for (info.field_names, info.field_types, info.field_attrs, 0..) |n, t, a, i| {")
+            rev = self.p(0.5)
+            out.append(f"        const j = {'info.field_names.len - 1 - i' if rev else 'i'};")
+            out.append("        names[j] = n;")
+            out.append("        types[j] = t;")
+            out.append("        attrs[j] = a;")
+            out.append("    }")
+            extra = self.r.randint(0, 99)
+            out.append('    names[info.field_names.len] = "extra";')
+            out.append("    types[info.field_names.len] = u16;")
+            out.append(f"    attrs[info.field_names.len] = .{{ .default_value_ptr = &@as(u16, {extra}) }};")
+            out.append("    const T = @Struct(.auto, null, &names, &types, &attrs);")
+            out.append("    var v: T = .{};")
+            i = self.r.randrange(nf)
+            out.append(f"    v.f{i} = {self.scalar_lit(fts[i])};")
+            out.append("    v.extra +%= 1;")
+            out.append(
+                f'    const D = @typeInfo(T).@"struct".field_attrs[{0 if not rev else nf - 1}].defaultValue(@typeInfo(T).@"struct".field_types[{0 if not rev else nf - 1}]);'
+            )
+            out.append(
+                f'    break :blk .{{ v, @field(v, "f{i}"), D, @typeInfo(T).@"struct".field_names.len, @hasField(T, "extra"), '
+                f'std.meta.fieldIndex(T, "f0").? }};'
+            )
+            out.append("};")
+            return out, "any"
+        if k < 0.6:
+            en = self.fresh("RE")
+            vals = sorted(self.r.sample(range(60), self.r.randint(1, 5)))
+            out.append(f"const {en} = enum(u8) {{ " + ", ".join(f"e{i} = {v}" for i, v in enumerate(vals)) + " };")
+            out.append(f"const {name} = blk: {{")
+            out.append(f'    const info = @typeInfo({en}).@"enum";')
+            out.append("    var vals: [info.field_values.len]u16 = undefined;")
+            mul = self.r.randint(1, 5)
+            out.append(f"    for (&vals, info.field_values) |*v, w| v.* = w * {mul} + 1;")
+            mode = self.ch([".exhaustive", ".nonexhaustive"])
+            out.append(f"    const R = @Enum(u16, {mode}, info.field_names, &vals);")
+            out.append("    var acc: u32 = 0;")
+            out.append("    for (std.enums.values(R)) |e| acc = acc *% 31 +% @intFromEnum(e);")
+            out.append("    const last: R = @enumFromInt(vals[vals.len - 1]);")
+            out.append(
+                '    break :blk .{ acc, @tagName(last), @typeInfo(R).@"enum".field_names.len, '
+                f'std.meta.stringToEnum(R, "e0") == @field(R, "e0"), @intFromEnum(@field(R, "e{len(vals) - 1}")) }};'
+            )
+            out.append("};")
+            return out, "any"
+        if k < 0.85:
+            un = self.fresh("RU")
+            out.append(
+                f"const {un} = union(enum) {{ " + ", ".join(f"f{i}: {t}" for i, t in enumerate(fts)) + ", none };"
+            )
+            out.append(f"const {name} = blk: {{")
+            out.append(f'    const info = @typeInfo({un}).@"union";')
+            out.append("    const Tag = std.meta.Tag(" + un + ");")
+            out.append(
+                "    const R = @Union(.auto, Tag, info.field_names, info.field_types[0..info.field_names.len], &@splat(.{}));"
+            )
+            i = self.r.randrange(nf)
+            out.append(f"    var u: R = .{{ .f{i} = {self.scalar_lit(fts[i])} }};")
+            out.append("    _ = &u;")
+            out.append("    const tag_name = @tagName(u);")
+            out.append("    const idx: usize = switch (u) {")
+            out.append("        inline else => |_, t| @intFromEnum(t),")
+            out.append("    };")
+            if self.p(0.5):
+                out.append("    u = .none;")
+            out.append(
+                f"    break :blk .{{ tag_name, idx, @sizeOf(R) == @sizeOf({un}), u == .none, std.meta.activeTag(u) }};"
+            )
+            out.append("};")
+            return out, "any"
+        out.append(f"const {name} = blk: {{")
+        out.append("    const T = @Tuple(&.{ " + ", ".join(fts) + " });")
+        out.append("    var t: T = .{ " + ", ".join(self.scalar_lit(t) for t in fts) + " };")
+        out.append("    _ = &t;")
+        i = self.r.randrange(nf)
+        out.append(f"    t[{i}] = {self.scalar_lit(fts[i])};")
+        out.append('    const info = @typeInfo(T).@"struct";')
+        out.append("    break :blk .{ t, info.is_tuple, info.field_names.len, @TypeOf(t[0]) == " + fts[0] + " };")
+        out.append("};")
+        return out, "any"
+
+    def t_tuples(self, name):
+        """Tuples: concatenation, indexing in inline for, coercion to arrays
+        and structs, comptime fields, nested tuples."""
+        out = [f"const {name} = blk: {{"]
+        n = self.r.randint(1, 4)
+        et = self.ch(["u8", "i32", "u16"])
+        a = ", ".join(f"@as({et}, {self.scalar_lit(et)})" for _ in range(n))
+        b = ", ".join(self.scalar_lit(et) for _ in range(self.r.randint(0, 3)))
+        out.append(f"    const a = .{{ {a} }};")
+        out.append(f"    const b = .{{ {b} }};")
+        out.append("    const c = a ++ b;")
+        out.append(f"    var arr: [c.len]{et} = c;")
+        out.append("    _ = &arr;")
+        out.append(f"    var sum: {et} = 0;")
+        out.append("    for (c) |x| sum +%= x;")
+        out.append(
+            '    var mixed: struct { u8, bool, []const u8, struct { i16, u4 } } = .{ 1, true, "str", .{ -2, 3 } };'
+        )
+        out.append("    _ = &mixed;")
+        out.append(f"    mixed[0] +%= {self.r.randint(0, 255)};")
+        out.append(f"    mixed[3][1] = {self.r.randint(0, 15)};")
+        out.append("    const S = struct { x: u8, y: bool = false };")
+        out.append(f"    const s: S = .{{ .x = {self.r.randint(0, 255)} }};")
+        out.append("    const rep = arr ++ arr;")
+        out.append("    break :blk .{ arr, sum, mixed, s, rep.len, c.len, @TypeOf(c[0]) == " + et + " };")
+        out.append("};")
+        return out, "any"
+
+    def t_slices2(self, name):
+        """Comptime slices of slices: nested string tables, sentinel
+        slices, mutation through slices of a comptime var's arrays."""
+        words = ["", "a", "zig", "hello", "xy", "\\x00b", "bs"]
+        ws = [self.ch(words) for _ in range(self.r.randint(1, 5))]
+        out = [f"const {name} = blk: {{"]
+        out.append("    const table: []const []const u8 = &.{ " + ", ".join(f'"{w}"' for w in ws) + " };")
+        out.append("    var bufs: [3][4]u8 = .{ .{ 1, 2, 3, 4 }, .{ 5, 6, 7, 8 }, .{ 9, 10, 11, 12 } };")
+        out.append("    var views: [3][]u8 = .{ bufs[0][1..], bufs[1][0..2], &bufs[2] };")
+        out.append("    _ = &views;")
+        for _ in range(self.r.randint(1, 5)):
+            k = self.r.random()
+            i = self.r.randrange(3)
+            if k < 0.3:
+                out.append(f"    views[{i}][0] +%= {self.r.randint(0, 9)};")
+            elif k < 0.5:
+                out.append(f"    views[{i}] = views[{i}][@min(1, views[{i}].len)..];")
+            elif k < 0.7:
+                out.append(f"    for (views[{i}]) |*e| e.* *%= 3;")
+            elif k < 0.85:
+                out.append(f"    @memcpy(bufs[{(i + 1) % 3}][0..2], bufs[{i}][2..4]);")
+            else:
+                out.append(
+                    f"    views[{i}] = bufs[{self.r.randrange(3)}][{self.r.randint(0, 2)}..{self.r.randint(2, 4)}];"
+                )
+        out.append("    var total: usize = 0;")
+        out.append("    for (table) |w| total += w.len;")
+        j = self.r.randrange(len(ws))
+        out.append(f"    const tail = table[{j}][@min(1, table[{j}].len)..];")
+        out.append('    const z: [:0]const u8 = "sentinel";')
+        out.append(f"    const zs = z[{self.r.randint(0, 8)}..];")
+        out.append("    var lens: [3]usize = undefined;")
+        out.append("    for (views, &lens) |v, *l| l.* = v.len;")
+        out.append("    break :blk .{ bufs, lens, total, tail, zs, zs[zs.len], table.len };")
+        out.append("};")
+        return out, "any"
+
+    def t_peer(self, name):
+        """Peer type resolution: `@TypeOf(a, b, ...)`, which resolves the
+        peers whatever their values, and each value coerced to it."""
+        families = [
+            [
+                "@as(u8, {v8})",
+                "@as(i16, {vi})",
+                "@as(u32, {v8})",
+                "@as(comptime_int, {vi})",
+                "@as(c_int, {vi})",
+                "@as(usize, {v8})",
+                "@as(u0, 0)",
+                "@as(i1, -1)",
+                "@as(u7, 5)",
+            ],
+            ["@as(?u8, {v8})", "@as(?u8, null)", "null", "@as(u8, {v8})", "@as(comptime_int, {v8})", "@as(?u4, 3)"],
+            [
+                "@as(error{A}!u8, {v8})",
+                "@as(error{A}!u8, error.A)",
+                "@as(error{B}, error.B)",
+                "@as(u8, {v8})",
+                "@as(u3, 1)",
+            ],
+            ["@as(f32, 1.5)", "@as(f64, -2.25)", "@as(comptime_float, 0.5)", "@as(comptime_int, {vi})", "@as(f16, 3)"],
+            [
+                '@as(*const [3]u8, "abc")',
+                '@as([]const u8, "de")',
+                '@as([*:0]const u8, "fg")',
+                "@as(?[]const u8, null)",
+                '@as(?*const [2]u8, "hi")',
+                '@as(*const [2:0]u8, "jk")',
+                "null",
+            ],
+            ["@as(@Vector(2, u8), .{ 1, 2 })", "@as([2]u8, .{ 3, 4 })", "@as(@Vector(2, u16), .{ 5, 6 })"],
+            ["@as(E_peer, .a)", ".b", "@as(?E_peer, null)", "@as(E_peer, .b)"],
+        ]
+        out = [f"const {name} = blk: {{"]
+        res = []
+        for j in range(self.r.randint(1, 4)):
+            fam = self.ch(families)
+            vals = [
+                self.ch(fam if self.p(0.9) else self.ch(families))
+                .replace("{v8}", str(self.r.randint(0, 255)))
+                .replace("{vi}", str(self.r.randint(-300, 300)))
+                for _ in range(self.r.randint(2, 3))
+            ]
+            out.append(f"    const P{j} = @TypeOf({', '.join(vals)});")
+            res.append(f"@typeName(P{j})")
+            for k, v in enumerate(vals):
+                if self.p(0.5):
+                    res.append(f"@as(P{j}, {v})")
+        out.append("    break :blk .{ " + ", ".join(res) + " };")
+        out.append("};")
+        return out, "any"
+
+    def t_fmt(self, name):
+        """std.fmt at comptime: integers and floats in several formats,
+        which runs std's float printing (Ryu, u128 arithmetic) in the
+        evaluator."""
+        out = [f"const {name} = blk: {{"]
+        out.append("    @setEvalBranchQuota(200000);")
+        parts = []
+        args = []
+        for _ in range(self.r.randint(1, 4)):
+            k = self.r.random()
+            if k < 0.5:
+                ft = self.float_type()
+                spec = self.ch(["{d}", "{e}", "{d:.3}", "{e:.2}", "{d:>12.1}", "{any}"])
+                parts.append(spec)
+                args.append(f"@as({ft.name()}, {self.float_lit(ft)})")
+            else:
+                t = self.int_type(128)
+                spec = self.ch(
+                    ["{d}", "{x}", "{X:0>8}", "{b}", "{o}", "{d:^9}", "{c}" if t.bits <= 8 and not t.signed else "{d}"]
+                )
+                parts.append(spec)
+                args.append(self.int_lit(t) if spec != "{c}" else f"@as(u8, {self.r.randint(32, 126)})")
+        fmt = "|".join(parts)
+        out.append(f'    const s = std.fmt.comptimePrint("{fmt}", .{{ {", ".join(args)} }});')
+        out.append("    break :blk .{ s, s.len };")
+        out.append("};")
+        return out, "any"
+
     KINDS = (
         (t_arith, 5),
         (t_fn_eval, 4),
@@ -1407,6 +1795,13 @@ class Gen:
         (t_memory, 3),
         (t_stdlib, 2),
         (t_control, 2),
+        (t_packed_odd, 3),
+        (t_errors, 2),
+        (t_reify, 3),
+        (t_tuples, 2),
+        (t_slices2, 2),
+        (t_peer, 3),
+        (t_fmt, 2),
     )
 
     def test(self, i):
@@ -1420,7 +1815,7 @@ class Gen:
 def generate(seed, size=1.0, only=None):
     g = Gen(seed, size)
     n = max(1, int(g.r.randint(8, 16) * size))
-    out = [f"// cthunt seed {seed}", 'const std = @import("std");', ""]
+    out = [f"// cthunt seed {seed}", 'const std = @import("std");', "const E_peer = enum { a, b };", ""]
     prints = []
     for i in range(n):
         kind, lines, rt = g.test(i)

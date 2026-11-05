@@ -179,7 +179,8 @@ def compile_run(tools, cfg, src, scratch):
         m = re.match(r"t(\d+) (.*)$", line)
         if m:
             # A NaN's sign is not specified.
-            lines[int(m.group(1))] = m.group(2).replace("-nan", "nan")
+            # A NaN's sign is unspecified; a pointer prints its address.
+            lines[int(m.group(1))] = re.sub(r"@[0-9a-f]+\b", "@addr", m.group(2).replace("-nan", "nan"))
     if r.returncode != 0:
         return Build("run-fail", r.stderr[-3000:], lines=lines)
     return Build("ok", lines=lines)
