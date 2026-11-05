@@ -105,6 +105,8 @@ macho_libs: []const MachODylib = &.{},
 stack_size: u64 = 16 * 1024 * 1024,
 /// `-fstrip`: link no debug info.
 strip: bool = false,
+/// `-fentry=<symbol>`, if given.
+entry_name: ?[]const u8 = null,
 /// `-ffuzz`: CodeGen instruments the main module family's functions with
 /// coverage points (docs/slop/architecture.md, "Fuzzing").
 fuzz: bool = false,
@@ -1346,7 +1348,7 @@ pub fn finish(emit: *Emit) !bool {
 
     // On macOS, libSystem's start calls the C `main` that std.start
     // exports.
-    const entry_name = if (ip.target == .aarch64_macos) "main" else "_start";
+    const entry_name = emit.entry_name orelse if (ip.target == .aarch64_macos) "main" else "_start";
     var entry: ?SymbolKey = null;
     for (zcu.exports.items) |e| {
         if (e.target != .nav) continue;
@@ -1357,12 +1359,16 @@ pub fn finish(emit: *Emit) !bool {
         }
     }
     if (emit.failed) return false;
-    // An executable whose `main` is C's (`main.Options.c_root`): dyld
-    // calls it where its object defines it, at an alias when that is
-    // inside its section's atom.
-    if (entry == null and ip.target == .aarch64_macos) if (emit.inputs) |in| if (try in.macho.lookup("main")) |t| {
+    // An entry point an object defines: C's `main` in an executable whose
+    // `main` is C's (`main.Options.c_root`), which dyld calls, or the
+    // `_start` of an object that `bs test-obj` built. At an alias when it
+    // is inside its section's atom.
+    const Def = struct { key: SymbolKey, offset: u64 };
+    if (entry == null) if (emit.inputs) |in| if (switch (in) {
+        inline else => |p| if (try p.lookup(entry_name)) |t| Def{ .key = t.key, .offset = t.offset } else null,
+    }) |t| {
         if (t.offset == 0) entry = t.key else {
-            const key: SymbolKey = .fromName("bs.c_main");
+            const key: SymbolKey = .fromName("bs.entry");
             try emit.aliases.append(emit.gpa, .{ .key = key, .target = t.key, .addend = @intCast(t.offset) });
             entry = key;
         }

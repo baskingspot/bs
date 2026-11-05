@@ -51,7 +51,25 @@ const usage =
     \\
 ;
 
-pub const Command = enum { build_exe, build_obj, build_lib, run, @"test" };
+pub const Command = enum {
+    build_exe,
+    build_obj,
+    build_lib,
+    run,
+    @"test",
+    /// `zig test-obj`: the tests and their runner, as an object.
+    test_obj,
+
+    /// Builds tests with a test runner (`test`, `test-obj`).
+    pub fn isTest(c: Command) bool {
+        return c == .@"test" or c == .test_obj;
+    }
+
+    /// Outputs an object (`build-obj`, `test-obj`).
+    pub fn isObj(c: Command) bool {
+        return c == .build_obj or c == .test_obj;
+    }
+};
 
 /// Options shared by the compile commands. Spelled like `zig build-exe`.
 pub const Options = struct {
@@ -98,6 +116,9 @@ pub const Options = struct {
     /// `-fstrip` on the root module: no debug info in the output, as
     /// upstream's (`builtin.strip_debug_info`).
     strip: bool = false,
+    /// `-fentry=<symbol>`: the executable's entry point, in place of
+    /// `_start` (C's `main` on aarch64-macos).
+    entry: ?[]const u8 = null,
     /// `-ffuzz` on any module: instrument those modules for upstream's
     /// fuzzer and link it (docs/slop/architecture.md, "Fuzzing").
     fuzz: bool = false,
@@ -166,6 +187,9 @@ pub const Options = struct {
     /// of C sources and objects only: its root file is bs's
     /// (`Builtin.c_main`), and in an executable C defines `main`.
     c_root: bool = false,
+    /// An executable linked from objects alone (with `c_root`): as
+    /// upstream's, without the C runtimes, which C sources would bring.
+    objects_only: bool = false,
     c_global_cc_argv: []const []const u8 = &.{},
     /// `std.zig.system.NativePaths`' include directories, which upstream's
     /// C takes after libc's when a native build names system libraries
@@ -210,7 +234,6 @@ pub const Options = struct {
 /// implement, so that they fail with a diagnostic, over the compiler
 /// protocol when asked to.
 const unsupported_commands: std.StaticStringMap([]const u8) = .initComptime(.{
-    .{ "test-obj", "bs does not build test objects yet ('test-obj'); build this step with upstream zig" },
     .{ "cc", "bs does not compile C ('cc'); build this step with upstream zig" },
     .{ "c++", "bs does not compile C++ ('c++'); build this step with upstream zig" },
     .{ "objcopy", "bs does not implement 'objcopy'; run this step with upstream zig" },
@@ -286,6 +309,8 @@ pub fn main(init_std: std.process.Init) !void {
         .run
     else if (std.mem.eql(u8, cmd, "test"))
         .@"test"
+    else if (std.mem.eql(u8, cmd, "test-obj"))
+        .test_obj
     else if (std.mem.eql(u8, cmd, "version")) {
         try Io.File.stdout().writeStreamingAll(init.io, zig_version ++ "\n");
         return;
@@ -461,10 +486,10 @@ pub const Job = struct {
             .global = opts.global_cache_dir,
             .local_is_global = command == .run,
         });
-        const is_test = command == .@"test";
+        const is_test = command.isTest();
         const builtin_opts: Builtin.Options = .{
             .output_mode = switch (command) {
-                .build_obj => .Obj,
+                .build_obj, .test_obj => .Obj,
                 .build_lib => .Lib,
                 else => .Exe,
             },
@@ -565,7 +590,7 @@ pub const Job = struct {
             .link_objects = link_objects,
             .link_shared = link_shared,
             .stem = opts.name orelse if (is_test) "test" else if (opts.c_only or opts.c_root) std.fs.path.stem(if (opts.c_sources.len != 0) opts.c_sources[0].path else if (opts.link_inputs.len != 0) opts.link_inputs[0] else opts.root_name) else std.fs.path.stem(opts.root_src_path),
-            .run_test = is_test and !opts.test_no_exec and !opts.listen and opts.emit_bin != .none,
+            .run_test = command == .@"test" and !opts.test_no_exec and !opts.listen and opts.emit_bin != .none,
             .environ_map = init_.environ_map,
             .full_args = args,
             .io = init_.io,
@@ -595,7 +620,7 @@ pub const Job = struct {
     pub fn openCache(job: *const Job, out_path: ?[]const u8) ?Incremental {
         const env = job.environ_map;
         if (out_path == null or !job.cacheable()) return null;
-        const tests_std = job.opts.command == .@"test" and
+        const tests_std = job.opts.command.isTest() and
             (Frontend.testsStd(job.gpa, job.zig_lib_dir, job.opts.root_src_path) catch fatal("out of memory", .{}));
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
         var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.opts.root_name, tests_std, job.cache_target, env.get("BS_CACHE_TIMING") != null) catch |err| {
@@ -616,7 +641,7 @@ pub const Job = struct {
             i.runpath = job.opts.runpath;
         }
         i.output = switch (job.opts.command) {
-            .build_obj => .obj,
+            .build_obj, .test_obj => .obj,
             .build_lib => .lib,
             else => .exe,
         };
@@ -899,7 +924,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, batch: ?*CSource.Batch,
     if (inputs) |list| try appendCInputs(arena, list, c.inputs);
     if (c.errors.len != 0) return .{ .errors = try dupeDiagnostics(arena, c.errors) };
     const bin_path = alt_path orelse out_path orelse return .{ .ok = .{ .cache_hit = false } };
-    if (job.opts.command == .build_obj) {
+    if (job.opts.command.isObj()) {
         if (!try writeMerged(init, bin_path, null, job.opts.link_inputs, c.objects, job.opts.bs_target)) return .failed;
     } else {
         var members: std.ArrayList(Archive.Input) = .empty;
@@ -967,7 +992,7 @@ fn appendCInputs(arena: std.mem.Allocator, list: *std.ArrayList(u8), c_inputs: [
 /// Whether the build links the C++ runtime libraries: an executable with
 /// `-lc++`, as upstream builds them for executables and shared libraries.
 fn cxxRuntime(opts: *const Options) bool {
-    return opts.link_libcpp and opts.command != .build_obj and (opts.command != .build_lib or opts.dynamic);
+    return opts.link_libcpp and !opts.command.isObj() and (opts.command != .build_lib or opts.dynamic);
 }
 
 /// Whether the build links glibc's libc_nonshared.a: an executable or
@@ -975,7 +1000,7 @@ fn cxxRuntime(opts: *const Options) bool {
 /// Zig externs call its functions (`atexit`, `__stack_chk_fail_local`,
 /// and before glibc 2.33 `stat` and `fstatat`, which std's I/O calls).
 fn libcNonshared(opts: *const Options) bool {
-    return opts.link_libc and opts.glibc_version != null and opts.command != .build_obj and (opts.command != .build_lib or opts.dynamic);
+    return opts.link_libc and opts.glibc_version != null and !opts.command.isObj() and (opts.command != .build_lib or opts.dynamic);
 }
 
 /// Starts compiling the job's C sources (CSource.zig).
@@ -1049,7 +1074,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         return .{ .ok = .{ .cache_hit = true } };
     };
 
-    const is_test = opts.command == .@"test";
+    const is_test = opts.command.isTest();
     const test_runner = opts.test_runner orelse try std.fs.path.join(arena, &.{ job.zig_lib_dir, "compiler", "test_runner.zig" });
     const fe_node = prog.start("Load Sources", 0);
     var fe: Frontend = try .init(init.gpa, init.io, job.zig_lib_dir, .{
@@ -1067,7 +1092,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
         // Only executables link the C runtimes; a library's C objects
         // reach them when an executable links the library, as upstream's.
-        .c_runtimes = ((opts.command != .build_obj and opts.command != .build_lib) or opts.dynamic) and (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp),
+        .c_runtimes = !opts.objects_only and ((!opts.command.isObj() and opts.command != .build_lib) or opts.dynamic) and (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp),
     });
     defer fe.deinit();
     try fe.enableCache(job.cache_dirs);
@@ -1135,7 +1160,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     }
     var emit: Emit = .init(init.gpa, &zcu);
     defer emit.deinit();
-    emit.obj = opts.command == .build_obj or opts.command == .build_lib;
+    emit.obj = opts.command.isObj() or opts.command == .build_lib;
     emit.pic = if (opts.pie) .pie else if (opts.pic) .pic else .none;
     emit.shared = opts.dynamic;
     if (opts.dynamic) emit.soname = switch (opts.soname) {
@@ -1147,11 +1172,12 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     if (opts.version) |v| emit.dylib_version = @as(u32, @intCast(@min(v.major, 0xffff))) << 16 | @as(u32, @intCast(@min(v.minor, 0xff))) << 8 | @as(u32, @intCast(@min(v.patch, 0xff)));
     emit.stack_size = opts.stack_size;
     emit.strip = opts.strip;
+    emit.entry_name = opts.entry;
     emit.fuzz = opts.fuzz;
     emit.prove_on = proving(job.environ_map);
     // Executables and shared libraries link glibc: an object or a static
     // library with -lc is an ordinary one, as upstream's.
-    const links_glibc = opts.link_libc and opts.command != .build_obj and (opts.command != .build_lib or opts.dynamic);
+    const links_glibc = opts.link_libc and !opts.command.isObj() and (opts.command != .build_lib or opts.dynamic);
     var glibc: ?Glibc = if (links_glibc) try loadGlibc(init, job) else null;
     defer if (glibc) |*g| g.deinit();
     if (glibc) |*g| emit.glibc = g;
@@ -1293,7 +1319,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // object with object inputs or C sources merges them (`writeMerged`).
     // A lazy edit build writes either itself.
     const archive = opts.command == .build_lib and !opts.dynamic;
-    const merged = opts.command == .build_obj and (opts.link_inputs.len != 0 or c_batch != null);
+    const merged = opts.command.isObj() and (opts.link_inputs.len != 0 or c_batch != null);
     const link_path = if (archive or merged) try std.fmt.allocPrint(arena, "{s}.o.tmp", .{bin_path}) else bin_path;
     var linked = lazy_linked orelse try emit.link(init.io, Io.Dir.cwd(), link_path);
     if (linked and lazy_linked == null and merged) {
@@ -1376,7 +1402,7 @@ fn printEnv(init: std.process.Init) !void {
 /// dylib's on macOS.
 fn outputName(arena: std.mem.Allocator, command: Command, dynamic: bool, version: ?std.SemanticVersion, stem: []const u8, macos: bool) ![]const u8 {
     return switch (command) {
-        .build_obj => std.fmt.allocPrint(arena, "{s}.o", .{stem}),
+        .build_obj, .test_obj => std.fmt.allocPrint(arena, "{s}.o", .{stem}),
         .build_lib => if (!dynamic)
             std.fmt.allocPrint(arena, "lib{s}.a", .{stem})
         else if (macos) if (version) |v|
@@ -1462,11 +1488,11 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     try server.serveStringMessage(.zig_version, zig_version);
     try server.serveConfig(.{ .flags = .{
         .output_mode = switch (opts.command) {
-            .build_obj => .Obj,
+            .build_obj, .test_obj => .Obj,
             .build_lib => .Lib,
             else => .Exe,
         },
-        .link_mode = if (opts.dynamic or (opts.link_libc and opts.command != .build_obj and opts.command != .build_lib)) .dynamic else .static,
+        .link_mode = if (opts.dynamic or (opts.link_libc and !opts.command.isObj() and opts.command != .build_lib)) .dynamic else .static,
         .link_libc = opts.link_libc,
         .link_libcpp = opts.link_libcpp,
         .link_libunwind = opts.link_libcpp,
@@ -1887,7 +1913,6 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-fno-entry", "bs does not build executables without an entry point yet ('-fno-entry')" },
     .{ "-fomit-frame-pointer", "bs always keeps frame pointers ('-fomit-frame-pointer'); remove '.omit_frame_pointer = true'" },
     .{ "-fsanitize-thread", "bs has no ThreadSanitizer ('-fsanitize-thread'); build this step with upstream zig" },
-    .{ "-femit-asm", "bs does not emit assembly ('-femit-asm')" },
     .{ "-femit-implib", "bs does not emit import libraries ('-femit-implib')" },
     .{ "-femit-llvm-bc", "bs has no LLVM backend ('-femit-llvm-bc')" },
     .{ "-femit-llvm-ir", "bs has no LLVM backend ('-femit-llvm-ir')" },
@@ -1977,6 +2002,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             opts.emit_bin = .none;
         } else if (std.mem.eql(u8, arg, "-femit-docs")) {
             opts.emit_docs = .default;
+        } else if (std.mem.eql(u8, arg, "-femit-asm") or std.mem.startsWith(u8, arg, "-femit-asm=")) {
+            // As upstream's own backends (x86_64's, its Debug default here),
+            // which accept it and emit no assembly.
         } else if (std.mem.startsWith(u8, arg, "-femit-docs=")) {
             opts.emit_docs = .{ .path = arg["-femit-docs=".len..] };
         } else if (std.mem.eql(u8, arg, "-fno-emit-docs")) {
@@ -1987,9 +2015,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             // means, as with -fllvm: bs links it static and non-PIE, and
             // `builtin.position_independent_*` stay false. Objects and
             // libraries get position-independent code, as upstream's.
-            if (command == .build_obj or command == .build_lib) {
+            if (command.isObj() or command == .build_lib) {
                 opts.pic = true;
-                if (std.mem.eql(u8, arg, "-fPIE") and command == .build_obj) opts.pie = true;
+                if (std.mem.eql(u8, arg, "-fPIE") and command.isObj()) opts.pie = true;
             }
         } else if (std.mem.eql(u8, arg, "-dynamic")) {
             lib_search = .{ .strategy = .mode_first, .static = false };
@@ -2037,7 +2065,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             opts.single_threaded = false;
         } else if (std.mem.eql(u8, arg, "-ffuzz")) {
             // Objects would need the coverage sections and their symbols.
-            if (command == .build_obj or command == .build_lib)
+            if (command.isObj() or command == .build_lib)
                 setUnsupported(&opts, arena, "bs does not instrument objects or libraries for fuzzing yet ('-ffuzz'); fuzz an executable or a test", .{});
             fuzz = true;
         } else if (std.mem.eql(u8, arg, "-fno-fuzz")) {
@@ -2075,7 +2103,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (std.mem.eql(u8, arg, "--test-filter")) {
             try test_filters.append(arena, nextTestArg(command, args, &i, arg));
         } else if (std.mem.eql(u8, arg, "--test-no-exec")) {
-            if (command != .@"test") fatal("{s} is only valid for 'bs test'", .{arg});
+            if (!command.isTest()) fatal("{s} is only valid for 'bs test' and 'bs test-obj'", .{arg});
             opts.test_no_exec = true;
         } else if (std.mem.eql(u8, arg, "--dep")) {
             try deps.append(arena, nextArg(args, &i, arg));
@@ -2210,7 +2238,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (std.mem.startsWith(u8, arg, "--export=")) {
             // As upstream's: only a WebAssembly link exports the symbol;
             // an ELF or Mach-O output exports what the code exports.
-        } else if (std.mem.startsWith(u8, arg, "-flto") or std.mem.startsWith(u8, arg, "-fentry=") or
+        } else if (std.mem.startsWith(u8, arg, "-fentry=")) {
+            opts.entry = arg["-fentry=".len..];
+        } else if (std.mem.startsWith(u8, arg, "-flto") or
             std.mem.startsWith(u8, arg, "-fpatchable-function-entry=") or
             std.mem.startsWith(u8, arg, "--compress-debug-sections="))
         {
@@ -2221,7 +2251,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             const ext = std.fs.path.extension(arg);
             if (CSource.Lang.ofPath(arg)) |lang| {
                 try c_files.append(arena, .{ .path = arg, .extra_flags = extra_cflags, .cc_argv = &.{}, .flags = .{}, .lang = lang });
-            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or (isSharedLib(arg) and command != .build_obj and command != .build_lib)) {
+            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or (isSharedLib(arg) and !command.isObj() and command != .build_lib)) {
                 try link_inputs.append(arena, arg);
             } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.indexOf(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib") or std.mem.eql(u8, ext, ".dylib") or std.mem.eql(u8, ext, ".tbd"))
                 setUnsupported(&opts, arena, "bs does not link object files or libraries ('{s}'); build this step with upstream zig", .{arg})
@@ -2240,7 +2270,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // against libSystem, which is macOS's libc (`-lc` asks for nothing
     // more), with C sources, Mach-O objects and archives.
     if (opts.bs_target == .aarch64_macos) {
-        if (command == .build_obj and (c_files.items.len != 0 or link_inputs.items.len != 0))
+        if (command.isObj() and (c_files.items.len != 0 or link_inputs.items.len != 0))
             setUnsupported(&opts, arena, "bs does not merge C sources or objects into aarch64-macos objects yet; build this step with upstream zig", .{})
         else if (opts.link_libcpp)
             setUnsupported(&opts, arena, "bs does not link libc++ for aarch64-macos yet; build this step with upstream zig", .{})
@@ -2288,20 +2318,24 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // As upstream (`requiresPIC`): glibc makes objects and libraries
     // position-independent, as their builtin says. bs links executables
     // itself, non-PIE.
-    if (opts.link_libc and (command == .build_obj or command == .build_lib)) opts.pic = true;
+    if (opts.link_libc and (command.isObj() or command == .build_lib)) opts.pic = true;
     if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena);
     // C sources without any module: a library or executable of C only, as
-    // upstream's; so are object inputs alone in a library or object.
-    if (root == null and !rootless_root and command != .@"test" and
-        (c_files.items.len != 0 or (link_inputs.items.len != 0 and (command == .build_lib or command == .build_obj)))) rootless_root = true;
+    // upstream's; so are object inputs alone.
+    if (root == null and !rootless_root and !command.isTest() and (c_files.items.len != 0 or link_inputs.items.len != 0)) rootless_root = true;
     if (root == null and rootless_root) {
         // An executable whose main is C's, as upstream's; on x86_64-linux
         // bs needs glibc for its start code (`Builtin.glibc_start`), and
         // on aarch64-macos dyld calls C's `main`. A shared library of
         // C is linked from bs's root too, for compiler_rt and ubsan_rt.
-        if ((command == .build_exe or command == .run) and (opts.link_libc or opts.bs_target == .aarch64_macos) and c_files.items.len != 0)
-            opts.c_root = true
-        else if (command != .build_lib and command != .build_obj)
+        // So is an executable linked from objects alone, one of which
+        // defines the entry point (`bs test-obj`'s), as upstream's.
+        if ((command == .build_exe or command == .run) and (opts.link_libc or opts.bs_target == .aarch64_macos) and c_files.items.len != 0) {
+            opts.c_root = true;
+        } else if ((command == .build_exe or command == .run) and c_files.items.len == 0) {
+            opts.c_root = true;
+            opts.objects_only = true;
+        } else if (command != .build_lib and !command.isObj())
             setUnsupported(&opts, arena, "bs builds modules without a Zig root source file only into libraries and objects of C and executables of C that link glibc ('-M{s}'); build this step with upstream zig", .{opts.root_name})
         else if (c_files.items.len == 0 and link_inputs.items.len == 0)
             setUnsupported(&opts, arena, "bs builds a library or object without a Zig root source file only from C sources and objects ('-M{s}')", .{opts.root_name})
@@ -2337,7 +2371,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // A static library holds object inputs as members after its own
     // object, an object merges them (`ElfMerge`), and a shared library
     // links both, as an executable does.
-    if (command == .build_obj or command == .build_lib) {
+    if (command.isObj() or command == .build_lib) {
         // As upstream's `Config.resolve`, a library that links a shared
         // one without `-static` or `-dynamic` is shared.
         if (command == .build_lib and link_mode == null) for (link_inputs.items) |path| if (isSharedLib(path)) {
@@ -2394,7 +2428,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     opts.c_global_cc_argv = cc_argv.items;
     // As upstream, a root file given without `-M` names its module "test"
     // under `bs test`, else after the file (not `--name`).
-    if (positional_root) opts.root_name = if (command == .@"test") "test" else std.fs.path.stem(opts.root_src_path);
+    if (positional_root) opts.root_name = if (command.isTest()) "test" else std.fs.path.stem(opts.root_src_path);
     // As upstream: a `--dep` names one module.
     for (modules.items, 0..) |m, k| {
         const prev = if (std.mem.eql(u8, m.name, opts.root_name)) opts.root_src_path else for (modules.items[0..k]) |p| {
@@ -2414,6 +2448,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         root_mode = mode;
     }
     opts.root_fuzz = root_fuzz orelse false;
+    if (command == .test_obj and !opts.test_no_exec and !opts.listen) fatal("test-obj requires --test-no-exec", .{});
     if (unsafe_mode) |a| if (!opts.listen)
         setUnsupported(&opts, arena, "bs builds only Debug and ReleaseSafe on the command line ('{s}'); use -OReleaseSafe, or upstream zig for an optimized build", .{a});
     // As upstream's `Config.resolve` and `Module.create`: error tracing and
@@ -2630,7 +2665,7 @@ pub fn resolveGlibc(opts: *Options, arena: std.mem.Allocator) void {
 }
 
 fn nextTestArg(command: Command, args: []const []const u8, i: *usize, flag: []const u8) []const u8 {
-    if (command != .@"test") fatal("{s} is only valid for 'bs test'", .{flag});
+    if (!command.isTest()) fatal("{s} is only valid for 'bs test'", .{flag});
     return nextArg(args, i, flag);
 }
 

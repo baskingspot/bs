@@ -121,6 +121,21 @@ misc)
 for f in index.html main.js main.wasm sources.tar; do [ -s "zig-out/docs/$f" ] || fail "zig-out/docs/$f"; done
 tar tf zig-out/docs/sources.tar | grep -qx test/main.zig || fail "sources.tar holds test/main.zig"
 
+# As upstream: `bs test-obj` builds the tests and their runner as an
+# object, which an executable links alone; `-fentry` picks the entry
+# point; `-femit-asm` emits no assembly, as upstream's own backend.
+mkdir "$work/obj"
+printf 'test {}\n' >"$work/obj/t.zig"
+printf 'pub const _start = {};\nexport fn foo() callconv(.naked) noreturn {\n    asm volatile ("syscall" : : [n] "{rax}" (60), [c] "{rdi}" (7));\n}\nexport fn bar() callconv(.naked) noreturn {\n    asm volatile ("syscall" : : [n] "{rax}" (60), [c] "{rdi}" (9));\n}\n' >"$work/obj/e.zig"
+(cd "$work/obj" && "$bs" test-obj --test-no-exec t.zig && "$bs" build-exe test.o && ./test) >"$work/log" 2>&1 || fail "bs test-obj --test-no-exec, then bs build-exe test.o"
+expect "All 1 tests passed."
+(cd "$work/obj" && "$bs" build-exe -fentry=foo e.zig -femit-asm) >"$work/log" 2>&1 || fail "bs build-exe -fentry=foo"
+if (cd "$work/obj" && ./e); then fail "the -fentry=foo program exits 7"; else [ $? = 7 ] || fail "the -fentry=foo program exits 7"; fi
+# Another entry in another cache directory: not the -fentry=foo build's
+# donor (upstream's entry_point checks the same).
+(cd "$work/obj" && "$bs" build-exe -fentry=bar e.zig --cache-dir c2 -femit-bin=e2) >"$work/log" 2>&1 || fail "bs build-exe -fentry=bar"
+if (cd "$work/obj" && ./e2); then fail "the -fentry=bar program exits 9"; else [ $? = 9 ] || fail "the -fentry=bar program exits 9"; fi
+
 # `bs env` for tools that ask the compiler (zls's tests).
 "$bs" env | grep -q '\.lib_dir = ' || fail "bs env prints .lib_dir"
 # `bs ast-check` on stdin, as zls runs it for unused-variable fixes.

@@ -945,7 +945,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             addrs[v.symbol] = @intCast(value_tag + i);
         }
     } else {
-        if (options.entry) |e| if (symbols.get(e) == null) {
+        // The entry may also be an alias, resolved with the others
+        // (an input's `_start` inside its section's atom).
+        if (options.entry) |e| if (symbols.get(e) == null and for (options.aliases) |a| {
+            if (a.key == e) break false;
+        } else true) {
             diag.* = .{ .target = e };
             return error.UndefinedSymbol;
         };
@@ -1122,7 +1126,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     try parallel(io, n_threads, l.n_resolve_tasks + n_debug_chunks, &l, Link.resolveAddrsAndLayOutDebug);
     try l.check(diag);
     try l.resolveAliases(options.aliases, &values, diag);
-    const entry_addr = if (options.entry == null) 0 else if (numbered) |s| l.numberedAddr(addrs[s.entry]) else symbols.get(options.entry.?).?;
+    const entry_addr = if (options.entry == null) 0 else if (numbered) |s| l.numberedAddr(addrs[s.entry]) else symbols.get(options.entry.?) orelse values.get(options.entry.?).?;
     if (entry_addr == null) {
         diag.* = .{ .target = options.entry };
         return error.UndefinedSymbol;

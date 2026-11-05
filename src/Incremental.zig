@@ -1210,7 +1210,8 @@ const donor_renew_ns = std.time.ns_per_hour;
 /// whether the build links an object (`build-obj`, `build-lib`), whose
 /// code CodeGen generates differently: a symbol the build does not export
 /// is an import, not compiler_rt's; the glibc a `-lc` executable links,
-/// for the same reason; and whether a test build tests std itself
+/// for the same reason; the entry point's name (`-fentry=`), which Emit
+/// resolves once; and whether a test build tests std itself
 /// (`tests_std`): only the module under test has tests among its roots,
 /// so that decides which of std's containers have effects
 /// (`Sema.noteEffects`), and a donor's unit that evaluated one without
@@ -1248,6 +1249,12 @@ fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, r
         // (`Emit.exportTarget`).
         if (std.mem.startsWith(u8, a, "--bs-glibc=")) {
             h.update("\x00glibc\x00");
+            h.update(a);
+        }
+        // -fentry=: Emit picks the entry once, and an edit build that
+        // changes nothing links the manifest's.
+        if (std.mem.startsWith(u8, a, "-fentry=")) {
+            h.update("\x00entry\x00");
             h.update(a);
         }
     }

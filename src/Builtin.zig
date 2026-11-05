@@ -115,7 +115,8 @@ pub const glibc_start =
 /// `glibc_start.zig` exports it.
 pub const c_main =
     \\//! bs's root file for an executable whose `main` is C's: glibc_start.zig
-    \\//! calls it, and std's start code exports neither `main` nor `_start`.
+    \\//! calls it, and std's start code exports neither `main` nor `_start`;
+    \\//! also for one linked from objects alone, one of which has `_start`.
     \\
     \\pub const _start = {};
     \\
