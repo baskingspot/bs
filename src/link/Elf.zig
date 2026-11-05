@@ -1590,8 +1590,9 @@ const Chunk = struct {
     n_syms: u32,
     str_len: u32,
     max_targets: u32,
-    /// The atoms with code after their epilogue's `ret`, whose FDEs can
-    /// exceed `Dwarf.max_short_fde_size`.
+    /// The atoms with code after their epilogue's `ret` or with saved
+    /// aarch64 d registers, whose FDEs can exceed
+    /// `Dwarf.max_short_fde_size`.
     n_long_fdes: u32,
     /// In a shared object, the atoms' absolute relocations, each of which
     /// is a dynamic relocation.
@@ -2008,7 +2009,7 @@ fn LinkOf(comptime Input: type) type {
                     c.str_len += @intCast(a.name.len + 1);
                 }
                 c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
-                c.n_long_fdes += @intFromBool(a.unwind.epilogue > 1);
+                c.n_long_fdes += @intFromBool(a.unwind.epilogue > 1 or a.unwind.saved & 0xf00 != 0);
                 if (dynamic) {
                     for (a.relocs) |r| c.n_rela += @intFromBool(l.needsDynamicReloc(a, r));
                 }

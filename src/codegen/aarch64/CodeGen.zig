@@ -166,6 +166,8 @@ const Home = union(enum) {
     /// The value is in this register; for an `alloc`, a promoted
     /// variable (`Ssa.plan`), the variable's value is.
     reg: Reg,
+    /// The same, for an f32 or f64 in one of d8-d15.
+    freg: VReg,
 };
 
 /// Where an operand's value can be read.
@@ -175,6 +177,8 @@ pub const Loc = union(enum) {
     mem: Mem,
     /// The value is in this register (x19-x28).
     reg: Reg,
+    /// The f32 or f64 is in this register (d8-d15).
+    freg: VReg,
     /// The value is the address of this memory.
     addr: Mem,
     /// A scalar constant, already extended to 64 bits.
@@ -246,6 +250,9 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         try cg.e.mov(.x, .fp, .sp);
         for (0..5) |k| if (cg.saved >> @intCast(k) & 1 != 0) {
             try cg.e.stp(.dword, pairReg(k, 1), pairReg(k, 0), .{ .base = .sp, .offset = .{ .pre = -16 } });
+        };
+        for (0..4) |k| if (cg.saved >> @intCast(8 + k) & 1 != 0) {
+            try cg.e.stpFp(.f64, float_regs[2 * k + 1], float_regs[2 * k], .{ .base = .sp, .offset = .{ .pre = -16 } });
         };
         // Two instructions that allocate the frame, written once its size
         // is known (`allocFrame`).
@@ -421,7 +428,11 @@ fn tempSlot(cg: *CodeGen) Error!Mem {
 /// Moves the results `resultMem` put in scratch slots to their registers,
 /// and frees the scratch slots for the next instruction.
 fn flushResults(cg: *CodeGen) Error!void {
-    for (cg.pending.items) |p| try cg.loadMem(cg.homes[@backingInt(p.inst)].reg, p.mem, cg.ir.typeOfIndex(p.inst, cg.ip));
+    for (cg.pending.items) |p| switch (cg.homes[@backingInt(p.inst)]) {
+        .reg => |r| try cg.loadMem(r, p.mem, cg.ir.typeOfIndex(p.inst, cg.ip)),
+        .freg => |v| try cg.loadFp(v, memVal(cg.ir.typeOfIndex(p.inst, cg.ip), p.mem)),
+        else => unreachable,
+    };
     cg.pending.clearRetainingCapacity();
     cg.tmp_next = 0;
 }
@@ -459,47 +470,61 @@ pub fn fate(cg: *const CodeGen, inst: Inst.Index) Ssa.Fate {
 /// no lowering uses as scratch and every call preserves.
 const alloc_regs = [_]Reg{ .x19, .x20, .x21, .x22, .x23, .x24, .x25, .x26, .x27, .x28 };
 
+/// The floating-point registers the allocator hands out, after
+/// `alloc_regs`: d8-d15, whose low 64 bits every call preserves, enough
+/// for the f32 and f64 values that have them.
+const float_regs = [_]VReg{ .v8, .v9, .v10, .v11, .v12, .v13, .v14, .v15 };
+
 /// Register `half` (0 the lower-numbered) of saved pair `k` (x19/x20 is 0).
 fn pairReg(k: usize, half: u1) Reg {
     return @fromBackingInt(@intCast(19 + 2 * k + half));
 }
 
 /// Gives the values `clobbers` marked their registers (`Ssa.allocate`)
-/// and records the pairs the prologue saves.
+/// and records the pairs the prologue saves: x19/x20 through x27/x28 in
+/// bits 0-4 and d8/d9 through d14/d15 in bits 8-11 of `saved`, compact
+/// unwind's frame-mode bits.
 fn allocateRegs(cg: *CodeGen) void {
     const f = &cg.emit.ssa;
     const live = f.live.slice();
     const reg = live.items(.reg);
     const fates = live.items(.fate);
     @memset(live.items(.hint), .{ Ssa.no_reg, Ssa.no_reg });
-    // Nothing clobbers x19-x28, so no value crosses a clobber point and
-    // none is split.
+    // Nothing clobbers x19-x28 or d8-d15, so no value crosses a clobber
+    // point and none is split.
     const split: std.DynamicBitSetUnmanaged = .{};
-    const used = f.allocate(alloc_regs.len, 0, (1 << alloc_regs.len) - 1, &.{}, &split, 0, &.{});
+    const n = alloc_regs.len + float_regs.len;
+    const used = f.allocate(alloc_regs.len, float_regs.len, (1 << n) - 1, &.{}, &split, 0, &.{});
     for (0..5) |k| if (used >> @intCast(2 * k) & 3 != 0) {
         cg.saved |= @as(u16, 1) << @intCast(k);
     };
+    for (0..4) |k| if (used >> @intCast(alloc_regs.len + 2 * k) & 3 != 0) {
+        cg.saved |= @as(u16, 0x100) << @intCast(k);
+    };
     for (f.values.items(.inst)) |inst| {
         const i = @backingInt(inst);
-        if (fates[i] == .normal and reg[i] < alloc_regs.len) cg.homes[i] = .{ .reg = alloc_regs[reg[i]] };
+        if (fates[i] != .normal or reg[i] >= n) continue;
+        cg.homes[i] = if (reg[i] < alloc_regs.len) .{ .reg = alloc_regs[reg[i]] } else .{ .freg = float_regs[reg[i] - alloc_regs.len] };
     }
 }
 
 // `Ssa.liveness` and `Ssa.plan` hooks.
 
 /// Whether value `inst`'s lowering may write a register a value holds:
-/// never, as only x19-x28 hold values. Also marks the values that want a
-/// register: scalars in general-purpose registers, other than allocs
-/// (`Ssa.plan` promotes variables) and block results.
+/// never, as only x19-x28 and d8-d15 hold values. Also marks the values
+/// that want a register: scalars in general-purpose registers and f32
+/// and f64 in floating-point ones, other than allocs (`Ssa.plan` promotes
+/// variables) and block results.
 pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
     if (cg.emit.ssa.has_asm) return false;
     switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
         .alloc, .block => return false,
         else => {},
     }
-    if (!cg.inGpr(cg.ir.typeOfIndex(inst, cg.ip))) return false;
+    const ty = cg.ir.typeOfIndex(inst, cg.ip);
+    const want = if (cg.inGpr(ty)) Ssa.want_reg else if (cg.inFloat(ty)) Ssa.want_float else return false;
     const live = cg.emit.ssa.live.slice();
-    live.items(.reg)[@backingInt(inst)] = Ssa.want_reg;
+    live.items(.reg)[@backingInt(inst)] = want;
     live.items(.tie)[@backingInt(inst)] = cg.tiedOperand(inst);
     return false;
 }
@@ -507,13 +532,16 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
 /// The operand whose register value `inst` may take when the operand dies
 /// there (`Live.tie`): the first of the lowerings that read every operand
 /// before they write the result register, or write it once from all of
-/// them (`binOp`, `condFlags`, loads, `elemAddrTo`).
+/// them (`binOp`, `condFlags`, loads, `elemAddrTo`, the float
+/// instructions with native registers).
 fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
     const ref: Ref = switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => data.bin_op.lhs,
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => data.bin_op.lhs,
-        .not, .load => data.ty_op.operand,
+        .not, .load, .float_cast => data.ty_op.operand,
+        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => data.bin_op.lhs,
+        .neg_float, .abs_float, .sqrt => data.un_op,
         .ptr_elem_ptr, .ptr_add => cg.ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs,
         else => return Ssa.no_tie,
     };
@@ -530,9 +558,11 @@ pub fn inPair(_: *CodeGen, _: Index) bool {
     return false;
 }
 
-/// As `inPair`, for one floating-point register.
-pub fn inFloat(_: *CodeGen, _: Index) bool {
-    return false;
+/// As `inPair`, for one floating-point register: f32 and f64.
+pub fn inFloat(cg: *CodeGen, ty: Index) bool {
+    if (Type.class(cg.ip, ty) != .float) return false;
+    const bits = Type.floatBits(cg.ip, ty);
+    return bits == 32 or bits == 64;
 }
 
 /// `Ssa.plan`'s hook for intervals the architecture lengthens: none
@@ -577,7 +607,7 @@ pub fn ovfFlagsOnly(_: *CodeGen, tag: Inst.Tag, bits: u16) bool {
 /// that `flushResults` moves to the register when the instruction's code
 /// is done, after it read its operands.
 pub fn resultMem(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Mem {
-    if (cg.homes[@backingInt(inst)] == .reg) {
+    if (cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .freg) {
         if (!Type.hasRuntimeBits(cg.ip, ty)) return null;
         const m = try cg.tempSlot();
         try cg.pending.append(cg.gpa, .{ .inst = inst, .mem = m });
@@ -1045,6 +1075,16 @@ fn setupParams(cg: *CodeGen) Error!void {
             },
             else => unreachable,
         };
+        if (cg.homes[@backingInt(inst)] == .freg) {
+            const v = cg.homes[@backingInt(inst)].freg;
+            switch (l) {
+                .fpr => |a| try cg.loadFp(v, .{ .ty = ty, .loc = .{ .freg = argVReg(a) } }),
+                .gpr => |r| try cg.setResult(inst, ty, argReg(r)),
+                .stack => |off| try cg.loadFp(v, memVal(ty, .at(.fp, @intCast(16 + off)))),
+                else => unreachable,
+            }
+            continue;
+        }
         switch (l) {
             .none => {},
             .gpr => |r| try cg.storeBytes((try cg.resultMem(inst, ty)).?, argReg(r), size),
@@ -1084,6 +1124,7 @@ pub fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
         .slot => |m| .{ .mem = m },
         .frame_addr => |m| .{ .addr = m },
         .reg => |r| .{ .reg = r },
+        .freg => |r| .{ .freg = r },
     };
     return cg.constLoc(ref.toInterned().?);
 }
@@ -1279,6 +1320,7 @@ fn loadVal(cg: *CodeGen, reg: Reg, v: Val) Error!void {
         .err => |name| try cg.e.movWideValue(.movz, .x, reg, try cg.emit.useError(name), 0),
         .mem => |m| try cg.loadMem(reg, m, v.ty),
         .reg => |r| if (r != reg) try cg.e.mov(.x, reg, r),
+        .freg => |r| if (Type.abiSize(cg.ip, v.ty) == 8) try cg.e.fmovToGpr(.x, reg, .f64, r) else try cg.e.fmovToGpr(.w, reg, .f32, r),
     }
 }
 
@@ -1351,6 +1393,7 @@ fn copyVal(cg: *CodeGen, dst: Mem, v: Val) Error!void {
         .none => {},
         .mem => |src| try cg.copyMem(dst, src, size),
         .reg => |r| try cg.storeReg(dst, r, size),
+        .freg => |r| try cg.storeFp(dst, r, size),
         .imm => |x| if (cg.passInRegs(v.ty)) {
             if (x == 0) return cg.storeReg(dst, .zr, size);
             try cg.e.movImm(.x, .x9, x);
@@ -1459,9 +1502,9 @@ pub fn memOf(cg: *CodeGen, ref: Ref) Error!Mem {
 
 fn valMem(cg: *CodeGen, v: Val) Error!Mem {
     if (v.loc == .mem) return v.loc.mem;
-    if (v.loc == .reg) {
+    if (v.loc == .reg or v.loc == .freg) {
         const m = try cg.tempSlot();
-        try cg.storeReg(m, v.loc.reg, Type.abiSize(cg.ip, v.ty));
+        try cg.copyVal(m, v);
         return m;
     }
     const m = try cg.allocSlot(Type.abiSize(cg.ip, v.ty), Type.abiAlignment(cg.ip, v.ty));
@@ -1483,6 +1526,11 @@ pub fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
 /// Stores value `inst` of type `ty`, computed in `reg`, to its slot, or
 /// moves it to its register, extended as a load of its type extends it.
 pub fn setResult(cg: *CodeGen, inst: Inst.Index, ty: Index, reg: Reg) Error!void {
+    if (cg.homes[@backingInt(inst)] == .freg) {
+        const v = cg.homes[@backingInt(inst)].freg;
+        if (Type.abiSize(cg.ip, ty) == 8) return cg.e.fmovFromGpr(.f64, v, .x, reg);
+        return cg.e.fmovFromGpr(.f32, v, .w, reg);
+    }
     if (cg.homes[@backingInt(inst)] == .reg) {
         const home = cg.homes[@backingInt(inst)].reg;
         // Computed in its register (`resultReg`), already extended.
@@ -1519,6 +1567,16 @@ fn promoted(cg: *CodeGen, ptr: Ref) ?Reg {
     if (cg.ir.instructions.items(.tag)[@backingInt(p)] != .alloc) return null;
     return switch (cg.homes[@backingInt(p)]) {
         .reg => |r| r,
+        else => null,
+    };
+}
+
+/// As `promoted`, for a variable in a floating-point register.
+fn promotedFp(cg: *CodeGen, ptr: Ref) ?VReg {
+    const p = ptr.toIndex() orelse return null;
+    if (cg.ir.instructions.items(.tag)[@backingInt(p)] != .alloc) return null;
+    return switch (cg.homes[@backingInt(p)]) {
+        .freg => |r| r,
         else => null,
     };
 }
@@ -1929,7 +1987,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .dbg_inline_end => try cg.endInline(),
         .alloc => {
             // A promoted variable in a register needs no memory.
-            if (data.ty == .none or cg.homes[@backingInt(inst)] == .reg) return;
+            if (data.ty == .none or cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .freg) return;
             const info = Type.ptrInfo(ip, data.ty);
             const size = @max(Type.abiSize(ip, info.child), 1);
             const alignment = @max(Type.abiAlignment(ip, info.child), if (info.flags.alignment == 0) 1 else @as(u64, 1) << @intCast(info.flags.alignment - 1));
@@ -1963,9 +2021,14 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 if (cg.homes[@backingInt(inst)] == .reg and cg.homes[@backingInt(inst)].reg == v) return;
                 return cg.setResult(inst, ty, v);
             }
+            if (cg.promotedFp(data.ty_op.operand)) |v| {
+                if (cg.homes[@backingInt(inst)] == .freg and cg.homes[@backingInt(inst)].freg == v) return;
+                return cg.setFpResult(inst, ty, v);
+            }
             if (cg.passInRegs(ty)) {
                 const m = try cg.ptrMem(data.ty_op.operand);
                 if (cg.homes[@backingInt(inst)] == .reg) return cg.loadMem(cg.homes[@backingInt(inst)].reg, m, ty);
+                if (cg.homes[@backingInt(inst)] == .freg) return cg.loadFp(cg.homes[@backingInt(inst)].freg, memVal(ty, m));
                 const d = cg.resultReg(inst, .x9);
                 try cg.loadMem(d, m, ty);
                 return cg.setResult(inst, ty, d);
@@ -1979,6 +2042,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const size = Type.abiSize(ip, cg.typeOf(val));
             if (size == 0) return;
             if (cg.promoted(data.bin_op.lhs)) |v| return cg.load(v, val);
+            if (cg.promotedFp(data.bin_op.lhs)) |v| return cg.loadFp(v, try cg.valOf(val));
             const m = try cg.ptrMem(data.bin_op.lhs);
             if (val.toInterned()) |v| if (ip.keyTag(v) == .undef and !cg.passInRegs(cg.typeOf(val))) return cg.fillMem(m, size, 0xaa);
             try cg.copyTo(m, val);
@@ -3175,6 +3239,11 @@ fn popFrame(cg: *CodeGen) Error!void {
         try cg.e.mov(.x, .sp, .fp);
     } else {
         try cg.e.addSub(.sub, .x, .sp, .fp, .{ .imm = 16 * @as(u12, n) });
+        var j: usize = 4;
+        while (j > 0) {
+            j -= 1;
+            if (cg.saved >> @intCast(8 + j) & 1 != 0) try cg.e.ldpFp(.f64, float_regs[2 * j + 1], float_regs[2 * j], .{ .base = .sp, .offset = .{ .post = 16 } });
+        }
         var k: usize = 5;
         while (k > 0) {
             k -= 1;
@@ -3268,8 +3337,8 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const callee_ty = cg.calleeType(callee_ref);
     const ret_ty = extra.data.ret_ty;
     const is_c = isC(callee_ty.cc);
-    // A scalar result in a register is moved there from x0.
-    const in_reg = !tail and cg.homes[@backingInt(inst)] == .reg;
+    // A scalar result in a register is moved there from x0 (or v0).
+    const in_reg = !tail and (cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .freg);
     const dst = if (tail or in_reg) null else try cg.resultMem(inst, ret_ty);
     var pn_save: ?Mem = null;
 
@@ -3307,7 +3376,11 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     }
     if (callee_val) |f| try cg.e.bl(.{ .sym = try cg.emit.funcKey(f) }) else try cg.e.blr(.x16);
     if (pn_save) |save| for (0..10) |k| try cg.loadMem(@fromBackingInt(@intCast(19 + k)), save.plus(@intCast(8 * k)), .usize_type);
-    if (in_reg) return cg.setResult(inst, ret_ty, .x0);
+    if (in_reg) {
+        // f32 and f64 results come back in v0 in every convention.
+        if (cg.homes[@backingInt(inst)] == .freg) return cg.setFpResult(inst, ret_ty, .v0);
+        return cg.setResult(inst, ret_ty, .x0);
+    }
     const m = dst orelse return;
     if (is_c) return cg.cCallResult(ret_ty, m);
     const size = Type.abiSize(ip, ret_ty);
@@ -4257,10 +4330,44 @@ fn loadFp(cg: *CodeGen, v: VReg, val: Val) Error!void {
         else => unreachable,
     };
     if (val.loc == .mem) return cg.e.ldrFp(ft, v, try cg.access(val.loc.mem, @intCast(size), .x16));
+    if (val.loc == .freg) {
+        // `fmov s` copies the h register's bits too.
+        if (val.loc.freg != v) try cg.e.fmov(if (size == 8) .f64 else .f32, v, val.loc.freg);
+        return;
+    }
     try cg.loadVal(.x9, val);
     // `fmov h, w` needs FEAT_FP16; `fmov s, w` sets the h register too.
     const via: Float = if (ft == .f16 and cg.fpType(val.ty) == null) .f32 else ft;
     try cg.e.fmovFromGpr(via, v, if (size == 8) .x else .w, .x9);
+}
+
+/// The register holding float `val`: its own, or `scratch` loaded with
+/// it.
+fn fpUse(cg: *CodeGen, val: Val, scratch: VReg) Error!VReg {
+    if (val.loc == .freg) return val.loc.freg;
+    try cg.loadFp(scratch, val);
+    return scratch;
+}
+
+/// The register float `inst` is computed in: its own, or `scratch` for
+/// `setFpResult` to store.
+fn fpResult(cg: *CodeGen, inst: Inst.Index, scratch: VReg) VReg {
+    return switch (cg.homes[@backingInt(inst)]) {
+        .freg => |r| r,
+        else => scratch,
+    };
+}
+
+/// Stores float `inst` of type `ty`, computed in `v`, to its slot, or
+/// moves it to its register.
+fn setFpResult(cg: *CodeGen, inst: Inst.Index, ty: Index, v: VReg) Error!void {
+    switch (cg.homes[@backingInt(inst)]) {
+        .freg => |r| if (r != v) try cg.e.fmov(if (Type.abiSize(cg.ip, ty) == 8) .f64 else .f32, r, v),
+        else => {
+            const m = try cg.resultMem(inst, ty) orelse return;
+            try cg.storeFp(m, v, Type.abiSize(cg.ip, ty));
+        },
+    }
 }
 
 /// Stores the low `size` bytes of `v`. Uses x16.
@@ -4337,19 +4444,24 @@ fn libmCall(cg: *CodeGen, op: []const u8, file: ?[]const u8, ty: Index, args: []
     try cg.rtCall(f, try cg.libmName(op, Type.floatBits(cg.ip, ty)), args, ty, dst);
 }
 
+/// The instruction of a float arithmetic tag.
+fn fpOp(tag: Inst.Tag) Encoder.FpOp {
+    return switch (tag) {
+        .add_float => .add,
+        .sub_float => .sub,
+        .mul_float => .mul,
+        .div_float => .div,
+        .min_float => .minnm,
+        .max_float => .maxnm,
+        else => unreachable,
+    };
+}
+
 fn floatArith(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Val, rhs: Val, dst: Mem) Error!void {
     if (cg.fpType(ty)) |ft| {
         try cg.loadFp(.v0, lhs);
         try cg.loadFp(.v1, rhs);
-        try cg.e.fp(switch (tag) {
-            .add_float => .add,
-            .sub_float => .sub,
-            .mul_float => .mul,
-            .div_float => .div,
-            .min_float => .minnm,
-            .max_float => .maxnm,
-            else => unreachable,
-        }, ft, .v0, .v0, .v1);
+        try cg.e.fp(fpOp(tag), ft, .v0, .v0, .v1);
         return cg.storeFp(dst, .v0, Type.abiSize(cg.ip, ty));
     }
     const bits = Type.floatBits(cg.ip, ty);
@@ -4387,6 +4499,13 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
     switch (tag) {
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => {
             const ty = cg.typeOf(data.bin_op.lhs);
+            if (cg.fpType(ty)) |ft| {
+                const l = try cg.fpUse(try cg.valOf(data.bin_op.lhs), .v0);
+                const r = try cg.fpUse(try cg.valOf(data.bin_op.rhs), .v1);
+                const d = cg.fpResult(inst, .v0);
+                try e.fp(fpOp(tag), ft, d, l, r);
+                return cg.setFpResult(inst, ty, d);
+            }
             const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.floatArith(tag, ty, try cg.valOf(data.bin_op.lhs), try cg.valOf(data.bin_op.rhs), dst);
         },
@@ -4446,12 +4565,13 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
         },
         .neg_float, .abs_float => {
             const ty = cg.typeOf(data.un_op);
-            const dst = try cg.resultMem(inst, ty) orelse return;
             if (cg.fpType(ty)) |ft| {
-                try cg.loadFp(.v0, try cg.valOf(data.un_op));
-                try e.fpUnary(if (tag == .neg_float) .neg else .abs, ft, .v0, .v0);
-                return cg.storeFp(dst, .v0, Type.abiSize(ip, ty));
+                const s = try cg.fpUse(try cg.valOf(data.un_op), .v0);
+                const d = cg.fpResult(inst, .v0);
+                try e.fpUnary(if (tag == .neg_float) .neg else .abs, ft, d, s);
+                return cg.setFpResult(inst, ty, d);
             }
+            const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.copyTo(dst, data.un_op);
             const top = dst.plus((Type.floatBits(ip, ty) - 1) / 8);
             try cg.loadMem(.x9, top, .u8_type);
@@ -4464,17 +4584,28 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
         },
         .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .floor, .ceil, .round, .trunc_float => {
             const ty = cg.typeOf(data.un_op);
-            const dst = try cg.resultMem(inst, ty) orelse return;
             const operand = try cg.valOf(data.un_op);
+            if (cg.fpType(ty)) |ft| {
+                const op: ?Encoder.FpUnaryOp = switch (tag) {
+                    .sqrt => .sqrt,
+                    .floor => .rintm,
+                    .ceil => .rintp,
+                    .round => .rinta,
+                    .trunc_float => .rintz,
+                    else => null,
+                };
+                if (op) |o| {
+                    const s = try cg.fpUse(operand, .v0);
+                    const d = cg.fpResult(inst, .v0);
+                    try e.fpUnary(o, ft, d, s);
+                    return cg.setFpResult(inst, ty, d);
+                }
+            }
+            const dst = try cg.resultMem(inst, ty) orelse return;
             switch (tag) {
                 .floor, .ceil, .round, .trunc_float => {
                     try cg.copyVal(dst, operand);
                     return cg.floatRound(if (tag == .trunc_float) "trunc" else @tagName(tag), ty, dst);
-                },
-                .sqrt => if (cg.fpType(ty)) |ft| {
-                    try cg.loadFp(.v0, operand);
-                    try e.fpUnary(.sqrt, ft, .v0, .v0);
-                    return cg.storeFp(dst, .v0, Type.abiSize(ip, ty));
                 },
                 else => {},
             }
@@ -4482,29 +4613,28 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
         },
         .mul_add => {
             const ty = cg.typeOf(data.pl_op.operand);
-            const dst = try cg.resultMem(inst, ty) orelse return;
             const bin = cg.ir.extraData(Ir.Bin, data.pl_op.payload).data;
             if (cg.fpType(ty)) |ft| {
-                try cg.loadFp(.v0, try cg.valOf(bin.lhs));
-                try cg.loadFp(.v1, try cg.valOf(bin.rhs));
-                try cg.loadFp(.v2, try cg.valOf(data.pl_op.operand));
-                try e.fma(.madd, ft, .v0, .v0, .v1, .v2);
-                return cg.storeFp(dst, .v0, Type.abiSize(ip, ty));
+                const a = try cg.fpUse(try cg.valOf(bin.lhs), .v0);
+                const b = try cg.fpUse(try cg.valOf(bin.rhs), .v1);
+                const c = try cg.fpUse(try cg.valOf(data.pl_op.operand), .v2);
+                const d = cg.fpResult(inst, .v0);
+                try e.fma(.madd, ft, d, a, b, c);
+                return cg.setFpResult(inst, ty, d);
             }
+            const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.libmCall("fma", null, ty, &.{ try cg.valOf(bin.lhs), try cg.valOf(bin.rhs), try cg.valOf(data.pl_op.operand) }, dst);
         },
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
-            const dst = try cg.resultMem(inst, .bool_type) orelse return;
             const ty = cg.typeOf(data.bin_op.lhs);
             const lhs = try cg.valOf(data.bin_op.lhs);
             const rhs = try cg.valOf(data.bin_op.rhs);
             if (cg.fpType(ty)) |ft| {
-                try cg.loadFp(.v0, lhs);
-                try cg.loadFp(.v1, rhs);
-                try e.fcmp(ft, .v0, .v1);
+                try e.fcmp(ft, try cg.fpUse(lhs, .v0), try cg.fpUse(rhs, .v1));
+                const d = cg.resultReg(inst, .x9);
                 // Unordered sets C and V: these are all false for NaN but
                 // `ne`.
-                try e.cset(.x, .x9, switch (tag) {
+                try e.cset(.x, d, switch (tag) {
                     .cmp_lt => .mi,
                     .cmp_lte => .ls,
                     .cmp_eq => .eq,
@@ -4513,8 +4643,9 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
                     .cmp_neq => .ne,
                     else => unreachable,
                 });
-                return cg.storeReg(dst, .x9, 1);
+                return cg.setResult(inst, .bool_type, d);
             }
+            const dst = try cg.resultMem(inst, .bool_type) orelse return;
             // `__cmp*f2` is 1 for unordered operands and `__ge*f2` is -1, so
             // each comparison is false for NaN.
             const bits = Type.floatBits(ip, ty);
@@ -4537,33 +4668,35 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
         },
         .float_cast => {
             const ty = data.ty_op.ty;
-            const dst = try cg.resultMem(inst, ty) orelse return;
             const src_ty = cg.typeOf(data.ty_op.operand);
             const operand = try cg.valOf(data.ty_op.operand);
             const from = Type.floatBits(ip, src_ty);
             const to = Type.floatBits(ip, ty);
-            if (from == to) return cg.copyTo(dst, data.ty_op.operand);
             // fcvt converts halves without FEAT_FP16.
-            if (cvtType(to) != null and cvtType(from) != null) {
-                try cg.loadFp(.v0, operand);
-                try e.fcvt(cvtType(to).?, .v0, cvtType(from).?, .v0);
-                return cg.storeFp(dst, .v0, Type.abiSize(ip, ty));
+            if (from != to and cvtType(to) != null and cvtType(from) != null) {
+                const s = try cg.fpUse(operand, .v0);
+                const d = cg.fpResult(inst, .v0);
+                try e.fcvt(cvtType(to).?, d, cvtType(from).?, s);
+                return cg.setFpResult(inst, ty, d);
             }
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            if (from == to) return cg.copyTo(dst, data.ty_op.operand);
             const widen = to > from;
             const name = try std.fmt.allocPrint(cg.emit.allocator(), "__{s}{s}{s}2", .{ if (widen) "extend" else "trunc", rtFloatAbbrev(from), rtFloatAbbrev(to) });
             try cg.rtCall(if (widen) "extendf.zig" else "truncf.zig", name, &.{operand}, ty, dst);
         },
         .float_from_int => {
             const ty = data.ty_op.ty;
-            const dst = try cg.resultMem(inst, ty) orelse return;
             const info = Type.intInfo(ip, cg.typeOf(data.ty_op.operand));
             const operand = try cg.valOf(data.ty_op.operand);
             if (cg.fpType(ty)) |ft| if (info.bits <= 64) {
                 // The operand is extended to 64 bits.
-                try cg.loadVal(.x9, operand);
-                try e.cvtf(info.signedness == .signed, ft, .v0, .x, .x9);
-                return cg.storeFp(dst, .v0, Type.abiSize(ip, ty));
+                const s = try cg.use(data.ty_op.operand, .x9);
+                const d = cg.fpResult(inst, .v0);
+                try e.cvtf(info.signedness == .signed, ft, d, .x, s);
+                return cg.setFpResult(inst, ty, d);
             };
+            const dst = try cg.resultMem(inst, ty) orelse return;
             if (info.bits > 128) return cg.fail("@floatFromInt of integers wider than 128 bits", .{});
             const abbrev = if (info.bits <= 32) "si" else if (info.bits <= 64) "di" else "ti";
             const name = try std.fmt.allocPrint(cg.emit.allocator(), "__float{s}{s}{s}", .{ if (info.signedness == .unsigned) "un" else "", abbrev, rtFloatAbbrev(Type.floatBits(ip, ty)) });
@@ -4571,17 +4704,17 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
         },
         .int_from_float => {
             const ty = data.ty_op.ty;
-            const dst = try cg.resultMem(inst, ty) orelse return;
             const float_ty = cg.typeOf(data.ty_op.operand);
             const info = Type.intInfo(ip, ty);
             const operand = try cg.valOf(data.ty_op.operand);
             const size = Type.abiSize(ip, ty);
             if (cg.fpType(float_ty)) |ft| if (info.bits <= 64) {
                 // Safety checks before this keep the value in range.
-                try cg.loadFp(.v0, operand);
-                try e.fcvtz(info.signedness == .signed, .x, .x9, ft, .v0);
-                return cg.storeReg(dst, .x9, size);
+                const d = cg.resultReg(inst, .x9);
+                try e.fcvtz(info.signedness == .signed, .x, d, ft, try cg.fpUse(operand, .v0));
+                return cg.setResult(inst, ty, d);
             };
+            const dst = try cg.resultMem(inst, ty) orelse return;
             if (info.bits > 128) return cg.fail("@intFromFloat to integers wider than 128 bits", .{});
             const abbrev = if (info.bits <= 32) "si" else if (info.bits <= 64) "di" else "ti";
             const name = try std.fmt.allocPrint(cg.emit.allocator(), "__fix{s}{s}{s}", .{ if (info.signedness == .unsigned) "uns" else "", rtFloatAbbrev(Type.floatBits(ip, float_ty)), abbrev });

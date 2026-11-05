@@ -882,28 +882,37 @@ comptime arguments are run-time values in the lowered code (uucode's
   form with the same per-instruction structure. It runs `Ssa.liveness`
   and `Ssa.plan` (dead values, fused branch conditions, overflow pairs
   and bits left in the flags, promoted variables), then `Ssa.allocate`
-  over the callee-saved x19-x28 alone: scalars that fit a general
-  register (`inGpr`) and promoted variables get one, the rest live in
-  stack slots shared by lifetime. No lowering uses x19-x28 as scratch
-  and every call preserves them, so `clobbers` reports nothing, no value
-  is spilled or split around a call, and both conventions (Apple's and
-  Linux's AAPCS64) only move arguments into their homes at entry and
-  results out of x0. Each lowering writes its result register after
-  reading every operand (results it writes through `resultMem` go to a
-  scratch slot and are moved to the register after the instruction),
-  so no value is tied to an operand. Floats, pairs (slices) and block
-  results stay in slots for now (`inFloat` and `inPair` say no), and a
-  function with inline assembly gets no registers. The prologue saves
-  the used pairs right below the frame record (x19 at fp - 8, x20 at
-  fp - 16, then the next used pair), which compact unwind's frame mode
-  reads from `Atom.Unwind.saved` and the aarch64-linux FDE describes
-  with `DW_CFA_offset` rules after the last push; the epilogue and
+  over the callee-saved x19-x28 and d8-d15 alone: scalars that fit a
+  general register (`inGpr`), f32 and f64 (`inFloat`, a `.freg` home)
+  and promoted variables of both get one, the rest live in stack slots
+  shared by lifetime. No lowering uses x19-x28 or d8-d15 as scratch and
+  every call preserves them (d8-d15 only their low 64 bits, all an f64
+  needs), so `clobbers` reports nothing, no value is spilled or split
+  around a call, and both conventions (Apple's and Linux's AAPCS64) only
+  move arguments into their homes at entry and results out of x0 or
+  v0. Each lowering writes its result register after reading every
+  operand (results it writes through `resultMem` go to a scratch slot
+  and are moved to the register after the instruction), so a result may
+  take the register of an operand that dies there (`tiedOperand`).
+  Pairs (slices) and block results stay in slots for now (`inPair` says
+  no), and a function with inline assembly gets no registers. The
+  prologue saves the used pairs right below the frame record (x19 at fp
+  - 8, x20 at fp - 16, then the next used pair, the d pairs after the x
+  pairs), which compact unwind's frame mode reads from
+  `Atom.Unwind.saved` (d8/d9 is 0x100) and the aarch64-linux FDE
+  describes with `DW_CFA_offset` rules after the last push
+  (`DW_CFA_offset_extended` for d8, DWARF register 72, and up; an FDE
+  with d pairs can exceed `Dwarf.max_short_fde_size`); the epilogue and
   tail calls restore them (`popFrame`). Measured on an M-series Mac
   (2026-11-05), against slots only: bench/runtime fib 103 → 87 ms,
   sieve 328 → 52, sort 459 → 154, hash 444 → 187, nbody 310 → 208,
   fmt 138 → 57 (sieve, sort, hash and fmt now beat upstream's LLVM
   Debug); std's tests run in 7.3 s instead of 12.6, with 9% less code;
-  compile time unchanged. A load that `plan` forwards
+  compile time unchanged. d8-d15 for f32 and f64, against x19-x28
+  only (mac.large): nbody 208 → 38 ms (0.22x upstream's LLVM Debug);
+  fib, fmt and the other programs without floats, and the hpke, zigimg
+  and qr corpus tests, unchanged; std's tests compile in the same 2.3 s
+  with 32 KB less code. A load that `plan` forwards
   shares the stored value's home, and a removed instruction's constant
   pointers still request their symbols (`keepSymbols`), as on x86_64. aarch64-macos builds use no cache yet:
   a relink would need the Mach-O linker's inputs in the manifest. Until

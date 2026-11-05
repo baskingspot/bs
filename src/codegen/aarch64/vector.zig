@@ -471,7 +471,7 @@ fn loadChunk(cg: *CodeGen, r: VReg, ref: Ref, k: u32) Error!void {
         },
         .none => try zero(cg, r),
         // Vectors have no general register (`CodeGen.inGpr`).
-        .addr, .err, .reg => unreachable,
+        .addr, .err, .reg, .freg => unreachable,
     }
 }
 

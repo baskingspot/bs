@@ -981,17 +981,19 @@ pub fn cieOf(arch: Atom.Unwind.Arch) *const [cie.len]u8 {
 /// after its `ret` (`Atom.Unwind.epilogue` at most 1); and the largest.
 pub const fde_size = 32;
 pub const max_short_fde_size = 48;
-pub const max_fde_size = 64;
+pub const max_fde_size = 72;
 
 /// The size of the FDE of a `size`-byte function whose `unwind` is not
 /// `none`: the frame-pointer program, 3 bytes per saved register, and the
 /// epilogue's rows, padded to 8. On aarch64: the frame record's program,
-/// then an advance and 4 bytes per saved pair (`writeFde`).
+/// then an advance, 4 bytes per saved pair of x19-x28 and 6 per pair of
+/// d8-d15 (`writeFde`).
 pub fn fdeSize(arch: Atom.Unwind.Arch, u: Atom.Unwind, size: u64) u32 {
     if (u.kind != .frame_pointer) return fde_size;
     if (arch == .aarch64) {
         const pairs: u32 = @popCount(u.saved & 0x1f);
-        return std.mem.alignForward(u32, @as(u32, frame_pointer_program_aarch64.len) + if (pairs == 0) 0 else 1 + 4 * pairs, 8);
+        const fpairs: u32 = @popCount(u.saved & 0xf00);
+        return std.mem.alignForward(u32, @as(u32, frame_pointer_program_aarch64.len) + if (pairs + fpairs == 0) 0 else 1 + 4 * pairs + 6 * fpairs, 8);
     }
     const n: u32 = @popCount(u.saved & Atom.Unwind.savedBits(.x86_64));
     const rows: u32 = if (epilogueRows(u, size)) |e| e.size(n) else 0;
@@ -1134,9 +1136,11 @@ comptime {
     // An epilogue within 64 KiB of the prologue keeps the common size.
     std.debug.assert(fdeSize(.x86_64, .{ .kind = .frame_pointer, .epilogue = 1 }, 1 << 16) == fde_size);
     std.debug.assert(fdeSize(.x86_64, .{ .kind = .frame_pointer, .epilogue = 1, .saved = 0x1f }, std.math.maxInt(u32)) == max_short_fde_size);
-    std.debug.assert(fdeSize(.x86_64, .{ .kind = .frame_pointer, .epilogue = std.math.maxInt(u16), .probes = 1, .saved = 0x1f }, std.math.maxInt(u32)) == max_fde_size);
-    // All five aarch64 pairs fit the short size.
+    std.debug.assert(fdeSize(.x86_64, .{ .kind = .frame_pointer, .epilogue = std.math.maxInt(u16), .probes = 1, .saved = 0x1f }, std.math.maxInt(u32)) <= max_fde_size);
+    // All five aarch64 pairs of x registers fit the short size; with the
+    // four of d registers, the largest.
     std.debug.assert(fdeSize(.aarch64, .{ .kind = .frame_pointer, .saved = 0x1f }, std.math.maxInt(u32)) == max_short_fde_size);
+    std.debug.assert(fdeSize(.aarch64, .{ .kind = .frame_pointer, .saved = 0xf1f }, std.math.maxInt(u32)) == max_fde_size);
 }
 
 /// Writes the FDE at offset `fde_off` of .eh_frame, `fdeSize(u, size)`
@@ -1144,16 +1148,17 @@ comptime {
 /// FDE's pc_begin field, whose `unwind` is `u`, not `none`.
 ///
 /// On aarch64 the FDE describes the frame record and the saved pairs of
-/// x19-x28 (`Atom.Unwind.saved`), padded to the size `fdeSize` gives; it
-/// records no epilogue yet. The prologue pushes the pairs right after the
-/// frame record, x19 at CFA - 24 and x20 at CFA - 32, each further pair 16
-/// bytes below, and their rules start after the last push (a push does
-/// not change the registers it saves).
+/// x19-x28 and d8-d15 (`Atom.Unwind.saved`), padded to the size `fdeSize`
+/// gives; it records no epilogue yet. The prologue pushes the pairs right
+/// after the frame record, x19 at CFA - 24 and x20 at CFA - 32, each
+/// further pair 16 bytes below, the d pairs after the x pairs, and their
+/// rules start after the last push (a push does not change the registers
+/// it saves). d8 is DWARF register 72, past `DW_CFA_offset`'s 6 bits.
 pub fn writeFde(arch: Atom.Unwind.Arch, out: []u8, u: Atom.Unwind, fde_off: u32, pc_rel: i32, size: u32) void {
     if (arch == .aarch64) {
         @memset(out, DW.CFA.nop);
         out[0..fde_size].* = if (u.kind == .outermost) outermost_fde_aarch64 else frame_pointer_fde_aarch64;
-        const pairs: u8 = @popCount(u.saved & 0x1f);
+        const pairs: u8 = @popCount(u.saved & 0xf1f);
         if (u.kind == .frame_pointer and pairs != 0) {
             var at: usize = frame_pointer_program_aarch64.len;
             out[at] = DW.CFA.advance_loc + 4 * pairs;
@@ -1163,6 +1168,12 @@ pub fn writeFde(arch: Atom.Unwind.Arch, out: []u8, u: Atom.Unwind, fde_off: u32,
                 const r: u8 = @intCast(19 + 2 * bit);
                 out[at..][0..4].* = .{ DW.CFA.offset + r, 3 + 2 * k, DW.CFA.offset + r + 1, 4 + 2 * k };
                 at += 4;
+                k += 1;
+            };
+            for (0..4) |bit| if (u.saved >> @intCast(8 + bit) & 1 != 0) {
+                const r: u8 = @intCast(72 + 2 * bit);
+                out[at..][0..6].* = .{ DW.CFA.offset_extended, r, 3 + 2 * k, DW.CFA.offset_extended, r + 1, 4 + 2 * k };
+                at += 6;
                 k += 1;
             };
         }
