@@ -2408,7 +2408,11 @@ user branches are coverage points and are only learned from.
   `x.limbs_count()` read one length (`std.crypto.ff`'s
   `montgomeryLoop`), while an inlined callee's by-value parameter is a
   copy made at the call, which a later write of the caller's variable
-  does not change. So each inlined helper's `self.metadata.?` on a
+  does not change. A pointer cast only to `*const` is the pointer, and
+  a field pointer is the struct's address and the field whatever its
+  own constness, so `d.limbs_count()` (a copy forwarded to `d.*` read
+  through a `*const`) and `d.v.limbs()` (through a `*Uint`) load one
+  length from one version of memory. So each inlined helper's `self.metadata.?` on a
   by-value `self` checks the same value, and the facts of the first
   check that dominates decide the rest, in place: the checks that stay
   keep their lines, as all checks do. `slice_len` of equal slices are equal and of a
