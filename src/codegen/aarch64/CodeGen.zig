@@ -622,16 +622,15 @@ fn asmRegs(cg: *CodeGen) u32 {
         if (ir.instructions.items(.tag)[@backingInt(inst)] != .assembly) continue;
         const extra = ir.extraData(Ir.Asm, ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload);
         const source = ip.stringSlice(extra.data.source);
-        const clobbered = extra.data.callee_saved_clobbers;
         for (alloc_regs, 0..) |r, k| {
-            if (mentionsReg(source, @backingInt(r)) or clobbered >> @intCast(Ir.Asm.aarch64_x19_bit + k) & 1 != 0) mask |= @as(u32, 1) << @intCast(k);
+            if (mentionsReg(source, @backingInt(r)) or extra.data.gpr_clobbers >> @intCast(@backingInt(r)) & 1 != 0) mask |= @as(u32, 1) << @intCast(k);
         }
         var named_v: u32 = 0;
-        for (0..32) |r| if (mentionsVReg(source, @intCast(r))) {
+        for (0..32) |r| if (mentionsVReg(source, @intCast(r)) or extra.data.vec_clobbers >> @intCast(r) & 1 != 0) {
             named_v += 1;
         };
         for (float_regs, 0..) |v, k| {
-            if (mentionsVReg(source, @backingInt(v)) or clobbered >> @intCast(Ir.Asm.aarch64_v8_bit + k) & 1 != 0) mask |= @as(u32, 1) << @intCast(alloc_regs.len + k);
+            if (mentionsVReg(source, @backingInt(v)) or extra.data.vec_clobbers >> @intCast(@backingInt(v)) & 1 != 0) mask |= @as(u32, 1) << @intCast(alloc_regs.len + k);
         }
         var vec_ops: u32 = 0;
         var i = extra.end;
@@ -4199,16 +4198,17 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
 
     var names: std.StringHashMapUnmanaged(AsmArg) = .empty;
     defer names.deinit(cg.gpa);
-    // Registers named by constraints; `r` operands get others.
-    var used: u64 = 0;
+    // Registers named by constraints or clobbers; `r` operands get others.
+    var used: u64 = extra.data.gpr_clobbers;
     for (ops) |op| {
         const c = asmAlternative(std.mem.trimStart(u8, ip.stringSlice(op.constraint), "=+&"));
         if (regConstraint(c)) |rn| if (parseReg(rn)) |r| {
             used |= @as(u64, 1) << @backingInt(r.reg);
         };
     }
-    // SIMD registers the template names; `w` and `x` operands get others.
-    var vused: u32 = 0;
+    // SIMD registers the template or the clobbers name; `w` and `x`
+    // operands get others.
+    var vused: u32 = extra.data.vec_clobbers;
     for (0..32) |r| {
         if (mentionsVReg(source, @intCast(r))) vused |= @as(u32, 1) << @intCast(r);
     }
@@ -4217,11 +4217,10 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     // saved to slots first. A context switch (zio's) names them only as
     // clobbers, and its caller's values live in them. A naked function
     // has no frame to save them in, and saves nothing, as upstream.
-    const clobbered = extra.data.callee_saved_clobbers;
     const naked = cg.fn_ty.cc == .naked;
     var saved: [10]?Mem = @splat(null);
     if (!naked) for (19..29) |r| {
-        if (mentionsReg(source, @intCast(r)) or used & (@as(u64, 1) << @intCast(r)) != 0 or clobbered >> @intCast(Ir.Asm.aarch64_x19_bit + r - 19) & 1 != 0) {
+        if (mentionsReg(source, @intCast(r)) or used & (@as(u64, 1) << @intCast(r)) != 0) {
             const m = try cg.allocSlot(8, 8);
             try cg.storeReg(m, @fromBackingInt(@intCast(r)), 8);
             saved[r - 19] = m;
@@ -4232,7 +4231,7 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     // or an operand gets one.
     var vsaved: [8]?Mem = @splat(null);
     for (8..16) |r| {
-        if (vused >> @intCast(r) & 1 != 0 or clobbered >> @intCast(Ir.Asm.aarch64_v8_bit + r - 8) & 1 != 0) try cg.saveVReg(&vsaved, @intCast(r));
+        if (vused >> @intCast(r) & 1 != 0) try cg.saveVReg(&vsaved, @intCast(r));
     }
     const out_regs = try cg.gpa.alloc(AsmOut, outputs.len);
     defer cg.gpa.free(out_regs);
