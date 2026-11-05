@@ -103,9 +103,12 @@ pub const Options = struct {
     values: []const Value = &.{},
     /// Code signing identifier; `link` defaults it to the output's file name.
     identifier: ?[]const u8 = null,
-    /// LC_BUILD_VERSION minimum macOS, also recorded as the SDK version.
+    /// LC_BUILD_VERSION minimum macOS.
     /// Zig 0.17.1's default minimum for aarch64-macos is 15.0.
     min_os: std.SemanticVersion = .{ .major = 15, .minor = 0, .patch = 0 },
+    /// LC_BUILD_VERSION's SDK version, the SDK's `SDKSettings.json`'s;
+    /// the minimum when null.
+    sdk: ?std.SemanticVersion = null,
     /// LC_MAIN's stack size, which the kernel gives the main thread instead
     /// of RLIMIT_STACK's 8 MiB. Upstream's default, as `Elf.Options.stack_size`.
     stack_size: u64 = 16 * 1024 * 1024,
@@ -998,8 +1001,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     }
     const uuid_at = w.at + @offsetOf(macho.uuid_command, "uuid");
     w.put(macho.uuid_command{ .uuid = @splat(0) });
-    const version = (@as(u32, @intCast(options.min_os.major)) << 16) | (@as(u32, @intCast(options.min_os.minor)) << 8) | @as(u32, @intCast(options.min_os.patch));
-    w.put(macho.build_version_command{ .cmdsize = @sizeOf(macho.build_version_command), .platform = .MACOS, .minos = version, .sdk = version, .ntools = 0 });
+    w.put(macho.build_version_command{ .cmdsize = @sizeOf(macho.build_version_command), .platform = .MACOS, .minos = packVersion(options.min_os), .sdk = packVersion(options.sdk orelse options.min_os), .ntools = 0 });
     if (dylib == null) w.put(macho.entry_point_command{ .entryoff = @intCast(@as(i64, @intCast(l.atomAddr(entry_index) - base)) + entry_addend), .stacksize = options.stack_size });
     w.putWithString(macho.dylib_command{ .cmd = .LOAD_DYLIB, .cmdsize = dylib_cmd_size, .dylib = .{
         .name = @sizeOf(macho.dylib_command),
@@ -3449,4 +3451,9 @@ test "a dylib has its install name, exports and fixups, and no __PAGEZERO or ent
     try std.testing.expectEqual(2, read.exports.count());
     try std.testing.expect(read.exports.get("f").?.weak);
     try std.testing.expect(!read.exports.get("ptr").?.weak);
+}
+
+/// A version as LC_BUILD_VERSION packs it: xxxx.yy.zz.
+pub fn packVersion(v: std.SemanticVersion) u32 {
+    return @as(u32, @intCast(@min(v.major, 0xffff))) << 16 | @as(u32, @intCast(@min(v.minor, 0xff))) << 8 | @as(u32, @intCast(@min(v.patch, 0xff)));
 }

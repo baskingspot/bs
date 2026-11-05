@@ -414,13 +414,13 @@ pub fn emit(gpa: Allocator, atoms: []const Atom, options: Options) Error![]u8 {
         w.int(u32, 0);
         w.int(u32, 0);
     }
-    // LC_BUILD_VERSION: macOS, the minimum also as the SDK.
-    const ver: u32 = @as(u32, @intCast(options.min_os.major)) << 16 | @as(u32, @intCast(options.min_os.minor)) << 8 | @as(u32, @intCast(options.min_os.patch));
+    // LC_BUILD_VERSION: macOS and its minimum, and no SDK version, as
+    // upstream's objects.
     w.int(u32, @backingInt(macho.LC.BUILD_VERSION));
     w.int(u32, build_cmd_size);
     w.int(u32, @backingInt(macho.PLATFORM.MACOS));
-    w.int(u32, ver);
-    w.int(u32, ver);
+    w.int(u32, MachO.packVersion(options.min_os));
+    w.int(u32, 0);
     w.int(u32, 0);
     // LC_SYMTAB
     w.int(u32, @backingInt(macho.LC.SYMTAB));

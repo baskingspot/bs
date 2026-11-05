@@ -7416,10 +7416,9 @@ Options:
      with `-iframework <sdk>/System/Library/Frameworks`; without either,
      `any-darwin-any`, as upstream. The SDK path is kept in the same
      records, keyed by `xcode-select -s`'s link, `DEVELOPER_DIR`,
-     `SDKROOT` and `PATH`. The translations then differ from upstream's
-     only where the headers test the macOS version: bs's native target
-     is `aarch64-macos` (15.0 minimum), upstream's the running system's.
-     Linking does not
+     `SDKROOT` and `PATH`. The native target's macOS version is the
+     running system's, as upstream's, so the translations match
+     upstream's byte for byte. Linking does not
      change: crt code, libc_nonshared.a and the glibc imports stay this
      option's.
    - **glibc version**: `-target x86_64-linux-gnu.2.28` says it; for the
@@ -8143,14 +8142,18 @@ and `zig build -Dtarget=aarch64-macos`.
   rest of aarch64-macos's `builtin` is upstream's `--show-builtin` for
   `-target aarch64-macos` (apple_m1, macOS 15.0, libc linked, PIE), and
   aarch64-linux's is x86_64-linux's with upstream's generic aarch64 CPU.
-  Known difference, to fix: native builds on a Mac (no `-target`) use
-  that same fixed target, macOS 15.0 (a 15–27 range in the builtin) and
-  bs's bundled libc headers, where upstream resolves the host through
-  `std.zig.system.resolveTargetQuery`: the host's macOS version, and with
-  Xcode installed its SDK for translate-c and C. std's OS-version checks
-  can then take other paths than upstream's. The fix is the
-  `resolveTargetQuery` path x86_64-linux native already uses, so the OS
-  version, translate-c and the C SDK all agree with upstream.
+  The macOS versions are the target's (`aarch64-macos.13.0`, a
+  `...` maximum) over the 15.0–27.0 default, and a native build on a Mac
+  resolves the host through `std.zig.system.resolveTargetQuery`, as
+  upstream: the running system's version as both minimum and maximum
+  (`main.checkTarget`, `Options.macos_version`, part of the cache key).
+  The same versions reach builtin, LC_BUILD_VERSION's minos, C's
+  `-mmacos-version-min` and translate-c's target (`CSource.macosTarget`).
+  LC_BUILD_VERSION's sdk is the `SDKSettings.json` version of the SDK the
+  build links against, as upstream's linker reads it: the system SDK's
+  for a native build when Xcode or the Command Line Tools are installed,
+  else the zig lib directory's (27.0) (`CSource.darwinSdkVersion`);
+  objects record none, as upstream's.
 - Conformance is measured per test: the number of `upstream/test/behavior`
   tests bs compiles and passes, divided by the number upstream 0.17.1 passes
   on the same target with the same backend.

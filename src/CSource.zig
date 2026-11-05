@@ -164,6 +164,8 @@ pub const Options = struct {
     /// aarch64-macos (apple_m1 and libSystem's headers, which every
     /// compile sees, as Darwin always links libc), not x86_64-linux.
     macos: bool = false,
+    /// With `macos`: the macOS versions (`-mmacos-version-min`).
+    macos_version: std.SemanticVersion.Range = undefined,
 };
 
 /// The compiles of one build, running while it analyzes.
@@ -592,7 +594,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         const st = Io.Dir.cwd().statFile(io, p, .{}) catch break :id "";
         break :id try std.fmt.allocPrint(s, "{s}\x00{d}\x00{d}\x00{d}", .{ p, st.inode, st.size, st.mtime.toNanoseconds() });
     } else "";
-    const target = if (o.macos) try macosTarget(io) else try cTarget(io, o.glibc_version, o.cpu);
+    const target = if (o.macos) try macosTarget(io, o.macos_version) else try cTarget(io, o.glibc_version, o.cpu);
     const common = try commonArgs(ra, io, environ, &target, lib, o);
 
     // The runtime libraries first, to know how many of their sources to
@@ -760,11 +762,16 @@ pub fn cTarget(io: Io, glibc_version: ?std.SemanticVersion, cpu: std.Target.Cpu)
     return target;
 }
 
-/// aarch64-macos, as `-target aarch64-macos` gives it (macOS 15.0 to
-/// 27.0, apple_m1), which bs's own code is generated for.
-pub fn macosTarget(io: Io) !std.Target {
-    const query = try std.Target.Query.parse(.{ .arch_os_abi = "aarch64-macos" });
-    return std.zig.system.resolveTargetQuery(io, query);
+/// aarch64-macos for the macOS `versions` (`main.Options.macos_version`)
+/// and apple_m1, which bs's own code is generated for.
+pub fn macosTarget(io: Io, versions: std.SemanticVersion.Range) !std.Target {
+    return std.zig.system.resolveTargetQuery(io, .{
+        .cpu_arch = .aarch64,
+        .os_tag = .macos,
+        .os_version_min = .{ .semver = versions.min },
+        .os_version_max = .{ .semver = versions.max },
+        .abi = .none,
+    });
 }
 
 /// The arguments that depend only on the target and the lib directory.
@@ -1282,6 +1289,21 @@ pub fn darwinSdk(arena: std.mem.Allocator, io: Io, environ: *const std.process.E
     const sdk = std.mem.trimEnd(u8, xcrun.stdout, "\r\n");
     writeLibcRecord(io, record, &.{sdk});
     return sdk;
+}
+
+/// The version of the SDK an aarch64-macos build links against, as
+/// upstream's linker reads it from `SDKSettings.json`: the system SDK's
+/// (`darwinSdk`) for the `native` target when one is installed, else the
+/// zig lib directory's (`libc/darwin`). Null when the file names none.
+pub fn darwinSdkVersion(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8, lib: []const u8, native: bool) !?std.SemanticVersion {
+    const sdk = if (native) try darwinSdk(arena, io, environ, global_cache) else null;
+    const path = if (sdk) |dir| try std.fs.path.join(arena, &.{ dir, "SDKSettings.json" }) else try std.fs.path.join(arena, &.{ lib, "libc", "darwin", "SDKSettings.json" });
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 24)) catch return null;
+    const settings = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch return null;
+    if (settings != .object) return null;
+    const version = settings.object.get("Version") orelse return null;
+    if (version != .string) return null;
+    return std.Target.Query.parseVersion(version.string) catch null;
 }
 
 fn libcRecordPath(arena: std.mem.Allocator, global_cache: []const u8, key: []const u8) ![]const u8 {

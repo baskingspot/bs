@@ -152,12 +152,17 @@ pub const Options = struct {
     glibc_version: ?std.SemanticVersion = null,
     /// A Linux target, resolved as upstream's (`checkTarget`), for
     /// builtin; `native_os` when the target names no OS, whose kernel,
-    /// glibc and dynamic linker this system decides.
+    /// glibc and dynamic linker, or macOS version, this system decides.
     linux: ?std.Target = null,
     native_os: bool = false,
-    /// aarch64-macos: the macOS versions, the default or those the target
-    /// names (`-target aarch64-macos.13.0`), as upstream resolves them.
+    /// aarch64-macos: the macOS versions, the default, those the target
+    /// names (`-target aarch64-macos.13.0`), or this system's for the
+    /// native target, as upstream resolves them.
     macos_version: std.SemanticVersion.Range = Builtin.macos_default,
+    /// aarch64-macos: the version of the SDK it links against, as
+    /// upstream's: the system SDK's for the native target when one is
+    /// installed, else the zig lib directory's (`CSource.darwinSdkVersion`).
+    macos_sdk: ?std.SemanticVersion = null,
     /// `-lc++` (or `-lstdc++`, `-lc++abi`, `-lsupc++`, as upstream): libc++'s
     /// headers for the C and C++ sources, and in an executable libc++,
     /// libc++abi and libunwind, built from the lib directory (CSource.zig).
@@ -539,6 +544,7 @@ pub const Job = struct {
         }
         var job_opts = opts;
         job_opts.modules = modules;
+        if (opts.bs_target == .aarch64_macos) job_opts.macos_sdk = try CSource.darwinSdkVersion(arena, init_.io, init_.environ_map, cache_dirs.global, zig_lib_dir, opts.native_os);
         // An executable or test that fuzzes links the fuzzer, whose
         // module family has a builtin of its own, as upstream's separate
         // compilation of it (a static library) does. A program other
@@ -573,6 +579,8 @@ pub const Job = struct {
         if (opts.native_os) if (opts.linux) |t| {
             const v = t.os.version_range.linux;
             try compile_args.append(arena, try std.fmt.allocPrint(arena, "--bs-native={t},{f},{f},{f},{s}", .{ t.abi, v.range.min, v.range.max, v.glibc, t.dynamic_linker.get() orelse "" }));
+        } else if (opts.bs_target == .aarch64_macos) {
+            try compile_args.append(arena, try std.fmt.allocPrint(arena, "--bs-native=macos,{f},{f},{?f}", .{ opts.macos_version.min, opts.macos_version.max, job_opts.macos_sdk }));
         };
         // The files the object and library arguments name, which `-l`
         // finds in the `-L` directories: the cache's link-only inputs,
@@ -1054,6 +1062,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .glibc_version = if (macos) null else opts.glibc_version,
         .cpu = opts.cpu,
         .macos = macos,
+        .macos_version = opts.macos_version,
         .link_libc = opts.link_libc or macos,
         .link_libcpp = opts.link_libcpp,
         .cxx_runtime = cxxRuntime(opts),
@@ -1213,6 +1222,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     if (opts.version) |v| emit.dylib_version = @as(u32, @intCast(@min(v.major, 0xffff))) << 16 | @as(u32, @intCast(@min(v.minor, 0xff))) << 8 | @as(u32, @intCast(@min(v.patch, 0xff)));
     emit.stack_size = opts.stack_size;
     emit.macos_min = opts.macos_version.min;
+    emit.macos_sdk = opts.macos_sdk;
     emit.strip = opts.strip;
     emit.entry_name = opts.entry;
     emit.fuzz = opts.fuzz;
@@ -2608,7 +2618,15 @@ fn inheritFlags(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []con
 /// ABI, glibc and dynamic linker, of this system.
 pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []const u8) void {
     if (std.mem.eql(u8, target, "native") and builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
+        // As upstream's native target: this system's macOS version, as
+        // both minimum and maximum.
+        const native = std.zig.system.resolveTargetQuery(io, .{}) catch |err| {
+            setUnsupported(opts, arena, "unable to detect the native target '{s}': {t}", .{ target, err });
+            return;
+        };
+        opts.macos_version = native.os.version_range.semver;
         opts.bs_target = .aarch64_macos;
+        opts.native_os = true;
         return;
     }
     var query = std.Target.Query.parse(.{ .arch_os_abi = target }) catch {
@@ -2895,4 +2913,13 @@ test "checkTarget reads the macOS versions an aarch64-macos target names" {
     var opts: Options = .{ .command = .build_exe, .root_src_path = "a.zig" };
     checkTarget(&opts, arena.allocator(), std.testing.io, "aarch64-macos-gnu");
     try std.testing.expect(opts.unsupported != null);
+    // The native target on a Mac: this system's version, both minimum and
+    // maximum, as upstream's.
+    if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
+        var native: Options = .{ .command = .build_exe, .root_src_path = "a.zig" };
+        checkTarget(&native, arena.allocator(), std.testing.io, "native");
+        const host = (try std.zig.system.resolveTargetQuery(std.testing.io, .{})).os.version_range.semver.min;
+        try std.testing.expectEqual(.aarch64_macos, native.bs_target);
+        try std.testing.expect(native.macos_version.min.order(host) == .eq and native.macos_version.max.order(host) == .eq);
+    }
 }

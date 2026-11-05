@@ -38,6 +38,9 @@ const Request = struct {
     /// system's without `-target`, as upstream's native target, with or
     /// without `-lc`; null for `x86_64-linux(-none)` and `aarch64-linux`.
     glibc_version: ?std.SemanticVersion,
+    /// aarch64-macos: the macOS versions (`main.Options.macos_version`):
+    /// the native system's without `-target`, as upstream's.
+    macos_version: std.SemanticVersion.Range,
     /// `-mcpu`, as for a compilation (`cpu.resolve`): it sets the macros
     /// the headers see (`__SSE4_1__`).
     cpu: std.Target.Cpu,
@@ -139,7 +142,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
     var native_includes: []const []const u8 = &.{};
     const host = @import("builtin").target;
     if (std.mem.eql(u8, target, "native") and host.cpu.arch == .aarch64 and host.os.tag == .macos) {
-        opts.bs_target = .aarch64_macos;
+        main.checkTarget(&opts, arena, io, target);
     } else if (std.mem.eql(u8, target, "native")) {
         if (!(host.cpu.arch == .x86_64 and host.os.tag == .linux))
             main.setUnsupported(&opts, arena, "bs translates C only for x86_64-linux and aarch64-macos so far ('native'); pass -target x86_64-linux", .{})
@@ -170,6 +173,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         .target = opts.bs_target,
         .link_libc = opts.link_libc,
         .glibc_version = opts.glibc_version,
+        .macos_version = opts.macos_version,
         .cpu = opts.cpu,
         .cc_args = cc_args.items,
         .native_includes = native_includes,
@@ -297,9 +301,10 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
         "-fno-lto",                         "-fhosted",
         "-nostdinc",
     });
-    const query_text = if (macos) "aarch64-macos" else if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "{t}-linux-gnu.{f}", .{ req.cpu.arch, v }) else try std.fmt.allocPrint(arena, "{t}-linux-none", .{req.cpu.arch});
-    const query = try std.Target.Query.parse(.{ .arch_os_abi = query_text, .cpu_features = "baseline" });
-    var target = try std.zig.system.resolveTargetQuery(io, query);
+    var target = if (macos) try CSource.macosTarget(io, req.macos_version) else target: {
+        const query_text = if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "{t}-linux-gnu.{f}", .{ req.cpu.arch, v }) else try std.fmt.allocPrint(arena, "{t}-linux-none", .{req.cpu.arch});
+        break :target try std.zig.system.resolveTargetQuery(io, try std.Target.Query.parse(.{ .arch_os_abi = query_text, .cpu_features = "baseline" }));
+    };
     target.cpu = req.cpu;
     if (req.link_libc and !macos) try argv.append(arena, try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{req.glibc_version.?.minor}));
     try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ lib, "include" }) });

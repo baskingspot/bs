@@ -106,6 +106,9 @@ macho_libs: []const MachODylib = &.{},
 stack_size: u64 = 16 * 1024 * 1024,
 /// aarch64-macos: the minimum macOS, LC_BUILD_VERSION's.
 macos_min: std.SemanticVersion = @import("Builtin.zig").macos_default.min,
+/// aarch64-macos: the SDK's version (`main.Options.macos_sdk`),
+/// LC_BUILD_VERSION's.
+macos_sdk: ?std.SemanticVersion = null,
 /// `-fstrip`: link no debug info.
 strip: bool = false,
 /// `-fentry=<symbol>`, if given.
@@ -1578,7 +1581,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         if (emit.shared) for (emit.exports.items) |x| if (x.visibility != .hidden)
             try dylib_exports.append(emit.gpa, .{ .key = x.key, .name = x.name, .offset = x.offset, .weak = x.weak });
         const dylib: MachO.Dylib = .{ .install_name = emit.install_name orelse sub_path, .current_version = emit.dylib_version, .exports = dylib_exports.items };
-        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry orelse undefined, .dylib = if (emit.shared) &dylib else null, .libs = libs, .rpaths = rpaths.items, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = if (emit.strip) &.{} else emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .min_os = emit.macos_min, .aliases = emit.aliases.items, .local_symbols = emit.input_symbols }) catch |err| {
+        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry orelse undefined, .dylib = if (emit.shared) &dylib else null, .libs = libs, .rpaths = rpaths.items, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = if (emit.strip) &.{} else emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .min_os = emit.macos_min, .sdk = emit.macos_sdk, .aliases = emit.aliases.items, .local_symbols = emit.input_symbols }) catch |err| {
             std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
             return false;
         };
