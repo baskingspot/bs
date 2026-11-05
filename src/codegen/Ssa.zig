@@ -1049,7 +1049,12 @@ const SharedReads = struct {
 
     fn use(c: *SharedReads, ref: Inst.Ref) void {
         const l = @backingInt(ref.toIndex() orelse return);
-        if (c.f.live.items(.share)[l] != @backingInt(c.v)) return;
+        // A forwarded load reads the value stored (`Live.fwd`), which may
+        // be a load sharing the register: `temp.b` of `const temp = gcd`
+        // reads `gcd.b`'s register.
+        const fwd = c.f.live.items(.fwd)[l];
+        const r = if (fwd != no_tie and c.ir.instructions.items(.tag)[l] == .load) fwd else l;
+        if (c.f.live.items(.share)[r] != @backingInt(c.v)) return;
         if (l != c.tie) c.other = true;
     }
 };
