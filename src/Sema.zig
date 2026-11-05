@@ -7248,10 +7248,14 @@ fn zirBuiltinExtern(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
     const pcrel = ip.intValue(u64, ip.keyPayload(.enum_tag, relocation).int).? == @backingInt(std.lang.ExternOptions.Relocation.pcrel);
     const dll_import = try sema.fieldValue(options, info.fieldIndex(ip, "is_dll_import").?) == .bool_true;
     // A function's address is a comptime-known pointer to the extern
-    // function, which CodeGen reads from the slot the link fills.
-    if (!is_weak and !pcrel and !is_tls and Type.class(ip, ty) == .pointer and Type.class(ip, Type.ptrInfo(ip, ty).child) == .@"fn") {
-        const f = try sema.intern(.{ .extern_func = .{ .name = try sema.getString(name), .ty = Type.ptrInfo(ip, ty).child, .is_weak = false } });
-        return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .uav = .{ .val = f, .orig_ty = ty } } } }));
+    // function, which CodeGen reads from the slot the link fills. Asked
+    // for as an optional, it is a comptime-known non-null one unless the
+    // symbol is weak, as upstream (`@extern(?*const fn () ..., ...) orelse
+    // @compileError(...)` compiles).
+    if (!is_weak and !pcrel and !is_tls and Type.class(ip, Type.ptrInfo(ip, ptr_ty).child) == .@"fn") {
+        const f = try sema.intern(.{ .extern_func = .{ .name = try sema.getString(name), .ty = Type.ptrInfo(ip, ptr_ty).child, .is_weak = false } });
+        const ptr: Ref = .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = f, .orig_ty = ptr_ty } } } }));
+        return if (ty == ptr_ty) ptr else sema.coerce(block, ty, ptr, src);
     }
     // Data's address at comptime is a pointer the link binds, which
     // comptime cannot load through; each call site's is its own, as
