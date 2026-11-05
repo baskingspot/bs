@@ -8892,7 +8892,7 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
     else if (Type.class(ip, wanted) == .pointer and Type.class(ip, actual) == .pointer and
         !Type.ptrInfo(ip, wanted).flags.is_const and Type.ptrInfo(ip, actual).flags.is_const)
         // A pointer to a constant where a mutable one is wanted.
-        try sema.noteOrigin(block, src, .root, .@"const");
+        try sema.noteOrigin(block, src, .pointee, .@"const");
     return err;
 }
 

@@ -1249,6 +1249,9 @@ pub const OriginDepth = enum {
     /// The variable whose memory a place expression names: `x` in `x`,
     /// `x.f.g`, `x[i]`, `&x`, and in a method call's callee `x.m`.
     root,
+    /// As `root`, for the memory a pointer value points at: `x` in `&x`,
+    /// `p` (a `for` loop's `|*p|` or `const p = &x`) and `x.m`.
+    pointee,
 };
 
 /// The origin of the value of the expression at `start..end`.
@@ -1263,15 +1266,98 @@ pub fn valueOrigin(tree: *const Ast, start: u32, end: u32, depth: OriginDepth) ?
             .slice_open, .slice, .slice_sentinel => node = tree.fullSlice(node).?.ast.sliced,
             else => {},
         },
-        .root => while (true) switch (tree.nodeTag(node)) {
-            .field_access => node = tree.nodeData(node).node_and_token[0],
-            .array_access => node = tree.nodeData(node).node_and_node[0],
-            .address_of => node = tree.nodeData(node).node,
-            .grouped_expression => node = tree.nodeData(node).node_and_token[0],
-            else => break,
+        .root, .pointee => {
+            // Through a pointer (`p.*`, or a `for` loop's `|*x|`), the
+            // memory is a local's only when the pointer is `&local`,
+            // directly or as a constant local's initializer.
+            var via_ptr = false;
+            var through = depth == .pointee and tree.nodeTag(node) != .address_of;
+            // A field of an assigned initializer is stored through the
+            // assignment's destination.
+            if (initDest(tree, node)) |dest| {
+                node = dest;
+                through = true;
+            }
+            for (0..64) |_| switch (tree.nodeTag(node)) {
+                .field_access => {
+                    node = tree.nodeData(node).node_and_token[0];
+                    through = true;
+                },
+                .array_access => {
+                    node = tree.nodeData(node).node_and_node[0];
+                    through = true;
+                },
+                .deref => {
+                    node = tree.nodeData(node).node;
+                    through = true;
+                    via_ptr = true;
+                },
+                .address_of => {
+                    node = tree.nodeData(node).node;
+                    via_ptr = false;
+                },
+                .grouped_expression => node = tree.nodeData(node).node_and_token[0],
+                .identifier => {
+                    if (!through) break;
+                    const tok = tree.nodeMainToken(node);
+                    if (forPtrCaptureInput(tree, tok)) |input| {
+                        node = input;
+                        via_ptr = true;
+                        continue;
+                    }
+                    const local = localNamed(tree, tok) orelse break;
+                    const init = local.init.unwrap() orelse break;
+                    if (tree.tokenTag(local.mut_tok) != .keyword_const or tree.nodeTag(init) != .address_of) break;
+                    node = init;
+                },
+                else => break,
+            };
+            if (via_ptr) return .{ .node = node, .local = null };
         },
     }
     return .{ .node = node, .local = if (tree.nodeTag(node) == .identifier) localNamed(tree, tree.nodeMainToken(node)) else null };
+}
+
+/// The destination of the assignment whose initializer has `node` as a
+/// field or element, at any depth: `p.*` in `p.* = .{ .f = node }`.
+fn initDest(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    var n = node;
+    outer: for (0..16) |_| {
+        for (0..tree.nodes.len) |i| {
+            const cand: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            var buf: [2]Ast.Node.Index = undefined;
+            const elems = if (tree.fullStructInit(&buf, cand)) |s| s.ast.fields else if (tree.fullArrayInit(&buf, cand)) |a| a.ast.elements else {
+                if (n != node and tree.nodeTag(cand) == .assign and tree.nodeData(cand).node_and_node[1] == n) return tree.nodeData(cand).node_and_node[0];
+                continue;
+            };
+            for (elems) |e| if (e == n) {
+                n = cand;
+                continue :outer;
+            };
+        }
+        return null;
+    }
+    return null;
+}
+
+/// The input of the `for` loop around `use` whose pointer capture
+/// (`|*x|`) `use` names.
+fn forPtrCaptureInput(tree: *const Ast, use: Ast.TokenIndex) ?Ast.Node.Index {
+    const name = tree.tokenSlice(use);
+    for (0..tree.nodes.len) |i| {
+        const f = tree.fullFor(@fromBackingInt(@intCast(i))) orelse continue;
+        const body = f.ast.then_expr;
+        if (use < tree.firstToken(body) or use > tree.lastToken(body)) continue;
+        var tok = f.payload_token;
+        for (f.ast.inputs) |input| {
+            const by_ptr = tree.tokenTag(tok) == .asterisk;
+            if (by_ptr) tok += 1;
+            if (by_ptr and std.mem.eql(u8, tree.tokenSlice(tok), name)) return input;
+            if (tree.tokenTag(tok + 1) != .comma) break;
+            tok += 2;
+        }
+    }
+    return null;
 }
 
 /// The local declaration in scope at `use` that its identifier names: of
