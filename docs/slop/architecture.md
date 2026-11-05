@@ -9254,7 +9254,19 @@ the choice instead of failing:
   aarch64 has no such choice yet: bs generates code for `apple_m1` on
   aarch64-macos and the generic ARMv8.0 core on aarch64-linux, with or
   without `-mcpu=native`, where upstream's native target uses the
-  host's CPU.
+  host's CPU. Following upstream there would need main.zig to resolve
+  and clamp the host's aarch64 CPU as `cpu.zig` does x86_64's, to the
+  features the aarch64 backend and its inline assembler handle;
+  aarch64-macos's `builtin.cpu` and C target built from that CPU
+  (`Builtin.zig` and `CSource.macosTarget` write `apple_m1`); and
+  `cpu.cacheName` to name CPUs against each target's default. On the
+  Mac that changes no std path: every M-series model has aes, sha2 and
+  lse, the only aarch64 features std and compiler_rt test besides neon
+  and sve. On aarch64-linux a host CPU instead of generic turns on std's
+  AES, GHASH and SHA-256 asm paths (the assembler encodes them) and the
+  backend's LSE atomics, and on SVE hosts (Neoverse V1 and V2)
+  `std.simd`'s 256-bit vector length and the syscalls' z and p register
+  clobbers, so sve would be clamped out as x86_64's AVX is.
   With `cx16` (x86-64-v2) 128-bit atomics are allowed, as upstream
   (`Sema.atomicElemType`), and lowered with `lock cmpxchg16b`
   (`codegen/x86_64/atomic128.zig`).
