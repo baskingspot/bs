@@ -2216,9 +2216,13 @@ class Gen:
         out.append(f"    const v: {vt} = @splat({self.ch(['true', 'false'] if 'bool' in vt else ['1', '0', '5'])});")
         out.append(f"    const va: [@typeInfo({vt}).vector.len]@typeInfo({vt}).vector.child = v;")
         res.append("va")
-        out.append("    const bytes = std.mem.asBytes(&x);")
+        # The fields' bytes, not the padding between them: padding is
+        # undefined, which upstream's LLVM backend (aarch64-linux) and its
+        # x86_64 backend print differently.
         out.append("    var sum: u64 = 0;")
-        out.append("    for (bytes) |b| sum = sum *% 31 +% b;")
+        out.append(f'    inline for (@typeInfo({s}).@"struct".field_names) |n| {{')
+        out.append("        for (std.mem.asBytes(&@field(x, n))) |b| sum = sum *% 31 +% b;")
+        out.append("    }")
         res.append("sum")
         res.append("@as(i16, @as(c_char, @bitCast(@as(u8, 200))))")
         out.append("    break :blk .{ " + ", ".join(res) + " };")

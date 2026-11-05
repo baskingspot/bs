@@ -203,6 +203,27 @@ def compile_run(tools, cfg, src, scratch):
     return Build("ok", lines=lines)
 
 
+# What bs prints for an undefined value (memory filled with 0xaa), as an
+# integer of each width, signed and unsigned, and as f32 and f64.
+UNDEF = {
+    str(v)
+    for bits in (8, 16, 32, 64, 128)
+    for v in (int("aa" * (bits // 8), 16), int("aa" * (bits // 8), 16) - (1 << bits))
+} | {"-3.0316488e-13", "-3.7206620809969885e-103"}
+TOKEN = re.compile(r"-?[0-9][0-9a-zA-Z.+-]*|[^0-9-]+|-")
+
+
+def same_value(got, want):
+    """Whether bs's line `got` means `want`: equal, or equal except where
+    bs printed an undefined value and upstream printed something else
+    (upstream's LLVM backend, which aarch64-linux uses, emits undefined
+    memory as zeros, not 0xaa)."""
+    if got == want or got is None or want is None:
+        return got == want
+    g, w = TOKEN.findall(got), TOKEN.findall(want)
+    return len(g) == len(w) and all(a == b or a in UNDEF for a, b in zip(g, w))
+
+
 def new_scratch():
     base = os.path.join(WORK, "tmp")
     os.makedirs(base, exist_ok=True)
@@ -332,7 +353,9 @@ def check(seed, tools, size=1.0, text=None, save_findings=True):
             return rec
         rec["accepted"] = len(up.lines)
         for tid, want in sorted(up.lines.items()):
-            bad = [c for c, b in res.items() if b.status in ("ok", "run-fail") and b.lines.get(tid) != want]
+            bad = [
+                c for c, b in res.items() if b.status in ("ok", "run-fail") and not same_value(b.lines.get(tid), want)
+            ]
             if bad:
                 rec["findings"].append(
                     save(seed, src_text, tools, up, res, "wrong-value", tid, bad, "", size, only, text is not None)
