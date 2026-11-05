@@ -2357,7 +2357,21 @@ fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
 // register pairs, as LLVM lowers them for Apple Silicon: FEAT_LSE2 makes an
 // aligned `ldp` or `stp` single-copy atomic, with `dmb ish` for sequential
 // consistency, and `caspal` (whose pairs start at even registers) does the
-// rest.
+// rest. A CPU without them (aarch64-linux's ARMv8.0 baseline) gets LLVM's
+// `ldaxp`/`stlxp` loops instead, where a pair load is atomic only once
+// the store-exclusive after it succeeds.
+
+/// Whether an aligned `ldp` or `stp` is single-copy atomic (FEAT_LSE2).
+fn hasLse2(cg: *const CodeGen) bool {
+    return cg.emit.zcu.cpu.has(.aarch64, .lse2);
+}
+
+/// Stores x10:x11 back to [x12] with `stlxp`, repeating from `top` (whose
+/// `ldaxp` reloads them) until it succeeds. Uses x7.
+fn storePairExclusive(cg: *CodeGen, lo: Reg, hi: Reg, top: Encoder.Label) Error!void {
+    try cg.e.stlxp(.x7, lo, hi, .x12);
+    try cg.e.cbz(true, .w, .x7, top);
+}
 
 /// `ldp`, `stp` and `caspal` need 16-byte alignment, which f80 and f128
 /// lack under LLVM's layout (upstream's LLVM build fails to compile their
@@ -2369,8 +2383,15 @@ fn atomic16Aligned(cg: *CodeGen, ty: Index) Error!void {
 fn atomicLoad16(cg: *CodeGen, inst: Inst.Index, ty: Index, ptr: Ref) Error!void {
     try cg.atomic16Aligned(ty);
     try cg.load(.x12, ptr);
-    try cg.e.ldp(.dword, .x10, .x11, .at(.x12, 0));
-    try cg.e.dmb(.ish);
+    if (cg.hasLse2()) {
+        try cg.e.ldp(.dword, .x10, .x11, .at(.x12, 0));
+        try cg.e.dmb(.ish);
+    } else {
+        const top = try cg.e.newLabel();
+        cg.e.bind(top);
+        try cg.e.ldaxp(.x10, .x11, .x12);
+        try cg.storePairExclusive(.x10, .x11, top);
+    }
     const dst = try cg.resultMem(inst, ty) orelse return;
     try cg.storePair16(dst, .x10, .x11);
 }
@@ -2380,6 +2401,12 @@ fn atomicStore16(cg: *CodeGen, ptr: Ref, operand: Ref) Error!void {
     const v = try cg.pairVal(operand);
     try cg.load(.x12, ptr);
     try cg.loadPair(.x10, .x11, v);
+    if (!cg.hasLse2()) {
+        const top = try cg.e.newLabel();
+        cg.e.bind(top);
+        try cg.e.ldaxp(.x4, .x5, .x12);
+        return cg.storePairExclusive(.x10, .x11, top);
+    }
     try cg.e.dmb(.ish);
     try cg.e.stp(.dword, .x10, .x11, .at(.x12, 0));
     try cg.e.dmb(.ish);
@@ -2398,10 +2425,29 @@ fn storePair16(cg: *CodeGen, dst: Mem, lo: Reg, hi: Reg) Error!void {
 
 /// `caspal` of x10:x11 (the expected value, then the old one) and x2:x3
 /// (the new value) at [x12]; sets `ne` if it failed. Uses x4-x7.
+/// Without LSE, an exclusive loop that stores the old value back when it
+/// differs, as LLVM's, so the old value read is atomic.
 fn casPair(cg: *CodeGen) Error!void {
     const e = &cg.e;
     try e.mov(.x, .x4, .x10);
     try e.mov(.x, .x5, .x11);
+    if (!cg.hasLse()) {
+        const top = try e.newLabel();
+        const differ = try e.newLabel();
+        const done = try e.newLabel();
+        e.bind(top);
+        try e.ldaxp(.x10, .x11, .x12);
+        try e.logic(.eor, .x, .x6, .x10, .r(.x4));
+        try e.logic(.eor, .x, .x7, .x11, .r(.x5));
+        try e.logic(.orr, .x, .x6, .x6, .r(.x7));
+        try e.cbz(true, .x, .x6, differ);
+        try cg.storePairExclusive(.x2, .x3, top);
+        try e.b(.{ .label = done });
+        e.bind(differ);
+        try cg.storePairExclusive(.x10, .x11, top);
+        e.bind(done);
+        return e.cmp(.x, .x6, .{ .imm = 0 });
+    }
     try e.casp(.dword, .acq_rel, .x10, .x2, .x12);
     try e.logic(.eor, .x, .x6, .x10, .r(.x4));
     try e.logic(.eor, .x, .x7, .x11, .r(.x5));

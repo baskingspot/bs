@@ -924,7 +924,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   not probed (upstream's LLVM probes only on x86 off Darwin). The CPU is
   upstream's baseline for `-target aarch64-linux`, the generic ARMv8.0
   core, so atomics without LSE are `ldaxr`/`stlxr` loops (`atomicCas`,
-  `atomicOp`), as LLVM emits for it, and f16 arithmetic without
+  `atomicOp`), as LLVM emits for it (16-byte ones `ldaxp`/`stlxp`
+  loops, which store the old value back after a failed compare so that
+  the read is atomic), and f16 arithmetic without
   FEAT_FP16 calls compiler_rt (`fpType`), where `fcvt` still converts
   halves. The cache is not used yet. The inline assembly std's Linux code
   needs adds `msr tpidr_el0`, the shifts, and the extension aliases.

@@ -637,6 +637,21 @@ pub fn stlxr(e: *Encoder, size: Size, status: Reg, src: Reg, base: Reg) !void {
     e.word(0x0800fc00 | (@as(u32, @backingInt(size)) << 30) | (status.zrEnc() << 16) | (base.spEnc() << 5) | src.zrEnc());
 }
 
+/// `ldaxp`: a load-acquire exclusive of the x register pair at `[base]`,
+/// single-copy atomic only once a `stlxp` to it succeeds.
+pub fn ldaxp(e: *Encoder, lo: Reg, hi: Reg, base: Reg) !void {
+    try e.reserve();
+    e.word(0xc87f8000 | (hi.zrEnc() << 10) | (base.spEnc() << 5) | lo.zrEnc());
+}
+
+/// `stlxp`: a store-release exclusive of the x register pair `lo`, `hi`
+/// to `[base]`; `status` gets 0 if it stored, 1 if not.
+pub fn stlxp(e: *Encoder, status: Reg, lo: Reg, hi: Reg, base: Reg) !void {
+    assert(status != lo and status != hi and status != base);
+    try e.reserve();
+    e.word(0xc8208000 | (status.zrEnc() << 16) | (hi.zrEnc() << 10) | (base.spEnc() << 5) | lo.zrEnc());
+}
+
 /// `cas{a}{l}{b,h}`: compares `size` bytes at `[base]` with `expected`
 /// and, if equal, stores `new`. `expected` receives the old value either
 /// way (LSE, ARMv8.1, which every Apple Silicon core has).
@@ -1595,6 +1610,8 @@ test "atomics, bit ops, and other step-5 encodings match the system assembler" {
     try e.raw(System.msr_tpidr_el0 | 5); // msr tpidr_el0, x5
     try e.ldaxr(.byte, .x9, .x12); // ldaxrb w9, [x12]
     try e.stlxr(.dword, .x17, .x11, .x12); // stlxr w17, x11, [x12]
+    try e.ldaxp(.x10, .x11, .x12); // ldaxp x10, x11, [x12]
+    try e.stlxp(.x7, .x2, .x3, .x12); // stlxp w7, x2, x3, [x12]
     try e.stackProbe(0x186b0, chkstk); // mov x9, #0x86b0; movk x9, #1, lsl #16; bl ___chkstk_darwin
     try e.adr(.x16, table); // adr x16, table
     e.bind(case);
@@ -1603,10 +1620,10 @@ test "atomics, bit ops, and other step-5 encodings match the system assembler" {
     try e.finish();
     const want = hex("241845fa" ++ "40b0433a" ++ "2008c05a" ++ "2008c0da" ++ "c514c0da" ++ "0058200e" ++ "00b8310e" ++
         "208c621f" ++ "0410381e" ++ "05f0671e" ++ "e1ffe008" ++ "067d6448" ++ "628021f8" ++ "7f706178" ++ "20fcdf08" ++
-        "ffff9fc8" ++ "bf3b03d5" ++ "e10bc03d" ++ "0280803c" ++ "e827bfad" ++ "34120000" ++ "20001fba" ++ "6200045a" ++ "df3f03d5" ++ "9f3b03d5" ++ "63d03bd5" ++ "030038d5" ++ "430738d5" ++ "45d01bd5" ++ "89fd5f08" ++ "8bfd11c8" ++ "09d690d2" ++ "2900a0f2" ++
+        "ffff9fc8" ++ "bf3b03d5" ++ "e10bc03d" ++ "0280803c" ++ "e827bfad" ++ "34120000" ++ "20001fba" ++ "6200045a" ++ "df3f03d5" ++ "9f3b03d5" ++ "63d03bd5" ++ "030038d5" ++ "430738d5" ++ "45d01bd5" ++ "89fd5f08" ++ "8bfd11c8" ++ "8aad7fc8" ++ "828d27c8" ++ "09d690d2" ++ "2900a0f2" ++
         "00000094" ++ "30000010" ++ "00000000");
     try std.testing.expectEqualSlices(u8, &want, e.code.items);
-    try std.testing.expectEqualDeep(&[_]Atom.Reloc{.init(0x84, .aarch64_branch26, 0, 0)}, e.refs.relocs.items);
+    try std.testing.expectEqualDeep(&[_]Atom.Reloc{.init(0x8c, .aarch64_branch26, 0, 0)}, e.refs.relocs.items);
 }
 
 test "bitmask immediates" {
