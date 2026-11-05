@@ -1285,6 +1285,26 @@ pub fn unwindEncoding(u: Atom.Unwind) u32 {
     };
 }
 
+/// A compact unwind entry of a function: from `off` on, `encoding`.
+pub const UnwindPart = struct { off: u32, encoding: u32 };
+
+/// The compact unwind entries of the `size`-byte function `u` describes:
+/// its `unwindEncoding`, then for the stubs after the blocks
+/// (`Atom.Unwind.epilogue`, aarch64's synthetic panic frames), which make
+/// frame records of their own and save no pairs, the frame mode without
+/// them, and for the probes after the stubs, which run in the prologue's
+/// frame, the function's again.
+pub fn unwindParts(u: Atom.Unwind, size: u32, out: *[3]UnwindPart) []const UnwindPart {
+    const e = unwindEncoding(u);
+    out[0] = .{ .off = 0, .encoding = e };
+    const stub_e = unwindEncoding(.frame_pointer);
+    if (u.kind != .frame_pointer or u.epilogue == 0 or stub_e == e) return out[0..1];
+    out[1] = .{ .off = size - u.epilogue, .encoding = stub_e };
+    if (u.probes == 0) return out[0..2];
+    out[2] = .{ .off = size - u.probes, .encoding = e };
+    return out[0..3];
+}
+
 /// Writes the header, the first-level index, and the leading page of
 /// `out`, the __unwind_info section, after the debug chunks wrote their
 /// pages. Offsets are from the start of __TEXT; __text spans `text_start`
@@ -1945,6 +1965,12 @@ fn LinkOf(comptime Input: type) type {
                     }
                     n += 1;
                     encoding = e;
+                }
+                var parts_buf: [3]UnwindPart = undefined;
+                for (unwindParts(Elf.ref(&a).unwind, @intCast(a.bytes.len), &parts_buf)[1..]) |part| {
+                    if (write) putUnwindEntry(page, n, start + part.off, part.encoding);
+                    n += 1;
+                    encoding = part.encoding;
                 }
                 if (write) run_end = start + @as(u32, @intCast(input.atom(atom).bytes.len));
             }

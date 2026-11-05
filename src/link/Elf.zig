@@ -1026,7 +1026,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // ascend), so at most `n_long_fdes` FDEs exceed the short bound.
     const eh_off = std.mem.alignForward(u64, pcs_end, 8);
     // The input sections' FDEs follow bs's.
-    const eh_room = if (has_cfi) Dwarf.cie.len + n_debug * Dwarf.max_short_fde_size + @min(n_debug, n_long_fdes) * (Dwarf.max_fde_size - Dwarf.max_short_fde_size) + input_eh + 4 else 0;
+    const eh_room = if (has_cfi) Dwarf.cie.len + n_debug * Dwarf.max_short_fde_size + @min(n_debug, n_long_fdes) * (Dwarf.maxFdeSize(options.arch) - Dwarf.max_short_fde_size) + input_eh + 4 else 0;
     const hdr_off = eh_off + eh_room;
     const hdr_room = if (has_cfi) Dwarf.eh_frame_hdr_size + (n_debug + n_input_fdes) * Dwarf.eh_frame_hdr_entry_size else 0;
     const r_end = if (has_cfi) hdr_off + hdr_room else pcs_end;

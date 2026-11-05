@@ -634,31 +634,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             // error return trace of the program built without inlining
             // (docs/slop/architecture.md, "Synthetic panic frames"),
             // addresses aside.
-            if (!upstream and host_runs_bs_output and isTraceChecked(file)) {
-                const plain = b.addRunArtifact(bs);
-                plain.setName(b.fmt("compile {s} (BS_INLINE=0)", .{name}));
-                plain.addArgs(&.{ "build-exe", "-target", "x86_64-linux" });
-                plain.addFileArg(b.path(src_path));
-                plain.setEnvironmentVariable("BS_INLINE", "0");
-                plain.setEnvironmentVariable("BS_CACHE", "off");
-                const plain_bin = plain.addPrefixedOutputFileArg("-femit-bin=", name);
-                const same = b.addSystemCommand(&.{
-                    "sh", "-c",
-                    \\set -e
-                    \\mask() { sed -E 's/0x[0-9a-f]+/0x?/g; s/thread [0-9]+/thread ?/'; }
-                    \\{ "$1" 2>&1 >/dev/null; } 2>/dev/null | mask >"$3.inlined" || true
-                    \\{ "$2" 2>&1 >/dev/null; } 2>/dev/null | mask >"$3.plain" || true
-                    \\diff "$3.plain" "$3.inlined" >&2
-                    \\touch "$3"
-                    ,
-                    "sh",
-                });
-                same.setName(b.fmt("{s}: the trace matches BS_INLINE=0's", .{name}));
-                same.addFileArg(bin);
-                same.addFileArg(plain_bin);
-                _ = same.addOutputFileArg("trace");
-                test_step.dependOn(&same.step);
-            }
+            if (!upstream and host_runs_bs_output and isTraceChecked(file)) traceCheck(b, test_step, bs, src_path, name, "x86_64-linux", &.{});
             if (!upstream and !host_runs_bs_output) {
                 // bs emits x86_64-linux executables; elsewhere only check
                 // that they compile.
@@ -685,6 +661,11 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             for (expect.stderr_contains.items) |part| run.addCheck(.{ .expect_stderr_match = part });
             run.addCheck(.{ .expect_term = if (expect.signal) |sig| .{ .signal = sig } else .{ .exited = expect.exit.? } });
             test_step.dependOn(&run.step);
+        }
+        // The x86_64 programs' traces check aarch64's stubs too.
+        if (isTraceChecked(file)) {
+            if (host_runs_macos_output) traceCheck(b, test_step, bs, src_path, name, "aarch64-macos", &.{});
+            if (aarch64_linux_runner) |runner| traceCheck(b, test_step, bs, src_path, name, "aarch64-linux", runner);
         }
         if (expect.aarch64_linux) for ([_]bool{ false, true }) |upstream| {
             const rebuild = !upstream and expect.rebuild_without.items.len != 0;
@@ -764,6 +745,42 @@ fn earlierVersion(b: *std.Build, source: []const u8, edits: []const [2][]const u
         earlier = b.fmt("{s}{s}{s}", .{ earlier[0..at], edit[1], earlier[at + edit[0].len ..] });
     }
     return earlier;
+}
+
+/// Checks that `src_path`'s stack or error return trace built for `target`
+/// is that of the program built without inlining (docs/slop/architecture.md,
+/// "Synthetic panic frames"), addresses and thread ids aside; `runner`
+/// prefixes the runs.
+fn traceCheck(b: *std.Build, test_step: *std.Build.Step, bs: *std.Build.Step.Compile, src_path: []const u8, name: []const u8, target: []const u8, runner: []const []const u8) void {
+    var out: [2]std.Build.LazyPath = undefined;
+    for (&out, [_]?[]const u8{ null, "0" }) |*o, inline_env| {
+        const c = b.addRunArtifact(bs);
+        c.setName(b.fmt("compile {s} for {s}{s}", .{ name, target, if (inline_env != null) " (BS_INLINE=0)" else "" }));
+        c.addArgs(&.{ "build-exe", "-target", target });
+        c.addFileArg(b.path(src_path));
+        if (inline_env) |v| c.setEnvironmentVariable("BS_INLINE", v);
+        c.setEnvironmentVariable("BS_CACHE", "off");
+        o.* = c.addPrefixedOutputFileArg("-femit-bin=", name);
+    }
+    const same = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -e
+        \\inl=$1 plain=$2 trace=$3
+        \\shift 3
+        \\mask() { sed -E 's/0x[0-9a-f]+/0x?/g; s/thread [0-9]+/thread ?/'; }
+        \\{ "$@" "$inl" 2>&1 >/dev/null; } 2>/dev/null | mask >"$trace.inlined" || true
+        \\{ "$@" "$plain" 2>&1 >/dev/null; } 2>/dev/null | mask >"$trace.plain" || true
+        \\diff "$trace.plain" "$trace.inlined" >&2
+        \\touch "$trace"
+        ,
+        "sh",
+    });
+    same.setName(b.fmt("{s}: the trace for {s} matches BS_INLINE=0's", .{ name, target }));
+    same.addFileArg(out[0]);
+    same.addFileArg(out[1]);
+    _ = same.addOutputFileArg("trace");
+    same.addArgs(runner);
+    test_step.dependOn(&same.step);
 }
 
 fn isTraceChecked(file: []const u8) bool {

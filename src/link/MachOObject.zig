@@ -102,6 +102,8 @@ const Piece = struct {
     /// The atom it comes from.
     atom: u32,
     what: enum { bytes, descriptor, unwind },
+    /// For `unwind`: which of `MachO.unwindParts`.
+    part: u8 = 0,
 };
 
 const Reloc = struct { address: u32, symbol: u32, pcrel: bool, length: u2, kind: macho.reloc_type_arm64 };
@@ -147,8 +149,11 @@ pub fn emit(gpa: Allocator, atoms: []const Atom, options: Options) Error![]u8 {
             desc[i] = @intCast(pieces.items.len);
             try pieces.append(arena, .{ .sect = .thread_vars, .size = 24, .alignment = 8, .atom = @intCast(i), .what = .descriptor });
         }
-        if (a.section == .text and MachO.unwindEncoding(a.unwind) != 0)
-            try pieces.append(arena, .{ .sect = .compact_unwind, .size = 32, .alignment = 8, .atom = @intCast(i), .what = .unwind });
+        if (a.section == .text and MachO.unwindEncoding(a.unwind) != 0) {
+            var parts: [3]MachO.UnwindPart = undefined;
+            for (0..MachO.unwindParts(a.unwind, @intCast(a.bytes.len), &parts).len) |k|
+                try pieces.append(arena, .{ .sect = .compact_unwind, .size = 32, .alignment = 8, .atom = @intCast(i), .what = .unwind, .part = @intCast(k) });
+        }
     }
 
     // Sections: their pieces in atom order, and addresses from 0.
@@ -242,9 +247,16 @@ pub fn emit(gpa: Allocator, atoms: []const Atom, options: Options) Error![]u8 {
                 try relocs[s].append(arena, .{ .address = at + 16, .symbol = init_sym[p.atom], .pcrel = false, .length = 3, .kind = .ARM64_RELOC_UNSIGNED });
             },
             .unwind => {
+                // A part's address is the function's plus its offset (the
+                // relocation's addend).
                 const out = contents[s][p.off..][0..32];
-                std.mem.writeInt(u32, out[8..12], @intCast(a.bytes.len), .little);
-                std.mem.writeInt(u32, out[12..16], MachO.unwindEncoding(a.unwind), .little);
+                var buf: [3]MachO.UnwindPart = undefined;
+                const parts = MachO.unwindParts(a.unwind, @intCast(a.bytes.len), &buf);
+                const part = parts[p.part];
+                const end = if (p.part + 1 < parts.len) parts[p.part + 1].off else a.bytes.len;
+                std.mem.writeInt(u64, out[0..8], part.off, .little);
+                std.mem.writeInt(u32, out[8..12], @intCast(end - part.off), .little);
+                std.mem.writeInt(u32, out[12..16], part.encoding, .little);
                 try relocs[s].append(arena, .{ .address = @intCast(p.off), .symbol = key_sym.get(a.key).?, .pcrel = false, .length = 3, .kind = .ARM64_RELOC_UNSIGNED });
             },
             .bytes => {
