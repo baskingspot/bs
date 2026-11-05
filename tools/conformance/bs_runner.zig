@@ -32,7 +32,7 @@ fn initTls(envp: [*]const usize) void {
     std.os.linux.tls.initStatic(@as([*]elf.ElfN.Phdr, @ptrFromInt(at_phdr))[0..at_phnum]);
 }
 
-pub export fn _start() callconv(.naked) noreturn {
+pub export fn _start() callconv(.naked) noreturn { // ziglint-ignore: Z031 -- the ELF entry symbol the linker looks for
     asm volatile (
         \\ xorl %%ebp, %%ebp
         \\ movq %%rsp, %%rdi
