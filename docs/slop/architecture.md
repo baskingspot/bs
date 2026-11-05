@@ -7115,7 +7115,12 @@ libraries as inputs. To be agreed with that thread.
   globals and commons are exported next to the Zig code's
   (`ElfInput.dynamicExports`, at their offsets in their sections'
   atoms), and names nothing defines are imported, as the Zig code's
-  are. Thread-locals keep the dynamic models: TLSGD addresses a 16-byte
+  are. A name's visibility is the most constraining one any object's
+  symbol gives it, reference or definition (`Inputs.visibility`, the
+  gABI's rule and lld's): libc++'s inline functions are hidden in its
+  archive and default in the user's objects, so they stay unexported
+  and bind locally (test/link_input/so_hidref.c; 2026-11-05).
+  Thread-locals keep the dynamic models: TLSGD addresses a 16-byte
   (module, offset) pair the loader completes (R_X86_64_DTPMOD64,
   `x86_64_dtpmod64`), TLSLD the module's pair, and a TLS descriptor
   (GCC's `-mtls-dialect=gnu2`) a 16-byte descriptor (R_X86_64_TLSDESC

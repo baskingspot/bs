@@ -1464,6 +1464,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         zso_inputs.addFileArg(b.path("test/link_input/so_lib.zig"));
         zso_inputs.addFileArg(b.path("test/link_input/merge.c"));
         zso_inputs.addFileArg(b.path("test/link_input/so_interpose.c"));
+        zso_inputs.addFileArg(b.path("test/link_input/so_hidref.c"));
         zso_inputs.addFileArg(tls_o.addPrefixedOutputFileArg("-o", "tls.o"));
         zso_inputs.addFileArg(desc_lib);
         zso_inputs.setEnvironmentVariable("BS_ZIG", zig);
@@ -1487,7 +1488,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         preempt.setName("run so_preempt (thread-locals, functions and data preempting a bs shared library's)");
         preempt.addFileArg(so_file);
         preempt.addFileArg(preempt_host.addPrefixedOutputFileArg("-o", "so_preempt"));
-        preempt.addCheck(.{ .expect_stdout_exact = "100012 200310 1000 2003\n32 1 202\n" });
+        preempt.addCheck(.{ .expect_stdout_exact = "100012 200310 1000 2003\n32 1 202 4\n" });
         preempt.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&preempt.step);
     }

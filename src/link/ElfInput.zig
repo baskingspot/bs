@@ -27,6 +27,12 @@ archives: std.ArrayList(ArchiveInput) = .empty,
 /// Each global name the loaded objects define, strong over weak, else
 /// the first in input order.
 defs: std.StringHashMapUnmanaged(Def) = .empty,
+/// The most constraining visibility (STV_INTERNAL 1, STV_HIDDEN 2,
+/// STV_PROTECTED 3) of the names that any object's symbol, a reference
+/// or a definition, gives one other than STV_DEFAULT, as the ELF gABI
+/// and lld merge it: a name defined with default visibility but
+/// referenced as hidden is hidden. Names not here are STV_DEFAULT.
+visibility: std.StringHashMapUnmanaged(u2) = .empty,
 /// COMMON symbols: the largest size and alignment of each name, which one
 /// zero-filled atom gets, unless an object defines the name.
 commons: std.StringArrayHashMapUnmanaged(Common) = .empty,
@@ -205,6 +211,11 @@ fn load(in: *Inputs, o: Object) Error!void {
         const bind = sym.st_bind();
         if (bind != elf.STB_GLOBAL and bind != elf.STB_WEAK) continue;
         const name = obj.symName(sym);
+        const vis: u2 = @truncate(sym.st_other);
+        if (vis != 0) {
+            const v = try in.visibility.getOrPut(in.arena, name);
+            if (!v.found_existing or vis < v.value_ptr.*) v.value_ptr.* = vis;
+        }
         if (sym.st_shndx == elf.SHN_UNDEF or (sym.st_shndx < elf.SHN_LORESERVE and obj.discarded[sym.st_shndx])) {
             if (!in.defs.contains(name)) try in.undefs.put(in.arena, name, {});
             continue;
@@ -531,15 +542,16 @@ pub fn dynamicExports(in: *Inputs, skip: anytype) ![]ElfDynamic.Export {
         if (try skip.zigExport(name) != null) continue;
         const o = &in.objects.items[d.value_ptr.object];
         const sym = o.syms[d.value_ptr.sym];
-        // STV_INTERNAL 1, STV_HIDDEN 2, STV_PROTECTED 3.
-        const vis = sym.st_other & 3;
+        const vis = in.visibility.get(name) orelse 0;
         if (vis == 1 or vis == 2) continue;
         const t = try in.symTarget(o, d.value_ptr.sym, 0) orelse continue;
         try out.append(in.arena, .{ .key = t.key, .name = name, .offset = t.offset, .size = sym.st_size, .weak = d.value_ptr.weak, .visibility = if (vis == 3) .protected else .default });
     }
     for (in.commons.keys(), in.commons.values()) |name, common| {
         if (in.defs.contains(name) or try skip.zigExport(name) != null) continue;
-        try out.append(in.arena, .{ .key = commonKey(name), .name = name, .size = common.size });
+        const vis = in.visibility.get(name) orelse 0;
+        if (vis == 1 or vis == 2) continue;
+        try out.append(in.arena, .{ .key = commonKey(name), .name = name, .size = common.size, .visibility = if (vis == 3) .protected else .default });
     }
     std.mem.sortUnstable(ElfDynamic.Export, out.items, {}, struct {
         fn lt(_: void, a: ElfDynamic.Export, b: ElfDynamic.Export) bool {
@@ -1280,10 +1292,9 @@ fn Converter(comptime Ctx: type) type {
             if (s < c.o.first_global or sym.st_bind() == elf.STB_LOCAL) return false;
             const name = c.o.symName(sym);
             if (try c.ctx.zigExport(name) != null) return false;
+            if (c.in.visibility.contains(name)) return false;
             const d = c.in.defs.get(name) orelse return c.in.commons.contains(name);
-            const def = c.in.objects.items[d.object].syms[d.sym];
-            // STV_DEFAULT 0.
-            return def.st_other & 3 == 0 and def.st_type() != elf.STT_GNU_IFUNC;
+            return c.in.objects.items[d.object].syms[d.sym].st_type() != elf.STT_GNU_IFUNC;
         }
 
         /// Converts relocation `r` against `t`, an export another module
