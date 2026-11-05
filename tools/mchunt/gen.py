@@ -3248,8 +3248,21 @@ class Gen:
             names = [f"f{i}" for i in range(nf)]
             T = self.fresh("SF")
             e(f"const {T} = struct {{ {', '.join(f'{nm}: {kinds[ft][0]}' for nm, ft in zip(names, fts))} }};")
-            v = self.fresh("sf")
-            e(f"var {v}: {T} = .{{ {', '.join(f'.{nm} = {kinds[ft][1]()}' for nm, ft in zip(names, fts))} }};")
+            mk = lambda: f".{{ {', '.join(f'.{nm} = {kinds[ft][1]()}' for nm, ft in zip(names, fts))} }}"
+            src = None
+            if self.chance(0.4):
+                # Other memory: an element of a local array reached through
+                # a pointer, copied from itself or from the other element.
+                arr, pi = self.fresh("sfa"), self.fresh("sfi")
+                e(f"var {arr}: [2]{T} = .{{ {mk()}, {mk()} }};")
+                e(f"const {pi}: usize = @as(usize, @truncate({self.int_expr(ctx, U64, 1)})) & 1;")
+                ps = self.fresh("sfp")
+                e(f"const {ps}: *{T} = &{arr}[{pi}];")
+                v = f"{ps}.*"
+                src = self.pick([v, v, f"{arr}[{pi} ^ 1]"])
+            else:
+                v = self.fresh("sf")
+                e(f"var {v}: {T} = {mk()};")
             acc = lambda c, i: f"{c}.{names[i]}"
             store = lambda i, val: f"{v}.{names[i]} = {val};"
             whole = None
@@ -3273,7 +3286,7 @@ class Gen:
         e(f"while ({cnt} < {n}) : ({cnt} += 1) {{")
         ctx["indent"] += 1
         t = self.fresh("sc")
-        e(f"const {t} = {v};")
+        e(f"const {t} = {src if kind <= 1 and src else v};")
         # New values: copies of same-typed fields, or computed from them.
         vals = []
         for i, ft in enumerate(fts):
