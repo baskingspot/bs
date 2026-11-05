@@ -277,6 +277,35 @@ const Walker = struct {
         }
     }
 
+    /// `!(a < b)` is `a >= b` when `a` and `b` are integers, bools,
+    /// enums or pointers (not floats, where NaN makes both false): the
+    /// `not` becomes the inverted compare of the same operands, so the
+    /// compare it read can die and the new one fuse into its branch
+    /// (`if (!lessThan(a, b))` after inlining). Changes `inst` in place.
+    fn invertCmp(w: *Walker, inst: Inst.Index, data: Inst.Data) bool {
+        const op = data.ty_op.operand.toIndex() orelse return false;
+        const tags = w.ir.instructions.items(.tag);
+        const datas = w.ir.instructions.items(.data);
+        const inverse: Tag = switch (tags[@backingInt(op)]) {
+            .cmp_lt => .cmp_gte,
+            .cmp_gte => .cmp_lt,
+            .cmp_lte => .cmp_gt,
+            .cmp_gt => .cmp_lte,
+            .cmp_eq => .cmp_neq,
+            .cmp_neq => .cmp_eq,
+            else => return false,
+        };
+        const bin = datas[@backingInt(op)].bin_op;
+        switch (Type.class(w.ip, w.ir.typeOf(bin.lhs, w.ip))) {
+            .int, .bool, .@"enum", .pointer => {},
+            else => return false,
+        }
+        tags[@backingInt(inst)] = inverse;
+        datas[@backingInt(inst)] = .{ .bin_op = bin };
+        w.stats.folds += 1;
+        return true;
+    }
+
     /// What `inst` becomes under the first rule that matches it, if any.
     fn match(w: *Walker, inst: Inst.Index, tag: Tag, data: Inst.Data) Allocator.Error!?Inst.Ref {
         const ip = w.ip;
@@ -289,6 +318,7 @@ const Walker = struct {
             .array_elem_val => return w.constElem(data.bin_op.lhs, data.bin_op.rhs),
             .load => return w.loadConst(data.ty_op.operand),
             .add_with_overflow, .sub_with_overflow, .mul_with_overflow => return w.overflowConst(inst, tag, data),
+            .not => if (w.invertCmp(inst, data)) return null,
             else => {},
         }
         const list = by_tag[@backingInt(tag)];

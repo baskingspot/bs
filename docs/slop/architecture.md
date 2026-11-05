@@ -2267,7 +2267,12 @@ code. Rules are matched per tag (a comptime index of the table):
   pointer: Sema makes a destructured `const` local that way, and its loads
   then read the alloc directly, which `Ssa.plan` can promote (with the
   bitcast in between, `const r, const o = @addWithOverflow(a, b)` kept
-  both in memory).
+  both in memory);
+- `!(a < b)` of integers, bools, enums or pointers is `a >= b` (and the
+  other five compares likewise; not floats, where NaN makes both
+  false): the `not` becomes the inverted compare in place, so the
+  compare it read can die and the new one fuse into its branch
+  (`if (!lessThan(a, b))` after inlining was `setb; movzx; test; jne`).
 
 A `cond_br` whose condition became constant keeps only the taken body
 (`Ssa.build`), in a block of its own, so a panic that now always runs
@@ -2488,7 +2493,8 @@ user branches are coverage points and are only learned from.
   branches within it (no call, store, check, or loop, at most 64
   instructions), becomes a void block with a single `br`; its body's
   values and the compares only it read are dropped, and `dbg_stmt`s go
-  only with that code. sort −3.2% Ir.
+  only with that code. sort −3.2% Ir; with the `not` rule in "Rewrite
+  rules", −5.4%.
 - **Turning it off.** `BS_PROVE=off` keeps every check (its own cache
   target, `+noprove`). A program whose output or panic differs between
   on and off has found a bug in a proof, with no oracle needed. The
