@@ -111,7 +111,16 @@ StaticHttpFileServer; zwasm is Apache-2.0, the rest MIT) were added on
 frameworks (ziex, merjs), a GPU UI toolkit (nanoui), a scripting language
 (revo) and smaller libraries. A step name a build uses twice (zwasm's and
 revo's several `test`s) is recorded as `<name>:<root file>` after the
-first.
+first. The 15 after StaticHttpFileServer (flash through XirAsm) were
+added on 2026-11-05 toward the kinds of code that had found bugs: crypto
+and protocols (zquic, zig-blind-rsa-signatures, zig-cbc, nats.zig), SIMD
+and image processing (zignal), a columnar format (zarrow), an assembler
+(XirAsm), a text editor and a terminal (flow, teru), a glob walker
+(zlob), an inference engine (zlaya), a GIR translator (zig-gobject) and
+smaller libraries; they are MIT, Apache-2.0 or 0BSD. flow is recorded
+with `-Dtarget=x86_64-linux-gnu`, since its default target is musl.
+Setup installs into `.work/install/`, deleted after each step, so a
+project's install output does not fill the disk.
 
 ## Scoreboard
 

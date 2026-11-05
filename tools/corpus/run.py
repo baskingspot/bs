@@ -104,10 +104,14 @@ def setup(proj, zig, refresh):
     gen = os.path.join(WORK, "gen", proj["name"])
     shutil.rmtree(gen, ignore_errors=True)
     cmds = {}
+    # What the steps install is not needed (the commands are), and for some
+    # projects it is gigabytes, so it goes to a directory deleted afterwards.
+    prefix = os.path.join(WORK, "install", proj["name"])
     for args in proj.get("build", [["install"]]):
-        argv = [zig, "build", *args, "--verbose", "--cache-dir", gen]
+        argv = [zig, "build", *args, "--verbose", "--cache-dir", gen, "--prefix", prefix]
         log(f"  {shlex.join(argv)}")
         p = sh(argv, src, check=False, timeout=3600)
+        shutil.rmtree(prefix, ignore_errors=True)
         for line in p.stderr.splitlines():
             if not line.startswith("info(verbose): "):
                 continue
