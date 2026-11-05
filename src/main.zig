@@ -2193,8 +2193,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
                 while (i + 1 < args.len and !std.mem.eql(u8, args[i + 1], "--")) i += 1;
                 i += 1;
             } else if (std.mem.eql(u8, arg, "-x")) _ = nextArg(args, &i, arg);
+        } else if (std.mem.startsWith(u8, arg, "--export=")) {
+            // As upstream's: only a WebAssembly link exports the symbol;
+            // an ELF or Mach-O output exports what the code exports.
         } else if (std.mem.startsWith(u8, arg, "-flto") or std.mem.startsWith(u8, arg, "-fentry=") or
-            std.mem.startsWith(u8, arg, "--export=") or std.mem.startsWith(u8, arg, "-fpatchable-function-entry=") or
+            std.mem.startsWith(u8, arg, "-fpatchable-function-entry=") or
             std.mem.startsWith(u8, arg, "--compress-debug-sections="))
         {
             setUnsupported(&opts, arena, "bs does not support '{s}' yet", .{arg});
