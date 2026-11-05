@@ -2560,6 +2560,19 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     for (r.unit_info, item_results[0..r.unit_info.len]) |info, res| result_of[info.node] = res;
     for (r.dependee_info, item_results[r.unit_info.len..]) |info, res| result_of[info.node] = res;
     try d.addItems(enc.words.items, enc.starts.items);
+    // A dependee whose subject is another item now, under the same key (a
+    // function whose type changed): written, or the manifest would go on
+    // naming the old item, its instruction remapped to the new code
+    // (`remapItems`), which a later build decodes and analyzes.
+    for (nodes, final, write, 0..) |n, f, *w, ni| {
+        if (w.* or f >= n_prev) continue;
+        switch (n.tag) {
+            .link, .content, .nav_val, .type_layout, .struct_defaults, .func, .comptime_decl => continue,
+            else => {},
+        }
+        const sj = result_of[ni].subject;
+        if (!sameSubject(m, &enc, m.subject(f), result_words.items[sj[0]..][0..sj[1]])) w.* = true;
+    }
     var name_words: std.ArrayList(u32) = .empty;
     defer name_words.deinit(gpa);
     const names_of = try gpa.alloc([2]u32, nodes.len);
@@ -3042,6 +3055,33 @@ fn rewriteKept(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32, final
         // Changed flags come after the nodes (`Delta.setFlags`).
         .flags = m.flags(i),
     });
+}
+
+/// Whether subject words `old` (the manifest's) and `new` (encoded by
+/// `enc`, after the manifest's items) name the same thing: their items by
+/// stable hash, since `new` names an item the build did not decode by a
+/// new id.
+fn sameSubject(m: *const Manifest, enc: *const results.Encoder, old: []const u32, new: []const u32) bool {
+    if (old.len != new.len) return false;
+    if (old.len == 0) return true;
+    if (old[0] != new[0]) return false;
+    const tag: std.meta.Tag(results.Subject) = @fromBackingInt(@intCast(old[0]));
+    if (tag == .embed_file) return std.mem.eql(u32, old, new);
+    if (!std.mem.eql(u32, old[2..], new[2..])) return false;
+    const a = old[1];
+    const b = new[1];
+    if (a < InternPool.static_len or b < InternPool.static_len) return a == b;
+    const hash = struct {
+        fn hash(mm: *const Manifest, e: *const results.Encoder, ref: u32) Hash {
+            const id = ref - InternPool.static_len;
+            if (id < e.id_base) {
+                const words, const at = mm.resultItems().at(id);
+                return @bitCast(words[at..][0..4].*);
+            }
+            return @bitCast(e.words.items[e.starts.items[id - e.id_base]..][0..4].*);
+        }
+    }.hash;
+    return hash(m, enc, a) == hash(m, enc, b);
 }
 
 /// Rewrites the manifest's result items that name instructions of changed
@@ -4985,6 +5025,27 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
                 break;
             }
         }
+    }
+    // Dependees' subjects, by stable hash: the key can stay while the item
+    // changes (a function whose type changed).
+    const ip = &r.zcu.ip;
+    const items = m.resultItems();
+    for (r.dependee_list.items, r.dependee_info) |dep, info| {
+        const pi = m.find(r.nodes.items[info.node].key) orelse continue;
+        const index: InternPool.Index = switch (dep) {
+            .nav_ty => |nav| r.zcu.namespacePtr(ip.getNav(nav).namespace).owner_type,
+            .func_body, .func_ies, .func_inline => |f| f,
+            .namespace_name => |nn| r.zcu.namespacePtr(nn.namespace).owner_type,
+            .namespace => |ns| r.zcu.namespacePtr(ns).owner_type,
+            .embed_file, .nav_val, .type_layout, .struct_defaults => continue,
+        };
+        const old = m.subject(pi);
+        if (old.len == 0) continue;
+        const same = old.len >= 2 and if (old[1] < InternPool.static_len) old[1] == @backingInt(index) else same: {
+            const words, const at = items.at(old[1] - InternPool.static_len);
+            break :same @as(Hash, @bitCast(words[at..][0..4].*)) == ip.stableHash(index);
+        };
+        if (!same) V.report(r, info.node, &r.nodes.items[info.node], "different subject", &differ);
     }
     var it = seen.iterator(.{ .kind = .unset });
     while (it.next()) |pi| {

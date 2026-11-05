@@ -5665,7 +5665,15 @@ records only what changed, and links from the manifest.
   link, and `finishRecord`): `recordDelta` builds the same graph as
   `record` (`Graph`), from this build's analysis only, and appends one log
   record. It holds the nodes of the units analyzed, every new node, and
-  the dependees whose results or references changed. Their atoms are
+  the dependees whose results, references or subjects changed. A
+  subject is compared by its item's stable hash (`sameSubject`): a
+  function whose type changes keeps its dependees' keys, and a subject
+  left naming the old function item, its instruction remapped to the
+  new ZIR, interned a function of the old type with the new body for
+  the next build (a crash in `analyzeFuncBody` after `main` gained a
+  parameter, from upstream's test/incremental with donors; any lazy
+  build after such an edit). `BS_CACHE_VERIFY` compares dependees'
+  subjects the same way. Their atoms are
   appended to the local pack. It also holds the changed and new inputs,
   this build's result items after the manifest's (items it decoded keep
   their ids), and new error names. For the changed inputs, it rewrites

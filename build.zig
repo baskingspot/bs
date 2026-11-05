@@ -1213,6 +1213,18 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &rt.step, 15);
         test_step.dependOn(&rt.step);
     }
+    // Edits after a function's type changed: test/run/edit_subject.sh.
+    {
+        const sj = b.addSystemCommand(&.{"sh"});
+        sj.setName("bs edit after a function type change");
+        sj.addFileArg(b.path("test/run/edit_subject.sh"));
+        sj.addArtifactArg(bs);
+        _ = sj.addOutputDirectoryArg("work");
+        sj.addDirectoryArg(std_zir);
+        sj.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &sj.step, 10);
+        test_step.dependOn(&sj.step);
+    }
 
     const bs_run = b.addRunArtifact(bs);
     bs_run.setName("bs run args");
