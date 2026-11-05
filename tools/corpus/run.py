@@ -529,8 +529,15 @@ def compare(res, tgt):
     if "tests" in z and "tests" in u:
         # A test binary: the same outcome for each test, in any order
         # (what tests print to stdout follows the order and the timings).
-        if z["tests"] != u["tests"]:
-            diff = sorted(set(z["tests"]) ^ set(u["tests"]))
+        zt, ut = z["tests"], u["tests"]
+        if "no summary" in z["run"]:
+            # Both died in the same test, each after the tests its order
+            # put first: compare the tests both reached.
+            names = {t.rpartition(": ")[0] for t in zt} & {t.rpartition(": ")[0] for t in ut}
+            zt = [t for t in zt if t.rpartition(": ")[0] in names]
+            ut = [t for t in ut if t.rpartition(": ")[0] in names]
+        if zt != ut:
+            diff = sorted(set(zt) ^ set(ut))
             return f"bs: test results differ ({diff[0]}{', ...' if len(diff) > 1 else ''})"
     elif tgt.get("compare_stdout", True) and z["stdout_sha"] != u["stdout_sha"]:
         return "bs: stdout differs"
@@ -547,14 +554,23 @@ def warm_translate_c(bs):
     """Builds bs's translate-c tool (Aro, which bs compiles on its first
     `bs translate-c` into the global cache, once per bs binary) before any
     build is timed, so that no target's cold build pays for it. Returns
-    the time that first translation took."""
+    the time that first translation took. libc++ and libc++abi, which bs
+    also builds into the global cache on its first `-lc++` link (about
+    15 s), are warmed the same way: upstream's are already in its cache."""
     with tempfile.TemporaryDirectory() as tmp:
         header = os.path.join(tmp, "warm.h")
         with open(header, "w") as f:
             f.write("int warm(void);\n")
         secs, code, output = timed([bs, "translate-c", header, "--cache-dir", os.path.join(tmp, "cache")], tmp)
-    if code != 0:
-        sys.exit(f"bs translate-c failed on an empty header:\n{output}")
+        if code != 0:
+            sys.exit(f"bs translate-c failed on an empty header:\n{output}")
+        root = os.path.join(tmp, "warm.zig")
+        with open(root, "w") as f:
+            f.write("pub fn main() void {}\n")
+        argv = [bs, "build-exe", root, "-lc++", "-lc", "--cache-dir", os.path.join(tmp, "cache")]
+        _, code, output = timed(argv + ["-femit-bin=" + os.path.join(tmp, "warm")], tmp)
+        if code != 0:
+            sys.exit(f"bs failed to link an empty program against libc++:\n{output}")
     return secs
 
 
@@ -607,7 +623,7 @@ def write_scoreboard(results, manifest, path, tool_secs=None):
     if tool_secs is not None:
         note = (
             f"bs's translate-c tool, warmed before timing: {fmt_s(tool_secs)} (a first build of it, once per bs binary,"
-            " takes about 2 s; no cold-local time above includes it)."
+            " takes about 2 s; no cold-local time above includes it, nor bs's first build of libc++)."
         )
         lines += ["", note]
     with open(path, "w") as f:
