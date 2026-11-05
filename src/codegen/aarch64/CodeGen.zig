@@ -580,6 +580,12 @@ pub fn inFloat(cg: *CodeGen, ty: Index) bool {
     return bits == 32 or bits == 64;
 }
 
+/// As `inFloat`, for a vector only call-clobbered registers hold
+/// (`Ssa.want_vec`): none yet.
+pub fn inVec(_: *CodeGen, _: Index) bool {
+    return false;
+}
+
 /// `Ssa.plan`'s hook for intervals the architecture lengthens: none
 /// here, since no address is folded into its users yet.
 pub fn lengthenIntervals(_: *CodeGen) void {}

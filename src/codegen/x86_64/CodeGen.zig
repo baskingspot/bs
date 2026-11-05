@@ -3496,6 +3496,13 @@ pub fn inFloat(cg: *CodeGen, ty: Index) bool {
     };
 }
 
+/// As `inFloat`, for a vector only call-clobbered registers hold
+/// (`Ssa.want_vec`): none, as no XMM register survives a call, so
+/// vectors are `inFloat`.
+pub fn inVec(_: *CodeGen, _: Index) bool {
+    return false;
+}
+
 /// Whether value `inst` is computed by code that leaves it in a register
 /// (`setResult`), or in two (`Home.regs`, for the operations that compute
 /// those).
