@@ -1281,9 +1281,12 @@ fn copyTo(cg: *CodeGen, dst: Mem, ref: Ref) Error!void {
     }
 }
 
-/// The largest copy `copyMem` makes with moves, without `rep movsb`,
-/// which costs about as much as 30 moves to start.
+/// The largest copy `copyMem` makes with straight-line moves.
 const copy_inline_max = 256;
+/// The largest copy `copyMem` makes with a loop of moves, without
+/// `rep movsb`, which takes about 8 ns to start and only overtakes
+/// 64-byte blocks of SSE moves past about 1 KB.
+const copy_loop_max = 1024;
 
 /// Copies `size` bytes. Uses rax and xmm0, which hold no value between
 /// instructions (values live in xmm8-xmm15, and SSE arguments are loaded
@@ -1304,10 +1307,100 @@ fn copyMem(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
     if (size > copy_inline_max) {
         try cg.e.lea(.qword, .rsi, src);
         try cg.e.lea(.qword, .rdi, dst);
-        try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(size) });
-        return cg.e.repMovsb();
+        if (size > copy_loop_max) {
+            try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(size) });
+            return cg.e.repMovsb();
+        }
+        // 64-byte blocks, then the rest in 16-byte moves ending at the
+        // end, overlapping the last block. Each 16 bytes are read before
+        // they are written, so a copy onto itself stays intact.
+        try cg.e.mov(.dword, .{ .reg = .rcx }, .{ .imm = @intCast(size / 64) });
+        const top = try cg.e.newLabel();
+        cg.e.bind(top);
+        try cg.copyBlock(Mem.at(.rdi, 0), Mem.at(.rsi, 0), 64);
+        try cg.e.alu(.add, .qword, .{ .reg = .rsi }, .{ .imm = 64 });
+        try cg.e.alu(.add, .qword, .{ .reg = .rdi }, .{ .imm = 64 });
+        try cg.e.alu(.sub, .dword, .{ .reg = .rcx }, .{ .imm = 1 });
+        try cg.e.jcc(.ne, .{ .label = top });
+        const rest = size % 64;
+        const tail = std.mem.alignForward(u64, rest, 16);
+        const at = -@as(i32, @intCast(tail - rest));
+        return cg.copyBlock(Mem.at(.rdi, at), Mem.at(.rsi, at), tail);
     }
     try cg.copyTail(dst, src, size);
+}
+
+/// Copies `size` bytes, a multiple of 16, through xmm0.
+fn copyBlock(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
+    var off: u64 = 0;
+    while (off < size) : (off += 16) {
+        try cg.e.movups(.{ .reg = .xmm0 }, .{ .mem = offsetMem(src, off) });
+        try cg.e.movups(.{ .mem = offsetMem(dst, off) }, .{ .reg = .xmm0 });
+    }
+}
+
+/// Copies rcx bytes from rsi to rdi, which must not overlap; clobbers
+/// all three, rax and xmm0. Up to 16 bytes with two overlapping moves,
+/// up to `copy_inline_max` with a loop of 16-byte moves and an
+/// overlapping last one, and above that with `rep movsb`.
+fn copyRuntime(cg: *CodeGen) Error!void {
+    const e = &cg.e;
+    const done = try e.newLabel();
+    const above16 = try e.newLabel();
+    const below8 = try e.newLabel();
+    const below4 = try e.newLabel();
+    const at = struct {
+        fn at(base: Reg, disp: i32) Mem {
+            return .{ .base = .{ .reg = base }, .index = .{ .reg = .rcx }, .disp = disp };
+        }
+    }.at;
+    try e.alu(.cmp, .qword, .{ .reg = .rcx }, .{ .imm = 16 });
+    try e.jcc(.a, .{ .label = above16 });
+    try e.alu(.cmp, .dword, .{ .reg = .rcx }, .{ .imm = 8 });
+    try e.jcc(.b, .{ .label = below8 });
+    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.at(.rsi, 0) });
+    try e.mov(.qword, .{ .mem = Mem.at(.rdi, 0) }, .{ .reg = .rax });
+    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = at(.rsi, -8) });
+    try e.mov(.qword, .{ .mem = at(.rdi, -8) }, .{ .reg = .rax });
+    try e.jmp(.{ .label = done });
+    e.bind(below8);
+    try e.alu(.cmp, .dword, .{ .reg = .rcx }, .{ .imm = 4 });
+    try e.jcc(.b, .{ .label = below4 });
+    try e.mov(.dword, .{ .reg = .rax }, .{ .mem = Mem.at(.rsi, 0) });
+    try e.mov(.dword, .{ .mem = Mem.at(.rdi, 0) }, .{ .reg = .rax });
+    try e.mov(.dword, .{ .reg = .rax }, .{ .mem = at(.rsi, -4) });
+    try e.mov(.dword, .{ .mem = at(.rdi, -4) }, .{ .reg = .rax });
+    try e.jmp(.{ .label = done });
+    e.bind(below4);
+    // 1 to 3 bytes: the first, the last, and the middle one.
+    try e.@"test"(.dword, .{ .reg = .rcx }, .{ .reg = .rcx });
+    try e.jcc(.e, .{ .label = done });
+    try e.mov(.byte, .{ .reg = .rax }, .{ .mem = Mem.at(.rsi, 0) });
+    try e.mov(.byte, .{ .mem = Mem.at(.rdi, 0) }, .{ .reg = .rax });
+    try e.mov(.byte, .{ .reg = .rax }, .{ .mem = at(.rsi, -1) });
+    try e.mov(.byte, .{ .mem = at(.rdi, -1) }, .{ .reg = .rax });
+    try e.shift(.shr, .dword, .{ .reg = .rcx }, 1);
+    try e.mov(.byte, .{ .reg = .rax }, .{ .mem = at(.rsi, 0) });
+    try e.mov(.byte, .{ .mem = at(.rdi, 0) }, .{ .reg = .rax });
+    try e.jmp(.{ .label = done });
+    e.bind(above16);
+    const rep = try e.newLabel();
+    try e.alu(.cmp, .qword, .{ .reg = .rcx }, .{ .imm = copy_inline_max });
+    try e.jcc(.a, .{ .label = rep });
+    const top = try e.newLabel();
+    e.bind(top);
+    try cg.copyBlock(Mem.at(.rdi, 0), Mem.at(.rsi, 0), 16);
+    try e.alu(.add, .qword, .{ .reg = .rsi }, .{ .imm = 16 });
+    try e.alu(.add, .qword, .{ .reg = .rdi }, .{ .imm = 16 });
+    try e.alu(.sub, .qword, .{ .reg = .rcx }, .{ .imm = 16 });
+    try e.alu(.cmp, .qword, .{ .reg = .rcx }, .{ .imm = 16 });
+    try e.jcc(.a, .{ .label = top });
+    // 1 to 16 bytes left: the last 16, overlapping what was copied.
+    try cg.copyBlock(at(.rdi, -16), at(.rsi, -16), 16);
+    try e.jmp(.{ .label = done });
+    e.bind(rep);
+    try e.repMovsb();
+    e.bind(done);
 }
 
 fn copyTail(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
@@ -5274,10 +5367,18 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.copyMem(dst, offsetMem(src, layout.tag_offset), layout.tag_size);
         },
         .memcpy, .memmove => {
+            const dest = Type.ptrInfo(cg.ip, cg.typeOf(data.bin_op.lhs));
+            if (tag == .memcpy and dest.flags.size != .slice) {
+                // An array: a copy of known size, without its sentinel.
+                const a = cg.ip.keyPayload(.array_type, dest.child);
+                try cg.load(.rdi, data.bin_op.lhs);
+                try cg.load(.rsi, data.bin_op.rhs);
+                return cg.copyMem(Mem.at(.rdi, 0), Mem.at(.rsi, 0), a.len * Type.abiSize(cg.ip, a.child));
+            }
             const elem_size = try cg.memDest(.rdi, .rcx, data.bin_op.lhs);
             if (elem_size != 1) try cg.e.imul(.qword, .rcx, .{ .reg = .rcx }, @intCast(elem_size));
             try cg.load(.rsi, data.bin_op.rhs);
-            if (tag == .memcpy) return cg.e.repMovsb();
+            if (tag == .memcpy) return cg.copyRuntime();
             // Copy backwards when the destination is above the source.
             const forward = try cg.e.newLabel();
             const done = try cg.e.newLabel();

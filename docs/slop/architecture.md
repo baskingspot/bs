@@ -4967,8 +4967,17 @@ or objects into its output, and `-lc++`.
   compiler_rt sees `is_test = true`; it reads it only in declarations bs
   does not analyze (exports, its panic handler) and in `@setRuntimeSafety`
   arguments, which bs ignores there.
-- `@memcpy`, `@memset`, and `@memmove` are inlined by CodeGen
-  (`rep movsb`, `rep stosb`, and a direction check for overlap), not calls.
+- `@memcpy`, `@memset`, and `@memmove` are inlined by CodeGen, not
+  calls. On x86_64 a copy of known size (a struct copy, or `@memcpy` into
+  a `*[N]T`) is straight 16-byte moves up to 256 bytes, a loop of 64-byte
+  blocks and an overlapping last block up to 1 KB, and `rep movsb` above,
+  where its start (about 8 ns) stops mattering. A runtime-length
+  `@memcpy` branches on the length: two overlapping moves up to 16 bytes,
+  a loop of 16-byte moves and an overlapping last one up to 256, `rep
+  movsb` above. `@memset` is `rep stosb` and `@memmove` `rep movsb` with
+  a direction check for overlap. aarch64 copies of known size are a loop
+  of 32-byte `ldp`/`stp` blocks above 128 bytes, and runtime-length ones
+  a loop of 8-byte words and a loop of bytes.
 - Consequence: bs binaries contain only the compiler_rt symbols they use.
   Code that calls compiler_rt or `memcpy` by name gets them through the same
   lazy reference, so it still links.
