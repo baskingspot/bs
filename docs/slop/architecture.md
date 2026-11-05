@@ -6666,7 +6666,13 @@ state. Built for step 1:
   built), so with the cache off a shuffled build numbers them
   differently (behavior's fn_delegation.zig: two entries of the error
   name table swap), while `BS_CACHE_VERIFY=full` seeds them from the
-  last build as edit builds do. The eager-resolve mode stays planned.
+  last build as edit builds do. aarch64-macos does not use the cache
+  yet (`Job.cacheable`), so there `--sched-check` drops the shuffle
+  for four threads with random delays (`BS_SCHED_FUZZ=<seed>`) and
+  compares binaries only, as std's tier swap there does (baseline
+  `std-aarch64-macos.json`); `--edit-verify` checks nothing beyond the
+  builds and their tests. aarch64-linux uses the cache, so its checks
+  are x86_64-linux's. The eager-resolve mode stays planned.
 - `zig build -Dsanitize-thread -Doptimize=ReleaseFast`: a
   ThreadSanitizer build of bs, linked with libc so that the allocator is
   malloc, which ThreadSanitizer intercepts. (std's SafeAllocator, the
