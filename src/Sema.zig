@@ -12749,6 +12749,9 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
     }
     if (lc == .pointer and rc == .pointer) {
         if (Type.ptrInfo(ip, lt).flags.size == .slice or Type.ptrInfo(ip, rt).flags.size == .slice) return sema.failNotComparable(block, src, op, lhs, rhs);
+        // The operands must have a peer type also when comptime-known, as
+        // upstream: a many-pointer and a single pointer do not compare.
+        const ty = try sema.resolvePeerTypesAt(block, src, &.{ lhs, rhs }, &.{ src.operandSrc(0), src.operandSrc(1) });
         if (sema.resolveValue(lhs)) |a| if (sema.resolveValue(rhs)) |b| {
             if (sema.isUndef(a) or sema.isUndef(b)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
             const ka = ip.indexToKey(a);
@@ -12773,7 +12776,6 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
             }
         };
         try sema.requireRuntime(block, src);
-        const ty = try sema.resolvePeerTypesAt(block, src, &.{ lhs, rhs }, &.{ src.operandSrc(0), src.operandSrc(1) });
         return sema.addBinOp(block, if (op == .eq) .cmp_eq else .cmp_neq, try sema.coerce(block, ty, lhs, src), try sema.coerce(block, ty, rhs, src));
     }
     const l_int = lc == .int or lc == .comptime_int;
