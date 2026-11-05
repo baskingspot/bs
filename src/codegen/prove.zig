@@ -836,6 +836,11 @@ const Walker = struct {
             .struct_field_ptr, .struct_field_val => {
                 const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
                 key.ty = data.ty_pl.ty;
+                // A field pointer is the struct's address and the field:
+                // keyed by the struct type, not the field pointer's type,
+                // which differs with the operand's constness
+                // (`constBitcast`).
+                if (tag == .struct_field_ptr) key.ty = Type.ptrInfo(w.ip, ir.typeOf(sf.operand, w.ip)).child;
                 key.a = w.term(sf.operand);
                 key.x = sf.index;
                 // `(x - c) + c` is `x`.
@@ -861,7 +866,7 @@ const Walker = struct {
                 if (tag == .intcast and w.widens(inst.toRef(), data.ty_op.operand)) return;
                 // A `bitcast` to the operand's own type is the operand (a
                 // copy `forward.run` turned into the memory it copies).
-                if (tag == .bitcast and data.ty_op.ty == ir.typeOf(data.ty_op.operand, w.ip)) {
+                if (tag == .bitcast and (data.ty_op.ty == ir.typeOf(data.ty_op.operand, w.ip) or w.constBitcast(data.ty_op.ty, data.ty_op.operand))) {
                     w.s.canon.items[ii] = w.term(data.ty_op.operand);
                     return;
                 }
@@ -1211,6 +1216,15 @@ const Walker = struct {
         // version of memory (`mem`) reads the same value.
         if (Type.ptrInfo(w.ip, w.ir.typeOf(data.ty_op.operand, w.ip)).flags.is_volatile) return own;
         return w.numberOf(.{ .tag = .load, .ty = data.ty_op.ty, .x = w.mem, .a = w.term(data.ty_op.operand), .b = .none }, own);
+    }
+
+    /// Whether a `bitcast` of pointer `op` to `ty` only adds `const`: the
+    /// same address, read the same way.
+    fn constBitcast(w: *const Walker, ty: Index, op: Inst.Ref) bool {
+        var a = w.ip.keyAs(.ptr_type, w.ir.typeOf(op, w.ip)) orelse return false;
+        const b = w.ip.keyAs(.ptr_type, ty) orelse return false;
+        a.flags.is_const = true;
+        return b.flags.is_const and std.meta.eql(a, b);
     }
 
     /// What the field `sfp` points to holds, as `own` when first seen:
