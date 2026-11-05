@@ -273,14 +273,17 @@ const Walk = struct {
             // Nothing may write the source from the load to the local's last
             // read: no write to unknown memory, and when the source is in a
             // local, no store into that local.
+            // A local forwarded already is the memory it copies, whose
+            // writes count from here to the last read.
             const end = @max(w.last[ii], w.pos[store]);
             if (prefix[end + 1] - prefix[w.pos[l] + 1] != 0) continue;
-            if (src.toIndex()) |s| if (w.root[@backingInt(s)] != none) {
-                const r = w.root[@backingInt(s)];
+            var r = w.rootOf(src) orelse none;
+            while (r != none and w.flags[r].forwarded) r = w.rootOf(datas[r].ty_op.operand) orelse none;
+            if (r != none) {
                 if (for (w.order[w.pos[l] + 1 .. end + 1]) |i| {
                     if (w.writes(i, r)) break true;
                 } else false) continue;
-            };
+            }
             const ty = datas[ii].ty;
             tags[ii] = .bitcast;
             datas[ii] = .{ .ty_op = .{ .ty = ty, .operand = src } };

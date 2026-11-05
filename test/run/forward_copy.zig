@@ -1,11 +1,13 @@
 //! exit: 0
-//! stdout: "1 2 3 4 5 6 7 8 9 10\n2 11 9 3 6 2 3 7 4 6 21 10\n"
+//! stdout: "1 2 3 4 5 6 7 8 9 10\n2 11 9 3 6 2 3 7 4 6 21 10\n105 12\n"
 
 // A `const` copy of an aggregate that is only read reads its source
 // (`codegen/forward.zig`), unless the source may be written while the copy
 // is in use. Each case writes the source after the copy and must read the
 // value from before. The second line: a load reads the value a store or a
 // load before it found, unless something in between may write the memory.
+// The third line: a copy of a copy reads the first source, which a write
+// after the middle copy's last read still changes.
 const std = @import("std");
 
 const S = struct { a: u64, b: u64, c: [6]u64 };
@@ -174,6 +176,31 @@ noinline fn storeThenUse(p: *u64, a: u64, b: u64) u64 {
     return p.*;
 }
 
+const C = struct { x: [4]u64, y: u64 };
+
+noinline fn copyOfCopy(v: u64) u64 {
+    var a: C = .{ .x = .{ v, v + 1, v + 2, v + 3 }, .y = v };
+    const b = a;
+    const c = b.x;
+    a.x[0] = 100;
+    return c[0] + a.x[0] + c[3];
+}
+
+noinline fn bumpG() void {
+    g_c.x[0] = 50;
+}
+
+var g_c: C = .{ .x = .{ 1, 2, 3, 4 }, .y = 5 };
+
+noinline fn copyOfCopyCall(p: *C) u64 {
+    var a = p.*;
+    const b = a;
+    const c = b.x;
+    bumpG();
+    a.x[0] = 9;
+    return c[0] + a.x[0] + c[1];
+}
+
 pub fn main() void {
     var s: S = .{ .a = 1, .b = 1, .c = @splat(1) };
     var buf = [_]S{ s, s };
@@ -210,5 +237,7 @@ pub fn main() void {
         afterBump(&x),      inBranch(&x, &x, true), loopCarried(&x),                     afterMemset(&bytes),
         escapedLocal(),     throughAlias(1),        wholeStore(1, .{ .a = 20, .b = 0 }), storeThenUse(&x, 3, 4),
     }) catch unreachable;
+    var t: C = .{ .x = .{ 1, 2, 3, 4 }, .y = 5 };
+    w.print("{} {}\n", .{ copyOfCopy(1), copyOfCopyCall(&t) }) catch unreachable;
     std.Io.File.stdout().writeStreamingAll(std.Options.debug_io, w.buffered()) catch {};
 }
