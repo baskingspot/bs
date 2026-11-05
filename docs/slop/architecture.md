@@ -4599,15 +4599,18 @@ The other direction, bs's own relocatable output, is new:
   A text-based stub becomes a `MachODylib` through `Tbd.dylib` (install
   name, versions, arm64 exports including the ObjC class, metaclass,
   ehtype and ivar symbols). Its re-exported libraries are read from
-  their own stubs under the same SDK root and their names merged,
-  marked `reexport`: an import binds to a linked library that defines
-  the name itself before one that only re-exports it, so with AppKit
-  and CoreFoundation both linked, CF names bind to CoreFoundation, as
-  upstream's do. Differences from upstream: LC_LOAD_DYLIB order is the
-  command line's (upstream sorts), and libSystem's current version stays
-  1.0.0. `-weak_framework` is refused. Objective-C sections in C inputs
-  (`__DATA,__cfstring`, `__objc_*`) are refused, which keeps raylib's
-  rglfw out.
+  their own stubs under the same SDK root. A public one (in /usr/lib,
+  or a framework's own library: upstream's `isHoisted`) is linked in
+  its own right, as ld64's implicit linking and upstream do: a
+  `MachODylib` marked `implicit`, after the linked ones, which gets an
+  LC_LOAD_DYLIB only if an import binds to it. So Foundation's
+  `objc_msgSend` binds to libobjc and AppKit's CF names to
+  CoreFoundation. A private one's names merge into the stub that
+  re-exports it. Each import binds to the first library exporting its
+  name. Differences from upstream: LC_LOAD_DYLIB order is the command
+  line's, then the implicit libraries' in first-use order (upstream
+  sorts), and libSystem's current version stays 1.0.0.
+  `-weak_framework` is refused.
 Still refused on aarch64-macos: `build-obj` that would merge C sources
 or objects into its output, and `-lc++`.
 

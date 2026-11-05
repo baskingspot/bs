@@ -1258,19 +1258,26 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     }
     if (macos) {
         emit.runpath = opts.runpath;
-        const libs = try arena.alloc(MachODylib, opts.shared_libs.len);
-        for (libs, opts.shared_libs) |*lib, path| {
+        var libs: std.ArrayList(MachODylib) = try .initCapacity(arena, opts.shared_libs.len);
+        // Each library's re-exports, which only stubs list.
+        const pending = try arena.alloc([]const []const u8, opts.shared_libs.len);
+        for (opts.shared_libs, pending) |path, *reexports| {
             const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
                 fatal("unable to read '{s}': {t}", .{ path, err });
-            lib.* = if (std.mem.startsWith(u8, bytes, "--- !tapi-tbd"))
-                try readTbd(arena, init.io, path, bytes)
-            else
-                MachODylib.parse(arena, path, bytes) catch |err| switch (err) {
+            reexports.* = &.{};
+            libs.appendAssumeCapacity(if (std.mem.startsWith(u8, bytes, "--- !tapi-tbd")) lib: {
+                const lib, reexports.* = Tbd.dylib(arena, path, bytes) catch |err| switch (err) {
                     error.OutOfMemory => |e| return e,
-                    error.InvalidDylib => fatal("'{s}' is not an arm64 Mach-O dynamic library", .{path}),
+                    error.InvalidTbd => fatal("'{s}': a text-based stub without an install name", .{path}),
                 };
+                break :lib lib;
+            } else MachODylib.parse(arena, path, bytes) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.InvalidDylib => fatal("'{s}' is not an arm64 Mach-O dynamic library", .{path}),
+            });
         }
-        emit.macho_libs = libs;
+        try readTbds(arena, init.io, &libs, pending);
+        emit.macho_libs = libs.items;
     }
     const shared_libs = try arena.alloc(ElfShared, if (macos) 0 else opts.shared_libs.len);
     for (shared_libs, opts.shared_libs[0..shared_libs.len], opts.shared_names[0..shared_libs.len]) |*lib, path, name| {
@@ -2763,41 +2770,66 @@ const LibQuery = struct {
 /// follows the re-exports: they are read from the SDK the stub is in, the
 /// part of `path` before its `/usr/lib/` or `/System/Library/`, as ld64
 /// finds them under `-syslibroot`.
-fn readTbd(arena: std.mem.Allocator, io: Io, path: []const u8, bytes: []const u8) !MachODylib {
-    var lib, var pending = Tbd.dylib(arena, path, bytes) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        error.InvalidTbd => fatal("'{s}': a text-based stub without an install name", .{path}),
-    };
-    const root = for ([_][]const u8{ "/usr/lib/", "/System/Library/" }) |dir| {
-        if (std.mem.indexOf(u8, path, dir)) |at| break path[0..at];
-    } else "";
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    try seen.put(arena, lib.install_name, {});
-    var queue: std.ArrayList([]const u8) = .empty;
-    try queue.appendSlice(arena, pending);
-    while (queue.pop()) |install_name| {
-        if ((try seen.getOrPut(arena, install_name)).found_existing) continue;
-        // `/usr/lib/libobjc.A.dylib`'s is `libobjc.A.tbd`; a framework's
-        // library has no extension.
-        const stem = if (std.mem.endsWith(u8, install_name, ".dylib")) install_name[0 .. install_name.len - ".dylib".len] else install_name;
-        const stub = try std.fmt.allocPrint(arena, "{s}{s}.tbd", .{ root, stem });
-        const text = Io.Dir.cwd().readFileAlloc(io, stub, arena, .unlimited) catch |err|
-            fatal("'{s}' re-exports '{s}', whose stub '{s}' cannot be read: {t}", .{ path, install_name, stub, err });
-        const reexported, pending = Tbd.dylib(arena, stub, text) catch |err| switch (err) {
-            error.OutOfMemory => |e| return e,
-            error.InvalidTbd => fatal("'{s}': a text-based stub without an install name", .{stub}),
-        };
-        var it = reexported.exports.iterator();
-        while (it.next()) |e| {
-            const gop = try lib.exports.getOrPut(arena, e.key_ptr.*);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = e.value_ptr.*;
-                gop.value_ptr.reexport = true;
+/// Reads the text-based stubs of `libs`, linked libraries, and appends
+/// the public libraries they re-export to `libs` as implicit ones, as
+/// upstream "hoists" them (ld64's implicit linking). A private one's
+/// names merge into the stub that re-exports it.
+fn readTbds(arena: std.mem.Allocator, io: Io, libs: *std.ArrayList(MachODylib), pending: []const []const []const u8) !void {
+    var linked: std.StringHashMapUnmanaged(void) = .empty;
+    // libSystem is linked always (`MachO`).
+    try linked.put(arena, "/usr/lib/libSystem.B.dylib", {});
+    for (libs.items) |lib| try linked.put(arena, lib.install_name, {});
+    for (0..pending.len) |i| {
+        const path = libs.items[i].path;
+        // The SDK the stub is in, whose stubs its re-exports' are.
+        const root = for ([_][]const u8{ "/usr/lib/", "/System/Library/" }) |dir| {
+            if (std.mem.indexOf(u8, path, dir)) |at| break path[0..at];
+        } else "";
+        // The library private re-exports merge into: the explicit one.
+        const umbrella = i;
+        var merged: std.StringHashMapUnmanaged(void) = .empty;
+        var queue: std.ArrayList([]const u8) = .empty;
+        try queue.appendSlice(arena, pending[i]);
+        while (queue.pop()) |install_name| {
+            const hoisted = isPublicDylib(install_name);
+            if (hoisted) {
+                if ((try linked.getOrPut(arena, install_name)).found_existing) continue;
+            } else if ((try merged.getOrPut(arena, install_name)).found_existing) continue;
+            // `/usr/lib/libobjc.A.dylib`'s is `libobjc.A.tbd`; a framework's
+            // library has no extension.
+            const stem = if (std.mem.endsWith(u8, install_name, ".dylib")) install_name[0 .. install_name.len - ".dylib".len] else install_name;
+            const stub = try std.fmt.allocPrint(arena, "{s}{s}.tbd", .{ root, stem });
+            const text = Io.Dir.cwd().readFileAlloc(io, stub, arena, .unlimited) catch |err|
+                fatal("'{s}' re-exports '{s}', whose stub '{s}' cannot be read: {t}", .{ path, install_name, stub, err });
+            var reexported, const next = Tbd.dylib(arena, stub, text) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.InvalidTbd => fatal("'{s}': a text-based stub without an install name", .{stub}),
+            };
+            if (hoisted) {
+                reexported.implicit = true;
+                try libs.append(arena, reexported);
+            } else {
+                var it = reexported.exports.iterator();
+                while (it.next()) |e| {
+                    const gop = try libs.items[umbrella].exports.getOrPut(arena, e.key_ptr.*);
+                    if (!gop.found_existing) gop.value_ptr.* = e.value_ptr.*;
+                }
             }
+            try queue.appendSlice(arena, next);
         }
-        try queue.appendSlice(arena, pending);
     }
-    return lib;
+}
+
+/// Whether a re-exported library is public, so a link hoists it instead
+/// of merging it into the library that re-exports it: in /usr/lib, or a
+/// framework's own library (upstream's `MachO.isHoisted`).
+fn isPublicDylib(install_name: []const u8) bool {
+    const dir = std.fs.path.dirname(install_name) orelse return false;
+    if (std.mem.startsWith(u8, dir, "/usr/lib")) return true;
+    if (!std.mem.startsWith(u8, dir, "/System/Library/Frameworks/")) return false;
+    const rest = dir["/System/Library/Frameworks/".len..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return false;
+    return std.mem.eql(u8, std.fs.path.basename(install_name), rest[0..dot]);
 }
 
 /// Framework `name`'s library in one of `dirs`, as upstream's

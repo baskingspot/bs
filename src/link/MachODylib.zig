@@ -18,10 +18,12 @@ compatibility_version: u32,
 /// Exported names without Darwin's leading underscore.
 exports: std.StringHashMapUnmanaged(Export) = .empty,
 
-/// `reexport` marks a name a stub takes from a library it re-exports
-/// (`Tbd`): a link prefers a library that defines the name itself, as
-/// upstream binds to the defining library when that one is linked too.
-pub const Export = packed struct(u8) { weak: bool, tls: bool, reexport: bool = false, _: u5 = 0 };
+/// A public library that a linked one re-exports (CoreFoundation, which
+/// AppKit re-exports), linked in its own right as ld64 and upstream do:
+/// it gets an LC_LOAD_DYLIB only if an import binds to it.
+implicit: bool = false,
+
+pub const Export = packed struct(u8) { weak: bool, tls: bool, _: u6 = 0 };
 
 pub const Error = error{ OutOfMemory, InvalidDylib };
 
