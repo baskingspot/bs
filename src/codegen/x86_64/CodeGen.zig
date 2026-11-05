@@ -116,17 +116,15 @@ trace_slot: ?i32 = null,
 /// The callee-saved registers the function's values use (`alloc_regs`
 /// bits), which the prologue saves below rbp and every return restores.
 saved: u32 = 0,
-/// From `planRegisters`: per position (as `Ssa.clobbers`), how many
-/// values and terminators before it may write r11 (`usesR11`).
-r11_clobbers: std.ArrayList(u32) = .empty,
-/// From `planR11`: per value (by position in `Ssa.values`) and per block's
-/// terminator, whether `usesR11` said it may write r11 when the allocator
-/// was told, which emission checks against.
-r11_values: std.DynamicBitSetUnmanaged = .{},
-r11_terms: std.DynamicBitSetUnmanaged = .{},
-/// A lowering named r11 (`r11`) since the value or terminator being
-/// emitted began, which `usesR11` must have said it may.
-r11_used: bool = false,
+/// From `planScratch`: per register of `scratch_regs` and position (as
+/// `Ssa.clobbers`), how many values and terminators before it may write
+/// that register (`scratchUse`).
+scratch_counts: [scratch_regs.len]std.ArrayList(u32) = @splat(.empty),
+/// From `planScratch`: per value (by position in `Ssa.values`) and per
+/// block's terminator, the registers `scratchUse` said it may write when
+/// the allocator was told, which emission checks against (`checkWrites`).
+scratch_values: std.ArrayList(u16) = .empty,
+scratch_terms: std.ArrayList(u16) = .empty,
 /// `Ssa.liveness` ran, so value slots are shared by lifetime.
 live: bool = false,
 /// The function's one epilogue, which ends its code (`Atom.Unwind.epilogue`):
@@ -351,9 +349,9 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.stub_chains.deinit(gpa);
         cg.stub_open.deinit(gpa);
         cg.cover_pcs.deinit(gpa);
-        cg.r11_clobbers.deinit(gpa);
-        cg.r11_values.deinit(gpa);
-        cg.r11_terms.deinit(gpa);
+        for (&cg.scratch_counts) |*c| c.deinit(gpa);
+        cg.scratch_values.deinit(gpa);
+        cg.scratch_terms.deinit(gpa);
         cg.asm_counts.deinit(gpa);
     }
     if (cover) cg.cover_key = Emit.coverageKeys(try emit.funcKey(ir.func))[0];
@@ -1897,14 +1895,21 @@ pub fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
 /// uses as scratch except the clobbering ones (`clobbers`).
 const alloc_regs = [_]Reg{ .rbx, .r12, .r13, .r14, .r15, .rsi, .rdi, .r8, .r9, .r11 };
 const callee_saved: u32 = 0b11111;
-/// The registers some lowerings use as scratch, which hold only values
-/// whose intervals contain none of them (`usesR11`).
-const r11_only: u32 = 1 << 9;
+const callee_saved_mask: u16 = Reg.bit(.rbx) | Reg.bit(.r12) | Reg.bit(.r13) | Reg.bit(.r14) | Reg.bit(.r15);
+/// The registers lowerings write as scratch besides rax, which hold only
+/// values whose intervals contain no value or terminator that may write
+/// them (`scratchUse`).
+const scratch_regs = [_]Reg{ .rcx, .rdx, .r10, .r11 };
+const scratch_mask: u16 = Reg.bit(.rcx) | Reg.bit(.rdx) | Reg.bit(.r10) | Reg.bit(.r11);
+/// The registers a clobber point (`clobbers`) may write besides those.
+const clobber_mask: u16 = Reg.bit(.rsi) | Reg.bit(.rdi) | Reg.bit(.r8) | Reg.bit(.r9);
+/// The registers the allocator may hand out, which `checkWrites` checks
+/// lowerings' writes to: all but rax, rsp and rbp.
+const checked_mask: u16 = ~(Reg.bit(.rax) | Reg.bit(.rsp) | Reg.bit(.rbp));
 
-/// r11, as scratch: what may name it is listed in `usesR11`, which the
-/// emission checks.
+/// r11, as scratch: what may write it is listed in `usesR11`.
 pub fn r11(cg: *CodeGen) Reg {
-    cg.r11_used = true;
+    _ = cg;
     return .r11;
 }
 
@@ -2038,36 +2043,104 @@ fn fusedUsesR11(cg: *CodeGen, c: Inst.Index) bool {
     return cg.usesR11(c);
 }
 
-/// `r11_clobbers`, after `Ssa.plan`, whose fates `usesR11` reads.
-fn planR11(cg: *CodeGen) Error!void {
+/// The registers of `scratch_regs` value `inst`'s lowering may write,
+/// decided before allocation, so that no value that lives across it, or
+/// that it reads last or computes, lives in them. `checkWrites` fails a
+/// function whose lowering writes one this did not list.
+fn scratchUse(cg: *CodeGen, inst: Inst.Index) u16 {
+    return @as(u16, if (cg.usesR11(inst)) Reg.bit(.r11) else 0) | Reg.bit(.rcx) | Reg.bit(.rdx) | Reg.bit(.r10);
+}
+
+/// `scratchUse` for block `block`'s terminator.
+fn termScratch(cg: *CodeGen, block: Ssa.Block.Index) u16 {
+    return @as(u16, if (cg.termUsesR11(block)) Reg.bit(.r11) else 0) | Reg.bit(.rcx) | Reg.bit(.rdx) | Reg.bit(.r10);
+}
+
+/// `scratch_counts`, `scratch_values` and `scratch_terms`, after
+/// `Ssa.plan`, whose fates `scratchUse` reads.
+fn planScratch(cg: *CodeGen) Error!void {
     const f = cg.ssa;
-    try cg.r11_clobbers.resize(cg.gpa, f.clobbers.items.len);
-    const cl = cg.r11_clobbers.items;
-    try cg.r11_values.resize(cg.gpa, f.values.len, false);
-    cg.r11_values.unsetAll();
-    try cg.r11_terms.resize(cg.gpa, f.blocks.items.len, false);
-    cg.r11_terms.unsetAll();
-    var count: u32 = 0;
-    cl[0] = 0;
-    cl[1] = 0;
+    var cls: [scratch_regs.len][]u32 = undefined;
+    for (&cg.scratch_counts, &cls) |*c, *cl| {
+        try c.resize(cg.gpa, f.clobbers.items.len);
+        cl.* = c.items;
+        cl.*[0] = 0;
+        cl.*[1] = 0;
+    }
+    try cg.scratch_values.resize(cg.gpa, f.values.len);
+    try cg.scratch_terms.resize(cg.gpa, f.blocks.items.len);
+    @memset(cg.scratch_terms.items, 0);
+    var counts: [scratch_regs.len]u32 = @splat(0);
     for (f.layout.items) |block| {
         const b = f.blocks.items[@backingInt(block)];
         for (b.start..b.start + b.len) |i| {
             const inst = f.values.items(.inst)[i];
-            if (f.live.items(.fate)[@backingInt(inst)] != .dead and cg.usesR11(inst)) {
-                count += 1;
-                cg.r11_values.set(i);
+            const m = if (f.live.items(.fate)[@backingInt(inst)] != .dead) cg.scratchUse(inst) else 0;
+            cg.scratch_values.items[i] = m;
+            for (scratch_regs, &counts, cls) |r, *n, cl| {
+                if (m & r.bit() != 0) n.* += 1;
+                cl[2 * i + 2] = n.*;
+                cl[2 * i + 3] = n.*;
             }
-            cl[2 * i + 2] = count;
-            cl[2 * i + 3] = count;
         }
-        if (cg.termUsesR11(block)) {
-            count += 1;
-            cg.r11_terms.set(@backingInt(block));
+        const m = cg.termScratch(block);
+        cg.scratch_terms.items[@backingInt(block)] = m;
+        for (scratch_regs, &counts, cls) |r, *n, cl| {
+            if (m & r.bit() != 0) n.* += 1;
+            cl[2 * (b.start + b.len) + 1] = n.*;
+            cl[2 * (b.start + b.len) + 2] = n.*;
         }
-        cl[2 * (b.start + b.len) + 1] = count;
-        cl[2 * (b.start + b.len) + 2] = count;
     }
+}
+
+/// The general-purpose registers home `h` occupies.
+fn homeRegs(h: Home) u16 {
+    return switch (h) {
+        .reg => |r| r.bit(),
+        .regs => |p| p.lo.bit() | p.hi.bit(),
+        else => 0,
+    };
+}
+
+/// Fails unless the registers the encoder saw written since it cleared
+/// `written` are ones value `inst` (or a terminator, for null) may
+/// write: `planned` (`scratchUse`), those a clobber point may write when
+/// it is one, and its own homes: its result's, an overflow pair's fields',
+/// a promoted variable's that a store writes, and for a `ret` the
+/// callee-saved ones the epilogue restores.
+fn checkWrites(cg: *CodeGen, inst: ?Inst.Index, planned: u16, clobber: bool, own: u16) Error!void {
+    var allowed = planned | own;
+    if (clobber) allowed |= clobber_mask | scratch_mask;
+    const bad = cg.e.written & checked_mask & ~allowed;
+    if (bad == 0) return;
+    const r: Reg = @enumFromInt(@ctz(bad));
+    if (inst) |i| return cg.fail("internal error: '{t}' writes {t}, which may hold a value", .{ cg.ir.instructions.items(.tag)[@backingInt(i)], r });
+    return cg.fail("internal error: a terminator writes {t}, which may hold a value", .{r});
+}
+
+/// The registers value `inst` writes as its own (`checkWrites`).
+fn ownRegs(cg: *CodeGen, inst: Inst.Index) u16 {
+    const i = @backingInt(inst);
+    var m = homeRegs(cg.homes[i]);
+    const ir = cg.ir;
+    switch (ir.instructions.items(.tag)[i]) {
+        // The encoder cannot tell which registers a template writes; no
+        // value lives across the statement in a register it may write
+        // (`asm_regs`, and `scratchUse` for rcx, rdx, r10 and r11).
+        .assembly => m |= checked_mask,
+        // A promoted alias, as an address in its own register.
+        .alloc => if (cg.homes[i] == .reg_addr) {
+            m |= cg.homes[i].reg_addr.base.bit();
+        },
+        .store => if (ir.instructions.items(.data)[i].bin_op.lhs.toIndex()) |a| {
+            m |= homeRegs(cg.homes[@backingInt(a)]);
+        },
+        else => {},
+    }
+    if (cg.ssa.live.items(.fate)[i] == .pair) for (cg.ssa.pairs.get(i).?) |fld| {
+        if (fld != Ssa.no_tie) m |= homeRegs(cg.homes[fld]);
+    };
+    return m;
 }
 
 /// A `Live.hint` for the value a `ret` returns that is computed in rax
@@ -2336,12 +2409,18 @@ fn planRegisters(cg: *CodeGen) Error!void {
     var consts = cg.const_alias.keyIterator();
     while (consts.next()) |a| cg.split.unset(a.*);
     try cg.planRetCalls();
-    try cg.planR11();
-    var restrictions: [2]Ssa.Restriction = .{ .{ .regs = r11_only, .counts = cg.r11_clobbers.items }, undefined };
-    var n_restrictions: usize = 1;
+    try cg.planScratch();
+    var restrictions: [scratch_regs.len + 1]Ssa.Restriction = undefined;
+    var n_restrictions: usize = 0;
+    for (scratch_regs, &cg.scratch_counts) |r, *c| {
+        const k = allocIndex(r);
+        if (k == Ssa.no_reg) continue;
+        restrictions[n_restrictions] = .{ .regs = @as(u32, 1) << @intCast(k), .counts = c.items };
+        n_restrictions += 1;
+    }
     if (try f.asmCounts(cg.gpa, ir, &cg.asm_counts)) |c| {
-        restrictions[1] = .{ .regs = asm_regs, .counts = c };
-        n_restrictions = 2;
+        restrictions[n_restrictions] = .{ .regs = asm_regs, .counts = c };
+        n_restrictions += 1;
     }
     cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split, restrictions[0..n_restrictions]) & callee_saved | asm_regs & callee_saved;
     const reg2 = live.items(.reg2);
@@ -2746,6 +2825,9 @@ fn genSplit(cg: *CodeGen, inst: Inst.Index, q: u32) Error!void {
         try cg.split_now.append(cg.gpa, .{ .v = v, .home = home, .reload = end[v] != q });
     }
     try cg.genInst(inst);
+    // The reloads write what the spills saved, which `checkWrites` allows.
+    const written = cg.e.written;
+    defer cg.e.written = written;
     const returns = cg.ir.typeOfIndex(inst, cg.ip) != .noreturn_type;
     // A result computed in a variable's register (`Live.share`) is the
     // variable's new value.
@@ -4710,15 +4792,24 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
             continue;
         }
         const q = Ssa.valuePos(idx);
-        cg.r11_used = false;
-        if (cg.split_vals.items.len != 0 and !std.meta.eql(cl[q], cl[q - 1])) try cg.genSplit(inst, q) else try cg.genInst(inst);
-        if (cg.r11_used and !cg.has_asm and !(if (cg.live) cg.r11_values.isSet(idx) else cg.usesR11(inst)))
-            return cg.fail("internal error: '{t}' uses r11, which may hold a value", .{cg.ir.instructions.items(.tag)[@backingInt(inst)]});
+        const clobber = cg.live and !std.meta.eql(cl[q], cl[q - 1]);
+        cg.e.written = 0;
+        if (cg.split_vals.items.len != 0 and clobber) try cg.genSplit(inst, q) else try cg.genInst(inst);
+        if (cg.live) try cg.checkWrites(inst, cg.scratch_values.items[idx], clobber, cg.ownRegs(inst));
     }
-    cg.r11_used = false;
-    try cg.genTerm(cg.ssa.blocks.items[@backingInt(block)].term, next);
-    if (cg.r11_used and !cg.has_asm and !(if (cg.live) cg.r11_terms.isSet(@backingInt(block)) else cg.termUsesR11(block)))
-        return cg.fail("internal error: a '{t}' terminator uses r11, which may hold a value", .{b.term.tag});
+    cg.e.written = 0;
+    const term = cg.ssa.blocks.items[@backingInt(block)].term;
+    try cg.genTerm(term, next);
+    if (cg.live) {
+        const data = cg.ir.instructions.items(.data)[@backingInt(term.inst)];
+        // A `br` writes its block's result; a `ret` ends with the epilogue.
+        const own: u16 = switch (term.tag) {
+            .ret => callee_saved_mask | if (cg.win_save != null) Reg.bit(.rsi) | Reg.bit(.rdi) else 0,
+            .jump, .branch => if (cg.ir.instructions.items(.tag)[@backingInt(term.inst)] == .br) homeRegs(cg.homes[@backingInt(data.br.block_inst)]) else 0,
+            else => 0,
+        };
+        try cg.checkWrites(null, cg.scratch_terms.items[@backingInt(block)], cg.termClobbers(block), own);
+    }
 }
 
 fn checkNaked(cg: *CodeGen, tag: Inst.Tag) Error!void {
@@ -6649,7 +6740,12 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         // registers, gets the frames of the calls it was inlined from.
         if (ret_ty == .noreturn_type and cg.in_cold and !is_c and !is_win and !stack_args and !cg.outermost_frame) {
             try cg.panicThroughStubs(try cg.emit.funcKey(f));
-        } else try cg.e.call(.{ .sym = try cg.emit.funcKey(f) });
+        } else {
+            const written = cg.e.written;
+            try cg.e.call(.{ .sym = try cg.emit.funcKey(f) });
+            // `returnError` writes only these (`planRegisters`).
+            if (f == cg.emit.zcu.return_error) cg.e.written = written | Reg.bit(.rax) | scratch_mask;
+        }
     } else {
         // r11 is not an argument register in either convention.
         try cg.load(cg.r11(), callee_ref);
