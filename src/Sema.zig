@@ -7571,7 +7571,15 @@ fn fieldParentPtr(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.FieldPar
     const field_ptr = sema.resolveInst(extra.field_ptr);
     if (Type.class(ip, sema.typeOf(field_ptr)) != .pointer) return sema.fail(block, sema.callArgSrc(src, false, 1), "expected pointer type, found '{f}'", .{sema.fmtType(sema.typeOf(field_ptr))});
     if (sema.resolveValue(field_ptr)) |v| if (!sema.isUndef(v)) {
-        const k = ip.keyPayload(.ptr, v);
+        var k = ip.keyPayload(.ptr, v);
+        // A field's first element, cast back to the field's type (or
+        // reached by pointer arithmetic), is the field's address, as
+        // upstream.
+        while (k.base == .elem and k.base.elem.index == 0 and k.byte_offset == 0) {
+            const inner = ip.keyPayload(.ptr, k.base.elem.base);
+            if (inner.base != .field and inner.base != .elem) break;
+            k = inner;
+        }
         const of_parent = k.base == .field and k.byte_offset == 0 and
             Type.ptrInfo(ip, ip.typeOf(k.base.field.base)).child == parent_ty;
         if (of_parent and k.base.field.index == field_index)

@@ -1,8 +1,9 @@
 //! exit: 0
-//! stdout: "abc/abc/abc/x.txt\n01/01/b\n2\n4\n12\nellorl\n252\n1\n2\n3\n2\n1\n3\n15\n"
+//! stdout: "abc/abc/abc/x.txt\n01/01/b\n2\n4\n12\nellorl\n252\n1\n2\n3\n2\n1\n3\n15\n29\n"
 //! Comptime memory read through views of another shape: arrays of arrays
 //! as bytes, slices that start inside an element, subarrays of comptime
-//! arrays, `++` of such slices, and indexing a pointer to a tuple.
+//! arrays, `++` of such slices, indexing a pointer to a tuple, and
+//! `@fieldParentPtr` of a field's first element cast back to the field.
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -10,6 +11,20 @@ pub export fn _start() callconv(.naked) noreturn {
         :
         : [main] "X" (&main),
     );
+}
+
+const Inner = struct { w: u8, v: [2]u32 };
+
+fn bump(comptime which: u8) u8 {
+    comptime var o: Inner = .{ .w = 9, .v = .{ 1, 2 } };
+    const parent: *[2]u32 = switch (which) {
+        0 => &o.v,
+        1 => @ptrCast(&o.v[0]),
+        else => @ptrCast(o.v[1..].ptr - 1),
+    };
+    const ip: *Inner = @fieldParentPtr("v", parent);
+    ip.w += which;
+    return o.w;
 }
 
 fn repeat(comptime n: usize, comptime s: []const u8) []const u8 {
@@ -72,5 +87,6 @@ pub fn main() void {
     // Indexing through a pointer to a tuple.
     const tp = &tuple;
     rt.printInt(tp[0] + tp[1]);
+    rt.printInt(comptime bump(0) + bump(1) + bump(3) - 2);
     rt.exit(0);
 }
