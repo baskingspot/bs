@@ -1806,10 +1806,10 @@ fn fillsOut(f: *const Ssa, ir: *const Ir, block: u32, n: usize, out: *[max_fill_
     for (out[0..n]) |*o| o.* = ~@as(u64, 0);
     const term = f.blocks.items[block].term;
     const meet = struct {
-        fn and_(o: *[max_fill_allocs]u64, in: []const u64) void {
+        fn call(o: *[max_fill_allocs]u64, in: []const u64) void {
             for (o[0..in.len], in) |*x, y| x.* &= y;
         }
-    }.and_;
+    }.call;
     switch (term.tag) {
         .jump, .fallthrough => meet(out, ok[term.succ[0] * n ..][0..n]),
         .branch => for (term.succ) |succ| meet(out, ok[succ * n ..][0..n]),

@@ -170,7 +170,7 @@ pub const Mem = struct {
     }
 
     /// The offset from sp of a slot.
-    fn base_off(m: Mem) i32 {
+    fn baseOff(m: Mem) i32 {
         assert(m.base == .reg and m.base.reg == .sp);
         return m.off;
     }
@@ -527,7 +527,7 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
     const class = if (cg.live and !cg.in_cold) Ssa.slotClass(size, alignment) else null;
     const home: Home = .{ .slot = if (class) |c| blk: {
         const f = &cg.emit.ssa;
-        const off = try f.takeSlot(cg.gpa, inst, c) orelse (try cg.allocSlot(c.size, c.alignment)).base_off();
+        const off = try f.takeSlot(cg.gpa, inst, c) orelse (try cg.allocSlot(c.size, c.alignment)).baseOff();
         try f.holdSlot(cg.gpa, inst, off, c);
         break :blk .at(.sp, off);
     } else try cg.allocSlot(size, alignment) };
