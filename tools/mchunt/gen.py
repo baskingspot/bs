@@ -572,6 +572,33 @@ EXTRA_DECL["sharefwd"] = [
     "inline fn sfIn(a: u64, b: u64) u64 { return (a ^ b) +% (a >> 3); }",
 ]
 
+# Byte loops over @ptrCast slices of *T and constant-length subslices
+# (s_unrollswap).
+EXTRA_DECL["unrollswap"] = [
+    "const UsE = extern struct { a: u8, b: u16, c: u8 };",
+    "const UsP = packed struct(u24) { a: u5, b: u11, c: u8 };",
+    "const UsS = struct { x: u40, y: u8 };",
+    "const UsO = extern struct { a: [3]u8, b: u8, c: u8 };",
+    "fn usSwap(comptime T: type, a: *T, b: *T) void {",
+    "    const ab: []align(@alignOf(T)) u8 = @ptrCast(a);",
+    "    const bb: []align(@alignOf(T)) u8 = @ptrCast(b);",
+    "    for (ab, bb) |*x, *y| {",
+    "        const t = x.*;",
+    "        x.* = y.*;",
+    "        y.* = t;",
+    "    }",
+    "}",
+    "inline fn usSwapI(comptime T: type, a: *T, b: *T) void {",
+    "    const ab: []u8 = @ptrCast(a);",
+    "    const bb: []u8 = @ptrCast(b);",
+    "    for (ab, bb) |*x, *y| {",
+    "        const t = x.*;",
+    "        x.* = y.*;",
+    "        y.* = t;",
+    "    }",
+    "}",
+]
+
 # Stores through pointers, then loads of the same address (s_storefwd).
 EXTRA_DECL["storefwd"] = [
     "const SfL = struct { items: []u32, cap: usize, tag: u8 };",
@@ -1559,7 +1586,7 @@ class Gen:
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
             (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
             (2, "swx"), (2, "scopenum"), (2, "argbase"), (2, "mulbound"), (2, "retlen"),
-            (2, "sharefwd"), (2, "fwdalias"), (2, "storefwd"),
+            (2, "sharefwd"), (2, "fwdalias"), (2, "storefwd"), (2, "unrollswap"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -3411,6 +3438,128 @@ class Gen:
                 sk(f"@as(u64, {x1}) *% 1000 +% {x2}")
                 ctx["indent"] -= 1
                 e("} else |_| {}")
+
+    def s_unrollswap(self, ctx):
+        """std.mem.swap and its byte loop over @ptrCast slices of *T (odd
+        sizes, packed and extern structs, arrays), swaps through aliasing,
+        identical or overlapping pointers, byte loops that break or
+        continue early, and loops over constant-length subslices
+        `s[a..][0..N]`, directly or through a slice local that may be
+        reassigned through a pointer."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        ctx["fn"].risky = True
+        self.extra.add("unrollswap")
+        e = lambda s_: self.emit(ctx, s_)
+        sk = lambda x: self.sink(ctx, x, U64)
+        u8 = lambda: f"@as(u8, @truncate({self.int_expr(ctx, U64, 1)}))"
+        sel = self.fresh("us")
+        e(f"var {sel} = [_]usize{{ 0, 1, 2, 3, 4, 5, 7, 9 }};")
+        e(f"_ = &{sel};")
+        pv = lambda: f"{sel}[@as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % 8]"
+        # (type, literal, fields to sink, has no padding)
+        def lit(t):
+            if t == "UsE":
+                return f".{{ .a = {u8()}, .b = {self.int_expr(ctx, Int(False, 16), 1)}, .c = {u8()} }}", ["a", "b", "c"], False
+            if t == "UsP":
+                return f".{{ .a = @truncate({u8()}), .b = @truncate({self.int_expr(ctx, Int(False, 16), 1)}), .c = {u8()} }}", ["a", "b", "c"], False
+            if t == "UsS":
+                return f".{{ .x = @truncate({self.int_expr(ctx, U64, 1)}), .y = {u8()} }}", ["x", "y"], False
+            if t == "UsO":
+                return f".{{ .a = .{{ {u8()}, 2, {u8()} }}, .b = {u8()}, .c = 7 }}", ["a[0]", "a[1]", "a[2]", "b", "c"], True
+            if t == "[7]u8":
+                return f"@splat({u8()})", [f"[{i}]" for i in range(7)], True
+            if t == "[3]u16":
+                return f".{{ {self.int_expr(ctx, Int(False, 16), 1)}, 5, 0xffff }}", ["[0]", "[1]", "[2]"], True
+            return f"@truncate({self.int_expr(ctx, U64, 1)})", [""], False
+        def sinkv(v, fields):
+            for f in fields:
+                sk(f"@as(u64, {v}{'.' + f if f and not f.startswith('[') else f})")
+        k = self.r.randrange(8)
+        if k <= 3:
+            t = self.pick(["UsE", "UsP", "UsS", "UsO", "[7]u8", "[3]u16", "u24"])
+            a, b = self.fresh("ua"), self.fresh("ub")
+            la, fields, nopad = lit(t)
+            lb, _, _ = lit(t)
+            e(f"var {a}: {t} = {la};")
+            e(f"var {b}: {t} = {lb};")
+            e(f"_ = &{b};")
+            w = self.r.randrange(6)
+            if w <= 1:
+                e(f"std.mem.swap({t}, &{a}, &{b});")
+            elif w == 2:
+                e(f"usSwap({t}, &{a}, &{a});")
+            elif w == 3:
+                pa = self.fresh("up")
+                e(f"const {pa}: *{t} = {self.pick([f'&{a}', f'&{b}'])};")
+                e(f"{self.pick(['usSwap', 'usSwapI'])}({t}, {pa}, &{a});")
+            elif w == 4:
+                e(f"usSwapI({t}, &{a}, &{b});")
+            else:
+                for _ in range(self.r.randint(2, 3)):
+                    e(f"std.mem.swap({t}, &{a}, &{b});")
+            if nopad and self.chance(0.6):
+                # Mutate the bytes, with an early break or continue.
+                bs, i = self.fresh("uby"), self.fresh("ui")
+                e(f"const {bs}: []u8 = @ptrCast(&{a});")
+                e(f"for ({bs}, 0..) |*x, {i}| {{")
+                ctx["indent"] += 1
+                ex = self.r.randrange(3)
+                if ex == 0:
+                    e(f"if ({i} == {pv()}) break;")
+                elif ex == 1:
+                    e(f"if (x.* == {u8()} or {i} == {pv()}) continue;")
+                e(f"x.* +%= @truncate({i} *% 3 +% 1);")
+                ctx["indent"] -= 1
+                e("}")
+            sinkv(a, fields)
+            sinkv(b, fields)
+        elif k == 4:
+            # Overlapping byte windows of one buffer.
+            buf = self.fresh("ubuf")
+            n = self.r.randint(2, 5)
+            e(f"var {buf}: [10]u8 = .{{ {', '.join(str(self.r.randint(0, 255)) for _ in range(10))} }};")
+            e(f"usSwap([{n}]u8, {buf}[{self.r.randint(0, 2)}..][0..{n}], {buf}[{self.r.randint(0, 4)}..][0..{n}]);")
+            sk(f"std.mem.readInt(u64, {buf}[0..8], .little)")
+            sk(f"@as(u64, {buf}[8]) << 8 | {buf}[9]")
+        else:
+            # Loops over constant-length subslices s[a..][0..N].
+            buf = self.fresh("ubuf")
+            L = self.r.randint(6, 16)
+            e(f"var {buf}: [{L}]u8 = @splat({u8()});")
+            sl = self.fresh("usl")
+            e(f"const {sl}: []u8 = &{buf};")
+            n = self.r.randint(1, min(8, L))
+            a = self.fresh("uo")
+            e(f"const {a}: usize = {pv()}{' % ' + str(L - n + 1) if self.chance(0.85) else ''};")
+            if k == 5:
+                src = f"{sl}[{a}..][0..{n}]"
+            elif k == 6:
+                cs = self.fresh("ucs")
+                e(f"const {cs}: []u8 = {sl}[{a}..][0..{n}];")
+                src = cs
+            else:
+                vs, vp = self.fresh("uvs"), self.fresh("uvp")
+                e(f"var {vs}: []u8 = {sl}[{a}..][0..{n}];")
+                e(f"const {vp}: *[]u8 = &{vs};")
+                m = self.r.randint(0, min(8, L))
+                e(f"if ({self.bool_expr(ctx, 1)}) {vp}.* = {sl}[{self.r.randint(0, L - m)}..][0..{m}];")
+                src = vs
+            i = self.fresh("ui")
+            e(f"for ({src}, 0..) |*x, {i}| {{")
+            ctx["indent"] += 1
+            ex = self.r.randrange(3)
+            if ex == 0:
+                e(f"if ({i} == {pv()}) break;")
+            elif ex == 1:
+                e(f"if ({i} & 1 == {self.r.randint(0, 1)}) continue;")
+            e(f"x.* = x.* *% 7 +% @as(u8, @truncate({i}));")
+            if self.chance(0.4):
+                sk(f"@as(u64, {sl}[{a} + {i}])")
+            ctx["indent"] -= 1
+            e("}")
+            for j in range(L):
+                sk(f"@as(u64, {buf}[{j}])")
 
     def s_storefwd(self, ctx):
         """A store through a pointer, then a load of the same address used
