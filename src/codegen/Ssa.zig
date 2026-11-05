@@ -160,16 +160,20 @@ pub const want_reg: u8 = 0xfe;
 pub const want_pair: u8 = 0xfd;
 /// Like `want_reg`, for a value in a floating-point register.
 pub const want_float: u8 = 0xfc;
+/// Like `want_float`, for a vector, which only a call-clobbered register
+/// can hold (one of `allocate`'s floats outside `survives`): it gets none
+/// when it crosses a clobber point, unless it is split.
+pub const want_vec: u8 = 0xfb;
 /// For an address its users may read as an offset from another value
 /// (`allocate`'s `fold`): no register if that value has one or is itself
 /// folded, else like `want_reg`. Not one of the `want` markers.
-pub const want_fold: u8 = 0xfb;
+pub const want_fold: u8 = 0xfa;
 /// What `allocate` leaves for a `want_fold` value that took no register.
-pub const folded: u8 = 0xfa;
+pub const folded: u8 = 0xf9;
 
 /// Whether `r` is one of the `want` markers.
 pub fn wants(r: u8) bool {
-    return r >= want_float and r != no_reg;
+    return r >= want_vec and r != no_reg;
 }
 
 pub const Value = struct {
@@ -654,9 +658,10 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
 /// - Arguments are all moved at the entry, so an unused one, whose interval
 ///   ends there, takes no register.
 /// - Promotion: a non-volatile alloc whose type is in a general-purpose
-///   register (`ctx.inGpr`), two (`ctx.inPair`), or a floating-point one
-///   (`ctx.inFloat`) and whose address is only loaded from and stored to,
-///   so it is never taken, gets `want_reg` (`want_pair`, `want_float`), and its loads and
+///   register (`ctx.inGpr`), two (`ctx.inPair`), a floating-point one
+///   (`ctx.inFloat`), or a vector one (`ctx.inVec`) and whose address is
+///   only loaded from and stored to, so it is never taken, gets `want_reg`
+///   (`want_pair`, `want_float`, `want_vec`), and its loads and
 ///   stores are moves. This is mem2reg without renaming: the variable
 ///   keeps one register for its interval, which `liveness` extends over
 ///   the loops that use it, so it needs no phis. A load may share the
@@ -767,10 +772,10 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                     const info = Type.ptrInfo(ip, ty);
                     if (info.flags.is_volatile) continue;
                     // Class 3: only forwarded, never promoted.
-                    const class: u32 = if (ctx.inGpr(info.child)) 0 else if (ctx.inPair(info.child)) 1 else if (ctx.inFloat(info.child)) 2 else if (info.flags.is_const) 3 else continue;
+                    const class: u32 = if (ctx.inGpr(info.child)) 0 else if (ctx.inPair(info.child)) 1 else if (ctx.inFloat(info.child)) 2 else if (ctx.inVec(info.child)) 4 else if (info.flags.is_const) 3 else continue;
                     count[i] = candidate;
                     if (!info.flags.is_const) fwd[i] = no_fwd;
-                    try f.candidates.append(gpa, i | class << 30);
+                    try f.candidates.append(gpa, i | class << 29);
                 },
                 .load => if (fate[i] != .dead) {
                     const v = @backingInt(datas[i].ty_op.operand.toIndex() orelse continue);
@@ -812,17 +817,18 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
     // forwarded or promoted (see `plan`).
     const tie = live.items(.tie);
     for (f.candidates.items) |c| {
-        const v = c & ~(@as(u32, 3) << 30);
+        const v = c & ~(@as(u32, 7) << 29);
         if (candidate - count[v] == uses[v]) {
             if (fwd[v] < no_fwd) {
                 fate[v] = .dead;
                 fate[fwd[v]] = .dead;
                 reg[v] = no_reg;
-            } else if (c >> 30 != 3) {
-                reg[v] = switch (c >> 30) {
+            } else if (c >> 29 != 3) {
+                reg[v] = switch (c >> 29) {
                     0 => want_reg,
                     1 => want_pair,
-                    else => want_float,
+                    2 => want_float,
+                    else => want_vec,
                 };
                 tie[v] = no_tie;
             }
@@ -876,7 +882,7 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
             const br = datas[@backingInt(b.term.inst)].br;
             const v = @backingInt(br.block_inst);
             const w = @backingInt(br.operand.toIndex() orelse break :br);
-            if (reg[v] != reg[w] or (reg[w] != want_reg and reg[w] != want_float)) break :br;
+            if (reg[v] != reg[w] or (reg[w] != want_reg and reg[w] != want_float and reg[w] != want_vec)) break :br;
             if (uses[w] != 1 or fate[w] != .normal or share[w] != no_tie or end[w] != valuePos(b.start + b.len) - 1) break :br;
             if (tags[w] == .block or def[w] < valuePos(b.start)) break :br;
             f.shareTies(ir, @fromBackingInt(w), @fromBackingInt(v), valuePos(b.start));
@@ -887,7 +893,7 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
             const bin = datas[i].bin_op;
             const v = @backingInt(bin.lhs.toIndex() orelse continue);
             const w = @backingInt(bin.rhs.toIndex() orelse continue);
-            if (tags[v] != .alloc or reg[v] != reg[w] or (reg[w] != want_reg and reg[w] != want_float)) continue;
+            if (tags[v] != .alloc or reg[v] != reg[w] or (reg[w] != want_reg and reg[w] != want_float and reg[w] != want_vec)) continue;
             if (uses[w] != 1 or fate[w] != .normal or share[w] != no_tie or end[w] != valuePos(idx) or def[w] <= def[v]) continue;
             if (tags[w] == .block) continue;
             var start = valuePos(b.start);
@@ -924,7 +930,7 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
             if (f.storeShares(ir, @fromBackingInt(w), @fromBackingInt(v), idx)) f.shareTies(ir, @fromBackingInt(w), @fromBackingInt(v), start);
         };
     }
-    for (f.candidates.items) |c| fwd[c & ~(@as(u32, 3) << 30)] = no_tie;
+    for (f.candidates.items) |c| fwd[c & ~(@as(u32, 7) << 29)] = no_tie;
 }
 
 /// `v` if load `load` of promoted variable `v` may share its register
@@ -1234,8 +1240,9 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// Linear-scan register allocation (Poletto and Sarkar) over the values
 /// `liveness` gave intervals and the architecture marked `want_reg` or
 /// `want_pair`, with `n` general-purpose registers (indices 0 to n - 1),
-/// and `want_float`, with `n_float` floating-point ones (the next
-/// indices), in order of definition. Only the
+/// and `want_float` and `want_vec`, with `n_float` floating-point ones
+/// (the next indices, of which `want_vec` takes those outside
+/// `survives`), in order of definition. Only the
 /// registers in `survives` may hold a value that crosses a clobber point;
 /// a value that crosses none prefers the others. When none is free, the
 /// value whose interval ends last among those holding a register it could
@@ -1325,7 +1332,12 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, 
         const splits = crosses[inst] and split.isSet(inst);
         const rc = restricted_clobbers;
         const keep_out = if (rc.len != 0 and (rc[end[inst]] != rc[def[inst]] or rc[def[inst]] != rc[def[inst] - 1])) restricted else 0;
-        const usable: u32 = (if (reg[inst] == want_float) floats else gprs) & ~keep_out & if (crosses[inst] and !splits) survives else ~@as(u32, 0);
+        const class: u32 = switch (reg[inst]) {
+            want_float => floats,
+            want_vec => floats & ~survives,
+            else => gprs,
+        };
+        const usable: u32 = class & ~keep_out & if (crosses[inst] and !splits) survives else ~@as(u32, 0);
         const v = share[inst];
         if (v != no_tie and reg[v] < total) {
             reg[inst] = reg[v];
