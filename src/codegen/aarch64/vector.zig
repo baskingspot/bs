@@ -470,7 +470,8 @@ fn loadChunk(cg: *CodeGen, r: VReg, ref: Ref, k: u32) Error!void {
             try cg.e.fmovFromGpr(.f64, r, .x, .x9);
         },
         .none => try zero(cg, r),
-        .addr, .err => unreachable,
+        // Vectors have no general register (`CodeGen.inGpr`).
+        .addr, .err, .reg => unreachable,
     }
 }
 

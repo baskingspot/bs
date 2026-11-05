@@ -2135,7 +2135,7 @@ fn LinkOf(comptime Input: type) type {
                     const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
                     const fn_addr: i64 = @intCast(addr);
                     const k = fde - c.frame_base;
-                    const fde_len = Dwarf.fdeSize(unwind, size);
+                    const fde_len = Dwarf.fdeSize(l.arch, unwind, size);
                     Dwarf.writeFde(l.arch, out[0][fde_at..][0..fde_len], unwind, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
                     fde_at += fde_len;
                     const entry = out[1][@as(usize, k) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
@@ -3862,8 +3862,8 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
     // Four FDEs, g's with its three saved registers and its epilogue, k's
     // with its stubs' and probes' rows; the duplicate and the naked
     // function leave their room unused.
-    try std.testing.expectEqual(40, Dwarf.fdeSize(atoms[4].unwind, code.len));
-    try std.testing.expectEqual(48, Dwarf.fdeSize(atoms[6].unwind, code.len));
+    try std.testing.expectEqual(40, Dwarf.fdeSize(.x86_64, atoms[4].unwind, code.len));
+    try std.testing.expectEqual(48, Dwarf.fdeSize(.x86_64, atoms[6].unwind, code.len));
     try std.testing.expectEqual(Dwarf.cie.len + 2 * Dwarf.fde_size + 40 + 48 + 4, testSection(out, ".eh_frame").?.size);
     try std.testing.expectEqual(Dwarf.eh_frame_hdr_size + 4 * Dwarf.eh_frame_hdr_entry_size, testSection(out, ".eh_frame_hdr").?.size);
 

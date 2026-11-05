@@ -878,13 +878,31 @@ comptime arguments are run-time values in the lowered code (uucode's
 - aarch64-macos (`src/codegen/aarch64/CodeGen.zig`) lowers the same SSA
   form with the same per-instruction structure. It runs `Ssa.liveness`
   and `Ssa.plan` (dead values, fused branch conditions, overflow pairs
-  and bits left in the flags); every value lives in a stack slot, shared
-  by lifetime, until register allocation (`Ssa.allocate`) is wired up.
-  Until then `plan`'s promotion changes nothing there (`inPair` and
-  `inFloat` say no, and the `want_reg` marks go unread), but a load
-  that `plan` forwards shares the stored value's slot, and a removed
-  instruction's constant pointers still request their symbols
-  (`keepSymbols`), as on x86_64. aarch64-macos builds use no cache yet:
+  and bits left in the flags, promoted variables), then `Ssa.allocate`
+  over the callee-saved x19-x28 alone: scalars that fit a general
+  register (`inGpr`) and promoted variables get one, the rest live in
+  stack slots shared by lifetime. No lowering uses x19-x28 as scratch
+  and every call preserves them, so `clobbers` reports nothing, no value
+  is spilled or split around a call, and both conventions (Apple's and
+  Linux's AAPCS64) only move arguments into their homes at entry and
+  results out of x0. Each lowering writes its result register after
+  reading every operand (results it writes through `resultMem` go to a
+  scratch slot and are moved to the register after the instruction),
+  so no value is tied to an operand. Floats, pairs (slices) and block
+  results stay in slots for now (`inFloat` and `inPair` say no), and a
+  function with inline assembly gets no registers. The prologue saves
+  the used pairs right below the frame record (x19 at fp - 8, x20 at
+  fp - 16, then the next used pair), which compact unwind's frame mode
+  reads from `Atom.Unwind.saved` and the aarch64-linux FDE describes
+  with `DW_CFA_offset` rules after the last push; the epilogue and
+  tail calls restore them (`popFrame`). Measured on an M-series Mac
+  (2026-11-05), against slots only: bench/runtime fib 103 → 87 ms,
+  sieve 328 → 52, sort 459 → 154, hash 444 → 187, nbody 310 → 208,
+  fmt 138 → 57 (sieve, sort, hash and fmt now beat upstream's LLVM
+  Debug); std's tests run in 7.3 s instead of 12.6, with 9% less code;
+  compile time unchanged. A load that `plan` forwards
+  shares the stored value's home, and a removed instruction's constant
+  pointers still request their symbols (`keepSymbols`), as on x86_64. aarch64-macos builds use no cache yet:
   a relink would need the Mach-O linker's inputs in the manifest.
   Each function keeps a frame record (`stp x29, x30, [sp, #-16]!; mov
   x29, sp`), so compact unwind's frame mode covers it, and addresses its
@@ -2513,8 +2531,9 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    std's tests: 4.62 → 4.49 code bytes per IR instruction, allocation
    106 → 113–116, wall time within noise, binary 60.7 → 59.9 MB.
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
-   thread). Lowering, ABIs, inline assembly, liveness and `Ssa.plan` are
-   in (aarch64-macos conformance 98.0%); register allocation next.
+   thread). Lowering, ABIs, inline assembly, liveness, `Ssa.plan` and
+   register allocation over x19-x28 are in (aarch64-macos conformance
+   100% of upstream); float registers (d8-d15) and pairs next.
 6. DWARF variable locations; then leaf inlining with the cache edge.
    *DWARF types and variables: paused by the owner, 2026-11-03.* bs
    keeps line tables, CFI, function names and inlined frames, the
@@ -7827,6 +7846,14 @@ and `zig build -Dtarget=aarch64-macos`.
   rest of aarch64-macos's `builtin` is upstream's `--show-builtin` for
   `-target aarch64-macos` (apple_m1, macOS 15.0, libc linked, PIE), and
   aarch64-linux's is x86_64-linux's with upstream's generic aarch64 CPU.
+  Known difference, to fix: native builds on a Mac (no `-target`) use
+  that same fixed target, macOS 15.0 (a 15–27 range in the builtin) and
+  bs's bundled libc headers, where upstream resolves the host through
+  `std.zig.system.resolveTargetQuery`: the host's macOS version, and with
+  Xcode installed its SDK for translate-c and C. std's OS-version checks
+  can then take other paths than upstream's. The fix is the
+  `resolveTargetQuery` path x86_64-linux native already uses, so the OS
+  version, translate-c and the C SDK all agree with upstream.
 - Conformance is measured per test: the number of `upstream/test/behavior`
   tests bs compiles and passes, divided by the number upstream 0.17.1 passes
   on the same target with the same backend.

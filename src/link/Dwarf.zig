@@ -742,7 +742,9 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
         part.n_runs += @intFromBool(units.new_run);
         if (a.unwind.kind != .none) {
             c.n_frames += 1;
-            c.frame_bytes += fdeSize(a.unwind, a.bytes.len);
+            // Mach-O, aarch64 only, writes no .eh_frame and has no `arch`.
+            const arch: Atom.Unwind.Arch = if (@hasField(@TypeOf(l.*), "arch")) l.arch else .aarch64;
+            c.frame_bytes += fdeSize(arch, a.unwind, a.bytes.len);
         }
     }
 }
@@ -983,9 +985,14 @@ pub const max_fde_size = 64;
 
 /// The size of the FDE of a `size`-byte function whose `unwind` is not
 /// `none`: the frame-pointer program, 3 bytes per saved register, and the
-/// epilogue's rows, padded to 8.
-pub fn fdeSize(u: Atom.Unwind, size: u64) u32 {
+/// epilogue's rows, padded to 8. On aarch64: the frame record's program,
+/// then an advance and 4 bytes per saved pair (`writeFde`).
+pub fn fdeSize(arch: Atom.Unwind.Arch, u: Atom.Unwind, size: u64) u32 {
     if (u.kind != .frame_pointer) return fde_size;
+    if (arch == .aarch64) {
+        const pairs: u32 = @popCount(u.saved & 0x1f);
+        return std.mem.alignForward(u32, @as(u32, frame_pointer_program_aarch64.len) + if (pairs == 0) 0 else 1 + 4 * pairs, 8);
+    }
     const n: u32 = @popCount(u.saved & Atom.Unwind.savedBits(.x86_64));
     const rows: u32 = if (epilogueRows(u, size)) |e| e.size(n) else 0;
     return std.mem.alignForward(u32, @as(u32, frame_pointer_program.len) + 3 * n + rows, 8);
@@ -1122,25 +1129,43 @@ fn fdeTemplate(comptime program: []const u8) [fde_size]u8 {
 }
 
 comptime {
-    std.debug.assert(cie.len % 8 == 0 and fdeSize(.frame_pointer, 0) == fde_size and outermost_program.len <= fde_size);
-    std.debug.assert(cie_aarch64.len == cie.len and frame_pointer_program_aarch64.len <= fde_size);
+    std.debug.assert(cie.len % 8 == 0 and fdeSize(.x86_64, .frame_pointer, 0) == fde_size and outermost_program.len <= fde_size);
+    std.debug.assert(cie_aarch64.len == cie.len and fdeSize(.aarch64, .frame_pointer, 0) == fde_size);
     // An epilogue within 64 KiB of the prologue keeps the common size.
-    std.debug.assert(fdeSize(.{ .kind = .frame_pointer, .epilogue = 1 }, 1 << 16) == fde_size);
-    std.debug.assert(fdeSize(.{ .kind = .frame_pointer, .epilogue = 1, .saved = 0x1f }, std.math.maxInt(u32)) == max_short_fde_size);
-    std.debug.assert(fdeSize(.{ .kind = .frame_pointer, .epilogue = std.math.maxInt(u16), .probes = 1, .saved = 0x1f }, std.math.maxInt(u32)) == max_fde_size);
+    std.debug.assert(fdeSize(.x86_64, .{ .kind = .frame_pointer, .epilogue = 1 }, 1 << 16) == fde_size);
+    std.debug.assert(fdeSize(.x86_64, .{ .kind = .frame_pointer, .epilogue = 1, .saved = 0x1f }, std.math.maxInt(u32)) == max_short_fde_size);
+    std.debug.assert(fdeSize(.x86_64, .{ .kind = .frame_pointer, .epilogue = std.math.maxInt(u16), .probes = 1, .saved = 0x1f }, std.math.maxInt(u32)) == max_fde_size);
+    // All five aarch64 pairs fit the short size.
+    std.debug.assert(fdeSize(.aarch64, .{ .kind = .frame_pointer, .saved = 0x1f }, std.math.maxInt(u32)) == max_short_fde_size);
 }
 
 /// Writes the FDE at offset `fde_off` of .eh_frame, `fdeSize(u, size)`
 /// bytes of `out`, for the `size`-byte function `pc_rel` bytes after the
 /// FDE's pc_begin field, whose `unwind` is `u`, not `none`.
 ///
-/// On aarch64 the FDE describes the frame record alone, padded to the
-/// size `fdeSize` gives: bs's aarch64 code saves no other registers and
-/// records no epilogue yet.
+/// On aarch64 the FDE describes the frame record and the saved pairs of
+/// x19-x28 (`Atom.Unwind.saved`), padded to the size `fdeSize` gives; it
+/// records no epilogue yet. The prologue pushes the pairs right after the
+/// frame record, x19 at CFA - 24 and x20 at CFA - 32, each further pair 16
+/// bytes below, and their rules start after the last push (a push does
+/// not change the registers it saves).
 pub fn writeFde(arch: Atom.Unwind.Arch, out: []u8, u: Atom.Unwind, fde_off: u32, pc_rel: i32, size: u32) void {
     if (arch == .aarch64) {
         @memset(out, DW.CFA.nop);
         out[0..fde_size].* = if (u.kind == .outermost) outermost_fde_aarch64 else frame_pointer_fde_aarch64;
+        const pairs: u8 = @popCount(u.saved & 0x1f);
+        if (u.kind == .frame_pointer and pairs != 0) {
+            var at: usize = frame_pointer_program_aarch64.len;
+            out[at] = DW.CFA.advance_loc + 4 * pairs;
+            at += 1;
+            var k: u8 = 0;
+            for (0..5) |bit| if (u.saved >> @intCast(bit) & 1 != 0) {
+                const r: u8 = @intCast(19 + 2 * bit);
+                out[at..][0..4].* = .{ DW.CFA.offset + r, 3 + 2 * k, DW.CFA.offset + r + 1, 4 + 2 * k };
+                at += 4;
+                k += 1;
+            };
+        }
         std.mem.writeInt(u32, out[0..4], @intCast(out.len - 4), .little);
     } else switch (u.kind) {
         .none => unreachable,
