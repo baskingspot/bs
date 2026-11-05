@@ -1289,18 +1289,32 @@ const Walker = struct {
     /// first) follows from a fact or loop candidate, for any `y` when
     /// null. From an unsigned `x + c < y` or `x + c <= y` whose left side
     /// is exactly `x + c` (`offset`) and `d <= c`: `x + d <= x + c`, and
-    /// `x + d < x + c` when `d < c`. Only facts of types at most `bits`
+    /// `x + d < x + c` when `d < c`.
+    /// The fact's right side may be `y - k`, exact, which adds `k` to `c`. Only facts of types at most `bits`
     /// wide (any when 0) count, so `x + d` is at most `y`, at most the
     /// maximum of `bits`.
     fn bound(w: *const Walker, x: Term, d: u64, y: ?Term, bits: u16) ?Op {
         var best: ?Op = null;
         for (w.recent()) |g| {
             if (g.signed or (g.op != .lt and g.op != .le) or (bits != 0 and g.bits > bits)) continue;
-            if (y) |b| if (!g.b.eql(b)) continue;
+            // `x + c < y - k`, the subtraction exact, is `x + c + k < y`
+            // (`for (1..n) |j|` counts to `n - 1`, and `j` is that count
+            // plus one).
+            var k: u64 = 0;
+            if (y) |b| if (!g.b.eql(b)) {
+                if (g.b.tag != .inst) continue;
+                const bt = w.ir.instructions.items(.tag)[g.b.a];
+                if (bt != .struct_field_val and bt != .sub_wrap) continue;
+                const p = w.exactOperands(g.b, .sub_with_overflow) orelse continue;
+                if (!p[0].eql(b) or p[1].tag != .konst) continue;
+                k = @intCast(p[1].value());
+            };
             if (g.a.tag != .inst and !g.a.eql(x)) continue;
             const o = w.offset(g.a, true);
-            if (!o.x.eql(x) or o.c < d) continue;
-            if (g.op == .lt or o.c > d) return .lt;
+            if (!o.x.eql(x)) continue;
+            const c = std.math.add(u64, o.c, k) catch continue;
+            if (c < d) continue;
+            if (g.op == .lt or c > d) return .lt;
             best = .le;
         }
         for (w.s.cands.items) |g| {
@@ -1970,8 +1984,74 @@ const Walker = struct {
     }
 
     /// True or false if the facts decide `f`, a compare of operands of
-    /// type `info`.
+    /// type `info`: directly, or for `<` and `<=` from facts on operands
+    /// the facts make equal to `f`'s (`equals`), as `j < s.len` from `j <
+    /// n` when `s.len == n` was asserted, or from `j < m` when `s.len == n`
+    /// and `n == m` were. Facts name values, not places: a load after a
+    /// store or a call is another value, which the facts before it do not
+    /// name.
     fn proves(w: *const Walker, f: Fact, info: Type.IntInfo) ?bool {
+        if (w.provesDirect(f, info)) |r| return r;
+        if (f.op != .lt and f.op != .le) return null;
+        // The recent equalities of two values, usually none.
+        var eqs: [max_equal]Fact = undefined;
+        var ne: usize = 0;
+        for (w.recent()) |g| {
+            if (g.op != .eq or g.signed != f.signed or g.a.isConst() or g.b.isConst()) continue;
+            eqs[ne] = g;
+            ne += 1;
+            if (ne == max_equal) break;
+        }
+        if (ne == 0) return null;
+        var as: [max_equal]Term = undefined;
+        var bs: [max_equal]Term = undefined;
+        const na = equals(eqs[0..ne], f.a, &as);
+        const nb = equals(eqs[0..ne], f.b, &bs);
+        for (as[0..na], 0..) |a, i| for (bs[0..nb], 0..) |b, j| {
+            if (i == 0 and j == 0) continue;
+            if (w.provesFacts(with(f, f.op, a, b))) |r| return r;
+        };
+        return null;
+    }
+
+    const max_equal = 6;
+
+    /// `t`, then the values `eqs` make equal to it, directly and through
+    /// one more equality, at most `max_equal` in all; returns how many.
+    fn equals(eqs: []const Fact, t: Term, out: *[max_equal]Term) usize {
+        out[0] = t;
+        var n: usize = 1;
+        var k: usize = 0;
+        // `out[0]`, then the values equal to it.
+        var expand: usize = 1;
+        while (k < expand) : (k += 1) {
+            for (eqs) |g| {
+                const other = if (g.a.eql(out[k])) g.b else if (g.b.eql(out[k])) g.a else continue;
+                if (for (out[0..n]) |o| (if (o.eql(other)) break true) else false) continue;
+                out[n] = other;
+                n += 1;
+                if (n == max_equal) return n;
+            }
+            if (k == 0) expand = n;
+        }
+        return n;
+    }
+
+    /// `proves` from the facts on the operands alone, without their
+    /// bounds: a fact on them or on an offset of them (`offsetHolds`),
+    /// also for an exact `x - b` as `x` (`provesDirect`).
+    fn provesFacts(w: *const Walker, f: Fact) ?bool {
+        if (f.a.eql(f.b)) return f.op == .le;
+        if (!f.signed) if (w.exactOperands(f.a, .sub_with_overflow)) |p| {
+            if (w.holds(with(f, f.op, p[0], f.b)) or w.offsetHolds(with(f, f.op, p[0], f.b))) return true;
+        };
+        if (w.holds(f) or w.offsetHolds(f)) return true;
+        if (w.holds(negate(f)) or w.offsetHolds(negate(f))) return false;
+        return null;
+    }
+
+    /// `proves` without replacing operands.
+    fn provesDirect(w: *const Walker, f: Fact, info: Type.IntInfo) ?bool {
         // Equal terms are one value.
         if (f.a.eql(f.b)) return f.op == .le or f.op == .eq;
         if (!f.signed and (f.op == .le or f.op == .lt)) {
