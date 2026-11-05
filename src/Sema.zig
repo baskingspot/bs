@@ -10548,38 +10548,21 @@ fn resolvePeerTypesInner(sema: *Sema, block: *Block, src: Src, refs: []const Ref
     sema.peers_comptime_known = false;
     for (refs) |r| sema.peers_comptime_known = sema.peers_comptime_known or sema.resolveValue(r) != null;
     // Upstream resolves all peers at once: array pointers next to a
-    // many-pointer become many-pointers, not slices, whatever their order.
-    // So many-pointer peers go first.
+    // many-pointer become many-pointers, not slices, and an integer next
+    // to a comptime_float becomes a float when a float peer is there
+    // (`fixed_float`; `comptime_float`, `i1`, `f16` gives `f16`), whatever
+    // their order. So many-pointer peers go first, then floats.
     var many_first = refs;
     for (refs) |r| {
-        if (!sema.isManyPtr(sema.typeOf(r))) continue;
+        if (sema.peerRank(sema.typeOf(r)) == 2) continue;
         const sorted = try sema.arena.dupe(Ref, refs);
         std.mem.sort(Ref, sorted, sema, struct {
             fn lt(s: *Sema, x: Ref, y: Ref) bool {
-                return s.isManyPtr(s.typeOf(x)) and !s.isManyPtr(s.typeOf(y));
+                return s.peerRank(s.typeOf(x)) < s.peerRank(s.typeOf(y));
             }
         }.lt);
         many_first = sorted;
         break;
-    }
-    // Likewise numbers next to a fixed-width float become that float,
-    // whatever their order (`comptime_float`, `i1`, `f16` gives `f16`):
-    // float peers go first.
-    if (many_first.ptr == refs.ptr) number: {
-        var any_float = false;
-        for (refs) |r| switch (Type.class(sema.ip, sema.typeOf(r))) {
-            .float => any_float = true,
-            .int, .comptime_int, .comptime_float, .noreturn, .undefined => {},
-            else => break :number,
-        };
-        if (!any_float) break :number;
-        const sorted = try sema.arena.dupe(Ref, refs);
-        std.mem.sort(Ref, sorted, sema, struct {
-            fn lt(s: *Sema, x: Ref, y: Ref) bool {
-                return Type.class(s.ip, s.typeOf(x)) == .float and Type.class(s.ip, s.typeOf(y)) != .float;
-            }
-        }.lt);
-        many_first = sorted;
     }
     for (many_first) |r| {
         const ty = sema.typeOf(r);
@@ -10616,6 +10599,20 @@ fn resolvePeerTypesInner(sema: *Sema, block: *Block, src: Src, refs: []const Ref
         return e;
     };
     return chosen;
+}
+
+/// The order `resolvePeerTypesInner` resolves peers in: many-pointers,
+/// then fixed-width floats (also as an optional's or error union's
+/// payload), then the rest in source order.
+fn peerRank(sema: *Sema, ty: Index) u2 {
+    const ip = sema.ip;
+    if (sema.isManyPtr(ty)) return 0;
+    const t = switch (Type.class(ip, ty)) {
+        .optional => Type.childType(ip, ty),
+        .error_union => ip.keyPayload(.error_union_type, ty).payload_type,
+        else => ty,
+    };
+    return if (Type.class(ip, t) == .float) 1 else 2;
 }
 
 fn isManyPtr(sema: *Sema, ty: Index) bool {
