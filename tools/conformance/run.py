@@ -2000,6 +2000,239 @@ def langref_target(compiler, cfg, args, workdir):
             print(f"  {n}: {results[n]['status']}")
 
 
+# ------------------------------------------------------------ incremental
+
+INCREMENTAL_ROOT = UPSTREAM_TEST / "incremental"
+
+
+def parse_incremental(path):
+    """An incremental case's manifest, as upstream's test/src/Runner.zig
+    reads it: the compiler arguments (`#exe {...#}`) and the updates, each
+    the files it writes or deletes, its name and its check (`stdout` or
+    `errors`) with the expected text. A command's contents follow on its
+    line after `{` up to the next `#}`, or come from a file of a directory
+    case (`#write main.zig 0/main.zig`)."""
+    manifest = path / "manifest" if path.is_dir() else path
+    text = manifest.read_text()
+    exe_args, steps, pending = None, [], []
+    pos = 0
+    while pos < len(text):
+        end = text.find("\n", pos)
+        end = len(text) if end < 0 else end
+        words = text[pos:end].split(" ")
+        pos = end + 1
+        if not words[0]:
+            continue
+        cmd = words[0][1:]
+        arg = words[1] if cmd in ("write", "delete", "check", "skip") and len(words) > 1 else None
+        rest = " ".join(words[2:] if arg is not None else words[1:])
+        contents = ""
+        if rest == "{":
+            close = text.index("#}", pos)
+            contents = text[pos:close]
+            pos = text.find("\n", close)
+            pos = len(text) if pos < 0 else pos + 1
+        elif rest:
+            contents = (path / rest).read_text()
+        if cmd == "exe":
+            exe_args = contents.split()
+        elif cmd == "write":
+            pending.append((arg, contents))
+        elif cmd == "delete":
+            pending.append((arg, None))
+        elif cmd == "update":
+            steps.append({"name": contents.strip() or f"update {len(steps)}", "files": pending})
+            pending = []
+        elif cmd == "check":
+            steps[-1]["check"], steps[-1]["expected"] = arg, contents
+    return exe_args, steps
+
+
+def incremental_errors(stderr):
+    """bs's diagnostics (--error-format=json) rendered as upstream's error
+    bundle renders them for the incremental harness: no source lines or
+    reference traces, notes (call frames worded as upstream's) after their
+    error, then the compile log."""
+    lines, log = [], []
+    for ln in stderr.splitlines():
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        if "compile_log" in d:
+            log += d["compile_log"]
+        if "msg" not in d:
+            continue
+        times = lambda o: f" ({o['count']} times)" if o.get("count") else ""
+        loc = lambda o: f"{o['file']}:{o['line']}:{o.get('col', 0)}: " if "line" in o else ""
+        lines.append(f"{loc(d)}error: {d['msg']}{times(d)}")
+        # A location-less error's notes are indented, as upstream renders them.
+        indent = "" if "line" in d else "    "
+        for n in d.get("notes", []):
+            lines.append(f"{indent}{loc(n)}note: {n['msg']}{times(n)}")
+        for c in d.get("calls", []):
+            msg = {
+                "inline": "called inline here",
+                "comptime": "called at comptime here",
+                "generic": "generic function instantiated here",
+            }[c["kind"]]
+            lines.append(f"{indent}{loc(c)}note: {msg}{times(c)}")
+    out = "".join(ln + "\n" for ln in lines)
+    if log:
+        out += "\nCompile Log Output:\n" + "".join(ln + "\n" for ln in log)
+    return out
+
+
+def stdout_matches(expected, actual):
+    """Upstream's stdout check: equal, or with `#...` matching any text."""
+    if "#..." not in expected:
+        return expected == actual
+    parts = expected.split("#...")
+    if not actual.startswith(parts[0]):
+        return False
+    pos = len(parts[0])
+    for part in parts[1:-1]:
+        at = actual.find(part, pos)
+        if at < 0:
+            return False
+        pos = at + len(part)
+    return actual[pos:].endswith(parts[-1]) and len(actual) - pos >= len(parts[-1])
+
+
+def run_one_incremental(compiler, path, cfg, args, workdir):
+    """Runs a case's updates as successive builds in one directory, each
+    after the first an edit build that bs verifies against a full build
+    (BS_CACHE_VERIFY=1, BS_CACHE_CHECK=1), and checks each against the
+    manifest. A step's status: pass, errors (the errors match but not
+    their notes or order), wrong_errors, missing_errors (built where
+    errors were expected), unexpected_errors, wrong_stdout, run_failed,
+    verify (the edit build differs from a full build), crash, timeout,
+    unsupported; the steps after a crash or timeout are not run."""
+    name = path.name
+    exe_args, steps = parse_incremental(path)
+    out_dir = workdir / "incremental" / name
+    shutil.rmtree(out_dir, ignore_errors=True)
+    src = out_dir / "src"
+    src.mkdir(parents=True)
+    bin_path = out_dir / "main"
+    argv = [str(compiler), "build-exe", *exe_args, f"-femit-bin={bin_path}", "--error-format=json"]
+    if cfg["host"] != (platform.system(), platform.machine()):
+        argv += ["-target", cfg["zig_target"]]
+    mtime = time.time() - 3600
+    results = []
+    for i, step in enumerate(steps):
+        for file, contents in step["files"]:
+            if contents is None:
+                (src / file).unlink()
+                continue
+            (src / file).parent.mkdir(parents=True, exist_ok=True)
+            (src / file).write_text(contents)
+            # As upstream: every update's files are newer than the last's.
+            os.utime(src / file, (mtime + 2 * i, mtime + 2 * i))
+        # The case's own cache: without a build.zig above it, bs would use
+        # the global cache, where every case's `main` shares one manifest.
+        # No donors unless asked for: a case's first build would replay
+        # whichever case ran before it, making outcomes depend on order.
+        env = dict(
+            os.environ,
+            ZIG_LOCAL_CACHE_DIR=str(out_dir / "cache"),
+            BS_CACHE_DONOR=os.environ.get("BS_CACHE_DONOR", "off"),
+            BS_CACHE_CHECK="1",
+            **({"BS_CACHE_VERIFY": "1"} if i else {}),
+        )
+        bin_path.unlink(missing_ok=True)
+        code, _out, err, timed_out = run_process(argv, src, args.compile_timeout, env)
+        r = {"name": step["name"], "check": step["check"]}
+        errors = incremental_errors(err)
+        if timed_out:
+            r["status"] = "timeout"
+        elif "[unsupported]" in err:
+            r["status"], r["log"] = "unsupported", err[-LOG_LIMIT:]
+        elif "BS_CACHE_VERIFY:" in err:
+            r["status"], r["log"] = "verify", err[-LOG_LIMIT:]
+        elif code < 0 or code != 0 and "panic: " in err and not errors:
+            r["status"], r["crash"] = "crash", crash_frame(err)
+        elif step["check"] == "errors":
+            if code == 0:
+                r["status"] = "missing_errors"
+            elif errors == step["expected"]:
+                r["status"] = "pass"
+            else:
+                r["expected"], r["got"] = step["expected"], errors or err[-LOG_LIMIT:]
+                errs = lambda t: sorted(ln for ln in t.splitlines() if ": error: " in ln or ln.startswith("error: "))
+                r["status"] = "errors" if errors and errs(errors) == errs(step["expected"]) else "wrong_errors"
+        elif code != 0:
+            r["status"], r["got"] = "unexpected_errors", errors or err[-LOG_LIMIT:]
+        else:
+            rcode, out, rerr, rtimed = run_process(exec_argv(bin_path), src, args.run_timeout)
+            if rtimed or rcode != 0:
+                r["status"], r["exit"], r["log"] = "run_failed", "timeout" if rtimed else rcode, rerr[-LOG_LIMIT:]
+            elif stdout_matches(step["expected"], out):
+                r["status"] = "pass"
+            else:
+                r["status"], r["expected"], r["got"] = "wrong_stdout", step["expected"], out[-LOG_LIMIT:]
+        results.append(r)
+        if r["status"] in ("crash", "timeout"):
+            break
+    shutil.rmtree(out_dir, ignore_errors=True)
+    passed = sum(r["status"] == "pass" for r in results)
+    return name, {"steps": results, "of": len(steps), "pass": passed}
+
+
+def incremental_target(compiler, cfg, args, workdir):
+    """--incremental: upstream's test/incremental cases, each update an
+    edit build of the last, checked against the case's expectations. With
+    BS_CACHE=off, every update is a full build, which tells analysis
+    failures from the cache's."""
+    paths = sorted(INCREMENTAL_ROOT.iterdir())
+    if args.files:
+        paths = [p for p in paths if p.name in args.files]
+    results = {}
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        futs = [ex.submit(run_one_incremental, compiler, p, cfg, args, workdir) for p in paths]
+        for f in as_completed(futs):
+            name, r = f.result()
+            results[name] = r
+    cases_passed = sum(r["pass"] == r["of"] for r in results.values())
+    steps = sum(r["of"] for r in results.values())
+    steps_passed = sum(r["pass"] for r in results.values())
+    errors_steps = [s for r in results.values() for s in r["steps"] if s["check"] == "errors"]
+    counts = {}
+    for r in results.values():
+        for s in r["steps"]:
+            counts[s["status"]] = counts.get(s["status"], 0) + 1
+        counts["not_run"] = counts.get("not_run", 0) + r["of"] - len(r["steps"])
+    if not counts["not_run"]:
+        del counts["not_run"]
+    data = {
+        "format": FORMAT,
+        "target": cfg["name"],
+        "compiler": str(compiler),
+        "summary": {
+            "cases": len(results),
+            "cases_pass": cases_passed,
+            "steps": steps,
+            "steps_pass": steps_passed,
+            "error_steps": len(errors_steps),
+            "error_steps_pass": sum(s["status"] == "pass" for s in errors_steps),
+            **counts,
+        },
+        "cases": dict(sorted(results.items())),
+    }
+    out_path = args.out or workdir / f"incremental-{cfg['name']}.json"
+    write_json(out_path, data)
+    fails = ", ".join(f"{counts[k]} {k.replace('_', ' ')}" for k in sorted(counts) if k != "pass")
+    print(
+        f"{cfg['name']} incremental: {cases_passed}/{len(results)} cases pass, {steps_passed}/{steps} updates "
+        f"({data['summary']['error_steps_pass']}/{len(errors_steps)} of the error checks)"
+        f"{'; ' + fails if fails else ''} -> {rel(out_path)}"
+    )
+    for n in sorted(results):
+        for i, s in enumerate(results[n]["steps"]):
+            if s["status"] != "pass":
+                print(f"  {n} #{i} ({s['name']}): {s['status']}")
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -2061,6 +2294,11 @@ def main():
         action="store_true",
         help="measure upstream's doc/langref examples, each built and run as upstream's doctest does and compared with baseline/langref-<target>.json",
     )
+    p.add_argument(
+        "--incremental",
+        action="store_true",
+        help="bs only: run upstream's test/incremental cases, each update an edit build checked against the case",
+    )
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
     p.add_argument("--compile-timeout", type=float, default=300, help="seconds per file compile")
@@ -2116,6 +2354,8 @@ def main():
                 standalone_target(compiler, cfg, args, args.workdir)
             elif args.langref:
                 langref_target(compiler, cfg, args, args.workdir)
+            elif args.incremental:
+                incremental_target(compiler, cfg, args, args.workdir)
             elif args.std or args.c_abi:
                 std_target(compiler, cfg, args, args.workdir)
             elif args.upstream:

@@ -8220,6 +8220,15 @@ and `zig build -Dtarget=aarch64-macos`.
   outcomes in `baseline/langref-<target>.json`; the measure is the share
   that matches, with the examples bs refuses (`-OReleaseFast`) counted
   apart.
+- `run.py --incremental` runs upstream's `test/incremental` cases (49):
+  each is a sequence of updates (files written or deleted) with the
+  stdout or compile errors expected after each. bs builds the updates in
+  turn in one directory with its own cache and no donors (unless
+  `BS_CACHE_DONOR` is set), each after the first an edit
+  build that `BS_CACHE_VERIFY=1` and `BS_CACHE_CHECK=1` check against a
+  full build; errors are compared as upstream's harness renders them (no
+  source lines or reference traces). With `BS_CACHE=off` every update is
+  a full build, which tells analysis failures from the cache's.
 
 ## Diagnostics (designed 2026-11-03, accepted by the owner; being built)
 
