@@ -51,10 +51,9 @@ targets: std.ArrayList(Block.Index) = .empty,
 /// innermost loop containing it (an index into `loops`, or `no_loop`).
 loops: std.ArrayList(Loop) = .empty,
 block_loop: std.ArrayList(u32) = .empty,
-/// The function contains inline assembly, so no value gets a register
-/// (its constraints do not come from the allocator yet). aarch64 also
-/// sets it for functions that use the preserve_none convention.
-has_asm: bool = false,
+/// No value gets a register and no variable is promoted: aarch64 sets it
+/// for functions that use the preserve_none convention.
+no_regs: bool = false,
 
 /// Liveness and register allocation, per IR instruction (values are IR
 /// instructions until the SSA gets its own ops). Positions number the
@@ -289,10 +288,32 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
     try f.values.ensureTotalCapacity(gpa, ir.instructions.len);
     var b: Builder = .{ .f = f, .gpa = gpa, .ir = ir };
     try b.body(ir.mainBody());
+    f.no_regs = false;
+}
+
+/// Per position (as `clobbers`), how many inline assembly statements
+/// that are not dead come at or before it, for `allocate`'s
+/// `Restriction.counts`; null without any.
+pub fn asmCounts(f: *const Func, gpa: Allocator, ir: *const Ir, out: *std.ArrayList(u32)) Allocator.Error!?[]const u32 {
     const tags = ir.instructions.items(.tag);
-    f.has_asm = for (f.values.items(.inst)) |inst| {
-        if (tags[@backingInt(inst)] == .assembly) break true;
-    } else false;
+    const fate = f.live.items(.fate);
+    try out.resize(gpa, 2 * f.values.len + 3);
+    const cl = out.items;
+    var count: u32 = 0;
+    cl[0] = 0;
+    cl[1] = 0;
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        for (b.start..b.start + b.len) |i| {
+            const inst = f.values.items(.inst)[i];
+            if (tags[@backingInt(inst)] == .assembly and fate[@backingInt(inst)] != .dead) count += 1;
+            cl[2 * i + 2] = count;
+            cl[2 * i + 3] = count;
+        }
+        cl[2 * (b.start + b.len) + 1] = count;
+        cl[2 * (b.start + b.len) + 2] = count;
+    }
+    return if (count == 0) null else cl;
 }
 
 /// Passes 3 and 4: bypasses blocks that only jump (`fwd`) and orders the
@@ -705,7 +726,7 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
             forEachOperand(ir, inst, Uses{ .uses = uses });
         }
     }
-    if (f.has_asm) return;
+    if (f.no_regs) return;
     // Promotion counts each candidate's loads and stores in `share`, free
     // until the loads' entries are set.
     const count = share;
@@ -2000,12 +2021,11 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// the value `fold` gives for it has one, which is then never evicted, or
 /// is itself folded. A crossing value in `split` may also take a register
 /// outside `survives` when none in it is free, which the architecture
-/// saves and restores around each clobber point it crosses. The registers
-/// in `restricted` some lowerings write as scratch: per position (as
-/// `clobbers`), `restricted_clobbers` counts those lowerings so far, and
-/// a value takes such a register only if none lies in its interval, at
-/// its definition, or at its last use. Returns the mask of registers used.
-pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.DynamicBitSetUnmanaged, restricted: u32, restricted_clobbers: []const u32) u32 {
+/// saves and restores around each clobber point it crosses. Each of
+/// `restrictions` keeps a value out of its registers when one of its
+/// lowerings lies in the value's interval, at its definition, or at its
+/// last use. Returns the mask of registers used.
+pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.DynamicBitSetUnmanaged, restrictions: []const Restriction) u32 {
     const total = n + n_float;
     assert(total <= max_regs);
     const gprs: u32 = (@as(u32, 1) << @intCast(n)) - 1;
@@ -2075,8 +2095,11 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, 
         const h = hint[inst];
         pending &= ~(regBit(h[0]) | regBit(h[1]));
         const splits = crosses[inst] and split.isSet(inst);
-        const rc = restricted_clobbers;
-        const keep_out = if (rc.len != 0 and (rc[end[inst]] != rc[def[inst]] or rc[def[inst]] != rc[def[inst] - 1])) restricted else 0;
+        var keep_out: u32 = 0;
+        for (restrictions) |r| {
+            const rc = r.counts;
+            if (rc[end[inst]] != rc[def[inst]] or rc[def[inst]] != rc[def[inst] - 1]) keep_out |= r.regs;
+        }
         const class: u32 = switch (reg[inst]) {
             want_float => floats,
             want_vec => floats & ~survives,
@@ -2167,6 +2190,12 @@ fn spillsBefore(weight: []const u32, end: []const u32, a: u32, b: u32) bool {
 }
 
 pub const max_regs = 32;
+
+/// Registers that some lowerings write (r11 as x86_64's scratch, the
+/// registers inline assembly names or takes for its operands), and per
+/// position (as `clobbers`) how many of those lowerings come at or before
+/// it.
+pub const Restriction = struct { regs: u32, counts: []const u32 };
 
 /// The mask of register `r`, or 0 for `no_reg`.
 fn regBit(r: u8) u32 {
