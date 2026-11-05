@@ -49,6 +49,9 @@ func_is_naked: bool = false,
 fn_ret_ty: Index = .none,
 /// See `panicNamespace`; `.none` until resolved.
 panic_ns: Index = .none,
+/// The error an `unreachable` reports, in a body that runs for it and
+/// only ends in `unreachable` (`errorUnwrapBody`).
+unwrap_err: Ref = .none,
 /// `@disableInstrumentation()` ran in `func`'s body (`Ir.disable_instrumentation`).
 disable_instrumentation: bool = false,
 ir_insts: std.MultiArrayList(Ir.Inst) = .empty,
@@ -3246,6 +3249,7 @@ const PanicId = enum(u32) {
     copy_len_mismatch,
     memcpy_alias,
     noreturn_returned,
+    load_uninstantiable_type,
     /// With the active and accessed tags.
     inactive_union_field,
     /// With the index and length.
@@ -3254,6 +3258,10 @@ const PanicId = enum(u32) {
     start_greater_than_end,
     /// With the error.
     unwrap_error,
+    /// With the error.
+    unexpected_error_code,
+    /// With the source slice's length.
+    slice_cast_len_remainder,
     /// With the expected and found sentinels.
     sentinel_mismatch,
     /// `@panic(msg)`: calls `call(msg, null)`.
@@ -3282,18 +3290,54 @@ fn addPanic(sema: *Sema, block: *Block, id: PanicId, lhs: Ref, rhs: Ref) Compile
         .out_of_bounds => .{ "outOfBounds", &.{ lhs, rhs } },
         .start_greater_than_end => .{ "startGreaterThanEnd", &.{ lhs, rhs } },
         .sentinel_mismatch => .{ "sentinelMismatch", &.{ lhs, rhs } },
-        // bs tags an untagged union with an integer, which has no
-        // field names to report.
+        // bs tags an untagged union with an integer, which has no field
+        // names: `call` gets the message upstream's `inactiveUnionField`
+        // writes.
         .inactive_union_field => if (Type.class(sema.ip, sema.typeOf(lhs)) == .@"enum")
             .{ "inactiveUnionField", &.{ lhs, rhs } }
         else
-            .{ "call", &.{ .fromInterned(try sema.stringLiteral("access of inactive union field")), .fromInterned(try sema.intern(.{ .opt = .{ .ty = try sema.optType(.usize_type), .val = .none } })) } },
+            .{ "call", &.{ try sema.inactiveUnionFieldMsg(block, lhs, rhs), .fromInterned(try sema.intern(.{ .opt = .{ .ty = try sema.optType(.usize_type), .val = .none } })) } },
         .unwrap_error => .{ "unwrapError", &.{lhs} },
+        .unexpected_error_code => .{ "unexpectedErrorCode", &.{lhs} },
+        .slice_cast_len_remainder => .{ "sliceCastLenRemainder", &.{lhs} },
         inline else => |tag| .{ comptime panicFnName(tag), &.{} },
     };
     const callee = try sema.namespaceLookupVal(block, src, ns, name, src);
     _ = try sema.analyzeCall(block, src, callee, .none, .{ .resolved = try sema.arena.dupe(Ref, args) }, .auto);
     _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
+}
+
+/// The message of upstream's `inactiveUnionField` for an untagged union:
+/// `active` is its runtime integer tag, `accessed` a union value with the
+/// accessed field active. A switch on the tag picks the message.
+fn inactiveUnionFieldMsg(sema: *Sema, block: *Block, active: Ref, accessed: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const gpa = sema.gpa;
+    const union_ty = sema.typeOf(accessed);
+    const info = ip.structInfo(union_ty);
+    const accessed_name = ip.stringSlice(info.field_names[ip.intValue(u64, ip.keyPayload(.un, accessed.toInterned().?).tag).?]);
+    const block_inst = try sema.reserveInst();
+    var bodies: std.ArrayList(u32) = .empty;
+    defer bodies.deinit(gpa);
+    for (info.field_names, 0..) |name, k| {
+        const msg = try std.fmt.allocPrint(sema.arena, "access of union field '{s}' while field '{s}' is active", .{ accessed_name, ip.stringSlice(name) });
+        var case = block.child();
+        defer case.deinitInsts();
+        _ = try sema.addInst(&case, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = try sema.coerce(&case, .slice_const_u8_type, .fromInterned(try sema.stringLiteral(msg)), block.nodeSrc(.zero)) } } });
+        try bodies.appendSlice(gpa, &.{ 1, @intCast(case.instructions.items.len), @backingInt(try sema.intValue(sema.typeOf(active), k)) });
+        try bodies.appendSlice(gpa, @ptrCast(case.instructions.items));
+    }
+    var else_block = block.child();
+    defer else_block.deinitInsts();
+    _ = try sema.addInst(&else_block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
+    var inner = block.child();
+    defer inner.deinitInsts();
+    const payload = try sema.addExtra(Ir.SwitchBr{ .cases_len = @intCast(info.field_names.len), .else_body_len = @intCast(else_block.instructions.items.len) });
+    try sema.ir_extra.appendSlice(gpa, bodies.items);
+    try sema.appendBody(else_block.instructions.items);
+    _ = try sema.addInst(&inner, .{ .tag = .switch_br, .data = .{ .pl_op = .{ .operand = active, .payload = payload } } });
+    try sema.addBlock(block, block_inst, .slice_const_u8_type, inner.instructions.items);
+    return block_inst.toRef();
 }
 
 /// `std.lang.panic`, the namespace of panic handlers: the root file's
@@ -4080,7 +4124,10 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                     return err;
                 }
                 if (block.want_safety) {
-                    try sema.addPanic(block, .reached_unreachable, .none, .none);
+                    if (sema.unwrap_err != .none)
+                        try sema.addPanic(block, .unwrap_error, sema.unwrap_err, .none)
+                    else
+                        try sema.addPanic(block, .reached_unreachable, .none, .none);
                 } else {
                     _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
                 }
@@ -4511,9 +4558,39 @@ fn zirCondbr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!?[]
     try sema.analyzeBodyInner(&then_block, then_body);
     var else_block = parent.condChild(cond_src);
     defer else_block.deinitInsts();
-    try sema.analyzeBodyInner(&else_block, else_body);
+    // `x catch unreachable`: the error the else body runs for.
+    const err: Ref = if (sema.isErrorUnwrapBody(&else_block, else_body, false)) err: {
+        const i = extra.data.condition.toIndex() orelse break :err .none;
+        if (sema.code.instructions.items(.tag)[@backingInt(i)] != .is_non_err) break :err .none;
+        const eu = sema.resolveInst(sema.code.instructions.items(.data)[@backingInt(i)].un_node.operand);
+        if (Type.class(sema.ip, sema.typeOf(eu)) != .error_union) break :err .none;
+        break :err try sema.addTyOp(&else_block, .unwrap_errunion_err, sema.ip.keyPayload(.error_union_type, sema.typeOf(eu)).error_set_type, eu);
+    } else .none;
+    try sema.analyzeErrorUnwrapBody(&else_block, else_body, err);
     try sema.addCondBr(parent, cond, then_block.instructions.items, else_block.instructions.items, .both);
     return null;
+}
+
+/// Whether `body`, run for an error, only ends in `unreachable` or
+/// `@panic`, as upstream's `maybeErrorUnwrap` asks: then its
+/// `unreachable` panics with `unwrapError` and the error.
+fn isErrorUnwrapBody(sema: *Sema, block: *Block, body: []const Zir.Inst.Index, allow_err_code: bool) bool {
+    if (!block.want_safety or block.is_comptime) return false;
+    for (body) |i| switch (sema.code.instructions.items(.tag)[@backingInt(i)]) {
+        .@"unreachable", .save_err_ret_index, .dbg_stmt, .str, .as_node, .panic => {},
+        .err_union_code => if (!allow_err_code) return false,
+        else => return false,
+    };
+    return true;
+}
+
+/// Analyzes `body`, where an `unreachable` reports error `err` if it is
+/// not `.none` (`isErrorUnwrapBody`).
+fn analyzeErrorUnwrapBody(sema: *Sema, block: *Block, body: []const Zir.Inst.Index, err: Ref) CompileError!void {
+    const saved = sema.unwrap_err;
+    sema.unwrap_err = err;
+    defer sema.unwrap_err = saved;
+    try sema.analyzeBodyInner(block, body);
 }
 
 /// `operand_src` is the returned expression, where coercion errors point,
@@ -5926,6 +6003,11 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 }
             }
             if (block.is_comptime) break :blk sema.fail(block, src, "unable to evaluate comptime expression", .{});
+            // As upstream, an error code is not zero. (Upstream also checks
+            // it against the number of errors, which the backends do not
+            // provide yet.)
+            if (!to_int and block.want_safety)
+                try sema.addSafetyCheck(block, try sema.addBinOp(block, .cmp_neq, operand, .fromInterned(try sema.intValue(.u16_type, 0))), .invalid_error_code, .none, .none);
             break :blk sema.addTyOp(block, .bitcast, if (to_int) .u16_type else .anyerror_type, operand);
         },
         .ret_addr, .frame_address => blk: {
@@ -6667,6 +6749,19 @@ fn ptrFromInt(sema: *Sema, block: *Block, src: Src, ty: Index, uncasted: Ref) Co
             return sema.fail(block, operand_src, "pointer type '{f}' does not allow address zero", .{sema.fmtType(ty)});
         return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = .int, .byte_offset = addr } }));
     }
+    try sema.requireRuntime(block, src);
+    if (block.want_safety) {
+        // As upstream: a non-optional pointer that does not allow zero
+        // must not be null, and the address must be aligned.
+        const p = Type.ptrInfo(ip, ptr_ty);
+        if (Type.class(ip, ty) != .optional and !p.flags.is_allowzero and p.flags.size != .c)
+            try sema.addSafetyCheck(block, try sema.addBinOp(block, .cmp_neq, operand, .fromInterned(.zero_usize)), .cast_to_null, .none, .none);
+        try sema.resolveLayout(block, src, p.child);
+        if (sema.ptrAlignment(p)) |a| if (a > 1) {
+            const low = try sema.addBinOp(block, .bit_and, operand, .fromInterned(try sema.intValue(.usize_type, a - 1)));
+            try sema.addSafetyCheck(block, try sema.addBinOp(block, .cmp_eq, low, .fromInterned(.zero_usize)), .incorrect_alignment, .none, .none);
+        };
+    }
     return sema.addTyOp(block, .ptr_from_int, ty, operand);
 }
 
@@ -7204,7 +7299,7 @@ fn zirErrorCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
             const eq = try sema.addBinOp(block, .cmp_eq, code, err);
             ok = if (ok.toInterned() == .bool_false) eq else try sema.addBinOp(block, .bit_or, ok, eq);
         }
-        try sema.addSafetyCheck(block, ok, .invalid_error_code, .none, .none);
+        try sema.addSafetyCheck(block, ok, .unexpected_error_code, code, .none);
     };
     try sema.resolveLayout(block, src, dest_ty);
     return sema.addTyOp(block, .bitcast, dest_ty, operand);
@@ -9330,7 +9425,24 @@ fn zirTagName(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
         return sema.tagNameValue(ip.stringSlice(ip.structInfo(ty).field_names[i]));
     }
     try sema.requireRuntime(block, src);
+    try sema.checkNamedEnumValue(block, operand, .invalid_enum_value);
     return sema.addTyOp(block, .tag_name, .slice_const_u8_sentinel_0_type, operand);
+}
+
+/// Checks at run time, with safety on, that enum value `operand` is one of
+/// its type's named tags, else panics with `id` (upstream's
+/// `is_named_enum_value` checks).
+fn checkNamedEnumValue(sema: *Sema, block: *Block, operand: Ref, id: PanicId) CompileError!void {
+    const ip = sema.ip;
+    const info = ip.structInfo(sema.typeOf(operand));
+    if (!block.want_safety or info.field_defaults.len >= std.math.maxInt(u16)) return;
+    const int = try sema.addTyOp(block, .bitcast, info.tag_type, operand);
+    var ok: Ref = .fromInterned(.bool_false);
+    for (info.field_defaults) |v| {
+        const eq = try sema.addBinOp(block, .cmp_eq, int, .fromInterned(v));
+        ok = if (ok == Ref.fromInterned(.bool_false)) eq else try sema.addBinOp(block, .bit_or, ok, eq);
+    }
+    try sema.addSafetyCheck(block, ok, id, .none, .none);
 }
 
 /// The comptime-known result of `@tagName`: like upstream, a string
@@ -9887,6 +9999,17 @@ fn coercePtrTo(sema: *Sema, block: *Block, ptr: Ref, ty: Index) CompileError!Ref
         }
     }
     if (block.is_comptime and !block.discards_runtime) return sema.fail(block, .{ .base = block.src_base, .loc = .{ .node = .zero } }, "unable to evaluate comptime expression", .{});
+    // As upstream's coerceCompatiblePtrs: a C pointer (or allowzero one)
+    // that becomes one that does not allow zero must not be null.
+    if (Type.class(ip, src_ty) != .pointer or Type.class(ip, ty) != .pointer) return sema.addTyOp(block, .bitcast, ty, ptr);
+    const s = Type.ptrInfo(ip, src_ty);
+    const d = Type.ptrInfo(ip, ty);
+    if (block.want_safety and (s.flags.size == .c or s.flags.is_allowzero) and s.flags.size != .slice and
+        d.flags.size != .c and d.flags.size != .slice and !d.flags.is_allowzero)
+    {
+        const addr = try sema.addUnOp(block, .int_from_ptr, ptr);
+        try sema.addSafetyCheck(block, try sema.addBinOp(block, .cmp_neq, addr, .fromInterned(.zero_usize)), .cast_to_null, .none, .none);
+    }
     return sema.addTyOp(block, .bitcast, ty, ptr);
 }
 
@@ -12489,6 +12612,13 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
     const info = Type.ptrInfo(ip, ptr_ty);
     if (info.flags.vector_index != 0) return sema.analyzeLoad(block, src, try sema.vectorElemAccessPtr(block, src, ptr));
     if (Type.class(ip, info.child) == .@"opaque") return sema.fail(block, src, "cannot load opaque type '{f}'", .{sema.fmtType(info.child)});
+    // As upstream, loading an uninstantiable type is illegal behavior,
+    // before memory is read, also at comptime.
+    if (Type.hasNoPossibleValue(ip, info.child) and info.child != .noreturn_type and sema.layoutResolved(info.child)) {
+        if (block.is_comptime) return sema.fail(block, src, "cannot load uninstantiable type '{f}'", .{sema.fmtType(info.child)});
+        if (block.want_safety) try sema.addPanic(block, .load_uninstantiable_type, .none, .none) else _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
+        return .unreachable_value;
+    }
     if (sema.resolveValue(ptr)) |pv| if (!sema.bcForeign(pv)) {
         // Under @TypeOf only the type matters, also through a generic
         // function's runtime parameter, which stands as undefined.
@@ -12730,11 +12860,15 @@ fn cPtrToSingle(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref
     info.flags.size = .one;
     info.flags.is_allowzero = false;
     const single_ty = try sema.ptrType(info);
-    if (sema.resolveValue(ptr)) |v| {
-        const k = sema.ip.indexToKey(v);
-        // Under `@TypeOf`, only the type matters, as upstream.
-        if (k == .ptr and k.ptr.base == .int and k.ptr.byte_offset == 0 and !block.is_typeof) return sema.fail(block, src, "unable to unwrap null", .{});
-    } else if (block.want_safety and !block.is_comptime) {
+    const null_known = if (sema.resolveValue(ptr)) |v| switch (sema.ip.indexToKey(v)) {
+        .ptr => |p| p.base == .int and p.byte_offset == 0,
+        else => false,
+    } else false;
+    // Under `@TypeOf`, only the type matters, as upstream. A null known at
+    // comptime fails only at comptime; at run time it is checked, as
+    // upstream's load through a C pointer is.
+    if (null_known and block.is_comptime and !block.is_typeof) return sema.fail(block, src, "unable to unwrap null", .{});
+    if ((null_known or sema.resolveValue(ptr) == null) and block.want_safety and !block.is_comptime) {
         const ok = try sema.addBinOp(block, .cmp_neq, try sema.addUnOp(block, .int_from_ptr, ptr), .fromInterned(.zero_usize));
         try sema.addSafetyCheck(block, ok, .unwrap_null, .none, .none);
     }
@@ -14166,7 +14300,10 @@ fn unionFieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, i: u32, initial
             const loaded = try sema.analyzeLoad(block, src, ptr);
             const active = try sema.addTyOp(block, .get_union_tag, info.tag_type, loaded);
             const ok = try sema.addBinOp(block, .cmp_eq, active, tag);
-            try sema.addSafetyCheck(block, ok, .inactive_union_field, active, tag);
+            // An integer tag names no fields: the accessed field is
+            // passed as a union value with it active.
+            const accessed: Ref = if (Type.class(ip, info.tag_type) == .@"enum") tag else .fromInterned(try sema.intern(.{ .un = .{ .ty = union_ty, .tag = try sema.unionFieldTagValue(union_ty, i), .val = try sema.undefValue(field_ty) } }));
+            try sema.addSafetyCheck(block, ok, .inactive_union_field, active, accessed);
         }
     }
     return sema.fieldPtrAt(block, src, ptr, field_ty, i);
@@ -15271,7 +15408,7 @@ fn loadElem(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref)
                 try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none);
                 // `elemPtrOfArrayPtr`.
                 if (p.flags.alignment != 0) try sema.resolveLayout(block, src, a.child);
-                if (try sema.comptimePtrRoot(pv) == .int) break :comptime_known;
+                if (try sema.comptimePtrRoot(pv) == .int or Type.hasNoPossibleValue(ip, a.child)) break :comptime_known;
                 const e = try sema.ptrElemPtrKey(pv, ip.intValue(u64, sema.resolveValue(index).?).?, false);
                 if (try sema.comptimeLoadKey(block, src, e.key, e.elem_ty, .none)) |v| return .fromInterned(v);
             },
@@ -15283,6 +15420,7 @@ fn loadElem(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref)
                 const cp = Type.ptrInfo(ip, ip.typeOf(sv));
                 const index = try sema.coerce(block, .usize_type, uncasted_index, src);
                 try sema.resolveLayout(block, src, cp.child);
+                if (Type.hasNoPossibleValue(ip, cp.child)) break :comptime_known;
                 try sema.boundsCheck(block, src, index, .fromInterned(ip.keyPayload(.slice, sv).len), cp.sentinel != .none);
                 const e = try sema.ptrElemPtrKey(ip.keyPayload(.slice, sv).ptr, ip.intValue(u64, sema.resolveValue(index).?).?, false);
                 if (try sema.comptimeLoadKey(block, src, e.key, e.elem_ty, .none)) |v| return .fromInterned(v);
@@ -15707,6 +15845,11 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                     if (cp.flags.size == .c) if (try sema.resolveDefinedValue(block, src, obj)) |v| {
                         const k = ip.keyPayload(.ptr, v);
                         if (k.base == .int and k.byte_offset == 0) return sema.fail(block, src, "slice of null pointer", .{});
+                    } else if (block.want_safety and !block.is_comptime) {
+                        // As upstream: a run-time C pointer sliced must not
+                        // be null.
+                        const addr = try sema.addUnOp(block, .int_from_ptr, obj);
+                        try sema.addSafetyCheck(block, try sema.addBinOp(block, .cmp_neq, addr, .fromInterned(.zero_usize)), .unwrap_null, .none, .none);
                     };
                     elem_ty = cp.child;
                     ptr_sentinel = cp.sentinel;
@@ -17081,6 +17224,7 @@ fn emitSwitchProngs(sema: *Sema, outer: *Block, src: Src, inst: Zir.Inst.Index, 
             var else_block = outer.condChild(src.operandSrc(0));
             defer else_block.deinitInsts();
             if (else_case) |e| {
+                try sema.checkSwitchElse(&else_block, cond, operand);
                 try sema.analyzeProng(&else_block, e, operand, capture_inst, inst);
             } else if (outer.want_safety) {
                 try sema.addPanic(&else_block, .corrupt_switch, .none, .none);
@@ -17093,6 +17237,17 @@ fn emitSwitchProngs(sema: *Sema, outer: *Block, src: Src, inst: Zir.Inst.Index, 
             _ = try sema.addInst(outer, .{ .tag = .switch_br, .data = .{ .pl_op = .{ .operand = cond, .payload = payload } } });
         }
     }
+}
+
+/// As upstream, the `else` prong of a run-time switch on an exhaustive
+/// enum or a tagged union's tag first checks that the tag `cond` is a
+/// named one.
+fn checkSwitchElse(sema: *Sema, block: *Block, cond: Ref, operand: Ref) CompileError!void {
+    const ip = sema.ip;
+    const ty = sema.typeOf(cond);
+    if (Type.class(ip, ty) != .@"enum" or sema.resolveValue(cond) != null) return;
+    if (ip.structInfo(ty).nonexhaustive and Type.class(ip, sema.typeOf(operand)) != .@"union") return;
+    try sema.checkNamedEnumValue(block, cond, .corrupt_switch);
 }
 
 /// The label of the runtime block of ZIR block `inst` enclosing `block`.
@@ -17310,6 +17465,11 @@ fn analyzeProng(sema: *Sema, block: *Block, c: SwitchCase, operand: Ref, capture
         _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
         return;
     }
+    // A prong on an error that only ends in `unreachable` reports the
+    // error (`isErrorUnwrapBody`).
+    if (Type.class(ip, op_ty) == .error_set and sema.isErrorUnwrapBody(block, c.body, true)) {
+        return sema.analyzeErrorUnwrapBody(block, c.body, operand);
+    }
     if (try sema.analyzeInlineBody(block, c.body, switch_inst)) |result| {
         // A prong ended with a comptime break to the switch.
         try sema.addBr(block, labelOf(block, switch_inst).?, result, block.nodeSrc(.zero));
@@ -17318,7 +17478,10 @@ fn analyzeProng(sema: *Sema, block: *Block, c: SwitchCase, operand: Ref, capture
 
 fn switchAsCondBrs(sema: *Sema, block: *Block, src: Src, cases: []const SwitchCase, else_case: ?SwitchCase, cond_operand: Ref, operand: Ref, capture_inst: Zir.Inst.Index, switch_inst: Zir.Inst.Index) CompileError!void {
     if (cases.len == 0) {
-        if (else_case) |e| return sema.analyzeProng(block, e, operand, capture_inst, switch_inst);
+        if (else_case) |e| {
+            try sema.checkSwitchElse(block, cond_operand, operand);
+            return sema.analyzeProng(block, e, operand, capture_inst, switch_inst);
+        }
         if (block.want_safety) return sema.addPanic(block, .corrupt_switch, .none, .none);
         _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
         return;
@@ -18195,6 +18358,15 @@ fn hasBitRepresentation(sema: *Sema, ty: Index) bool {
 }
 
 fn bitCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) CompileError!Ref {
+    const result = try sema.bitCastUnchecked(block, src, dest_ty, operand);
+    // As upstream's `bit_cast_safe`: a run-time result of an exhaustive
+    // enum type must name a tag.
+    if (Type.class(sema.ip, dest_ty) == .@"enum" and !sema.ip.structInfo(dest_ty).nonexhaustive and sema.resolveValue(result) == null)
+        try sema.checkNamedEnumValue(block, result, .invalid_enum_value);
+    return result;
+}
+
+fn bitCastUnchecked(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) CompileError!Ref {
     const ip = sema.ip;
     const src_ty = sema.typeOf(operand);
     if (Type.isInt(ip, dest_ty) and Type.isInt(ip, src_ty)) {
@@ -18742,7 +18914,7 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
         const new_len = try sema.addBinOp(block, .div_trunc, bytes, .fromInterned(try sema.intValue(.usize_type, dsize)));
         if (block.want_safety and ssize % dsize != 0) {
             const rem = try sema.addBinOp(block, .rem, bytes, .fromInterned(try sema.intValue(.usize_type, dsize)));
-            try sema.addSafetyCheck(block, try sema.addBinOp(block, .cmp_eq, rem, .fromInterned(.zero_usize)), .exact_division_remainder, .none, .none);
+            try sema.addSafetyCheck(block, try sema.addBinOp(block, .cmp_eq, rem, .fromInterned(.zero_usize)), .slice_cast_len_remainder, len, .none);
         }
         return sema.makeSlice(block, dest_ty, many, new_len);
     }
@@ -19492,10 +19664,17 @@ fn analyzeCall(
         if (modifier == .always_tail) try sema.bcRefuse();
         if (modifier == .always_tail and ip.target != .aarch64_macos) return sema.failTailCall(block, src);
         if (fn_ty.cc == .auto) sema.has_error_trace = true;
-        const payload = try sema.addExtra(Ir.Call{ .ret_ty = ret_ty, .args_len = @intCast(args.len), .flags = .{ .always_tail = modifier == .always_tail } });
+        // As upstream, a function pointer or extern function that does not
+        // return panics if it does: the call returns void, then panics.
+        const check_ret = block.want_safety and modifier != .always_tail and Type.hasNoPossibleValue(ip, ret_ty);
+        const payload = try sema.addExtra(Ir.Call{ .ret_ty = if (check_ret) .void_type else ret_ty, .args_len = @intCast(args.len), .flags = .{ .always_tail = modifier == .always_tail } });
         try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(args));
         const call = try sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = callee_ptr, .payload = payload } } });
         if (modifier == .always_tail) return sema.tailRet(block, src, fn_ty_index, call);
+        if (check_ret) {
+            try sema.addPanic(block, .noreturn_returned, .none, .none);
+            return .unreachable_value;
+        }
         return sema.endIfNoReturn(block, call);
     }
     if (comptime_call) {

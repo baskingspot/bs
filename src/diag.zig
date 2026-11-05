@@ -1888,6 +1888,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "no size available for uninstantiable type '{f}'", .@"bad-type" },
     .{ "no size available for comptime-only type '{f}'", .@"bad-type" },
     .{ "no align available for uninstantiable type '{f}'", .@"bad-type" },
+    .{ "cannot load uninstantiable type '{f}'", .@"bad-type" },
     .{ "array of opaque type '{f}' not allowed", .@"bad-type" },
     .{ "opaque return type '{s}{f}' not allowed", .@"bad-fn-type" },
     .{ "parameter of {s}type '{f}' not allowed", .@"bad-fn-type" },
