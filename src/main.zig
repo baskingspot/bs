@@ -4,6 +4,7 @@ const Io = std.Io;
 const build_options = @import("build_options");
 const diag = @import("diag.zig");
 const Frontend = @import("Frontend.zig");
+const BlockCache = @import("BlockCache.zig");
 const BuildWeb = @import("BuildWeb.zig");
 const Zcu = @import("Zcu.zig");
 const Ir = @import("Ir.zig");
@@ -222,14 +223,21 @@ pub const std_options: std.Options = .{
 var safe_gpa: std.heap.SafeAllocator = undefined;
 const own_gpa = (builtin.mode == .safe or builtin.mode == .debug) and !builtin.link_libc;
 
+/// A ReleaseFast or ReleaseSafe bs keeps up to 16 MiB of freed large
+/// blocks for reuse (`BlockCache`), under the ReleaseSafe SafeAllocator.
+/// More buys little: on ghostty's lib-vt, 128 MiB took 1 s off a 9.9 s
+/// cold build at 145 MB more peak memory, 16 MiB 0.6 s at 32 MB.
+var block_cache: BlockCache = .{ .child = std.heap.smp_allocator, .cap = 16 << 20 };
+const use_block_cache = builtin.mode != .debug and !builtin.link_libc;
+
 pub fn main(init_std: std.process.Init) !void {
     var init = init_std;
     if (own_gpa) {
-        safe_gpa = if (builtin.mode == .safe) .init(std.heap.smp_allocator, .{}) else .init(std.heap.page_allocator, .{
+        safe_gpa = if (builtin.mode == .safe) .init(block_cache.allocator(), .{}) else .init(std.heap.page_allocator, .{
             .stack_trace_frames = if (init.environ_map.get("BS_ALLOC_TRACES")) |v| std.fmt.parseInt(usize, v, 10) catch 7 else 0,
         });
         init.gpa = safe_gpa.allocator();
-    }
+    } else if (use_block_cache) init.gpa = block_cache.allocator();
     // Reports leaks, as std.start does for the allocator it made.
     defer if (own_gpa) {
         _ = safe_gpa.deinit();
@@ -2528,6 +2536,7 @@ pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
 
 test {
     _ = Frontend;
+    _ = BlockCache;
     _ = @import("cache.zig");
     _ = @import("cpu.zig");
     _ = @import("link/Atom.zig");
