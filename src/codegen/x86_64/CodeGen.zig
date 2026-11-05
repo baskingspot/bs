@@ -757,17 +757,19 @@ fn argScratch(cg: *CodeGen, n: usize) Error!struct { []Index, []AutoArg } {
 /// size is assembled from the top down: the highest byte or word
 /// zero-extended, then each lower word written into the low half after a
 /// shift, which keeps the rest. No scratch register, so `m` may be
-/// addressed through any register but `reg` (r11 for a deferred load
-/// whose pointer is in memory, `deferredMem`).
-fn loadBytes(cg: *CodeGen, reg: Reg, m: Mem, n: u64) Error!void {
+/// addressed through any register (r11 for a deferred load whose pointer
+/// is in memory, `deferredMem`); through `reg` itself, r11 holds the
+/// address instead, since the first load overwrites `reg`.
+fn loadBytes(cg: *CodeGen, reg: Reg, mem: Mem, n: u64) Error!void {
     const e = &cg.e;
     switch (n) {
-        8 => return e.mov(.qword, .{ .reg = reg }, .{ .mem = m }),
-        4 => return e.movzx(.qword, reg, .dword, .{ .mem = m }),
-        2 => return e.movzx(.qword, reg, .word, .{ .mem = m }),
-        1 => return e.movzx(.qword, reg, .byte, .{ .mem = m }),
+        8 => return e.mov(.qword, .{ .reg = reg }, .{ .mem = mem }),
+        4 => return e.movzx(.qword, reg, .dword, .{ .mem = mem }),
+        2 => return e.movzx(.qword, reg, .word, .{ .mem = mem }),
+        1 => return e.movzx(.qword, reg, .byte, .{ .mem = mem }),
         else => {},
     }
+    const m = try cg.addressFree(mem, reg);
     var off: u64 = n - 2 + n % 2;
     try e.movzx(.qword, reg, if (n % 2 == 1) .byte else .word, .{ .mem = offsetMem(m, off) });
     while (off > 0) {
@@ -812,8 +814,41 @@ fn loadPair(cg: *CodeGen, lo: Reg, hi: Reg, ref: Ref) Error!void {
     if (cg.pairOf(ref) != null) return cg.loadRegs(.{ .lo = lo, .hi = hi }, ref);
     const size = Type.abiSize(cg.ip, cg.typeOf(ref));
     const m = try cg.memOf(ref);
-    try cg.e.mov(.qword, .{ .reg = lo }, .{ .mem = m });
-    try cg.loadBytes(hi, offsetMem(m, 8), size - 8);
+    if (memUses(m, lo) and !memUses(m, hi)) {
+        try cg.loadBytes(hi, offsetMem(m, 8), size - 8);
+        return cg.e.mov(.qword, .{ .reg = lo }, .{ .mem = m });
+    }
+    const a = try cg.addressFree(m, lo);
+    try cg.e.mov(.qword, .{ .reg = lo }, .{ .mem = a });
+    try cg.loadBytes(hi, offsetMem(a, 8), size - 8);
+}
+
+/// Whether `m` is addressed through `r`.
+fn memUses(m: Mem, r: Reg) bool {
+    return (m.base == .reg and m.base.reg == r) or (m.index != null and m.index.?.reg == r);
+}
+
+/// `m`, or, if it is addressed through `r`, the same memory through r11
+/// holding its address: a load in pieces into `r` would overwrite the
+/// address before its last piece.
+fn addressFree(cg: *CodeGen, m: Mem, r: Reg) Error!Mem {
+    if (!memUses(m, r)) return m;
+    try cg.e.lea(.qword, .r11, m);
+    return Mem.at(.r11, 0);
+}
+
+/// Loads the qwords at `m` and 8 bytes after it into `lo` and `hi`. `m`
+/// may be addressed through either: the register it is addressed
+/// through is written last.
+fn loadQwords(cg: *CodeGen, lo: Reg, hi: Reg, m: Mem) Error!void {
+    const e = &cg.e;
+    if (memUses(m, lo) and !memUses(m, hi)) {
+        try e.mov(.qword, .{ .reg = hi }, .{ .mem = offsetMem(m, 8) });
+        return e.mov(.qword, .{ .reg = lo }, .{ .mem = m });
+    }
+    const a = try cg.addressFree(m, lo);
+    try e.mov(.qword, .{ .reg = lo }, .{ .mem = a });
+    try e.mov(.qword, .{ .reg = hi }, .{ .mem = offsetMem(a, 8) });
 }
 
 fn setupParams(cg: *CodeGen) Error!void {
@@ -1324,9 +1359,7 @@ fn loadRegs(cg: *CodeGen, d: Regs, ref: Ref) Error!void {
         if (p.hi != d.hi) try cg.e.mov(.qword, .{ .reg = d.hi }, .{ .reg = p.hi });
         return;
     }
-    const m = try cg.memOf(ref);
-    try cg.e.mov(.qword, .{ .reg = d.lo }, .{ .mem = m });
-    try cg.e.mov(.qword, .{ .reg = d.hi }, .{ .mem = offsetMem(m, 8) });
+    try cg.loadQwords(d.lo, d.hi, try cg.memOf(ref));
 }
 
 /// Whether `ty`'s values live in two general-purpose registers when they
@@ -4053,11 +4086,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
                 return cg.copyTo((try cg.resultMem(inst, ty)) orelse return, data.ty_op.operand);
             }
-            if (cg.pairOf(inst.toRef())) |d| {
-                const m = try cg.ptrMem(data.ty_op.operand);
-                try cg.e.mov(.qword, .{ .reg = d.lo }, .{ .mem = m });
-                return cg.e.mov(.qword, .{ .reg = d.hi }, .{ .mem = offsetMem(m, 8) });
-            }
+            if (cg.pairOf(inst.toRef())) |d| return cg.loadQwords(d.lo, d.hi, try cg.ptrMem(data.ty_op.operand));
             if (cg.passInRegs(ty)) return cg.loadResult(inst, ty, try cg.ptrMem(data.ty_op.operand));
             const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.copyMem(dst, try cg.ptrMem(data.ty_op.operand), Type.abiSize(ip, data.ty_op.ty));
@@ -4870,9 +4899,7 @@ fn memDest(cg: *CodeGen, ptr: Reg, len: Reg, dest: Ref) Error!u64 {
     const ip = cg.ip;
     const p = Type.ptrInfo(ip, cg.typeOf(dest));
     if (p.flags.size == .slice) {
-        const m = try cg.memOf(dest);
-        try cg.e.mov(.qword, .{ .reg = ptr }, .{ .mem = m });
-        try cg.e.mov(.qword, .{ .reg = len }, .{ .mem = offsetMem(m, 8) });
+        try cg.loadQwords(ptr, len, try cg.memOf(dest));
         return Type.abiSize(ip, p.child);
     }
     const a = ip.keyPayload(.array_type, p.child);
@@ -6872,17 +6899,8 @@ fn cCallArgs(cg: *CodeGen, args: []const Val, ret_ty: Index, dst: ?Mem) Error!u8
     };
     for (args, locs, mems) |a, l, m| if (l == .regs) switch (cg.cClass(a.ty)) {
         .int => try cg.loadVal(c_arg_regs[l.regs.gp], a),
-        .int_pair => {
-            try cg.e.mov(.qword, .{ .reg = c_arg_regs[l.regs.gp] }, .{ .mem = m });
-            try cg.e.mov(.qword, .{ .reg = c_arg_regs[l.regs.gp + 1] }, .{ .mem = offsetMem(m, 8) });
-        },
-        .agg => |ebs| {
-            var r = l.regs.gp;
-            for (ebs, 0..) |eb, i| if (eb == .int) {
-                try cg.loadBytes(c_arg_regs[r], offsetMem(m, 8 * i), ebBytes(Type.abiSize(ip, a.ty), i));
-                r += 1;
-            };
-        },
+        .int_pair => try cg.loadQwords(c_arg_regs[l.regs.gp], c_arg_regs[l.regs.gp + 1], m),
+        .agg => |ebs| try cg.loadIntEbs(c_arg_regs[l.regs.gp..], m, ebs, Type.abiSize(ip, a.ty)),
         else => {},
     };
     for (args, locs, mems) |a, l, m| if (l == .elems) {
@@ -6931,11 +6949,24 @@ fn loadEbs(cg: *CodeGen, m: Mem, ebs: [2]Eb, size: u64) Error!void {
         try cg.loadXmmBytes(xmm_args[x], offsetMem(m, 8 * i), ebBytes(size, i));
         x += 1;
     };
-    var r: u8 = 0;
+    try cg.loadIntEbs(&c_ret_regs, m, ebs, size);
+}
+
+/// Loads the integer eightbytes among `ebs` of the `size`-byte value at
+/// `m` into `regs`, in order. `m` may be addressed through them: the
+/// register it is addressed through is written last.
+fn loadIntEbs(cg: *CodeGen, regs: []const Reg, m: Mem, ebs: [2]Eb, size: u64) Error!void {
+    var dst: [2]?Reg = .{ null, null };
+    var r: usize = 0;
     for (ebs, 0..) |eb, i| if (eb == .int) {
-        try cg.loadBytes(c_ret_regs[r], offsetMem(m, 8 * i), ebBytes(size, i));
+        dst[i] = regs[r];
         r += 1;
     };
+    const lo_used = dst[0] != null and memUses(m, dst[0].?);
+    const hi_used = dst[1] != null and memUses(m, dst[1].?);
+    const a = if (lo_used and hi_used) try cg.addressFree(m, dst[0].?) else m;
+    const order: [2]usize = if (lo_used and !hi_used) .{ 1, 0 } else .{ 0, 1 };
+    for (order) |i| if (dst[i]) |reg| try cg.loadBytes(reg, offsetMem(a, 8 * i), ebBytes(size, i));
 }
 
 const c_ret_regs = [_]Reg{ .rax, .rdx };
@@ -7161,11 +7192,7 @@ fn cRet(cg: *CodeGen, operand: Ref) Error!void {
                 try cg.e.fld(.m64, offsetMem(m, 16));
             }
         },
-        .int_pair => {
-            const m = try cg.memOf(operand);
-            try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = m });
-            try cg.e.mov(.qword, .{ .reg = .rdx }, .{ .mem = offsetMem(m, 8) });
-        },
+        .int_pair => try cg.loadQwords(.rax, .rdx, try cg.memOf(operand)),
         .sse => try cg.loadXmm(.xmm0, try cg.valOf(operand)),
         .agg => |ebs| try cg.loadEbs(try cg.memOf(operand), ebs, Type.abiSize(cg.ip, ty)),
         .x87 => try cg.e.fld(.m80, try cg.memOf(operand)),
