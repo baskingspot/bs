@@ -1401,7 +1401,18 @@ In this order, each with the measured reason it is there:
    exit only branches on its result: each `br` to it with a constant
    jumps to the branch's side, and each other `br` becomes that branch,
    on the `br`'s operand (the `br` still writes the result when the
-   result has other uses). A labeled switch's `continue` that stores a
+   result has other uses). The exit may also hold the next condition's
+   block (`a and b and c`) and debug state, may negate the result, and
+   may only pass the result on to an enclosing bool block (an inlined
+   call's `return a < b`), when nothing else reads the results it skips.
+   A branch on a value prove substituted for a block left by one `br`
+   (an inlined call's result, whose `br`s then carry nothing) is tested
+   at the `br` instead; that duplicates one branch, and the exits it
+   skips are dropped when every `br` to them is threaded. An exit that
+   is not emitted still gives the blocks it opens their homes
+   (`emitBlocks`). The result: `cmp; jcc` where a compare was
+   materialized with `setcc; movzx; test; jcc` (sort's insertion loop,
+   vaxis's cell comparisons). A labeled switch's `continue` that stores a
    constant to the switched local right before its `repeat` jumps to the
    case that constant selects, when the loop header is only the load
    and the `switch_br` and nothing else reads the load (a capture does,

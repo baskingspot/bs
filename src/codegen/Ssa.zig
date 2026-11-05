@@ -269,11 +269,15 @@ pub fn switchCases(f: *const Ssa, term: Term, len: usize) []const Block.Index {
     return f.extra.items[term.succ[0]..][0..len];
 }
 
-/// The condition of a `branch` terminator: its `cond_br`'s, or a threaded
-/// `br`'s operand (`thread`).
+/// The condition of a `branch` terminator: its `cond_br`'s, a threaded
+/// `br`'s operand, or a threaded branch's value itself (`thread`).
 pub fn branchCond(ir: *const Ir, term: Term) Inst.Ref {
     const data = ir.instructions.items(.data)[@backingInt(term.inst)];
-    return if (ir.instructions.items(.tag)[@backingInt(term.inst)] == .br) data.br.operand else data.pl_op.operand;
+    return switch (ir.instructions.items(.tag)[@backingInt(term.inst)]) {
+        .br => data.br.operand,
+        .cond_br => data.pl_op.operand,
+        else => term.inst.toRef(),
+    };
 }
 
 /// Builds `f` from `ir`, replacing what it held.
@@ -447,7 +451,9 @@ pub fn bypassUnread(f: *Ssa, ir: *const Ir) void {
 ///   operand, so the bool is never tested. The `br`s still write the
 ///   result, which is then dead unless something else reads it, and the
 ///   block after the body, which nothing reaches any more, is not emitted
-///   (`unreached`).
+///   (`unreached`). That block may hold values without code (the next
+///   condition's block in `a and b and c`), and may only pass the result
+///   on to an enclosing bool block (`threadExit`).
 /// - A loop whose header only loads a local and switches on it (a labeled
 ///   switch's dispatch, `continue :sw .x`): a `repeat` right after a store
 ///   of a constant to the local goes to the case holding it, when nothing
@@ -462,31 +468,25 @@ fn thread(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Allocat
     // Loop headers checked for the switch dispatch, and whether they have it.
     var headers: std.AutoHashMapUnmanaged(u32, bool) = .empty;
     defer headers.deinit(gpa);
+    // `countReads`, when a chain first needs it.
+    var counts: ?[]u32 = null;
+    defer if (counts) |c| gpa.free(c);
     for (f.layout.items) |block| {
         const b = &f.blocks.items[@backingInt(block)];
         if (b.term.tag != .jump) continue;
         const ti = @backingInt(b.term.inst);
         switch (tags[ti]) {
             .br => {
-                const br = datas[ti].br;
-                const blk = @backingInt(br.block_inst);
-                if (tags[blk] != .block or datas[blk].ty_pl.ty != .bool_type) continue;
-                const x = f.targets.items[blk];
-                const xb = &f.blocks.items[@backingInt(x)];
-                if (f.unreached.items[@backingInt(x)]) {
-                    // Done for an earlier `br`.
-                } else if (xb.len != 0 or xb.term.tag != .branch or branchCond(ir, xb.term) != br.block_inst.toRef()) {
-                    continue;
+                // An exit threaded through for an earlier `br`.
+                if (f.unreached.items[@backingInt(block)]) continue;
+                const to = (try f.threadExit(gpa, ir, b.term.inst, &counts)) orelse continue;
+                // A constant goes to the side it selects.
+                if (to.value.toInterned() == .bool_true) {
+                    b.term.succ[0] = to.term.succ[0];
+                } else if (to.value.toInterned() == .bool_false) {
+                    b.term.succ[0] = to.term.succ[1];
                 } else {
-                    f.unreached.items[@backingInt(x)] = true;
-                }
-                const succ = f.blocks.items[@backingInt(x)].term.succ;
-                if (br.operand.toInterned() == .bool_true) {
-                    b.term.succ[0] = succ[0];
-                } else if (br.operand.toInterned() == .bool_false) {
-                    b.term.succ[0] = succ[1];
-                } else {
-                    b.term = .{ .tag = .branch, .inst = b.term.inst, .succ = succ };
+                    b.term = to.term;
                 }
             },
             .repeat => {
@@ -517,6 +517,158 @@ fn thread(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Allocat
     for (f.layout.items) |block| {
         if (f.unreached.items[@backingInt(block)]) f.blocks.items[@backingInt(block)].term.tag = .unreach;
     }
+}
+
+/// Where a threaded `br` (`thread`) goes: the branch that tests its
+/// block's result, with the value it tests there and the condition
+/// (`branchCond`) to branch with: the `br`, whose operand the value is,
+/// or the value itself. The way there may pass exits that only pass a
+/// result on to an enclosing bool block (an inlined call's
+/// `return a < b`), may negate it, and may test a value prove substituted
+/// for the result of a block left by one `br`. Each exit passed has no
+/// code (`noCode`) but such a negation, and the result its skipped `br`
+/// writes is read by nothing but the next exit; so is the `br`'s own
+/// block's, when the value replaces the `br`. Marks an exit `unreached`
+/// when every `br` to its block is threaded: the rest of the way tests the
+/// block's result, or the block has one `br`. Null when there is no such
+/// branch.
+fn threadExit(f: *Ssa, gpa: Allocator, ir: *const Ir, br_inst: Inst.Index, counts: *?[]u32) Allocator.Error!?struct { term: Term, value: Inst.Ref } {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const insts = f.values.items(.inst);
+    const br = datas[@backingInt(br_inst)].br;
+    // The blocks passed, and whether the way on from each needs the value
+    // the `br` writes rather than only its block's result.
+    var chain: [8]struct { t: Inst.Index, by_value: bool } = undefined;
+    var n: usize = 0;
+    var t = br.block_inst;
+    // `t`'s result, when known: `value`, negated if `neg`.
+    var value: ?Inst.Ref = if (br.operand == Inst.Ref.void_value) null else br.operand;
+    var neg = false;
+    const exit: Term = while (n < chain.len) : (n += 1) {
+        if (tags[@backingInt(t)] != .block or datas[@backingInt(t)].ty_pl.ty != .bool_type) return null;
+        const xb = f.blocks.items[@backingInt(f.targets.items[@backingInt(t)])];
+        chain[n] = .{ .t = t, .by_value = false };
+        var not: ?Inst.Index = null;
+        for (insts[xb.start..][0..xb.len]) |v| {
+            if (noCode(tags[@backingInt(v)])) continue;
+            if (not != null or tags[@backingInt(v)] != .not) return null;
+            not = v;
+        }
+        if (xb.term.tag != .branch and (xb.term.tag != .jump or tags[@backingInt(xb.term.inst)] != .br)) return null;
+        // What the exit's terminator reads.
+        var r = branchCond(ir, xb.term);
+        if (not) |x| {
+            if (r != x.toRef() or try f.countsOf(gpa, ir, counts, .reads, x) != 1) return null;
+            r = datas[@backingInt(x)].ty_op.operand;
+        }
+        if (r == t.toRef()) {
+            // The result.
+        } else if (value != null and r == value.?) {
+            neg = false;
+            chain[n].by_value = true;
+        } else if (r == Inst.Ref.void_value) {
+            value = null;
+        } else {
+            value = r;
+            neg = false;
+            chain[n].by_value = true;
+        }
+        if (not != null) neg = !neg;
+        if (xb.term.tag == .branch) break xb.term;
+        const next = datas[@backingInt(xb.term.inst)].br.block_inst;
+        if (!try f.readOnlyByExit(gpa, ir, next, counts)) return null;
+        t = next;
+    } else return null;
+    n += 1;
+    const tested = value orelse return null;
+    const succ: [2]u32 = if (neg) .{ exit.succ[1], exit.succ[0] } else exit.succ;
+    var cond = br_inst;
+    if (tested != br.operand) {
+        // Available at the `br` unless an exit passed defines it.
+        cond = tested.toIndex() orelse return .{ .term = .{ .tag = .branch, .inst = br_inst, .succ = succ }, .value = tested };
+        for (chain[0..n]) |e| {
+            const xb = f.blocks.items[@backingInt(f.targets.items[@backingInt(e.t)])];
+            if (std.mem.findScalar(Inst.Index, insts[xb.start..][0..xb.len], cond) != null) return null;
+        }
+        if (br.operand != Inst.Ref.void_value and !try f.readOnlyByExit(gpa, ir, br.block_inst, counts)) return null;
+    }
+    var by_result = true;
+    var i = n;
+    while (i > 0) {
+        i -= 1;
+        by_result = by_result and !chain[i].by_value;
+        if (by_result or try f.countsOf(gpa, ir, counts, .brs, chain[i].t) == 1)
+            f.unreached.items[@backingInt(f.targets.items[@backingInt(chain[i].t)])] = true;
+    }
+    return .{ .term = .{ .tag = .branch, .inst = cond, .succ = succ }, .value = tested };
+}
+
+/// Whether nothing but the terminator of block `t`'s exit reads its
+/// result, or a negation of it the terminator reads.
+fn readOnlyByExit(f: *Ssa, gpa: Allocator, ir: *const Ir, t: Inst.Index, counts: *?[]u32) Allocator.Error!bool {
+    const term = f.blocks.items[@backingInt(f.targets.items[@backingInt(t)])].term;
+    const by_exit = switch (term.tag) {
+        .branch => cond: {
+            const c = branchCond(ir, term);
+            const ci = c.toIndex() orelse break :cond false;
+            break :cond c == t.toRef() or (ir.instructions.items(.tag)[@backingInt(ci)] == .not and ir.instructions.items(.data)[@backingInt(ci)].ty_op.operand == t.toRef());
+        },
+        .jump => jump: {
+            if (ir.instructions.items(.tag)[@backingInt(term.inst)] != .br) break :jump false;
+            const o = ir.instructions.items(.data)[@backingInt(term.inst)].br.operand;
+            const oi = o.toIndex() orelse break :jump false;
+            break :jump o == t.toRef() or (ir.instructions.items(.tag)[@backingInt(oi)] == .not and ir.instructions.items(.data)[@backingInt(oi)].ty_op.operand == t.toRef());
+        },
+        else => false,
+    };
+    return try f.countsOf(gpa, ir, counts, .reads, t) == @intFromBool(by_exit);
+}
+
+/// How many values and terminators read IR instruction `inst`, or how
+/// many `br`s go to it; counted for all of them at the first call.
+fn countsOf(f: *const Ssa, gpa: Allocator, ir: *const Ir, counts: *?[]u32, what: enum { reads, brs }, inst: Inst.Index) Allocator.Error!u32 {
+    const n = ir.instructions.len;
+    if (counts.* == null) {
+        const tags = ir.instructions.items(.tag);
+        const datas = ir.instructions.items(.data);
+        const all = try gpa.alloc(u32, 2 * n);
+        @memset(all, 0);
+        const Count = struct {
+            reads: []u32,
+            const Self = @This();
+            pub fn use(c: Self, ref: Inst.Ref) void {
+                if (ref.toIndex()) |i| c.reads[@backingInt(i)] += 1;
+            }
+        };
+        const c: Count = .{ .reads = all[0..n] };
+        for (f.values.items(.inst)) |v| forEachOperand(ir, v, c);
+        for (f.layout.items) |block| {
+            const term = f.blocks.items[@backingInt(block)].term;
+            switch (term.tag) {
+                .jump, .branch => if (tags[@backingInt(term.inst)] == .br) {
+                    const br = datas[@backingInt(term.inst)].br;
+                    c.use(br.operand);
+                    all[n + @backingInt(br.block_inst)] += 1;
+                } else if (term.tag == .branch) c.use(branchCond(ir, term)),
+                .switch_br => c.use(datas[@backingInt(term.inst)].pl_op.operand),
+                .ret => c.use(datas[@backingInt(term.inst)].un_op),
+                .fallthrough, .noreturn, .unreach => {},
+            }
+        }
+        counts.* = all;
+    }
+    return counts.*.?[@as(usize, @backingInt(what)) * n + @backingInt(inst)];
+}
+
+/// Whether a value with tag `tag` emits no code: a block's result, which
+/// gets its home from the architecture's `emitBlocks` also in a block that
+/// is not emitted, or debug state, which it keeps in place there.
+pub fn noCode(tag: Inst.Tag) bool {
+    return switch (tag) {
+        .block, .dbg_stmt, .dbg_inline_end => true,
+        else => false,
+    };
 }
 
 /// Whether loop header `h` (one load and a switch on it, `thread`) loads
@@ -657,7 +809,7 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
                 // The `br` writes the block's result.
                 const blk = @backingInt(term_data.br.block_inst);
                 w.end[blk] = @max(w.end[blk], term_pos);
-            } else if (b.term.tag == .branch) w.use(term_data.pl_op.operand),
+            } else if (b.term.tag == .branch) w.use(branchCond(ir, b.term)),
             .switch_br => w.use(term_data.pl_op.operand),
             .ret => w.use(term_data.un_op),
             .fallthrough, .noreturn, .unreach => {},
@@ -748,7 +900,7 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
         const cond: ?Inst.Index = if (b.term.tag != .branch) null else if (tags[@backingInt(b.term.inst)] == .br) cond: {
             const br = datas[@backingInt(b.term.inst)].br;
             break :cond if (uses[@backingInt(br.block_inst)] == 0) br.operand.toIndex() else null;
-        } else datas[@backingInt(b.term.inst)].pl_op.operand.toIndex();
+        } else branchCond(ir, b.term).toIndex();
         const values = insts[b.start..][0..b.len];
         for (values, 0..) |inst, k| {
             const i = @backingInt(inst);

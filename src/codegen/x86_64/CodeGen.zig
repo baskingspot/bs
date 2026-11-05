@@ -1716,7 +1716,7 @@ fn termUsesR11(cg: *CodeGen, block: Ssa.Block.Index) bool {
         // r11 after writing its block's result.
         .branch => ir.instructions.items(.tag)[@backingInt(term.inst)] == .br or
             // A compare fused into the branch is lowered there.
-            deferred(cg, data.pl_op.operand) or if (data.pl_op.operand.toIndex()) |c| cg.fusedUsesR11(c) else false,
+            deferred(cg, Ssa.branchCond(ir, term)) or if (Ssa.branchCond(ir, term).toIndex()) |c| cg.fusedUsesR11(c) else false,
         .jump => ir.instructions.items(.tag)[@backingInt(term.inst)] == .br and deferred(cg, data.br.operand),
         .fallthrough, .noreturn, .unreach => false,
     };
@@ -4265,7 +4265,14 @@ fn emitBlocks(cg: *CodeGen) Error!void {
     for (cg.labels) |*l| l.* = try cg.e.newLabel();
     var k: usize = 0; // the next block in `order`
     for (f.layout.items, 0..) |block, i| {
-        if (!f.emits(i, block)) continue;
+        if (!f.emits(i, block)) {
+            // A threaded block's exit keeps values without code (`Ssa.thread`):
+            // block results get their homes, and debug state stays in place.
+            for (f.blockInsts(block)) |inst| {
+                if (Ssa.noCode(cg.ir.instructions.items(.tag)[@backingInt(inst)]) and cg.homes[@backingInt(inst)] != .dead) try cg.genInst(inst);
+            }
+            continue;
+        }
         if (f.cold.items[@backingInt(block)]) {
             try cg.cold_starts.append(cg.gpa, .{ .line = cg.dbg_line, .column = cg.dbg_column, .open_start = @intCast(cg.cold_open.items.len), .open_len = @intCast(cg.dbg_open.items.len) });
             try cg.cold_open.appendSlice(cg.gpa, cg.dbg_open.items);
