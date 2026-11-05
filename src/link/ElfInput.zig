@@ -122,6 +122,17 @@ pub fn parseObject(arena: Allocator, path: []const u8, bytes: []const u8) Error!
     return parseObjectFor(arena, path, bytes, .x86_64);
 }
 
+/// Whether ELF object `bytes` references, without defining, a symbol whose
+/// name starts with `prefix`; true if it does not parse.
+pub fn referencesUndefined(arena: Allocator, bytes: []const u8, prefix: []const u8) Allocator.Error!bool {
+    const o = parseObject(arena, "", bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return true,
+    };
+    for (o.syms) |sym| if (sym.st_shndx == elf.SHN_UNDEF and std.mem.startsWith(u8, o.symName(sym), prefix)) return true;
+    return false;
+}
+
 /// Parses an ELF64 ET_REL of `arch` in place.
 pub fn parseObjectFor(arena: Allocator, path: []const u8, bytes: []const u8, arch: Atom.Unwind.Arch) Error!Object {
     if (bytes.len < @sizeOf(elf.Elf64_Ehdr) or !std.mem.eql(u8, bytes[0..4], elf.MAGIC)) return error.InvalidObject;

@@ -522,7 +522,6 @@ pub const Job = struct {
         }
         var job_opts = opts;
         job_opts.modules = modules;
-        if (opts.c_root) job_opts.root_src_path = try Builtin.writeCMain(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }), plainC(&opts));
         // An executable or test that fuzzes links the fuzzer, whose
         // module family has a builtin of its own, as upstream's separate
         // compilation of it (a static library) does. A program other
@@ -990,13 +989,21 @@ fn cxxRuntime(opts: *const Options) bool {
 }
 
 /// Whether the build is C only (`Options.c_root`) and nothing in it calls
-/// ubsan_rt: no C source has `-fsanitize-c=full`, and there are no object
-/// or archive inputs, which may have been built with it. Upstream links
-/// no ubsan_rt then, and its compiler_rt (an archive after libc, of one
-/// member) only for names libc lacks.
-fn plainC(opts: *const Options) bool {
+/// ubsan_rt: no C source's object references a `__ubsan_*` handler, which
+/// only `-fsanitize-c=full` emits, and there are no object or archive
+/// inputs, which may. Upstream links ubsan_rt, an archive member, only
+/// when something references it, and its compiler_rt (an archive after
+/// libc, of one member) only for names libc lacks. Waits for the C
+/// objects of a build with `-fsanitize-c=full` sources; on aarch64, such
+/// a build counts as calling ubsan_rt.
+fn plainC(arena: std.mem.Allocator, opts: *const Options, c_batch: ?*CSource.Batch) !bool {
     if (!opts.c_root or opts.link_inputs.len != 0) return false;
-    for (opts.c_sources) |s| if (s.flags.sanitizeC() == .full) return false;
+    for (opts.c_sources) |s| {
+        if (s.flags.sanitizeC() == .full) break;
+    } else return true;
+    if (opts.bs_target.arch() != .x86_64) return false;
+    const b = c_batch orelse return false;
+    for ((try b.wait()).objects) |o| if (try ElfInput.referencesUndefined(arena, o.bytes, "__ubsan_")) return false;
     return true;
 }
 
@@ -1081,9 +1088,10 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
 
     const is_test = opts.command.isTest();
     const test_runner = opts.test_runner orelse try std.fs.path.join(arena, &.{ job.zig_lib_dir, "compiler", "test_runner.zig" });
+    const plain = try plainC(arena, &opts, c_batch);
     const fe_node = prog.start("Load Sources", 0);
     var fe: Frontend = try .init(init.gpa, init.io, job.zig_lib_dir, .{
-        .root_src_path = if (is_test) test_runner else opts.root_src_path,
+        .root_src_path = if (is_test) test_runner else if (opts.c_root) try Builtin.writeCMain(arena, init.io, try std.fs.path.join(arena, &.{ job.cache_dirs.global, "bs" }), plain) else opts.root_src_path,
         .root_dir = opts.root_dir,
         .builtin_dir = job.builtin_dir,
         .main_src_path = if (is_test) opts.root_src_path else null,
@@ -1101,7 +1109,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         // and calls glibc's `__stack_chk_fail`; glibc before 2.4 lacks
         // it, and upstream's then comes from compiler_rt.
         .c_runtimes = !opts.objects_only and ((!opts.command.isObj() and opts.command != .build_lib) or opts.dynamic) and (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp) and
-            !(plainC(&opts) and opts.glibc_version != null and opts.glibc_version.?.order(.{ .major = 2, .minor = 4, .patch = 0 }) != .lt),
+            !(plain and opts.glibc_version != null and opts.glibc_version.?.order(.{ .major = 2, .minor = 4, .patch = 0 }) != .lt),
     });
     defer fe.deinit();
     try fe.enableCache(job.cache_dirs);
@@ -1199,7 +1207,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     };
     if (glibc != null) emit.runpath = opts.runpath;
     emit.lld = opts.c_root;
-    emit.libc_first = glibc != null and plainC(&opts);
+    emit.libc_first = glibc != null and plain;
     // aarch64-macos links against Mach-O dylibs, with LC_RPATHs.
     const macos = opts.bs_target == .aarch64_macos;
     if (macos) {

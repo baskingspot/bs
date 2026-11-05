@@ -1899,6 +1899,21 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         cexe_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
         test_step.dependOn(&cexe_run.step);
     }
+    // C only with -fsanitize-c=full that calls no `__ubsan_*` handler: no
+    // ubsan_rt and no std panic handler, so it links against glibc 2.4,
+    // which lacks functions std's I/O calls.
+    {
+        const nexe = b.addRunArtifact(bs);
+        nexe.setName("bs build-exe -lc c_nocheck.c (x86_64-linux-gnu.2.4)");
+        nexe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu.2.4" });
+        nexe.addFileArg(b.path("test/link_input/c_nocheck.c"));
+        nexe.setEnvironmentVariable("BS_ZIG", zig);
+        const r = std.Build.Step.Run.create(b, "run bs -lc build of c_nocheck.c (x86_64-linux-gnu.2.4)");
+        r.addFileArg(nexe.addPrefixedOutputFileArg("-femit-bin=", "c_nocheck"));
+        r.addCheck(.{ .expect_stdout_exact = "no checks\n" });
+        r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&r.step);
+    }
     // Which memcmp C only calls: glibc's (interposable) without UBSan's
     // runtime, compiler_rt's with it, as upstream's compiler_rt archive
     // after libc resolves only names libc lacks unless ubsan_rt pulls it.

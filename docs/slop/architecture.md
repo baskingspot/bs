@@ -7695,14 +7695,20 @@ libraries as inputs. To be agreed with that thread.
   which declares `_start` so that std's start code exports neither
   `_start` nor `main`. glibc_start.zig calls C's `main`, and the build
   roots compiler_rt and ubsan_rt as any executable with C does, and
-  caches like one. Without `-fsanitize-c=full` C sources and without
-  object inputs, nothing reports through a panic handler, so the root
+  caches like one. When no C source's object references a `__ubsan_*`
+  handler (none has `-fsanitize-c=full`, or its code has nothing UBSan
+  checks, such as calls to `sin` and `cos`) and there are no object
+  inputs, nothing reports through a panic handler (`main.plainC`; on
+  x86_64 the build waits for the C objects before analysis to read
+  their undefined symbols, as upstream's archive of ubsan_rt is pulled
+  only by a reference). The root then
   sets `panic = std.debug.no_panic`: upstream's crt1.o and compiler_rt
   (built with no safety) have none either. Otherwise compiler_rt's
   `__stack_chk_fail` and the std functions it shares with the program
   reach std's default handler, whose I/O imports glibc functions that
   glibc before 2.16 lacks (`accept4`, `sendmmsg`), and the program
-  grows from 275 KB to 2.4 MB. Either way the root's std options are
+  grows from 275 KB to 2.4 MB (a shared library of `sin` and `cos`:
+  2.4 MB and 92 imports, against 14.6 KB and 2 when plain). Either way the root's std options are
   upstream's ubsan_rt.zig root's, the only Zig upstream links into C:
   no networking, so std's I/O imports no socket functions (`accept4`,
   `getaddrinfo`, `sendmmsg`), and no segfault handler, which crt1.o
