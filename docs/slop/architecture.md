@@ -928,8 +928,13 @@ comptime arguments are run-time values in the lowered code (uucode's
   loops, which store the old value back after a failed compare so that
   the read is atomic), and f16 arithmetic without
   FEAT_FP16 calls compiler_rt (`fpType`), where `fcvt` still converts
-  halves. The cache is not used yet. The inline assembly std's Linux code
-  needs adds `msr tpidr_el0`, the shifts, and the extension aliases.
+  halves. Builds use the cache as x86_64-linux's do (`Job.cacheable`
+  keys on the OS): the manifest's numbered link is the ELF linker's, with
+  `Elf.Options.arch` from `Incremental.arch`, and records already carry
+  aarch64's relocation kinds and unwind records. A no-change build of
+  std's tests relinks in 0.2 s against 9 s cold. The inline assembly
+  std's Linux code needs adds `msr tpidr_el0`, the shifts, and the
+  extension aliases.
 - Panics are calls, as upstream: `@panic` and each failed safety check
   call the matching function of `std.lang.panic` (`integerOverflow`,
   `outOfBounds(index, len)`, `call(msg, null)`, ...), then `unreach`.

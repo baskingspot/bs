@@ -562,7 +562,7 @@ pub const Job = struct {
         // objects have their records.
         // aarch64-macos does not use the cache yet: its relink would need
         // the Mach-O linker's inputs in the manifest.
-        return !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and job.opts.bs_target == .x86_64_linux and
+        return !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and job.opts.bs_target.os() == .linux and
             !std.mem.eql(u8, job.environ_map.get("BS_CACHE") orelse "", "off");
     }
 

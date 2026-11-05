@@ -1,7 +1,8 @@
 //! signal: ABRT
+//! targets: x86_64-linux aarch64-linux
 //! rebuild-without: "// Moved down by the edit.\n"
 //! stderr-contains: "panic: boom\n"
-//! stderr-contains: "panic_inline.zig:22:16: 0x"
+//! stderr-contains: "panic_inline.zig:23:16: 0x"
 //! stderr-contains: " in check ("
 //! stderr-contains: "    if (x > 2) @panic(\"boom\");\n               ^\n"
 //! stderr-contains: "start.zig:788:64: 0x"

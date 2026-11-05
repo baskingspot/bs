@@ -192,7 +192,11 @@ pub fn build(b: *std.Build) void {
 ///                               (`qemu-aarch64-static` or `qemu-aarch64`
 ///                               on PATH), builds it for that target with
 ///                               bs (`test`) and upstream (`test-upstream`)
-///                               and checks both
+///                               and checks both; bs builds it with its
+///                               `rebuild-without` edits (not lib edits
+///                               or -lc) as an edit build checked against
+///                               a full build, then relinks it, which
+///                               must give a full build's bytes
 ///
 /// `test` builds each with bs and checks it; `test-upstream` does the same
 /// with upstream zig, so every program is checked against the oracle.
@@ -332,15 +336,8 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 // then the earlier and this one again, each an edit build
                 // checked against a full build, then this one with nothing
                 // changed (a relink), all from the cache.
-                var earlier = source;
-                var body_start: usize = 0;
-                while (std.mem.startsWith(u8, earlier[body_start..], "//! ")) body_start = std.mem.indexOfScalarPos(u8, earlier, body_start, '\n').? + 1;
-                for (expect.rebuild_without.items) |edit| {
-                    const at = std.mem.indexOfPos(u8, earlier, body_start, edit[0]) orelse std.debug.panic("{s}: rebuild-without text not found", .{src_path});
-                    earlier = b.fmt("{s}{s}{s}", .{ earlier[0..at], edit[1], earlier[at + edit[0].len ..] });
-                }
                 const files = b.addWriteFiles();
-                const before = files.add(file, earlier);
+                const before = files.add(file, earlierVersion(b, source, expect.rebuild_without.items, src_path));
                 // A lib edit: a copy of the lib directory of links, and the
                 // edited file's two versions.
                 var lib_setup: []const u8 = "";
@@ -587,10 +584,48 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             test_step.dependOn(&run.step);
         }
         if (expect.aarch64_linux) for ([_]bool{ false, true }) |upstream| {
-            const compile = if (upstream) b.addSystemCommand(&.{upstreamZig(b)}) else b.addRunArtifact(bs);
-            compile.addArgs(&.{ "build-exe", "-target", "aarch64-linux" });
-            compile.addFileArg(b.path(src_path));
-            const bin = compile.addPrefixedOutputFileArg("-femit-bin=", name);
+            const rebuild = !upstream and expect.rebuild_without.items.len != 0;
+            if (rebuild and (expect.lib_edit != null or expect.libc)) std.debug.panic("{s}: aarch64-linux rebuilds take neither lib edits nor -lc", .{src_path});
+            const compile = if (rebuild) blk: {
+                // The earlier version, then this one as an edit build
+                // checked against a full build, then a relink that must
+                // give the bytes of a build without the cache.
+                const files = b.addWriteFiles();
+                const before = files.add(file, earlierVersion(b, source, expect.rebuild_without.items, src_path));
+                const r = b.addSystemCommand(&.{
+                    "sh", "-c",
+                    b.fmt(
+                        \\set -e
+                        \\out=$4 compiler=$5
+                        \\mkdir -p "$out.d"
+                        \\cp "$3" "$out.d/rt.zig"
+                        \\cp "$1" "$out.d/{[file]s}"
+                        \\bs() {{ "$compiler" build-exe -target aarch64-linux "$out.d/{[file]s}" -femit-bin="$1" 2>"$out.d/log" || {{ cat "$out.d/log" >&2; exit 1; }}; }}
+                        \\bs "$out"
+                        \\cp "$2" "$out.d/{[file]s}"
+                        \\BS_CACHE_VERIFY=1 BS_CACHE_CHECK=1 bs "$out"
+                        \\rm "$out"
+                        \\bs "$out"
+                        \\BS_CACHE=off bs "$out.d/full"
+                        \\cmp "$out" "$out.d/full" >&2
+                    , .{ .file = file }),
+                    "sh",
+                });
+                r.addFileArg(before);
+                r.addFileArg(b.path(src_path));
+                r.addFileArg(b.path("test/run/rt.zig"));
+                takes(b, &r.step, if (std.mem.indexOf(u8, source, "@import(\"std\")") != null) 4 else 1);
+                break :blk r;
+            } else if (upstream) b.addSystemCommand(&.{upstreamZig(b)}) else b.addRunArtifact(bs);
+            const bin = if (rebuild) blk: {
+                const out = compile.addOutputFileArg(name);
+                compile.addArtifactArg(bs);
+                break :blk out;
+            } else blk: {
+                compile.addArgs(&.{ "build-exe", "-target", "aarch64-linux" });
+                compile.addFileArg(b.path(src_path));
+                break :blk compile.addPrefixedOutputFileArg("-femit-bin=", name);
+            };
             const runner = aarch64_linux_runner orelse {
                 if (!upstream) test_step.dependOn(&compile.step);
                 continue;
@@ -611,6 +646,20 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             (if (upstream) upstream_step else test_step).dependOn(&run.step);
         };
     }
+}
+
+/// `source` with each of `edits` (text, and what the earlier version has
+/// instead) undone after its header lines: the earlier version a
+/// `rebuild-without` test builds first.
+fn earlierVersion(b: *std.Build, source: []const u8, edits: []const [2][]const u8, src_path: []const u8) []const u8 {
+    var earlier = source;
+    var body_start: usize = 0;
+    while (std.mem.startsWith(u8, earlier[body_start..], "//! ")) body_start = std.mem.indexOfScalarPos(u8, earlier, body_start, '\n').? + 1;
+    for (edits) |edit| {
+        const at = std.mem.indexOfPos(u8, earlier, body_start, edit[0]) orelse std.debug.panic("{s}: rebuild-without text not found", .{src_path});
+        earlier = b.fmt("{s}{s}{s}", .{ earlier[0..at], edit[1], earlier[at + edit[0].len ..] });
+    }
+    return earlier;
 }
 
 fn isTraceChecked(file: []const u8) bool {

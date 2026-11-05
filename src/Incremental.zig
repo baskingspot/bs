@@ -617,6 +617,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     var diag: Elf.Diagnostic = .{};
     const options: Elf.Options = .{
         .entry = if (inc.output == .exe) @fromBackingInt(m.entry) else null,
+        .arch = inc.arch,
         .dynamic = if (exe_dyn) &dynamic else null,
         .aliases = aliases,
         .symbols = .{
@@ -921,6 +922,7 @@ fn linkWithInputs(
     var diag: Elf.Diagnostic = .{};
     const options: Elf.Options = .{
         .entry = @fromBackingInt(m.entry),
+        .arch = inc.arch,
         .values = values.items,
         .diag = &diag,
         .comp_dir = cwd,
