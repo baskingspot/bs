@@ -25,9 +25,11 @@ const Frontend = @import("Frontend.zig");
 const Incremental = @import("Incremental.zig");
 const BuildRunner = @import("BuildRunner.zig");
 const ToolRecord = @import("ToolRecord.zig");
+const InternPool = @import("InternPool.zig");
 
 const Request = struct {
     source: []const u8,
+    target: InternPool.Target,
     link_libc: bool,
     /// The target's glibc, which the target triple names: the native
     /// system's without `-target`, as upstream's native target, with or
@@ -129,9 +131,12 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
     }
     const target = opts.target orelse "native";
     var native_includes: []const []const u8 = &.{};
-    if (std.mem.eql(u8, target, "native")) {
-        if (!(@import("builtin").cpu.arch == .x86_64 and @import("builtin").os.tag == .linux))
-            main.setUnsupported(&opts, arena, "bs translates C only for x86_64-linux so far ('native'); pass -target x86_64-linux", .{})
+    const host = @import("builtin").target;
+    if (std.mem.eql(u8, target, "native") and host.cpu.arch == .aarch64 and host.os.tag == .macos) {
+        opts.bs_target = .aarch64_macos;
+    } else if (std.mem.eql(u8, target, "native")) {
+        if (!(host.cpu.arch == .x86_64 and host.os.tag == .linux))
+            main.setUnsupported(&opts, arena, "bs translates C only for x86_64-linux and aarch64-macos so far ('native'); pass -target x86_64-linux", .{})
         else if (std.zig.system.resolveTargetQuery(io, .{})) |native| {
             if (native.abi.isGnu()) opts.glibc_version = native.os.version_range.linux.glibc;
             if (named_libs) if (std.zig.system.NativePaths.detect(arena, io, &native, init.environ_map)) |paths| {
@@ -145,13 +150,20 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         const libc = opts.link_libc;
         opts.link_libc = true;
         main.checkTarget(&opts, arena, target);
-        if (opts.bs_target != .x86_64_linux)
-            main.setUnsupported(&opts, arena, "bs translates C only for x86_64-linux so far ('{s}'); pass -target x86_64-linux", .{target});
         opts.link_libc = libc;
-        if (opts.link_libc and opts.unsupported == null) main.resolveGlibc(&opts, arena, io);
+        if (opts.link_libc and opts.unsupported == null and opts.bs_target == .x86_64_linux) main.resolveGlibc(&opts, arena, io);
+    }
+    // As the code bs compiles the headers into: apple_m1, whatever the
+    // host (`-mcpu native` included).
+    // Darwin always links libc (libSystem), as upstream's
+    // `requiresLibC`, so its headers are always on the include path.
+    if (opts.bs_target == .aarch64_macos) {
+        opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
+        opts.link_libc = true;
     }
     return .{
         .source = source orelse if (opts.unsupported != null) "" else main.fatal("expected a C source file to translate", .{}),
+        .target = opts.bs_target,
         .link_libc = opts.link_libc,
         .glibc_version = opts.glibc_version,
         .cpu = opts.cpu,
@@ -271,16 +283,20 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
         try std.fmt.allocPrint(arena, "--zig-lib={s}", .{lib}), "--",
         "-x",                                                   "c",
         "-isystem",                                             try std.fs.path.join(arena, &.{ lib, "compiler", "aro", "include" }),
-        "-fno-PIE",                                             if (req.link_libc) "-fPIC" else "-fno-PIC",
-        "-gdwarf-4",                                            "-gdwarf32",
-        "-fno-lto",                                             "-fhosted",
+    });
+    // Darwin code is always position-independent.
+    const macos = req.target == .aarch64_macos;
+    try argv.appendSlice(arena, &.{
+        if (macos) "-fPIE" else "-fno-PIE", if (req.link_libc) "-fPIC" else "-fno-PIC",
+        "-gdwarf-4",                        "-gdwarf32",
+        "-fno-lto",                         "-fhosted",
         "-nostdinc",
     });
-    const query_text = if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "x86_64-linux-gnu.{f}", .{v}) else "x86_64-linux-none";
+    const query_text = if (macos) "aarch64-macos" else if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "x86_64-linux-gnu.{f}", .{v}) else "x86_64-linux-none";
     const query = try std.Target.Query.parse(.{ .arch_os_abi = query_text, .cpu_features = "baseline" });
     var target = try std.zig.system.resolveTargetQuery(io, query);
     target.cpu = req.cpu;
-    if (req.link_libc) try argv.append(arena, try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{req.glibc_version.?.minor}));
+    if (req.link_libc and !macos) try argv.append(arena, try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{req.glibc_version.?.minor}));
     try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ lib, "include" }) });
     if (req.link_libc) {
         const dirs = try std.zig.LibCDirs.detectFromBuilding(arena, .{ .root_dir = .cwd(), .sub_path = lib }, &target);
