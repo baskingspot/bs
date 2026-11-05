@@ -2100,7 +2100,7 @@ fn navResultHash(ip: *const InternPool, nav: *const InternPool.Nav) Hash {
 /// type gaining a `type` field can leave sizes and offsets alone. Before
 /// the layout is known (an opaque type, a failed one), the type's
 /// identity.
-fn layoutResultHash(ip: *const InternPool, ty: InternPool.Index) Hash {
+pub fn layoutResultHash(ip: *const InternPool, ty: InternPool.Index) Hash {
     const id = ip.stableHash(ty);
     const kind = std.meta.activeTag(ip.indexToKey(ty));
     if (kind == .opaque_type) return id;

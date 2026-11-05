@@ -45,6 +45,7 @@ const unroll = @import("codegen/unroll.zig");
 const forward = @import("codegen/forward.zig");
 const Sema = @import("Sema.zig");
 const cache = @import("cache.zig");
+const Incremental = @import("Incremental.zig");
 
 const Emit = @This();
 
@@ -723,6 +724,25 @@ const ProcessMode = enum {
     body,
 };
 
+/// The layouts the body of `func` read (its `type_layout` dependencies),
+/// in any order: its IR names types by identity, but a caller it is
+/// inlined into lays out their fields as they are now, so its inline
+/// result changes with them.
+fn layoutsHash(zcu: *Zcu, func: Index) cache.Hash {
+    var sum: cache.Hash = 0;
+    const deps = zcu.deps.get(.{ .func = func }) orelse return 0;
+    for (deps, 0..) |d, i| switch (d) {
+        .type_layout => |ty| {
+            const dup = for (deps[0..i]) |prev| {
+                if (prev == .type_layout and prev.type_layout == ty) break true;
+            } else false;
+            if (!dup) sum +%= Incremental.layoutResultHash(&zcu.ip, ty);
+        },
+        else => {},
+    };
+    return sum;
+}
+
 /// Decides what `ir`'s function inlines and whether it is inlinable,
 /// splices the inlinable callees in, and hands it on as `mode` says.
 /// Returns false if a callee could not be decided now (in progress, or
@@ -808,7 +828,7 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     const inlinable = all and size <= emit.inline_budget * inline_ir.nested_loop_factor;
     // Of its own body, before the splices.
     const loaded = emit.inline_fates.contains(func);
-    const own_hash: cache.Hash = if (inlinable and !loaded) try inline_ir.hashBody(gpa, &zcu.ip, &ir) else 0;
+    const own_hash: cache.Hash = if (inlinable and !loaded) try inline_ir.hashBody(gpa, &zcu.ip, &ir) +% layoutsHash(zcu, func) else 0;
     // `inline_bodies` is final now.
     for (splices.items, bodies.items) |*sp, b| sp.body = &emit.inline_bodies.items[b];
     // Sema recorded the rest of them.
