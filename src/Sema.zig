@@ -19525,6 +19525,30 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
             return err;
         }
     }
+    // `@alignCast` to a stricter alignment checks the operand's address
+    // before any change of size, as upstream's ptrCastFull: now if it is
+    // comptime-known, else at runtime, where a slice of length 0 to a
+    // slice may have any address.
+    if (flags.align_cast) {
+        try sema.resolveLayout(block, src, s.child);
+        try sema.resolveLayout(block, src, d.child);
+        const da = sema.ptrAlignment(d) orelse 1;
+        if (da > (sema.ptrAlignment(s) orelse 1)) {
+            if (sema.resolveValue(operand)) |v| {
+                const p = if (s.flags.size == .slice and !sema.isUndef(v)) ip.keyPayload(.slice, v).ptr else v;
+                if (ip.keyTag(p) == .ptr and ip.keyPayload(.ptr, p).base == .int and ip.keyPayload(.ptr, p).byte_offset % da != 0)
+                    return sema.fail(block, sema.callArgSrc(src, false, 0), "pointer address 0x{X} is not aligned to {d} bytes", .{ ip.keyPayload(.ptr, p).byte_offset, da });
+            } else if (block.want_safety and !block.is_comptime) {
+                const raw = if (s.flags.size == .slice) try sema.slicePtr(block, operand) else operand;
+                const addr = try sema.addUnOp(block, .int_from_ptr, raw);
+                const low = try sema.addBinOp(block, .bit_and, addr, .fromInterned(try sema.intValue(.usize_type, da - 1)));
+                var ok = try sema.addBinOp(block, .cmp_eq, low, .fromInterned(.zero_usize));
+                if (s.flags.size == .slice and d.flags.size == .slice)
+                    ok = try sema.addBinOp(block, .bit_or, try sema.addBinOp(block, .cmp_eq, try sema.sliceLen(block, operand), .fromInterned(.zero_usize)), ok);
+                try sema.addSafetyCheck(block, ok, .incorrect_alignment, .none, .none);
+            }
+        }
+    }
     if (s.flags.size == .slice and d.flags.size != .slice) {
         // The slice's pointer.
         const raw = try sema.slicePtr(block, operand);
@@ -19584,27 +19608,6 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
             try sema.addSafetyCheck(block, try sema.addBinOp(block, .cmp_eq, rem, .fromInterned(.zero_usize)), .slice_cast_len_remainder, len, .none);
         }
         return sema.makeSlice(block, dest_ty, many, new_len);
-    }
-    // `@alignCast` to a stricter alignment of a comptime-known address is
-    // checked now, as upstream.
-    if (flags.align_cast) if (sema.resolveValue(operand)) |v| if (ip.keyTag(v) == .ptr and ip.keyPayload(.ptr, v).base == .int) {
-        try sema.resolveLayout(block, src, d.child);
-        const da = sema.ptrAlignment(d) orelse 1;
-        const addr = ip.keyPayload(.ptr, v).byte_offset;
-        if (da > (sema.ptrAlignment(s) orelse 1) and addr % da != 0)
-            return sema.fail(block, sema.callArgSrc(src, false, 0), "pointer address 0x{X} is not aligned to {d} bytes", .{ addr, da });
-    };
-    // `@alignCast` to a stricter alignment is checked at runtime.
-    if (flags.align_cast and block.want_safety and !block.is_comptime and sema.resolveValue(operand) == null) {
-        try sema.resolveLayout(block, src, d.child);
-        const da = sema.ptrAlignment(d) orelse 1;
-        const sa = sema.ptrAlignment(s) orelse 1;
-        if (da > sa and da > 1) {
-            const addr = try sema.addUnOp(block, .int_from_ptr, operand);
-            const low = try sema.addBinOp(block, .bit_and, addr, .fromInterned(try sema.intValue(.usize_type, da - 1)));
-            const ok = try sema.addBinOp(block, .cmp_eq, low, .fromInterned(.zero_usize));
-            try sema.addSafetyCheck(block, ok, .incorrect_alignment, .none, .none);
-        }
     }
     return sema.coercePtrTo(block, operand, dest_ty);
 }
