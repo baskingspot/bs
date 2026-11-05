@@ -10577,8 +10577,13 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
     if (ca == .null) return if (cb == .optional) b else sema.optType(b);
     if (cb == .null) return if (ca == .optional) a else sema.optType(a);
     if (ca == .optional and cb == .optional) return sema.optType(try sema.peerPair(block, src, Type.childType(ip, a), Type.childType(ip, b)));
-    if (ca == .optional and cb != .optional) return sema.optType(try sema.peerPair(block, src, Type.childType(ip, a), b));
-    if (cb == .optional and ca != .optional) return sema.optType(try sema.peerPair(block, src, a, Type.childType(ip, b)));
+    // A C pointer peer gives a C pointer, which holds null itself, as
+    // upstream's `c_ptr` strategy.
+    if (ca == .optional and cb != .optional or cb == .optional and ca != .optional) {
+        const r = if (ca == .optional) try sema.peerPair(block, src, Type.childType(ip, a), b) else try sema.peerPair(block, src, a, Type.childType(ip, b));
+        if (Type.class(ip, r) == .pointer and Type.ptrInfo(ip, r).flags.size == .c) return r;
+        return sema.optType(r);
+    }
     if (ca == .vector or cb == .vector) {
         const elems = struct {
             fn f(p: *InternPool, ty: Index) ?struct { u64, Index } {
