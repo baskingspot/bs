@@ -1920,10 +1920,12 @@ build, the passes, and the debug info treat them as Sema's inline calls
     size and hash; the hash mixes `f`'s canonical IR hash (`inline.
     hashBody`: instructions numbered by first appearance, InternPool
     indices by stable hash, names by their bytes, positions relative to
-    `f`'s declaration), the layouts `f`'s body read (its `type_layout`
-    dependencies' results, `Emit.layoutsHash`: the IR names a type by
-    identity and a field by index, and a caller lays out the fields as
-    they are now; test/run/edit_inline_layout.zig), its inlined callees'
+    `f`'s declaration, and the layout results of the containers whose
+    values it holds or whose fields or elements it addresses: the IR
+    names a type by identity and a field by index, and a caller lays out
+    the fields as they are now, test/run/edit_inline_layout.zig; taken
+    from the IR, not from `f`'s `type_layout` dependencies, which differ
+    with the comptime tier that ran its calls), its inlined callees'
     hashes, its size, and the variant (`Emit.inlineSalt`: budget and full/safe). A function that is
     not inlinable has the result `salt ^ 1`, so edits to a large `f` do
     not touch its callers. The size is the node's one result word, and

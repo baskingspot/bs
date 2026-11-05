@@ -11,6 +11,7 @@ const Ir = @import("../Ir.zig");
 const Inst = Ir.Inst;
 const Type = @import("../Type.zig");
 const Zcu = @import("../Zcu.zig");
+const Incremental = @import("../Incremental.zig");
 const Zir = std.zig.Zir;
 
 /// The most instructions with hot code (`Scan.size`) a body inlined at a
@@ -560,8 +561,28 @@ pub fn hashBody(gpa: Allocator, ip: *const InternPool, ir: *const Ir) Allocator.
     var h: Hasher = .{ .gpa = gpa, .ip = ip, .ir = ir };
     defer h.words.deinit(gpa);
     defer h.numbers.deinit(gpa);
+    defer h.types.deinit(gpa);
     try h.numbers.appendNTimes(gpa, no_number, ir.instructions.len);
     try h.body(ir.mainBody());
+    // The layouts of the containers whose values the body holds or whose
+    // fields it addresses, named by identity above: a caller the body is
+    // inlined into lays them out as they are now. From the IR, not the
+    // function's dependencies, which differ with the comptime tier that
+    // ran its calls; and only layouts the code needs, which every tier
+    // has resolved.
+    var i: usize = 0;
+    while (i < h.types.count()) : (i += 1) {
+        const ty = h.types.keys()[i];
+        switch (ip.indexToKey(ty)) {
+            .array_type => |a| try h.noteValue(a.child),
+            .vector_type => |v| try h.noteValue(v.child),
+            .opt_type => |c| try h.noteValue(c),
+            .error_union_type => |e| try h.noteValue(e.payload_type),
+            .tuple_type => |t| for (t.types) |f| try h.noteValue(f),
+            .struct_type, .union_type, .enum_type => try h.wide(Incremental.layoutResultHash(ip, ty)),
+            else => {},
+        }
+    }
     return cache.hash(0x696e6c696e65, @ptrCast(h.words.items));
 }
 
@@ -576,6 +597,10 @@ const Hasher = struct {
     /// Each instruction's number in body order.
     numbers: std.ArrayList(u32) = .empty,
     next: u32 = 0,
+    /// The types of the values the body holds and of the memory it
+    /// addresses, in order of first appearance, for their layouts
+    /// (`hashBody`). Not a pointer's child the code does not address.
+    types: std.AutoArrayHashMapUnmanaged(Index, void) = .empty,
 
     fn word(h: *Hasher, w: u32) Allocator.Error!void {
         try h.words.append(h.gpa, w);
@@ -588,6 +613,19 @@ const Hasher = struct {
     fn index(h: *Hasher, i: Index) Allocator.Error!void {
         if (i == .none) return h.word(no_number);
         try h.wide(h.ip.stableHash(i));
+        try h.noteValue(if (h.ip.isType(i)) i else h.ip.typeOf(i));
+    }
+
+    fn noteValue(h: *Hasher, ty: Index) Allocator.Error!void {
+        if (ty != .none) try h.types.put(h.gpa, ty, {});
+    }
+
+    /// The child of pointer type `ty`, whose memory the code addresses.
+    fn notePointee(h: *Hasher, ty: Index) Allocator.Error!void {
+        switch (h.ip.indexToKey(ty)) {
+            .ptr_type => |p| try h.noteValue(p.child),
+            else => try h.noteValue(ty),
+        }
     }
 
     fn number(h: *Hasher, i: Inst.Index) u32 {
@@ -638,7 +676,10 @@ const Hasher = struct {
                 try h.index(data.arg.ty);
                 try h.word(data.arg.index);
             },
-            .alloc, .err_return_trace, .c_va_start => try h.index(data.ty),
+            .alloc, .err_return_trace, .c_va_start => {
+                try h.index(data.ty);
+                if (tag == .alloc) try h.notePointee(data.ty);
+            },
             .dbg_stmt => {
                 try h.word(data.dbg_stmt.line);
                 try h.word(data.dbg_stmt.column);
@@ -677,6 +718,7 @@ const Hasher = struct {
             .add_with_overflow, .sub_with_overflow, .mul_with_overflow, .ptr_elem_ptr, .slice_elem_ptr, .slice, .ptr_add => {
                 try h.index(data.ty_pl.ty);
                 try h.payload(Ir.Bin, data.ty_pl.payload);
+                if (tag == .ptr_elem_ptr or tag == .slice_elem_ptr or tag == .ptr_add) try h.notePointee(data.ty_pl.ty);
             },
             .mul_add, .vector_store_elem => {
                 try h.ref(data.pl_op.operand);
@@ -685,6 +727,7 @@ const Hasher = struct {
             .struct_field_ptr, .struct_field_val, .union_init => {
                 try h.index(data.ty_pl.ty);
                 try h.payload(Ir.StructField, data.ty_pl.payload);
+                if (tag != .union_init) try h.notePointee(ir.typeOf(ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand, h.ip));
             },
             .atomic_rmw => {
                 try h.index(data.ty_pl.ty);
