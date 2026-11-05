@@ -670,13 +670,17 @@ pub const Outcome = union(enum) {
 /// cannot leave `out_path` as it is writes its output there instead
 /// (`serve`).
 pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, alt_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8)) !Outcome {
-    // A build the cache cannot take answers a build of the same
-    // compilation that changed nothing from its inputs record.
-    var rec: ?InputsRecord = if (inc_opt == null and out_path != null and job.opts.pic and !job.opts.c_only and !job.opts.dump_ir and
+    // A build the cache cannot take (position-independent outputs, and
+    // every aarch64-macos build) answers a build of the same compilation
+    // that changed nothing from its inputs record, unless asked to check
+    // itself (`BS_CACHE_VERIFY`), which takes a build.
+    var rec: ?InputsRecord = if (inc_opt == null and out_path != null and !job.cacheable() and !job.opts.c_only and !job.opts.dump_ir and
         !std.mem.eql(u8, job.environ_map.get("BS_CACHE") orelse "", "off")) InputsRecord.open(init.arena.allocator(), job) else null;
     defer if (rec) |*r| r.close(init.io);
     if (rec) |*r| {
-        if (try r.unchanged(init.arena.allocator(), init.io, out_path.?, job.opts.command == .run, inputs)) return .{ .ok = .{ .cache_hit = true } };
+        // As `Incremental.renew_output`.
+        const renew = job.opts.command == .run or (job.opts.command == .@"test" and job.opts.emit_bin == .default and !job.opts.listen);
+        if (job.environ_map.get("BS_CACHE_VERIFY") == null and try r.unchanged(init.arena.allocator(), init.io, out_path.?, renew, inputs)) return .{ .ok = .{ .cache_hit = true } };
         r.forget(init.io);
     }
     const n_inputs = if (inputs) |list| list.items.len else 0;
@@ -719,9 +723,10 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     };
 }
 
-/// The no-change skip of a build the cache cannot take: -fPIC (also
-/// implied by -fPIE, -dynamic, and -lc on libraries), which the numbered
-/// link cannot lay out (`Job.cacheable`). After a successful build,
+/// The no-change skip of a build the cache cannot take (`Job.cacheable`):
+/// -fPIC (also implied by -fPIE, -dynamic, and -lc on libraries), which the
+/// numbered link cannot lay out, and every aarch64-macos build, whose
+/// Mach-O relink the manifest cannot describe yet. After a successful build,
 /// `<compilation dir>/inputs` records every file the build read, its link
 /// inputs and its output, each with its stat and content hash; a build of
 /// the same compilation (`Incremental.compilationKey`) that finds them
@@ -780,8 +785,8 @@ const InputsRecord = struct {
 
     /// Whether the record matches: every input has its recorded contents
     /// and `out_path` its recorded stat. Then appends the reported inputs
-    /// to `inputs`, and with `renew` (`bs run`, whose programs are trimmed
-    /// by mtime) renews the output's mtime.
+    /// to `inputs`, and with `renew` (`bs run`'s program and `bs test`'s
+    /// binary in the cache, trimmed by mtime) renews the output's mtime.
     fn unchanged(r: *InputsRecord, arena: std.mem.Allocator, io: Io, out_path: []const u8, renew: bool, inputs: ?*std.ArrayList(u8)) !bool {
         const cwd = Io.Dir.cwd();
         const bytes = r.dir.readFileAlloc(io, file_name, arena, .unlimited) catch return false;

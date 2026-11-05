@@ -906,7 +906,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   compile time unchanged. A load that `plan` forwards
   shares the stored value's home, and a removed instruction's constant
   pointers still request their symbols (`keepSymbols`), as on x86_64. aarch64-macos builds use no cache yet:
-  a relink would need the Mach-O linker's inputs in the manifest.
+  a relink would need the Mach-O linker's inputs in the manifest. Until
+  then a build that changed nothing answers from its inputs record, as
+  -fPIC builds do (`InputsRecord`).
   Each function keeps a frame record (`stp x29, x30, [sp, #-16]!; mov
   x29, sp`), so compact unwind's frame mode covers it, and addresses its
   slots from sp above a fixed outgoing argument area (the most any call
@@ -4522,10 +4524,11 @@ compilation (see "Integration" below).
     manifest      base: mapped, pointer-free, replaced whole
     manifest.log  one checksummed record per build since the base
     pack          every Atom the last build linked, append-only
-    inputs        instead of all the above, for a -fPIC build, which the cache does
-                  not take: the files the last successful build read, its link
-                  inputs and output, with stats and content hashes; a build that
-                  finds them unchanged compiles nothing (`InputsRecord`, main.zig)
+    inputs        instead of all the above, for a -fPIC or aarch64-macos build,
+                  which the cache does not take: the files the last successful
+                  build read, its link inputs and output, with stats and content
+                  hashes; a build that finds them unchanged compiles nothing
+                  (`InputsRecord`, main.zig), unless BS_CACHE_VERIFY asks for a build
 ```
 
 - **Atom records** (`cache/atoms.zig`): 16-byte aligned, a 64-byte header,

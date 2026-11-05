@@ -95,6 +95,16 @@ pub fn build(b: *std.Build) void {
         tc_sdk.addCheck(.{ .expect_stdout_match = "pub const CFAllocatorRef = ?*const struct___CFAllocator;" });
         takes(b, &tc_sdk.step, 13);
         test_step.dependOn(&tc_sdk.step);
+        // A build that changed nothing answers from its inputs record:
+        // test/obj/macos_record.sh.
+        const rec = b.addSystemCommand(&.{"sh"});
+        rec.setName("bs inputs record on aarch64-macos");
+        rec.addFileArg(b.path("test/obj/macos_record.sh"));
+        rec.addArtifactArg(exe);
+        _ = rec.addOutputDirectoryArg("work");
+        rec.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &rec.step, 10);
+        test_step.dependOn(&rec.step);
     }
     addDiagTests(b, exe, test_step, upstream_step, std_zir);
     const build_test_step = addBuildTest(b, exe, build_web_wasm, translate_c);
