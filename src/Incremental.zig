@@ -1480,9 +1480,7 @@ pub fn donorPathsKnown(gpa: Allocator, m: *const Manifest, fe: *const Frontend) 
         const key = m.inputKey(@intCast(i));
         if (isLinkInput(key)) continue;
         const colon = std.mem.indexOfScalar(u8, key, ':') orelse continue;
-        const mod = for (fe.modules.items) |*mod| {
-            if (std.mem.eql(u8, mod.name, key[0..colon])) break mod;
-        } else continue;
+        const mod = fe.module(keyModule(fe, key[0..colon]) orelse continue);
         const sub = key[colon + 1 ..];
         try add(gpa, &paths, &.{ mod.root_dir, if (sub.len == 0) mod.root_file else sub });
     }
@@ -4090,11 +4088,36 @@ pub fn inputPath(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, m
     try buf.print(gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse mod.root_dir, std.fs.path.sep, sub_path });
 }
 
-/// `Manifest.Input.key` of a file: `Zcu.fileKey`.
+/// `Manifest.Input.key` of a file: `Zcu.fileKey`, with the module's
+/// `--dep`s (`depsTag`) after its name. Its analysis reads which module
+/// each `@import` name gives, which keys alone do not tell: a donor from
+/// a program that maps the names to other modules (revo's two test
+/// programs swap `root` and `revo`) must not match the file, so that its
+/// nodes are analyzed again (`inputKeyHolds`, `Replay.create`).
 pub fn inputKey(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, module: Frontend.Module.Index, sub_path: []const u8) !void {
     const mod = fe.module(module);
     buf.clearRetainingCapacity();
-    try buf.print(gpa, "{s}:{s}", .{ mod.name, if (std.mem.eql(u8, sub_path, mod.root_file)) "" else sub_path });
+    const tag = depsTag(fe, mod);
+    try buf.print(gpa, "{s}{s}:{s}", .{ mod.name, std.mem.sliceTo(&tag, 0), if (std.mem.eql(u8, sub_path, mod.root_file)) "" else sub_path });
+}
+
+/// `#` and a hash of the names a module's `--dep`s give and the modules
+/// they name, in any order; empty without `--dep`s, so std's and
+/// compiler_rt's keys are their unit-key prefixes.
+fn depsTag(fe: *const Frontend, mod: *const Frontend.Module) [17]u8 {
+    if (mod.deps.len == 0) return @splat(0);
+    var sum: u64 = 0;
+    for (mod.deps) |d| {
+        var h: std.hash.Wyhash = .init(0x646570);
+        h.update(d.name);
+        h.update("\x00");
+        h.update(fe.module(d.module).name);
+        sum +%= h.final();
+    }
+    var tag: [17]u8 = undefined;
+    tag[0] = '#';
+    tag[1..].* = std.fmt.hex(sum);
+    return tag;
 }
 
 /// Whether input `i` of `m` would be the same file in this build: its
@@ -4104,12 +4127,34 @@ pub fn inputKey(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, mo
 pub fn inputKeyHolds(gpa: Allocator, buf: *std.ArrayList(u8), m: *const Manifest, i: u32, fe: *const Frontend) !bool {
     const key = m.inputKey(i);
     const colon = std.mem.indexOfScalar(u8, key, ':') orelse return false;
-    const mod = for (fe.modules.items, 0..) |*mod, mi| {
-        if (std.mem.eql(u8, mod.name, key[0..colon])) break @as(Frontend.Module.Index, @fromBackingInt(@as(u32, @intCast(mi))));
-    } else return false;
+    const mod = keyModule(fe, key[0..colon]) orelse return false;
+    // The same `--dep`s too.
+    const tag = depsTag(fe, fe.module(mod));
+    if (!std.mem.eql(u8, key[fe.module(mod).name.len..colon], std.mem.sliceTo(&tag, 0))) return false;
     const sub_path = key[colon + 1 ..];
     try inputPath(gpa, buf, fe, mod, if (sub_path.len == 0) fe.module(mod).root_file else sub_path);
     return std.mem.eql(u8, buf.items, m.input(i)[1]);
+}
+
+/// Whether input `i` of `m` is this build's file but for its module's
+/// `--dep`s: `inputKeyHolds` without the deps tag.
+pub fn inputKeyRebound(gpa: Allocator, buf: *std.ArrayList(u8), m: *const Manifest, i: u32, fe: *const Frontend) !bool {
+    const key = m.inputKey(i);
+    const colon = std.mem.indexOfScalar(u8, key, ':') orelse return false;
+    const mod = keyModule(fe, key[0..colon]) orelse return false;
+    const sub_path = key[colon + 1 ..];
+    try inputPath(gpa, buf, fe, mod, if (sub_path.len == 0) fe.module(mod).root_file else sub_path);
+    return std.mem.eql(u8, buf.items, m.input(i)[1]);
+}
+
+/// The module an input key's module part (before the `:`) names.
+fn keyModule(fe: *const Frontend, part: []const u8) ?Frontend.Module.Index {
+    for (fe.modules.items, 0..) |*mod, mi| {
+        if (!std.mem.startsWith(u8, part, mod.name)) continue;
+        if (part.len == mod.name.len or (part.len == mod.name.len + 17 and part[mod.name.len] == '#'))
+            return @fromBackingInt(@as(u32, @intCast(mi)));
+    }
+    return null;
 }
 
 fn checkPrediction(inc: *Incremental, r: *const Recorder, fe: *const Frontend) void {

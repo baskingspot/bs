@@ -1187,6 +1187,19 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &donor.step, 15);
         test_step.dependOn(&donor.step);
     }
+    // A donor whose modules give an import name another module:
+    // test/run/donor_module_deps.sh.
+    {
+        const deps = b.addSystemCommand(&.{"sh"});
+        deps.setName("bs donor module deps");
+        deps.addFileArg(b.path("test/run/donor_module_deps.sh"));
+        deps.addArtifactArg(bs);
+        _ = deps.addOutputDirectoryArg("work");
+        deps.addDirectoryArg(std_zir);
+        deps.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &deps.step, 10);
+        test_step.dependOn(&deps.step);
+    }
     // A compiler_rt edit without its old ZIR: test/run/edit_rt_old_zir.sh.
     {
         const rt = b.addSystemCommand(&.{"sh"});

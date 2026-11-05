@@ -5789,7 +5789,16 @@ analyzing everything.
   file is this build's root file, changed, and std's `@import("root")` in
   a donor's result names this build's root struct; whether its
   declarations match is decided by the namespace dependencies, as in any
-  edit. In an eager replay, a function's atom is loaded only if its debug
+  edit. A module with `--dep`s puts `#` and a hash of them (each import
+  name and the module it gives) after its name in its files' input keys
+  (`Incremental.inputKey`, not in unit keys): an `@import` reads which
+  module the name gives, which no source hash covers. A donor whose
+  program maps the names to other modules (revo's two test programs
+  swap `root` and `revo`, so capi's `@import("revo")` gives another
+  module in each) then has that file as a changed input with no new ZIR
+  whose key does not hold, and its units are analyzed again however
+  their sources compare (`Replay.rebound`): before, they loaded green
+  and named the donor's module by its name. In an eager replay, a function's atom is loaded only if its debug
   info names paths this build's would (`Replay.debug_paths`): source paths
   are as the compiler opened them, so with relative paths a worktree's
   functions load, and with absolute ones only std's do.

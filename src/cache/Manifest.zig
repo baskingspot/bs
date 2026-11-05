@@ -474,7 +474,8 @@ pub const Input = extern struct {
     mtime: i64,
     path: StrRef,
     /// The file's unit-key prefix, `<module name>:<path within it>`
-    /// (`Zcu.fileKey`): what the nodes' keys name the file by. A build
+    /// (`Zcu.fileKey`), with the module's `--dep`s after its name
+    /// (`Incremental.inputKey`): what the nodes' keys name the file by. A build
     /// whose modules map the key to another file must not take the
     /// nodes as its own (a donor's, see `Replay.create`).
     key: StrRef,

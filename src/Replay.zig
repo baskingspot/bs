@@ -53,6 +53,11 @@ maps: seeds.InstMaps = .{},
 changed_input: std.DynamicBitSetUnmanaged = .{},
 /// The nodes in those inputs, in order (`Manifest.nodesOfInputs`).
 changed_nodes: std.ArrayList(u32) = .empty,
+/// A donor's inputs that are this build's files but whose modules'
+/// `--dep`s give other modules (`Incremental.inputKeyRebound`): their
+/// units are analyzed again, since an `@import` in one gives another
+/// module than the source alone tells.
+rebound: std.DynamicBitSetUnmanaged = .{},
 /// Changed inputs `lateMap` tried to map.
 late_mapped: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// Whether `lateMap` failed for one, whose old ZIR was gone (the global
@@ -265,6 +270,10 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
         if (Incremental.isLinkInput(m.inputKey(@intCast(i)))) seen.set(i);
         if (seen.isSet(i) or try Incremental.inputKeyHolds(gpa, &path_buf, m, @intCast(i), fe)) continue;
         seen.set(i);
+        if (try Incremental.inputKeyRebound(gpa, &path_buf, m, @intCast(i), fe)) {
+            if (r.rebound.bit_length == 0) r.rebound = try .initEmpty(gpa, m.inputCount());
+            r.rebound.set(i);
+        }
         missing = true;
         try changed.append(gpa, .{ .input = @intCast(i), .file = null });
     }
@@ -435,6 +444,7 @@ pub fn destroy(r: *Replay) void {
     r.pack.close(gpa, r.io);
     r.outdated.deinit(gpa);
     r.changed_input.deinit(gpa);
+    r.rebound.deinit(gpa);
     r.changed_nodes.deinit(gpa);
     r.visited.deinit(gpa);
     r.roots.deinit(gpa);
@@ -807,6 +817,12 @@ fn inputOf(r: *Replay, file: u32) ?u32 {
 /// once analysis resolves the request, which loads the file. Replay
 /// cannot load it itself: files load only when the pool drains, since
 /// CodeGen workers read `Frontend.files`.
+fn inRebound(r: *const Replay, node: u32) bool {
+    if (r.rebound.bit_length == 0) return false;
+    const input = r.m.source(node).input;
+    return input != Manifest.Source.no_input and r.rebound.isSet(input);
+}
+
 fn inUnloadedCompilerRt(r: *Replay, node: u32) bool {
     const input = r.m.source(node).input;
     if (input == Manifest.Source.no_input) return false;
@@ -870,7 +886,7 @@ fn greenNode(r: *Replay, unit: Zcu.AnalUnit) !?Green {
         .func, .comptime_decl => true,
         else => m.result(node).len != 0,
     };
-    if (n.src_hash != r.keyer.unitSrcHash(unit) or !has_result) return r.red(node);
+    if (n.src_hash != r.keyer.unitSrcHash(unit) or !has_result or r.inRebound(node)) return r.red(node);
     errdefer r.deps.shrinkRetainingCapacity(g.deps_start);
     for (m.deps(node)) |e| {
         const edge: Manifest.Edge = @bitCast(e);
