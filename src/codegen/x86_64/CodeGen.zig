@@ -1355,6 +1355,44 @@ fn fillSplat(cg: *CodeGen, dst: Mem, elem: Ref, count: u64) Error!bool {
     return true;
 }
 
+/// Writes `total` bytes at `dst` (8 to 128) of a run of runtime scalar
+/// `elem` of 1, 2 or 4 bytes, eight at a time: the element repeated in
+/// rax by one multiply, as compiler_rt's `memsetSmallPowerOf2` needs
+/// (`d[0..size].* = @splat(b)`, a byte store each before). False for other
+/// elements and for constants, which `copyTo` writes. Uses rax and rcx.
+fn splatWords(cg: *CodeGen, dst: Mem, elem: Ref, total: u64) Error!bool {
+    const ip = cg.ip;
+    const ty = cg.typeOf(elem);
+    switch (Type.class(ip, ty)) {
+        .int, .bool, .@"enum" => {},
+        else => return false,
+    }
+    if (elem.toInterned() != null) return false;
+    const size: Size = switch (Type.abiSize(ip, ty)) {
+        1 => .byte,
+        2 => .word,
+        4 => .dword,
+        else => return false,
+    };
+    const ones: u64 = switch (size) {
+        .byte => 0x0101_0101_0101_0101,
+        .word => 0x0001_0001_0001_0001,
+        else => 0x0000_0001_0000_0001,
+    };
+    try cg.load(.rax, elem);
+    if (size == .dword) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .reg = .rax }) else try cg.e.movzx(.qword, .rax, size, .{ .reg = .rax });
+    try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @bitCast(ones) });
+    try cg.e.imul(.qword, .rax, .{ .reg = .rcx }, null);
+    var off: u64 = 0;
+    while (off + 8 <= total) : (off += 8) try cg.e.mov(.qword, .{ .mem = offsetMem(dst, off) }, .{ .reg = .rax });
+    while (off < total) {
+        const n: u64 = if (total - off >= 4) 4 else if (total - off >= 2) 2 else 1;
+        try cg.storeReg(offsetMem(dst, off), .rax, n);
+        off += n;
+    }
+    return true;
+}
+
 /// The memory holding value `ref`, materializing a register-only constant
 /// into a scratch slot if needed.
 pub fn memOf(cg: *CodeGen, ref: Ref) Error!Mem {
@@ -5117,6 +5155,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 } else elems.len;
                 const total = run * elem_size;
                 if (total > 128 and try cg.fillSplat(dst, elems[0], run)) {
+                    first = run;
+                } else if (total >= 8 and total <= 128 and elem_size < 8 and try cg.splatWords(dst, elems[0], total)) {
                     first = run;
                 } else if (total > 128) {
                     var span: u64 = 0;
