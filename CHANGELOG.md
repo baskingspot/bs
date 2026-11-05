@@ -7,6 +7,7 @@ Changes a user of bs notices, newest first, in the
 
 ### Added
 
+- `--force_undefined <name>` (`forceUndefinedSymbol` in build.zig) makes the link treat the name as referenced, so the archive member that defines it is linked, as lld's and ld64's `-u` do. On aarch64-macos the name is a Mach-O symbol name (`_keep_me` for C's `keep_me`), and one that nothing defines is an `undefined-symbol` error, as with upstream.
 - Binary releases for x86_64 Linux, aarch64 Linux, and Apple Silicon macOS, on GitHub and in the Homebrew tap (`brew install --cask baskingspot/tap/bs`); mise installs them as `github:baskingspot/bs`.
 - `--version-script` for ELF shared libraries (`bs build-lib -dynamic`, and `setVersionScript` in `bs build`), as lld reads it: version nodes and anonymous nodes, `global:` and `local:` patterns with `*`, `?` and `[...]` wildcards, quoted names, and `extern "C"` blocks, with lld's precedence. Versioned exports get `.gnu.version` entries and the nodes `.gnu.version_d`; `local:` symbols leave `.dynsym`, and C objects reach them directly rather than through the loader. A name the script versions that nothing defines is an `error[version-script]` at it unless `--undefined-version`. `extern "C++"` blocks are refused, as are version scripts on aarch64-macos.
 - `-rdynamic` on a dynamically linked executable (`-lc` with glibc) exports all its global definitions, Zig's and its C objects', so the shared objects it loads with `dlopen` bind to them, as upstream does. A stock Lua interpreter built with `-rdynamic` loads C modules (siv's `test-lua`).

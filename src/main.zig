@@ -208,6 +208,9 @@ pub const Options = struct {
     /// it name what nothing defines.
     version_script: ?[]const u8 = null,
     allow_undefined_version: bool = false,
+    /// `--force_undefined`: names the link treats as referenced, so that
+    /// archive members defining them load (lld's and ld64's `-u`).
+    force_undefined: []const []const u8 = &.{},
     /// C source files, each with its module's C arguments and options,
     /// compiled by upstream's Clang (CSource.zig), and the settings they
     /// share.
@@ -682,6 +685,7 @@ pub const Job = struct {
         i.link_shared_names = job.opts.shared_names;
         i.lld = job.opts.c_root;
         i.rdynamic = job.opts.rdynamic;
+        i.force_undefined = job.opts.force_undefined;
         if (job.opts.link_libc and !job.opts.pic) {
             i.glibc_version = job.opts.glibc_version;
             i.glibc_lib_dir = job.zig_lib_dir;
@@ -1333,18 +1337,20 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     };
     emit.lld = opts.c_root;
     emit.rdynamic = opts.rdynamic;
+    emit.force_undefined = opts.force_undefined;
     // aarch64-macos links against Mach-O dylibs, with LC_RPATHs.
     const macos = opts.bs_target == .aarch64_macos;
     emit.libc_first = plain and (glibc != null or macos);
     // Plain C binds the names libSystem exports to it before compiler_rt,
     // from the stub upstream links against.
     var libsystem: std.StringHashMapUnmanaged(void) = .empty;
-    if (plain and macos) {
+    if ((plain or opts.force_undefined.len != 0) and macos) {
         const tbd_path = try Io.Dir.path.join(arena, &.{ job.zig_lib_dir, "libc", "darwin", "libSystem.tbd" });
         const text = Io.Dir.cwd().readFileAlloc(init.io, tbd_path, arena, .unlimited) catch |err|
             fatal("unable to read '{s}': {t}", .{ tbd_path, err });
         try Tbd.exports(arena, text, &libsystem);
-        emit.libsystem = &libsystem;
+        if (plain) emit.libsystem = &libsystem;
+        emit.force_libsystem = &libsystem;
     }
     if (macos) {
         emit.runpath = opts.runpath;
@@ -2081,7 +2087,6 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-fsanitize-coverage-trace-pc-guard", "bs does not instrument coverage ('-fsanitize-coverage-trace-pc-guard')" },
     .{ "-rcflags", "bs does not compile Windows resources ('-rcflags')" },
     .{ "-x", "bs does not compile C sources ('-x'); build this step with upstream zig" },
-    .{ "--force_undefined", "bs does not support '--force_undefined' yet" },
     .{ "-mcmodel", "bs only supports the default code model ('-mcmodel')" },
     .{ "--script", "bs does not support linker scripts ('--script'); build this step with upstream zig" },
     .{ "--subsystem", "bs does not target Windows ('--subsystem')" },
@@ -2114,6 +2119,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     var mcpu: ?[]const u8 = null;
     var lib_search: LibQuery.Search = .{};
     var rpaths: std.ArrayList([]const u8) = .empty;
+    var force_undefined: std.ArrayList([]const u8) = .empty;
     var sysroot = false;
     var deps: std.ArrayList([]const u8) = .empty;
     var modules: std.ArrayList(Frontend.ModuleArg) = .empty;
@@ -2340,6 +2346,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             try lib_dirs.append(arena, nextArg(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "-L")) {
             try lib_dirs.append(arena, arg[2..]);
+        } else if (std.mem.eql(u8, arg, "--force_undefined")) {
+            try force_undefined.append(arena, nextArg(args, &i, arg));
         } else if (std.mem.eql(u8, arg, "--version-script")) {
             opts.version_script = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--undefined-version") or std.mem.eql(u8, arg, "--no-undefined-version")) {
@@ -2523,6 +2531,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     }
     opts.root_src_path = root orelse if (opts.unsupported != null or opts.c_only or opts.c_root) "" else fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
+    opts.force_undefined = force_undefined.items;
     // As upstream: `-L` directories that do not exist are left out, and
     // `-l` names also search the native library directories, after them.
     var search_dirs: std.ArrayList([]const u8) = .empty;

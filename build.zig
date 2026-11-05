@@ -1082,6 +1082,31 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         vs_bad.addCheck(.{ .expect_term = .{ .exited = 1 } });
         test_step.dependOn(&vs_bad.step);
     }
+    // `--force_undefined`: a forced name pulls the archive member that
+    // defines it, as lld's `-u` (its constructor prints, and sees the
+    // forced export); without the flag nothing references the member.
+    {
+        const fu_cc = b.addSystemCommand(&.{ upstreamZig(b), "cc", "-target", "x86_64-linux-gnu", "-c" });
+        fu_cc.addFileArg(b.path("test/link_input/force_undefined.c"));
+        const fu_o = fu_cc.addPrefixedOutputFileArg("-o", "force_undefined.o");
+        const fu_ar = b.addSystemCommand(&.{ upstreamZig(b), "ar", "rcs" });
+        const fu_a = fu_ar.addOutputFileArg("libforce_undefined.a");
+        fu_ar.addFileArg(fu_o);
+        for ([_]bool{ true, false }) |forced| {
+            const fu_exe = b.addRunArtifact(bs);
+            fu_exe.setName(if (forced) "bs build-exe --force_undefined" else "bs build-exe without --force_undefined");
+            fu_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+            if (forced) fu_exe.addArgs(&.{ "--force_undefined", "keep_me", "--force_undefined", "fu_from_archive" });
+            fu_exe.addFileArg(b.path("test/link_input/force_undefined.zig"));
+            fu_exe.addFileArg(fu_a);
+            fu_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+            const fu_run = std.Build.Step.Run.create(b, if (forced) "run force_undefined (the member pulled)" else "run force_undefined (no member)");
+            fu_run.addFileArg(fu_exe.addPrefixedOutputFileArg("-femit-bin=", "force_undefined"));
+            fu_run.addCheck(.{ .expect_stderr_exact = if (forced) "pulled, keep_me 42\n" else "" });
+            fu_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+            test_step.dependOn(&fu_run.step);
+        }
+    }
     // A shared library that links another shared library, given as an
     // input: DT_NEEDED names it and its functions are imports, as
     // upstream's.

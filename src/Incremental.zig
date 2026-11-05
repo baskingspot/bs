@@ -158,6 +158,8 @@ runpath: ?[]const u8 = null,
 lld: bool = false,
 /// `-rdynamic` (`Glibc.dynamicOptions`).
 rdynamic: bool = false,
+/// `Emit.force_undefined`.
+force_undefined: []const []const u8 = &.{},
 /// Whether a build that does not relink renews the output's mtime, as a
 /// relink would: `bs run`'s programs are trimmed by it.
 renew_output: bool = false,
@@ -882,6 +884,7 @@ fn linkWithInputs(
         if (m.node(i).tag != @backingInt(Tag.link) and (m.atoms(i).len == 0 or m.flags(i).unlinked)) continue;
         for (m.nodeRefs(i)) |ref| if (ref.kind == .ext or ref.kind == .ext_weak) try externs.put(arena, m.refName(ref.value), {});
     }
+    for (inc.force_undefined) |name| try externs.put(arena, name, {});
     _ = try objects.pull(externs.keys(), resolver);
     const converted = try objects.convert(resolver);
     if (objects.errors.items.len != 0) return inc.noLink("{s}", .{objects.errors.items[0]});

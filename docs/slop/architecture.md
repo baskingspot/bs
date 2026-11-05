@@ -3857,6 +3857,19 @@ resolve externs by name. Rules, as ld's:
 - An undefined name pulls the archive member whose symbol index defines
   it. Pulling repeats over all archives until nothing changes (lld's
   semantics, so archive order and cycles do not matter).
+- `--force_undefined <name>` (the build API's `forceUndefinedSymbol`;
+  2026-11-05, for zig-graph-compiler) adds a name to what the link
+  wants, in `Emit.pullInputs` and in Incremental's relink, so the member
+  defining it loads, as lld's and ld64's `-u` load it. A forced name
+  nothing defines is fine on ELF, as with lld, and an `undefined-symbol`
+  error on Mach-O, as upstream's Mach-O linker reports it (the Zig
+  exports, the objects and the libraries' exports count). On Mach-O
+  the name is a symbol name, as ld64's `-u` and upstream take it:
+  `_keep_me` for C's `keep_me`, so `keep_me` is undefined there, with
+  a hint naming `_keep_me` when that is defined. Upstream's
+  own ELF linker ignores the flag (it keeps Zig exports anyway and
+  pulls no member for it); bs follows lld, which upstream uses with
+  `-fllvm -flld`.
 - Then compiler_rt, as upstream links libcompiler_rt after the inputs.
 - Then shared libraries (abilists for `-lc`, `.so` inputs in stage C),
   which give imports.

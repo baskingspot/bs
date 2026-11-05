@@ -145,6 +145,10 @@ runpath: ?[]const u8 = null,
 lld: bool = false,
 /// `-rdynamic`: a dynamic executable exports all its definitions.
 rdynamic: bool = false,
+/// `--force_undefined`: names the link treats as referenced, so that the
+/// archive members defining them load, as lld's and ld64's `-u`. On
+/// Mach-O one that nothing defines is an error, as upstream's.
+force_undefined: []const []const u8 = &.{},
 /// Plain C against glibc or libSystem (`main.plainC`): names the libc
 /// defines resolve to it before compiler_rt, as upstream's compiler_rt
 /// archive after libc leaves them (`memset`, `memcpy`, libm's functions).
@@ -152,6 +156,9 @@ libc_first: bool = false,
 /// With `libc_first` on aarch64-macos: the names libSystem's stub exports
 /// to arm64, without the leading underscore (link/Tbd.zig).
 libsystem: ?*const std.StringHashMapUnmanaged(void) = null,
+/// The same names for `force_undefined` on aarch64-macos, where they
+/// define forced names as the libraries' exports do.
+force_libsystem: ?*const std.StringHashMapUnmanaged(void) = null,
 /// An executable's object and archive inputs, which `sync` pulls archive
 /// members for and `finish` converts into atoms.
 inputs: ?Inputs = null,
@@ -1034,6 +1041,7 @@ fn pullInputs(emit: *Emit, in: anytype) !void {
     var wanted: std.ArrayList([]const u8) = .empty;
     defer wanted.deinit(emit.gpa);
     for (emit.externs.keys()) |slot| try wanted.append(emit.gpa, parseExternSlot(slot)[0]);
+    for (emit.force_undefined) |arg| if (emit.forcedName(arg)) |name| try wanted.append(emit.gpa, name);
     const first = try in.pull(wanted.items, ctx);
     if (first == emit.inputs_requested) return;
     var names: std.ArrayList([]const u8) = .empty;
@@ -1607,6 +1615,22 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         return true;
     }
     if (emit.zcu.ip.target == .aarch64_macos) {
+        // As upstream's Mach-O linker: a forced name that neither the Zig
+        // code, the objects nor a library defines is undefined.
+        for (emit.force_undefined) |arg| {
+            if (emit.forcedName(arg)) |name| if (try emit.machoDefines(name)) continue;
+            const c_name = emit.forcedName(arg) == null and try emit.machoDefines(arg);
+            emit.link_diagnostic = .{
+                .code = .@"undefined-symbol",
+                .loc = null,
+                .msg = try emit.allocator().print("undefined symbol: {s}, which --force_undefined names: nothing in the link defines it", .{arg}),
+                .hint = if (c_name)
+                    try emit.allocator().print("Mach-O symbol names start with '_', as ld64's -u takes them: '_{s}' names the C name '{s}'", .{ arg, arg })
+                else
+                    "export it from the Zig code, link an object or library that defines it, or drop the --force_undefined (`forceUndefinedSymbol`)",
+            };
+            return false;
+        }
         const imports = try emit.gpa.alloc(MachO.Import, emit.imports.count());
         defer emit.gpa.free(imports);
         // Each import binds to the first library that exports its name, the
@@ -1765,6 +1789,25 @@ pub fn versionScriptLoc(path: []const u8, src: []const u8, offset: u32) Diag.Loc
         .source_line = src[line_start..line_end],
         .in_lib = false,
     };
+}
+
+/// The name a `--force_undefined` argument wants the link to define: on
+/// Mach-O a symbol name, `_name` for C's `name`, as ld64's `-u` and
+/// upstream's linker take it (one without the underscore names nothing);
+/// on ELF the name itself.
+fn forcedName(emit: *const Emit, arg: []const u8) ?[]const u8 {
+    if (emit.zcu.ip.target != .aarch64_macos) return arg;
+    return if (arg.len > 1 and arg[0] == '_') arg[1..] else null;
+}
+
+/// Whether the Zig exports, the Mach-O objects or the libraries define C
+/// name `name`.
+fn machoDefines(emit: *Emit, name: []const u8) !bool {
+    if (try emit.userExport(name) != null) return true;
+    if (emit.inputs) |in| if (in == .macho and (in.macho.defs.contains(name) or in.macho.commons.contains(name))) return true;
+    for (emit.macho_libs) |l| if (l.exports.contains(name)) return true;
+    if (emit.force_libsystem) |set| return set.contains(name);
+    return false;
 }
 
 /// Reports link error `err`: one a program can fix as `link_diagnostic`,
