@@ -2586,6 +2586,18 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    thread). Lowering, ABIs, inline assembly, liveness, `Ssa.plan` and
    register allocation over x19-x28 are in (aarch64-macos conformance
    100% of upstream); float registers (d8-d15) and pairs next.
+   bench/realworld.py on an M-series Mac (mac.large, 2026-11-05,
+   stage-next 9c9c845 with register allocation; upstream Debug is LLVM
+   there), as bs / Debug and bs / ReleaseSafe: vaxis 1.11x / 6.11x,
+   zig-fmt 0.65x / 6.06x, zig-sema 0.69x / 8.44x, zls-test 0.37x /
+   2.70x; corpus uucode-gen 0.55x / 10.2x, vulkan-gen 0.55x / 6.2x,
+   zigimg-test 0.49x / 3.8x, json-zig-test 0.46x / 6.1x, msgpack-test
+   0.28x / 54x, tls-test 0.82x / 19x, hpke-test 1.30x / 32x, yaml-test
+   0.60x / 6.9x, json5-test 0.23x / 51x, ini-test 0.30x / 31x, tar-test
+   0.30x / 16x, trie-test 0.31x / 12x, qr-test 0.54x / 3.3x, loc 0.45x
+   / 2.1x. Not built by bs: zedis-test (`&.{}` to `[*]Kevent` in zio's
+   kqueue backend), the zwasm runs (a C call returning `@Vector(16,
+   u8)`). translate-c and jinja-test fail in every mode on a Mac.
 6. DWARF variable locations; then leaf inlining with the cache edge.
    *DWARF types and variables: paused by the owner, 2026-11-03.* bs
    keeps line tables, CFI, function names and inlined frames, the

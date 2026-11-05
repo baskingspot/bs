@@ -3,9 +3,9 @@
 where microbenchmarks can mislead.
 
 Each workload builds a real program with bs and, unless --no-upstream, with
-upstream zig 0.17.1 in Debug (self-hosted x86_64 backend) and ReleaseSafe
-(LLVM), checks that the builds print the same output, and reports the
-median wall time of each:
+upstream zig 0.17.1 in Debug (self-hosted x86_64 backend; LLVM on
+aarch64-macos) and ReleaseSafe (LLVM), checks that the builds print the
+same output, and reports the median wall time of each:
 
 - zig-fmt:  upstream's compiler (src/main.zig without LLVM), built by each
             compiler, running `zig fmt --check` over upstream's lib/std.
@@ -43,9 +43,12 @@ sys.path.insert(0, BENCH_DIR)
 import bench
 
 WORKLOADS = ["zig-fmt", "zig-sema", "vaxis", "zls-test"]
+# Upstream's Debug default: the self-hosted backend on x86_64-linux, LLVM on
+# aarch64-macos, where its self-hosted backend is unfinished.
+NO_LLVM = [] if sys.platform == "darwin" else ["-fno-llvm", "-fno-lld"]
 MODES = {
     "bs": [],
-    "Debug": ["-fno-llvm", "-fno-lld"],
+    "Debug": NO_LLVM,
     "ReleaseSafe": ["-OReleaseSafe"],
 }
 
@@ -69,7 +72,7 @@ def with_mode(argv, mode):
     upstream's with its optimize mode and backend."""
     if mode == "bs":
         return argv
-    res = [w for w in argv if not w.startswith("-O")]
+    res = [w for w in argv if not w.startswith("-O") and (NO_LLVM or w not in ("-fno-llvm", "-fno-lld"))]
     return res[:2] + MODES[mode] + res[2:]
 
 

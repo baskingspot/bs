@@ -2,9 +2,9 @@
 """Run-time benchmarks: the speed of the code bs generates.
 
 Builds each program in bench/runtime/ with bs and with upstream zig 0.17.1
-in Debug (self-hosted x86_64 backend) and ReleaseSafe (LLVM), checks that
-all three print the same output, and reports the median wall time of each
-binary. See bench/README.md.
+in Debug (self-hosted x86_64 backend; LLVM on aarch64-macos) and
+ReleaseSafe (LLVM), checks that all three print the same output, and
+reports the median wall time of each binary. See bench/README.md.
 """
 
 import argparse
@@ -65,8 +65,11 @@ def main():
     bs = os.path.abspath(args.compiler)
     builds = [("bs", lambda src, out: [bs, "build-exe", src, f"-femit-bin={out}"])]
     if not args.no_upstream:
+        no_llvm = [] if sys.platform == "darwin" else ["-fno-llvm", "-fno-lld"]
         builds += [
-            ("Debug", lambda src, out: [args.zig, "build-exe", "-fno-llvm", "-fno-lld", src, f"-femit-bin={out}"]),
+            # Upstream's Debug default: LLVM on aarch64-macos, where its
+            # self-hosted backend is unfinished.
+            ("Debug", lambda src, out: [args.zig, "build-exe", *no_llvm, src, f"-femit-bin={out}"]),
             ("ReleaseSafe", lambda src, out: [args.zig, "build-exe", "-OReleaseSafe", src, f"-femit-bin={out}"]),
         ]
 

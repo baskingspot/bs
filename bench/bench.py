@@ -324,6 +324,10 @@ class Vaxis(Workload):
         gen = os.path.join(self.dir, "gen")
         setup_cache = os.path.join(self.work, "setup-cache")
         setup_env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=os.path.join(setup_cache, "global"))
+        wrapper = os.path.join(self.dir, "wrapper")
+        os.makedirs(wrapper, exist_ok=True)
+        for f in ("build.zig", "build.zig.zon"):
+            shutil.copy(os.path.join(BENCH_DIR, "workloads", "vaxis-build", f), wrapper)
         if not (
             os.path.exists(os.path.join(gen, "tables.zig")) and os.path.isdir(os.path.join(src, "zig-pkg", UUCODE_PKG))
         ):
@@ -332,9 +336,20 @@ class Vaxis(Workload):
             # generated modules so the timed build-exe command needs no build system.
             local = os.path.join(setup_cache, "vaxis-local")
             rmtree(local)
-            out = run_checked(
-                [self.setup_zig, "build", "-Dllvm=false", "--verbose", "--cache-dir", local], src, setup_env
-            )
+            if sys.platform == "darwin":
+                # libvaxis's install step also builds its test binary, and
+                # that build with -Dllvm=false took Mac satellites down.
+                # Fetch the packages only and take the commands from the
+                # wrapper, which builds just the example with the default
+                # backend.
+                run_checked([self.setup_zig, "build", "--fetch=all", "--cache-dir", local], src, setup_env)
+                cwd = wrapper
+                out = run_checked([self.setup_zig, "build", "--verbose", "--cache-dir", local], cwd, setup_env)
+            else:
+                cwd = src
+                out = run_checked(
+                    [self.setup_zig, "build", "-Dllvm=false", "--verbose", "--cache-dir", local], cwd, setup_env
+                )
             line = next(
                 (ln for ln in out.splitlines() if "build-exe" in ln and "--name example-text_input" in ln), None
             )
@@ -344,11 +359,7 @@ class Vaxis(Workload):
             os.makedirs(gen)
             for mod in ("tables", "build_config"):
                 m = re.search(rf"-M{mod}=(\S+)", line)
-                shutil.copy(os.path.join(src, m.group(1)), os.path.join(gen, f"{mod}.zig"))
-        wrapper = os.path.join(self.dir, "wrapper")
-        os.makedirs(wrapper, exist_ok=True)
-        for f in ("build.zig", "build.zig.zon"):
-            shutil.copy(os.path.join(BENCH_DIR, "workloads", "vaxis-build", f), wrapper)
+                shutil.copy(os.path.join(cwd, m.group(1)), os.path.join(gen, f"{mod}.zig"))
         if not os.path.isdir(os.path.join(wrapper, "zig-pkg", UUCODE_PKG)):
             run_checked(
                 [self.setup_zig, "build", "--cache-dir", os.path.join(setup_cache, "wrapper-local")], wrapper, setup_env
