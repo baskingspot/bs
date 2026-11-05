@@ -2110,6 +2110,7 @@ fn exemptArgs(cg: *CodeGen) Error!void {
     // before it there (`Ssa.liveness`); the call itself does not count.
     const Uses = struct {
         cg: *CodeGen,
+        arms: *const Ssa.DeadArms,
         start: u32,
         pos: u32,
         own: u32,
@@ -2118,9 +2119,8 @@ fn exemptArgs(cg: *CodeGen) Error!void {
             const v = @backingInt(ref.toIndex() orelse return);
             const l = c.cg.ssa.live.slice();
             if (l.items(.reg2)[v] != 0) return;
-            const cl2 = c.cg.ssa.clobbers.items;
-            const at = if (l.items(.end)[v] == c.pos) cl2[c.pos][1] - c.own else cl2[c.pos][1];
-            if (at != cl2[@max(c.start, l.items(.def)[v])][1]) l.items(.reg2)[v] = 1;
+            const own = if (l.items(.end)[v] == c.pos) c.own else 0;
+            if (c.arms.crossed(c.cg.ssa.clobbers.items, @max(c.start, l.items(.def)[v]), c.pos, own)) l.items(.reg2)[v] = 1;
         }
     };
     // `reg2` is free until `Ssa.plan`: 0 marks a candidate, 1 one that
@@ -2128,12 +2128,16 @@ fn exemptArgs(cg: *CodeGen) Error!void {
     const reg2 = live.items(.reg2);
     @memset(reg2, Ssa.no_reg);
     for (cg.arg_hints.items) |h| reg2[h.v] = 0;
-    for (f.layout.items) |block| {
+    var arms: Ssa.DeadArms = try .init(cg.gpa, f);
+    defer arms.deinit(cg.gpa);
+    for (f.layout.items, 0..) |block, k| {
         const b = f.blocks.items[@backingInt(block)];
-        if (!Ssa.deadEnd(b.term.tag)) continue;
+        arms.enter(k);
+        const from = f.doom.items[@backingInt(block)].from;
+        if (from == Ssa.no_tie) continue;
         for (f.blockInsts(block), b.start..) |inst, idx| {
             const q = Ssa.valuePos(idx);
-            Ssa.forEachOperand(ir, inst, Uses{ .cg = cg, .start = 2 * b.start + 1, .pos = q, .own = cl[q][1] - cl[q - 1][1] });
+            Ssa.forEachOperand(ir, inst, Uses{ .cg = cg, .arms = &arms, .start = 2 * from + 1, .pos = q, .own = cl[q][1] - cl[q - 1][1] });
         }
     }
     var n: usize = 0;
@@ -2318,11 +2322,14 @@ fn planSplits(cg: *CodeGen) Error!void {
         const b = f.blocks.items[@backingInt(block)];
         const lp = f.block_loop.items[@backingInt(block)];
         ws.w = @as(u64, 1) << @intCast(3 * @as(u32, if (lp == Ssa.no_loop) 0 else depth[lp]));
+        // A cold block's clobber points run only on a failing check's way
+        // to its panic.
+        const cw = if (f.cold.items[@backingInt(block)]) 0 else ws.w;
         for (b.start..b.start + b.len + 1) |idx| {
             const q = Ssa.valuePos(idx) - 1;
-            wcl[q] = wcl[q - 1] + if (cl[q][0] != cl[q - 1][0]) ws.w else 0;
+            wcl[q] = wcl[q - 1] + if (std.meta.eql(cl[q], cl[q - 1])) 0 else cw;
             if (idx == b.start + b.len) break;
-            wcl[q + 1] = wcl[q] + if (cl[q + 1][0] != cl[q][0]) ws.w else 0;
+            wcl[q + 1] = wcl[q] + if (std.meta.eql(cl[q + 1], cl[q])) 0 else cw;
             Ssa.forEachOperand(cg.ir, f.values.items(.inst)[idx], &ws);
         }
         const q = 2 * (b.start + b.len) + 1;
