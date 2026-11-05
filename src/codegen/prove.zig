@@ -1359,18 +1359,21 @@ const Walker = struct {
                 if (!p[0].eql(b) or p[1].tag != .konst) continue;
                 k = @intCast(p[1].value());
             };
-            if (g.a.tag != .inst and !g.a.eql(x)) continue;
             const o = w.offset(g.a, true);
-            if (!o.x.eql(x)) continue;
+            // A constant `x` is below any unsigned `z + c` with `x <= c`
+            // (`0 < n` from `i < n`).
+            const dx: u64 = if (o.x.eql(x)) d else if (x.tag == .konst) std.math.add(u64, d, @intCast(x.value())) catch continue else continue;
             const c = std.math.add(u64, o.c, k) catch continue;
-            if (c < d) continue;
-            if (g.op == .lt or c > d) return .lt;
+            if (c < dx) continue;
+            if (g.op == .lt or c > dx) return .lt;
             best = .le;
         }
         for (w.s.cands.items) |g| {
-            if ((bits != 0 and g.bits > bits) or !g.base.eql(x) or g.c < d) continue;
+            if (bits != 0 and g.bits > bits) continue;
+            const dx: u64 = if (g.base.eql(x)) d else if (x.tag == .konst) std.math.add(u64, d, @intCast(x.value())) catch continue else continue;
+            if (g.c < dx) continue;
             if (y) |b| if (!g.y.eql(b)) continue;
-            if (g.op == .lt or g.c > d) return .lt;
+            if (g.op == .lt or g.c > dx) return .lt;
             best = .le;
         }
         return best;

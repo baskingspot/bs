@@ -2404,7 +2404,9 @@ user branches are coverage points and are only learned from.
   + c' < y - k` for an exact `y - k` with `c = c' + k` (`for (1..n)
   |j|` counts to `n - 1`, and `j` is the count plus one), so `x <= y`, `x + d`
   cannot overflow, and a `+%` chain bounded so computes `x + d`; and `x +
-  c <= x + d` for `c <= d` when both sums are exact. So `s[i..][0..16]`
+  c <= x + d` for `c <= d` when both sums are exact. A constant `k <= c`
+  is below what `x + c` is below, `x` being unsigned (`s[0]` in a loop
+  to `s.len`). So `s[i..][0..16]`
   after `i + 32 < s.len` keeps none of its three checks, nor does the
   next block's at `i + 16`, derived from the exact `i += 16` that made
   the new `i`, not from a later load.
