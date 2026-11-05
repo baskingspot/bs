@@ -91,6 +91,11 @@ pub const Options = struct {
     /// Link a dynamic library (MH_DYLIB) instead of an executable. Not
     /// with `symbols`.
     dylib: ?*const Dylib = null,
+    /// Libraries other than libSystem that imports bind to (`Import.lib`),
+    /// loaded in this order after it.
+    libs: []const Lib = &.{},
+    /// LC_RPATH directories, where dyld looks for `@rpath/` libraries.
+    rpaths: []const []const u8 = &.{},
     /// Symbols imported from libSystem. An atom with the same key overrides
     /// the import.
     imports: []const Import = &.{},
@@ -178,6 +183,16 @@ pub const Import = struct {
     /// The symbol's name without Darwin's leading underscore, which the
     /// linker adds, as it does to atoms' names: `write`.
     name: []const u8,
+    /// The library it binds to: 0 for libSystem, else 1 + its index in
+    /// `Options.libs`.
+    lib: u16 = 0,
+};
+
+/// A library an LC_LOAD_DYLIB loads, as its LC_ID_DYLIB names it.
+pub const Lib = struct {
+    install_name: []const u8,
+    current_version: u32 = 0x10000,
+    compatibility_version: u32 = 0x10000,
 };
 
 pub const Value = Elf.Value;
@@ -601,12 +616,16 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const dylinker_cmd_size = std.mem.alignForward(u32, @sizeOf(macho.dylinker_command) + dylinker_path.len + 1, 8);
     const dylib_cmd_size = std.mem.alignForward(u32, @sizeOf(macho.dylib_command) + libsystem_path.len + 1, 8);
     const id_cmd_size = if (dylib) |d| std.mem.alignForward(u32, @intCast(@sizeOf(macho.dylib_command) + d.install_name.len + 1), 8) else 0;
+    var extra_cmds_size: u32 = 0;
+    for (options.libs) |lib| extra_cmds_size += std.mem.alignForward(u32, @intCast(@sizeOf(macho.dylib_command) + lib.install_name.len + 1), 8);
+    for (options.rpaths) |r| extra_cmds_size += std.mem.alignForward(u32, @intCast(@sizeOf(macho.rpath_command) + r.len + 1), 8);
     var sizeofcmds: u32 = @sizeOf(macho.segment_command_64) + // __LINKEDIT
         2 * @sizeOf(macho.linkedit_data_command) + // chained fixups, exports trie
         @sizeOf(macho.symtab_command) + @sizeOf(macho.dysymtab_command) +
         @sizeOf(macho.uuid_command) + @sizeOf(macho.build_version_command) +
         dylib_cmd_size + 2 * @sizeOf(macho.linkedit_data_command); // function starts, code signature
-    var ncmds: u32 = 10;
+    var ncmds: u32 = 10 + @as(u32, @intCast(options.libs.len + options.rpaths.len));
+    sizeofcmds += extra_cmds_size;
     if (dylib == null) {
         sizeofcmds += @sizeOf(macho.segment_command_64) + dylinker_cmd_size + @sizeOf(macho.entry_point_command);
         ncmds += 3;
@@ -872,7 +891,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         }
         for (bind_imports, 0..) |imp, i| {
             // Two-level namespace: library ordinal 1, libSystem.
-            writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_UNDF | macho.N_EXT, 0, 1 << 8, 0));
+            // Two-level namespace: the library's ordinal, libSystem's 1.
+            writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_UNDF | macho.N_EXT, 0, (@as(u16, imp.lib) + 1) << 8, 0));
             sym_off += @sizeOf(macho.nlist_64);
             buf[strtab_off + str_off] = '_';
             @memcpy(buf[strtab_off + str_off + 1 ..][0..imp.name.len], imp.name);
@@ -972,6 +992,19 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .current_version = 0x10000,
         .compatibility_version = 0x10000,
     } }, libsystem_path, dylib_cmd_size);
+    for (options.libs) |lib| {
+        const size = std.mem.alignForward(u32, @intCast(@sizeOf(macho.dylib_command) + lib.install_name.len + 1), 8);
+        w.putWithString(macho.dylib_command{ .cmd = .LOAD_DYLIB, .cmdsize = size, .dylib = .{
+            .name = @sizeOf(macho.dylib_command),
+            .timestamp = 2,
+            .current_version = lib.current_version,
+            .compatibility_version = lib.compatibility_version,
+        } }, lib.install_name, size);
+    }
+    for (options.rpaths) |r| {
+        const size = std.mem.alignForward(u32, @intCast(@sizeOf(macho.rpath_command) + r.len + 1), 8);
+        w.putWithString(macho.rpath_command{ .cmdsize = size, .path = @sizeOf(macho.rpath_command) }, r, size);
+    }
     w.put(macho.linkedit_data_command{ .cmd = .FUNCTION_STARTS, .dataoff = @intCast(func_starts_off), .datasize = @intCast(func_starts_size) });
     w.put(macho.linkedit_data_command{ .cmd = .CODE_SIGNATURE, .dataoff = @intCast(sig_off), .datasize = @intCast(sig_size) });
     std.debug.assert(w.at == cmds_end);
@@ -2254,10 +2287,10 @@ const ChainedFixupsLayout = struct {
                 prev = off;
             }
         }
-        // Imports: library ordinal 1 (libSystem), not weak, name offset.
+        // Imports: library ordinal (libSystem's 1), not weak, name offset.
         var name_off: u32 = 1;
         for (imports, 0..) |imp, i| {
-            put32(out, cf.imports_off + 4 * i, 1 | (name_off << 9));
+            put32(out, cf.imports_off + 4 * i, (@as(u32, imp.lib) + 1) | (name_off << 9));
             out[cf.symbols_off + name_off] = '_';
             @memcpy(out[cf.symbols_off + name_off + 1 ..][0..imp.name.len], imp.name);
             name_off += @intCast(1 + imp.name.len + 1);
@@ -3314,4 +3347,14 @@ test "a dylib has its install name, exports and fixups, and no __PAGEZERO or ent
     try std.testing.expectEqual([2]u64{ macho.EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, f_off }, trieLookup(trie, "_f").?);
     try std.testing.expectEqual(0, trieLookup(trie, "_ptr").?[0]);
     try std.testing.expectEqual(null, trieLookup(trie, "_g"));
+
+    // What an executable linking against it reads back.
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const read = try @import("MachODylib.zig").parse(arena_state.allocator(), "libt.dylib", out);
+    try std.testing.expectEqualStrings("@rpath/libt.dylib", read.install_name);
+    try std.testing.expectEqual(0x10203, read.current_version);
+    try std.testing.expectEqual(2, read.exports.count());
+    try std.testing.expect(read.exports.get("f").?.weak);
+    try std.testing.expect(!read.exports.get("ptr").?.weak);
 }

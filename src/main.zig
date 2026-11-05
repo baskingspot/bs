@@ -17,6 +17,7 @@ const Archive = @import("link/Archive.zig");
 const ElfMerge = @import("link/ElfMerge.zig");
 const ElfInput = @import("link/ElfInput.zig");
 const MachOInput = @import("link/MachOInput.zig");
+const MachODylib = @import("link/MachODylib.zig");
 const ElfShared = @import("link/ElfShared.zig");
 const Docs = @import("Docs.zig");
 const Glibc = @import("link/Glibc.zig");
@@ -1141,8 +1142,23 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     };
     if (glibc != null) emit.runpath = opts.runpath;
     emit.lld = opts.c_root;
-    const shared_libs = try arena.alloc(ElfShared, opts.shared_libs.len);
-    for (shared_libs, opts.shared_libs, opts.shared_names) |*lib, path, name| {
+    // aarch64-macos links against Mach-O dylibs, with LC_RPATHs.
+    const macos = opts.bs_target == .aarch64_macos;
+    if (macos) {
+        emit.runpath = opts.runpath;
+        const libs = try arena.alloc(MachODylib, opts.shared_libs.len);
+        for (libs, opts.shared_libs) |*lib, path| {
+            const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
+                fatal("unable to read '{s}': {t}", .{ path, err });
+            lib.* = MachODylib.parse(arena, path, bytes) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.InvalidDylib => fatal("'{s}' is not an arm64 Mach-O dynamic library", .{path}),
+            };
+        }
+        emit.macho_libs = libs;
+    }
+    const shared_libs = try arena.alloc(ElfShared, if (macos) 0 else opts.shared_libs.len);
+    for (shared_libs, opts.shared_libs[0..shared_libs.len], opts.shared_names[0..shared_libs.len]) |*lib, path, name| {
         const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
             fatal("unable to read '{s}': {t}", .{ path, err });
         lib.* = ElfShared.parse(arena, path, name, bytes) catch |err| switch (err) {
@@ -2321,7 +2337,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     opts.link_inputs = objects.items;
     opts.shared_libs = shared.items;
     opts.shared_names = shared_names.items;
-    if (shared.items.len != 0 and !opts.link_libc)
+    if (shared.items.len != 0 and !opts.link_libc and opts.bs_target != .aarch64_macos)
         setUnsupported(&opts, arena, "bs links shared libraries only into executables that link libc ('{s}'); add -lc or build this step with upstream zig", .{shared.items[0]});
     // DT_RUNPATH: as upstream's `rpath_list`, deduplicated.
     if (native) try rpaths.appendSlice(arena, search_dirs.items[0..n_explicit_dirs]);
@@ -2488,10 +2504,11 @@ fn loadGlibc(init: std.process.Init, job: *const Job) !Glibc {
     return g;
 }
 
-/// Whether `path` names a shared library: `.so`, or a versioned `.so.1`.
+/// Whether `path` names a shared library: `.so`, a versioned `.so.1`, or
+/// a Mach-O `.dylib`.
 fn isSharedLib(path: []const u8) bool {
     const base = std.fs.path.basename(path);
-    return std.mem.endsWith(u8, base, ".so") or std.mem.indexOf(u8, base, ".so.") != null;
+    return std.mem.endsWith(u8, base, ".so") or std.mem.indexOf(u8, base, ".so.") != null or std.mem.endsWith(u8, base, ".dylib");
 }
 
 /// A `-l` library, found as upstream's `link.resolveLibInput` finds one
