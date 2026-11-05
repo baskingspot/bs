@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n16\n41\nNope\nBad\nother\nA\n7\nGenericFailure\nWeird name!\n1\n100\n8\n200\n9\n300\n12\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n16\n41\nNope\nBad\nother\nA\n7\nGenericFailure\nWeird name!\n1\n100\n8\n200\n9\n300\n12\nOnlyFolded\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -200,6 +200,12 @@ fn main() callconv(.c) noreturn {
         _ = &in;
         rt.printInt(viaRetPtr(&in));
     }
+    // A code from a comptime `@intFromError` names its error at runtime,
+    // though no code uses the error itself.
+    var folded: u16 = @intFromError(error.OnlyFolded);
+    _ = &folded;
+    rt.print(@errorName(@errorFromInt(folded)));
+    rt.print("\n");
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
 }
 

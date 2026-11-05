@@ -2227,23 +2227,25 @@ pub fn errorKeyFromName(name: []const u8) SymbolKey {
 }
 
 /// A `[:0]const u8` per error code, for `@errorName` at runtime. It is
-/// built after every function is lowered, when the set of errors the
-/// program uses is known; codes stay symbolic everywhere else.
+/// built after every function is lowered, when every error code is
+/// assigned; codes stay symbolic everywhere else. As upstream's, it names
+/// every code `@errorFromInt` accepts (`errors_len`), not only the errors
+/// code uses: a code can come from a comptime `@intFromError`.
 pub const error_name_table: SymbolKey = .fromName("__bs_error_names");
 
 fn emitErrorNameTable(emit: *Emit) !void {
     const ip = &emit.zcu.ip;
     const gpa = emit.gpa;
-    var max: u32 = 0;
-    for (emit.errors.keys()) |name| max = @max(max, try ip.errorValue(name));
-    const bytes = try emit.allocator().alloc(u8, (@as(usize, max) + 1) * 16);
+    // Codes are assigned when first asked for: the errors code uses get
+    // theirs now if they have none yet.
+    for (emit.errors.keys()) |name| _ = try ip.errorValue(name);
+    const bytes = try emit.allocator().alloc(u8, ip.error_names.items.len * 16);
     @memset(bytes, 0);
     var refs: Atom.RelocList = .{};
     defer refs.deinit(gpa);
-    // In code order, not use order, so that the atom is the same however
-    // the build reached its uses (an edit build loads some of them).
-    for (ip.error_names.items[1 .. max + 1]) |name| {
-        if (!emit.errors.contains(name)) continue;
+    // In code order, so that the atom is the same however the build
+    // reached its uses (an edit build loads some of them).
+    for (ip.error_names.items[1..]) |name| {
         const s = ip.stringSlice(name);
         const z = try gpa.alloc(u8, s.len + 1);
         defer gpa.free(z);
