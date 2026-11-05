@@ -102,6 +102,8 @@ pub fn lowers(cg: *CodeGen, inst: Inst.Index) bool {
         .neg_float, .abs_float, .sqrt => ip.keyTag(cg.typeOf(data.un_op)) == .vector_type,
         .not, .intcast, .trunc => ip.keyTag(data.ty_op.ty) == .vector_type,
         .aggregate_init => isSplat(cg, data),
+        .bitcast => storedBitcast(cg, inst),
+        .load => loadedBitcast(cg, inst) != null,
         else => false,
     };
 }
@@ -120,6 +122,8 @@ fn isSplat(cg: *CodeGen, data: Inst.Data) bool {
 pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error!void {
     const ip = cg.ip;
     switch (tag) {
+        .bitcast => {}, // the store after it stores the operand (`stored`)
+        .load => {}, // the bitcast after it loads (`loaded`)
         .intcast, .trunc => try cast(cg, inst, data.ty_op.ty, data.ty_op.operand),
         .cmp_vector => {
             if (absorbed(cg, inst)) return; // computed by its reduce
@@ -207,7 +211,9 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
 // A compare or select whose only user is the reduce right after it in its
 // block is not emitted (`absorbed`): the reduce computes from its operands,
 // which nothing between overwrites, since no value is defined between
-// (and, for a reduce its branch computes, none after it either).
+// (and, for a reduce its branch computes, none after it either). A
+// bitcast of a vector whose only user is the store right after it is not
+// emitted either (`storedBitcast`).
 
 fn isDbg(tag: Inst.Tag) bool {
     return tag == .dbg_stmt or tag == .dbg_inline_begin or tag == .dbg_inline_end;
@@ -265,6 +271,76 @@ fn fusedCmp(cg: *CodeGen, inst: Inst.Index) ?Inst.Index {
     if (cg.ir.instructions.items(.tag)[@backingInt(c)] != .cmp_vector) return null;
     if (absorber(cg, c) != inst) return null;
     return c;
+}
+
+/// Whether bitcast `inst`, of a vector of lanes to an array or vector of
+/// its size (the coercion before storing a vector into an array), is not
+/// emitted: its only user is the store right after it, which stores the
+/// operand instead (`stored`), saving a copy of the vector.
+fn storedBitcast(cg: *CodeGen, inst: Inst.Index) bool {
+    const insts = fromHere(cg, inst) orelse return false;
+    const ip = cg.ip;
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op;
+    const src_ty = cg.typeOf(data.operand);
+    if (shape(ip, src_ty) == null) return false;
+    if (ip.keyTag(data.ty) != .array_type and ip.keyTag(data.ty) != .vector_type) return false;
+    if (Type.abiSize(ip, data.ty) != Type.abiSize(ip, src_ty)) return false;
+    const live = cg.ssa.live.slice();
+    if (live.items(.uses)[@backingInt(inst)] != 1 or live.items(.fate)[@backingInt(inst)] != .normal) return false;
+    const tags = cg.ir.instructions.items(.tag);
+    for (insts[1..]) |x| {
+        if (isDbg(tags[@backingInt(x)])) continue;
+        return tags[@backingInt(x)] == .store and cg.ir.instructions.items(.data)[@backingInt(x)].bin_op.rhs == inst.toRef();
+    }
+    return false;
+}
+
+/// The bitcast that loads for load `inst`, which is not emitted: the
+/// load's only user, right after it, converting an array or vector to a
+/// vector of its size in a register.
+fn loadedBitcast(cg: *CodeGen, inst: Inst.Index) ?Inst.Index {
+    const insts = fromHere(cg, inst) orelse return null;
+    const live = cg.ssa.live.slice();
+    if (live.items(.uses)[@backingInt(inst)] != 1 or live.items(.fate)[@backingInt(inst)] != .normal) return null;
+    const tags = cg.ir.instructions.items(.tag);
+    // Not a load of a variable, which `Ssa.plan` may forward or promote
+    // so that it has no memory.
+    const ptr = cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op.operand;
+    if (ptr.toIndex()) |p| if (tags[@backingInt(p)] == .alloc) return null;
+    for (insts[1..]) |x| {
+        if (isDbg(tags[@backingInt(x)])) continue;
+        // A bitcast a store absorbs is not emitted to load either.
+        if (tags[@backingInt(x)] != .bitcast or !bitcastToVreg(cg, x) or storedBitcast(cg, x)) return null;
+        if (cg.ir.instructions.items(.data)[@backingInt(x)].ty_op.operand != inst.toRef()) return null;
+        return x;
+    }
+    return null;
+}
+
+/// Whether bitcast `inst` loads its result's vector register from its
+/// operand, an array or vector of the same size outside general-purpose
+/// registers (`CodeGen` lowers the rest).
+pub fn bitcastToVreg(cg: *CodeGen, inst: Inst.Index) bool {
+    if (cg.homes[@backingInt(inst)] != .vreg) return false;
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op;
+    const src_ty = cg.typeOf(data.operand);
+    return !cg.inGpr(src_ty) and Type.abiSize(cg.ip, data.ty) == Type.abiSize(cg.ip, src_ty);
+}
+
+/// For a bitcast to a vector register: the pointer to load from, when
+/// its operand is a load it absorbs (`loadedBitcast`).
+pub fn loaded(cg: *CodeGen, operand: Ref) ?Ref {
+    const i = operand.toIndex() orelse return null;
+    if (cg.ir.instructions.items(.tag)[@backingInt(i)] != .load or loadedBitcast(cg, i) == null) return null;
+    return cg.ir.instructions.items(.data)[@backingInt(i)].ty_op.operand;
+}
+
+/// The value store operand `val` stands for: the vector a bitcast before
+/// the store converts (`storedBitcast`), else `val`.
+pub fn stored(cg: *CodeGen, val: Ref) Ref {
+    const i = val.toIndex() orelse return val;
+    if (cg.ir.instructions.items(.tag)[@backingInt(i)] != .bitcast or !storedBitcast(cg, i)) return val;
+    return cg.ir.instructions.items(.data)[@backingInt(i)].ty_op.operand;
 }
 
 /// For `CodeGen.fusable`: whether `inst` is an `@reduce(.Or)` or

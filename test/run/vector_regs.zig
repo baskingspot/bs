@@ -1,12 +1,13 @@
 //! exit: 0
-//! stderr: "many b86b44fdbe971fe3\ncalls ff11b1274f604e3\nloop 995e5ee3c34409a7\nshort d6bcc89073567f5b\n"
+//! stderr: "many b86b44fdbe971fe3\ncalls ff11b1274f604e3\nloop 995e5ee3c34409a7\nshort d6bcc89073567f5b\nfused 49932c7b3f9e0d1\n"
 //! targets: x86_64-linux aarch64-macos aarch64-linux
 
 // Vectors held in vector registers across the shapes where a register
 // class goes wrong: more live vectors than registers, vectors live across
 // calls (a function, compiler_rt's f128 division and i128 multiply, libm),
 // which clobber the caller-saved vector registers, vectors carried
-// around a loop, and short vectors whose registers hold other bytes.
+// around a loop, short vectors whose registers hold other bytes, and
+// bitcasts fused with the load or store next to them.
 const std = @import("std");
 
 const V = @Vector(4, u32);
@@ -99,6 +100,24 @@ noinline fn short(x: u16, y: u8) void {
     for (r) |v| h = (h ^ v) *% 0x100000001b3;
 }
 
+const S = struct { a: @Vector(8, i8), b: u8 };
+
+/// Bitcasts next to the load or store they fuse with: vectors loaded from
+/// arrays and stored into them, and a load, a bitcast and a store in a
+/// row into a vector variable.
+noinline fn fused(src: []const u8, dst: []u8, wide: []u32, sp: *const S) void {
+    const v: B = src[0..16].*;
+    dst[0..16].* = v +% @as(B, @splat(1));
+    const w: @Vector(16, u32) = v;
+    wide[0..16].* = w;
+    var acc: @Vector(1, i64) = .{5};
+    var n: usize = src.len % 3 + 1;
+    while (n != 0) : (n -= 1) acc = @bitCast(sp.a);
+    for (dst[0..16]) |x| h = (h ^ x) *% 0x100000001b3;
+    for (wide[0..16]) |x| h = (h ^ x) *% 0x100000001b3;
+    h = (h ^ @as(u64, @bitCast(acc[0]))) *% 0x100000001b3;
+}
+
 pub fn main() void {
     many();
     std.debug.print("many {x}\n", .{h});
@@ -108,4 +127,11 @@ pub fn main() void {
     std.debug.print("loop {x}\n", .{h});
     short(0x1234, 0x56);
     std.debug.print("short {x}\n", .{h});
+    var src: [24]u8 = undefined;
+    for (&src, 0..) |*x, i| x.* = @truncate(i *% 37 +% 11);
+    var dst: [16]u8 = undefined;
+    var wide: [16]u32 = undefined;
+    const s: S = .{ .a = .{ -128, -1, 8, -17, -19, -81, -1, 17 }, .b = 3 };
+    fused(&src, &dst, &wide, &s);
+    std.debug.print("fused {x}\n", .{h});
 }

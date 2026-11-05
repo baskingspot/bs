@@ -2181,7 +2181,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.copyMem(dst, .at(.x12, 0), Type.abiSize(ip, ty));
         },
         .store => {
-            const val = data.bin_op.rhs;
+            const val = vector.stored(cg, data.bin_op.rhs);
             const size = Type.abiSize(ip, cg.typeOf(val));
             if (size == 0) return;
             if (cg.promoted(data.bin_op.lhs)) |v| return cg.load(v, val);
@@ -2334,6 +2334,14 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const ty = data.ty_op.ty;
             const src_ty = cg.typeOf(data.ty_op.operand);
             if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(src_ty)) and Type.isInt(ip, ty)) return cg.genWide(inst, tag, data);
+            const size = Type.abiSize(ip, ty);
+            const src_size = Type.abiSize(ip, src_ty);
+            // A vector in a register from an array or vector of its size.
+            if (vector.bitcastToVreg(cg, inst)) {
+                const v = cg.homes[@backingInt(inst)].vreg;
+                if (vector.loaded(cg, data.ty_op.operand)) |ptr| return vector.loadMem(cg, v, try cg.ptrMem(ptr), @intCast(size));
+                return vector.loadVec(cg, v, data.ty_op.operand);
+            }
             if (cg.passInRegs(ty) and cg.passInRegs(src_ty)) {
                 try cg.load(.x9, data.ty_op.operand);
                 if (Type.isInt(ip, ty)) try cg.normalize(.x9, ty);
@@ -2342,11 +2350,6 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 if (ty == .bool_type and src_ty != .bool_type) try cg.e.logic(.@"and", .x, .x9, .x9, .{ .imm = 1 });
                 return cg.setResult(inst, ty, .x9);
             }
-            const size = Type.abiSize(ip, ty);
-            const src_size = Type.abiSize(ip, src_ty);
-            // A vector in a register from an array or vector of its size.
-            if (tag == .bitcast and cg.homes[@backingInt(inst)] == .vreg and src_size == size)
-                return vector.loadVec(cg, cg.homes[@backingInt(inst)].vreg, data.ty_op.operand);
             const dst = try cg.resultMem(inst, ty) orelse return;
             if (src_size != size) {
                 // A bitcast between a vector and an array or integer
