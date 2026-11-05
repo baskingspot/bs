@@ -3806,11 +3806,17 @@ value model:
   data naming an extern symbol builds again eagerly
   (`Emit.inputs_deferred`). An undefined symbol in data is a compile
   error (`lowerNav` records it as `Emit.failed`).
-- A thread-local whose value is wholly undefined, or lowers to zeros
-  with no relocations, is a zero-filled `.tbss` atom (`__thread_bss` on
-  Mach-O), as LLVM places it, instead of `.tdata` bytes: std's 256 KiB
+- A variable whose value is wholly undefined, or lowers to zeros with
+  no relocations, is a zero-filled atom, as LLVM places it: `.bss`
+  (`__bss` on Mach-O), or for a thread-local `.tbss` (`__thread_bss`),
+  instead of `.data` or `.tdata` bytes. std's 256 KiB
   `Thread.maybeAttachSignalStack` stack left every executable's file
-  (2026-11-05). Other data keeps its bytes, undefined as 0xaa.
+  (2026-11-05). Sizes (x86_64-linux, before → thread-locals only → all
+  variables): hello 2,672,792 → 2,406,552 → 2,399,376 bytes; the zig
+  compiler workload 110.74 → 110.40 → 110.38 MB; std's tests 58.78 →
+  58.52 → 51.93 MB, whose RW segment's file bytes drop from 6.5 MB to
+  19 KB. Constants keep their bytes in `.rodata`, as LLVM keeps them,
+  and other data its bytes, undefined as 0xaa.
 - A constant that a function reads is a content atom CodeGen writes
   while analysis runs, before the exports and inputs are complete. Its
   address of extern symbol `name` relocates to `Emit.externAddrKey`
