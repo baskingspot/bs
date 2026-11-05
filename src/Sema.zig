@@ -116,6 +116,11 @@ const_allocs: std.AutoHashMapUnmanaged(Ir.Inst.Index, ConstAlloc) = .empty,
 /// Field indices of the bit pointers (`bitcast`s) into packed fields of
 /// `const_allocs`. Arena-allocated.
 packed_field_ptrs: std.AutoHashMapUnmanaged(Ir.Inst.Index, u32) = .empty,
+/// The last store into part of a packed host integer (`analyzeStore`).
+packed_chain: ?PackedChain = null,
+/// The last field pointer of a struct literal stored through a pointer,
+/// and the literal's pointer.
+init_field: struct { ptr: Ref = .none, base: Ref = .none } = .{},
 /// Mutable pointers to comptime fields' values, which stores may only
 /// check. Arena-allocated.
 comptime_field_ptrs: std.AutoHashMapUnmanaged(Index, void) = .empty,
@@ -3433,6 +3438,21 @@ fn addSafetyCheck(sema: *Sema, block: *Block, ok: Ref, id: PanicId, lhs: Ref, rh
     }
     var fail_block = block.child();
     defer fail_block.deinitInsts();
+    // A packed host's write that the next one may take over (`PackedChain`)
+    // happens before the panic too, on its own: the next write changes the
+    // first read's mask.
+    const chain_store: ?Ir.Inst.Index = if (sema.packed_chain) |c|
+        if (c.block == block and c.checks_len < c.checks.len and sema.onlyArithmeticSince(block, c.store, c.init_base != .none) != null) c.store else null
+    else
+        null;
+    if (chain_store) |s| {
+        const c = sema.packed_chain.?;
+        const host_ptr = sema.ir_insts.items(.data)[@backingInt(s)].bin_op.lhs;
+        const host_bits = Type.intInfo(sema.ip, c.host_ty).bits;
+        const keep = (@as(u64, std.math.maxInt(u64)) >> @intCast(64 - host_bits)) & ~c.written;
+        const new = if (keep == 0) c.fields else try sema.addBinOp(&fail_block, .bit_or, try sema.addBinOp(&fail_block, .bit_and, try sema.addTyOp(&fail_block, .load, c.host_ty, host_ptr), .fromInterned(try sema.intValue(c.host_ty, keep))), c.fields);
+        _ = try sema.addBinOp(&fail_block, .store, host_ptr, new);
+    }
     try sema.addPanic(&fail_block, id, lhs, rhs);
     // `block { cond_br(ok, { br }, { panic }) }`
     const block_inst: Ir.Inst.Index = @fromBackingInt(@intCast(sema.ir_insts.len));
@@ -3447,6 +3467,10 @@ fn addSafetyCheck(sema: *Sema, block: *Block, ok: Ref, id: PanicId, lhs: Ref, rh
     try sema.appendBody(inner.instructions.items);
     sema.ir_insts.items(.data)[@backingInt(block_inst)].ty_pl.payload = payload;
     try block.instructions.append(sema.gpa, block_inst);
+    if (sema.packed_chain) |*c| if (chain_store != null and c.store == chain_store.?) {
+        c.checks[c.checks_len] = block_inst;
+        c.checks_len += 1;
+    };
 }
 
 /// `cover`: the arms of a branch the user wrote, which `-ffuzz` makes
@@ -5170,7 +5194,9 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             if (sema.ip.keyTag(child) == .union_type) {
                 break :blk sema.unionFieldPtr(block, src, ptr, try sema.unionFieldIndex(block, src.fieldName(), child, name), true);
             }
-            break :blk sema.fieldPtr(block, src, ptr, name);
+            const field_ptr = try sema.fieldPtr(block, src, ptr, name);
+            sema.init_field = .{ .ptr = field_ptr, .base = ptr };
+            break :blk field_ptr;
         },
         .array_init, .array_init_ref, .array_init_anon => blk: {
             const val = try sema.zirArrayInit(block, inst);
@@ -12400,9 +12426,48 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
         // Read, modify, and write the host integer.
         const host_ty = try sema.intType(.unsigned, info.packed_offset.host_size * 8);
         const host_ptr = try sema.addTyOp(block, .bitcast, try sema.ptrType(.{ .child = host_ty, .flags = .{ .is_volatile = info.flags.is_volatile, .address_space = info.flags.address_space } }), ptr);
+        const bits = Type.packedBits(ip, info.child).?;
+        const host_bits = info.packed_offset.host_size * 8;
+        if (bits == 0 or host_bits > 64 or info.flags.is_volatile) {
+            sema.packed_chain = null;
+            const old = try sema.addTyOp(block, .load, host_ty, host_ptr);
+            const new = try sema.packedInsert(block, old, info.packed_offset.bit_offset, operand);
+            _ = try sema.addBinOp(block, .store, host_ptr, new);
+            return;
+        }
+        const field = (@as(u64, std.math.maxInt(u64)) >> @intCast(64 - bits)) << @intCast(info.packed_offset.bit_offset);
+        const root = bitcastRoot(sema.ir_insts.slice(), ptr);
+        const init_base: Ref = if (ptr == sema.init_field.ptr) sema.init_field.base else .none;
+        if (sema.packed_chain) |*c| if (c.block == block and c.root == root and c.host_ty == host_ty and c.written & field == 0) {
+            if (sema.onlyArithmeticSince(block, c.store, init_base != .none and init_base == c.init_base)) |pos| {
+                // The earlier store's value is what the host holds now:
+                // add this field to its fields, clear one more field of
+                // the host as first read, and store once.
+                _ = block.instructions.orderedRemove(pos);
+                c.written |= field;
+                const all = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - host_bits);
+                sema.ir_insts.items(.data)[@backingInt(c.first_and)].bin_op.rhs = .fromInterned(try sema.intValue(host_ty, all & ~c.written));
+                c.fields = try sema.addBinOp(block, .bit_or, c.fields, try sema.packedField(block, host_ty, info.packed_offset.bit_offset, operand));
+                const new = try sema.addBinOp(block, .bit_or, c.first_and.toRef(), c.fields);
+                c.store = (try sema.addBinOp(block, .store, host_ptr, new)).toIndex().?;
+                c.checks_len = 0;
+                return;
+            }
+        };
         const old = try sema.addTyOp(block, .load, host_ty, host_ptr);
         const new = try sema.packedInsert(block, old, info.packed_offset.bit_offset, operand);
-        _ = try sema.addBinOp(block, .store, host_ptr, new);
+        const st = try sema.addBinOp(block, .store, host_ptr, new);
+        const or_data = sema.ir_insts.items(.data)[@backingInt(new.toIndex().?)].bin_op;
+        sema.packed_chain = .{
+            .block = block,
+            .root = root,
+            .host_ty = host_ty,
+            .store = st.toIndex().?,
+            .first_and = or_data.lhs.toIndex().?,
+            .fields = or_data.rhs,
+            .written = field,
+            .init_base = init_base,
+        };
         return;
     }
     _ = try sema.addBinOp(block, .store, ptr, operand);
@@ -12547,10 +12612,80 @@ fn packedInsert(sema: *Sema, block: *Block, host: Ref, bit_offset: u16, val: Ref
     try all.addScalar(&all, -1);
     try mask.bitXor(&mask, &all);
     const cleared = try sema.addBinOp(block, .bit_and, host, .fromInterned(try sema.bigToValue(host_ty, mask.toConst())));
+    return sema.addBinOp(block, .bit_or, cleared, try sema.packedField(block, host_ty, bit_offset, val));
+}
+
+/// `val`'s bits at `bit_offset` in an otherwise zero `host_ty`.
+fn packedField(sema: *Sema, block: *Block, host_ty: Index, bit_offset: u16, val: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const host_bits = Type.intInfo(ip, host_ty).bits;
+    if (host_bits <= 64) if (sema.resolveValue(val)) |k| if (!sema.isUndef(k)) if (sema.valueBits64(k, bit_offset)) |x|
+        return .fromInterned(try sema.intValue(host_ty, x));
     var v = try sema.packedToBits(block, val);
-    if (bits != host_bits) v = try sema.addTyOp(block, .intcast, host_ty, v);
+    if (Type.packedBits(ip, sema.typeOf(val)).? != host_bits) v = try sema.addTyOp(block, .intcast, host_ty, v);
     if (bit_offset != 0) v = try sema.addBinOp(block, .shl, v, .fromInterned(try sema.intValue(try sema.intType(.unsigned, Type.log2IntBits(host_bits)), bit_offset)));
-    return sema.addBinOp(block, .bit_or, cleared, v);
+    return v;
+}
+
+/// A store into part of a packed host integer, which the next store into
+/// another part of the same host extends when only arithmetic comes
+/// between them: the second reads the first's value instead of the host,
+/// and the first store goes. A literal of a packed struct stored through
+/// a pointer, which writes field by field, then reads the host once, or
+/// not at all when it writes every field, and writes it once.
+const PackedChain = struct {
+    block: *Block,
+    /// The host's address, under its `bitcast`s; the host's type.
+    root: Ref,
+    host_ty: Index,
+    store: Ir.Inst.Index,
+    /// The first store's `host & mask`, whose mask clears the fields
+    /// written since too.
+    first_and: Ir.Inst.Index,
+    /// The fields written, at their places in the host, and their bits.
+    fields: Ref,
+    written: u64,
+    /// The struct literal whose field the store wrote, if any: only its
+    /// next fields' writes take over across a statement's line changes.
+    init_base: Ref,
+    /// The safety checks since the store, whose failing paths write the
+    /// same fields before they panic (`addSafetyCheck`).
+    checks: [4]Ir.Inst.Index = undefined,
+    checks_len: u8 = 0,
+};
+
+/// `ptr` under its `bitcast`s.
+fn bitcastRoot(insts: std.MultiArrayList(Ir.Inst).Slice, ptr: Ref) Ref {
+    var r = ptr;
+    while (r.toIndex()) |i| {
+        if (insts.items(.tag)[@backingInt(i)] != .bitcast) break;
+        r = insts.items(.data)[@backingInt(i)].ty_op.operand;
+    }
+    return r;
+}
+
+/// The position of `store` in `block` if only arithmetic, which neither
+/// touches memory nor branches, follows it there, safety checks that
+/// store the same value before they panic, and if `lines`, line changes.
+fn onlyArithmeticSince(sema: *Sema, block: *Block, store: Ir.Inst.Index, lines: bool) ?usize {
+    const insts = block.instructions.items;
+    const tags = sema.ir_insts.items(.tag);
+    var k = insts.len;
+    while (k > 0 and insts.len - k < 32) {
+        k -= 1;
+        if (insts[k] == store) return k;
+        switch (tags[@backingInt(insts[k])]) {
+            .bitcast, .intcast, .trunc, .int_from_bool, .not, .bit_and, .bit_or, .xor, .shl, .shr, .add_wrap, .sub_wrap, .mul_wrap => {},
+            .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {},
+            .dbg_stmt => if (!lines) return null,
+            .block => {
+                const c = sema.packed_chain orelse return null;
+                if (c.store != store or std.mem.indexOfScalar(Ir.Inst.Index, c.checks[0..c.checks_len], insts[k]) == null) return null;
+            },
+            else => return null,
+        }
+    }
+    return null;
 }
 
 fn analyzeRef(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!Ref {
