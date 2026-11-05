@@ -452,12 +452,14 @@ judged on more than the small programs above:
 | zig-sema | the same binary analyzing hello.zig with an empty cache |
 | vaxis | libvaxis laying out and rendering text into memory ([`realworld/vaxis_render.zig`](realworld/vaxis_render.zig)) |
 | zls-test | the corpus's zls test suite |
+| corpus | corpus targets with a CPU-bound run (`Corpus.TARGETS` in realworld.py): translate-c on x86intrin.h, uucode's table generator, vulkan-zig's generator, test suites of zigimg, json-zig, zig-msgpack, tls.zig, zig-hpke, zedis and seven zig-libs modules, zigcli's `loc` over std, and zwasm's interpreter on three shootout programs |
 
 ```sh
 python3 bench/realworld.py --compiler zig-out/bin/bs
 ```
 
-Options: `--workloads vaxis,zls-test`, `--runs`, `--no-upstream`, `--out
+Options: `--workloads vaxis,zls-test` (`corpus` for all the corpus
+targets, which the corpus checks out and records first), `--runs`, `--no-upstream`, `--out
 PATH.json`. Upstream's builds are kept in `bench/.work/realworld/bin` and
 reused; the compiler has no ReleaseSafe column, since LLVM needs more than an
 orb's 7 GB to build it.
