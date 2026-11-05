@@ -240,6 +240,9 @@ pub fn build(b: *std.Build) void {
 ///                               (paths from the repository root) they
 ///                               replace the program's path, which one of
 ///                               them names
+///   //! upstream-llvm: true     upstream builds the x86_64-linux program
+///                               with LLVM, for a program its self-hosted
+///                               backend miscompiles
 ///   //! targets: <target> ...   the targets the program is for (default
 ///                               x86_64-linux); with aarch64-macos, an
 ///                               aarch64-macos host also builds it for
@@ -343,6 +346,9 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             /// into one global cache; neither replays the other as a donor.
             donor_libc: bool = false,
             flags: std.ArrayList([]const u8) = .empty,
+            /// `upstream-llvm`: upstream builds the x86_64-linux program
+            /// with LLVM, not its self-hosted backend.
+            upstream_llvm: bool = false,
             aarch64_macos: bool = false,
             aarch64_linux: bool = false,
         } = .{};
@@ -364,6 +370,8 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             } else if (std.mem.eql(u8, key, "flags")) {
                 var flags = std.mem.tokenizeScalar(u8, value, ' ');
                 while (flags.next()) |f| expect.flags.append(b.allocator, f) catch @panic("OOM");
+            } else if (std.mem.eql(u8, key, "upstream-llvm")) {
+                expect.upstream_llvm = std.mem.eql(u8, value, "true");
             } else if (std.mem.eql(u8, key, "donor-libc")) {
                 expect.donor_libc = std.mem.eql(u8, value, "true");
             } else if (std.mem.eql(u8, key, "donor-without") or std.mem.eql(u8, key, "donor-here-without")) {
@@ -405,7 +413,8 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
 
         for ([_]bool{ false, true }) |upstream| {
             const compile = if (upstream) blk: {
-                const r = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-llvm", "-fno-lld" });
+                const r = b.addSystemCommand(&.{ upstreamZig(b), "build-exe" });
+                r.addArgs(if (expect.upstream_llvm) &.{"-fllvm"} else &.{ "-fno-llvm", "-fno-lld" });
                 if (expect.libc) r.addArgs(&.{ "-target", "x86_64-linux-gnu", "-lc" });
                 addFlags(b, r, expect.flags.items, src_path);
                 break :blk r;

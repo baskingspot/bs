@@ -1207,10 +1207,19 @@ right shifts, widening casts, overflow checks, and stores to memory. At
 every boundary a value is normalized (zero- or sign-extended to its ABI
 size, as today's invariant for memory): in memory, in call arguments and
 results of both conventions (Apple's C convention requires callers to
-extend arguments narrower than 32 bits), and in returns. So loads and
-incoming arguments are known extended, and lowering tracks that to skip
-redundant extensions. x86_64 may use 8- and 16-bit forms where they
-give the same result.
+extend arguments narrower than 32 bits), and in returns. So a value's own
+slots (spills, results) and incoming arguments are known extended, and
+lowering tracks that to skip redundant extensions. Memory the program
+reads is not: memory written as another type of the same size (an
+unsigned twin through `@ptrCast`, a packed union's other field, a union
+built by `@bitCast`, raw bytes) may hold other bits above an integer's
+width, so a load of an integer or enum whose width is not a whole number
+of bytes extends from its width (`loadMem`; spill and argument reloads
+use `loadKnown`), as upstream's LLVM build does (its x86_64 backend
+trusts the bits). That costs one `and` or shift pair per such load:
+callgrind Ir +0.6% on `zig fmt --check std` (Token.Tag is a u7 enum),
++0.16% on bench/runtime's fmt, within 0.02% on the others. x86_64 may use
+8- and 16-bit forms where they give the same result.
 
 The position is the IR's statement position (line, column) and the
 innermost open inline call (an index into the function's inline table),

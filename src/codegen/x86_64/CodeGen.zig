@@ -955,7 +955,7 @@ fn setupParams(cg: *CodeGen) Error!void {
     }
     for (args, tys, locs) |inst, ty, l| switch (l) {
         .stack => |off| switch (cg.homes[@backingInt(inst)]) {
-            .reg => |r| try cg.loadMem(r, Mem.at(.rbp, 16 + @as(i32, @intCast(off))), ty),
+            .reg => |r| try cg.loadKnown(r, Mem.at(.rbp, 16 + @as(i32, @intCast(off))), ty),
             .regs => |p| {
                 const m = Mem.at(.rbp, 16 + @as(i32, @intCast(off)));
                 try cg.e.mov(.qword, .{ .reg = p.lo }, .{ .mem = m });
@@ -1114,11 +1114,22 @@ pub fn load(cg: *CodeGen, reg: Reg, ref: Ref) Error!void {
             if (m.base.reg != reg) try cg.e.mov(.qword, .{ .reg = reg }, .{ .reg = m.base.reg });
         } else try cg.e.lea(.qword, reg, m),
         .err => |name| try cg.loadError(reg, name),
-        .mem => |m| try cg.loadMem(reg, m, ty),
+        .mem => |m| try cg.loadKnown(reg, m, ty),
     }
 }
 
+/// Loads a value of type `ty` from memory that may have been written as
+/// another type (`extendLoaded`).
 fn loadMem(cg: *CodeGen, reg: Reg, m: Mem, ty: Index) Error!void {
+    try cg.loadKnown(reg, m, ty);
+    try cg.extendLoaded(reg, ty);
+}
+
+/// Loads a value of type `ty` from memory that a register of that type
+/// wrote, extended (a spill slot or an argument slot), so a narrow integer
+/// needs no `extendLoaded`. Narrow integers are never deferred loads
+/// (`deferLoad`), so the slots `locOf` gives them are of this kind.
+fn loadKnown(cg: *CodeGen, reg: Reg, m: Mem, ty: Index) Error!void {
     const size = Type.abiSize(cg.ip, ty);
     switch (size) {
         8 => try cg.e.mov(.qword, .{ .reg = reg }, .{ .mem = m }),
@@ -1128,6 +1139,27 @@ fn loadMem(cg: *CodeGen, reg: Reg, m: Mem, ty: Index) Error!void {
             try cg.e.movzx(.qword, reg, sizeOf(size), .{ .mem = m }),
         else => return cg.fail("loading a {d}-byte value into a register", .{size}),
     }
+}
+
+/// Extends an integer of type `ty` that `loadMem` loaded into `reg` from
+/// its width when that is not a whole number of bytes. Memory written as
+/// another type of its size (an unsigned twin through a pointer cast, a
+/// packed union's other field, raw bytes) may hold other bits above the
+/// width, which the value does not include, as upstream's LLVM loads.
+fn extendLoaded(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
+    const c = Type.class(cg.ip, ty);
+    if (c != .int and c != .@"enum") return;
+    const info = Type.intInfo(cg.ip, ty);
+    switch (info.bits) {
+        0, 8, 16, 32 => return,
+        else => if (info.bits >= 64) return,
+    }
+    // A 32-bit `and` also clears the upper half.
+    if (info.signedness == .unsigned and info.bits < 32)
+        return cg.e.alu(.@"and", .dword, .{ .reg = reg }, .{ .imm = @intCast((@as(u32, 1) << @intCast(info.bits)) - 1) });
+    const shift: u8 = @intCast(64 - info.bits);
+    try cg.e.shift(.shl, .qword, .{ .reg = reg }, shift);
+    try cg.e.shift(if (info.signedness == .signed) .sar else .shr, .qword, .{ .reg = reg }, shift);
 }
 
 fn loadError(cg: *CodeGen, reg: Reg, name: InternPool.String) Error!void {
@@ -4538,7 +4570,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 try cg.fillMem(dst, size, 0);
                 try cg.copyMem(dst, try cg.memOf(data.ty_op.operand), n);
                 if (Type.isInt(ip, ty) and cg.passInRegs(ty)) {
-                    try cg.loadMem(.rax, dst, ty);
+                    try cg.loadKnown(.rax, dst, ty);
                     try cg.normalize(.rax, ty);
                     try cg.storeReg(dst, .rax, size);
                 }
@@ -6763,7 +6795,7 @@ fn loadVal(cg: *CodeGen, reg: Reg, v: Val) Error!void {
         .imm => |x| try cg.e.mov(.qword, .{ .reg = reg }, .{ .imm = @bitCast(x) }),
         .addr => |m| try cg.e.lea(.qword, reg, m),
         .err => |name| try cg.loadError(reg, name),
-        .mem => |m| try cg.loadMem(reg, m, v.ty),
+        .mem => |m| try cg.loadKnown(reg, m, v.ty),
         .xmm => |x| try cg.e.movFromXmm(sizeOf(Type.abiSize(cg.ip, v.ty)), .{ .reg = reg }, x),
     }
 }

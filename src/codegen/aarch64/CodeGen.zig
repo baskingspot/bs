@@ -1070,7 +1070,7 @@ fn setupParams(cg: *CodeGen) Error!void {
                 continue;
             },
             .stack => |off| {
-                try cg.loadMem(cg.homes[@backingInt(inst)].reg, .at(.fp, @intCast(16 + off)), ty);
+                try cg.loadKnown(cg.homes[@backingInt(inst)].reg, .at(.fp, @intCast(16 + off)), ty);
                 continue;
             },
             else => unreachable,
@@ -1318,13 +1318,31 @@ fn loadVal(cg: *CodeGen, reg: Reg, v: Val) Error!void {
         .imm => |x| try cg.e.movImm(.x, reg, x),
         .addr => |m| try cg.addrTo(reg, m),
         .err => |name| try cg.e.movWideValue(.movz, .x, reg, try cg.emit.useError(name), 0),
-        .mem => |m| try cg.loadMem(reg, m, v.ty),
+        .mem => |m| try cg.loadKnown(reg, m, v.ty),
         .reg => |r| if (r != reg) try cg.e.mov(.x, reg, r),
         .freg => |r| if (Type.abiSize(cg.ip, v.ty) == 8) try cg.e.fmovToGpr(.x, reg, .f64, r) else try cg.e.fmovToGpr(.w, reg, .f32, r),
     }
 }
 
+/// Loads a value of type `ty` from memory that may have been written as
+/// another type. An integer whose width is not a whole number of bytes is
+/// extended from its width: memory written as another type of its size (an
+/// unsigned twin through a pointer cast, a packed union's other field, raw
+/// bytes) may hold other bits above it, which the value does not include,
+/// as upstream's LLVM loads.
 fn loadMem(cg: *CodeGen, reg: Reg, m: Mem, ty: Index) Error!void {
+    const size = Type.abiSize(cg.ip, ty);
+    const c = Type.class(cg.ip, ty);
+    const bits = if (c == .int or c == .@"enum") Type.intInfo(cg.ip, ty).bits else 0;
+    if (bits == 0 or bits >= 64 or bits == size * 8) return cg.loadKnown(reg, m, ty);
+    try cg.e.ldr(sizeOf(size), reg, try cg.access(m, @intCast(size), reg));
+    try cg.e.bitfield(if (cg.signed(ty)) .sbfm else .ubfm, .x, reg, reg, 0, @intCast(bits - 1));
+}
+
+/// Loads a value of type `ty` from memory that a register of that type
+/// wrote, extended (a value's slot or an argument slot), so a narrow
+/// integer needs no extending from its width.
+fn loadKnown(cg: *CodeGen, reg: Reg, m: Mem, ty: Index) Error!void {
     const size = Type.abiSize(cg.ip, ty);
     switch (size) {
         1, 2, 4, 8 => {
@@ -2208,7 +2226,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 try cg.fillMem(dst, size, 0);
                 try cg.copyMem(dst, try cg.memOf(data.ty_op.operand), @min(size, src_size));
                 if (Type.isInt(ip, ty) and cg.passInRegs(ty)) {
-                    try cg.loadMem(.x9, dst, ty);
+                    try cg.loadKnown(.x9, dst, ty);
                     try cg.normalize(.x9, ty);
                     try cg.storeReg(dst, .x9, size);
                 }
