@@ -7959,7 +7959,11 @@ libraries as inputs. To be agreed with that thread.
   before), so an archive of C is upstream's byte for
   byte for the same CPU with upstream's own linker (`-fno-llvm
   -fno-lld`); a library of C only under `zig build` links with LLD by
-  default, which writes llvm-ar's format (a 32-bit `/` index). A rootless module other than the root
+  default, which writes llvm-ar's format (a 32-bit `/` index) and names
+  each member after its object's path in upstream's cache
+  (`.zig-cache/o/<hash>/altsvc.o`, curl's libcurl.a), where bs keeps
+  the basename. The paths could not match: bs's cache lays its objects
+  out differently. A rootless module other than the root
   contributes its C files to any build. A rootless root module of
   `build-lib -dynamic` (libsodium's shared library) makes a shared
   library of C, linked from bs's root file as an executable of C only

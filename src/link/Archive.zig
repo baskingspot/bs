@@ -1,5 +1,7 @@
 //! Static libraries (`bs build-lib`, the default static linkage): a GNU ar
-//! archive of the library's relocatable objects, as upstream writes it: a
+//! archive of the library's relocatable objects, as upstream's own
+//! linker writes it (`-fno-lld`; LLD names members after the objects'
+//! cache paths instead): a
 //! `/SYM64/` symbol index of the objects' defined global and weak symbols
 //! (empty when they have none), then the members: the Zig object, named
 //! after the root source file (`protobuf.o` for
