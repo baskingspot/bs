@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -344,6 +344,14 @@ fn dataPtr(some: bool) ?*u32 {
     return @ptrCast(@alignCast(dataGet(some)));
 }
 
+// dvui (App.zig): a comptime struct's `fn () anyerror!T` field holds a
+// function whose error set is inferred.
+const App = struct { frameFn: fn () anyerror!u8 };
+fn appFrame() !u8 {
+    return error.Oops;
+}
+const app: App = .{ .frameFn = appFrame };
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -450,5 +458,6 @@ fn main() callconv(.c) noreturn {
     var fds: [2]i32 = .{ 0, 0 };
     rt.printInt(@intCast(cPipe(&fds)[1] + fds[1]));
     rt.printInt(dataPtr(true).?.* + @intFromBool(dataPtr(false) == null));
+    rt.printInt(app.frameFn() catch 42);
     rt.exit(0);
 }

@@ -13409,6 +13409,10 @@ fn comptimeLoadKey(sema: *Sema, block: *Block, src: Src, key: InternPool.Ptr, lo
     const v = (try sema.comptimeLoadStructuralKey(block, src, key, load_ty, ptr)) orelse return null;
     const v_ty = ip.typeOf(v);
     if (v_ty == load_ty or load_ty == .generic_poison_type or load_ty == .anyopaque_type) return v;
+    // A function body keeps its own type where it coerced to another
+    // function type (`coerceInner`), so a field or element of a function
+    // type may hold one.
+    if (Type.class(ip, load_ty) == .@"fn" and Type.class(ip, v_ty) == .@"fn") return v;
     if (sema.childCoercibleInMemory(v_ty, load_ty)) return try sema.retypeInMemory(v, load_ty);
     // The pointer views the memory as another type.
     return sema.reinterpretLoadOrNull(block, src, ptr);
