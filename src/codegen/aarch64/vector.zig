@@ -583,6 +583,15 @@ pub fn loadVec(cg: *CodeGen, r: VReg, ref: Ref) Error!void {
     try loadChunk(cg, r, ref, 0);
 }
 
+/// Copies `operand` to `inst`'s result, of the same bits in a vector
+/// register: a struct and the vector it wraps (`CodeGen.inVec`).
+pub fn copy(cg: *CodeGen, inst: Inst.Index, ty: Index, operand: Ref) Error!void {
+    switch (try dest(cg, inst, ty) orelse return) {
+        .reg => |r| try loadVec(cg, r, operand),
+        .mem => |m| try cg.copyTo(m, operand),
+    }
+}
+
 /// `fmov dr, x(lo); fmov vr.d[1], x(hi)`: the 16 bytes of a register pair
 /// (a 128-bit integer) in a vector register.
 pub fn fromPair(cg: *CodeGen, r: VReg, p: CodeGen.Regs) Error!void {

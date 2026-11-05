@@ -11,10 +11,13 @@
 //! the backend change.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const InternPool = @import("../InternPool.zig");
 const Index = InternPool.Index;
 const Type = @import("../Type.zig");
 const Ir = @import("../Ir.zig");
+const Inst = Ir.Inst;
+const Ssa = @import("Ssa.zig");
 
 pub const Op = union(enum) {
     add_wrap,
@@ -99,6 +102,24 @@ pub fn lane(ip: *const InternPool, ty: Index) ?Lane {
     };
 }
 
+/// The index of the field a struct wraps, as `crypto.aes` wraps its
+/// blocks: its one runtime field, when that field is as large as the
+/// struct, so it sits at offset 0 and the struct is its bits. A backend
+/// keeps such a struct where it keeps the field (a vector in a vector
+/// register), so `struct_field_val` and `aggregate_init` on it are moves.
+pub fn wrappedField(ip: *const InternPool, ty: Index) ?u32 {
+    if (ip.keyTag(ty) != .struct_type or Type.isPacked(ip, ty)) return null;
+    const info = ip.structInfo(ty);
+    var only: ?u32 = null;
+    for (info.field_types, 0..) |ft, i| {
+        if (info.fieldIsComptime(i) or !Type.hasRuntimeBits(ip, ft)) continue;
+        if (only != null) return null;
+        only = @intCast(i);
+    }
+    const i = only orelse return null;
+    return if (Type.abiSize(ip, info.field_types[i]) == Type.abiSize(ip, ty)) i else null;
+}
+
 /// Whether vector type `ty`'s integer elements are narrower than their
 /// lane (`lane`). Operations on such lanes must keep them extended, so
 /// only those that do are native: bitwise ops, compares, `@select`,
@@ -178,4 +199,99 @@ pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Ind
         .shl, .shr => !l.isFloat(),
         .cast => unreachable,
     };
+}
+
+/// Reads a wrapping struct's field (`wrappedField`) as a field of the
+/// struct's value: `load(struct_field_ptr(p, i))`, which Sema emits for
+/// `s.repr` on a parameter or `const` (and the inliner and `forward.run`
+/// leave on the caller's own local), becomes `struct_field_val(load(p))`
+/// when the load comes right after the field pointer and is its only use,
+/// reading `p` itself through a pointer cast that only adds `const`. The
+/// field is all of the struct's bits, so the load reads the same memory;
+/// the local is then only loaded and stored whole, which `Ssa.plan`
+/// promotes to the register the backend keeps the struct in, where the
+/// field read is a move. Rewrites in place, on the CodeGen workers.
+pub fn foldWrappedLoads(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayList(u32)) Allocator.Error!void {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    // Most functions have none, which this pass finds.
+    const any = for (tags, datas) |tag, data| {
+        if (tag == .struct_field_ptr and wrappedPtr(ip, ir, data) != null) break true;
+    } else false;
+    if (!any) return;
+    scratch.clearRetainingCapacity();
+    const uses = try scratch.addManyAsSlice(gpa, ir.instructions.len);
+    @memset(uses, 0);
+    const Count = struct {
+        uses: []u32,
+        const Self = @This();
+        pub fn use(c: Self, ref: Inst.Ref) void {
+            if (ref.toIndex()) |i| c.uses[@backingInt(i)] +|= 1;
+        }
+    };
+    for (0..ir.instructions.len) |i| Ssa.forEachOperand(ir, @fromBackingInt(@intCast(i)), Count{ .uses = uses });
+    foldBody(ip, ir, uses, ir.mainBody());
+}
+
+/// The pointer to the wrapping struct whose wrapped field
+/// `struct_field_ptr` `data` addresses, if it does and is not volatile.
+fn wrappedPtr(ip: *const InternPool, ir: *const Ir, data: Inst.Data) ?Inst.Ref {
+    const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+    const info = Type.ptrInfo(ip, ir.typeOf(sf.operand, ip));
+    if (info.flags.is_volatile or info.flags.size != .one) return null;
+    return if (wrappedField(ip, info.child) == sf.index) sf.operand else null;
+}
+
+fn foldBody(ip: *const InternPool, ir: *Ir, uses: []const u32, body: []const Inst.Index) void {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    var prev: ?Inst.Index = null;
+    for (body) |inst| {
+        const i = @backingInt(inst);
+        switch (tags[i]) {
+            .dbg_stmt => continue,
+            .block, .loop => {
+                const extra = ir.extraData(Ir.Block, datas[i].ty_pl.payload);
+                foldBody(ip, ir, uses, ir.bodySlice(extra.end, extra.data.body_len));
+            },
+            .cond_br => {
+                const extra = ir.extraData(Ir.CondBr, datas[i].pl_op.payload);
+                foldBody(ip, ir, uses, ir.bodySlice(extra.end, extra.data.then_body_len));
+                foldBody(ip, ir, uses, ir.bodySlice(extra.end + extra.data.then_body_len, extra.data.else_body_len));
+            },
+            .switch_br => {
+                var it = ir.switchCases(datas[i].pl_op.payload);
+                while (it.next()) |c| foldBody(ip, ir, uses, c.body);
+                foldBody(ip, ir, uses, it.elseBody());
+            },
+            .load => if (prev) |x| if (datas[i].ty_op.operand == x.toRef() and tags[@backingInt(x)] == .struct_field_ptr and uses[@backingInt(x)] == 1) {
+                const xi = @backingInt(x);
+                if (wrappedPtr(ip, ir, datas[xi])) |p_in| {
+                    var p = p_in;
+                    // Through a cast to `*const S` of a `*S`.
+                    if (p.toIndex()) |c| if (tags[@backingInt(c)] == .bitcast) {
+                        const src = datas[@backingInt(c)].ty_op.operand;
+                        const to = Type.ptrInfo(ip, datas[@backingInt(c)].ty_op.ty);
+                        const from_ty = ir.typeOf(src, ip);
+                        if (ip.keyTag(from_ty) == .ptr_type) {
+                            const from = Type.ptrInfo(ip, from_ty);
+                            if (from.child == to.child and from.flags.size == .one and !from.flags.is_volatile and
+                                from.flags.address_space == to.flags.address_space) p = src;
+                        }
+                    };
+                    const payload = datas[xi].ty_pl.payload;
+                    const container = Type.ptrInfo(ip, ir.typeOf(p_in, ip)).child;
+                    // The struct field pointer's payload, now the field read's.
+                    @constCast(ir.extra)[payload] = @backingInt(x.toRef());
+                    const field_ty = datas[i].ty_op.ty;
+                    datas[i] = .{ .ty_pl = .{ .ty = field_ty, .payload = payload } };
+                    tags[i] = .struct_field_val;
+                    datas[xi] = .{ .ty_op = .{ .ty = container, .operand = p } };
+                    tags[xi] = .load;
+                }
+            },
+            else => {},
+        }
+        prev = inst;
+    }
 }
