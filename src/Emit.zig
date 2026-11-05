@@ -39,6 +39,7 @@ const inline_ir = @import("codegen/inline.zig");
 const rewrite = @import("codegen/rewrite.zig");
 const prove = @import("codegen/prove.zig");
 const sroa = @import("codegen/sroa.zig");
+const unroll = @import("codegen/unroll.zig");
 const Sema = @import("Sema.zig");
 const cache = @import("cache.zig");
 
@@ -844,6 +845,7 @@ fn submit(emit: *Emit, ir_in: Ir, exports: ExportsView) !void {
     var ir = ir_in;
     {
         const t0 = std.Io.Timestamp.now(zcu.io, .awake);
+        _ = try unroll.run(emit.gpa, &zcu.ip, Zcu.tid, &ir);
         emit.codegen_stats.splits += try sroa.run(emit.gpa, &zcu.ip, Zcu.tid, &ir, &emit.sroa_scratch);
         const t1 = std.Io.Timestamp.now(zcu.io, .awake);
         emit.codegen_stats.sroa_ns += @intCast(t0.durationTo(t1).nanoseconds);

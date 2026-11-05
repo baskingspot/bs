@@ -1884,6 +1884,24 @@ build, the passes, and the debug info treat them as Sema's inline calls
   `str x30, [sp, #-16]!; bl next`, with the row `CFA = sp+16` and x30 at
   `CFA-16`.
 
+#### Unrolling
+
+Built on the IR, after inlining and before scalar replacement and the
+rewrite rules (`src/codegen/unroll.zig`, from `Emit.submit`): a `for`
+loop in the shape Sema gives a loop over comptime-known arrays or a
+constant range (a `usize` counter alloc set to a constant before the
+loop, `i < N` against a constant, `i +% 1`, and no other use of the
+counter) runs at most 8 times and copies at most 256 instructions in
+all, becomes one copy of its body per iteration, each in a block that
+`continue` exits, with the counter's load replaced by the iteration's
+constant. The copies reuse the inliner's `Copier`. The rewrite rules
+then fold what the constants make constant: elements of the constant
+arrays, and the bounds checks against their lengths, which are copied
+like every other check and fold only where the constant proves them.
+`MultiArrayList.slice` (2–5 iterations over its fields' sizes) is the
+case that matters: zig fmt −2.9%, the zls tests −4.1% outside std's
+unwinder.
+
 #### Rewrite rules
 
 Built on the IR, after inlining (`src/codegen/rewrite.zig`): a table of

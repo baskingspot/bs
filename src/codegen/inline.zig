@@ -327,26 +327,39 @@ pub fn splice(gpa: Allocator, ir: *Ir, splices: []const Splice) Allocator.Error!
     ir.instructions = insts.slice();
 }
 
-/// Copies a callee's instructions to `base +` their index in the caller.
-const Copier = struct {
+/// Copies a callee's instructions to `base +` their index in the caller
+/// (splicing), or a body of a function into the same function, each
+/// instruction to its index in `map` (`unroll.zig`).
+pub const Copier = struct {
     gpa: Allocator,
     from: *const Ir,
     insts: *std.MultiArrayList(Inst),
     extra: *std.ArrayList(u32),
-    base: u32,
-    args: []const Inst.Ref,
-    /// The call, now the block the callee's `ret`s exit.
-    block: Inst.Index,
+    base: u32 = 0,
+    /// Copying within a function: the new index of each copied
+    /// instruction. Others keep theirs.
+    map: ?*const std.AutoHashMapUnmanaged(u32, u32) = null,
+    args: []const Inst.Ref = &.{},
+    /// Splicing: the call, now the block the callee's `ret`s exit. Copying
+    /// within a function keeps `ret`s.
+    block: ?Inst.Index = null,
+    /// An instruction whose uses read `subst_to` in the copy (a loop
+    /// counter's load, the iteration's constant).
+    subst_from: ?Inst.Index = null,
+    subst_to: Inst.Ref = .none,
 
     fn ref(c: *const Copier, r: Inst.Ref) Inst.Ref {
         if (r == .none) return r;
         const i = r.toIndex() orelse return r;
+        if (c.subst_from == i) return c.subst_to;
+        if (c.map != null) return c.index(i).toRef();
         const data = c.from.instructions.items(.data)[@backingInt(i)];
         if (c.from.instructions.items(.tag)[@backingInt(i)] == .arg) return c.args[data.arg.index];
         return c.index(i).toRef();
     }
 
     fn index(c: *const Copier, i: Inst.Index) Inst.Index {
+        if (c.map) |m| return if (m.get(@backingInt(i))) |n| @fromBackingInt(n) else i;
         return @fromBackingInt(c.base + @backingInt(i));
     }
 
@@ -361,7 +374,7 @@ const Copier = struct {
         return pos;
     }
 
-    fn bodyIndices(c: *Copier, body_insts: []const Inst.Index) Allocator.Error!void {
+    pub fn bodyIndices(c: *Copier, body_insts: []const Inst.Index) Allocator.Error!void {
         for (body_insts) |i| try c.extra.append(c.gpa, @backingInt(c.index(i)));
     }
 
@@ -369,7 +382,7 @@ const Copier = struct {
         for (list) |r| try c.extra.append(c.gpa, @backingInt(c.ref(r)));
     }
 
-    fn body(c: *Copier, body_insts: []const Inst.Index) Allocator.Error!void {
+    pub fn body(c: *Copier, body_insts: []const Inst.Index) Allocator.Error!void {
         for (body_insts) |i| try c.inst(i);
     }
 
@@ -383,10 +396,12 @@ const Copier = struct {
             .ret_addr, .frame_addr, .err_return_trace, .set_err_return_trace, .assembly, .c_va_start, .c_va_arg, .c_va_copy => unreachable,
             .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect, .comptime_exit => unreachable,
             .dbg_inline_begin => data.dbg_inline.payload = try c.payload(Ir.DbgInline, data.dbg_inline.payload),
-            .ret => {
+            .ret => if (c.block) |b| {
                 tag = .br;
                 const operand = c.ref(data.un_op);
-                data = .{ .br = .{ .block_inst = c.block, .operand = operand } };
+                data = .{ .br = .{ .block_inst = b, .operand = operand } };
+            } else {
+                data.un_op = c.ref(data.un_op);
             },
             .br => {
                 const operand = c.ref(data.br.operand);
