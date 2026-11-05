@@ -1596,9 +1596,11 @@ fn planRegisters(cg: *CodeGen) Error!void {
             if (last == w) {
                 reg[wi] = Ssa.no_reg;
                 hint[wi][0] = hint_rax;
-            } else if (tags[wi] == .block and last == null) {
-                // A block result returned by a block with nothing else is
-                // written by the `br`s right before they jump to it.
+            } else if (tags[wi] == .block and last == null and f.targets.items[wi] == block) {
+                // A block result returned by its own exit, a block with
+                // nothing else, is written by the `br`s right before they
+                // jump to it. (Returned by a later block, it lives across
+                // what comes between.)
                 reg[wi] = Ssa.no_reg;
                 hint[wi][0] = hint_rax;
             }
