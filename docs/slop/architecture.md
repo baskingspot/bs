@@ -1152,10 +1152,21 @@ GNU as names upstream does not take (`movzbl`, `cltq`) and unsized
 memory operands are refused with the name or suffix to use. bs also
 refuses what upstream accepts but would fault or silently drop: `lock`
 on a register destination or a `mov`, and a prefix alone on its line.
-`test/run/asm_x86_insns.zig` assembles 241 forms with both compilers
-and compares each with upstream's bytes. `mov`, `lea`, `push`, `pop`,
-branches, `crc32` and the SSE and AES instructions stay in CodeGen's
-`asmInst`. Errors point at the failing line of the template, found from
+SSE through SSE4.2 and SHA go through `codegen/x86_64/asm_sse.zig`, a
+table of forms (mandatory prefix, opcode, operand shape, the
+general-purpose register sizes upstream's encodings take, feature):
+register forms only, since upstream sizes no 128-bit memory operand (no
+AT&T suffix names 128 bits, and a suffix would size the xmm registers
+too), so a memory operand is refused with that reason, and `movq` and
+the other names upstream refuses (`pavgb`, `pcmpistri`, `mpsadbw`) are
+absent. `x` operands take xmm0-xmm7 and `{xmm0}`-`{xmm7}` constraints
+pin one (std's `sha256rnds2`); xmm8-xmm15 hold the function's values.
+`test/run/asm_x86_insns.zig` assembles 476 forms with both compilers
+and compares each with upstream's bytes; a probe of 2012 SSE forms at
+five CPUs (baseline, v2, +sha, +aes+pclmul, v3) matched upstream's
+choice and bytes, which are GNU as's. `mov`, `lea`, `push`, `pop`,
+branches, `crc32`, AES-NI, PCLMULQDQ and the VEX forms std uses stay in
+CodeGen's `asmInst` (`asmSimd`), each on a CPU with its features. Errors point at the failing line of the template, found from
 the last statement's position (`codegen/asm_src.zig`, which aarch64's
 errors use too).
 
@@ -9586,8 +9597,8 @@ the choice instead of failing:
 
 - *CPU models and features.* bs's own x86_64 code uses instructions up
   to x86-64-v2 (SSE4.2, `src/cpu.zig`'s `isa`); inline assembly
-  (`codegen/x86_64/asm_insn.zig`) may also use aes and pclmul (in their
-  SSE and VEX forms), clflushopt, lzcnt, movbe, prfchw, rdpid, rdrnd,
+  (`codegen/x86_64/asm_insn.zig`, `asm_sse.zig`) may also use aes and
+  pclmul (in their SSE and VEX forms), sha, clflushopt, lzcnt, movbe, prfchw, rdpid, rdrnd,
   rdseed, and any other instruction it encodes whose feature the CPU
   has. An explicit CPU (`-mcpu`, a model and features) is resolved as
   upstream resolves it, whatever its instruction sets, and is what
@@ -9603,7 +9614,8 @@ the choice instead of failing:
   over 16 bytes on a CPU with AVX (Clang and upstream put it in YMM or
   ZMM registers; `checkCVectors`), an asm `x` operand of over 16 bytes
   (std's AES with vaes), and instructions the inline assembler does not
-  encode (std's SHA-256 with sha and AVX2, so far). Features no x86 CPU
+  encode. std's SHA-256 with sha and AVX2 (`-mcpu=x86_64_v3+sha`) is
+  its SHA-NI assembly. Features no x86 CPU
   model has (`retpoline`, `lvi_cfi`, `seses`), and `soft_float`, change
   how code is generated rather than add instructions and are refused
   with a message naming them. As upstream, no `-mcpu` means the host's

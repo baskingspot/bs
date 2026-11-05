@@ -49,6 +49,9 @@ pub const Fail = union(enum) {
     prefix,
     /// The instruction needs this CPU feature (`-mcpu`).
     feature: Feature,
+    /// An SSE instruction with a memory operand, which upstream cannot
+    /// size (`asm_sse`).
+    xmm_memory,
 };
 
 const Kind = enum {
@@ -124,6 +127,7 @@ const table = std.StaticStringMap(Insn).initComptime(.{
     .{ "ud2", Insn{ .kind = .zo, .ops = &.{ 0x0f, 0x0b } } },
     .{ "int3", Insn{ .kind = .zo, .ops = &.{0xcc} } },
     .{ "pause", Insn{ .kind = .zo, .ops = &.{ 0xf3, 0x90 } } },
+    .{ "emms", Insn{ .kind = .zo, .ops = &.{ 0x0f, 0x77 } } },
     .{ "nop", Insn{ .kind = .zo, .ops = &.{0x90} } },
     .{ "hlt", Insn{ .kind = .zo, .ops = &.{0xf4} } },
     .{ "ret", Insn{ .kind = .zo, .ops = &.{0xc3} } },

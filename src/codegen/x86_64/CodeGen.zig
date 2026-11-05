@@ -42,6 +42,7 @@ const Atom = @import("../../link/Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
 const asm_insn = @import("asm_insn.zig");
+const asm_sse = @import("asm_sse.zig");
 const asm_src = @import("../asm_src.zig");
 const cpu_mod = @import("../../cpu.zig");
 const Ssa = @import("../Ssa.zig");
@@ -6803,20 +6804,27 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         };
     }
     // `x` operands get xmm0-xmm7, which hold no value between
-    // instructions (homes are xmm8-xmm15), loaded first: `loadXmm` may
-    // use rax, which a register operand may hold.
+    // instructions (homes are xmm8-xmm15), except those a `{xmmN}`
+    // constraint pins; loaded first: `loadXmm` may use rax, which a
+    // register operand may hold.
+    var xmm_used: u8 = 0;
+    for (ops) |op| {
+        const c = asmAlternative(std.mem.trimStart(u8, ip.stringSlice(op.constraint), "=+&"));
+        if (regConstraint(c)) |name| if (try cg.asmPinnedXmm(name)) |x| {
+            xmm_used |= @as(u8, 1) << @intCast(@backingInt(x));
+        };
+    }
     const out_xmms = try cg.gpa.alloc(?Encoder.Xmm, outputs.len);
     defer cg.gpa.free(out_xmms);
-    var next_xmm: u4 = 0;
     for (outputs, out_xmms) |out, *out_xmm| {
         out_xmm.* = null;
         const full = ip.stringSlice(out.constraint);
         // `&` (early clobber) holds: no two operands share a register.
-        if (full.len < 2 or !std.mem.eql(u8, asmAlternative(std.mem.trimStart(u8, full[1..], "&")), "x")) continue;
-        if (next_xmm == 8) return cg.fail("asm with too many 'x' operands", .{});
+        const c = if (full.len < 2) "" else asmAlternative(std.mem.trimStart(u8, full[1..], "&"));
+        const pinned = if (regConstraint(c)) |name| try cg.asmPinnedXmm(name) else null;
+        if (pinned == null and !std.mem.eql(u8, c, "x")) continue;
         try cg.asmXmmFits(if (out.operand == .none) data.ty_pl.ty else Type.ptrInfo(ip, cg.typeOf(out.operand)).child);
-        const x: Encoder.Xmm = @fromBackingInt(next_xmm);
-        next_xmm += 1;
+        const x = pinned orelse try cg.asmNextXmm(&xmm_used);
         out_xmm.* = x;
         try names.put(cg.gpa, ip.stringSlice(out.name), .{ .xmm = x });
         if (full[0] == '+') {
@@ -6833,11 +6841,11 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             try names.put(cg.gpa, ip.stringSlice(in.name), .{ .xmm = x });
             continue;
         };
-        if (!std.mem.eql(u8, asmAlternative(ip.stringSlice(in.constraint)), "x")) continue;
-        if (next_xmm == 8) return cg.fail("asm with too many 'x' operands", .{});
+        const c = asmAlternative(ip.stringSlice(in.constraint));
+        const pinned = if (regConstraint(c)) |name| try cg.asmPinnedXmm(name) else null;
+        if (pinned == null and !std.mem.eql(u8, c, "x")) continue;
         try cg.asmXmmFits(cg.typeOf(in.operand));
-        const x: Encoder.Xmm = @fromBackingInt(next_xmm);
-        next_xmm += 1;
+        const x = pinned orelse try cg.asmNextXmm(&xmm_used);
         try cg.loadXmm(x, try cg.valOf(in.operand));
         try names.put(cg.gpa, ip.stringSlice(in.name), .{ .xmm = x });
     }
@@ -6896,6 +6904,7 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         } else if (std.mem.eql(u8, constraint, "m") or std.mem.eql(u8, constraint, "rm")) {
             // Only for templates that do not name the operand.
         } else if (regConstraint(constraint)) |reg_name| {
+            if (try cg.asmPinnedXmm(reg_name) != null) continue;
             const reg = parseReg(reg_name) orelse return cg.fail("unknown register '{s}' in asm constraint", .{reg_name});
             try cg.load(reg.reg, in.operand);
             // The template may name it too (`callq *%[callee]`), at the
@@ -6937,6 +6946,23 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             try cg.storeXmm(Mem.at(.r10, 0), x, Type.abiSize(ip, Type.ptrInfo(ip, cg.typeOf(out.operand)).child));
         }
     }
+}
+
+/// The xmm register a `{xmmN}` constraint names, if it names one; fails
+/// for xmm8-xmm15, which hold values across the statement.
+fn asmPinnedXmm(cg: *CodeGen, name: []const u8) Error!?Encoder.Xmm {
+    if (!std.mem.startsWith(u8, name, "xmm")) return null;
+    const n = std.fmt.parseInt(u8, name[3..], 10) catch return null;
+    if (n >= 8) return cg.fail("asm constraint '{{{s}}}': bs pins only xmm0-xmm7 to asm operands, as xmm8-xmm15 hold the function's values; use an \"x\" operand", .{name});
+    return @fromBackingInt(@as(u4, @intCast(n)));
+}
+
+/// The first of xmm0-xmm7 no operand has taken, for an `x` operand.
+fn asmNextXmm(cg: *CodeGen, used: *u8) Error!Encoder.Xmm {
+    if (used.* == 0xff) return cg.fail("asm with too many 'x' operands", .{});
+    const n: u3 = @intCast(@ctz(~used.*));
+    used.* |= @as(u8, 1) << n;
+    return @fromBackingInt(@as(u4, n));
 }
 
 /// Fails for an `x` operand wider than an XMM register: with AVX it
@@ -7223,8 +7249,9 @@ fn asmMemOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapU
 }
 
 /// AES-NI and PCLMULQDQ (`-mcpu` with aes and pclmul), and the VEX forms
-/// of them and of the SSE integer instructions std's `crypto.aes` key
-/// expansion uses (`vaesenc`, `vpxor`); in AT&T order, an immediate
+/// (with avx) of them and of the SSE integer instructions std's
+/// `crypto.aes` key expansion and `sha2` use (`vaesenc`, `vpxor`,
+/// `vpalignr`), each on a CPU with its features; in AT&T order, an immediate
 /// first and the destination last. Returns false for other mnemonics.
 fn asmSimd(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []const u8) Error!bool {
     // The operands after the immediate: `rm, dst`; `rm, src2, dst` (VEX's
@@ -7232,29 +7259,32 @@ fn asmSimd(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
     // destination is `vvvv`.
     const Shape = enum { rm_dst, rm_src2_dst, shift };
     const Enc = enum { op38, op3a, vex };
-    const Form = struct { name: []const u8, enc: Enc, map: Encoder.VexMap, opcode: u8, imm: bool, shape: Shape };
+    const Form = struct { name: []const u8, enc: Enc, map: Encoder.VexMap, opcode: u8, imm: bool, shape: Shape, features: []const std.Target.x86.Feature };
     const forms = [_]Form{
-        .{ .name = "aesenc", .enc = .op38, .map = .@"0f38", .opcode = 0xdc, .imm = false, .shape = .rm_dst },
-        .{ .name = "aesenclast", .enc = .op38, .map = .@"0f38", .opcode = 0xdd, .imm = false, .shape = .rm_dst },
-        .{ .name = "aesdec", .enc = .op38, .map = .@"0f38", .opcode = 0xde, .imm = false, .shape = .rm_dst },
-        .{ .name = "aesdeclast", .enc = .op38, .map = .@"0f38", .opcode = 0xdf, .imm = false, .shape = .rm_dst },
-        .{ .name = "aesimc", .enc = .op38, .map = .@"0f38", .opcode = 0xdb, .imm = false, .shape = .rm_dst },
-        .{ .name = "aeskeygenassist", .enc = .op3a, .map = .@"0f3a", .opcode = 0xdf, .imm = true, .shape = .rm_dst },
-        .{ .name = "pclmulqdq", .enc = .op3a, .map = .@"0f3a", .opcode = 0x44, .imm = true, .shape = .rm_dst },
-        .{ .name = "vaesenc", .enc = .vex, .map = .@"0f38", .opcode = 0xdc, .imm = false, .shape = .rm_src2_dst },
-        .{ .name = "vaesenclast", .enc = .vex, .map = .@"0f38", .opcode = 0xdd, .imm = false, .shape = .rm_src2_dst },
-        .{ .name = "vaesdec", .enc = .vex, .map = .@"0f38", .opcode = 0xde, .imm = false, .shape = .rm_src2_dst },
-        .{ .name = "vaesdeclast", .enc = .vex, .map = .@"0f38", .opcode = 0xdf, .imm = false, .shape = .rm_src2_dst },
-        .{ .name = "vaesimc", .enc = .vex, .map = .@"0f38", .opcode = 0xdb, .imm = false, .shape = .rm_dst },
-        .{ .name = "vaeskeygenassist", .enc = .vex, .map = .@"0f3a", .opcode = 0xdf, .imm = true, .shape = .rm_dst },
-        .{ .name = "vpclmulqdq", .enc = .vex, .map = .@"0f3a", .opcode = 0x44, .imm = true, .shape = .rm_src2_dst },
-        .{ .name = "vpxor", .enc = .vex, .map = .@"0f", .opcode = 0xef, .imm = false, .shape = .rm_src2_dst },
-        .{ .name = "vpshufd", .enc = .vex, .map = .@"0f", .opcode = 0x70, .imm = true, .shape = .rm_dst },
-        .{ .name = "vpslldq", .enc = .vex, .map = .@"0f", .opcode = 0x73, .imm = true, .shape = .shift },
+        .{ .name = "aesenc", .enc = .op38, .map = .@"0f38", .opcode = 0xdc, .imm = false, .shape = .rm_dst, .features = &.{.aes} },
+        .{ .name = "aesenclast", .enc = .op38, .map = .@"0f38", .opcode = 0xdd, .imm = false, .shape = .rm_dst, .features = &.{.aes} },
+        .{ .name = "aesdec", .enc = .op38, .map = .@"0f38", .opcode = 0xde, .imm = false, .shape = .rm_dst, .features = &.{.aes} },
+        .{ .name = "aesdeclast", .enc = .op38, .map = .@"0f38", .opcode = 0xdf, .imm = false, .shape = .rm_dst, .features = &.{.aes} },
+        .{ .name = "aesimc", .enc = .op38, .map = .@"0f38", .opcode = 0xdb, .imm = false, .shape = .rm_dst, .features = &.{.aes} },
+        .{ .name = "aeskeygenassist", .enc = .op3a, .map = .@"0f3a", .opcode = 0xdf, .imm = true, .shape = .rm_dst, .features = &.{.aes} },
+        .{ .name = "pclmulqdq", .enc = .op3a, .map = .@"0f3a", .opcode = 0x44, .imm = true, .shape = .rm_dst, .features = &.{.pclmul} },
+        .{ .name = "vaesenc", .enc = .vex, .map = .@"0f38", .opcode = 0xdc, .imm = false, .shape = .rm_src2_dst, .features = &.{ .aes, .avx } },
+        .{ .name = "vaesenclast", .enc = .vex, .map = .@"0f38", .opcode = 0xdd, .imm = false, .shape = .rm_src2_dst, .features = &.{ .aes, .avx } },
+        .{ .name = "vaesdec", .enc = .vex, .map = .@"0f38", .opcode = 0xde, .imm = false, .shape = .rm_src2_dst, .features = &.{ .aes, .avx } },
+        .{ .name = "vaesdeclast", .enc = .vex, .map = .@"0f38", .opcode = 0xdf, .imm = false, .shape = .rm_src2_dst, .features = &.{ .aes, .avx } },
+        .{ .name = "vaesimc", .enc = .vex, .map = .@"0f38", .opcode = 0xdb, .imm = false, .shape = .rm_dst, .features = &.{ .aes, .avx } },
+        .{ .name = "vaeskeygenassist", .enc = .vex, .map = .@"0f3a", .opcode = 0xdf, .imm = true, .shape = .rm_dst, .features = &.{ .aes, .avx } },
+        .{ .name = "vpclmulqdq", .enc = .vex, .map = .@"0f3a", .opcode = 0x44, .imm = true, .shape = .rm_src2_dst, .features = &.{ .pclmul, .avx } },
+        .{ .name = "vpxor", .enc = .vex, .map = .@"0f", .opcode = 0xef, .imm = false, .shape = .rm_src2_dst, .features = &.{.avx} },
+        .{ .name = "vpshufd", .enc = .vex, .map = .@"0f", .opcode = 0x70, .imm = true, .shape = .rm_dst, .features = &.{.avx} },
+        .{ .name = "vpalignr", .enc = .vex, .map = .@"0f3a", .opcode = 0x0f, .imm = true, .shape = .rm_src2_dst, .features = &.{.avx} },
+        .{ .name = "vpshufb", .enc = .vex, .map = .@"0f38", .opcode = 0x00, .imm = false, .shape = .rm_src2_dst, .features = &.{.avx} },
+        .{ .name = "vpslldq", .enc = .vex, .map = .@"0f", .opcode = 0x73, .imm = true, .shape = .shift, .features = &.{.avx} },
     };
     const f = for (forms) |f| {
         if (std.mem.eql(u8, f.name, mnemonic)) break f;
     } else return false;
+    for (f.features) |feat| if (!cg.emit.zcu.cpu.has(.x86, feat)) return cg.asmFail(.{ .feature = feat }, .none, mnemonic, line);
     const n_regs: usize = if (f.shape == .rm_src2_dst) 3 else 2;
     if (ops.len != n_regs + @intFromBool(f.imm)) return cg.fail("wrong operands for '{s}': '{s}'", .{ mnemonic, line });
     const imm: ?u8 = if (!f.imm) null else switch (ops[0]) {
@@ -7287,10 +7317,42 @@ fn asmSimd(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
     return true;
 }
 
-/// One instruction: the general-purpose ones `asm_insn` takes, SSE ones
-/// (`asmSimd`), and `mov`, `lea`, `push`, `pop`, `call`, `jmp` and `crc32`.
+/// The error for an inline assembly instruction that `asm_insn` or
+/// `asm_sse` did not assemble.
+fn asmFail(cg: *CodeGen, why: asm_insn.Fail, prefix: asm_insn.Prefix, mnemonic: []const u8, line: []const u8) Error {
+    switch (why) {
+        .unknown => unreachable,
+        .alias => |name| return cg.fail("'{s}' is GNU as's name for an instruction that upstream zig's assembler calls '{s}' (it takes Intel mnemonics, with an optional b, w, l or q size suffix): '{s}'", .{ mnemonic, name, line }),
+        .unknown_size => |k| return cg.fail("asm memory operand {d} has no size: give '{s}' a size suffix (b, w, l or q), as upstream zig requires: '{s}'", .{ k + 1, mnemonic, line }),
+        .register_size => |k| return cg.fail("asm register operand {d} does not have the size of the suffix of '{s}': '{s}'", .{ k + 1, mnemonic, line }),
+        .invalid_size => return cg.fail("'{s}' has a fixed operand size; drop the size suffix: '{s}'", .{ mnemonic, line }),
+        .operands => return cg.fail("wrong operands for '{s}': '{s}'", .{ mnemonic, line }),
+        .prefix => return cg.fail("'{t}' cannot prefix this instruction: '{s}'", .{ prefix, line }),
+        .feature => |f| return if (cpu_mod.accepts(f))
+            cg.fail("'{s}' needs the CPU feature {t} (-mcpu=native on a CPU that has it, or -mcpu=x86_64_v2+{t}): '{s}'", .{ mnemonic, f, f, line })
+        else
+            cg.fail("'{s}' needs the CPU feature {t}, which the native CPU leaves out (bs clamps it to x86-64-v2); pass -mcpu with a model that has it or -mcpu=x86_64_v2+{t}: '{s}'", .{ mnemonic, f, f, line }),
+        .xmm_memory => return cg.fail("'{s}' takes registers only: upstream zig's assembler cannot size a 128-bit memory operand; pass the value in an xmm register (an \"x\" constraint): '{s}'", .{ mnemonic, line }),
+    }
+}
+
+/// One instruction: AES-NI, PCLMULQDQ and VEX ones (`asmSimd`), SSE ones
+/// (`asm_sse`), the general-purpose ones `asm_insn` takes, and `mov`,
+/// `lea`, `push`, `pop`, `call`, `jmp` and `crc32`.
 fn asmInst(cg: *CodeGen, prefix: asm_insn.Prefix, mnemonic: []const u8, ops: []const AsmOperand, line: []const u8) Error!void {
     if (prefix == .none and try cg.asmSimd(mnemonic, ops, line)) return;
+    sse: {
+        var sse_ops: [4]asm_sse.Operand = undefined;
+        if (ops.len > sse_ops.len) break :sse;
+        for (ops, sse_ops[0..ops.len]) |op, *o| o.* = switch (op) {
+            .xmm => |x| .{ .xmm = x },
+            .reg => |r| .{ .reg = .{ .reg = r.reg, .size = r.size } },
+            .imm => |v| .{ .imm = v },
+            .mem, .sym => .other,
+        };
+        const why = try asm_sse.assemble(&cg.e, cg.emit.zcu.cpu, prefix, mnemonic, sse_ops[0..ops.len]) orelse return;
+        if (why != .unknown) return cg.asmFail(why, prefix, mnemonic, line);
+    }
     gpr: {
         var gpr_ops: [4]asm_insn.Operand = undefined;
         for (ops, gpr_ops[0..ops.len]) |op, *g| g.* = switch (op) {
@@ -7300,19 +7362,7 @@ fn asmInst(cg: *CodeGen, prefix: asm_insn.Prefix, mnemonic: []const u8, ops: []c
             .xmm, .sym => break :gpr,
         };
         const why = try asm_insn.assemble(&cg.e, cg.emit.zcu.cpu, prefix, mnemonic, gpr_ops[0..ops.len]) orelse return;
-        switch (why) {
-            .unknown => {},
-            .alias => |name| return cg.fail("'{s}' is GNU as's name for an instruction that upstream zig's assembler calls '{s}' (it takes Intel mnemonics, with an optional b, w, l or q size suffix): '{s}'", .{ mnemonic, name, line }),
-            .unknown_size => |k| return cg.fail("asm memory operand {d} has no size: give '{s}' a size suffix (b, w, l or q), as upstream zig requires: '{s}'", .{ k + 1, mnemonic, line }),
-            .register_size => |k| return cg.fail("asm register operand {d} does not have the size of the suffix of '{s}': '{s}'", .{ k + 1, mnemonic, line }),
-            .invalid_size => return cg.fail("'{s}' has a fixed operand size; drop the size suffix: '{s}'", .{ mnemonic, line }),
-            .operands => return cg.fail("wrong operands for '{s}': '{s}'", .{ mnemonic, line }),
-            .prefix => return cg.fail("'{t}' cannot prefix this instruction: '{s}'", .{ prefix, line }),
-            .feature => |f| return if (cpu_mod.accepts(f))
-                cg.fail("'{s}' needs the CPU feature {t} (-mcpu=native on a CPU that has it, or -mcpu=x86_64_v2+{t}): '{s}'", .{ mnemonic, f, f, line })
-            else
-                cg.fail("'{s}' needs the CPU feature {t}, which the native CPU leaves out (bs clamps it to x86-64-v2); pass -mcpu with a model that has it or -mcpu=x86_64_v2+{t}: '{s}'", .{ mnemonic, f, f, line }),
-        }
+        if (why != .unknown) return cg.asmFail(why, prefix, mnemonic, line);
     }
     const unsupported = "bs does not support this inline assembly instruction yet: '{s}'";
     if (prefix != .none or ops.len > 2) return cg.fail(unsupported, .{line});
