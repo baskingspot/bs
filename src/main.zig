@@ -205,6 +205,12 @@ pub const Options = struct {
     /// `-rpath` arguments, then for the native target the `-L`
     /// directories, without repeats, joined with ':'; null for none.
     runpath: ?[]const u8 = null,
+    /// The `-L` and `-F` directories that exist, then the native SDK's,
+    /// where an aarch64-macos link looks for the libraries a stub
+    /// re-exports by their names (`readTbds`), as `-l` and `-framework`
+    /// look.
+    lib_dirs: []const []const u8 = &.{},
+    framework_dirs: []const []const u8 = &.{},
     /// `--version-script`: the ld version script of a shared object
     /// (`link/VersionScript.zig`), and `--undefined-version`, which lets
     /// it name what nothing defines.
@@ -1389,7 +1395,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
                 error.InvalidDylib => fatal("'{s}' is not an arm64 Mach-O dynamic library", .{path}),
             });
         }
-        try readTbds(arena, init.io, &libs, pending);
+        try readTbds(arena, init.io, &libs, pending, opts.lib_dirs, opts.framework_dirs);
         emit.macho_libs = libs.items;
     }
     const shared_libs = try arena.alloc(ElfShared, if (macos) 0 else opts.shared_libs.len);
@@ -2570,6 +2576,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             } else |_| {}
         } else |_| {}
     }
+    opts.lib_dirs = search_dirs.items;
+    opts.framework_dirs = search_frameworks.items;
     var found: std.StringHashMapUnmanaged(void) = .empty;
     const macos = opts.bs_target == .aarch64_macos;
     for (libs.items) |q| {
@@ -2914,14 +2922,18 @@ const LibQuery = struct {
 /// A macOS SDK stub (`-lz`'s `libz.tbd`, `-framework Cocoa`'s
 /// `Cocoa.tbd`) as the library it describes. The libraries it re-exports
 /// in other stubs, as Cocoa does AppKit, export through it, as dyld
-/// follows the re-exports: they are read from the SDK the stub is in, the
-/// part of `path` before its `/usr/lib/` or `/System/Library/`, as ld64
-/// finds them under `-syslibroot`.
+/// follows the re-exports. Each is found as upstream's
+/// `parseDependentDylibs` finds it: by its name in `framework_dirs`
+/// (`CoreFoundation.framework/CoreFoundation.tbd`) or `lib_dirs`
+/// (`libobjc.A.tbd`), then at its install name in the SDK the stub is in,
+/// the part of `path` before its `/usr/lib/` or `/System/Library/`, as
+/// ld64 finds them under `-syslibroot`. A vendored SDK (a package of
+/// stubs passed with `-F`) has the first, the system's the second.
 /// Reads the text-based stubs of `libs`, linked libraries, and appends
 /// the public libraries they re-export to `libs` as implicit ones, as
 /// upstream "hoists" them (ld64's implicit linking). A private one's
 /// names merge into the stub that re-exports it.
-fn readTbds(arena: std.mem.Allocator, io: Io, libs: *std.ArrayList(MachODylib), pending: []const []const []const u8) !void {
+fn readTbds(arena: std.mem.Allocator, io: Io, libs: *std.ArrayList(MachODylib), pending: []const []const []const u8, lib_dirs: []const []const u8, framework_dirs: []const []const u8) !void {
     var linked: std.StringHashMapUnmanaged(void) = .empty;
     // libSystem is linked always (`MachO`).
     try linked.put(arena, "/usr/lib/libSystem.B.dylib", {});
@@ -2944,14 +2956,27 @@ fn readTbds(arena: std.mem.Allocator, io: Io, libs: *std.ArrayList(MachODylib), 
             } else if ((try merged.getOrPut(arena, install_name)).found_existing) continue;
             // `/usr/lib/libobjc.A.dylib`'s is `libobjc.A.tbd`; a framework's
             // library has no extension.
+            const name = Io.Dir.path.stem(install_name);
+            const found = try findFramework(arena, io, framework_dirs, name) orelse for (lib_dirs) |dir| {
+                const lib = if (std.mem.startsWith(u8, name, "lib")) name[3..] else name;
+                if (try LibQuery.exists(arena, io, dir, lib, &.{ ".tbd", ".dylib", "" })) |p| break p;
+            } else null;
             const stem = if (std.mem.endsWith(u8, install_name, ".dylib")) install_name[0 .. install_name.len - ".dylib".len] else install_name;
-            const stub = try arena.print("{s}{s}.tbd", .{ root, stem });
+            const stub = found orelse try arena.print("{s}{s}.tbd", .{ root, stem });
             const text = Io.Dir.cwd().readFileAlloc(io, stub, arena, .unlimited) catch |err|
                 fatal("'{s}' re-exports '{s}', whose stub '{s}' cannot be read: {t}", .{ path, install_name, stub, err });
-            var reexported, const next = Tbd.dylib(arena, stub, text) catch |err| switch (err) {
-                error.OutOfMemory => |e| return e,
-                error.InvalidTbd => fatal("'{s}': a text-based stub without an install name", .{stub}),
-            };
+            // A library found by name may be a Mach-O one, whose
+            // re-exports its exports trie already has.
+            var reexported, const next = if (!std.mem.startsWith(u8, text, "--- !tapi-tbd"))
+                .{ MachODylib.parse(arena, stub, text) catch |err| switch (err) {
+                    error.OutOfMemory => |e| return e,
+                    error.InvalidDylib => fatal("'{s}' is not an arm64 Mach-O dynamic library", .{stub}),
+                }, &[_][]const u8{} }
+            else
+                Tbd.dylib(arena, stub, text) catch |err| switch (err) {
+                    error.OutOfMemory => |e| return e,
+                    error.InvalidTbd => fatal("'{s}': a text-based stub without an install name", .{stub}),
+                };
             if (hoisted) {
                 reexported.implicit = true;
                 try libs.append(arena, reexported);
@@ -3075,6 +3100,56 @@ test {
     _ = @import("diag.zig");
     _ = Ir;
     _ = Emit;
+}
+
+test "a stub's re-exports are found by name in -F and -L directories first" {
+    // A vendored SDK, as zine's: a package of stubs passed with `-F`,
+    // whose re-exports name the system's paths, which hold no stubs.
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const stub = struct {
+        fn text(a: std.mem.Allocator, install_name: []const u8, reexports: []const u8, symbol: []const u8) ![]const u8 {
+            return a.print(
+                \\--- !tapi-tbd
+                \\tbd-version:     4
+                \\targets:         [ arm64-macos ]
+                \\install-name:    '{s}'
+                \\reexported-libraries:
+                \\  - targets:         [ arm64-macos ]
+                \\    libraries:       [ {s} ]
+                \\exports:
+                \\  - targets:         [ arm64-macos ]
+                \\    symbols:         [ _{s} ]
+                \\...
+                \\
+            , .{ install_name, reexports, symbol });
+        }
+    };
+    const deps = "'/System/Library/Frameworks/Dep.framework/Versions/A/Dep', '/usr/lib/libdepl.dylib'";
+    try tmp.dir.createDirPath(io, "F/Umb.framework");
+    try tmp.dir.createDirPath(io, "F/Dep.framework");
+    try tmp.dir.createDirPath(io, "L");
+    try tmp.dir.writeFile(io, .{ .sub_path = "F/Umb.framework/Umb.tbd", .data = try stub.text(arena, "/System/Library/Frameworks/Umb.framework/Versions/A/Umb", deps, "umb") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "F/Dep.framework/Dep.tbd", .data = try stub.text(arena, "/System/Library/Frameworks/Dep.framework/Versions/A/Dep", "", "dep") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "L/libdepl.tbd", .data = try stub.text(arena, "/usr/lib/libdepl.dylib", "", "depl") });
+    const root = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const umb_path = try std.fmt.allocPrint(arena, "{s}/F/Umb.framework/Umb.tbd", .{root});
+    const umb, const pending = try Tbd.dylib(arena, umb_path, try tmp.dir.readFileAlloc(io, "F/Umb.framework/Umb.tbd", arena, .unlimited));
+    var libs: std.ArrayList(MachODylib) = .empty;
+    try libs.append(arena, umb);
+    try readTbds(arena, io, &libs, &.{pending}, &.{try std.fmt.allocPrint(arena, "{s}/L", .{root})}, &.{try std.fmt.allocPrint(arena, "{s}/F", .{root})});
+    // Both are public, so the link has them as implicit libraries of
+    // their own, read from the directories rather than the system paths.
+    try std.testing.expectEqual(3, libs.items.len);
+    for (libs.items[1..]) |lib| try std.testing.expect(lib.implicit);
+    try std.testing.expectEqualStrings("/usr/lib/libdepl.dylib", libs.items[1].install_name);
+    try std.testing.expect(libs.items[1].exports.contains("depl"));
+    try std.testing.expectEqualStrings("/System/Library/Frameworks/Dep.framework/Versions/A/Dep", libs.items[2].install_name);
+    try std.testing.expect(libs.items[2].exports.contains("dep"));
 }
 
 test "checkTarget reads the macOS versions an aarch64-macos target names" {

@@ -4888,7 +4888,12 @@ The other direction, bs's own relocatable output, is new:
   A text-based stub becomes a `MachODylib` through `Tbd.dylib` (install
   name, versions, arm64 exports including the ObjC class, metaclass,
   ehtype and ivar symbols). Its re-exported libraries are read from
-  their own stubs under the same SDK root. A public one (in /usr/lib,
+  their own stubs, found as upstream's `parseDependentDylibs` finds
+  them: by name in the `-F` and `-L` directories (and the native SDK's)
+  first, then at the install name under the same SDK root. The first
+  serves a vendored SDK, a package of stubs passed with `-F` (zine's
+  CoreServices re-exports CoreFoundation by its system path, which holds
+  no stub). A public one (in /usr/lib,
   or a framework's own library: upstream's `isHoisted`) is linked in
   its own right, as ld64's implicit linking and upstream do: a
   `MachODylib` marked `implicit`, after the linked ones, which gets an
