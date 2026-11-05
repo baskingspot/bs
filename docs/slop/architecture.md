@@ -2285,7 +2285,13 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    lowering leaves alone and calls preserve, or, when their interval
    contains no clobber point, of rsi, rdi, r8, r9 (the scalar lowerings use
    only rax, rcx, rdx, r10, r11 as scratch; calls, string instructions,
-   and the fallback clobber the rest). A clobber point in a block that ends
+   and the fallback clobber the rest). r11 is allocated too, to a value
+   whose interval, definition and last use contain no lowering that may
+   write it: `CodeGen.usesR11` and `termUsesR11` decide that before
+   allocation (deferred loads read through r11, division, bit counting,
+   wide integers, odd-sized moves, calls, overflow bits, vector masks), and
+   every lowering names r11 through `CodeGen.r11`, so emission fails the
+   function where one does where they said it does not. A clobber point in a block that ends
    the function (a return, or the panic call of a failing check) matters
    only to later uses in that block. Registers hold values extended to 64
    bits, a stronger rule than the narrow-integer rule above, which the

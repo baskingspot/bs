@@ -475,7 +475,7 @@ fn allocateRegs(cg: *CodeGen) void {
     // Nothing clobbers x19-x28, so no value crosses a clobber point and
     // none is split.
     const split: std.DynamicBitSetUnmanaged = .{};
-    const used = f.allocate(alloc_regs.len, 0, (1 << alloc_regs.len) - 1, &.{}, &split);
+    const used = f.allocate(alloc_regs.len, 0, (1 << alloc_regs.len) - 1, &.{}, &split, 0, &.{});
     for (0..5) |k| if (used >> @intCast(2 * k) & 3 != 0) {
         cg.saved |= @as(u16, 1) << @intCast(k);
     };

@@ -111,6 +111,12 @@ trace_slot: ?i32 = null,
 /// The callee-saved registers the function's values use (`alloc_regs`
 /// bits), which the prologue saves below rbp and every return restores.
 saved: u32 = 0,
+/// From `planRegisters`: per position (as `Ssa.Func.clobbers`), how many
+/// values and terminators before it may write r11 (`usesR11`).
+r11_clobbers: std.ArrayList(u32) = .empty,
+/// A lowering named r11 (`r11`) since the value or terminator being
+/// emitted began, which `usesR11` must have said it may.
+r11_used: bool = false,
 /// `Ssa.liveness` ran, so value slots are shared by lifetime.
 live: bool = false,
 /// The function's one epilogue, which ends its code (`Atom.Unwind.epilogue`):
@@ -323,6 +329,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.stub_chains.deinit(gpa);
         cg.stub_open.deinit(gpa);
         cg.cover_pcs.deinit(gpa);
+        cg.r11_clobbers.deinit(gpa);
     }
     if (cover) cg.cover_key = Emit.coverageKeys(try emit.funcKey(ir.func))[0];
     @memset(cg.homes, .none);
@@ -833,8 +840,8 @@ fn memUses(m: Mem, r: Reg) bool {
 /// address before its last piece.
 fn addressFree(cg: *CodeGen, m: Mem, r: Reg) Error!Mem {
     if (!memUses(m, r)) return m;
-    try cg.e.lea(.qword, .r11, m);
-    return Mem.at(.r11, 0);
+    try cg.e.lea(.qword, cg.r11(), m);
+    return Mem.at(cg.r11(), 0);
 }
 
 /// Loads the qwords at `m` and 8 bytes after it into `lo` and `hi`. `m`
@@ -935,9 +942,9 @@ fn setupParams(cg: *CodeGen) Error!void {
             if (!read) break i;
         } else blk: {
             const d = moves[0].dst;
-            try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .reg = d });
+            try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = d });
             for (moves[0..n_moves]) |*other| if (other.src == d) {
-                other.src = .r11;
+                other.src = cg.r11();
             };
             break :blk 0;
         };
@@ -974,13 +981,13 @@ fn setupParams(cg: *CodeGen) Error!void {
 fn copyArgIn(cg: *CodeGen, dst: Mem, ptr: union(enum) { reg: Reg, mem: Mem }, size: u64) Error!void {
     const e = &cg.e;
     try e.mov(.qword, .{ .reg = .r10 }, .{ .reg = .rsi });
-    try e.mov(.qword, .{ .reg = .r11 }, .{ .reg = .rdi });
+    try e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = .rdi });
     try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rcx });
     switch (ptr) {
         .reg => |r| {
             const src: Reg = switch (r) {
                 .rsi => .r10,
-                .rdi => .r11,
+                .rdi => cg.r11(),
                 .rcx => .rax,
                 else => r,
             };
@@ -992,7 +999,7 @@ fn copyArgIn(cg: *CodeGen, dst: Mem, ptr: union(enum) { reg: Reg, mem: Mem }, si
     try e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(size) });
     try e.repMovsb();
     try e.mov(.qword, .{ .reg = .rsi }, .{ .reg = .r10 });
-    try e.mov(.qword, .{ .reg = .rdi }, .{ .reg = .r11 });
+    try e.mov(.qword, .{ .reg = .rdi }, .{ .reg = cg.r11() });
     try e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .rax });
 }
 
@@ -1321,8 +1328,8 @@ fn deferredMem(cg: *CodeGen, ptr: Ref) Error!Mem {
         .addr => |m| return m,
         .reg => |r| return Mem.at(r, 0),
         else => {
-            try cg.load(.r11, ptr);
-            return Mem.at(.r11, 0);
+            try cg.load(cg.r11(), ptr);
+            return Mem.at(cg.r11(), 0);
         },
     }
 }
@@ -1436,8 +1443,148 @@ pub fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
 /// The registers the allocator hands out: the callee-saved ones, in the
 /// order the prologue saves them, then the caller-saved ones no lowering
 /// uses as scratch except the clobbering ones (`clobbers`).
-const alloc_regs = [_]Reg{ .rbx, .r12, .r13, .r14, .r15, .rsi, .rdi, .r8, .r9 };
+const alloc_regs = [_]Reg{ .rbx, .r12, .r13, .r14, .r15, .rsi, .rdi, .r8, .r9, .r11 };
 const callee_saved: u32 = 0b11111;
+/// The registers some lowerings use as scratch, which hold only values
+/// whose intervals contain none of them (`usesR11`).
+const r11_only: u32 = 1 << 9;
+
+/// r11, as scratch: what may name it is listed in `usesR11`, which the
+/// emission checks.
+pub fn r11(cg: *CodeGen) Reg {
+    cg.r11_used = true;
+    return .r11;
+}
+
+/// Whether value `inst`'s lowering may write r11 as scratch, decided
+/// before allocation, so that no value that lives across it, or that it
+/// reads last or computes, lives in r11. `genBlock` fails a function
+/// whose lowering names r11 where this said it does not.
+fn usesR11(cg: *CodeGen, inst: Inst.Index) bool {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const i = @backingInt(inst);
+    const tag = ir.instructions.items(.tag)[i];
+    const data = ir.instructions.items(.data)[i];
+    // A load deferred to its user reads its memory through r11 when the
+    // pointer has no register (`deferredMem`).
+    const Deferred = struct {
+        cg: *CodeGen,
+        found: *bool,
+        pub fn use(c: @This(), r: Ref) void {
+            const x = r.toIndex() orelse return;
+            if (c.cg.homes[@backingInt(x)] == .deferred) c.found.* = true;
+        }
+    };
+    var deferred = false;
+    Ssa.forEachOperand(ir, inst, Deferred{ .cg = cg, .found = &deferred });
+    if (deferred) return true;
+    // The vector lowerings mask bool vectors' lanes through r11.
+    if (vector.lowers(cg, inst)) return true;
+    switch (tag) {
+        // The prologue's moves; a call's, its indirect callee, and the
+        // C ABI's odd-sized results.
+        .arg, .call, .assembly => return true,
+        .div_trunc, .div_floor, .div_ceil, .rem, .mod, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => return true,
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => {
+            const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+            const ty = cg.typeOf(bin.lhs);
+            if (!cg.inGpr(ty)) return true;
+            if (tag == .mul_with_overflow and !cg.ovfFlagsOnly(tag, Type.intInfo(ip, ty).bits)) return true;
+            const live = cg.ssa.live.slice();
+            // The bit goes through r11 unless the branch reads it from the
+            // flags, or nothing does.
+            if (live.items(.fate)[i] != .pair) return true;
+            const bit = cg.ssa.pairs.get(i).?[1];
+            return bit != Ssa.no_tie and live.items(.fate)[bit] != .fused;
+        },
+        else => {},
+    }
+    // Wide integers' lowerings loop with r10 and r11.
+    const Wide = struct {
+        cg: *CodeGen,
+        found: *bool,
+        pub fn use(c: @This(), r: Ref) void {
+            const t = c.cg.typeOf(r);
+            if (t != .none and c.cg.isWideInt(t)) c.found.* = true;
+        }
+    };
+    var wide = false;
+    Ssa.forEachOperand(ir, inst, Wide{ .cg = cg, .found = &wide });
+    if (wide) return true;
+    // An inferred alloc whose initializer never completes has no type.
+    const ty = ir.typeOfIndex(inst, ip);
+    return ty != .none and cg.isWideInt(ty);
+}
+
+/// Whether block `block`'s terminator may write r11 as scratch: a C
+/// ABI or odd-sized return, a read of a deferred load, a compare fused
+/// into a branch that does, a threaded `br`, or a switch.
+fn termUsesR11(cg: *CodeGen, block: Ssa.Block.Index) bool {
+    const ir = cg.ir;
+    const term = cg.ssa.blocks.items[@backingInt(block)].term;
+    const data = ir.instructions.items(.data)[@backingInt(term.inst)];
+    const deferred = struct {
+        fn f(c: *CodeGen, r: Ref) bool {
+            return if (r.toIndex()) |x| c.homes[@backingInt(x)] == .deferred else false;
+        }
+    }.f;
+    return switch (term.tag) {
+        // A jump table's address and a key that does not fit imm32
+        // (`SwitchEmit`).
+        .switch_br => true,
+        // An odd-sized result is loaded byte by byte (`loadBytes`).
+        .ret => cg.fn_ty.cc != .auto or deferred(cg, data.un_op) or switch (cg.autoClass(cg.fn_ty.return_type)) {
+            .gpr => switch (Type.abiSize(cg.ip, cg.fn_ty.return_type)) {
+                1, 2, 4, 8 => false,
+                else => true,
+            },
+            .gpr_pair => true,
+            else => false,
+        },
+        // A threaded `br` (`Ssa.branchCond`) reads its condition into
+        // r11 after writing its block's result.
+        .branch => ir.instructions.items(.tag)[@backingInt(term.inst)] == .br or
+            // A compare fused into the branch is lowered there.
+            deferred(cg, data.pl_op.operand) or if (data.pl_op.operand.toIndex()) |c| cg.fusedUsesR11(c) else false,
+        .jump => ir.instructions.items(.tag)[@backingInt(term.inst)] == .br and deferred(cg, data.br.operand),
+        .fallthrough, .noreturn, .unreach => false,
+    };
+}
+
+/// Whether condition `c`, if fused into a branch, writes r11 there: its
+/// own lowering, or that of the condition a fused `not` negates
+/// (`condFlags`), such as `if (!@reduce(.Or, v))`.
+fn fusedUsesR11(cg: *CodeGen, c: Inst.Index) bool {
+    if (cg.ssa.live.items(.fate)[@backingInt(c)] != .fused) return false;
+    const ir = cg.ir;
+    if (ir.instructions.items(.tag)[@backingInt(c)] == .not) {
+        if (ir.instructions.items(.data)[@backingInt(c)].ty_op.operand.toIndex()) |x| if (cg.fusedUsesR11(x)) return true;
+    }
+    return cg.usesR11(c);
+}
+
+/// `r11_clobbers`, after `Ssa.plan`, whose fates `usesR11` reads.
+fn planR11(cg: *CodeGen) Error!void {
+    const f = cg.ssa;
+    try cg.r11_clobbers.resize(cg.gpa, f.clobbers.items.len);
+    const cl = cg.r11_clobbers.items;
+    var count: u32 = 0;
+    cl[0] = 0;
+    cl[1] = 0;
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        for (b.start..b.start + b.len) |i| {
+            const inst = f.values.items(.inst)[i];
+            if (f.live.items(.fate)[@backingInt(inst)] != .dead and cg.usesR11(inst)) count += 1;
+            cl[2 * i + 2] = count;
+            cl[2 * i + 3] = count;
+        }
+        if (cg.termUsesR11(block)) count += 1;
+        cl[2 * (b.start + b.len) + 1] = count;
+        cl[2 * (b.start + b.len) + 2] = count;
+    }
+}
 
 /// A `Live.hint` for the value a `ret` returns that is computed in rax
 /// (`planRegisters`), outside `alloc_regs`.
@@ -1672,7 +1819,8 @@ fn planRegisters(cg: *CodeGen) Error!void {
     while (aliases.next()) |a| cg.split.unset(a.*);
     var consts = cg.const_alias.keyIterator();
     while (consts.next()) |a| cg.split.unset(a.*);
-    cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split) & callee_saved;
+    try cg.planR11();
+    cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split, r11_only, cg.r11_clobbers.items) & callee_saved;
     const reg2 = live.items(.reg2);
     for (f.values.items(.inst)) |inst| {
         const i = @backingInt(inst);
@@ -3900,9 +4048,15 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
             continue;
         }
         const q = Ssa.valuePos(idx);
+        cg.r11_used = false;
         if (cg.split_vals.items.len != 0 and !std.meta.eql(cl[q], cl[q - 1])) try cg.genSplit(inst, q) else try cg.genInst(inst);
+        if (cg.r11_used and !cg.has_asm and !cg.usesR11(inst))
+            return cg.fail("internal error: '{t}' uses r11, which may hold a value", .{cg.ir.instructions.items(.tag)[@backingInt(inst)]});
     }
+    cg.r11_used = false;
     try cg.genTerm(cg.ssa.blocks.items[@backingInt(block)].term, next);
+    if (cg.r11_used and !cg.has_asm and !cg.termUsesR11(block))
+        return cg.fail("internal error: a '{t}' terminator uses r11, which may hold a value", .{b.term.tag});
 }
 
 fn checkNaked(cg: *CodeGen, tag: Inst.Tag) Error!void {
@@ -3933,7 +4087,7 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
             const cond = Ssa.branchCond(ir, term);
             const fused = if (cond.toIndex()) |c| cg.homes[@backingInt(c)] == .fused else false;
             const cc: Encoder.Cond = if (fused) try cg.condFlags(cond.toIndex().?) else cc: {
-                const r = try cg.regOf(cond, if (tag == .br) .r11 else .rax);
+                const r = try cg.regOf(cond, if (tag == .br) cg.r11() else .rax);
                 try cg.e.@"test"(.byte, .{ .reg = r }, .{ .reg = r });
                 break :cc .ne;
             };
@@ -4935,8 +5089,8 @@ fn bitOp(cg: *CodeGen, tag: Inst.Tag, bits: u16, operand: Ref) Error!void {
     try cg.load(.rdx, operand);
     if (bits < 64) {
         // Only the operand's own bits.
-        try e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast((@as(u64, 1) << @intCast(bits)) - 1) });
-        try e.alu(.@"and", .qword, .{ .reg = .rdx }, .{ .reg = .r11 });
+        try e.mov(.qword, .{ .reg = cg.r11() }, .{ .imm = @bitCast((@as(u64, 1) << @intCast(bits)) - 1) });
+        try e.alu(.@"and", .qword, .{ .reg = .rdx }, .{ .reg = cg.r11() });
     }
     try e.alu(.xor, .dword, .{ .reg = .rax }, .{ .reg = .rax });
     const top = try e.newLabel();
@@ -4982,9 +5136,9 @@ fn bitOp(cg: *CodeGen, tag: Inst.Tag, bits: u16, operand: Ref) Error!void {
             try e.@"test"(.dword, .{ .reg = .rcx }, .{ .reg = .rcx });
             try e.jcc(.e, .{ .label = done });
             try e.shift(.shl, .qword, .{ .reg = .rax }, unit);
-            try e.mov(.qword, .{ .reg = .r11 }, .{ .reg = .rdx });
-            try e.alu(.@"and", .qword, .{ .reg = .r11 }, .{ .imm = 1 });
-            try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .reg = .r11 });
+            try e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = .rdx });
+            try e.alu(.@"and", .qword, .{ .reg = cg.r11() }, .{ .imm = 1 });
+            try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .reg = cg.r11() });
             try e.shift(.shr, .qword, .{ .reg = .rdx }, unit);
             try e.alu(.sub, .dword, .{ .reg = .rcx }, .{ .imm = 1 });
             try e.jmp(.{ .label = top });
@@ -5113,9 +5267,9 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void 
                 } else {
                     const wide = try cg.e.newLabel();
                     const done = try cg.e.newLabel();
-                    try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .reg = .rax });
-                    try cg.e.alu(.@"or", .qword, .{ .reg = .r11 }, .{ .reg = .rcx });
-                    try cg.e.shift(.shr, .qword, .{ .reg = .r11 }, 32);
+                    try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = .rax });
+                    try cg.e.alu(.@"or", .qword, .{ .reg = cg.r11() }, .{ .reg = .rcx });
+                    try cg.e.shift(.shr, .qword, .{ .reg = cg.r11() }, 32);
                     try cg.e.jcc(.ne, .{ .label = wide });
                     try cg.e.unary(.div, .dword, .{ .reg = .rcx });
                     try cg.e.jmp(.{ .label = done });
@@ -5131,8 +5285,8 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void 
                 const done = try cg.e.newLabel();
                 try cg.e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
                 try cg.e.jcc(.e, .{ .label = done });
-                try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .reg = .rdx });
-                try cg.e.alu(.xor, .qword, .{ .reg = .r11 }, .{ .reg = .rcx });
+                try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = .rdx });
+                try cg.e.alu(.xor, .qword, .{ .reg = cg.r11() }, .{ .reg = .rcx });
                 try cg.e.jcc(.ns, .{ .label = done });
                 if (tag == .div_floor) {
                     try cg.e.alu(.sub, .qword, .{ .reg = .rax }, .{ .imm = 1 });
@@ -5148,8 +5302,8 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void 
                 try cg.e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
                 try cg.e.jcc(.e, .{ .label = done });
                 if (s) {
-                    try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .reg = .rdx });
-                    try cg.e.alu(.xor, .qword, .{ .reg = .r11 }, .{ .reg = .rcx });
+                    try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .reg = .rdx });
+                    try cg.e.alu(.xor, .qword, .{ .reg = cg.r11() }, .{ .reg = .rcx });
                     try cg.e.jcc(.s, .{ .label = done });
                 }
                 try cg.e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = 1 });
@@ -5179,14 +5333,14 @@ fn divConst(cg: *CodeGen, tag: Inst.Tag, d: u64, bits: u16) Error!void {
         if (want_rem) try cg.andImm(.rdx, d - 1);
     } else if (d > @as(u64, 1) << @intCast(bits - 1)) {
         // The quotient is 0 or 1.
-        try e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast(d) });
+        try e.mov(.qword, .{ .reg = cg.r11() }, .{ .imm = @bitCast(d) });
         try e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rax });
         try e.alu(.xor, .dword, .{ .reg = .rcx }, .{ .reg = .rcx });
-        try e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .r11 });
+        try e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = cg.r11() });
         try e.setcc(.ae, .{ .reg = .rcx });
         const done = try e.newLabel();
         try e.jcc(.b, .{ .label = done });
-        try e.alu(.sub, .qword, .{ .reg = .rdx }, .{ .reg = .r11 });
+        try e.alu(.sub, .qword, .{ .reg = .rdx }, .{ .reg = cg.r11() });
         e.bind(done);
         try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rcx });
     } else {
@@ -5197,8 +5351,8 @@ fn divConst(cg: *CodeGen, tag: Inst.Tag, d: u64, bits: u16) Error!void {
             if (mm * d - two_p <= @as(u128, 1) << @intCast(p - bits)) break mm;
         };
         try e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .rax });
-        try e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast(@as(u64, @truncate(m))) });
-        try e.unary(.mul, .qword, .{ .reg = .r11 });
+        try e.mov(.qword, .{ .reg = cg.r11() }, .{ .imm = @bitCast(@as(u64, @truncate(m))) });
+        try e.unary(.mul, .qword, .{ .reg = cg.r11() });
         if (m >> 64 == 0) {
             try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rdx });
             if (p > 64) try e.shift(.shr, .qword, .{ .reg = .rax }, @intCast(p - 64));
@@ -5240,8 +5394,8 @@ fn divConst(cg: *CodeGen, tag: Inst.Tag, d: u64, bits: u16) Error!void {
 /// `reg &= mask`.
 fn andImm(cg: *CodeGen, reg: Reg, mask: u64) Error!void {
     if (std.math.cast(i32, mask)) |imm| return cg.e.alu(.@"and", .qword, .{ .reg = reg }, .{ .imm = imm });
-    try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast(mask) });
-    try cg.e.alu(.@"and", .qword, .{ .reg = reg }, .{ .reg = .r11 });
+    try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .imm = @bitCast(mask) });
+    try cg.e.alu(.@"and", .qword, .{ .reg = reg }, .{ .reg = cg.r11() });
 }
 
 /// `{ T, u1 }` results: the wrapped value and whether it overflowed `T`.
@@ -5262,19 +5416,19 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
             cg.ovf_cc = cc;
         } else if (!pair or fields[1] != Ssa.no_tie) {
             // A bit nothing reads is not computed.
-            try cg.e.setcc(cc, .{ .reg = .r11 });
-            try cg.e.movzx(.qword, .r11, .byte, .{ .reg = .r11 });
+            try cg.e.setcc(cc, .{ .reg = cg.r11() });
+            try cg.e.movzx(.qword, cg.r11(), .byte, .{ .reg = cg.r11() });
         }
     } else assert(!in_flags);
     // Only moves from here on, which keep the flags.
     if (pair) {
         if (fields[0] != Ssa.no_tie) try cg.setResult(@fromBackingInt(fields[0]), ty, res);
-        if (fields[1] != Ssa.no_tie and !in_flags) try cg.setResult(@fromBackingInt(fields[1]), .u1_type, .r11);
+        if (fields[1] != Ssa.no_tie and !in_flags) try cg.setResult(@fromBackingInt(fields[1]), .u1_type, cg.r11());
         return;
     }
     const size = Type.abiSize(ip, ty);
     try cg.storeReg(dst, .rax, size);
-    try cg.storeReg(offsetMem(dst, Type.fieldOffset(ip, tuple_ty, 1)), .r11, 1);
+    try cg.storeReg(offsetMem(dst, Type.fieldOffset(ip, tuple_ty, 1)), cg.r11(), 1);
 }
 
 /// Computes an overflow operation's result, normalized, into `d` (if it
@@ -5343,15 +5497,15 @@ fn overflowArith(cg: *CodeGen, tag: Inst.Tag, bin: Ir.Bin, ty: Index, d: Reg) Er
     const flag_too = !cg.ovfFlagsOnly(tag, info.bits);
     if (flag_too) {
         // The product can exceed 64 bits too.
-        try cg.e.setcc(.o, .{ .reg = .r11 });
-        try cg.e.movzx(.qword, .r11, .byte, .{ .reg = .r11 });
+        try cg.e.setcc(.o, .{ .reg = cg.r11() });
+        try cg.e.movzx(.qword, cg.r11(), .byte, .{ .reg = cg.r11() });
     }
     try cg.e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rax });
     try cg.normalize(.rax, ty);
     try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
     if (!flag_too) return .{ .rax, .ne };
     try cg.e.setcc(.ne, .{ .reg = .rdx });
-    try cg.e.alu(.@"or", .byte, .{ .reg = .r11 }, .{ .reg = .rdx });
+    try cg.e.alu(.@"or", .byte, .{ .reg = cg.r11() }, .{ .reg = .rdx });
     return .{ .rax, null };
 }
 
@@ -5495,8 +5649,8 @@ const SwitchEmit = struct {
     fn cmpOffset(s: SwitchEmit, r: Reg, n: u64) Error!void {
         const cg = s.cg;
         if (std.math.cast(i32, n)) |x| return cg.e.alu(.cmp, if (s.narrow) .dword else .qword, .{ .reg = r }, .{ .imm = x });
-        try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast(n) });
-        try cg.e.alu(.cmp, .qword, .{ .reg = r }, .{ .reg = .r11 });
+        try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .imm = @bitCast(n) });
+        try cg.e.alu(.cmp, .qword, .{ .reg = r }, .{ .reg = cg.r11() });
     }
 
     pub fn branchIn(s: SwitchEmit, lo: u64, hi: u64, l: u32) Error!void {
@@ -5515,9 +5669,9 @@ const SwitchEmit = struct {
             try cg.e.jcc(.a, .{ .label = @fromBackingInt(out) });
         }
         const tab = try cg.e.newLabel();
-        try cg.e.leaLabel(.r11, tab);
-        try cg.e.movsx(.qword, .rcx, .dword, .{ .mem = .{ .base = .{ .reg = .r11 }, .index = .{ .reg = r, .scale = .@"4" } } });
-        try cg.e.alu(.add, .qword, .{ .reg = .rcx }, .{ .reg = .r11 });
+        try cg.e.leaLabel(cg.r11(), tab);
+        try cg.e.movsx(.qword, .rcx, .dword, .{ .mem = .{ .base = .{ .reg = cg.r11() }, .index = .{ .reg = r, .scale = .@"4" } } });
+        try cg.e.alu(.add, .qword, .{ .reg = .rcx }, .{ .reg = cg.r11() });
         try cg.e.jmpIndirect(.{ .reg = .rcx });
         cg.e.bind(tab);
         var k = lo;
@@ -5664,9 +5818,9 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         } else try cg.e.call(.{ .sym = try cg.emit.funcKey(f) });
     } else {
         // r11 is not an argument register in either convention.
-        try cg.load(.r11, callee_ref);
+        try cg.load(cg.r11(), callee_ref);
         if (is_c and callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
-        try cg.e.callIndirect(.{ .reg = .r11 });
+        try cg.e.callIndirect(.{ .reg = cg.r11() });
     }
     if (in_rax) {
         // C callees leave the bits above a narrow result unspecified.
@@ -7368,8 +7522,8 @@ fn setupWinParams(cg: *CodeGen) Error!void {
         const ty = cg.ir.instructions.items(.data)[@backingInt(ref.inst)].arg.ty;
         const size = Type.abiSize(ip, ty);
         const m = Mem.at(.rbp, try cg.allocSlot(size, Type.abiAlignment(ip, ty)));
-        try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .mem = Mem.at(.rbp, ref.ptr) });
-        try cg.copyMem(m, Mem.at(.r11, 0), size);
+        try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .mem = Mem.at(.rbp, ref.ptr) });
+        try cg.copyMem(m, Mem.at(cg.r11(), 0), size);
         cg.homes[@backingInt(ref.inst)] = .{ .slot = m.disp };
     }
     if (cg.fn_ty.is_var_args) cg.va = .{ .stack = 8 * p };
@@ -8049,9 +8203,9 @@ fn mulLimbsLoop(cg: *CodeGen, dst: Mem, lhs: Mem, rhs: Mem, n: u32) Error!void {
     // (the column that keeps only the low half); r10 and r11 address the
     // operands, which may be constants.
     try e.lea(.qword, .r10, lhs);
-    try e.lea(.qword, .r11, rhs);
+    try e.lea(.qword, cg.r11(), rhs);
     const lhs_at = Mem.at(.r10, 0);
-    const rhs_at = Mem.at(.r11, 0);
+    const rhs_at = Mem.at(cg.r11(), 0);
     const outer = try e.newLabel();
     const inner = try e.newLabel();
     const last = try e.newLabel();

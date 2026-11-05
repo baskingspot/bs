@@ -1243,9 +1243,12 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// the value `fold` gives for it has one, which is then never evicted, or
 /// is itself folded. A crossing value in `split` may also take a register
 /// outside `survives` when none in it is free, which the architecture
-/// saves and restores around each clobber point it crosses. Returns the
-/// mask of registers used.
-pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.DynamicBitSetUnmanaged) u32 {
+/// saves and restores around each clobber point it crosses. The registers
+/// in `restricted` some lowerings write as scratch: per position (as
+/// `clobbers`), `restricted_clobbers` counts those lowerings so far, and
+/// a value takes such a register only if none lies in its interval, at
+/// its definition, or at its last use. Returns the mask of registers used.
+pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.DynamicBitSetUnmanaged, restricted: u32, restricted_clobbers: []const u32) u32 {
     const total = n + n_float;
     assert(total <= max_regs);
     const gprs: u32 = (@as(u32, 1) << @intCast(n)) - 1;
@@ -1315,7 +1318,9 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, 
         const h = hint[inst];
         pending &= ~(regBit(h[0]) | regBit(h[1]));
         const splits = crosses[inst] and split.isSet(inst);
-        const usable: u32 = (if (reg[inst] == want_float) floats else gprs) & if (crosses[inst] and !splits) survives else ~@as(u32, 0);
+        const rc = restricted_clobbers;
+        const keep_out = if (rc.len != 0 and (rc[end[inst]] != rc[def[inst]] or rc[def[inst]] != rc[def[inst] - 1])) restricted else 0;
+        const usable: u32 = (if (reg[inst] == want_float) floats else gprs) & ~keep_out & if (crosses[inst] and !splits) survives else ~@as(u32, 0);
         const v = share[inst];
         if (v != no_tie and reg[v] < total) {
             reg[inst] = reg[v];

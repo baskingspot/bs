@@ -700,8 +700,8 @@ fn lenMask(bits: u32) u64 {
 /// `reg ^= mask`. Uses r11.
 fn xorImm(cg: *CodeGen, reg: Reg, mask: u64) Error!void {
     if (std.math.cast(i32, @as(i64, @bitCast(mask)))) |imm| return cg.e.alu(.xor, .qword, .{ .reg = reg }, .{ .imm = imm });
-    try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast(mask) });
-    try cg.e.alu(.xor, .qword, .{ .reg = reg }, .{ .reg = .r11 });
+    try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .imm = @bitCast(mask) });
+    try cg.e.alu(.xor, .qword, .{ .reg = reg }, .{ .reg = cg.r11() });
 }
 
 /// `reg &= mask`. Uses r11.
@@ -709,8 +709,8 @@ fn andImm(cg: *CodeGen, reg: Reg, mask: u64) Error!void {
     if (mask == std.math.maxInt(u64)) return;
     if (mask == std.math.maxInt(u32)) return cg.e.mov(.dword, .{ .reg = reg }, .{ .reg = reg });
     if (std.math.cast(i32, @as(i64, @bitCast(mask)))) |imm| return cg.e.alu(.@"and", .qword, .{ .reg = reg }, .{ .imm = imm });
-    try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast(mask) });
-    try cg.e.alu(.@"and", .qword, .{ .reg = reg }, .{ .reg = .r11 });
+    try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .imm = @bitCast(mask) });
+    try cg.e.alu(.@"and", .qword, .{ .reg = reg }, .{ .reg = cg.r11() });
 }
 
 /// A 16-byte constant in read-only data, 16-byte aligned.
