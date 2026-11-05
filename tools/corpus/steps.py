@@ -7,8 +7,9 @@ prefix, both deleted afterwards, and runs with `--summary all`. A build
 matches when the exit status, the step tree (each step's status and test
 counts, without timings, MaxRSS or "cached") and the installed files
 (their paths and executable bits, and the contents of everything that
-is not an ELF file or an archive; tar files by member names and
-contents) are the same.
+is not an ELF or Mach-O file or an archive; tar files by member names
+and contents) are the same. On aarch64-macos (a Mac satellite), pass
+`--zig ~/.cache/bs/zig-aarch64-macos-0.17.1/zig`.
 
     python3 tools/corpus/steps.py --bs zig-out/bin/bs
     python3 tools/corpus/steps.py --projects zls,zio --bs-only
@@ -65,7 +66,9 @@ def installed(prefix):
             mode = "x " if os.access(path, os.X_OK) else ""
             with open(path, "rb") as f:
                 head = f.read(8)
-            if head.startswith((b"\x7fELF", b"!<arch>")):
+            # ELF, Mach-O (64-bit, universal) and archives: build products
+            # whose bytes each compiler lays out its own way.
+            if head.startswith((b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"!<arch>")):
                 files[rel] = mode + "binary"
             elif name.endswith(".tar"):
                 # By member names and contents: the headers hold the
@@ -171,7 +174,11 @@ def main():
         with open(path) as f:
             old = {(r["project"], tuple(r["args"])): r for r in json.load(f)}
     bs = os.path.abspath(args.bs)
-    compilers = [bs, os.path.realpath(shutil.which(args.zig) or args.zig)]
+    # bs's build runner names itself by its real path (macOS's /tmp is
+    # /private/tmp), of which `bs` can be a suffix: longest first.
+    compilers = sorted(
+        {bs, os.path.realpath(bs), os.path.realpath(shutil.which(args.zig) or args.zig)}, key=len, reverse=True
+    )
     for proj in projects:
         run.log(f"{proj['name']} {proj['commit'][:12]}")
         src = run.checkout(proj, args.zig)
