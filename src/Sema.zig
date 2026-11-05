@@ -4744,7 +4744,7 @@ fn analyzeRet(sema: *Sema, b: *Block, operand_in: Ref, src: Src, operand_src: Sr
         // Such as a `try` in a comptime loop of a function that returns
         // no error.
         if (err == error.AnalysisFail) if (sema.bc) |bc| if (!bc.refused and !bc.not_ready) {
-            sema.zcu.errors.shrinkRetainingCapacity(n_errors);
+            sema.dropErrors(n_errors);
             if (try sema.bcDeferError(b)) return;
         };
         return err;
@@ -10380,13 +10380,33 @@ fn resolvePeerTypes(sema: *Sema, block: *Block, src: Src, refs: []const Ref) Com
     return sema.resolvePeerTypesAt(block, src, refs, &.{});
 }
 
+/// Whether `e`, recorded since a probe began, is this analysis's own: not
+/// an error of another unit analyzed meanwhile (a function body analyzed
+/// for its inferred error set), which only that unit's analysis reports.
+fn ownError(sema: *const Sema, e: Zcu.ErrorMsg) bool {
+    return e.unit == null or std.meta.eql(e.unit.?, sema.owner);
+}
+
+/// Drops the errors this analysis recorded since there were `n`, for a
+/// probe or an attempt it takes back. Other units' errors stay: their
+/// units failed for good and report them once.
+fn dropErrors(sema: *Sema, n: usize) void {
+    const errors = &sema.zcu.errors;
+    var w = n;
+    for (errors.items[n..]) |e| if (!sema.ownError(e)) {
+        errors.items[w] = e;
+        w += 1;
+    };
+    errors.shrinkRetainingCapacity(w);
+}
+
 /// `resolvePeerTypes` of peers at `srcs` (or none). As upstream, a
 /// conflict names the two peers that conflict in source order, with a
 /// "type here" note at each.
 fn resolvePeerTypesAt(sema: *Sema, block: *Block, src: Src, refs: []const Ref, srcs: []const Src) CompileError!Index {
     const n = sema.zcu.errors.items.len;
     return sema.resolvePeerTypesInner(block, src, refs, srcs) catch |err| {
-        if (err != error.AnalysisFail or sema.zcu.errors.items.len != n + 1) return err;
+        if (err != error.AnalysisFail or sema.zcu.errors.items.len != n + 1 or !sema.ownError(sema.zcu.errors.items[n])) return err;
         const old = sema.zcu.errors.pop().?;
         // The peer the candidate type came from and the peer that does not
         // resolve with it, probed in source order.
@@ -10405,7 +10425,11 @@ fn resolvePeerTypesAt(sema: *Sema, block: *Block, src: Src, refs: []const Ref, s
                 if (p == t) ci = k;
                 chosen = p;
             } else |e| {
-                if (e != error.AnalysisFail or sema.zcu.errors.items.len != n + 1) return e;
+                if (e != error.AnalysisFail or sema.zcu.errors.items.len != n + 1 or !sema.ownError(sema.zcu.errors.items[n])) {
+                    sema.dropErrors(n);
+                    try sema.zcu.errors.append(sema.gpa, old);
+                    return e;
+                }
                 break .{ ci, k };
             }
         } else {
@@ -18073,7 +18097,7 @@ fn capturePeer(sema: *Sema, block: *Block, src: Src, c: SwitchCase, samples: []c
     const cap_src = src.switchCapture(c.index, false);
     const n = sema.zcu.errors.items.len;
     return sema.resolvePeerTypes(block, cap_src, samples) catch |err| {
-        if (err != error.AnalysisFail or sema.zcu.errors.items.len != n + 1) return err;
+        if (err != error.AnalysisFail or sema.zcu.errors.items.len != n + 1 or !sema.ownError(sema.zcu.errors.items[n])) return err;
         const old = sema.zcu.errors.pop().?;
         // The first pair of peers that does not resolve, probed one at a
         // time as upstream's peer type resolution reports it.
@@ -18087,7 +18111,7 @@ fn capturePeer(sema: *Sema, block: *Block, src: Src, c: SwitchCase, samples: []c
                 chosen = p;
             } else |e| {
                 if (e != error.AnalysisFail) return e;
-                sema.zcu.errors.shrinkRetainingCapacity(n);
+                sema.dropErrors(n);
                 pair = .{ ci, k };
                 break;
             }
@@ -21245,7 +21269,7 @@ fn bcRollback(sema: *Sema, saved_undo: usize, saved_count: u32, saved_quota: u32
     sema.bc_undo.shrinkRetainingCapacity(saved_undo);
     sema.branch_count = saved_count;
     sema.branch_quota = saved_quota;
-    sema.zcu.errors.shrinkRetainingCapacity(n_errors);
+    sema.dropErrors(n_errors);
 }
 
 /// A store an evaluator run made to a comptime allocation that is older
@@ -21323,7 +21347,7 @@ fn bcFinish(sema: *Sema, ok: bool, n_errors: usize, params: []const Zcu.Bytecode
     const zcu = sema.zcu;
     const bc = sema.bc.?;
     if (!ok or bc.not_ready or bc.refused or zcu.errors.items.len != n_errors) {
-        zcu.errors.shrinkRetainingCapacity(n_errors);
+        sema.dropErrors(n_errors);
         return if (bc.not_ready and !bc.refused) .{ .not_ready = bc.blocker } else .refused;
     }
     for (sema.ir_insts.items(.tag)) |tag| if (!bcSupported(tag)) return .refused;
