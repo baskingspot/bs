@@ -3842,7 +3842,8 @@ differs from the design above:
   a numbered link rejects them until the cache relinks inputs.
 - .dynsym: an import of a library's function (STT_FUNC or
   STT_GNU_IFUNC there, or not data in glibc's abilists) is STT_FUNC, as
-  both of upstream's linkers write it; others are STT_NOTYPE, or
+  both of upstream's linkers write it; an import of data (glibc's
+  `stderr`) is STT_OBJECT, as lld writes it; others are STT_NOTYPE, or
   STT_TLS (2026-11-05).
 - `-l<name>`/`-L<dir>` find `lib<name>.so` or `lib<name>.a` in the `-L`
   directories (and the native ones; see stage C above) by upstream's
