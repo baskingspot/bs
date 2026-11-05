@@ -405,14 +405,27 @@ fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, tru
     const use = cache.useTool(io, dir) catch null;
     errdefer if (use) |f| f.close(io);
     if (trusted and BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h, use };
+    // In ReleaseSafe, as the build runner: std's ReleaseSafe paths, so the
+    // allocator records no stack trace per allocation, which took more
+    // than half of a Debug build's time translating a header. `-O` sets
+    // the modules that follow it.
     try BuildRunner.compileTool(init, dir, &.{
-        "bs",                                                                              "build-exe",
-        "--dep",                                                                           "aro",
-        try std.fmt.allocPrint(arena, "-Mroot={s}/compiler/translate-c/main.zig", .{lib}), try std.fmt.allocPrint(arena, "-Maro={s}/compiler/aro/aro.zig", .{lib}),
-        "--name",                                                                          "translate-c",
-        "--zig-lib-dir",                                                                   lib,
-        "--cache-dir",                                                                     global,
-        "--global-cache-dir",                                                              global,
+        "bs",
+        "build-exe",
+        "--name",
+        "translate-c",
+        "--zig-lib-dir",
+        lib,
+        "--cache-dir",
+        global,
+        "--global-cache-dir",
+        global,
+        "-OReleaseSafe",
+        "--dep",
+        "aro",
+        try std.fmt.allocPrint(arena, "-Mroot={s}/compiler/translate-c/main.zig", .{lib}),
+        "-OReleaseSafe",
+        try std.fmt.allocPrint(arena, "-Maro={s}/compiler/aro/aro.zig", .{lib}),
     }, "Compiling translate-c (first time setup)", "translate-c", try std.fmt.allocPrint(arena, "{s}/compiler/translate-c/main.zig", .{lib}), try std.fmt.allocPrint(arena, "{s}/compiler", .{lib}));
     // The binary's contents, hashed again only when it changed.
     if (BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h, use };
