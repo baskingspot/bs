@@ -324,7 +324,12 @@ fn classify(ip: *const InternPool, ir: *const Ir, kind: []Kind) void {
     for (tags, datas, 0..) |tag, data, i| switch (tag) {
         .load => {},
         .store => {
-            e.use(data.bin_op.rhs);
+            // A pointer into a `*const` alloc stored as a value (an
+            // inlined `*const` parameter) reads it only: what loads it
+            // back is a `*const` pointer, and writing through one is
+            // illegal. Only initializing stores write a `*const` alloc,
+            // through the alloc or its field pointers themselves.
+            if (!constPtr(ir, ip, data.bin_op.rhs)) e.use(data.bin_op.rhs);
             const p = data.bin_op.lhs.toIndex() orelse continue;
             // A store into a field of a `*const` alloc (an initialization
             // field by field) makes it `other`.
@@ -377,6 +382,15 @@ fn allocOf(ir: *const Ir, ip: *const InternPool, r: Inst.Ref, all: bool) ?u32 {
         derived = true;
     }
     return null;
+}
+
+/// Whether `r` is a `*const` pointer to a `*const` alloc or into one
+/// (`allocOf`).
+fn constPtr(ir: *const Ir, ip: *const InternPool, r: Inst.Ref) bool {
+    const a = allocOf(ir, ip, r, false) orelse return false;
+    const alloc_ty = ir.instructions.items(.data)[a].ty;
+    if (!Type.ptrInfo(ip, alloc_ty).flags.is_const) return false;
+    return Type.ptrInfo(ip, ir.typeOf(r, ip)).flags.is_const;
 }
 
 /// The alloc `r` is, through casts to its own type, but not a field
@@ -1196,20 +1210,42 @@ const Walker = struct {
                 },
                 .other, .stored_once => {},
             }
-            // A field of a `*const` alloc: that field of the value stored
-            // to it, as `struct_field_val` numbers it.
             if (w.ir.instructions.items(.tag)[pi] == .struct_field_ptr) {
-                const sf = w.ir.extraData(Ir.StructField, w.ir.instructions.items(.data)[pi].ty_pl.payload).data;
-                if (allocCast(w.ir, w.ip, sf.operand)) |a| if (s.kind.items[a] == .constant) {
-                    const v = s.value.items[a];
-                    if (v.tag != .none) return w.numberOf(.{ .tag = .struct_field_val, .ty = data.ty_op.ty, .x = sf.index, .a = v, .b = .none }, own);
-                };
+                if (try w.constField(p, own)) |t| return t;
             }
         }
         // Other memory: a load of the same address and type from the same
         // version of memory (`mem`) reads the same value.
         if (Type.ptrInfo(w.ip, w.ir.typeOf(data.ty_op.operand, w.ip)).flags.is_volatile) return own;
         return w.numberOf(.{ .tag = .load, .ty = data.ty_op.ty, .x = w.mem, .a = w.term(data.ty_op.operand), .b = .none }, own);
+    }
+
+    /// What the field `sfp` points to holds, as `own` when first seen:
+    /// in a `*const` alloc stored once, at any depth of fields, that field
+    /// of the value stored to it, as `struct_field_val` numbers it, since
+    /// nothing writes the alloc after its store. A field of a field is
+    /// numbered through the inner field pointer, which stands for the
+    /// inner field's value in the `struct_field_val` key only.
+    fn constField(w: *Walker, sfp: Inst.Index, own: Term) Allocator.Error!?Term {
+        const ir = w.ir;
+        const data = ir.instructions.items(.data)[@backingInt(sfp)];
+        const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+        const ty = Type.ptrInfo(w.ip, data.ty_pl.ty).child;
+        // The pointer the field is in, as numbered: a pointer to it
+        // stored to an alloc and loaded back (an inlined `*const`
+        // parameter) is the same pointer.
+        const base = w.term(sf.operand);
+        if (base.tag != .inst) return null;
+        const v: Term = v: {
+            if (ir.instructions.items(.tag)[base.a] == .struct_field_ptr)
+                break :v (try w.constField(@fromBackingInt(base.a), base)) orelse return null;
+            const a = allocCast(ir, w.ip, @as(Inst.Index, @fromBackingInt(base.a)).toRef()) orelse return null;
+            if (w.s.kind.items[a] != .constant) return null;
+            break :v w.s.value.items[a];
+        };
+        if (v.tag == .none) return null;
+        const t = try w.numberOf(.{ .tag = .struct_field_val, .ty = ty, .x = sf.index, .a = v, .b = .none }, own);
+        return t;
     }
 
     /// What variable `pi` holds here (`loadTerm`).
