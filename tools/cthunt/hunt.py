@@ -50,6 +50,11 @@ CONFIGS = {
     "bs": ("bs", {}),
     "bs-walk": ("bs", {"BS_COMPTIME_EVAL": "0"}),
     "bs-eval1": ("bs", {"BS_COMPTIME_EVAL": "1"}),
+    # Upstream with LLVM, which rechecks a value upstream's self-hosted
+    # x86_64 backend prints: it trusts the bits above a narrow integer's
+    # width in memory (a packed union's signed field after an unsigned
+    # one was written gives 5, not -3), where LLVM and bs extend.
+    "zig-llvm": ("zig", {}),
 }
 BS_CONFIGS = ["bs", "bs-walk", "bs-eval1"]
 SAVE = [True]
@@ -148,6 +153,8 @@ def compile_run(tools, cfg, src, scratch):
         argv = [tools.bs, "build-exe", src, f"-femit-bin={out}"]
     else:
         argv = [tools.zig, "build-exe", src, f"-femit-bin={out}", "--cache-dir", os.path.join(scratch, "zc")]
+        if cfg == "zig-llvm":
+            argv.append("-fllvm")
     argv += ["-target", tools.target]
     try:
         p = subprocess.run(
@@ -373,10 +380,17 @@ def check(seed, tools, size=1.0, text=None, save_findings=True):
             rec["why"] = "upstream did not settle"
             return rec
         rec["accepted"] = len(up.lines)
+        llvm = None
         for tid, want in sorted(up.lines.items()):
             bad = [
                 c for c, b in res.items() if b.status in ("ok", "run-fail") and not same_value(b.lines.get(tid), want)
             ]
+            if bad and tools.target == "x86_64-linux":
+                if llvm is None:
+                    llvm = compile_run(tools, "zig-llvm", src, scratch)
+                if llvm.status == "ok" and all(same_value(res[c].lines.get(tid), llvm.lines.get(tid)) for c in bad):
+                    rec["upstream_x86"] = rec.get("upstream_x86", 0) + 1
+                    continue
             if bad:
                 rec["findings"].append(
                     save(
@@ -535,6 +549,9 @@ def main():
                 tests += rec.get("tests", 0)
                 rejected += rec.get("rejected", 0)
                 accepted += rec.get("accepted", 0)
+                if rec.get("upstream_x86"):
+                    # Values only upstream's x86_64 backend got wrong.
+                    counts["x86-backend-values"] = counts.get("x86-backend-values", 0) + rec["upstream_x86"]
                 if rec["result"] == "discard":
                     why[rec.get("why", "")] = why.get(rec.get("why", ""), 0) + 1
                 for f in rec["findings"]:

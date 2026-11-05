@@ -26,6 +26,13 @@ under qemu's user-mode emulator (`qemu-aarch64-static`, which
 A finding on another target than x86_64-linux names it in its
 signature and directory.
 
+Upstream builds x86_64-linux with its self-hosted backend, which trusts
+the bits above a narrow integer's width in memory (a packed union's `i3`
+read after its `u3` was written prints 5, not -3); bs and LLVM extend.
+So on that leg a value bs prints differently is rechecked against
+upstream built with `-fllvm`, and one that matches is counted as
+`x86-backend-values`, not saved as a finding.
+
 ## Programs
 
 A program is 8 to 16 independent tests. Each is a declaration `tN`
