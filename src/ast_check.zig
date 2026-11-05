@@ -100,7 +100,7 @@ pub fn run(arena: Allocator, io: Io, args: []const []const u8) !void {
     }
     var error_bundle = try wip_errors.toOwnedBundle("");
     if (error_bundle.errorMessageCount() > 0) {
-        error_bundle.renderToStderr(io, .{}, color) catch {};
+        error_bundle.renderToStderr(io, .{}, color) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
         process.exit(1);
     }
     if (want_output_text)

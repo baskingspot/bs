@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
     const cwd = Io.Dir.cwd();
-    cwd.deleteTree(io, work_path) catch {};
+    cwd.deleteTree(io, work_path) catch {}; // ziglint-ignore: Z026 -- cleanup is best effort
     const work = try cwd.createDirPathOpen(io, work_path, .{});
 
     var prng: std.Random.DefaultPrng = .init(0x5eed);
@@ -495,7 +495,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
             for ([_]bool{ false, true }) |cross| {
                 if (cross and !shm_ok) continue;
                 const store_root = if (cross) shm: {
-                    Io.Dir.cwd().deleteTree(io, "/dev/shm/bs-bench-cache") catch {};
+                    Io.Dir.cwd().deleteTree(io, "/dev/shm/bs-bench-cache") catch {}; // ziglint-ignore: Z026 -- cleanup is best effort
                     break :shm try Io.Dir.cwd().createDirPathOpen(io, "/dev/shm/bs-bench-cache", .{});
                 } else try work.createDirPathOpen(io, if (cross) "x" else "hl-store", .{});
                 const cdir = try work.createDirPathOpen(io, if (cross) "hl-c-cross" else "hl-c", .{});
@@ -551,7 +551,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
                     gpa.free(out);
                     relink.add(.{ ns(t0, t1), ns(t1, t2), 0, 0 });
                 }
-                if (cross) Io.Dir.cwd().deleteTree(io, "/dev/shm/bs-bench-cache") catch {};
+                if (cross) Io.Dir.cwd().deleteTree(io, "/dev/shm/bs-bench-cache") catch {}; // ziglint-ignore: Z026 -- cleanup is best effort
                 print("  first build writing Atoms once ({s}): commit into the compilation dir and {s} {d:.0} ms; relink from it: gather {d:.2} ms, Elf.emitInput {d:.2} ms (same output)\n", .{
                     if (cross) "store on tmpfs" else "same file system", if (cross) "copy to the store" else "hard-link into the store", ms(t_keep), ms(relink.median(0)), ms(relink.median(1)),
                 });

@@ -67,7 +67,7 @@ pub fn setTimestamps(io: Io, dir: Io.Dir, sub_path: []const u8, options: Io.File
 pub fn lock(io: Io, dir: Io.Dir) !Io.File {
     const f = try dir.createFile(io, "lock", .{ .truncate = false, .lock = .exclusive });
     // Records use for `maintainCompilations`.
-    f.setTimestampsNow(io) catch {};
+    f.setTimestampsNow(io) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     return f;
 }
 
@@ -88,7 +88,7 @@ pub fn useTool(io: Io, dir_path: []const u8) !Io.File {
     var dir = try Io.Dir.cwd().openDir(io, dir_path, .{});
     defer dir.close(io);
     const f = try dir.createFile(io, tool_use_name, .{ .truncate = false, .lock = .shared });
-    f.setTimestampsNow(io) catch {};
+    f.setTimestampsNow(io) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     return f;
 }
 
@@ -352,11 +352,11 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
                 defer f.close(io);
                 if (!(f.tryLock(io, .exclusive) catch false)) continue;
                 c.deleteTree(io, e.name()) catch continue;
-                if (outputDirs(e.name())) |outs| for (outs) |out| local_cache.deleteTree(io, &out) catch {};
+                if (outputDirs(e.name())) |outs| for (outs) |out| local_cache.deleteTree(io, &out) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
             },
             .translation => {
                 tc.?.deleteFile(io, e.name()) catch continue;
-                local_cache.deleteTree(io, std.mem.print(&buf, "o/{s}", .{e.name()}) catch unreachable) catch {};
+                local_cache.deleteTree(io, std.mem.print(&buf, "o/{s}", .{e.name()}) catch unreachable) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
             },
         }
         total -= e.bytes;
@@ -377,7 +377,7 @@ fn trimTemporary(io: Io, local_cache: Io.Dir, now: Io.Timestamp) void {
     while (it.next(io) catch null) |e| {
         if (e.kind != .file) continue;
         const stat = tmp.statFile(io, e.name, .{}) catch continue;
-        if (stat.mtime.durationTo(now).toNanoseconds() > max_temporary_ns) tmp.deleteFile(io, e.name) catch {};
+        if (stat.mtime.durationTo(now).toNanoseconds() > max_temporary_ns) tmp.deleteFile(io, e.name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     }
 }
 

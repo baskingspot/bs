@@ -334,7 +334,7 @@ fn refreshUsed(store: *Store, io: Io) void {
     for (store.packs) |*p| {
         if (!p.used.swap(false, .monotonic)) continue;
         if (p.mtime.durationTo(store.opened).toNanoseconds() < used_refresh_ns) continue;
-        cache.setTimestamps(io, store.dir, &p.name, .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {};
+        cache.setTimestamps(io, store.dir, &p.name, .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
         p.mtime = store.opened;
     }
 }
@@ -809,7 +809,7 @@ fn maintainIfDue(store: *const Store, gpa: Allocator, io: Io, new_bytes: u64) vo
     for (store.packs) |*p| bytes += p.size;
     const n_packs = store.packs.len + @intFromBool(new_bytes != 0);
     if (!trim_due and !stampDue(store.dir, io, "scan", now, scan_interval_ns) and n_packs <= max_packs and bytes <= store.max_bytes) return;
-    _ = maintain(gpa, io, store.dir, .{ .trim = trim_due, .now = now, .max_bytes = store.max_bytes }) catch {};
+    _ = maintain(gpa, io, store.dir, .{ .trim = trim_due, .now = now, .max_bytes = store.max_bytes }) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }
 
 const CandidateKind = enum { pack, donor, zir };
@@ -882,7 +882,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
             if (e.kind != .directory) continue;
             if (std.mem.startsWith(u8, e.name, donor_tmp_prefix)) {
                 const st = d.statFile(io, e.name, .{}) catch continue;
-                if (st.mtime.durationTo(options.now).toNanoseconds() > std.time.ns_per_hour) d.deleteTree(io, e.name) catch {};
+                if (st.mtime.durationTo(options.now).toNanoseconds() > std.time.ns_per_hour) d.deleteTree(io, e.name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
                 continue;
             }
             var dd = d.openDir(io, e.name, .{ .iterate = true }) catch continue;
@@ -927,7 +927,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
     var n_kept: usize = 0;
     for (candidates.items) |c| {
         if (options.trim and c.mtime.durationTo(options.now).toNanoseconds() > max_unused_ns) {
-            deleteCandidate(io, dir, donors, zir, c.kind, c.name) catch {};
+            deleteCandidate(io, dir, donors, zir, c.kind, c.name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
             result.deleted += 1;
             continue;
         }
@@ -1018,7 +1018,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
     // The merged pack was last used when the most recently used of its
     // parts was.
     try dir.setTimestamps(io, &name, .{ .modify_timestamp = .{ .new = mtime } });
-    for (live.items, merge) |p, m| if (m) dir.deleteFile(io, &p.name) catch {};
+    for (live.items, merge) |p, m| if (m) dir.deleteFile(io, &p.name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     result.merged = @intCast(n_merge);
     return result;
 }

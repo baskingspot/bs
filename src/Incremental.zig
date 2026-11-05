@@ -497,7 +497,7 @@ pub fn noteOutput(inc: *const Incremental, out_dir: Io.Dir, sub_path: []const u8
     if (sub_path.len > 4096) return;
     const stat = out_dir.statFile(io, sub_path, .{}) catch return;
     const os: OutputStat = .{ .inode = @intCast(stat.inode), .size = stat.size, .mtime = @intCast(stat.mtime.toNanoseconds()) };
-    cache.writeReplace(io, inc.dir, output_name, &.{ std.mem.asBytes(&os), sub_path }) catch {};
+    cache.writeReplace(io, inc.dir, output_name, &.{ std.mem.asBytes(&os), sub_path }) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }
 
 /// The base manifest and pack whose atom records a link last checked
@@ -513,13 +513,13 @@ fn baseChecked(inc: *const Incremental, want: [2]Hash) bool {
 /// Records that a link that succeeded checked every record of `ids`'
 /// base. Best effort.
 fn noteBaseChecked(inc: *const Incremental, ids: [2]Hash) void {
-    cache.writeReplace(inc.io, inc.dir, checked_name, &.{std.mem.asBytes(&ids)}) catch {};
+    cache.writeReplace(inc.io, inc.dir, checked_name, &.{std.mem.asBytes(&ids)}) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }
 
 /// Forgets the output's stat before a link replaces the output, so that
 /// a link that fails halfway does not leave it matching.
 fn forgetOutput(inc: *const Incremental) void {
-    inc.dir.deleteFile(inc.io, output_name) catch {};
+    inc.dir.deleteFile(inc.io, output_name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }
 
 /// The key prefix of a link-only input (`link_objects`): `:link:<path>`,
@@ -1432,7 +1432,7 @@ pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
             linkOrCopy(d, c.m.basePack(i), inc.dir, io) catch break false;
         } else true;
         if (!linked) continue;
-        if (c.mtime.durationTo(Io.Clock.real.now(io)).toNanoseconds() > donor_renew_ns) cache.setTimestamps(io, d, "manifest", .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {};
+        if (c.mtime.durationTo(Io.Clock.real.now(io)).toNanoseconds() > donor_renew_ns) cache.setTimestamps(io, d, "manifest", .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
         if (inc.timing) std.debug.print("cache: first build: replaying donor {s}, {s} ({d} of its {d} inputs are this build's, builtin {s}; {d} candidates) in {d:.2} ms\n", .{
             &c.name, if (c.own) "the program's own" else "another program's", c.shared, c.m.inputCount(), if (c.builtin) "the same" else "different", candidates.items.len, ms(t0, now(io)),
         });
@@ -1491,8 +1491,8 @@ fn installDonorBase(inc: *Incremental) !void {
     const path = std.mem.print(&buf, "{s}/{s}", .{ donors_path, &inc.donor.? }) catch unreachable;
     var d = try inc.global.openDir(io, path, .{});
     defer d.close(io);
-    inc.dir.deleteFile(io, "manifest.log") catch {};
-    inc.dir.deleteFile(io, "manifest") catch {};
+    inc.dir.deleteFile(io, "manifest.log") catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
+    inc.dir.deleteFile(io, "manifest") catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     try linkOrCopy(d, "manifest", inc.dir, io);
 }
 
@@ -1501,8 +1501,8 @@ fn installDonorBase(inc: *Incremental) !void {
 /// own (a relink of the donor's output, say).
 fn dropDonorBase(inc: *Incremental) void {
     if (inc.donor == null) return;
-    inc.dir.deleteFile(inc.io, "manifest.log") catch {};
-    inc.dir.deleteFile(inc.io, "manifest") catch {};
+    inc.dir.deleteFile(inc.io, "manifest.log") catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
+    inc.dir.deleteFile(inc.io, "manifest") catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }
 
 /// After a full record is placed: publishes the manifest as a donor for
@@ -1531,7 +1531,7 @@ fn publishDonor(inc: *Incremental, base_names: []const []const u8) !void {
         for (base_names) |n| try linkOrCopy(inc.dir, n, tmp, io);
     }
     donors.rename(&tmp_name, donors, &name, io) catch |err| {
-        donors.deleteTree(io, &tmp_name) catch {};
+        donors.deleteTree(io, &tmp_name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
         return err;
     };
     // This program's older donors, which this one supersedes: they would
@@ -1556,14 +1556,14 @@ fn publishDonor(inc: *Incremental, base_names: []const []const u8) !void {
         const stat = donors.statFile(io, &path, .{}) catch continue;
         try same.append(gpa, .{ .name = e.name[0..donor_name_len].*, .mtime = stat.mtime });
     }
-    for (superseded.items) |*o| donors.deleteTree(io, o) catch {};
+    for (superseded.items) |*o| donors.deleteTree(io, o) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     if (same.items.len < max_donors_per_key) return;
     std.mem.sortUnstable(Old, same.items, {}, struct {
         fn newer(_: void, a: Old, b: Old) bool {
             return a.mtime.compare(.gt, b.mtime);
         }
     }.newer);
-    for (same.items[max_donors_per_key - 1 ..]) |o| donors.deleteTree(io, &o.name) catch {};
+    for (same.items[max_donors_per_key - 1 ..]) |o| donors.deleteTree(io, &o.name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }
 
 /// Assigns the last build's error codes first, so that they keep their
@@ -2199,7 +2199,7 @@ fn finishRecordFallible(inc: *Incremental, linked: bool) !void {
         if (!std.mem.endsWith(u8, e.name, ".zsp")) continue;
         for (r.base_names) |name| {
             if (std.mem.eql(u8, name, e.name)) break;
-        } else inc.dir.deleteFile(inc.io, e.name) catch {};
+        } else inc.dir.deleteFile(inc.io, e.name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     }
     if (inc.timing) std.debug.print("{s}; after the link, waited {d:.2} ms and placed in {d:.2} ms\n", .{ r.report, waited, ms(t0, now(inc.io)) - waited });
     switch (inc.verify) {
@@ -2347,10 +2347,10 @@ fn setFlags(rp: *const Replay, d: *Manifest.Delta, i: u32, live: *const std.bit_
 /// Truncates the manifest's log to `len` bytes, dropping the records
 /// appended since (0: no log).
 fn dropLog(inc: *Incremental, len: u64) void {
-    if (len == 0) return inc.dir.deleteFile(inc.io, "manifest.log") catch {};
+    if (len == 0) return inc.dir.deleteFile(inc.io, "manifest.log") catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     const f = inc.dir.openFile(inc.io, "manifest.log", .{ .mode = .write_only }) catch return;
     defer f.close(inc.io);
-    f.setLength(inc.io, len) catch {};
+    f.setLength(inc.io, len) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }
 
 /// Ends the lazy replay, for the caller to build again eagerly.
@@ -4399,7 +4399,7 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
         var name: Io.Writer.Allocating = .init(gpa);
         defer name.deinit();
         for (r.unit_list.items, r.unit_info) |u, info| if (info.key == n.key) {
-            r.zcu.unitKey(u, &name.writer) catch {};
+            r.zcu.unitKey(u, &name.writer) catch {}; // ziglint-ignore: Z026 -- only names a unit in a message
             break;
         };
         std.debug.print("cache check: {t} node {x} ({s}) changed its result but no changed source reaches it; it depended on:\n", .{ n.tag, n.key, name.written() });
@@ -4407,7 +4407,7 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
             const dn = m.node(Manifest.Edge.nodeOf(e));
             name.clearRetainingCapacity();
             for (r.unit_list.items, r.unit_info) |u, info| if (info.key == dn.key) {
-                r.zcu.unitKey(u, &name.writer) catch {};
+                r.zcu.unitKey(u, &name.writer) catch {}; // ziglint-ignore: Z026 -- only names a unit in a message
                 break;
             };
             std.debug.print("cache check:   {t} {x} {s}\n", .{ @as(Tag, @fromBackingInt(@intCast(dn.tag))), dn.key, name.written() });
@@ -4760,7 +4760,7 @@ fn markReached(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *Manif
         var name: Io.Writer.Allocating = .init(gpa);
         defer name.deinit();
         for (r.unit_list.items, r.unit_info) |u, info| if (info.key == n.key) {
-            r.zcu.unitKey(u, &name.writer) catch {};
+            r.zcu.unitKey(u, &name.writer) catch {}; // ziglint-ignore: Z026 -- only names a unit in a message
             break;
         };
         std.debug.print("cache check: {t} node {s} {s}\n", .{ n.tag, name.written(), what });
@@ -4788,7 +4788,7 @@ fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const resul
         fn report(z: *Zcu, dec: anytype, unit: anytype, what: []const u8) void {
             var name: Io.Writer.Allocating = .init(z.gpa);
             defer name.deinit();
-            z.unitKey(unit, &name.writer) catch {};
+            z.unitKey(unit, &name.writer) catch {}; // ziglint-ignore: Z026 -- only names a unit in a message
             std.debug.print("cache check: the result of {t} {s} does not round-trip: {s}", .{ unit, name.written(), what });
             if (dec.miss.reason != .none) std.debug.print(" (item {d}, {t}: {t})", .{ dec.miss.id, dec.miss.tag, dec.miss.reason });
             std.debug.print("\n", .{});
@@ -5009,16 +5009,16 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         fn nodeName(rec: *const Recorder, ni: usize, w: *Io.Writer) void {
             const z = rec.zcu;
             for (rec.unit_list.items, rec.unit_info) |unit, info| if (info.node == ni) {
-                z.unitKey(unit, w) catch {};
+                z.unitKey(unit, w) catch {}; // ziglint-ignore: Z026 -- only names a unit in a message
                 return;
             };
             for (rec.dependee_list.items, rec.dependee_info) |d, info| if (info.node == ni) {
                 switch (d) {
-                    .nav_ty => |nav| w.writeAll(z.ip.stringSlice(z.ip.getNav(nav).key)) catch {},
-                    .func_body, .func_ies, .func_inline => |f| z.unitKey(.{ .func = f }, w) catch {},
-                    .namespace_name => |nn| w.print("{s} {s}", .{ z.namespacePtr(nn.namespace).key, z.ip.stringSlice(nn.name) }) catch {},
-                    .namespace => |ns| w.writeAll(z.namespacePtr(ns).key) catch {},
-                    .embed_file => |i| w.writeAll(z.embed_files.values()[i].key) catch {},
+                    .nav_ty => |nav| w.writeAll(z.ip.stringSlice(z.ip.getNav(nav).key)) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
+                    .func_body, .func_ies, .func_inline => |f| z.unitKey(.{ .func = f }, w) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
+                    .namespace_name => |nn| w.print("{s} {s}", .{ z.namespacePtr(nn.namespace).key, z.ip.stringSlice(nn.name) }) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
+                    .namespace => |ns| w.writeAll(z.namespacePtr(ns).key) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
+                    .embed_file => |i| w.writeAll(z.embed_files.values()[i].key) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
                     .nav_val, .type_layout, .struct_defaults => {},
                 }
                 return;

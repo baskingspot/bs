@@ -2516,7 +2516,7 @@ pub const Builder = struct {
     pub fn place(af: *Io.File.Atomic, io: Io, dir: Io.Dir) !void {
         try af.replace(io);
         // The new base's id makes the old log inapplicable; this only tidies.
-        dir.deleteFile(io, log_name) catch {};
+        dir.deleteFile(io, log_name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     }
 };
 

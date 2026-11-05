@@ -140,7 +140,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8) !
                     try wip_errors.addZirErrorMessages(zir, tree, source_code, "<stdin>");
                     var error_bundle = try wip_errors.toOwnedBundle("");
                     defer error_bundle.deinit(gpa);
-                    error_bundle.renderToStderr(io, .{}, color) catch {};
+                    error_bundle.renderToStderr(io, .{}, color) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
                     process.exit(2);
                 }
             } else {
@@ -153,12 +153,12 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8) !
                     try wip_errors.addZoirErrorMessages(zoir, tree, source_code, "<stdin>");
                     var error_bundle = try wip_errors.toOwnedBundle("");
                     defer error_bundle.deinit(gpa);
-                    error_bundle.renderToStderr(io, .{}, color) catch {};
+                    error_bundle.renderToStderr(io, .{}, color) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
                     process.exit(2);
                 }
             }
         } else if (tree.errors.len != 0) {
-            std.zig.printAstErrorsToStderr(gpa, io, tree, "<stdin>", color) catch {};
+            std.zig.printAstErrorsToStderr(gpa, io, tree, "<stdin>", color) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
             process.exit(2);
         }
         const formatted = try tree.renderAlloc(gpa);

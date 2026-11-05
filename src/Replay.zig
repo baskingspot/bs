@@ -1044,7 +1044,7 @@ fn noteMiss(r: *Replay, unit: Zcu.AnalUnit, what: []const u8) void {
     if (!r.check) return;
     var buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    r.zcu.unitKey(unit, &w) catch {};
+    r.zcu.unitKey(unit, &w) catch {}; // ziglint-ignore: Z026 -- only names a unit in a message
     const dm = r.decoder.miss;
     std.debug.print("cache replay: could not load {t} {s}: {s}", .{ unit, w.buffered(), what });
     if (dm.reason != .none) std.debug.print(" (item {d}, {t}: {t})", .{ dm.id, dm.tag, dm.reason });

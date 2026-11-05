@@ -601,7 +601,7 @@ fn stopWorkers(pool: *Pool) void {
     pool.stop = true;
     pool.work.broadcast(io);
     pool.mutex.unlock(io);
-    pool.group.await(io) catch {};
+    pool.group.await(io) catch {}; // ziglint-ignore: Z026 -- bs never cancels this group
 }
 
 /// Starts CodeGen workers on `threads` threads besides the Sema thread; 0
@@ -975,8 +975,8 @@ fn submit(emit: *Emit, ir_in: Ir, exports: ExportsView) !void {
 /// sometimes yields.
 fn fuzzDelay(io: std.Io, random: std.Random) void {
     switch (random.uintLessThan(u8, 8)) {
-        0, 1 => io.sleep(.{ .nanoseconds = random.uintLessThan(u32, 500_000) }, .awake) catch {},
-        2, 3 => std.Thread.yield() catch {},
+        0, 1 => io.sleep(.{ .nanoseconds = random.uintLessThan(u32, 500_000) }, .awake) catch {}, // ziglint-ignore: Z026 -- only jitter for the test
+        2, 3 => std.Thread.yield() catch {}, // ziglint-ignore: Z026 -- only jitter for the test
         else => {},
     }
 }

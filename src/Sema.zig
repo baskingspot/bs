@@ -21291,7 +21291,7 @@ fn refersToComptimeAlloc(sema: *Sema, val: Index) bool {
                     if (sema.refersToComptimeAlloc(e)) break true;
                 } else false;
                 // Out of memory only costs the cache.
-                sema.zcu.comptime_alloc_refs.put(sema.gpa, val, r) catch {};
+                sema.zcu.comptime_alloc_refs.put(sema.gpa, val, r) catch {}; // ziglint-ignore: Z026 -- out of memory only costs the cache
                 return r;
             },
             .repeated_elem => |e| sema.refersToComptimeAlloc(e),

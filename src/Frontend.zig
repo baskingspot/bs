@@ -478,7 +478,7 @@ fn mapOrLower(fe: *const Frontend, f: *File) Allocator.Error!void {
         std.process.fatal("'{s}' changed during compilation", .{f.display_path});
     const ast = try Ast.parse(arena, src, .{ .mode = .zig });
     const zir = try AstGen.generate(arena, ast);
-    if (fe.blobCache()) |blobs| blobs.saveZir(gpa, io, f.content_hash, &zir, try .of(arena, &zir)) catch {};
+    if (fe.blobCache()) |blobs| blobs.saveZir(gpa, io, f.content_hash, &zir, try .of(arena, &zir)) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     var insts = try zir.instructions.toMultiArrayList().clone(gpa);
     errdefer insts.deinit(gpa);
     const extra = try gpa.dupe(u32, zir.extra);
@@ -586,7 +586,7 @@ pub fn resolveCacheDirs(
 /// runs it beside the link.
 pub fn trimCaches(fe: *const Frontend) void {
     const blobs = fe.blobCache() orelse return;
-    for (&fe.caches) |*c| if (c.*) |*cd| cd.trim(fe.gpa, fe.io, blobs) catch {};
+    for (&fe.caches) |*c| if (c.*) |*cd| cd.trim(fe.gpa, fe.io, blobs) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }
 
 pub fn enableCache(fe: *Frontend, dirs: CacheDirs) !void {
@@ -729,7 +729,7 @@ const CacheDir = struct {
             var index: CacheDir = .{ .dir = cd.dir, .index = &.{}, .index_names = &.{}, .index_bytes = &.{}, .global = false, .renew_before_ns = 0 };
             try index.loadIndex(gpa, io);
             defer gpa.free(index.index_bytes);
-            cd.sweepSuperseded(gpa, io, blobs, index.index, &.{}, now) catch {};
+            cd.sweepSuperseded(gpa, io, blobs, index.index, &.{}, now) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
             if (!cd.global) {
                 try named.ensureTotalCapacity(gpa, @intCast(index.index.len));
                 for (index.index) |e| named.putAssumeCapacity(e.content_hash, {});
@@ -747,7 +747,7 @@ const CacheDir = struct {
             }
             const stat = cd.dir.statFile(io, e.name, .{}) catch continue;
             if (stat.mtime.durationTo(now).toNanoseconds() < std.time.ns_per_day) continue;
-            cd.dir.deleteFile(io, e.name) catch {};
+            cd.dir.deleteFile(io, e.name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
         }
     }
 
@@ -807,7 +807,7 @@ const CacheDir = struct {
             // Renewed since it was marked.
             if (stat.mtime.toNanoseconds() >= e.at_ns - std.time.ns_per_day) continue;
             if (now_ns - e.at_ns >= superseded_grace_ns) {
-                blobs.dir.deleteFile(io, &name) catch {};
+                blobs.dir.deleteFile(io, &name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
                 continue;
             }
             try keep.append(gpa, e);
@@ -824,7 +824,7 @@ const CacheDir = struct {
         }
         if (keep.items.len == old.len and new.len == 0) return;
         if (keep.items.len == 0) {
-            cd.dir.deleteFile(io, "superseded") catch {};
+            cd.dir.deleteFile(io, "superseded") catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
             return;
         }
         var af = try cd.dir.createFileAtomic(io, "superseded", .{ .replace = true });
@@ -890,7 +890,7 @@ const CacheDir = struct {
         const stat = try f.stat(io);
         const len = stat.size;
         if (layout.total != len) return error.CorruptCache;
-        if (renew and stat.mtime.toNanoseconds() < cd.renew_before_ns) f.setTimestampsNow(io) catch {};
+        if (renew and stat.mtime.toNanoseconds() < cd.renew_before_ns) f.setTimestampsNow(io) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
         var mm: Io.File.MemoryMap = try .create(io, f, .{
             .len = @intCast(len),
             .protection = .{ .read = true },
@@ -1508,7 +1508,7 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
     var root_jobs: [5]*Job = undefined;
     for (roots, root_jobs[0..roots.len]) |r, *j| j.* = try l.getJob(r.module, r.sub_path);
     l.work(.main);
-    l.group.await(io) catch {};
+    l.group.await(io) catch {}; // ziglint-ignore: Z026 -- bs never cancels this group
     if (l.failure) |err| return err;
     const finish_start = Io.Clock.awake.now(io);
 
@@ -1625,7 +1625,7 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
             continue;
         };
         // Best effort: what it misses goes with the store's packs.
-        if (superseded.items.len != 0) cd.sweepSuperseded(gpa, io, fe.blobCache().?, merged.items, superseded.items, Io.Clock.real.now(io)) catch {};
+        if (superseded.items.len != 0) cd.sweepSuperseded(gpa, io, fe.blobCache().?, merged.items, superseded.items, Io.Clock.real.now(io)) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     }
 
     const end = Io.Clock.awake.now(io);
@@ -1694,7 +1694,7 @@ fn probeFile(fe: *Frontend, job: *Job, buf: *std.ArrayList(u8), loader_start_ns:
             return .miss;
         };
         defer zf.close(fe.io);
-        zf.setTimestampsNow(fe.io) catch {};
+        zf.setTimestampsNow(fe.io) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
         var e = entry.*;
         e.renewed_ns = @intCast(loader_start_ns);
         job.index_update = .{ .entry = e, .names = try fe.gpa.dupe(u8, summary.names) };

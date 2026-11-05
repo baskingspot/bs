@@ -357,7 +357,7 @@ pub fn main(init_std: std.process.Init) !void {
         } else false;
         const d: []const diag.Diagnostic = &.{.{ .code = .unsupported, .loc = null, .msg = msg }};
         if (listen) return serveFailure(init, d, .Exe);
-        printDiagnostics(init.io, d, .text) catch {};
+        printDiagnostics(init.io, d, .text) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
         std.process.exit(1);
     } else fatal("unknown command: {s}", .{cmd});
 
@@ -367,7 +367,7 @@ pub fn main(init_std: std.process.Init) !void {
         return serve(init, args, opts);
     }
     if (opts.unsupported) |msg| {
-        printDiagnostics(init.io, &.{.{ .code = .unsupported, .loc = null, .msg = msg }}, opts.error_format) catch {};
+        printDiagnostics(init.io, &.{.{ .code = .unsupported, .loc = null, .msg = msg }}, opts.error_format) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
         std.process.exit(1);
     }
 
@@ -394,7 +394,7 @@ pub fn main(init_std: std.process.Init) !void {
     switch (try compile(init, &job, if (inc) |*i| i else null, out_path, null, .none, null)) {
         .ok => {},
         .errors => |diags| {
-            printDiagnostics(init.io, diags, opts.error_format) catch {};
+            printDiagnostics(init.io, diags, opts.error_format) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
             std.process.exit(1);
         },
         .failed => std.process.exit(1),
@@ -830,7 +830,7 @@ const InputsRecord = struct {
     /// Deletes the record before the build writes its output, so that a
     /// build that fails halfway leaves none that matches.
     fn forget(r: *InputsRecord, io: Io) void {
-        r.dir.deleteFile(io, file_name) catch {};
+        r.dir.deleteFile(io, file_name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     }
 
     /// Whether the record matches: every input has its recorded contents
@@ -881,7 +881,7 @@ const InputsRecord = struct {
             dirty = true;
         }
         // Best effort: without it, the next check hashes those inputs again.
-        if (dirty) cache.writeReplace(io, r.dir, file_name, &.{bytes}) catch {};
+        if (dirty) cache.writeReplace(io, r.dir, file_name, &.{bytes}) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
         return true;
     }
 
@@ -917,7 +917,7 @@ const InputsRecord = struct {
         const o: Output = .{ .inode = @intCast(stat.inode), .size = stat.size, .mtime = @intCast(stat.mtime.toNanoseconds()), .path_len = out_path.len };
         try buf.appendSlice(arena, std.mem.asBytes(&o));
         try buf.appendSlice(arena, out_path);
-        cache.writeReplace(io, r.dir, file_name, &.{buf.items}) catch {};
+        cache.writeReplace(io, r.dir, file_name, &.{buf.items}) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     }
 
     /// Appends the entry of `path` with `hash`, its contents when the build
@@ -990,7 +990,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, batch: ?*CSource.Batch,
         std.mem.writeInt(u128, &bytes, stamp, .little);
         Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = &bytes, .flags = .{} }) catch |err| switch (err) {
             error.FileNotFound => if (Io.Dir.cwd().createDirPath(io, Io.Dir.path.dirname(sp).?)) |_| {
-                Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = &bytes, .flags = .{} }) catch {};
+                Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = &bytes, .flags = .{} }) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
             } else |_| {},
             else => {},
         };
@@ -1870,7 +1870,7 @@ fn runExe(init: std.process.Init, path: []const u8, run_args: []const []const u8
     @memcpy(argv[1..], run_args);
     // Upstream sets ZIG_EXE for the program.
     if (std.process.executablePathAlloc(init.io, arena)) |self| {
-        init.environ_map.put("ZIG_EXE", self) catch {};
+        init.environ_map.put("ZIG_EXE", self) catch {}; // ziglint-ignore: Z026 -- out of memory only leaves ZIG_EXE unset
     } else |_| {}
     const err = std.process.replace(init.io, .{ .argv = argv, .environ_map = init.environ_map });
     fatal("the following command failed to execve with '{t}':\n{s}", .{ err, std.mem.join(arena, " ", argv) catch path });
@@ -1898,7 +1898,7 @@ fn runTest(init: std.process.Init, path: []const u8, temporary: bool) !void {
     const exe = if (std.mem.findScalar(u8, path, '/') == null) try Io.Dir.path.join(init.arena.allocator(), &.{ ".", path }) else path;
     var child = try std.process.spawn(init.io, .{ .argv = &.{exe} });
     const term = try child.wait(init.io);
-    if (temporary) Io.Dir.cwd().deleteFile(init.io, path) catch {};
+    if (temporary) Io.Dir.cwd().deleteFile(init.io, path) catch {}; // ziglint-ignore: Z026 -- the bs/tmp sweep removes leftovers
     switch (term) {
         .exited => |code| if (code != 0) std.process.exit(code),
         else => fatal("the test binary terminated unexpectedly: {any}", .{term}),

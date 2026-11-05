@@ -63,8 +63,8 @@ pub fn resolve(arena: std.mem.Allocator, io: std.Io, text: []const u8) Resolved 
     for (Cpu.Arch.x86_64.allFeaturesList(), 0..) |f, i| {
         if (!target.cpu.features.isEnabled(@intCast(i)) or accepted(i)) continue;
         avx = avx or isAvx(f.name);
-        if (names.items.len != 0) names.appendSlice(arena, ", ") catch {};
-        names.appendSlice(arena, f.name) catch {};
+        if (names.items.len != 0) names.appendSlice(arena, ", ") catch {}; // ziglint-ignore: Z026 -- out of memory only shortens the message
+        names.appendSlice(arena, f.name) catch {}; // ziglint-ignore: Z026 -- out of memory only shortens the message
     }
     if (names.items.len == 0) return .{ .cpu = target.cpu };
     return .{ .cpu = baseline, .refused = arena.print("bs generates code for x86_64 CPUs up to x86-64-v2 (SSE4.2){s}; '-mcpu {s}' enables {s}", .{

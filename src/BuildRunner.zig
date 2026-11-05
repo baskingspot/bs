@@ -45,7 +45,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const runner_path = try Io.Dir.path.join(arena, &.{ runner_dir, "maker" });
     // Held until the runner replaces this process (the file closes on
     // exec), so that maintenance keeps the runner it finds.
-    _ = cache.useTool(io, runner_dir) catch {};
+    _ = cache.useTool(io, runner_dir) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     // With the default zig lib directory, upstream zig 0.17.1's, which
     // nobody edits, a runner that is as the last check left it is current:
     // that saves the check's stat of every source the runner imports
@@ -104,7 +104,7 @@ pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []cons
         switch (try main.compile(init, &job, if (inc) |*i| i else null, job.stem, null, prog, null)) {
             .ok => {},
             .errors => |diags| {
-                main.printDiagnostics(io, diags, .text) catch {};
+                main.printDiagnostics(io, diags, .text) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
                 main.fatal("bs could not compile the {s} ({s})", .{ what, root });
             },
             .failed => main.fatal("bs could not link the {s} ({s})", .{ what, root }),
@@ -135,5 +135,5 @@ pub fn noteTool(io: Io, runner_path: []const u8, stamp_path: []const u8) void {
     var atomic = Io.Dir.cwd().createFileAtomic(io, stamp_path, .{ .replace = true }) catch return;
     defer atomic.deinit(io);
     atomic.file.writeStreamingAll(io, std.mem.asBytes(&st)) catch return;
-    atomic.replace(io) catch {};
+    atomic.replace(io) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }

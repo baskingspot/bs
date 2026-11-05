@@ -1354,7 +1354,7 @@ pub fn printUnitTiming(zcu: *Zcu) void {
     for (t.ns.keys()[0..@min(t.top, t.ns.count())], t.ns.values()[0..@min(t.top, t.ns.count())]) |unit, ns| {
         var buf: [256]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
-        zcu.unitKey(unit, &w) catch {};
+        zcu.unitKey(unit, &w) catch {}; // ziglint-ignore: Z026 -- only names a unit in a message
         std.debug.print("{d:>9.2} ms  {s} {s}\n", .{ @as(f64, @floatFromInt(ns)) / 1e6, @tagName(unit), w.buffered() });
     }
 }

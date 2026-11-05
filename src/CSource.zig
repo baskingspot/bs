@@ -408,7 +408,7 @@ pub const Batch = struct {
     /// done and no file is too new to trust its mtime; else the next build
     /// checks the records. Best effort.
     pub fn writeSummary(b: *Batch) void {
-        b.writeSummaryOrFail() catch {};
+        b.writeSummaryOrFail() catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     }
 
     fn writeSummaryOrFail(b: *Batch) !void {
@@ -1420,13 +1420,13 @@ fn readLibcRecord(arena: std.mem.Allocator, io: Io, record: []const u8) !?[]cons
 
 /// Best effort: without the record, the next build asks again.
 fn writeLibcRecord(io: Io, record: []const u8, dirs: []const []const u8) void {
-    if (Io.Dir.path.dirname(record)) |d| Io.Dir.cwd().createDirPath(io, d) catch {};
+    if (Io.Dir.path.dirname(record)) |d| Io.Dir.cwd().createDirPath(io, d) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     var parts: [4][]const u8 = undefined;
     for (dirs, 0..) |d, k| {
         parts[2 * k] = d;
         parts[2 * k + 1] = "\x00";
     }
-    cache.writeReplace(io, Io.Dir.cwd(), record, parts[0 .. 2 * dirs.len]) catch {};
+    cache.writeReplace(io, Io.Dir.cwd(), record, parts[0 .. 2 * dirs.len]) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }
 
 // The detection below follows upstream's `std.zig.LibCInstallation`

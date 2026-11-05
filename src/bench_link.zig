@@ -321,7 +321,7 @@ fn linkToFile(gpa: std.mem.Allocator, io: std.Io, atoms: []const Atom, single: E
                 for (b, [_]Elf.Options{ single, parallel }) |*t_best, options| {
                     var o = options;
                     o.file_writes = writes;
-                    if (fresh) cwd.deleteFile(io, out_path) catch {};
+                    if (fresh) cwd.deleteFile(io, out_path) catch {}; // ziglint-ignore: Z026 -- cleanup is best effort
                     const t = std.Io.Timestamp.now(io, .awake);
                     try Elf.link(gpa, io, cwd, out_path, atoms, o);
                     t_best.* = @min(t_best.*, elapsed(io, t));

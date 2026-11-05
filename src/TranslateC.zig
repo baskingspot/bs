@@ -213,7 +213,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     if (r.errors) |body| {
         var bundle = try std.zig.Server.allocErrorBundle(init.gpa, body);
         defer bundle.deinit(init.gpa);
-        bundle.renderToStderr(io, .{}, std.zig.Color.settingFromEnvironment(init.environ_map)) catch {};
+        bundle.renderToStderr(io, .{}, std.zig.Color.settingFromEnvironment(init.environ_map)) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
         std.process.exit(1);
     }
     const contents = try Io.Dir.cwd().readFileAlloc(io, r.out_path, init.arena.allocator(), .unlimited);

@@ -2455,7 +2455,7 @@ pub fn adviseHugePages(bytes: []u8) void {
     const huge = 2 << 20;
     const begin = std.mem.alignForward(usize, @intFromPtr(bytes.ptr), huge);
     const end = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr) + bytes.len, huge);
-    if (begin < end) std.posix.madvise(@ptrFromInt(begin), end - begin, std.posix.MADV.HUGEPAGE) catch {};
+    if (begin < end) std.posix.madvise(@ptrFromInt(begin), end - begin, std.posix.MADV.HUGEPAGE) catch {}; // ziglint-ignore: Z026 -- only a hint to the kernel
 }
 
 /// Faults in fresh memory, writable, ahead of use. Faulting it on first
@@ -2468,7 +2468,7 @@ pub fn populate(bytes: []u8) void {
     const begin = std.mem.alignForward(usize, @intFromPtr(bytes.ptr), std.heap.page_size_min);
     const end = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr) + bytes.len, std.heap.page_size_min);
     const MADV_POPULATE_WRITE = 23; // Linux 5.14; older kernels just fault.
-    if (begin < end) std.posix.madvise(@ptrFromInt(begin), end - begin, MADV_POPULATE_WRITE) catch {};
+    if (begin < end) std.posix.madvise(@ptrFromInt(begin), end - begin, MADV_POPULATE_WRITE) catch {}; // ziglint-ignore: Z026 -- only a hint to the kernel
 }
 
 pub fn prefetchSlice(comptime T: type, slice: []const T) void {

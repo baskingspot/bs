@@ -82,7 +82,7 @@ fn check(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.M
         var atomic = cwd.createFileAtomic(io, m, .{ .replace = true }) catch break :write;
         defer atomic.deinit(io);
         atomic.file.writeStreamingAll(io, parsed.lib_dir) catch break :write;
-        atomic.replace(io) catch {};
+        atomic.replace(io) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     }
     return .{ .lib_dir = parsed.lib_dir };
 }

@@ -125,10 +125,10 @@ pub fn check(arena: std.mem.Allocator, io: Io, record_path: []const u8, out_path
         changed = true;
     }
     if (changed) {
-        cache.writeReplace(io, cwd, record_path, &.{ rec[0..@sizeOf(Header)], std.mem.sliceAsBytes(entries), paths }) catch {};
+        cache.writeReplace(io, cwd, record_path, &.{ rec[0..@sizeOf(Header)], std.mem.sliceAsBytes(entries), paths }) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     } else {
         // The record's mtime is its last use, for trimming the cache.
-        cache.setTimestamps(io, cwd, record_path, .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {};
+        cache.setTimestamps(io, cwd, record_path, .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     }
     return .{ .hit = inputs.items };
 }
