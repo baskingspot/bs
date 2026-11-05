@@ -9216,9 +9216,13 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             const child = Type.childType(ip, dest_ty);
             if (sc == .null) return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = .none } }));
             if (sc == .optional) {
-                // `?*T` to `?*const T` and similar.
+                // `?*T` to `?*const T` and similar. Not `?*[N]T` to
+                // `?[*]T`, as upstream: only a plain `*[N]T` becomes a
+                // many pointer.
                 const s_child = Type.childType(ip, src_ty);
-                if (Type.class(ip, s_child) == .pointer and Type.class(ip, child) == .pointer and sema.ptrCoercibleInPlace(s_child, child)) {
+                if (Type.class(ip, s_child) == .pointer and Type.class(ip, child) == .pointer and sema.ptrCoercibleInPlace(s_child, child) and
+                    !(Type.ptrInfo(ip, s_child).flags.size == .one and Type.ptrInfo(ip, child).flags.size == .many))
+                {
                     if (val) |v| switch (ip.indexToKey(v)) {
                         .opt => |o| {
                             const payload: Index = if (o.val == .none) .none else (try sema.coercePtrTo(block, .fromInterned(o.val), child)).toInterned().?;
