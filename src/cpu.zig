@@ -1,7 +1,8 @@
 //! The CPU bs generates code for (`-mcpu`): x86_64's baseline by
-//! default, or a CPU model and features up to x86-64-v2 (SSE4.2). AVX
-//! changes the vector ABI and is refused; `-mcpu=native` is clamped to the
-//! supported subset (docs/slop/architecture.md, "Deliberate differences from
+//! default, or a CPU model and features up to x86-64-v2 (SSE4.2), plus
+//! AES-NI and PCLMULQDQ, which only inline assembly uses. AVX changes the
+//! vector ABI and is refused; `-mcpu=native` is clamped to the supported
+//! subset (docs/slop/architecture.md, "Deliberate differences from
 //! upstream").
 
 const std = @import("std");
@@ -11,8 +12,10 @@ const x86 = std.Target.x86;
 /// x86_64's baseline CPU, bs's default (upstream's default is native).
 pub const baseline: Cpu = x86.cpu.x86_64.toCpu(.x86_64);
 
-/// The instruction set features bs accepts: x86-64-v2's.
-const isa = [_]x86.Feature{ .@"64bit", .cmov, .crc32, .cx16, .cx8, .fxsr, .mmx, .nopl, .popcnt, .sahf, .sse, .sse2, .sse3, .sse4_1, .sse4_2, .ssse3, .x87 };
+/// The instruction set features bs accepts: x86-64-v2's, and aes and
+/// pclmul for inline assembly (std's `crypto.aes` and
+/// `crypto.ghash_polyval` take their asm paths only with AVX too).
+const isa = [_]x86.Feature{ .@"64bit", .aes, .cmov, .crc32, .cx16, .cx8, .fxsr, .mmx, .nopl, .pclmul, .popcnt, .sahf, .sse, .sse2, .sse3, .sse4_1, .sse4_2, .ssse3, .x87 };
 
 /// Whether feature `name` only tunes code generation (LLVM's tuning
 /// features), which bs ignores and so accepts.
@@ -102,21 +105,24 @@ test resolve {
     const io = std.testing.io;
     try std.testing.expect(resolve(arena, io, "baseline").cpu.model == baseline.model);
     // Models and features up to x86-64-v2, with their tuning features.
-    for ([_][]const u8{ "x86_64_v2", "nehalem", "penryn", "baseline+sse4_1", "x86_64+popcnt-sse3" }) |ok| {
+    for ([_][]const u8{ "x86_64_v2", "nehalem", "penryn", "baseline+sse4_1", "x86_64+popcnt-sse3", "westmere", "x86_64_v2+aes+pclmul" }) |ok| {
         try std.testing.expectEqual(null, resolve(arena, io, ok).refused);
     }
     try std.testing.expect(resolve(arena, io, "nehalem").cpu.has(.x86, .sse4_2));
     // AVX, explicitly or through a model, and other features beyond v2.
     try std.testing.expectEqualStrings("bs generates code for x86_64 CPUs up to x86-64-v2 (SSE4.2) and does not support AVX; '-mcpu x86_64_v2+avx' enables avx", resolve(arena, io, "x86_64_v2+avx").refused.?);
     try std.testing.expect(std.mem.indexOf(u8, resolve(arena, io, "haswell").refused.?, "does not support AVX") != null);
-    try std.testing.expectEqualStrings("bs generates code for x86_64 CPUs up to x86-64-v2 (SSE4.2); '-mcpu westmere' enables pclmul", resolve(arena, io, "westmere").refused.?);
+    try std.testing.expectEqualStrings("bs generates code for x86_64 CPUs up to x86-64-v2 (SSE4.2); '-mcpu x86_64_v2+sha' enables sha", resolve(arena, io, "x86_64_v2+sha").refused.?);
     try std.testing.expect(resolve(arena, io, "nosuchcpu").refused != null);
 }
 
 test clamp {
-    const haswell = clamp(x86.cpu.haswell.toCpu(.x86_64));
+    // A Haswell host, whose cpuid reports AES-NI (the model leaves it out).
+    var host = x86.cpu.haswell.toCpu(.x86_64);
+    host.features.addFeature(@backingInt(x86.Feature.aes));
+    const haswell = clamp(host);
     try std.testing.expect(haswell.model == &x86.cpu.x86_64_v2);
-    try std.testing.expect(haswell.has(.x86, .sse4_2) and !haswell.has(.x86, .avx) and !haswell.has(.x86, .pclmul));
+    try std.testing.expect(haswell.has(.x86, .sse4_2) and !haswell.has(.x86, .avx) and haswell.has(.x86, .aes) and haswell.has(.x86, .pclmul));
     const core2 = clamp(x86.cpu.core2.toCpu(.x86_64));
     try std.testing.expect(core2.model == baseline.model and core2.has(.x86, .ssse3) and !core2.has(.x86, .sse4_1));
 }

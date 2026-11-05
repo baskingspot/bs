@@ -952,11 +952,59 @@ pub const PackedOp38 = enum(u8) {
     pmaxuw = 0x3e,
     pmaxud = 0x3f,
     pmulld = 0x40,
+    // AES-NI (`-mcpu` with aes).
+    aesimc = 0xdb,
+    aesenc = 0xdc,
+    aesenclast = 0xdd,
+    aesdec = 0xde,
+    aesdeclast = 0xdf,
 };
 
 pub fn pint38(e: *Encoder, op: PackedOp38, dst: Xmm, src: XmmRm) !void {
     try e.reserve();
     try e.modRm(.{ .op16 = true }, &.{ 0x0f, 0x38, @backingInt(op) }, @backingInt(dst), rmXmm(src), 0);
+}
+
+/// The 66 0f 3a xx ib encoding: `aeskeygenassist` (0xdf) and `pclmulqdq`
+/// (0x44), for CPUs that have them (`-mcpu`).
+pub fn pint3a(e: *Encoder, opcode: u8, dst: Xmm, src: XmmRm, imm: u8) !void {
+    try e.reserve();
+    try e.modRm(.{ .op16 = true }, &.{ 0x0f, 0x3a, opcode }, @backingInt(dst), rmXmm(src), 1);
+    e.byte(imm);
+}
+
+pub const VexMap = enum(u5) { @"0f" = 1, @"0f38" = 2, @"0f3a" = 3 };
+
+/// A VEX.128.66 instruction, AVX's encoding of the SSE integer and AES
+/// instructions, which inline assembly names (`vaesenc`): `reg` in
+/// ModRM.reg, `vvvv` the extra source register (0 when the instruction
+/// has none), then `rm` and the immediate if there is one. bs's own code
+/// never uses VEX (`cpu.zig`).
+pub fn vex66(e: *Encoder, map: VexMap, opcode: u8, reg: u4, vvvv: u4, rm: XmmRm, imm: ?u8) !void {
+    try e.reserve();
+    const enc = rmXmm(rm);
+    var x: u1 = 0;
+    var b: u1 = 0;
+    switch (enc) {
+        .reg => |r| b = ext(r),
+        .mem => |m| {
+            if (m.base == .reg) b = ext(@backingInt(m.base.reg));
+            if (m.index) |i| x = ext(@backingInt(i.reg));
+        },
+    }
+    // vvvv inverted, L = 0 (128 bits), pp = 01 (66).
+    const last: u8 = (@as(u8, ~vvvv & 0xf) << 3) | 0b01;
+    if (map == .@"0f" and x == 0 and b == 0) {
+        e.byte(0xc5);
+        e.byte(@as(u8, ~ext(reg)) << 7 | last);
+    } else {
+        e.byte(0xc4);
+        e.byte(@as(u8, ~ext(reg)) << 7 | @as(u8, ~x) << 6 | @as(u8, ~b) << 5 | @backingInt(map));
+        e.byte(last); // W = 0
+    }
+    e.byte(opcode);
+    try e.rmBytes(reg, enc, @intFromBool(imm != null));
+    if (imm) |v| e.byte(v);
 }
 
 /// SSE4.2 `crc32`: the CRC-32C of `src_size` bytes of `src` folded into
@@ -1290,6 +1338,12 @@ fn modRm(e: *Encoder, o: Opts, opcode: []const u8, reg: u4, rm: RmEnc, imm_len: 
     }
     e.prefixes(rex, o);
     e.bytes(opcode);
+    try e.rmBytes(reg, rm, imm_len);
+}
+
+/// The ModRM byte, SIB byte, and displacement of `reg` and `rm`, after
+/// the prefixes and opcode; `imm_len` immediate bytes follow them.
+fn rmBytes(e: *Encoder, reg: u4, rm: RmEnc, imm_len: u8) !void {
     const reg3: u3 = @truncate(reg);
     const m = switch (rm) {
         .reg => |r| return e.byte(modrmByte(0b11, reg3, @truncate(r))),
@@ -1593,6 +1647,33 @@ test "packed SSE instructions match GNU as" {
     try e.pint(.psllq, .xmm9, .{ .reg = .xmm4 });
     try e.pint(.psraw, .xmm0, .{ .reg = .xmm12 });
     const expected = "660ffcca66440f744de066410fefc766440ffbc3410f58d2660f59080fc2dc0166450fc25c24100466410f70d44ef20f70d3b1f3440f70cb00660f71d10866410f72f21f660f73db04660f73f20166410fd7c166440fd7d10f50ca66450f50de660f6f4df0f3450f7f4a08f30f6f0500000000660f3800ca66440f38404df066410f3837c766440f383fe3f2480f38f0c666f2410f38f1c9f24c0f38f15f08f20f38f1d3f0490fc70af0480fc74de0" ++ "660fd2cd" ++ "66440ff3cc" ++ "66410fe1c4";
+    var buf: [expected.len / 2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
+}
+
+test "AES-NI, PCLMULQDQ, and their VEX forms match GNU as" {
+    const gpa = std.testing.allocator;
+    var e: Encoder = .init(gpa);
+    defer e.deinit();
+    try e.pint38(.aesenc, .xmm1, .{ .reg = .xmm2 });
+    try e.pint38(.aesenclast, .xmm9, .{ .mem = .at(.rbp, -16) });
+    try e.pint38(.aesdec, .xmm0, .{ .reg = .xmm15 });
+    try e.pint38(.aesdeclast, .xmm3, .{ .reg = .xmm4 });
+    try e.pint38(.aesimc, .xmm10, .{ .reg = .xmm2 });
+    try e.pint3a(0xdf, .xmm1, .{ .reg = .xmm2 }, 1); // aeskeygenassist
+    try e.pint3a(0x44, .xmm9, .{ .reg = .xmm10 }, 0x11); // pclmulqdq
+    try e.pint3a(0x44, .xmm0, .{ .mem = .at(.rax, 8) }, 0);
+    try e.vex66(.@"0f38", 0xdc, 1, 2, .{ .reg = .xmm3 }, null); // vaesenc %xmm3, %xmm2, %xmm1
+    try e.vex66(.@"0f38", 0xdd, 9, 10, .{ .reg = .xmm11 }, null);
+    try e.vex66(.@"0f38", 0xde, 0, 1, .{ .mem = .at(.r12, 16) }, null);
+    try e.vex66(.@"0f38", 0xdb, 2, 0, .{ .reg = .xmm8 }, null); // vaesimc
+    try e.vex66(.@"0f3a", 0xdf, 3, 0, .{ .reg = .xmm4 }, 0x1b); // vaeskeygenassist $0x1b
+    try e.vex66(.@"0f", 0xef, 1, 2, .{ .reg = .xmm3 }, null); // vpxor, two-byte VEX
+    try e.vex66(.@"0f", 0xef, 1, 2, .{ .reg = .xmm9 }, null);
+    try e.vex66(.@"0f", 0x73, 7, 5, .{ .reg = .xmm6 }, 4); // vpslldq $4, %xmm6, %xmm5
+    try e.vex66(.@"0f", 0x70, 12, 0, .{ .reg = .xmm1 }, 0xff); // vpshufd $0xff, %xmm1, %xmm12
+    try e.vex66(.@"0f3a", 0x44, 1, 2, .{ .reg = .xmm3 }, 0x10); // vpclmulqdq $0x10
+    const expected = "660f38dcca66440f38dd4df066410f38dec7660f38dfdc66440f38dbd2660f3adfca0166450f3a44ca11660f3a44400800c4e269dccbc44229ddcbc4c271de442410c4c279dbd0c4e379dfdc1bc5e9efcbc4c169efc9c5d173fe04c57970e1ffc4e36944cb10";
     var buf: [expected.len / 2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
 }

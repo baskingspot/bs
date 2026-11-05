@@ -9235,13 +9235,16 @@ Where upstream supports more than bs generates code for, bs narrows
 the choice instead of failing:
 
 - *CPU models and features.* bs accepts x86_64 CPU models and features
-  up to x86-64-v2 (SSE4.2, `src/cpu.zig`), puts them in `builtin.cpu` as
-  upstream does, and keys the cache on them. The default is the
-  baseline CPU, also where upstream defaults to the native one (no
-  `-mcpu`, which is also what `zig build` passes for its native default
-  and `-Dcpu=native`). An explicit AVX feature or a model that has one
-  (`haswell`, `x86_64_v3`), or any other feature past x86-64-v2
-  (`pclmul`), is refused with a message naming the features. Only
+  up to x86-64-v2 (SSE4.2, `src/cpu.zig`), plus aes and pclmul, whose
+  instructions inline assembly may use (in their SSE and VEX forms; bs's
+  own code is SSE only), puts them in `builtin.cpu` as upstream does,
+  and keys the cache on them. std's AES and GHASH take their asm paths
+  only with AVX as well, so they stay on their software ones. The
+  default is the baseline CPU, also where upstream defaults to the
+  native one (no `-mcpu`, which is also what `zig build` passes for its
+  native default and `-Dcpu=native`). An explicit AVX feature or a model
+  that has one (`haswell`, `x86_64_v3`), or any other feature past
+  those (`sha`), is refused with a message naming the features. Only
   `-mcpu=native` is clamped: the host's model becomes `x86_64_v2` when
   the host has all of its instructions, else `x86_64`, plus the host's
   features bs accepts; std takes its SSE paths, as upstream's on a CPU

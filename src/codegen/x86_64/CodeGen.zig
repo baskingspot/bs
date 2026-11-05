@@ -6147,7 +6147,7 @@ fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
 // register; `X`, `i`, and `n` inputs are substituted into the template as
 // symbols or immediates.
 
-const AsmArg = union(enum) { sym: struct { key: SymbolKey, off: i32 }, imm: i64, reg: ParsedReg };
+const AsmArg = union(enum) { sym: struct { key: SymbolKey, off: i32 }, imm: i64, reg: ParsedReg, xmm: Encoder.Xmm };
 
 fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const ip = cg.ip;
@@ -6175,11 +6175,42 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             used |= @as(u16, 1) << @backingInt(r.reg);
         };
     }
+    // `x` operands get xmm0-xmm7, which hold no value between
+    // instructions (homes are xmm8-xmm15), loaded first: `loadXmm` may
+    // use rax, which a register operand may hold.
+    const out_xmms = try cg.gpa.alloc(?Encoder.Xmm, outputs.len);
+    defer cg.gpa.free(out_xmms);
+    var next_xmm: u4 = 0;
+    for (outputs, out_xmms) |out, *out_xmm| {
+        out_xmm.* = null;
+        const full = ip.stringSlice(out.constraint);
+        // `&` (early clobber) holds: no two operands share a register.
+        if (full.len < 2 or !std.mem.eql(u8, asmAlternative(std.mem.trimStart(u8, full[1..], "&")), "x")) continue;
+        if (next_xmm == 8) return cg.fail("asm with too many 'x' operands", .{});
+        const x: Encoder.Xmm = @fromBackingInt(next_xmm);
+        next_xmm += 1;
+        out_xmm.* = x;
+        try names.put(cg.gpa, ip.stringSlice(out.name), .{ .xmm = x });
+        if (full[0] == '+') {
+            if (out.operand == .none) return cg.fail("asm output constraint '{s}'", .{full});
+            try cg.load(.r11, out.operand);
+            try cg.loadXmm(x, memVal(Type.ptrInfo(ip, cg.typeOf(out.operand)).child, Mem.at(.r11, 0)));
+        }
+    }
+    for (inputs) |in| {
+        if (!std.mem.eql(u8, asmAlternative(ip.stringSlice(in.constraint)), "x")) continue;
+        if (next_xmm == 8) return cg.fail("asm with too many 'x' operands", .{});
+        const x: Encoder.Xmm = @fromBackingInt(next_xmm);
+        next_xmm += 1;
+        try cg.loadXmm(x, try cg.valOf(in.operand));
+        try names.put(cg.gpa, ip.stringSlice(in.name), .{ .xmm = x });
+    }
     // `=r` and `+r` outputs get registers that no other operand uses; a
     // `+r` register starts with the operand's value.
     const out_regs = try cg.gpa.alloc(Reg, outputs.len);
     defer cg.gpa.free(out_regs);
-    for (outputs, out_regs) |out, *out_reg| {
+    for (outputs, out_regs, out_xmms) |out, *out_reg, out_xmm| {
+        if (out_xmm != null) continue;
         const full = ip.stringSlice(out.constraint);
         if (full.len == 0 or (full[0] != '=' and full[0] != '+')) return cg.fail("asm output constraint '{s}'", .{full});
         const read = full[0] == '+';
@@ -6208,6 +6239,7 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     }
     for (inputs) |in| {
         const constraint = asmAlternative(ip.stringSlice(in.constraint));
+        if (std.mem.eql(u8, constraint, "x")) continue;
         const is_r = std.mem.eql(u8, constraint, "r") or (std.mem.eql(u8, constraint, "rm") and cg.passInRegs(cg.typeOf(in.operand)));
         if (is_r) {
             const in_size = Type.abiSize(ip, cg.typeOf(in.operand));
@@ -6238,7 +6270,8 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     }
     try cg.assemble(ip.stringSlice(extra.data.source), &names);
 
-    for (outputs, out_regs) |out, reg| {
+    for (outputs, out_regs, out_xmms) |out, reg, out_xmm| {
+        if (out_xmm != null) continue;
         if (out.operand == .none) {
             const ty = data.ty_pl.ty;
             const dst = try cg.resultMem(inst, ty) orelse continue;
@@ -6248,6 +6281,16 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             const tmp: Reg = if (reg == .r10) .r11 else .r10;
             try cg.load(tmp, out.operand);
             try cg.storeReg(Mem.at(tmp, 0), reg, Type.abiSize(ip, ty));
+        }
+    }
+    // After the register outputs: `storeXmm` may use rax.
+    for (outputs, out_xmms) |out, out_xmm| {
+        const x = out_xmm orelse continue;
+        if (out.operand == .none) {
+            try cg.setXmm(inst, data.ty_pl.ty, x);
+        } else {
+            try cg.load(.r10, out.operand);
+            try cg.storeXmm(Mem.at(.r10, 0), x, Type.abiSize(ip, Type.ptrInfo(ip, cg.typeOf(out.operand)).child));
         }
     }
 }
@@ -6284,6 +6327,7 @@ fn parseReg(name: []const u8) ?ParsedReg {
 
 const AsmOperand = union(enum) {
     reg: ParsedReg,
+    xmm: Encoder.Xmm,
     imm: i64,
     sym: struct { key: SymbolKey, off: i32 },
     /// A memory operand, optionally relative to the fs segment.
@@ -6393,7 +6437,7 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
         };
         return cg.e.leaLabel(dst, try cg.localLabel(locals, ref, line));
     }
-    var operands: [2]AsmOperand = undefined;
+    var operands: [4]AsmOperand = undefined;
     var n: usize = 0;
     // Split at commas outside a memory operand's parentheses.
     const rest = line[sp..];
@@ -6410,7 +6454,7 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
         const tok = std.mem.trim(u8, rest[start..if (split) k else k + 1], " \t");
         start = k + 1;
         if (tok.len == 0) continue;
-        if (n == 2) return cg.fail("asm instruction with more than two operands: '{s}'", .{line});
+        if (n == 4) return cg.fail("asm instruction with more than four operands: '{s}'", .{line});
         operands[n] = try cg.asmOperand(tok, names, line);
         n += 1;
     }
@@ -6453,11 +6497,13 @@ fn asmOperand(cg: *CodeGen, tok_in: []const u8, names: *const std.StringHashMapU
             .imm => |v| .{ .imm = v },
             .sym => |s| .{ .sym = .{ .key = s.key, .off = s.off } },
             .reg => |r| .{ .reg = r },
+            .xmm => |x| .{ .xmm = x },
         };
     }
     if (std.mem.indexOfScalar(u8, tok, '(') != null or std.mem.indexOfScalar(u8, tok, ':') != null) return cg.asmMemOperand(tok, names, line);
     if (std.mem.startsWith(u8, tok, "%%") or std.mem.startsWith(u8, tok, "%")) {
         const name = std.mem.trimStart(u8, tok, "%");
+        if (std.mem.startsWith(u8, name, "xmm")) if (std.fmt.parseInt(u4, name[3..], 10)) |n| return .{ .xmm = @fromBackingInt(n) } else |_| {};
         const reg = parseReg(name) orelse return cg.fail("unknown register '{s}' in '{s}'", .{ name, line });
         return .{ .reg = reg };
     }
@@ -6513,7 +6559,75 @@ fn asmMemOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapU
     return .{ .mem = .{ .mem = mem, .fs = fs } };
 }
 
+/// AES-NI and PCLMULQDQ (`-mcpu` with aes and pclmul), and the VEX forms
+/// of them and of the SSE integer instructions std's `crypto.aes` key
+/// expansion uses (`vaesenc`, `vpxor`); in AT&T order, an immediate
+/// first and the destination last. Returns false for other mnemonics.
+fn asmSimd(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []const u8) Error!bool {
+    // The operands after the immediate: `rm, dst`; `rm, src2, dst` (VEX's
+    // second source, `vvvv`); or `src, dst` of a VEX shift, whose
+    // destination is `vvvv`.
+    const Shape = enum { rm_dst, rm_src2_dst, shift };
+    const Enc = enum { op38, op3a, vex };
+    const Form = struct { name: []const u8, enc: Enc, map: Encoder.VexMap, opcode: u8, imm: bool, shape: Shape };
+    const forms = [_]Form{
+        .{ .name = "aesenc", .enc = .op38, .map = .@"0f38", .opcode = 0xdc, .imm = false, .shape = .rm_dst },
+        .{ .name = "aesenclast", .enc = .op38, .map = .@"0f38", .opcode = 0xdd, .imm = false, .shape = .rm_dst },
+        .{ .name = "aesdec", .enc = .op38, .map = .@"0f38", .opcode = 0xde, .imm = false, .shape = .rm_dst },
+        .{ .name = "aesdeclast", .enc = .op38, .map = .@"0f38", .opcode = 0xdf, .imm = false, .shape = .rm_dst },
+        .{ .name = "aesimc", .enc = .op38, .map = .@"0f38", .opcode = 0xdb, .imm = false, .shape = .rm_dst },
+        .{ .name = "aeskeygenassist", .enc = .op3a, .map = .@"0f3a", .opcode = 0xdf, .imm = true, .shape = .rm_dst },
+        .{ .name = "pclmulqdq", .enc = .op3a, .map = .@"0f3a", .opcode = 0x44, .imm = true, .shape = .rm_dst },
+        .{ .name = "vaesenc", .enc = .vex, .map = .@"0f38", .opcode = 0xdc, .imm = false, .shape = .rm_src2_dst },
+        .{ .name = "vaesenclast", .enc = .vex, .map = .@"0f38", .opcode = 0xdd, .imm = false, .shape = .rm_src2_dst },
+        .{ .name = "vaesdec", .enc = .vex, .map = .@"0f38", .opcode = 0xde, .imm = false, .shape = .rm_src2_dst },
+        .{ .name = "vaesdeclast", .enc = .vex, .map = .@"0f38", .opcode = 0xdf, .imm = false, .shape = .rm_src2_dst },
+        .{ .name = "vaesimc", .enc = .vex, .map = .@"0f38", .opcode = 0xdb, .imm = false, .shape = .rm_dst },
+        .{ .name = "vaeskeygenassist", .enc = .vex, .map = .@"0f3a", .opcode = 0xdf, .imm = true, .shape = .rm_dst },
+        .{ .name = "vpclmulqdq", .enc = .vex, .map = .@"0f3a", .opcode = 0x44, .imm = true, .shape = .rm_src2_dst },
+        .{ .name = "vpxor", .enc = .vex, .map = .@"0f", .opcode = 0xef, .imm = false, .shape = .rm_src2_dst },
+        .{ .name = "vpshufd", .enc = .vex, .map = .@"0f", .opcode = 0x70, .imm = true, .shape = .rm_dst },
+        .{ .name = "vpslldq", .enc = .vex, .map = .@"0f", .opcode = 0x73, .imm = true, .shape = .shift },
+    };
+    const f = for (forms) |f| {
+        if (std.mem.eql(u8, f.name, mnemonic)) break f;
+    } else return false;
+    const n_regs: usize = if (f.shape == .rm_src2_dst) 3 else 2;
+    if (ops.len != n_regs + @intFromBool(f.imm)) return cg.fail("wrong operands for '{s}': '{s}'", .{ mnemonic, line });
+    const imm: ?u8 = if (!f.imm) null else switch (ops[0]) {
+        .imm => |v| @truncate(@as(u64, @bitCast(v))),
+        else => return cg.fail("'{s}' takes an immediate first: '{s}'", .{ mnemonic, line }),
+    };
+    const regs = ops[@intFromBool(f.imm)..];
+    const dst = switch (regs[regs.len - 1]) {
+        .xmm => |x| x,
+        else => return cg.fail("'{s}' writes an xmm register: '{s}'", .{ mnemonic, line }),
+    };
+    const rm: Encoder.XmmRm = switch (regs[0]) {
+        .xmm => |x| .{ .reg = x },
+        .mem => |m| if (!m.fs and f.shape != .shift) .{ .mem = m.mem } else return cg.fail("bad operand for '{s}': '{s}'", .{ mnemonic, line }),
+        else => return cg.fail("bad operand for '{s}': '{s}'", .{ mnemonic, line }),
+    };
+    const src2: Encoder.Xmm = if (f.shape != .rm_src2_dst) .xmm0 else switch (regs[1]) {
+        .xmm => |x| x,
+        else => return cg.fail("bad operand for '{s}': '{s}'", .{ mnemonic, line }),
+    };
+    switch (f.enc) {
+        .op38 => try cg.e.pint38(@fromBackingInt(f.opcode), dst, rm),
+        .op3a => try cg.e.pint3a(f.opcode, dst, rm, imm.?),
+        .vex => if (f.shape == .shift)
+            // `vpslldq` is 73 /7 with its destination in vvvv.
+            try cg.e.vex66(f.map, f.opcode, 7, @backingInt(dst), rm, imm)
+        else
+            try cg.e.vex66(f.map, f.opcode, @backingInt(dst), @backingInt(src2), rm, imm),
+    }
+    return true;
+}
+
 fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []const u8) Error!void {
+    if (try cg.asmSimd(mnemonic, ops, line)) return;
+    for (ops) |op| if (op == .xmm) return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
+    if (ops.len > 2) return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
     const e = &cg.e;
     const eql = std.mem.eql;
     // Memory operands of `mov`.
@@ -6556,12 +6670,12 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             .reg => |r| return if (mnemonic[0] == 'c') e.callIndirect(.{ .reg = r.reg }) else e.jmpIndirect(.{ .reg = r.reg }),
             // `jmpq *16(%rcx)`
             .mem => |m| if (!m.fs) return if (mnemonic[0] == 'c') e.callIndirect(.{ .mem = m.mem }) else e.jmpIndirect(.{ .mem = m.mem }),
-            .imm => {},
+            .imm, .xmm => {},
         };
         if (eql(u8, mnemonic, "push") or eql(u8, mnemonic, "pushq")) switch (ops[0]) {
             .reg => |r| return e.push(r.reg),
             .imm => |v| if (std.math.cast(i32, v)) |imm| return e.pushImm(imm),
-            .sym, .mem => {},
+            .sym, .mem, .xmm => {},
         };
         if (ops[0] == .reg) {
             const unary_ops = [_]struct { []const u8, Encoder.UnaryOp }{
@@ -6591,7 +6705,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             const src: Encoder.Rm = switch (ops[0]) {
                 .reg => |r| .{ .reg = r.reg },
                 .mem => |m| if (m.fs) return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line}) else .{ .mem = m.mem },
-                .imm, .sym => return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line}),
+                .imm, .sym, .xmm => return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line}),
             };
             return e.crc32(dst.size, src_size, dst.reg, src);
         }
@@ -6612,7 +6726,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             .reg => |r| .{ .reg = r.reg },
             .imm => |v| .{ .imm = v },
             .mem => |m| if (m.fs) return cg.fail("symbol or memory operand in '{s}'", .{line}) else .{ .mem = m.mem },
-            .sym => return cg.fail("symbol or memory operand in '{s}'", .{line}),
+            .sym, .xmm => return cg.fail("symbol or memory operand in '{s}'", .{line}),
         };
         if (eql(u8, base, "mov") or eql(u8, mnemonic, "movabs")) return e.mov(size, .{ .reg = dst.reg }, src);
         const alu_ops = [_]struct { []const u8, Encoder.AluOp }{
@@ -6626,7 +6740,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         for (shift_ops) |op| if (eql(u8, base, op[0])) switch (ops[0]) {
             .imm => |v| return e.shift(op[1], size, .{ .reg = dst.reg }, @truncate(@as(u64, @bitCast(v)))),
             .reg => |r| if (r.reg == .rcx) return e.shift(op[1], size, .{ .reg = dst.reg }, null),
-            .sym, .mem => {},
+            .sym, .mem, .xmm => {},
         };
         if (eql(u8, base, "xchg") and ops[0] == .reg) return e.xchg(size, .{ .reg = dst.reg }, ops[0].reg.reg);
     } else if (ops[1] == .mem and !ops[1].mem.fs and ops[0] != .sym and ops[0] != .mem) {
@@ -6647,7 +6761,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             const src: Encoder.Operand = switch (ops[0]) {
                 .reg => |r| .{ .reg = r.reg },
                 .imm => |v| .{ .imm = v },
-                .sym, .mem => unreachable,
+                .sym, .mem, .xmm => unreachable,
             };
             return e.alu(op[1], size, .{ .mem = ops[1].mem.mem }, src);
         }
