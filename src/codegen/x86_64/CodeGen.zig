@@ -1728,8 +1728,21 @@ fn termUsesR11(cg: *CodeGen, block: Ssa.Block.Index) bool {
 fn fusedUsesR11(cg: *CodeGen, c: Inst.Index) bool {
     if (cg.ssa.live.items(.fate)[@backingInt(c)] != .fused) return false;
     const ir = cg.ir;
-    if (ir.instructions.items(.tag)[@backingInt(c)] == .not) {
-        if (ir.instructions.items(.data)[@backingInt(c)].ty_op.operand.toIndex()) |x| if (cg.fusedUsesR11(x)) return true;
+    switch (ir.instructions.items(.tag)[@backingInt(c)]) {
+        .not => if (ir.instructions.items(.data)[@backingInt(c)].ty_op.operand.toIndex()) |x| if (cg.fusedUsesR11(x)) return true,
+        // Each operand is tested at the branch, from its register if not
+        // fused.
+        .bit_or, .bit_and => {
+            const bo = ir.instructions.items(.data)[@backingInt(c)].bin_op;
+            for ([2]Ref{ bo.lhs, bo.rhs }) |x| if (x.toIndex()) |xi| {
+                switch (cg.readHome(xi)) {
+                    .deferred, .result => return true,
+                    else => {},
+                }
+                if (cg.fusedUsesR11(xi)) return true;
+            };
+        },
+        else => {},
     }
     return cg.usesR11(c);
 }
@@ -3736,6 +3749,8 @@ pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
         .is_err, .is_non_err, .is_null, .is_non_null, .cmp_lt_errors_len => true,
         .reduce => vector.fusable(cg, inst),
         .not => cg.typeOf(data.ty_op.operand) == .bool_type,
+        // Each operand gets its own jump (`genTerm`).
+        .bit_or, .bit_and => cg.typeOf(data.bin_op.lhs) == .bool_type,
         else => false,
     };
 }
@@ -4411,13 +4426,24 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
             // A threaded `br` writes its block's result first, which may
             // be in rax (`planRegisters`).
             if (tag == .br) try cg.brResult(data.br);
-            const cond = Ssa.branchCond(ir, term);
-            const fused = if (cond.toIndex()) |c| cg.homes[@backingInt(c)] == .fused else false;
-            const cc: Encoder.Cond = if (fused) try cg.condFlags(cond.toIndex().?) else cc: {
-                const r = try cg.regOf(cond, if (tag == .br) cg.r11() else .rax);
-                try cg.e.@"test"(.byte, .{ .reg = r }, .{ .reg = r });
-                break :cc .ne;
+            var cond = Ssa.branchCond(ir, term);
+            const scratch: Reg = if (tag == .br) cg.r11() else .rax;
+            // A fused bool `|` goes to the true side when its left operand
+            // holds, a `&` to the false side when it does not; the right
+            // operand decides the rest.
+            if (cond.toIndex()) |c| if (cg.homes[@backingInt(c)] == .fused) switch (ir.instructions.items(.tag)[@backingInt(c)]) {
+                .bit_or, .bit_and => |op| {
+                    const bo = ir.instructions.items(.data)[@backingInt(c)].bin_op;
+                    const lhs = try cg.branchFlags(bo.lhs, scratch);
+                    if (op == .bit_or)
+                        try cg.e.jcc(lhs, .{ .label = cg.blockLabel(term.succ[0]) })
+                    else
+                        try cg.e.jcc(lhs.negate(), .{ .label = cg.blockLabel(term.succ[1]) });
+                    cond = bo.rhs;
+                },
+                else => {},
             };
+            const cc = try cg.branchFlags(cond, scratch);
             // Fall through to whichever side follows.
             if (cg.ssa.fwd.items[term.succ[1]] == next) return cg.e.jcc(cc, .{ .label = cg.blockLabel(term.succ[0]) });
             try cg.e.jcc(cc.negate(), .{ .label = cg.blockLabel(term.succ[1]) });
@@ -4621,6 +4647,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
 
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
+            if (cg.homes[@backingInt(inst)] == .fused) return;
             const ty = cg.typeOf(data.bin_op.lhs);
             if (tag == .mul_wrap) if (cg.mulWide(inst)) |fs| {
                 try cg.loadFactor(.rax, fs[0]);
@@ -5511,6 +5538,16 @@ fn scaleAdd(cg: *CodeGen, reg: Reg, index: Reg, size: u64) Error!void {
     if (size == 0) return;
     if (size != 1) try cg.e.imul(.qword, index, .{ .reg = index }, @intCast(size));
     try cg.e.alu(.add, .qword, .{ .reg = reg }, .{ .reg = index });
+}
+
+/// The flags in which branch condition `cond` holds: those of the
+/// condition, if the branch computes it, else a test of the bool, loaded
+/// into `scratch` when it has no register.
+fn branchFlags(cg: *CodeGen, cond: Ref, scratch: Reg) Error!Encoder.Cond {
+    if (cond.toIndex()) |c| if (cg.homes[@backingInt(c)] == .fused) return cg.condFlags(c);
+    const r = try cg.regOf(cond, scratch);
+    try cg.e.@"test"(.byte, .{ .reg = r }, .{ .reg = r });
+    return .ne;
 }
 
 /// A condition as a bool, unless its branch computes it.

@@ -1375,7 +1375,10 @@ leaves the loop (after the last `repeat`). In the same walk:
 - **Conditions stay virtual.** A compare, `is_null`, `is_err`, or an
   overflow bit is a value of class *flags* when its only user is the
   terminator of its block, or a select in it; lowering then fuses it.
-  Any other use materializes it as a bool (`setcc`), as today.
+  Any other use materializes it as a bool (`setcc`), as today. On x86_64
+  (2026-11-05) a bool `|` or `&` the branch alone reads jumps on each
+  operand, both fused when only it reads them (Sema's `@memcpy` alias
+  check: `cmp; jae; cmp; jb` instead of two `setcc`, `or`, `test`).
 - **Cold blocks.** A block whose terminator is a call to a noreturn
   function (the panic handlers, `@panic`, `unreachable` in safe mode) is
   marked cold.

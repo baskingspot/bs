@@ -1,11 +1,13 @@
 //! exit: 0
-//! stderr: "2105351464 2396440025\n"
+//! stderr: "2551021288 54238937\n"
 //! Branches on `and`/`or` conditions go to the condition's parts
 //! directly, and a labeled switch `continue` with a constant goes to its
 //! case: short-circuit order, a condition that is also a value, nested and
 //! negated conditions, and continues into items, ranges and else.
 //! Chains of `and` and `or`, and bool results of inlined calls passed on
 //! through enclosing calls, one `return` or several, also read as values.
+//! Branches on bool `|` and `&` jump on each operand: compares, the same
+//! compare twice, negations, floats, loaded bools and nested operators.
 const std = @import("std");
 
 var calls: u32 = 0;
@@ -81,6 +83,27 @@ fn inlined(items: []u32, x: u32, y: u32) u32 {
     return acc + @intFromBool(q);
 }
 
+fn bitops(x: u32, y: u32, p: *const [4]bool) u32 {
+    var acc: u32 = 0;
+    if ((x < 3) | (y > 7)) acc += 1;
+    if ((x < 3) & (y > 7)) acc += 2;
+    const c = x < 5;
+    if (c | c) acc += 4;
+    if (c & c) acc += 8;
+    const d = y == 2;
+    if ((x > 1) | d) acc += 16;
+    acc += @as(u32, @intFromBool(d)) * 32;
+    if (!(x == 4) & (y != 1)) acc += 64;
+    if (p[0] | p[1]) acc += 128;
+    if (p[2] & !p[3]) acc += 256;
+    if ((@as(f32, @floatFromInt(x)) < 2.5) | (y == 0)) acc += 512;
+    if (((x == 1) | (y == 1)) | p[0]) acc += 1024;
+    if (((x != 6) & (y < 9)) & side(x + y > 4)) acc += 2048;
+    var i: u32 = 0;
+    while ((i < x) & (i < 6)) : (i += 1) acc += 4096;
+    return acc;
+}
+
 fn machine(start: u8) u32 {
     var steps: u32 = 0;
     var n: u8 = 0;
@@ -123,6 +146,10 @@ pub fn main() void {
     for (0..10) |x| for (0..10) |y| for (0..16) |m| {
         const p: [4]bool = .{ m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0 };
         h = h *% 16777619 ^ chains(@intCast(x), @intCast(y), &p);
+    };
+    for (0..10) |x| for (0..10) |y| for (0..16) |m| {
+        const p: [4]bool = .{ m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0 };
+        h = h *% 16777619 ^ bitops(@intCast(x), @intCast(y), &p);
     };
     for (0..10) |x| for (0..10) |y| {
         var items = [_]u32{ 1, @intCast(x), 4, @intCast(y), 0 };

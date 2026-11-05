@@ -793,13 +793,22 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
         const cond: ?Inst.Index = if (b.term.tag == .branch) branchCond(ir, b.term).toIndex() else null;
         // The condition a `not` negates may be fused into the branch with
         // it (`plan`).
-        const negated: ?Inst.Index = if (cond) |c| if (tags[@backingInt(c)] == .not) datas[@backingInt(c)].ty_op.operand.toIndex() else null else null;
+        // So may both operands of a bool `|` or `&`, each with its own
+        // jump.
+        var negated: [2]?Inst.Index = .{ null, null };
+        if (cond) |c| switch (tags[@backingInt(c)]) {
+            .not => negated[0] = datas[@backingInt(c)].ty_op.operand.toIndex(),
+            .bit_or, .bit_and => if (ctx.fusable(c)) {
+                negated = .{ datas[@backingInt(c)].bin_op.lhs.toIndex(), datas[@backingInt(c)].bin_op.rhs.toIndex() };
+            },
+            else => {},
+        };
         for (b.start..b.start + b.len) |i| {
             const inst = insts[i];
             const p: u32 = @intCast(2 * i + 2);
             w.def[@backingInt(inst)] = p;
             w.end[@backingInt(inst)] = p;
-            w.pos = if ((cond != null and cond.? == inst) or (negated != null and negated.? == inst)) term_pos else p;
+            w.pos = if (cond == inst or negated[0] == inst or negated[1] == inst) term_pos else p;
             forEachOperand(ir, inst, &w);
         }
         w.pos = term_pos;
@@ -833,7 +842,9 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
 ///   them. Its bit is `fused` when only its block's branch tests it, if
 ///   nothing between sets the flags and `ctx.ovfFlagsOnly(tag, bits)`.
 /// - A condition only its block's branch reads is `fused` if
-///   `ctx.fusable(inst)`.
+///   `ctx.fusable(inst)`, and so are, when fusable, the condition a fused
+///   `not` negates and the operands of a fused bool `|` or `&` (each its
+///   own jump), when read only by it.
 /// - Arguments are all moved at the entry, so an unused one, whose interval
 ///   ends there, takes no register.
 /// - Promotion: a non-volatile alloc whose type is in a general-purpose
@@ -979,11 +990,24 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
                     // flags.
                     if (tags[i] == .not) if (datas[i].ty_op.operand.toIndex()) |x| {
                         const xi = @backingInt(x);
-                        if (uses[xi] == 1 and fate[xi] == .normal and tags[xi] != .not and def[xi] > 2 * b.start and ctx.fusable(x)) {
+                        if (uses[xi] == 1 and fate[xi] == .normal and tags[xi] != .not and tags[xi] != .bit_or and tags[xi] != .bit_and and def[xi] > 2 * b.start and ctx.fusable(x)) {
                             fate[xi] = .fused;
                             reg[xi] = no_reg;
                         }
                     };
+                    // So are the operands of a bool `|` or `&`, each
+                    // tested with its own jump.
+                    if (tags[i] == .bit_or or tags[i] == .bit_and) {
+                        const bo = datas[i].bin_op;
+                        for ([2]Inst.Ref{ bo.lhs, bo.rhs }) |x| if (x.toIndex()) |xx| {
+                            const xi = @backingInt(xx);
+                            const reads: u32 = if (bo.lhs == bo.rhs) 2 else 1;
+                            if (uses[xi] == reads and fate[xi] == .normal and tags[xi] != .bit_or and tags[xi] != .bit_and and def[xi] > 2 * b.start and ctx.fusable(xx)) {
+                                fate[xi] = .fused;
+                                reg[xi] = no_reg;
+                            }
+                        };
+                    }
                 },
             }
         }
@@ -2687,6 +2711,9 @@ test "liveness extends over loops and ignores clobbers on paths that end" {
                 5 => c.not_clobbers,
                 else => false,
             };
+        }
+        pub fn fusable(_: Self, _: Inst.Index) bool {
+            return false;
         }
         pub fn termClobbers(_: Self, _: Block.Index) bool {
             return false;
