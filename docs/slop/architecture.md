@@ -422,7 +422,10 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   existing codes, and units whose results depend on one (comptime
   `@intFromError`, an error integer folded into a constant), stay stable
   across rebuilds without a dependency on the code (see "Edit builds"
-  below).
+  below). The number of codes is a link-time value too
+  (`Emit.errors_len`), which `@errorFromInt`'s safety check
+  (`cmp_lt_errors_len`) compares with, so an edit build that adds an
+  error relinks with the new count without lowering the check again.
 - Pointers into comptime-mutable memory (`comptime var`, comptime
   allocations) are local to the unit that created them. They are excluded from
   stable hashing and persistence and must not escape a unit's result; an

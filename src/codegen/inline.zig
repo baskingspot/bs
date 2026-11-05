@@ -399,7 +399,7 @@ pub const Copier = struct {
                 data.br = .{ .block_inst = c.index(data.br.block_inst), .operand = operand };
             },
             .repeat => data.repeat.loop_inst = c.index(data.repeat.loop_inst),
-            .error_name, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err => data.un_op = c.ref(data.un_op),
+            .error_name, .cmp_lt_errors_len, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err => data.un_op = c.ref(data.un_op),
             .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => data.un_op = c.ref(data.un_op),
             .load, .not, .intcast, .trunc, .float_cast, .float_from_int, .int_from_float, .bitcast, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => data.ty_op.operand = c.ref(data.ty_op.operand),
             .ptr_from_int, .atomic_load, .slice_ptr, .slice_len, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set, .wrap_optional => data.ty_op.operand = c.ref(data.ty_op.operand),
@@ -574,7 +574,7 @@ const Hasher = struct {
                 try h.ref(data.br.operand);
             },
             .repeat => try h.word(h.number(data.repeat.loop_inst)),
-            .ret, .error_name, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err, .set_err_return_trace => try h.ref(data.un_op),
+            .ret, .error_name, .cmp_lt_errors_len, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err, .set_err_return_trace => try h.ref(data.un_op),
             .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => try h.ref(data.un_op),
             .load, .not, .intcast, .trunc, .float_cast, .float_from_int, .int_from_float, .bitcast, .clz, .ctz, .popcount, .byte_swap, .bit_reverse, .ptr_from_int, .atomic_load, .slice_ptr, .slice_len, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set, .wrap_optional, .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set, .wrap_errunion_payload, .wrap_errunion_err, .get_union_tag, .tag_name, .c_va_arg, .c_va_copy => {
                 try h.index(data.ty_op.ty);

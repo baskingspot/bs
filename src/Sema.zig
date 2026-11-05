@@ -6056,11 +6056,13 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 }
             }
             if (block.is_comptime) break :blk sema.fail(block, src, "unable to evaluate comptime expression", .{});
-            // As upstream, an error code is not zero. (Upstream also checks
-            // it against the number of errors, which the backends do not
-            // provide yet.)
-            if (!to_int and block.want_safety)
-                try sema.addSafetyCheck(block, try sema.addBinOp(block, .cmp_neq, operand, .fromInterned(try sema.intValue(.u16_type, 0))), .invalid_error_code, .none, .none);
+            // As upstream, an error code is neither zero nor past the
+            // compilation's last code.
+            if (!to_int and block.want_safety) {
+                const nonzero = try sema.addBinOp(block, .cmp_neq, operand, .fromInterned(try sema.intValue(.u16_type, 0)));
+                const in_range = try sema.addUnOp(block, .cmp_lt_errors_len, operand);
+                try sema.addSafetyCheck(block, try sema.addBinOp(block, .bit_and, in_range, nonzero), .invalid_error_code, .none, .none);
+            }
             break :blk sema.addTyOp(block, .bitcast, if (to_int) .u16_type else .anyerror_type, operand);
         },
         .ret_addr, .frame_address => blk: {

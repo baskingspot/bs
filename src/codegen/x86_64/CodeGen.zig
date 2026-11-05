@@ -3275,7 +3275,7 @@ pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
     return switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.scalarOperand(data.bin_op.lhs) or
             (cg.inFloat(cg.typeOf(data.bin_op.lhs)) and floatCc(cg.ir.instructions.items(.tag)[@backingInt(inst)]) != null),
-        .is_err, .is_non_err, .is_null, .is_non_null => true,
+        .is_err, .is_non_err, .is_null, .is_non_null, .cmp_lt_errors_len => true,
         .reduce => vector.fusable(cg, inst),
         .not => cg.typeOf(data.ty_op.operand) == .bool_type,
         else => false,
@@ -3348,7 +3348,7 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.inGpr(cg.typeOf(data.bin_op.lhs)) or cg.inFloat(cg.typeOf(data.bin_op.lhs)),
         .not, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => !cg.isWideInt(cg.typeOf(data.ty_op.operand)),
         .intcast, .trunc, .bitcast, .ptr_from_int => cg.passInRegs(cg.typeOf(data.ty_op.operand)) and !cg.isWideInt(cg.typeOf(data.ty_op.operand)),
-        .load, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err => true,
+        .load, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err, .cmp_lt_errors_len => true,
         // `setupParams` moves it from where `.auto` passes it.
         .arg => cg.fn_ty.cc == .auto,
         .struct_field_ptr, .struct_field_val, .ptr_elem_ptr, .slice_elem_ptr, .ptr_add, .ptr_elem_val, .slice_elem_val => true,
@@ -3608,6 +3608,14 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
                 .cmp_neq => .ne,
                 else => unreachable,
             };
+        },
+        .cmp_lt_errors_len => {
+            // The count of codes is a link-time value; a code is below it
+            // plus one.
+            const code = try cg.regOf(data.un_op, .rax);
+            try cg.e.movImmValue(.rcx, Emit.errors_len);
+            try cg.e.alu(.cmp, .qword, .{ .reg = code }, .{ .reg = .rcx });
+            return .be;
         },
         .is_err, .is_non_err => {
             const lo: ?Reg = if (cg.pairOf(data.un_op)) |p| p.lo else switch (try cg.locOf(data.un_op)) {
@@ -4527,7 +4535,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.storeVal(offsetMem(dst, 8), bin.rhs, 8);
         },
 
-        .is_null, .is_non_null, .is_err, .is_non_err => try cg.genCond(inst),
+        .is_null, .is_non_null, .is_err, .is_non_err, .cmp_lt_errors_len => try cg.genCond(inst),
         .optional_payload => {
             const child = data.ty_op.ty;
             if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);

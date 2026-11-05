@@ -1409,6 +1409,7 @@ pub fn finish(emit: *Emit) !bool {
     for (emit.errors.keys()) |name| {
         try emit.error_values.append(emit.gpa, .{ .key = errorKey(ip, name), .value = try ip.errorValue(name) });
     }
+    try emit.error_values.append(emit.gpa, .{ .key = errors_len, .value = ip.error_names.items.len - 1 });
     return true;
 }
 
@@ -2209,6 +2210,11 @@ pub fn navKey(emit: *Emit, nav: InternPool.NavIndex) !SymbolKey {
     try emit.addRef(.{ .nav = nav });
     return .fromName(try emit.unitName(.{ .nav_val = nav }));
 }
+
+/// A link-time value: the number of error codes the compilation assigned,
+/// which `cmp_lt_errors_len` compares a code with. The cache's relinks
+/// give it the manifest's count, which an edit build's new errors extend.
+pub const errors_len: SymbolKey = .fromName("bs.errors_len");
 
 pub fn errorKey(ip: *const InternPool, name: InternPool.String) SymbolKey {
     return errorKeyFromName(ip.stringSlice(name));

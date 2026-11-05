@@ -569,9 +569,10 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     defer exports.deinit(gpa);
     var imports: std.ArrayList(ElfObject.Import) = .empty;
     defer imports.deinit(gpa);
-    var values: std.ArrayList(Elf.NumberedValue) = try .initCapacity(gpa, m.errorCount() + m.link_symbols.len);
+    var values: std.ArrayList(Elf.NumberedValue) = try .initCapacity(gpa, m.errorCount() + 1 + m.link_symbols.len);
     defer values.deinit(gpa);
     for (1..m.errorCount() + 1) |code| values.appendAssumeCapacity(.{ .symbol = m.errorSymbol(@intCast(code)), .value = code });
+    if (m.symbol(@backingInt(Emit.errors_len))) |n| values.appendAssumeCapacity(.{ .symbol = n, .value = m.errorCount() });
     for (m.link_symbols) |ls| {
         const name = m.string(ls.name);
         switch (ls.kind) {
@@ -926,9 +927,10 @@ fn linkWithInputs(
     extra.shrinkRetainingCapacity(kept);
 
     // The objects' link-time values, then the error codes (`Emit.finish`).
-    var values: std.ArrayList(Elf.Value) = try .initCapacity(arena, converted.values.len + m.errorCount());
+    var values: std.ArrayList(Elf.Value) = try .initCapacity(arena, converted.values.len + m.errorCount() + 1);
     values.appendSliceAssumeCapacity(converted.values);
     for (1..m.errorCount() + 1) |code| values.appendAssumeCapacity(.{ .key = Emit.errorKeyFromName(m.errorName(@intCast(code))), .value = code });
+    values.appendAssumeCapacity(.{ .key = Emit.errors_len, .value = m.errorCount() });
     var dynamic: ElfDynamic.Options = .{};
     if (glibc) |g| {
         // As `Emit.link`: the copied imports go to the end.

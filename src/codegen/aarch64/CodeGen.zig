@@ -555,7 +555,7 @@ pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
             const ty = cg.typeOf(data.bin_op.lhs);
             break :blk !cg.isFloat(ty) and !cg.isWideInt(ty) and cg.passInRegs(ty);
         },
-        .is_err, .is_non_err, .is_null, .is_non_null => true,
+        .is_err, .is_non_err, .is_null, .is_non_null, .cmp_lt_errors_len => true,
         .reduce => vector.fusable(cg, inst),
         else => false,
     };
@@ -2128,7 +2128,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.storeReg(dst.plus(8), .x9, 8);
         },
 
-        .is_null, .is_non_null, .is_err, .is_non_err => try cg.genCond(inst),
+        .is_null, .is_non_null, .is_err, .is_non_err, .cmp_lt_errors_len => try cg.genCond(inst),
         .optional_payload => {
             const child = data.ty_op.ty;
             if (Type.optionalReprIsPtr(ip, child)) {
@@ -2495,6 +2495,14 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Cond {
                 .cmp_neq => .ne,
                 else => unreachable,
             };
+        },
+        .cmp_lt_errors_len => {
+            // The count of codes is a link-time value; a code is below it
+            // plus one.
+            try cg.load(.x9, data.un_op);
+            try cg.e.movWideValue(.movz, .x, .x10, Emit.errors_len, 0);
+            try cg.e.cmp(.x, .x9, .{ .reg = .{ .reg = .x10 } });
+            return .ls;
         },
         .is_err, .is_non_err => {
             const layout = Type.errorUnionLayout(ip, cg.typeOf(data.un_op));

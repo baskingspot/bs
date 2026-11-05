@@ -220,6 +220,13 @@ pub const Inst = struct {
         /// `un_op`: an error's name, a `[:0]const u8`, from the table the
         /// linker gets once every error code is assigned.
         error_name,
+        /// `un_op`: whether error code `operand` (a `u16`) is below the
+        /// number of error codes plus one, as upstream's
+        /// `cmp_lt_errors_len`: the code names an error of the
+        /// compilation. The count is a link-time value
+        /// (`Emit.errors_len`), so an edit build that adds an error need
+        /// not lower the check again.
+        cmp_lt_errors_len,
         /// `ty_op`: `usize` to pointer.
         ptr_from_int,
         /// `ty_op`: atomically load a `ty` from pointer `operand`.
@@ -738,7 +745,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .min_int, .max_int => ir.typeOf(data.bin_op.lhs, ip),
         .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ir.typeOf(data.un_op, ip),
         .mul_add => ir.typeOf(data.pl_op.operand, ip),
-        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => .bool_type,
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err, .cmp_lt_errors_len => .bool_type,
         .int_from_bool => .u1_type,
         .int_from_ptr, .ret_addr, .frame_addr, .save_err_return_trace_index => .usize_type,
         .error_name => .slice_const_u8_sentinel_0_type,
