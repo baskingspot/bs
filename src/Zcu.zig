@@ -149,6 +149,10 @@ anyerror_ies: std.AutoHashMapUnmanaged(InternPool.Index, void) = .empty,
 /// a cached instance green (upstream's order dependence, ziglang/zig#22410).
 branch_quotas: std.AutoHashMapUnmanaged(InternPool.Index, u32) = .empty,
 exports: std.ArrayList(Export) = .empty,
+/// Container-level assembly (`comptime { asm (...); }`), in analysis
+/// order, which Emit assembles into the module's code
+/// (src/codegen/global_asm.zig).
+global_asm: std.ArrayList(GlobalAsm) = .empty,
 /// Files read by `@embedFile`, each once; `Dependee.embed_file` indexes it.
 embed_files: std.StringArrayHashMapUnmanaged(EmbedFile) = .empty,
 /// compiler_rt functions that CodeGen calls and the functions and
@@ -238,6 +242,17 @@ pub const Export = struct {
         const k = x.keyword orelse return tree.nodeToSpan(x.node);
         return tree.tokenToSpan(tree.firstToken(x.node) + k);
     }
+};
+
+/// A block of container-level assembly. Like an `@export`, an effect of
+/// the unit whose analysis ran it, which the cache analyzes again rather
+/// than load (`Incremental`).
+pub const GlobalAsm = struct {
+    unit: AnalUnit,
+    source: InternPool.String,
+    /// The `asm` expression, where its errors go.
+    file: u32,
+    span: Ast.Span,
 };
 
 pub const FuncState = enum { queued, in_progress, done, failed };
@@ -552,6 +567,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.anyerror_ies.deinit(gpa);
     zcu.branch_quotas.deinit(gpa);
     zcu.exports.deinit(gpa);
+    zcu.global_asm.deinit(gpa);
     zcu.embed_files.deinit(gpa);
     zcu.rt_helpers.deinit(gpa);
     zcu.test_functions.deinit(gpa);

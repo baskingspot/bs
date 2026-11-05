@@ -32,6 +32,7 @@ const ElfShared = @import("link/ElfShared.zig");
 const CSource = @import("CSource.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
 const CodeGenA64 = @import("codegen/aarch64/CodeGen.zig");
+const global_asm = @import("codegen/global_asm.zig");
 const MachO = @import("link/MachO.zig");
 const MachOObject = @import("link/MachOObject.zig");
 const Ssa = @import("codegen/Ssa.zig");
@@ -70,6 +71,10 @@ externs: std.StringArrayHashMapUnmanaged(bool) = .empty,
 /// For each bound slot at offset 0, its `externAddrKey` and where the
 /// slot binds the symbol, for `link` (`lowerExternSlots`).
 aliases: std.ArrayList(Alias) = .empty,
+/// The global symbols container-level assembly defines, by the name Zig
+/// code and C objects know them by, at offsets in its atoms
+/// (codegen/global_asm.zig).
+asm_symbols: std.StringArrayHashMapUnmanaged(ExternTarget) = .empty,
 /// Whether code reads `error_name_table`.
 uses_error_names: bool = false,
 /// Compile errors that codegen reports (unsupported constructs), rendered
@@ -529,6 +534,7 @@ pub fn deinit(emit: *Emit) void {
     emit.errors.deinit(gpa);
     emit.externs.deinit(gpa);
     emit.aliases.deinit(gpa);
+    emit.asm_symbols.deinit(gpa);
     emit.imports.deinit(gpa);
     emit.copies.deinit(gpa);
     emit.exports.deinit(gpa);
@@ -1046,6 +1052,7 @@ const InputResolver = struct {
     emit: *Emit,
 
     pub fn zigExport(r: InputResolver, name: []const u8) !?SymbolKey {
+        if (r.emit.asm_symbols.get(name)) |t| if (t.addend == 0) return t.key;
         return r.emit.userExport(name);
     }
 
@@ -1404,6 +1411,8 @@ pub fn finish(emit: *Emit) !bool {
         try emit.nameAtoms();
         return true;
     }
+    // Before the slots, which can bind to its symbols.
+    if (!try global_asm.assembleAll(emit)) return false;
     // Before the declarations: a slot can request an exported one.
     if (!try emit.lowerExternSlots()) return false;
     if (emit.inputs) |in| if (!try emit.convertInputs(in)) return false;
@@ -1859,6 +1868,11 @@ fn findExports(emit: *Emit) !void {
         gop.value_ptr.* = emit.exports.items.len;
         try emit.exports.append(emit.gpa, entry);
     }
+    // Container-level assembly's, at the start of its atom (the others
+    // are an error in objects, `global_asm.assemble`).
+    for (emit.asm_symbols.keys(), emit.asm_symbols.values()) |name, t| {
+        if (t.addend == 0) try emit.exports.append(emit.gpa, .{ .key = t.key, .name = name, .weak = false, .visibility = .default });
+    }
 }
 
 /// Writes the slot of each external symbol: the address of the export of
@@ -1912,6 +1926,7 @@ pub const ExternTarget = struct { key: SymbolKey, addend: i64 = 0 };
 /// object, a symbol that is not exported is imported. Complete only once
 /// analysis is, and the inputs pulled.
 fn externTarget(emit: *Emit, name: []const u8, weak: bool) !?ExternTarget {
+    if (emit.asm_symbols.get(name)) |t| return t;
     if (emit.inputs) |in| if (try emit.userExport(name) == null) switch (in) {
         inline else => |p| if (try p.lookup(name)) |t| return .{ .key = t.key, .addend = @intCast(t.offset) },
     };
@@ -2042,7 +2057,7 @@ pub const ptrTarget = CodeGen.ptrTarget;
 /// The symbol the compilation exports as `name`, or null. Of several
 /// exports of one name, the last strong one wins, else the first, as
 /// upstream 0.17.1's linker (a weak export after a definition is ignored).
-fn userExport(emit: *Emit, name: []const u8) !?SymbolKey {
+pub fn userExport(emit: *Emit, name: []const u8) !?SymbolKey {
     const ip = &emit.zcu.ip;
     const view = emit.exportsView();
     var pick: ?usize = null;

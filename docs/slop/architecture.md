@@ -1098,6 +1098,52 @@ comptime arguments are run-time values in the lowered code (uucode's
   fused multiply-add, every fmov immediate, q-register loads and stores,
   udf, adr, and a 1 MiB relaxation case).
 
+#### Container-level assembly (built 2026-11-05)
+
+`comptime { asm (...); }` at container level, which upstream's
+self-hosted backends drop (only its LLVM backend assembles it, so
+upstream's langref `test_global_assembly` needs `-fllvm`), is assembled
+into the module's code, on all three targets.
+
+- Sema records each block as an effect of the unit that ran it
+  (`Zcu.global_asm`: unit, source, and the `asm`'s location), where it
+  used to return. Emit's `finish` (`codegen/global_asm.zig`) assembles
+  each block into one `.text` atom owned by that unit, before the
+  extern slots: x86_64 aligned to 1, aarch64 to 4, more with `.p2align`
+  or `.balign` at the block's start. Its key is the unit's stable key and
+  the block's place among the unit's blocks, so edit, eager and full
+  builds give the same atoms.
+- Instructions go through the target's inline assembler, one statement
+  at a time (`CodeGen.GlobalAsm`: a CodeGen with only `emit`, `gpa`, `e`,
+  `outermost_frame` and `global_asm` set, which is all the assembler
+  reads; `fail` then reports at the `asm`). The driver adds what inline
+  templates lack: named labels (`name:`), `.global`/`.globl`, and
+  accepts `.type`, `.text` and `.section .text`. Anything else, such as
+  an unknown directive, instruction or operand, a named label or an
+  external symbol as an operand, or alignment after the start, is a
+  compile error at the `asm` (test/diag/global_asm.zig), never dropped
+  code. Like other code generation errors, these errors need an output:
+  `-fno-emit-bin` does not assemble.
+- A `.global` label is a symbol at an offset in the atom
+  (`Emit.asm_symbols`). `externTarget` binds external names to it first,
+  so the extern slots of `extern fn` declarations carry the atom and
+  offset, which a relink from the manifest restores
+  (`externAliases`). C objects reach the labels at offset 0
+  (`InputResolver.zigExport`), and objects and shared objects export
+  those; a global label after the start is an error there. On
+  aarch64-macos, `_name` is the C name `name`, as LLVM's assembler has
+  it. Defining a name that a Zig export also defines, or one name twice,
+  is an error. The atom is named after its first label: later labels
+  are not in `.symtab` yet, since local symbols at offsets reach the
+  link only from converted inputs, and a relink would lose them.
+- The cache treats it like an `@export`: the unit gets an `analyze`
+  reference, so an eager edit build analyzes it again rather than load
+  it, and a lazy build that runs it again falls back ("container-level
+  assembly ran again"). A lazy build that leaves the unit green takes its
+  atom from the pack. Checked by test/run/global_asm.zig on x86_64-linux
+  and aarch64-linux (edit builds with the block green, a relink equal to
+  a full build) and run on a Mac satellite for aarch64-macos.
+
 ### Optimizing backend (designed 2026-11-03, accepted by the owner; being built)
 
 Step 1 is built (see "Landing it"). AGENTS.md fixes the goal: one optimization level, Debug
@@ -8963,6 +9009,10 @@ unchanged:
 
 Upstream 0.17.1 is the oracle, but where it computes a wrong value bs
 computes the right one instead of copying the bug:
+
+- *Container-level assembly.* Upstream's self-hosted backends drop it,
+  so its symbols are undefined at link time; bs assembles it as
+  upstream's LLVM backend does ("Container-level assembly").
 
 - *`extern threadlocal` that a shared library defines.* Zig 0.17.0's
   self-hosted x86_64 backend reaches every thread-local of a non-PIC

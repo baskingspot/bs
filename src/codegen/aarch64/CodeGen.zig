@@ -108,6 +108,8 @@ pending: std.ArrayList(Pending) = .empty,
 /// Inline assembly marked the return address undefined (`.cfi_undefined
 /// lr`): this is the outermost frame.
 outermost_frame: bool = false,
+/// Assembling container-level assembly (`GlobalAsm`): where errors go.
+global_asm: ?GlobalAsm.Src = null,
 /// In a variadic C function: the stack bytes the named parameters use.
 va_stack: u32 = 0,
 /// Debug info, as in the x86_64 backend.
@@ -408,6 +410,10 @@ fn endInline(cg: *CodeGen) Error!void {
 }
 
 fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
+    if (cg.global_asm) |src| {
+        try cg.emit.addError(src.file, src.span, fmt, args);
+        return error.CodegenFail;
+    }
     const ip = cg.ip;
     const nav = ip.getNav(ip.keyPayload(.func, cg.ir.func).owner_nav);
     const tree = try cg.emit.zcu.fe.tree(@fromBackingInt(nav.file));
@@ -3857,6 +3863,47 @@ fn parseReg(name: []const u8) ?ParsedReg {
     if (n > 30) return null;
     return .{ .reg = @fromBackingInt(@intCast(n)), .width = if (name[0] == 'x') .x else .w };
 }
+
+/// Container-level assembly (`comptime { asm (...); }`), which
+/// src/codegen/global_asm.zig drives one statement at a time: the inline
+/// assembler without a function, on a CodeGen with only `emit`, `gpa`, `e`,
+/// `outermost_frame` and `global_asm` set, which is all it reads.
+pub const GlobalAsm = struct {
+    cg: CodeGen,
+    locals: LocalLabels = .{},
+
+    pub const Src = struct { file: u32, span: std.zig.Ast.Span };
+
+    pub fn init(emit: *Emit, src: Src) GlobalAsm {
+        var cg: CodeGen = undefined;
+        cg.emit = emit;
+        cg.gpa = emit.gpa;
+        cg.e = .init(emit.gpa);
+        cg.outermost_frame = false;
+        cg.global_asm = src;
+        return .{ .cg = cg };
+    }
+
+    pub fn deinit(g: *GlobalAsm) void {
+        g.cg.e.deinit();
+    }
+
+    pub fn statement(g: *GlobalAsm, line: []const u8) Error!void {
+        return g.cg.assembleStatement(line, &.empty, &g.locals);
+    }
+
+    pub fn fail(g: *GlobalAsm, comptime fmt: []const u8, args: anytype) Error {
+        return g.cg.fail(fmt, args);
+    }
+
+    pub fn finish(g: *GlobalAsm) Error!void {
+        for (g.locals.fwd) |l| if (l != null) return g.cg.fail("asm refers to an undefined local label", .{});
+        g.cg.e.finish() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BranchOutOfRange => return g.cg.fail("asm branch out of range", .{}),
+        };
+    }
+};
 
 /// GNU as local labels `0:` to `9:`, referenced as `1f` (the next) and
 /// `1b` (the previous).

@@ -240,9 +240,10 @@ pub fn build(b: *std.Build) void {
 ///                               (paths from the repository root) they
 ///                               replace the program's path, which one of
 ///                               them names
-///   //! upstream-llvm: true     upstream builds the x86_64-linux program
-///                               with LLVM, for a program its self-hosted
-///                               backend miscompiles
+///   //! upstream-llvm: true     upstream builds the program with LLVM,
+///                               for a program its self-hosted backend
+///                               miscompiles or whose container-level
+///                               assembly it drops
 ///   //! targets: <target> ...   the targets the program is for (default
 ///                               x86_64-linux); with aarch64-macos, an
 ///                               aarch64-macos host also builds it for
@@ -346,8 +347,9 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             /// into one global cache; neither replays the other as a donor.
             donor_libc: bool = false,
             flags: std.ArrayList([]const u8) = .empty,
-            /// `upstream-llvm`: upstream builds the x86_64-linux program
-            /// with LLVM, not its self-hosted backend.
+            /// `upstream-llvm`: upstream builds the program with LLVM, not its
+            /// self-hosted backend: for what that miscompiles, and for
+            /// container-level assembly, which it drops.
             upstream_llvm: bool = false,
             aarch64_macos: bool = false,
             aarch64_linux: bool = false,
@@ -724,6 +726,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 break :blk out;
             } else blk: {
                 compile.addArgs(if (expect.libc) &.{ "build-exe", "-target", "aarch64-linux-gnu", "-lc" } else &.{ "build-exe", "-target", "aarch64-linux" });
+                if (upstream and expect.upstream_llvm) compile.addArg("-fllvm");
                 compile.addFileArg(b.path(src_path));
                 break :blk compile.addPrefixedOutputFileArg("-femit-bin=", name);
             };
@@ -806,6 +809,8 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         const block = std.mem.lastIndexOf(u8, source, "\n// error\n") orelse
             std.debug.panic("{s}: missing '// error' block", .{src_path});
         var args: []const u8 = "";
+        // `bs-only: why`: an error only bs gives, which upstream accepts.
+        var bs_only = false;
         // `edit-from: "text" "earlier text"`: also an edit build from the
         // earlier version, which compiles, through the cache.
         var earlier: ?[]const u8 = null;
@@ -817,6 +822,10 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
             const text = if (line.len > 2) line[3..] else "";
             if (expected.items.len == 0 and std.mem.startsWith(u8, text, "args: ")) {
                 args = text["args: ".len..];
+                continue;
+            }
+            if (expected.items.len == 0 and std.mem.startsWith(u8, text, "bs-only: ")) {
+                bs_only = true;
                 continue;
             }
             if (expected.items.len == 0 and std.mem.startsWith(u8, text, "edit-from: ")) {
@@ -886,6 +895,7 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
             test_step.dependOn(&edit.step);
         }
 
+        if (bs_only) continue;
         const up = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-emit-bin" });
         up.setName(b.fmt("diag {s} (upstream rejects)", .{file}));
         // The same target as bs's, for a diagnostic that depends on it.

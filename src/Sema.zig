@@ -19851,8 +19851,18 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const extra = sema.code.extraData(Zir.Inst.Asm, ext.operand);
     const small: Zir.Inst.Asm.Small = @bitCast(ext.small);
     const src = block.nodeSrc(extra.data.src_node);
-    // Container-level assembly: upstream's self-hosted backends drop it.
-    if (sema.func == .none and block.inlining == null and small.outputs_len == 0 and small.inputs_len == 0) return .void_value;
+    // Container-level assembly, which upstream's self-hosted backends drop:
+    // Emit assembles it into the module's code (`Zcu.global_asm`).
+    if (sema.func == .none and block.inlining == null and small.outputs_len == 0 and small.inputs_len == 0) {
+        try sema.bcRefuse();
+        const source = if (ext.opcode == .asm_expr)
+            try sema.resolveConstString(block, src, sema.resolveInst(@fromBackingInt(@backingInt(extra.data.asm_source))))
+        else
+            sema.zirString(extra.data.asm_source);
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        try sema.zcu.global_asm.append(sema.gpa, .{ .unit = sema.owner, .source = try sema.getString(source), .file = sema.file, .span = src.span(tree) });
+        return .void_value;
+    }
     // Even in a comptime block that drops runtime instructions, as upstream.
     if (block.is_comptime) return sema.failComptimeExpr(block, src);
     const gpa = sema.gpa;

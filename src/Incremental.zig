@@ -2398,6 +2398,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     // symbols are the link's), and declarations whose data this build
     // lowered without analyzing them (green, but never lowered before).
     for (zcu.exports.items) |e| if (e.unit != null) return inc.lazyFallback("an @export ran again", .{});
+    if (zcu.global_asm.items.len != 0) return inc.lazyFallback("container-level assembly ran again", .{});
     for (emit.atom_owners.items) |owner| switch (owner) {
         .unit => |u| if (!zcu.deps.contains(u)) return inc.lazyFallback("a declaration's data is new", .{}),
         .content, .link, .input => {},
@@ -3347,6 +3348,7 @@ const Graph = struct {
             else => {},
         };
         for (zcu.exports.items) |e| if (e.unit) |unit| try g.analyze_items.append(gpa, try r.addUnit(unit));
+        for (zcu.global_asm.items) |a| try g.analyze_items.append(gpa, try r.addUnit(a.unit));
         var it_quota = zcu.branch_quotas.iterator();
         while (it_quota.next()) |q| if (zcu.deps.contains(.{ .func = q.key_ptr.* }))
             try g.quota_items.append(gpa, .{ try r.addUnit(.{ .func = q.key_ptr.* }), q.value_ptr.* });
