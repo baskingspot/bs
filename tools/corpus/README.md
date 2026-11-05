@@ -17,9 +17,12 @@ the last upstream results), `--no-edit` (skip the edit builds), `--no-run`
 (build only), `--cache-check` (bs's edit builds check themselves against
 a full build with `BS_CACHE_VERIFY` and `BS_CACHE_CHECK`; not timed),
 `--samples N` (time each cold-local and edit build N times and keep the
-median), `--donors` (also time bs's cold-local build with donors, which
-find the build just made in the global store: bs's first build in a
-fresh checkout), `--results NAME` (write `.work/NAME.json` and
+median), `--donors` (also build with donors, bs's first build in a
+fresh checkout: the cold build without donors publishes none, so the
+first sample takes what the global store holds, often another target's
+donor, and later samples the target's own; the binary that runs is the
+donor build's, and a donor build that fails is a divergence),
+`--results NAME` (write `.work/NAME.json` and
 `.work/NAME.md` instead of `results.json` and `scoreboard.md`).
 `bench/scoreboard.py` runs it with `--no-run --donors --samples 3`.
 
@@ -81,8 +84,11 @@ fresh checkout), `--results NAME` (write `.work/NAME.json` and
     the run builds it before timing anything and reports that time on its
     own, under the scoreboard.
 - Both binaries run from the same path (programs print `argv[0]`). A test
-  binary's verdict is its exit status and summary line (`All N tests
-  passed.`); an executable's is its exit status and stdout.
+  binary's verdict is its exit status, its summary line (`All N tests
+  passed.`) and each test's outcome by name, in any order: bs's test
+  runner sorts tests and upstream's takes its work queue's order, and
+  what tests print follows that order. An executable's verdict is its
+  exit status and stdout.
 - The edit build appends `std.mem.doNotOptimizeAway(@as(u32, N));` to the
   target's `edit` line and rebuilds with the same cache: a full rebuild for
   upstream (`zig build-exe` caches nothing of the Zig compilation without
@@ -118,7 +124,8 @@ and image processing (zignal), a columnar format (zarrow), an assembler
 (XirAsm), a text editor and a terminal (flow, teru), a glob walker
 (zlob), an inference engine (zlaya), a GIR translator (zig-gobject) and
 smaller libraries; they are MIT, Apache-2.0 or 0BSD. flow is recorded
-with `-Dtarget=x86_64-linux-gnu`, since its default target is musl.
+with `-Dtarget=x86_64-linux-gnu`, and flow-musl builds its default
+target, x86_64-linux-musl with musl's libc.
 Setup installs into `.work/install/`, deleted after each step, so a
 project's install output does not fill the disk.
 

@@ -29,7 +29,7 @@ REPO_DIR = os.path.dirname(os.path.dirname(CORPUS_DIR))
 WORK = os.path.join(CORPUS_DIR, ".work")
 
 # Zig's optimize mode flag, as `zig build` passes it.
-OPTIMIZE_FLAG = re.compile(r"-O(debug|release_?safe|release_?fast|release_?small)$", re.IGNORECASE)
+OPTIMIZE_FLAG = re.compile(r"-O(debug|safe|fast|small|release_?safe|release_?fast|release_?small)$", re.IGNORECASE)
 
 # Appended to the edit line: keeps the line count, and differs per edit.
 EDIT_SUFFIX = " std.mem.doNotOptimizeAway(@as(u32, {n}));"
@@ -304,6 +304,26 @@ def run_binary(path, args, cwd, timeout):
     }
 
 
+def test_outcomes(stderr):
+    """Each test's name and outcome (OK, FAIL, SKIP, or none if it died),
+    sorted: test runners order tests differently (bs sorts them; upstream
+    takes its work queue's order), so results compare by name."""
+    starts = list(TEST_STARTED.finditer(stderr))
+    out = []
+    for i, m in enumerate(starts):
+        seg = stderr[m.end() : starts[i + 1].start() if i + 1 < len(starts) else len(stderr)]
+        if "FAIL (" in seg:
+            outcome = "FAIL"
+        elif re.search(r"SKIP\s*$", seg, re.MULTILINE):
+            outcome = "SKIP"
+        elif re.search(r"OK\s*$", seg, re.MULTILINE):
+            outcome = "OK"
+        else:
+            outcome = "none"
+        out.append(f"{m.group(1)}: {outcome}")
+    return sorted(out)
+
+
 def summarize_run(r, is_test):
     if is_test:
         m = TEST_SUMMARY.search(r["stderr"])
@@ -403,6 +423,9 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
                     break
                 donor.append(secs)
             r["cold_local_donor"] = tc_secs + statistics.median(donor) if code == 0 else None
+            if code != 0:
+                r["donor_error"] = first_error(output)
+                r["donor_output"] = output[-20000:]
         # Tests run without arguments; an executable runs only with the
         # manifest's "run" arguments.
         run_args = tgt.get("run", [] if is_test else None)
@@ -429,6 +452,8 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
             r["run_secs"] = run.get("secs")
         r["run_exit"] = run["exit"]
         r["stdout_sha"] = hashlib.sha256(run["stdout"].encode()).hexdigest()
+        if is_test and run_args is not None and r["run"] != "skipped":
+            r["tests"] = test_outcomes(run["stderr"])
         # A file the run writes (`output`) counts as part of its stdout.
         if tgt.get("output") and run_args is not None and r["run"] != "skipped":
             out_file = expand(tgt["output"], proj)
@@ -476,6 +501,8 @@ def compare(res, tgt):
         return "upstream fails to compile"
     if z["compile_exit"] != 0:
         return "bs: compile error" if z["compile_exit"] == 1 else f"bs: crash ({z['compile_exit']})"
+    if z.get("donor_error"):
+        return f"bs: donor build failed: {z['donor_error']}"
     if z["run"] == "skipped":
         return f"bs: edit build failed: {z['edit_error']}" if z.get("edit_error") else "compiles (not run)"
     # Upstream's own binary died (a stack overflow in a Debug frame bs does
@@ -485,7 +512,13 @@ def compare(res, tgt):
         return f"upstream run fails ({u['run']})"
     if z["run"] != u["run"]:
         return f"bs: run differs ({z['run']} vs {u['run']})"
-    if tgt.get("compare_stdout", True) and z["stdout_sha"] != u["stdout_sha"]:
+    if "tests" in z and "tests" in u:
+        # A test binary: the same outcome for each test, in any order
+        # (what tests print to stdout follows the order and the timings).
+        if z["tests"] != u["tests"]:
+            diff = sorted(set(z["tests"]) ^ set(u["tests"]))
+            return f"bs: test results differ ({diff[0]}{', ...' if len(diff) > 1 else ''})"
+    elif tgt.get("compare_stdout", True) and z["stdout_sha"] != u["stdout_sha"]:
         return "bs: stdout differs"
     if z.get("edit_error"):
         return f"bs: edit build failed: {z['edit_error']}"

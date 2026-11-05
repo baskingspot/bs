@@ -1922,7 +1922,100 @@
    "targets": [
     {
      "name": "flow",
-     "note": "Recorded with -Dtarget=x86_64-linux-gnu: flow's default on Linux is <native>-linux-musl with -lc, and bs links only glibc so far (musl queued; add a musl variant when it lands)."
+     "note": "Recorded with -Dtarget=x86_64-linux-gnu; flow-musl builds flow's default target, <native>-linux-musl with -lc."
+    },
+    {
+     "name": "test-terminal_icons"
+    },
+    {
+     "name": "test-syntax_validator"
+    },
+    {
+     "name": "test-stdio_capture"
+    },
+    {
+     "name": "test-dbus"
+    },
+    {
+     "name": "test-gitignore"
+    },
+    {
+     "name": "test-terminal_wt_profiles"
+    },
+    {
+     "name": "test-rc"
+    },
+    {
+     "name": "test-terminal_key"
+    },
+    {
+     "name": "test-flow"
+    },
+    {
+     "name": "test-richdoc"
+    },
+    {
+     "name": "test-match"
+    },
+    {
+     "name": "test-FileStore"
+    },
+    {
+     "name": "test-fetch"
+    },
+    {
+     "name": "test-chord_key"
+    },
+    {
+     "name": "test-command_line"
+    },
+    {
+     "name": "test-glyph_constraint"
+    },
+    {
+     "name": "test-edit_set"
+    },
+    {
+     "name": "test-double_mapped_ring_buffer"
+    },
+    {
+     "name": "test-mouse_event"
+    },
+    {
+     "name": "test-terminal_line_store"
+    },
+    {
+     "name": "test-terminal_screen"
+    },
+    {
+     "name": "test-glyph_atlas"
+    },
+    {
+     "name": "test-keybind"
+    },
+    {
+     "name": "test-gitignore-differential"
+    }
+   ]
+  },
+  {
+   "name": "flow-musl",
+   "url": "https://github.com/neurocyte/flow",
+   "commit": "a3e21cfa1ca5177c7ddcc553b4a7fc2634f2d8b8",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "flow",
+     "note": "flow's default target on Linux, <native>-linux-musl, with musl's libc built from the zig lib directory's sources."
     },
     {
      "name": "test-terminal_icons"
