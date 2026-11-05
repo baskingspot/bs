@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n42\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n42\n12\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -380,6 +380,15 @@ fn appFrame() !u8 {
 }
 const app: App = .{ .frameFn = appFrame };
 
+// dvui (Examples/animations.zig): a constant destructured from a comptime
+// block holds an array built in a comptime var, and runtime code takes its
+// address.
+fn namesLen(entries: []const []const u8) usize {
+    var n: usize = 0;
+    for (entries) |e| n += e.len;
+    return n;
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -488,5 +497,12 @@ fn main() callconv(.c) noreturn {
     rt.printInt(dataPtr(true).?.* + @intFromBool(dataPtr(false) == null));
     rt.printInt(app.frameFn() catch 42);
     rt.printInt(rbxAcrossTrampoline());
+    const names_k, const names = comptime blk: {
+        var out: [2][]const u8 = undefined;
+        out[0] = "ab";
+        out[1] = "cde";
+        break :blk .{ 7, out };
+    };
+    rt.printInt(names_k + namesLen(&names));
     rt.exit(0);
 }

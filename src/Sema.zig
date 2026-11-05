@@ -12949,6 +12949,13 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
         var info = Type.ptrInfo(sema.ip, try sema.allocPtrType(alloc.ty, alloc.alignment));
         info.flags.is_const = alloc.is_const;
         const ptr_ty = try sema.ptrType(info);
+        // A constant (`const a, const b = comptime ...`) becomes an
+        // immutable value that runtime code can address, as upstream.
+        if (alloc.is_const) {
+            const val = try sema.allocValue(alloc);
+            if (!sema.refersToComptimeAlloc(val))
+                return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = val, .orig_ty = ptr_ty } } } }));
+        }
         return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .comptime_alloc = id } } }));
     }
     const alloc_inst = ptr.toIndex().?;
