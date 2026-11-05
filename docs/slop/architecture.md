@@ -2475,6 +2475,20 @@ user branches are coverage points and are only learned from.
   own bounds keep it within. Variables changed in a failed walk are
   restored from an undo log of their versions, which also restores them
   between a `cond_br`'s or `switch_br`'s sides.
+- **Dead blocks after it** (`src/codegen/deadblock.zig`, after
+  `prove.run`, in functions where it proved a check whose condition is
+  not a compare). A decided check
+  can leave a block whose value nothing reads: std's sort wraps the
+  comparator as `lt = f(a, b); gt = f(b, a); assert(!(lt and gt));
+  return lt` in Debug, and once the assert is
+  decided the `lt and gt` block still built its diamond (`test; jne` to
+  the next instruction), kept `gt`'s compare alive through its `br`, and
+  gave `lt` a second reader, so it was materialized instead of fused.
+  Such a block, when its body only computes values read inside it and
+  branches within it (no call, store, check, or loop, at most 64
+  instructions), becomes a void block with a single `br`; its body's
+  values and the compares only it read are dropped, and `dbg_stmt`s go
+  only with that code. sort −3.2% Ir.
 - **Turning it off.** `BS_PROVE=off` keeps every check (its own cache
   target, `+noprove`). A program whose output or panic differs between
   on and off has found a bug in a proof, with no oracle needed. The

@@ -40,6 +40,9 @@ pub const Stats = struct {
     /// whose condition was proven.
     checks: u32 = 0,
     proven: u32 = 0,
+    /// Of those, the ones whose condition was not a compare, which may
+    /// leave a block nothing reads (`deadblock.run`).
+    proven_other: u32 = 0,
 };
 
 /// Arrays kept from one function to the next on a worker.
@@ -617,6 +620,10 @@ const Walker = struct {
                 if (check) if (w.decide(cond)) |c| if (!isCold(ir, if (c) then_body else else_body)) {
                     // The check passes (never decided toward its failure).
                     w.stats.proven += 1;
+                    switch (ir.instructions.items(.tag)[@backingInt(cond.toIndex().?)]) {
+                        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {},
+                        else => w.stats.proven_other += 1,
+                    }
                     if (w.checked_op) |op| try w.wrap(op);
                     try w.changing(ii);
                     ir.instructions.items(.data)[ii].pl_op.operand = .fromInterned(if (c) .bool_true else .bool_false);

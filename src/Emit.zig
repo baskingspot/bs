@@ -43,6 +43,7 @@ const prove = @import("codegen/prove.zig");
 const sroa = @import("codegen/sroa.zig");
 const unroll = @import("codegen/unroll.zig");
 const forward = @import("codegen/forward.zig");
+const deadblock = @import("codegen/deadblock.zig");
 const Sema = @import("Sema.zig");
 const cache = @import("cache.zig");
 const Builtin = @import("Builtin.zig");
@@ -241,6 +242,8 @@ rewrite_scratch: rewrite.Scratch = .{},
 sroa_scratch: sroa.Scratch = .{},
 /// `prove.run`'s arrays, on a worker, reused for the next function.
 prove_scratch: prove.Scratch = .{},
+/// `deadblock.run`'s, likewise.
+deadblock_scratch: deadblock.Scratch = .{},
 /// `forward.run`'s arrays, on a worker, reused for the next function.
 forward_scratch: std.ArrayList(u32) = .empty,
 /// Whether `prove.run` removes the checks it proves (`BS_PROVE=off`
@@ -572,6 +575,7 @@ pub fn deinit(emit: *Emit) void {
     emit.ssa.deinit(gpa);
     emit.rewrite_scratch.deinit(gpa);
     emit.prove_scratch.deinit(gpa);
+    emit.deadblock_scratch.deinit(gpa);
     emit.forward_scratch.deinit(gpa);
     emit.sroa_scratch.deinit(gpa);
     if (emit.bench_irs) |*irs| {
@@ -1216,6 +1220,8 @@ fn generateFunction(emit: *Emit, ir: *const Ir) Allocator.Error!void {
     const t1 = std.Io.Timestamp.now(io, .awake);
     emit.codegen_stats.forward_ns += @intCast(t0.durationTo(t1).nanoseconds);
     const st: prove.Stats = if (!emit.prove_on) .{} else try prove.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.prove_scratch, emit.fuzz);
+    // A block whose value only a check read loses it when prove decides the check.
+    if (st.proven_other != 0) _ = try deadblock.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.deadblock_scratch);
     emit.codegen_stats.prove_ns += @intCast(t1.durationTo(.now(io, .awake)).nanoseconds);
     emit.codegen_stats.checks += st.checks;
     emit.codegen_stats.proven += st.proven;
