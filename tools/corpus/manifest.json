@@ -2995,39 +2995,6 @@
      "note": "Not run: the terminal needs a Wayland compositor. Under weston (x11 backend) the window bs's build draws for `-e sh -c 'printf ...; ls'` matched upstream's pixel for pixel apart from the pointer (2026-11-05)."
     }
    ]
-  },
-  {
-   "name": "Avalanche",
-   "url": "https://github.com/SnowballSH/Avalanche",
-   "commit": "a61cfd2c6b47608bb7ece3d31156bba8718b3307",
-   "ref": "master",
-   "license": "GPL-3.0",
-   "build": [
-    [
-     "install"
-    ],
-    [
-     "test"
-    ]
-   ],
-   "targets": [
-    {
-     "name": "test",
-     "edit": [
-      "src/main.zig",
-      "    const startup_commands = args[@min(1, args.len)..];"
-     ],
-     "note": "Links libc. Needs bs's `*T` to `*[1]T` coercion for array T (large_memory.destroy). The suite takes about 2 minutes in Debug."
-    },
-    {
-     "name": "Avalanche",
-     "edit": [
-      "src/main.zig",
-      "    const startup_commands = args[@min(1, args.len)..];"
-     ],
-     "note": "Not run: the engine reads UCI commands from stdin and `go` searches asynchronously, so an argument list ends before the search; `bench` takes minutes in Debug. A UCI session's `go depth 7` printed the same lines under bs and upstream (2026-11-05)."
-    }
-   ]
   }
  ],
  "excluded": [
@@ -3039,6 +3006,12 @@
   {
    "name": "zzz",
    "reason": "MPL-2.0, not MIT-compatible; it also links libc and BearSSL (C) in every artifact"
+  },
+  {
+   "name": "Avalanche",
+   "url": "https://github.com/SnowballSH/Avalanche",
+   "reason": "GPL-3.0, outside the corpus licence rule",
+   "note": "Checked at a61cfd2 (2026-11-05): links libc; its tests gave 295 passed, 2 skipped under both bs and upstream, and a UCI session's `go depth 7` printed the same lines. Needs bs's `*T` to `*[1]T` coercion for array T (large_memory.destroy)."
   },
   {
    "name": "zware",
