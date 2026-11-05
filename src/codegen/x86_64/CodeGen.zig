@@ -2184,7 +2184,9 @@ pub fn termClobbers(cg: *CodeGen, block: Ssa.Block.Index) bool {
         .jump => ir.instructions.items(.tag)[@backingInt(term.inst)] == .br and data.br.operand != Ref.void_value and
             Type.abiSize(cg.ip, ir.typeOfIndex(data.br.block_inst, cg.ip)) > 128,
         .switch_br => cg.isWideInt(cg.typeOf(data.pl_op.operand)),
-        .ret => !cg.inGpr(cg.fn_ty.return_type) and !cg.inFloat(cg.fn_ty.return_type),
+        // The `.auto` convention returns in rax, rax:rdx, or xmm0 what does
+        // not go through memory (`ret`).
+        .ret => if (cg.fn_ty.cc == .auto) cg.autoClass(cg.fn_ty.return_type) == .memory else !cg.inGpr(cg.fn_ty.return_type) and !cg.inFloat(cg.fn_ty.return_type),
         .branch, .fallthrough, .noreturn, .unreach => false,
     };
 }
