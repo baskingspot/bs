@@ -8302,6 +8302,14 @@ libraries as inputs. To be agreed with that thread.
   holds the source alone (an `.include` it reads is not an input, as
   upstream's cache has none either). The command lines equal upstream's
   `--verbose-cc` apart from the CPU (bs's baseline).
+- **LLVM IR sources** (2026-11-05, evm.zig's mcl `.ll` files), as
+  upstream's `FileExt` `.ll` and `.bc`: C's arguments without the
+  preprocessor's (no defines, `-isystem` directories,
+  `-fno-spell-checking` or `-Werror=date-time`) but with the sanitizer,
+  `-O` and the CPU features, and no depfile, so the record holds the
+  source alone. `-cflags` still apply (Clang accepts `-std=c++20` on
+  IR). The command lines equal upstream's `--verbose-cc` apart from the
+  CPU.
 - **Static libraries** (2026-11-04), as upstream's: the archive holds
   the Zig object (`<root stem>.o`), then the object inputs (named after
   their files, as given), then one member per C source (`<stem>.o`),

@@ -55,6 +55,10 @@ pub const Lang = enum {
     /// `.s`: assembly as is, without include directories, defines or a
     /// depfile, as upstream's `.assembly`.
     assembly,
+    /// `.ll` (text) and `.bc` (bitcode): LLVM IR, which takes the code
+    /// generation flags but no include directories, defines or depfile,
+    /// as upstream's `.ll` and `.bc`.
+    llvm_ir,
 
     /// The language of a source file argument, by its extension, or null
     /// if it is not one bs compiles.
@@ -66,6 +70,7 @@ pub const Lang = enum {
         if (std.mem.eql(u8, ext, ".mm") or std.mem.eql(u8, ext, ".M")) return .objcpp;
         if (std.mem.eql(u8, ext, ".S")) return .asm_cpp;
         if (std.mem.eql(u8, ext, ".s")) return .assembly;
+        if (std.mem.eql(u8, ext, ".ll") or std.mem.eql(u8, ext, ".bc")) return .llvm_ir;
         return null;
     }
 };
@@ -749,7 +754,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .abs_source = abs_source,
             .argv = argv.items,
             .dep_at = dep_at,
-            .depfile = src.lang != .assembly,
+            .depfile = src.lang != .assembly and src.lang != .llvm_ir,
             .record_path = try Io.Dir.path.join(arena, &.{ local, "bs", "tc", &hex }),
             .out_path = try Io.Dir.path.join(arena, &.{ local, "o", &hex, try arena.print("{s}.o", .{Io.Dir.path.stem(src.path)}) }),
             .start_ns = start_ns,
@@ -983,24 +988,29 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
     }
     try argv.appendSlice(arena, &.{ "-fhosted", "-nostdinc" });
     if (m.lang == .cpp) try argv.append(arena, "-nostdinc++");
-    switch (m.optimize) {
-        .debug => {},
-        .safe => try argv.append(arena, "-D_FORTIFY_SOURCE=2"),
-        .fast, .small => try argv.append(arena, "-DNDEBUG"),
+    // LLVM IR is not preprocessed.
+    if (m.lang != .llvm_ir) {
+        switch (m.optimize) {
+            .debug => {},
+            .safe => try argv.append(arena, "-D_FORTIFY_SOURCE=2"),
+            .fast, .small => try argv.append(arena, "-DNDEBUG"),
+        }
+        if (m.link_libc and common.glibc_minor.len != 0) try argv.append(arena, common.glibc_minor);
+        if (m.libcpp) {
+            try argv.appendSlice(arena, &.{ "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "libcxx", "include" }), "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "libcxxabi", "include" }) });
+            try argv.appendSlice(arena, common.cxx_defines);
+        }
+        try argv.appendSlice(arena, &.{ "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "include" }) });
+        if (m.link_libc) try argv.appendSlice(arena, common.libc_includes);
+        if (m.native) try argv.appendSlice(arena, common.native_includes);
+        if (m.libunwind) try argv.appendSlice(arena, &.{ "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "libunwind", "include" }) });
+        if (m.link_libc) try argv.appendSlice(arena, common.libc_frameworks);
     }
-    if (m.link_libc and common.glibc_minor.len != 0) try argv.append(arena, common.glibc_minor);
-    if (m.libcpp) {
-        try argv.appendSlice(arena, &.{ "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "libcxx", "include" }), "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "libcxxabi", "include" }) });
-        try argv.appendSlice(arena, common.cxx_defines);
-    }
-    try argv.appendSlice(arena, &.{ "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "include" }) });
-    if (m.link_libc) try argv.appendSlice(arena, common.libc_includes);
-    if (m.native) try argv.appendSlice(arena, common.native_includes);
-    if (m.libunwind) try argv.appendSlice(arena, &.{ "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "libunwind", "include" }) });
-    if (m.link_libc) try argv.appendSlice(arena, common.libc_frameworks);
     if (!assembly) {
-        try argv.append(arena, "-fno-spell-checking");
-        if (m.optimize != .debug) try argv.append(arena, "-Werror=date-time");
+        if (m.lang != .llvm_ir) {
+            try argv.append(arena, "-fno-spell-checking");
+            if (m.optimize != .debug) try argv.append(arena, "-Werror=date-time");
+        }
         switch (m.sanitize_c) {
             .off => {},
             .trap => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fsanitize-trap=undefined" }),
@@ -1315,7 +1325,7 @@ fn runtimeJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Ru
             switch (lang) {
                 .c => try argv.appendSlice(arena, &.{ "-std=c99", "-fexceptions" }),
                 .cpp => try argv.appendSlice(arena, &.{ "-fno-exceptions", "-fno-rtti" }),
-                .objc, .objcpp, .asm_cpp, .assembly => {},
+                .objc, .objcpp, .asm_cpp, .assembly, .llvm_ir => {},
             }
             try argv.appendSlice(arena, &.{ "-w", "-I", try join(arena, &.{ lib, "libunwind", "include" }), "-D_LIBUNWIND_HIDE_SYMBOLS", "-Wa,--noexecstack", "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-fvisibility-global-new-delete=force-hidden", "-D_LIBUNWIND_IS_NATIVE_ONLY" });
             // The compilation's own mode, which is Debug.

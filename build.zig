@@ -2579,6 +2579,25 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     asm_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&asm_run.step);
 
+    // LLVM IR sources: `.ll` text and `.bc` bitcode go to Clang without
+    // the preprocessor, as upstream's, with `-cflags` (mcl's `.ll` files
+    // in evm.zig get C++ flags).
+    const bc = b.addSystemCommand(&.{ zig, "cc", "-c", "-emit-llvm" });
+    bc.addFileArg(b.path("test/link_input/llvm_ir_bc.c"));
+    const ir_exe = b.addRunArtifact(bs);
+    ir_exe.setName("bs build-exe with LLVM IR sources");
+    ir_exe.addArg("build-exe");
+    ir_exe.addFileArg(b.path("test/link_input/llvm_ir_main.zig"));
+    ir_exe.addArgs(&.{ "-cflags", "-std=c++20", "-DIR_UNUSED=1", "--" });
+    ir_exe.addFileArg(b.path("test/link_input/llvm_ir.ll"));
+    ir_exe.addFileArg(bc.addPrefixedOutputFileArg("-o", "llvm_ir.bc"));
+    ir_exe.setEnvironmentVariable("BS_ZIG", zig);
+    const ir_run = std.Build.Step.Run.create(b, "run bs build with LLVM IR sources");
+    ir_run.addFileArg(ir_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    ir_run.addCheck(.{ .expect_stderr_exact = "49 42\n" });
+    ir_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&ir_run.step);
+
     // GCC's -fPIE reads glibc's data PC-relative: the executable copies
     // `stdout` and `environ` (with its aliases, which glibc's start code
     // sets), and glibc, C and Zig all use the copies.
