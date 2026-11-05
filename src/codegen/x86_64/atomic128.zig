@@ -20,7 +20,6 @@
 //! register is loaded. 16-byte values live in
 //! memory (wide integers; f80 and f128).
 
-const std = @import("std");
 const Ir = @import("../../Ir.zig");
 const Inst = Ir.Inst;
 const InternPool = @import("../../InternPool.zig");
