@@ -151,6 +151,28 @@ pub fn build(b: *std.Build) void {
     bench_codegen_run.addArg("-fno-emit-bin");
     bench_codegen_run.has_side_effects = true;
     b.step("bench-codegen", "Measure the backend per stage, per IR instruction, on the hello workload (others: BS_BENCH_CODEGEN=n bs build-exe ...)").dependOn(&bench_codegen_run.step);
+
+    // C sources on an aarch64-macos host, compiled with upstream's Clang
+    // and linked against libSystem, by bs built as for the other tests and
+    // by a ReleaseFast bs: only ReleaseFast reused the stack under a slice
+    // of C arguments that outlived its function (a482a5f), which crashed
+    // every C compile on aarch64-macos.
+    if (b.graph.host.result.os.tag == .macos) {
+        for ([_]*std.Build.Step.Compile{ exe, bench_bs }, [_][]const u8{ "", " (ReleaseFast bs)" }) |bs, what| {
+            const c_exe = b.addRunArtifact(bs);
+            c_exe.setName(b.fmt("bs build-exe -lc with a C source on aarch64-macos{s}", .{what}));
+            c_exe.addArgs(&.{ "build-exe", "-lc" });
+            c_exe.addFileArg(b.path("test/link_input/libc_main.zig"));
+            c_exe.addFileArg(b.path("test/link_input/libc.c"));
+            c_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+            const c_run = std.Build.Step.Run.create(b, b.fmt("run bs -lc build of a C source on aarch64-macos{s}", .{what}));
+            c_run.addFileArg(c_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            c_run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
+            c_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
+            c_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+            test_step.dependOn(&c_run.step);
+        }
+    }
 }
 
 /// Each `test/run/*.zig` program (other than the shared `rt.zig`) starts
