@@ -2644,9 +2644,15 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    only when emitted, so the check looks through `Live.fwd`; division, bit counting,
    wide integers, odd-sized moves, calls, overflow bits, vector masks), and
    every lowering names r11 through `CodeGen.r11`, so emission fails the
-   function where one does where they said it does not. A clobber point in a block that ends
-   the function (a return, or the panic call of a failing check) matters
-   only to later uses in that block. Registers hold values extended to 64
+   function where one does where they said it does not. A clobber point in a
+   doomed block, one from which every path ends the function (a return,
+   the panic call of a failing check, an error return's `returnError`
+   call, or in a function without loops every block), matters only to
+   the uses it can reach: later uses in doomed blocks that follow it,
+   unless its block reaches no block that far in the layout
+   (`Ssa.DeadArms`). A value used on a `try`'s success path does not
+   cross the error path's call. A block's result crosses only the clobber
+   points after its first `br`. Registers hold values extended to 64
    bits, a stronger rule than the narrow-integer rule above, which the
    lowering may relax later. A result may take its first operand's
    register when that operand dies there. Three pieces of later passes
@@ -2952,7 +2958,8 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      values cross clobber points than callee-saved registers hold them,
      a value may take a caller-saved register instead of memory for its
      whole life if its clobber points, two moves each, cost less than its
-     uses read from memory, both weighted by 8 per enclosing loop. Each
+     uses read from memory, both weighted by 8 per enclosing loop (a cold
+     block's clobber points weigh nothing). Each
      clobber point it crosses stores it to its slot first, reads it from
      there (as do loads sharing its register), and reloads it after,
      unless the clobbering value's result is computed in its register
