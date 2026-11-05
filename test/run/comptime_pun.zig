@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "4294967295\n4294967294\n5\n120\n18\n1069547520\n1\n43971\n2751\n9\n4294967296\n200\n0\n52\n3\n9\n131071\n1\n1\n2049\n95\n"
+//! stdout: "4294967295\n4294967294\n5\n120\n18\n1069547520\n1\n43971\n2751\n9\n4294967296\n200\n0\n52\n3\n9\n131071\n1\n1\n2049\n95\n64\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -118,5 +118,14 @@ fn main() callconv(.c) noreturn {
     };
     rt.printInt(unaligned[0]);
     rt.printInt(unaligned[1]);
+    // An f80's padding bytes read as zeros, as upstream's.
+    const f80_bytes = comptime blk: {
+        var x: f80 = 2.5;
+        _ = &x;
+        break :blk @as(*const [16]u8, @ptrCast(&x)).*;
+    };
+    var pad_sum: u64 = 0;
+    for (f80_bytes[10..]) |b| pad_sum += b;
+    rt.printInt(pad_sum + f80_bytes[9]);
     rt.exit(0);
 }

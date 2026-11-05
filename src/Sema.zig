@@ -14495,16 +14495,15 @@ fn writeMemBytes(sema: *Sema, v: Index, buf: []u8, undef: []bool) CompileError!b
         }
         return true;
     }
-    var used = size;
     switch (Type.class(ip, ty)) {
         .void => return true,
         .bool => buf[0] = @intFromBool(v == .bool_true),
         .int => (try sema.bigValue(v)).toConst().writeTwosComplement(buf[0..size], .little),
         .float => {
-            used = Type.floatBits(ip, ty) / 8;
+            // As upstream, an f80's padding bytes are zeros, not undefined.
             var all: [16]u8 = undefined;
             std.mem.writeInt(u128, &all, ip.keyPayload(.float, v).bits(), .little);
-            @memcpy(buf[0..used], all[0..used]);
+            @memcpy(buf[0..size], all[0..size]);
         },
         .@"enum" => return sema.writeMemBytes(ip.keyPayload(.enum_tag, v).int, buf, undef),
         .pointer => {
@@ -14528,7 +14527,7 @@ fn writeMemBytes(sema: *Sema, v: Index, buf: []u8, undef: []bool) CompileError!b
         },
         else => return false,
     }
-    @memset(undef[0..used], false);
+    @memset(undef[0..size], false);
     return true;
 }
 
