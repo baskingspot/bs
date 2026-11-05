@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -296,6 +296,44 @@ const exp_table = blk: {
 const repeat_grid: [30000][4]u8 = @splat("(?:)".*);
 const repeated: [4 * 30000]u8 = @bitCast(repeat_grid);
 
+// zigcli (src/gitignore.zig): an error prong named through a declared
+// set (`E.A`) leaves the else prong's capture the error.
+const GiErr = error{A};
+fn giF(x: u8) !u8 {
+    if (x == 0) return GiErr.A;
+    if (x == 1) return error.B;
+    return x;
+}
+fn giG(x: u8) !u8 {
+    return giF(x) catch |e| switch (e) {
+        GiErr.A => 10,
+        else => return e,
+    };
+}
+
+// zigcli (std.testing.expectEqualDeep): a slice and a pointer to an
+// array whose elements differ in const and sentinel have the slice's type
+// as their peer.
+fn peerLen(a: []const [:0]const u8, buf: *[1][:0]u8) usize {
+    const T = @TypeOf(a, buf);
+    const x: T = buf;
+    return x.len + @intFromBool(T == []const [:0]const u8);
+}
+
+// astroz (cfitsio's fits_open_file), zigcli zfetch (getifaddrs): `*?*S`
+// passes as `[*c][*c]S`.
+const FitsFile = extern struct { x: c_int };
+fn fitsOpen(out: [*c][*c]FitsFile) callconv(.c) c_int {
+    out.* = null;
+    return 7;
+}
+
+// revo (std.c.pipe): `*[2]i32` passes as `*[2]c_int`, and back.
+fn cPipe(fds: *[2]c_int) *[2]i32 {
+    fds[1] = 4;
+    return fds;
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -391,5 +429,15 @@ fn main() callconv(.c) noreturn {
     var last: usize = repeated.len - 1;
     _ = &last;
     rt.printInt(repeated[last]);
+    rt.printInt((giG(0) catch 0) + (giG(5) catch 0));
+    rt.printInt(if (giG(1)) |_| 0 else |e| @intFromBool(e == error.B));
+    var y = "y".*;
+    var peer_buf = [1][:0]u8{y[0..1 :0]};
+    rt.printInt(peerLen(&.{"x"}, &peer_buf));
+    var fits: ?*FitsFile = undefined;
+    rt.printInt(@intCast(fitsOpen(&fits)));
+    rt.printInt(@intFromBool(fits == null));
+    var fds: [2]i32 = .{ 0, 0 };
+    rt.printInt(@intCast(cPipe(&fds)[1] + fds[1]));
     rt.exit(0);
 }
