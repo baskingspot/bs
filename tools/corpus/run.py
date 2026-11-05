@@ -451,6 +451,11 @@ def compare(res, tgt):
         return "bs: compile error" if z["compile_exit"] == 1 else f"bs: crash ({z['compile_exit']})"
     if z["run"] == "skipped":
         return f"bs: edit build failed: {z['edit_error']}" if z.get("edit_error") else "compiles (not run)"
+    # Upstream's own binary died (a stack overflow in a Debug frame bs does
+    # not need, an upstream miscompile) where bs's ran clean: upstream's
+    # failure, as a compile failure of upstream's is.
+    if z["run_exit"] == 0 and str(u["run_exit"]).startswith("signal"):
+        return f"upstream run fails ({u['run']})"
     if z["run"] != u["run"]:
         return f"bs: run differs ({z['run']} vs {u['run']})"
     if tgt.get("compare_stdout", True) and z["stdout_sha"] != u["stdout_sha"]:
