@@ -2892,7 +2892,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .memcpy, .memmove => {
             const elem_size = try cg.memDest(.x13, .x11, data.bin_op.lhs);
-            if (elem_size != 1) {
+            if (std.math.isPowerOfTwo(elem_size)) {
+                if (elem_size != 1) try cg.e.shiftImm(.lsl, .x, .x11, .x11, std.math.log2_int(u64, elem_size));
+            } else {
                 try cg.e.movImm(.x, .x9, elem_size);
                 try cg.e.mul(.x, .x11, .x11, .x9);
             }
@@ -3165,6 +3167,10 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Cond {
 fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref, d: Reg) Error!void {
     const e = &cg.e;
     const s = cg.signed(ty);
+    if (tag == .mul_wrap) if (try cg.pow2Factor(ty, lhs, rhs)) |f| {
+        try e.shiftImm(.lsl, .x, d, try cg.use(f.ref, .x9), f.shift);
+        return cg.normalize(d, ty);
+    };
     const a = try cg.use(lhs, .x9);
     // Immediate forms of the operations that have them.
     const imm: ?u64 = switch (try cg.locOf(rhs)) {
@@ -3209,6 +3215,25 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref, d: Reg) Err
         else => unreachable,
     }
     try cg.normalize(d, ty);
+}
+
+/// The operand of a multiply in `ty` by a constant power of two, on
+/// either side, other than 1, and the power: a shift left computes it.
+/// A signed constant counts only below `1 << (bits - 1)`, which is
+/// negative or out of range.
+fn pow2Factor(cg: *CodeGen, ty: Index, lhs: Ref, rhs: Ref) Error!?struct { ref: Ref, shift: u6 } {
+    const info = Type.intInfo(cg.ip, ty);
+    for ([2][2]Ref{ .{ rhs, lhs }, .{ lhs, rhs } }) |sides| {
+        const v = switch (try cg.locOf(sides[0])) {
+            .imm => |v| v,
+            else => continue,
+        };
+        if (v < 2 or !std.math.isPowerOfTwo(v)) continue;
+        const k = std.math.log2_int(u64, v);
+        if (k >= info.bits - @intFromBool(info.signedness == .signed)) continue;
+        return .{ .ref = sides[1], .shift = k };
+    }
+    return null;
 }
 
 /// `d = a op b` for division `tag` of 64-bit extended registers, signed
@@ -3338,8 +3363,9 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     const in_flags = fields[1] != Ssa.no_tie and cg.fate(@fromBackingInt(fields[1])) == .fused;
     const info = Type.intInfo(ip, ty);
     const s = info.signedness == .signed;
-    const a = try cg.use(bin.lhs, .x9);
-    const b = try cg.use(bin.rhs, .x10);
+    const pow2 = if (tag == .mul_with_overflow) try cg.pow2Factor(ty, bin.lhs, bin.rhs) else null;
+    const a = try cg.use(if (pow2) |f| f.ref else bin.lhs, .x9);
+    const b = if (pow2 == null) try cg.use(bin.rhs, .x10) else undefined;
     // The condition under which the flags say it overflowed, or null when
     // x11 holds the bit.
     const cc: ?Cond = switch (tag) {
@@ -3355,7 +3381,27 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
             try e.addSub(if (add) .add else .sub, .x, .x9, a, .r(b));
             break :cc try cg.truncCheck(ty);
         },
-        .mul_with_overflow => if (info.bits <= 32) cc: {
+        .mul_with_overflow => if (pow2) |f| cc: {
+            // A shift left: it overflowed if the bits shifted out of the
+            // type are not zero, or for a signed type, not the sign
+            // extension of those that stay.
+            const k = f.shift;
+            if (!s) {
+                try e.tst(.x, a, .{ .imm = ~((@as(u64, 1) << @intCast(info.bits - k)) - 1) });
+                try e.shiftImm(.lsl, .x, .x9, a, k);
+                try cg.normalize(.x9, ty);
+                break :cc .ne;
+            }
+            const src = if (a == .x9) src: {
+                try e.mov(.x, .x14, .x9);
+                break :src .x14;
+            } else a;
+            try e.shiftImm(.lsl, .x, .x9, src, k);
+            try cg.normalize(.x9, ty);
+            try e.shiftImm(.asr, .x, .x13, .x9, k);
+            try e.cmp(.x, .x13, .r(src));
+            break :cc .ne;
+        } else if (info.bits <= 32) cc: {
             // The product of extended operands is exact in 64 bits.
             try e.mul(.x, .x9, a, b);
             break :cc try cg.truncCheck(ty);
