@@ -15949,13 +15949,23 @@ fn slicePtr(sema: *Sema, block: *Block, slice: Ref) CompileError!Ref {
     return sema.addTyOp(block, .slice_ptr, many_ty, slice);
 }
 
-/// Emits `index < len` as a safety check.
-fn boundsCheck(sema: *Sema, block: *Block, src: Src, index: Ref, len: Ref, allow_eq: bool) CompileError!void {
+/// Emits `index < len` as a safety check. `of` names the indexed object
+/// for a comptime-known failure, which points at the index of the element
+/// access at `src`, as upstream; `.range` checks a slice's end, at `src`.
+fn boundsCheck(sema: *Sema, block: *Block, src: Src, index: Ref, len: Ref, allow_eq: bool, of: enum { array, slice, vector, range }) CompileError!void {
     if (sema.resolveValue(index)) |i| if (sema.resolveValue(len)) |l| {
-        if (sema.isUndef(i) or sema.isUndef(l)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+        const index_src = if (of == .range) src else src.operandSrc(1);
+        if (sema.isUndef(i) or sema.isUndef(l)) return sema.fail(block, index_src, "use of undefined value here causes illegal behavior", .{});
         const iv = sema.ip.intValue(u64, i).?;
         const lv = sema.ip.intValue(u64, l).?;
-        if (iv > lv or (iv == lv and !allow_eq)) return sema.fail(block, src, "index {d} outside array of length {d}", .{ iv, lv });
+        if (iv > lv or (iv == lv and !allow_eq)) {
+            const sentinel_label: []const u8 = if (allow_eq and of != .range) " +1 (sentinel)" else "";
+            return switch (of) {
+                .array, .range => sema.fail(block, index_src, "index {d} outside array of length {d}{s}", .{ iv, lv, sentinel_label }),
+                .slice => sema.fail(block, index_src, "index {d} outside slice of length {d}{s}", .{ iv, lv, sentinel_label }),
+                .vector => sema.fail(block, index_src, "index {d} outside vector of length {d}", .{ iv, lv }),
+            };
+        }
         return;
     };
     if (!block.want_safety or block.is_comptime) return;
@@ -15983,7 +15993,7 @@ fn loadElem(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref)
                 const a = ip.keyPayload(.array_type, p.child);
                 if (a.len == 0 and a.sentinel == .none) break :comptime_known;
                 const index = try sema.coerce(block, .usize_type, uncasted_index, src);
-                try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none);
+                try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none, .array);
                 // `elemPtrOfArrayPtr`.
                 if (p.flags.alignment != 0) try sema.resolveLayout(block, src, a.child);
                 if (try sema.comptimePtrRoot(pv) == .int or Type.hasNoPossibleValue(ip, a.child)) break :comptime_known;
@@ -15999,9 +16009,15 @@ fn loadElem(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref)
                 const index = try sema.coerce(block, .usize_type, uncasted_index, src);
                 try sema.resolveLayout(block, src, cp.child);
                 if (Type.hasNoPossibleValue(ip, cp.child)) break :comptime_known;
-                try sema.boundsCheck(block, src, index, .fromInterned(ip.keyPayload(.slice, sv).len), cp.sentinel != .none);
+                try sema.boundsCheck(block, src, index, .fromInterned(ip.keyPayload(.slice, sv).len), cp.sentinel != .none, .slice);
                 const e = try sema.ptrElemPtrKey(ip.keyPayload(.slice, sv).ptr, ip.intValue(u64, sema.resolveValue(index).?).?, false);
                 if (try sema.comptimeLoadKey(block, src, e.key, e.elem_ty, .none)) |v| return .fromInterned(v);
+            },
+            // Upstream indexes a comptime-known vector by value
+            // (`elemValArray`), which calls it an array when out of bounds.
+            .vector_type => if (try sema.comptimeLoadOrNull(block, src, pv) != null) {
+                const index = try sema.coerce(block, .usize_type, uncasted_index, src);
+                try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, ip.keyPayload(.vector_type, p.child).len)), false, .array);
             },
             else => {},
         }
@@ -16024,14 +16040,14 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
             if (a.len == 0 and a.sentinel == .none) return sema.fail(block, src, "cannot index into empty array", .{});
             const index = try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1));
             const len: Ref = .fromInterned(try sema.intValue(.usize_type, a.len));
-            if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, len, a.sentinel != .none);
+            if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, len, a.sentinel != .none, .array);
             return sema.elemPtrOfArrayPtr(block, src, ptr, index);
         },
         .vector_type => |v| {
             const index = try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1));
             if (v.len == 0) return sema.fail(block, src, "cannot index into empty vector", .{});
             if (sema.resolveValue(index) == null) return sema.fail(block, src.operandSrc(1), "vector index not comptime known", .{});
-            try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, v.len)), false);
+            try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, v.len)), false, .vector);
             const i = ip.intValue(u64, sema.resolveValue(index).?).?;
             // `vector_index` and `host_size` hold the index and length.
             if (v.len < std.math.maxInt(u16)) return sema.vectorElemPtr(block, src, ptr, i);
@@ -16116,7 +16132,7 @@ fn elemPtrOfSlice(sema: *Sema, block: *Block, src: Src, slice: Ref, uncasted_ind
     // As upstream, an undefined slice gives an undefined element pointer
     // (`@TypeOf(&undefined_slice[0])`).
     if (sema.resolveValue(slice)) |sv| if (sema.isUndef(sv)) return .fromInterned(try sema.undefValue(elem_ptr_ty));
-    if (safety) try sema.boundsCheck(block, src, index, try sema.sliceLen(block, slice), cp.sentinel != .none);
+    if (safety) try sema.boundsCheck(block, src, index, try sema.sliceLen(block, slice), cp.sentinel != .none, .slice);
     if (sema.resolveValue(slice)) |sv| {
         if (iv) |v| return .fromInterned(try sema.ptrElemPtrVal(sema.ip.keyPayload(.slice, sv).ptr, sema.ip.intValue(u64, v).?));
     }
@@ -16261,7 +16277,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
             .slice => {
                 const index = try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1));
                 // The sentinel of a sentinel-terminated slice can be read.
-                if (safety) try sema.boundsCheck(block, src, index, try sema.sliceLen(block, lhs), p.sentinel != .none);
+                if (safety) try sema.boundsCheck(block, src, index, try sema.sliceLen(block, lhs), p.sentinel != .none, .slice);
                 if (sema.resolveValue(lhs)) |sv| if (sema.resolveValue(index)) |iv| {
                     const slice_ptr = ip.keyPayload(.slice, sv).ptr;
                     const e = try sema.ptrElemPtrKey(slice_ptr, ip.intValue(u64, iv).?, false);
@@ -16295,7 +16311,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
                 const ep = if (p.flags.size == .one) blk: {
                     const a = ip.keyPayload(.array_type, p.child);
                     if (a.len == 0 and a.sentinel == .none) return sema.fail(block, src, "cannot index into empty array", .{});
-                    if (safety) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none);
+                    if (safety) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none, .array);
                     break :blk try sema.elemPtrOfArrayPtr(block, src, lhs, index);
                 } else blk: {
                     // As upstream's validateRuntimeElemAccess: a pointer to
@@ -16310,7 +16326,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
         .array_type => |a| {
             if (a.len == 0 and a.sentinel == .none) return sema.fail(block, src, "cannot index into empty array", .{});
             const index = try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1));
-            if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none);
+            if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none, .array);
             if (sema.resolveValue(lhs)) |v| if (sema.resolveValue(index)) |iv| return .fromInterned(try sema.elemValue(v, ip.intValue(u64, iv).?));
             if (!Type.hasRuntimeBits(ip, a.child) and !Type.isComptimeOnly(ip, a.child)) if (try sema.onePossibleValue(a.child)) |v| return .fromInterned(v);
             try sema.requireRuntime(block, src);
@@ -16320,7 +16336,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
         },
         .vector_type => |v| {
             const index = try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1));
-            if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, v.len)), false);
+            if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, v.len)), false, .array);
             if (Type.isInt(ip, v.child) and Type.intInfo(ip, v.child).bits == 0) return .fromInterned(try sema.intValue(v.child, 0));
             if (sema.resolveValue(lhs)) |val| if (sema.resolveValue(index)) |iv| return .fromInterned(try sema.elemValue(val, ip.intValue(u64, iv).?));
             try sema.requireRuntime(block, src);
@@ -16547,7 +16563,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                 .single => sema.fail(block, end_src, "end index {d} out of bounds for slice of single-item pointer", .{ev}),
             };
         }
-        try sema.boundsCheck(block, src, end_s, len_s, true);
+        try sema.boundsCheck(block, src, end_s, len_s, true, .range);
     }
     const start_val = sema.resolveValue(start);
     const end_val = sema.resolveValue(end);
