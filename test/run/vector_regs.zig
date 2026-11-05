@@ -1,5 +1,5 @@
 //! exit: 0
-//! stderr: "many b86b44fdbe971fe3\ncalls ff11b1274f604e3\nloop 995e5ee3c34409a7\nshort d6bcc89073567f5b\nfused 49932c7b3f9e0d1\n"
+//! stderr: "many b86b44fdbe971fe3\ncalls ff11b1274f604e3\nloop 995e5ee3c34409a7\nshort d6bcc89073567f5b\nfused 49932c7b3f9e0d1\npassed e62b355558096511\n"
 //! targets: x86_64-linux aarch64-macos aarch64-linux
 
 // Vectors held in vector registers across the shapes where a register
@@ -9,6 +9,7 @@
 // around a loop, short vectors whose registers hold other bytes, and
 // bitcasts fused with the load or store next to them.
 const std = @import("std");
+const builtin = @import("builtin");
 
 const V = @Vector(4, u32);
 const B = @Vector(16, u8);
@@ -118,6 +119,83 @@ noinline fn fused(src: []const u8, dst: []u8, wide: []u32, sp: *const S) void {
     h = (h ^ @as(u64, @bitCast(acc[0]))) *% 0x100000001b3;
 }
 
+fn mixInt(x: u64) void {
+    h = (h ^ x) *% 0x100000001b3;
+}
+
+/// Ten arguments the vector registers pass, more than v0-v7, so the last
+/// two go on the stack, with a 1-byte vector and a bool vector, which go
+/// in general registers, between them.
+noinline fn take(a: V, x: f64, b: @Vector(2, u8), c: @Vector(1, u8), d: B, m: @Vector(4, bool), e: @Vector(4, u16), f: @Vector(4, f32), g: V, y: f32, k: V, l: @Vector(2, u64)) V {
+    mix(a);
+    mixInt(@bitCast(x));
+    mix(b);
+    mix(c);
+    mix(d);
+    mixInt(@as(u4, @bitCast(m)));
+    mix(e);
+    mix(@as(V, @bitCast(f)));
+    mix(g);
+    mixInt(@as(u32, @bitCast(y)));
+    mix(k);
+    mix(l);
+    return a *% g +% k;
+}
+
+noinline fn short8(a: @Vector(8, u8), b: @Vector(8, u8)) @Vector(8, u8) {
+    return a +% b *% @as(@Vector(8, u8), @splat(3));
+}
+
+noinline fn addv(a: V, b: V) V {
+    return a *% @as(V, @splat(5)) +% b;
+}
+
+noinline fn fib(a: V, b: V, n: u32) V {
+    if (n == 0) return a;
+    // x86_64 has no tail calls, as upstream's x86_64 backend.
+    if (builtin.cpu.arch != .aarch64) return fib(b, a +% b, n - 1);
+    return @call(.always_tail, fib, .{ b, a +% b, n - 1 });
+}
+
+var fptr: *const fn (V, V) V = &addv;
+
+/// Structs whose one field is a vector, as `crypto.aes.Block`.
+const Blk = struct { repr: @Vector(2, u64) };
+const Half = struct { tag: void = {}, v: @Vector(8, u8) };
+
+noinline fn blk(a: Blk, h8: Half, b: Blk) Blk {
+    const w: @Vector(2, u64) = @bitCast(@as(@Vector(16, u8), @bitCast(a.repr)) +% std.simd.join(h8.v, h8.v));
+    return .{ .repr = w ^ (b.repr << @splat(1)) };
+}
+
+noinline fn half(x: u8) Half {
+    return .{ .v = std.simd.iota(u8, 8) *% @as(@Vector(8, u8), @splat(x)) };
+}
+
+/// An undefined 2-byte vector argument is a constant in a general
+/// register, moved to its vector register.
+noinline fn ignore(x: @Vector(2, u8), y: u32) u32 {
+    _ = x;
+    return y *% 7;
+}
+
+/// Vectors passed to and returned from `.auto` functions: directly,
+/// through a pointer, by a tail call, short vectors, and in structs.
+noinline fn passed() void {
+    const a = vec();
+    const g = vec();
+    const k = vec();
+    const r = take(a, 2.5, .{ 3, 250 }, .{9}, @bitCast(vec()), .{ true, false, false, true }, .{ 1, 2, 65535, 4 }, .{ 1.5, -2.25, 8, 0.125 }, g, -7.75, k, .{ 0x0123_4567_89ab_cdef, 42 });
+    mix(r);
+    mix(short8(@splat(17), .{ 1, 2, 3, 4, 5, 6, 7, 8 }));
+    mix(fptr(r, a));
+    mix(fib(a, g, 40));
+    const b = blk(.{ .repr = @bitCast(a) }, half(7), .{ .repr = @bitCast(g) });
+    mix(b.repr);
+    mix(half(@truncate(b.repr[1])).v);
+    mixInt(ignore(undefined, 6));
+}
+
 pub fn main() void {
     many();
     std.debug.print("many {x}\n", .{h});
@@ -134,4 +212,6 @@ pub fn main() void {
     const s: S = .{ .a = .{ -128, -1, 8, -17, -19, -81, -1, 17 }, .b = 3 };
     fused(&src, &dst, &wide, &s);
     std.debug.print("fused {x}\n", .{h});
+    passed();
+    std.debug.print("passed {x}\n", .{h});
 }

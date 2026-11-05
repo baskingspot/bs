@@ -1491,8 +1491,9 @@ identity is in every cache key):
 
 - Arguments are classified like the C convention's register part:
   scalars and pairs in general registers (x86_64 rdi, rsi, rdx, rcx, r8,
-  r9; aarch64 x0–x7) and floats in vector registers (xmm0–xmm7; v0–v7), in
-  order; a pair takes two consecutive general registers, and a pair that
+  r9; aarch64 x0–x7) and floats and vectors of at most 16 bytes of lanes
+  in vector registers (xmm0–xmm7; v0–v7, for vectors of 2 bytes or more),
+  in order; a pair takes two consecutive general registers, and a pair that
   does not fit entirely in registers goes on the stack, never split.
   Arguments that
   do not fit go in the outgoing stack area. On x86_64, a memory-class
@@ -1508,7 +1509,8 @@ identity is in every cache key):
   write, to its outgoing area. A parameter that gets no register is
   copied in at entry. `test/run/byref.zig` checks the aliasing cases
   (`f(g.*)` writing `g`, `s = f(s)`) against upstream's ReleaseSafe.
-- Results: scalars and pairs in rax/rdx (x0/x1), floats in xmm0 (v0);
+- Results: scalars and pairs in rax/rdx (x0/x1), floats and those
+  vectors in xmm0 (v0);
   others through a result pointer passed in rdi (x8, the indirect result
   register, as Apple's C convention). Large aggregates stay in the
   outgoing stack area on aarch64 too (the callee reads them at

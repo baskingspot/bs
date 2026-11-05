@@ -814,9 +814,10 @@ fn calleeType(cg: *CodeGen, callee: Ref) InternPool.FuncType {
 
 /// How `.auto` passes a value: in one or two general registers (x0-x7,
 /// the value's bytes; one register holds a value of 1, 2, 4, or 8 bytes
-/// extended like a load), in a vector register (v0-v7, floats of 16, 32,
-/// and 64 bits), or in memory (arguments in the outgoing area, in 8-byte
-/// aligned slots; results through the pointer in x8).
+/// extended like a load), in a vector register (v0-v7: floats of 16, 32,
+/// and 64 bits, and vectors of 2 to 16 bytes, `autoVec`), or in memory
+/// (arguments in the outgoing area, in 8-byte aligned slots; results
+/// through the pointer in x8).
 const AutoClass = enum { none, gpr, gpr_pair, fpr, memory };
 
 fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
@@ -825,8 +826,30 @@ fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
         16, 32, 64 => .fpr,
         else => .memory,
     };
+    if (cg.autoVec(ty)) return .fpr;
     const size = Type.abiSize(ip, ty);
     return if (size == 0) .none else if (size <= 8) .gpr else if (size <= 16) .gpr_pair else .memory;
+}
+
+/// Whether `.auto` passes `ty` in a vector register as its bytes: a
+/// vector of 2 bytes or more that the vector registers hold (`inVec`),
+/// or a struct whose one runtime field is such a vector, as `crypto.aes`
+/// wraps its blocks.
+fn autoVec(cg: *CodeGen, ty: Index) bool {
+    const ip = cg.ip;
+    const size = Type.abiSize(ip, ty);
+    if (size < 2) return false;
+    if (cg.inVec(ty)) return true;
+    if (ip.keyTag(ty) != .struct_type or Type.isPacked(ip, ty)) return false;
+    const info = ip.structInfo(ty);
+    var only: ?Index = null;
+    for (info.field_types, 0..) |ft, i| {
+        if (info.fieldIsComptime(i) or !Type.hasRuntimeBits(ip, ft)) continue;
+        if (only != null) return false;
+        only = ft;
+    }
+    const f = only orelse return false;
+    return Type.abiSize(ip, f) == size and cg.autoVec(f);
 }
 
 const ArgLoc = union(enum) {
@@ -1213,7 +1236,21 @@ fn setupParams(cg: *CodeGen) Error!void {
             },
             else => unreachable,
         };
-        if (cg.homes[@backingInt(inst)] == .vreg and !cg.inVec(ty)) {
+        if (cg.homes[@backingInt(inst)] == .vreg and cg.inVec(ty)) {
+            const v = cg.homes[@backingInt(inst)].vreg;
+            switch (l) {
+                .fpr => |a| {
+                    try vector.move(cg, v, argVReg(a));
+                    continue;
+                },
+                .stack => |off| {
+                    try vector.loadMem(cg, v, .at(.fp, @intCast(16 + off)), @intCast(size));
+                    continue;
+                },
+                // A 1-byte vector, in a general register.
+                else => {},
+            }
+        } else if (cg.homes[@backingInt(inst)] == .vreg) {
             const v = cg.homes[@backingInt(inst)].vreg;
             switch (l) {
                 .fpr => |a| try cg.loadFp(v, .{ .ty = ty, .loc = .{ .vreg = argVReg(a) } }),
@@ -3637,8 +3674,10 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const callee_ty = cg.calleeType(callee_ref);
     const ret_ty = extra.data.ret_ty;
     const is_c = isC(callee_ty.cc);
-    // A scalar result in a register is moved there from x0 (or v0).
-    const in_reg = !tail and (cg.homes[@backingInt(inst)] == .reg or (cg.homes[@backingInt(inst)] == .vreg and !cg.inVec(ret_ty)));
+    // A scalar result in a register is moved there from x0 (or v0), and
+    // so is a vector returned in v0.
+    const vec_in_v0 = cg.inVec(ret_ty) and (if (is_c) cg.cRetClass(ret_ty) == .fpr else cg.autoClass(ret_ty) == .fpr);
+    const in_reg = !tail and (cg.homes[@backingInt(inst)] == .reg or (cg.homes[@backingInt(inst)] == .vreg and (vec_in_v0 or !cg.inVec(ret_ty))));
     const dst = if (tail or in_reg) null else try cg.resultMem(inst, ret_ty);
     var pn_save: ?Mem = null;
     var stack_args = false;
@@ -3689,6 +3728,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     if (pn_save) |save| for (0..10) |k| try cg.loadMem(@fromBackingInt(@intCast(19 + k)), save.plus(@intCast(8 * k)), .usize_type);
     if (in_reg) {
         // f32 and f64 results come back in v0 in every convention.
+        if (vec_in_v0) return vector.move(cg, cg.homes[@backingInt(inst)].vreg, .v0);
         if (cg.homes[@backingInt(inst)] == .vreg) return cg.setFpResult(inst, ret_ty, .v0);
         return cg.setResult(inst, ret_ty, .x0);
     }
@@ -4694,8 +4734,9 @@ fn loadFp(cg: *CodeGen, v: VReg, val: Val) Error!void {
     };
     if (val.loc == .mem) return cg.e.ldrFp(ft, v, try cg.access(val.loc.mem, @intCast(size), .x16));
     try cg.loadVal(.x9, val);
-    // `fmov h, w` needs FEAT_FP16; `fmov s, w` sets the h register too.
-    const via: Float = if (ft == .f16 and cg.fpType(val.ty) == null) .f32 else ft;
+    // `fmov h, w` needs FEAT_FP16; `fmov s, w` sets the h register too,
+    // and moves a 2-byte vector.
+    const via: Float = if (ft == .f16 and (!cg.isFloat(val.ty) or cg.fpType(val.ty) == null)) .f32 else ft;
     try cg.e.fmovFromGpr(via, v, if (size == 8) .x else .w, .x9);
 }
 
