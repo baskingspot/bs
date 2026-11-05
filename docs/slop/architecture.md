@@ -922,8 +922,13 @@ comptime arguments are run-time values in the lowered code (uucode's
   and are moved to the register after the instruction), so a result may
   take the register of an operand that dies there (`tiedOperand`).
   Pairs (slices) and block results stay in slots for now (`inPair` says
-  no), and a function with inline assembly gets no registers. The
-  prologue saves the used pairs right below the frame record (x19 at fp
+  no). A value that meets an inline assembly statement (an operand,
+  its result, or a value live across it) takes none of the x19-x28 and
+  v8-v15 an assembly statement in the function names in its template,
+  pins or clobbers (`asmRegs`, an `Ssa.allocate` restriction); the
+  statement saves those it names around itself, for its caller's
+  values (a context switch names them only as clobbers), except in a
+  naked function. The prologue saves the used pairs right below the frame record (x19 at fp
   - 8, x20 at fp - 16, then the next used pair, the d pairs after the x
   pairs), which compact unwind's frame mode reads from
   `Atom.Unwind.saved` (d8/d9 is 0x100) and the aarch64-linux FDE
@@ -971,7 +976,7 @@ comptime arguments are run-time values in the lowered code (uucode's
   LLVM lowers `<N x i1>` and Clang's `ext_vector_type` bools agree.
   `aarch64_preserve_none` passes integers in x20-x28 then x0-x7; its
   callers save and restore x19-x28 around the call, and a function using
-  it gets no allocated registers (`Ssa.has_asm`). f16 arithmetic is
+  it gets no allocated registers (`Ssa.no_regs`). f16 arithmetic is
   native (FEAT_FP16); f80 and f128 call compiler_rt. Atomics use LSE
   (`ldadd`, `swp`, `cas`, ...) with acquire-release, `ldar`/`stlr` for
   loads and stores; 16-byte ones load and store with `ldp`/`stp` and
@@ -1497,6 +1502,17 @@ layout order of pass 4:
   lowering loads the thunk into x16 (`ldr x16, [x0]; blr x16`; clang uses
   x9 and so clobbers it); `___chkstk_darwin` (prologue only) clobbers x9,
   x16, x17, and NZCV. compiler_rt calls follow the C convention.
+- **Inline assembly** keeps values in registers around it.
+  `Ssa.allocate` takes restrictions, each a register mask and per
+  position a count of the lowerings that write those registers; a value
+  takes none of a restriction's registers when such a lowering lies in
+  its interval, at its definition, or at its last use. x86_64 has two:
+  r11 (`usesR11`), and the registers inline assembly pins or clobbers
+  plus rsi, rdi, r8, r9 and r11, which its `r` operands and output
+  addresses may get. An asm statement is also an x86_64 clobber point.
+  aarch64 restricts the registers an asm statement names; an asm
+  statement is a clobber point there too (`callFree`), so the values
+  that meet it keep out of v20-v29, which its SIMD operands get first.
 
 **The `.auto` calling convention** follows from this, and stays private
 to bs (nothing outside bs calls an `.auto` function, so it changes
