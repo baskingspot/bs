@@ -2197,7 +2197,7 @@ instructions in body order and records, per local, whether its address
 escapes (is used other than to load, store, or derive a field or element
 pointer), its stores and its last use. Dominance is by position: an
 instruction reaches the end of the body holding it, and a `block` left
-only by the `br` ending its body passes that reach to its body. Two
+only by the `br` ending its body passes that reach to its body. Three
 rewrites use it:
 
 - Copies. A `const` local of an aggregate, stored once with a whole load
@@ -2221,8 +2221,9 @@ rewrites use it:
   in a branch not taken, forgets what it may overlap: a store forgets
   other fields of the same struct only if the struct's fields do not
   overlap, two locals never overlap, a local whose address does not
-  escape overlaps nothing reached otherwise, and a returning call forgets
-  all but those locals. Panics do not return, so safety checks forget
+  escape overlaps nothing reached otherwise, a pointer parameter itself
+  (not one loaded through it) never points into a local, and a
+  returning call forgets all but those locals. Panics do not return, so safety checks forget
   nothing. Values do not flow around loop back edges. Loads straight
   through a local are left alone: `Ssa.plan` forwards and promotes those
   of scalar locals whose address does not escape (forwarding them first
@@ -2230,6 +2231,23 @@ rewrites use it:
   those of locals whose address escapes, which would walk nearly every
   function (96% of the zig workload's IR against 66%) for about 200
   loads.
+- Loop-invariant loads. A load of such a scalar in a loop that the
+  previous rule did not forward moves to just before its innermost loop
+  (which becomes `block { loads; loop }` in its place) when three things
+  hold. Its address, or the base of its field pointer, is computed before
+  the loop. No write anywhere in the loop's body, before or after the
+  load, may overlap its memory by the rules above, and no returning call
+  is in the loop unless the memory is a non-escaping local's; a write
+  (or call) after which the path leaves the loop without repeating it
+  counts only for loads later on that path (a tokenizer's keyword lookup
+  as it returns a token). And a load or store through the same base runs
+  on every path to the loop, at most 64 positions before it with no
+  returning call between, or first in the loop body before anything that
+  may leave it, so the moved load cannot fault where the loop body might
+  not have run. Two loads of the same memory in a loop move as one. The
+  moved loads take the line of the statement before the loop; safety checks do not move. This keeps
+  `self.buf.ptr` and `self.buf.len` in registers across a tokenizer's
+  loop, and lets prove see the bound of every `buf[i]` as the same value.
 
 `BS_FORWARD=off` turns the pass off (its own cache entries, as
 `+noforward`), to compare a program's behavior with and without it;

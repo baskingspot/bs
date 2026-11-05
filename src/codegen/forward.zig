@@ -8,7 +8,9 @@
 //! the frame to read a field or two. And a load of a scalar that a
 //! dominating store wrote, or a dominating load read, reads that value
 //! instead when nothing in between may write the memory: `self.index += 1`
-//! followed by a read of `self.index`, or `self.len` read twice. Runs on
+//! followed by a read of `self.index`, or `self.len` read twice. A load
+//! that no write in its loop may change moves before the loop:
+//! `self.buf.len` in a tokenizer's loop. Runs on
 //! the CodeGen workers before proving checks, which reads what was
 //! forwarded as equal values; scalar replacement leaves the copies whole
 //! for it.
@@ -101,20 +103,32 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
 
     var count: u32 = if (copies) w.forwardCopies(words[10 * n ..][0 .. w.next + 1]) else 0;
     if (reloads) {
-        const loads_forwarded = w.forwardLoads();
-        if (loads_forwarded != 0) {
+        // The loads in loops not forwarded, for `hoistLoads`, in room
+        // `forwardCopies` is done with.
+        const cands = words[10 * n .. 11 * n];
+        var ncands: u32 = 0;
+        const loads_forwarded = w.forwardLoads(cands, &ncands);
+        const hoisted = if (ncands != 0) try w.hoistLoads(gpa, cands[0..ncands]) else 0;
+        if (loads_forwarded != 0 or hoisted != 0) {
             const Subst = struct {
                 subst: []const u32,
                 const Self = @This();
                 pub fn use(s: Self, ref: *Inst.Ref) void {
                     const i = ref.toIndex() orelse return;
-                    const to = s.subst[@backingInt(i)];
-                    if (to != none) ref.* = @fromBackingInt(to);
+                    var to = s.subst[@backingInt(i)];
+                    if (to == none) return;
+                    // A load forwarded to one that was hoisted, or to one
+                    // hoisted with it.
+                    while (@as(Inst.Ref, @fromBackingInt(to)).toIndex()) |j| {
+                        if (@backingInt(j) >= s.subst.len or s.subst[@backingInt(j)] == none) break;
+                        to = s.subst[@backingInt(j)];
+                    }
+                    ref.* = @fromBackingInt(to);
                 }
             };
             for (w.order[0..w.next]) |i| Ssa.forEachOperandPtr(ir, @fromBackingInt(i), Subst{ .subst = w.subst });
         }
-        count += loads_forwarded;
+        count += loads_forwarded + hoisted;
     }
     return count;
 }
@@ -248,7 +262,8 @@ const Walk = struct {
     root: []u32,
     /// Each local's last use, by position.
     last: []u32,
-    /// Each local's store.
+    /// Each local's store; each loop's slot in the body that holds it;
+    /// each block's last position.
     store: []u32,
     /// The instruction at each position.
     order: []u32,
@@ -330,7 +345,7 @@ const Walk = struct {
     /// scanned in order, so a write anywhere between the two, also in a
     /// branch not taken, forgets what was known. A panic does not return,
     /// so the safety checks between them forget nothing.
-    fn forwardLoads(w: *Walk) u32 {
+    fn forwardLoads(w: *Walk, cands: []u32, ncands: *u32) u32 {
         const ir = w.ir;
         const subst = w.subst;
         const ip = w.ip;
@@ -360,6 +375,10 @@ const Walk = struct {
                             count += 1;
                             continue;
                         }
+                    }
+                    if (w.loop_of[i] != none) {
+                        cands[ncands.*] = i;
+                        ncands.* += 1;
                     }
                     len = remember(&known, len, .{ .key = key, .value = Inst.Index.toRef(@fromBackingInt(i)), .ty = ty, .inst = i });
                 },
@@ -399,6 +418,277 @@ const Walk = struct {
         }
         return count;
     }
+
+    /// Loop-invariant loads (`cands`: loads in loops that `forwardLoads`
+    /// did not forward, in position order): a load of a scalar whose
+    /// address is computed before its innermost loop, or is a field of a
+    /// pointer that is, moves to before the loop when no write in the
+    /// loop may reach its memory (`loopWrites`), and when that memory was
+    /// already read or written through the same base before the loop, or
+    /// is first in the loop, with no call between that might free it
+    /// (`accessedBefore`): the load then cannot fault where the original
+    /// might not have run. The loop becomes `block { loads;
+    /// loop }` in its slot, and the load's users read the moved load
+    /// (`subst`). The moved loads run on the line of the statement before
+    /// the loop. Safety checks stay where they are. Returns how many
+    /// loads moved.
+    fn hoistLoads(w: *Walk, gpa: Allocator, cands: []const u32) Allocator.Error!u32 {
+        const ir = w.ir;
+        const ip = w.ip;
+        const datas = ir.instructions.items(.data);
+        const Hoist = struct { load: u32, loop: u32, addr: Inst.Ref, field: u32, key: Key, ty: Index, ptr_ty: Index };
+        var hoists: [max_known]Hoist = undefined;
+        var nh: u32 = 0;
+        var cur_loop: u32 = none;
+        var loop_writes: LoopWrites = .{};
+        for (cands) |l| {
+            if (nh == hoists.len) break;
+            const lp = w.loop_of[l];
+            const ptr = w.resolve(datas[l].ty_op.operand);
+            const key = w.keyOf(ptr) orelse continue;
+            // The address, computed before the loop.
+            var addr = ptr;
+            var field: u32 = 0;
+            if (!w.dominatesLoop(ptr, lp)) {
+                if (key.field == 0 or !w.dominatesLoop(key.base, lp)) continue;
+                addr = key.base;
+                field = key.field;
+            }
+            if (!w.accessedBefore(key.base, lp)) continue;
+            if (cur_loop != lp) {
+                cur_loop = lp;
+                loop_writes = w.loopWrites(lp);
+            }
+            if (loop_writes.reach(w, key, l)) continue;
+            // The same memory loaded twice in the loop moves once.
+            const same = for (hoists[0..nh]) |h| {
+                if (h.loop == lp and h.key.base == key.base and h.key.field == key.field and datas[h.load].ty_op.ty == datas[l].ty_op.ty) break h.load;
+            } else none;
+            if (same != none) {
+                w.subst[l] = @backingInt(Inst.Index.toRef(@fromBackingInt(same)));
+                continue;
+            }
+            hoists[nh] = .{ .load = l, .loop = lp, .addr = addr, .field = field, .key = key, .ty = datas[l].ty_op.ty, .ptr_ty = ir.typeOf(ptr, ip) };
+            nh += 1;
+        }
+        if (nh == 0) return 0;
+        // By loop, keeping position order within each.
+        std.sort.insertion(Hoist, hoists[0..nh], {}, struct {
+            fn lt(_: void, a: Hoist, b: Hoist) bool {
+                return a.loop < b.loop;
+            }
+        }.lt);
+
+        // New instructions: per loop a `block`, and per load its field
+        // pointer if needed and the load. New bodies go after `extra`.
+        var list = ir.instructions.toMultiArrayList();
+        defer ir.instructions = list.slice();
+        // The whole allocation, which `Ir.deinit` frees; what lies past
+        // the last body is never read.
+        var extra: std.ArrayList(u32) = .fromOwnedSlice(@constCast(ir.extra));
+        defer ir.extra = extra.allocatedSlice();
+        var count: u32 = 0;
+        var k: u32 = 0;
+        while (k < nh) {
+            const lp = hoists[k].loop;
+            var end = k;
+            while (end < nh and hoists[end].loop == lp) end += 1;
+            // The field pointers and loads, whose payloads go before the
+            // block's body.
+            const first: u32 = @intCast(list.len);
+            for (hoists[k..end]) |h| {
+                var addr = h.addr;
+                if (h.field != 0) {
+                    const sf: u32 = @intCast(list.len);
+                    const payload: u32 = @intCast(extra.items.len);
+                    try extra.appendSlice(gpa, &.{ @backingInt(h.key.base), h.field - 1 });
+                    try list.append(gpa, .{ .tag = .struct_field_ptr, .data = .{ .ty_pl = .{ .ty = h.ptr_ty, .payload = payload } } });
+                    addr = Inst.Index.toRef(@fromBackingInt(sf));
+                }
+                const nl: u32 = @intCast(list.len);
+                try list.append(gpa, .{ .tag = .load, .data = .{ .ty_op = .{ .ty = h.ty, .operand = addr } } });
+                w.subst[h.load] = @backingInt(Inst.Index.toRef(@fromBackingInt(nl)));
+                count += 1;
+            }
+            // The block: those, then the loop.
+            const blk: u32 = @intCast(list.len);
+            const body_len: u32 = @intCast(list.len - first + 1);
+            try list.append(gpa, .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = list.items(.data)[lp].ty_pl.ty, .payload = @intCast(extra.items.len) } } });
+            try extra.append(gpa, body_len);
+            for (first..blk) |i| try extra.append(gpa, @intCast(i));
+            try extra.append(gpa, lp);
+            extra.items[w.store[lp]] = blk;
+            k = end;
+        }
+        return count;
+    }
+
+    /// Whether `ref` is a constant or computed before loop `lp`, on every
+    /// path to it.
+    fn dominatesLoop(w: *const Walk, ref: Inst.Ref, lp: u32) bool {
+        const d = @backingInt(ref.toIndex() orelse return true);
+        if (d >= w.pos.len) return false;
+        return w.pos[d] < w.pos[lp] and w.pos[lp] <= w.scope_end[d];
+    }
+
+    /// Whether a load or store through `base` runs on every path to loop
+    /// `lp`, shortly before it, with no call between that might free its
+    /// memory.
+    fn accessedBefore(w: *Walk, base: Inst.Ref, lp: u32) bool {
+        const ir = w.ir;
+        const tags = ir.instructions.items(.tag);
+        const datas = ir.instructions.items(.data);
+        var p = w.pos[lp];
+        const stop = p -| 64;
+        while (p > stop) {
+            p -= 1;
+            const i = w.order[p];
+            const ptr = switch (tags[i]) {
+                .load => datas[i].ty_op.operand,
+                .store => datas[i].bin_op.lhs,
+                .call => if (ir.extraData(Ir.Call, datas[i].pl_op.payload).data.ret_ty != .noreturn_type) return false else continue,
+                else => continue,
+            };
+            if (!(w.pos[lp] <= w.scope_end[i])) continue;
+            const key = w.keyOf(w.resolve(ptr)) orelse continue;
+            if (key.base == base) return true;
+        }
+        // Or first in the loop, which always runs its body once: on every
+        // path through the body, before anything that might leave it or
+        // free the memory.
+        const insts = blockBody(ir, @fromBackingInt(lp));
+        if (insts.len == 0) return false;
+        const body_end = w.scope_end[@backingInt(insts[0])];
+        p = w.pos[lp] + 1;
+        const end = @min(body_end + 1, p + 64);
+        while (p < end) : (p += 1) {
+            const i = w.order[p];
+            const ptr = switch (tags[i]) {
+                .load => datas[i].ty_op.operand,
+                .store => datas[i].bin_op.lhs,
+                .call, .br, .repeat, .ret, .unreach, .trap, .assembly => return false,
+                else => continue,
+            };
+            if (w.scope_end[i] < body_end) continue;
+            const key = w.keyOf(w.resolve(ptr)) orelse continue;
+            if (key.base == base) return true;
+        }
+        return false;
+    }
+
+    /// The writes in loop `lp`, its body's positions.
+    fn loopWrites(w: *Walk, lp: u32) LoopWrites {
+        const ir = w.ir;
+        const tags = ir.instructions.items(.tag);
+        const datas = ir.instructions.items(.data);
+        var lw: LoopWrites = .{};
+        const insts = blockBody(ir, @fromBackingInt(lp));
+        if (insts.len == 0) return lw;
+        const end = w.scope_end[@backingInt(insts[0])];
+        for (w.pos[lp] + 1..end + 1) |p| {
+            const i = w.order[p];
+            const data = datas[i];
+            const key: Key = switch (tags[i]) {
+                .store => if (w.direct(data.bin_op.lhs)) w.unknownKey(data.bin_op.lhs) else w.keyOf(data.bin_op.lhs) orelse w.unknownKey(data.bin_op.lhs),
+                .memset, .memcpy, .memmove, .set_union_tag => w.unknownKey(data.bin_op.lhs),
+                .optional_payload_ptr_set, .errunion_payload_ptr_set => w.unknownKey(data.ty_op.operand),
+                // Any memory but locals whose address does not escape.
+                .call, .atomic_store, .atomic_rmw, .cmpxchg, .assembly, .vector_store_elem, .c_va_start, .c_va_arg, .c_va_copy => if (w.writes(i, none))
+                    .{ .base = .none, .field = 0, .disjoint = false, .root = none }
+                else
+                    continue,
+                else => continue,
+            };
+            // Who may see the write: the rest of the path that leaves the
+            // loop, or the whole loop when it may repeat.
+            const seen_to = w.exitPath(lp, @intCast(p)) orelse end;
+            const seen_from: u32 = if (seen_to == end) w.pos[lp] + 1 else @intCast(p + 1);
+            // The same memory again: one entry, seen where either is, when
+            // their ranges overlap or no room is left.
+            const same = for (lw.writes[0..lw.len]) |*x| {
+                if (!std.meta.eql(x.key, key)) continue;
+                if (lw.len == lw.writes.len or (seen_from <= x.to and x.from <= seen_to)) break x;
+            } else null;
+            if (same) |x| {
+                x.from = @min(x.from, seen_from);
+                x.to = @max(x.to, seen_to);
+                continue;
+            }
+            if (lw.len == lw.writes.len) {
+                lw.all = true;
+                return lw;
+            }
+            lw.writes[lw.len] = .{ .key = key, .from = seen_from, .to = seen_to };
+            lw.len += 1;
+        }
+        return lw;
+    }
+
+    /// When what runs after position `p` in loop `lp` leaves the loop
+    /// without repeating it, the last position of that path: the rest of
+    /// the body holding `p`, and after each `br` on it to a block in the
+    /// loop that holds `p`, what follows that block.
+    fn exitPath(w: *const Walk, lp: u32, p: u32) ?u32 {
+        const ir = w.ir;
+        const tags = ir.instructions.items(.tag);
+        const datas = ir.instructions.items(.data);
+        var to = w.scope_end[w.order[p]];
+        // The blocks left: what follows each is scanned once.
+        var left: [8]u32 = undefined;
+        var nleft: u32 = 0;
+        var next: u32 = 0;
+        var from = p + 1;
+        var end = to;
+        var scanned: u32 = 0;
+        while (true) {
+            scanned += end + 1 -| from;
+            if (scanned > 512) return null;
+            var q = from;
+            while (q <= end) : (q += 1) {
+                const j = w.order[q];
+                switch (tags[j]) {
+                    .repeat => if (w.pos[@backingInt(datas[j].repeat.loop_inst)] <= p) return null,
+                    .br => {
+                        const b = @backingInt(datas[j].br.block_inst);
+                        if (w.pos[b] <= w.pos[lp] or w.pos[b] >= p) continue;
+                        if (std.mem.findScalar(u32, left[0..nleft], b) != null) continue;
+                        if (nleft == left.len) return null;
+                        left[nleft] = b;
+                        nleft += 1;
+                    },
+                    else => {},
+                }
+            }
+            if (next == nleft) return to;
+            // After the block's body (its last position, `store`), to the
+            // end of the body holding it.
+            const b = left[next];
+            next += 1;
+            from = w.store[b] + 1;
+            end = w.scope_end[b];
+            to = @max(to, end);
+        }
+    }
+
+    const LoopWrites = struct {
+        /// What each write may reach, and the positions of the loads that
+        /// may see it.
+        writes: [2 * max_known]struct { key: Key, from: u32, to: u32 } = undefined,
+        len: u32 = 0,
+        /// Too many writes to tell: they may write anything.
+        all: bool = false,
+
+        /// Whether a write in the loop may change what load `l` reads
+        /// through `key`.
+        fn reach(lw: *const LoopWrites, w: *const Walk, key: Key, l: u32) bool {
+            if (lw.all) return true;
+            const p = w.pos[l];
+            for (lw.writes[0..lw.len]) |x| {
+                if (p >= x.from and p <= x.to and w.mayOverlap(x.key, key)) return true;
+            }
+            return false;
+        }
+    };
 
     /// Whether `ptr` is a local whose address does not escape: its loads
     /// and stores are `Ssa.plan`'s, and touch no other memory.
@@ -451,6 +741,8 @@ const Walk = struct {
         // overlaps no memory reached otherwise.
         if (a.root != none and b.root != none) return a.root == b.root;
         if (a.root == none and b.root == none) return true;
+        // A parameter points to memory that was there before any local.
+        if (w.isArg(if (a.root != none) b.base else a.base)) return false;
         return w.flags[if (a.root != none) a.root else b.root].escaped;
     }
 
@@ -513,6 +805,12 @@ const Walk = struct {
         return r;
     }
 
+    fn isArg(w: *const Walk, ref: Inst.Ref) bool {
+        if (ref == .none) return false;
+        const i = ref.toIndex() orelse return false;
+        return w.ir.instructions.items(.tag)[@backingInt(i)] == .arg;
+    }
+
     /// The value `ref` was found to be (`forwardLoads`).
     fn resolve(w: *const Walk, ref: Inst.Ref) Inst.Ref {
         const i = ref.toIndex() orelse return ref;
@@ -521,7 +819,9 @@ const Walk = struct {
     }
 
     fn body(w: *Walk, insts: []const Inst.Index) void {
-        for (insts) |inst| w.instruction(inst);
+        // Where the body lies in `extra`, for a loop's slot (`store`).
+        const at: u32 = @intCast(@as([*]const u32, @ptrCast(insts.ptr)) - w.ir.extra.ptr);
+        for (insts, at..) |inst, slot| w.instruction(inst, @intCast(slot));
         for (insts) |inst| w.scope_end[@backingInt(inst)] = w.next - 1;
     }
 
@@ -541,7 +841,7 @@ const Walk = struct {
         }
     }
 
-    fn instruction(w: *Walk, inst: Inst.Index) void {
+    fn instruction(w: *Walk, inst: Inst.Index, slot: u32) void {
         const ir = w.ir;
         const i = @backingInt(inst);
         w.pos[i] = w.next;
@@ -603,8 +903,10 @@ const Walk = struct {
             .block => {
                 w.exits[i] = 0;
                 w.body(blockBody(ir, inst));
+                w.store[i] = w.next - 1;
             },
             .loop => {
+                w.store[i] = slot;
                 const outer = w.loop;
                 w.loop = i;
                 w.body(blockBody(ir, inst));
