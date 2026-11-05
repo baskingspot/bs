@@ -2832,6 +2832,13 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      blocks of `movups` stores of the element repeated in xmm0
      (`fillLoop`): `rep stos` takes about 8 ns to start, and the loop
      fills 129 bytes in 2.7 ns and 1 KB in 10.1 (13.5 for `rep stosb`).
+     An `@memset` of such an element (`memsetScalar`) into an array of up
+     to 128 bytes is straight stores; into a slice it branches on the
+     length in bytes: two overlapping stores up to 16, 16-byte stores from
+     both ends up to 64, a loop of 64-byte blocks and an overlapping last
+     block up to 1 KB, and `rep stos` above. `rep stosb` takes 3 to 4 ns
+     up to 128 bytes and about 8 from there; `rep stosw`, `stosd` and
+     `stosq` take 10 to 20 ns at any small size.
    nbody's `Vec.sub` went from 64 instructions to 26. Against main
    2cc5b3e (`bench/runtime.py`, two interleaved runs): nbody 279–283 →
    158–174 ms, hash 224–236 → 185–191, fmt 100–103 → 92–93, sieve and

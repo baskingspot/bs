@@ -1487,6 +1487,155 @@ fn fillSplat(cg: *CodeGen, dst: Mem, elem: Ref, count: u64) Error!bool {
     return true;
 }
 
+/// `@memset` of an element of `size` bytes (1, 2, 4 or 8), with the
+/// element repeated in rax (`patternRax`). Of an array, known in size:
+/// straight stores up to 128 bytes, `fillLoop` up to `fill_loop_max`, and
+/// `rep stos` above. Of a slice, branching on its length in bytes: two
+/// overlapping stores up to 16, two or four 16-byte stores from both ends
+/// up to 64, a loop of 64-byte blocks and an overlapping last block up to
+/// `fill_loop_max`, and `rep stos` above. `rep stosb` takes 3 to 4 ns up
+/// to 128 bytes and about 8 from there, and wider `rep stos` 10 to 20 at
+/// any small size. Every store is at a multiple of 16 bytes from either
+/// end or overlaps one at a multiple of the element's size, so the
+/// element stays in phase. Uses rax, rcx, rdx, r10, rdi and xmm0.
+fn memsetScalar(cg: *CodeGen, dest: Ref, elem: Ref, size: u64) Error!void {
+    const ip = cg.ip;
+    const e = &cg.e;
+    const p = Type.ptrInfo(ip, cg.typeOf(dest));
+    if (p.flags.size != .slice) {
+        const total = ip.keyPayload(.array_type, p.child).len * size;
+        try cg.load(.rdi, dest);
+        try cg.patternRax(elem, size);
+        if (total > fill_loop_max) {
+            try e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(total / size) });
+            return e.repStos(sizeOf(size));
+        }
+        if (total >= 16) {
+            try e.movToXmm(.qword, .xmm0, .{ .reg = .rax });
+            try e.pshuf(.d, .xmm0, .{ .reg = .xmm0 }, 0x44);
+            if (total > 128) return cg.fillLoop(Mem.at(.rdi, 0), total);
+            var off: u64 = 0;
+            while (off + 16 < total) : (off += 16) try e.movups(.{ .mem = Mem.at(.rdi, @intCast(off)) }, .{ .reg = .xmm0 });
+            return e.movups(.{ .mem = Mem.at(.rdi, @intCast(total - 16)) }, .{ .reg = .xmm0 });
+        }
+        var off: u64 = 0;
+        while (off < total) {
+            const n: u64 = if (total - off >= 8) 8 else if (total - off >= 4) 4 else if (total - off >= 2) 2 else 1;
+            try cg.storeReg(Mem.at(.rdi, @intCast(off)), .rax, n);
+            off += n;
+        }
+        return;
+    }
+    _ = try cg.memDest(.rdi, .rcx, dest);
+    try cg.patternRax(elem, size);
+    // rdx: the length in bytes; rcx stays the element count for `rep stos`.
+    try e.lea(.qword, .rdx, .{ .index = .{ .reg = .rcx, .scale = switch (size) {
+        1 => .@"1",
+        2 => .@"2",
+        4 => .@"4",
+        else => .@"8",
+    } } });
+    const end = struct {
+        fn end(disp: i32) Mem {
+            return .{ .base = .{ .reg = .rdi }, .index = .{ .reg = .rdx }, .disp = disp };
+        }
+    }.end;
+    const done = try e.newLabel();
+    const above16 = try e.newLabel();
+    try e.alu(.cmp, .qword, .{ .reg = .rdx }, .{ .imm = 16 });
+    try e.jcc(.a, .{ .label = above16 });
+    // 0 to 16 bytes: a multiple of the element's size.
+    const below8 = try e.newLabel();
+    try e.alu(.cmp, .dword, .{ .reg = .rdx }, .{ .imm = 8 });
+    try e.jcc(.b, .{ .label = if (size == 8) done else below8 });
+    try e.mov(.qword, .{ .mem = Mem.at(.rdi, 0) }, .{ .reg = .rax });
+    try e.mov(.qword, .{ .mem = end(-8) }, .{ .reg = .rax });
+    try e.jmp(.{ .label = done });
+    e.bind(below8);
+    if (size <= 4) {
+        const below4 = try e.newLabel();
+        try e.alu(.cmp, .dword, .{ .reg = .rdx }, .{ .imm = 4 });
+        try e.jcc(.b, .{ .label = if (size == 4) done else below4 });
+        try e.mov(.dword, .{ .mem = Mem.at(.rdi, 0) }, .{ .reg = .rax });
+        try e.mov(.dword, .{ .mem = end(-4) }, .{ .reg = .rax });
+        try e.jmp(.{ .label = done });
+        e.bind(below4);
+        if (size <= 2) {
+            try e.@"test"(.dword, .{ .reg = .rdx }, .{ .reg = .rdx });
+            try e.jcc(.e, .{ .label = done });
+            if (size == 2) {
+                try e.mov(.word, .{ .mem = Mem.at(.rdi, 0) }, .{ .reg = .rax });
+            } else {
+                // 1 to 3 bytes: the first, the last, and the middle one.
+                try e.mov(.byte, .{ .mem = Mem.at(.rdi, 0) }, .{ .reg = .rax });
+                try e.mov(.byte, .{ .mem = end(-1) }, .{ .reg = .rax });
+                try e.shift(.shr, .dword, .{ .reg = .rdx }, 1);
+                try e.mov(.byte, .{ .mem = end(0) }, .{ .reg = .rax });
+            }
+            try e.jmp(.{ .label = done });
+        }
+    }
+    e.bind(above16);
+    const rep = try e.newLabel();
+    try e.alu(.cmp, .qword, .{ .reg = .rdx }, .{ .imm = fill_loop_max });
+    try e.jcc(.a, .{ .label = rep });
+    try e.movToXmm(.qword, .xmm0, .{ .reg = .rax });
+    try e.pshuf(.d, .xmm0, .{ .reg = .xmm0 }, 0x44);
+    // 17 to 64 bytes: 16-byte stores from both ends.
+    const above32 = try e.newLabel();
+    const above64 = try e.newLabel();
+    try e.alu(.cmp, .dword, .{ .reg = .rdx }, .{ .imm = 64 });
+    try e.jcc(.a, .{ .label = above64 });
+    try e.alu(.cmp, .dword, .{ .reg = .rdx }, .{ .imm = 32 });
+    try e.jcc(.a, .{ .label = above32 });
+    try e.movups(.{ .mem = Mem.at(.rdi, 0) }, .{ .reg = .xmm0 });
+    try e.movups(.{ .mem = end(-16) }, .{ .reg = .xmm0 });
+    try e.jmp(.{ .label = done });
+    e.bind(above32);
+    for ([_]Mem{ Mem.at(.rdi, 0), Mem.at(.rdi, 16), end(-32), end(-16) }) |m| try e.movups(.{ .mem = m }, .{ .reg = .xmm0 });
+    try e.jmp(.{ .label = done });
+    // 65 bytes to `fill_loop_max`: 64-byte blocks, then the last 64
+    // bytes, from r10.
+    e.bind(above64);
+    try e.lea(.qword, .r10, end(-64));
+    const top = try e.newLabel();
+    e.bind(top);
+    for (0..4) |k| try e.movups(.{ .mem = Mem.at(.rdi, @intCast(16 * k)) }, .{ .reg = .xmm0 });
+    try e.alu(.add, .qword, .{ .reg = .rdi }, .{ .imm = 64 });
+    try e.alu(.cmp, .qword, .{ .reg = .rdi }, .{ .reg = .r10 });
+    try e.jcc(.b, .{ .label = top });
+    for (0..4) |k| try e.movups(.{ .mem = Mem.at(.r10, @intCast(16 * k)) }, .{ .reg = .xmm0 });
+    try e.jmp(.{ .label = done });
+    e.bind(rep);
+    try e.repStos(sizeOf(size));
+    e.bind(done);
+}
+
+/// Element `elem` of `size` bytes (1, 2, 4 or 8) repeated across rax.
+/// Uses rdx.
+fn patternRax(cg: *CodeGen, elem: Ref, size: u64) Error!void {
+    const ones: u64 = switch (size) {
+        1 => 0x0101_0101_0101_0101,
+        2 => 0x0001_0001_0001_0001,
+        4 => 0x0000_0001_0000_0001,
+        else => 1,
+    };
+    const mask = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - 8 * size);
+    switch (try cg.locOf(elem)) {
+        .imm => |v| return cg.e.mov(.qword, .{ .reg = .rax }, .{ .imm = @bitCast((@as(u64, @bitCast(v)) & mask) *% ones) }),
+        else => {},
+    }
+    try cg.load(.rax, elem);
+    switch (size) {
+        1 => try cg.e.movzx(.dword, .rax, .byte, .{ .reg = .rax }),
+        2 => try cg.e.movzx(.dword, .rax, .word, .{ .reg = .rax }),
+        4 => try cg.e.mov(.dword, .{ .reg = .rax }, .{ .reg = .rax }),
+        else => return,
+    }
+    try cg.e.mov(.qword, .{ .reg = .rdx }, .{ .imm = @bitCast(ones) });
+    try cg.e.imul(.qword, .rax, .{ .reg = .rdx }, null);
+}
+
 /// Repeats the element of `size` bytes (1, 2, 4 or 8) in rax across xmm0.
 fn splatXmm0(cg: *CodeGen, size: u64) Error!void {
     if (size == 8) {
@@ -5468,31 +5617,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .memset => {
             const elem = data.bin_op.rhs;
             const elem_ty = cg.typeOf(elem);
-            const dest = Type.ptrInfo(ip, cg.typeOf(data.bin_op.lhs));
-            if (dest.flags.size != .slice) switch (Type.abiSize(ip, elem_ty)) {
-                // An array of 129 bytes to 1 KB: a loop of stores.
-                1, 2, 4, 8 => |size| {
-                    const total = ip.keyPayload(.array_type, dest.child).len * size;
-                    if (total > 128 and total <= fill_loop_max) {
-                        try cg.load(.rdi, data.bin_op.lhs);
-                        try cg.load(.rax, elem);
-                        try cg.splatXmm0(size);
-                        return cg.fillLoop(Mem.at(.rdi, 0), total);
-                    }
-                },
-                else => {},
-            };
-            if (Type.abiSize(ip, elem_ty) == 1) {
-                _ = try cg.memDest(.rdi, .rcx, data.bin_op.lhs);
-                try cg.load(.rax, elem);
-                return cg.e.repStosb();
-            }
             switch (Type.abiSize(ip, elem_ty)) {
-                2, 4, 8 => |size| {
-                    _ = try cg.memDest(.rdi, .rcx, data.bin_op.lhs);
-                    try cg.load(.rax, elem);
-                    return cg.e.repStos(sizeOf(size));
-                },
+                1, 2, 4, 8 => |size| return cg.memsetScalar(data.bin_op.lhs, elem, size),
                 else => {},
             }
             // Store the first element, then copy what is stored until it
