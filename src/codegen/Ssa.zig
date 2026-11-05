@@ -762,6 +762,11 @@ fn shareTies(f: *Func, ir: *const Ir, w: Inst.Index, v: Inst.Index, start: u32) 
         if (u == no_tie or uses[u] != 1 or end[u] != def[x] or def[u] < start or fate[u] != .normal) break;
         if (reg[u] != reg[@backingInt(w)] or share[u] != no_tie or ir.instructions.items(.tag)[u] == .block) break;
         if (!f.storeShares(ir, @fromBackingInt(u), v, (def[x] - 2) / 2)) break;
+        // `u` holds the register when `x` reads its other operands (a
+        // call's arguments, with `u` its callee), so none may share it.
+        var c: SharedReads = .{ .f = f, .ir = ir, .v = v, .tie = u };
+        forEachOperand(ir, @fromBackingInt(x), &c);
+        if (c.other) break;
         share[u] = @backingInt(v);
         x = u;
     }
