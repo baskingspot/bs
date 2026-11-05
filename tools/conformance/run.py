@@ -1313,7 +1313,8 @@ def crash_frame(stderr):
     return "?"
 
 
-def run_case(compiler, path, cfg, expected, args, workdir):
+def run_case(compiler, path, cfg, expected, args, workdir, target=None):
+    """`target`: the `-target` to compile for, or None for the host."""
     out_dir = workdir / "compile-errors" / path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
     # Upstream's harness compiles each case as tmp.zig, in a module named
@@ -1330,6 +1331,8 @@ def run_case(compiler, path, cfg, expected, args, workdir):
         argv = [str(compiler), "build-exe", f"-Mroot={root}", f"-femit-bin={out_dir / 'case'}"]
     else:
         argv = [str(compiler), "build-obj", f"-Mroot={root}", f"-femit-bin={out_dir / 'case.o'}"]
+    if target:
+        argv += ["-target", target]
     argv.append("--error-format=json")
     code, _out, err, timed_out = run_process(argv, workdir, args.compile_timeout)
     shutil.rmtree(out_dir, ignore_errors=True)
@@ -1378,6 +1381,17 @@ def compile_errors_target(compiler, cfg, args, workdir):
         sys.exit("error: --compile-errors measures bs; the cases' expectations are upstream's")
     # Failing builds record nothing worth reusing across cases.
     os.environ["BS_CACHE"] = "off"
+    # Off the target's host, each case is cross-compiled for it: for the
+    # target its manifest names, or else the target's own.
+    cross = (platform.system(), platform.machine()) != cfg["host"]
+    arch_os = cfg["zig_target"].split("-")[:2]
+
+    def case_target(case_cfg):
+        if not cross:
+            return None
+        named = [t for t in case_cfg.get("target", "native").split(",") if t.split("-")[:2] == arch_os]
+        return named[0] if named else cfg["zig_target"]
+
     cases = []
     for path in sorted(CASES_DIR.rglob("*.zig")):
         parsed = parse_case(path)
@@ -1387,7 +1401,7 @@ def compile_errors_target(compiler, cfg, args, workdir):
         cases = [c for c in cases if c[0].name in args.files]
     results = {}
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        futs = [ex.submit(run_case, compiler, p, c, e, args, workdir) for p, c, e in cases]
+        futs = [ex.submit(run_case, compiler, p, c, e, args, workdir, case_target(c)) for p, c, e in cases]
         for f in as_completed(futs):
             name, r = f.result()
             results[name] = r
@@ -2333,7 +2347,8 @@ def main():
         sys.exit(f"error: {UPSTREAM_TEST} is missing; run .agents/setup")
 
     host = (platform.system(), platform.machine())
-    runnable = [t for t in targets if TARGETS[t]["host"] == host or emulator(TARGETS[t], host)]
+    # Compile errors need no binary run, so any host measures any target.
+    runnable = [t for t in targets if args.compile_errors or TARGETS[t]["host"] == host or emulator(TARGETS[t], host)]
     compiler = None
     if runnable:
         if args.upstream:
