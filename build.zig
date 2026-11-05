@@ -1677,17 +1677,19 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         test_step.dependOn(&preempt.step);
     }
     // An executable of C only, as upstream builds one: its main is C's.
-    // Without UBSan, std's panic handler and its I/O stay out, as
-    // upstream's crt1.o has none, so it links against glibc 2.12, which
-    // lacks functions std's I/O calls.
-    for ([_][]const []const u8{ &.{"x86_64-linux-gnu"}, &.{ "x86_64-linux-gnu.2.12", "-fno-sanitize-c" } }) |args| {
+    // It links against glibc 2.12, which lacks functions std's I/O calls:
+    // without UBSan, std's panic handler and its I/O stay out, as
+    // upstream's crt1.o has none, and with it std's I/O has networking
+    // off, as upstream's ubsan_rt.
+    for ([_][]const []const u8{ &.{"x86_64-linux-gnu"}, &.{ "x86_64-linux-gnu.2.12", "-fno-sanitize-c" }, &.{"x86_64-linux-gnu.2.12"} }) |args| {
         const cexe = b.addRunArtifact(bs);
-        cexe.setName(b.fmt("bs build-exe -lc with only C sources ({s})", .{args[0]}));
+        const label = std.mem.join(b.allocator, " ", args) catch @panic("OOM");
+        cexe.setName(b.fmt("bs build-exe -lc with only C sources ({s})", .{label}));
         cexe.addArgs(&.{ "build-exe", "-lc", "-target" });
         cexe.addArgs(args);
         cexe.addFileArg(b.path("test/link_input/cmain.c"));
         cexe.setEnvironmentVariable("BS_ZIG", zig);
-        const cexe_run = std.Build.Step.Run.create(b, b.fmt("run bs -lc build of only C sources ({s})", .{args[0]}));
+        const cexe_run = std.Build.Step.Run.create(b, b.fmt("run bs -lc build of only C sources ({s})", .{label}));
         cexe_run.addFileArg(cexe.addPrefixedOutputFileArg("-femit-bin=", "cmain"));
         cexe_run.addArg("5");
         cexe_run.addCheck(.{ .expect_stdout_exact = "argc=2 q=478165905515354922\n" });

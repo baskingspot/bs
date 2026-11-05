@@ -112,13 +112,17 @@ pub const glibc_start =
 /// no Zig for them; bs's need a Zig root for the start code, compiler_rt
 /// and ubsan_rt. std's
 /// start code still runs, and declares `_start` unless the root does;
-/// `glibc_start.zig` exports it.
+/// `glibc_start.zig` exports it. Its std options are those of upstream's
+/// ubsan_rt.zig root, the only Zig upstream links into C: no networking
+/// (std's I/O would import the socket functions), and no segfault
+/// handler, which upstream's crt1.o does not install.
 pub const c_main =
     \\//! bs's root file for an executable whose `main` is C's: glibc_start.zig
     \\//! calls it, and std's start code exports neither `main` nor `_start`;
     \\//! also for one linked from objects alone, one of which has `_start`.
     \\
     \\pub const _start = {};
+    \\pub const std_options: @import("std").Options = .{ .networking = false, .enable_segfault_handler = false };
     \\
 ;
 

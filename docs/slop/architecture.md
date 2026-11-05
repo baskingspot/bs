@@ -7547,7 +7547,11 @@ libraries as inputs. To be agreed with that thread.
   `__stack_chk_fail` and the std functions it shares with the program
   reach std's default handler, whose I/O imports glibc functions that
   glibc before 2.16 lacks (`accept4`, `sendmmsg`), and the program
-  grows from 275 KB to 2.4 MB.
+  grows from 275 KB to 2.4 MB. Either way the root's std options are
+  upstream's ubsan_rt.zig root's, the only Zig upstream links into C:
+  no networking, so std's I/O imports no socket functions (`accept4`,
+  `getaddrinfo`, `sendmmsg`), and no segfault handler, which crt1.o
+  does not install either.
   Such plain C (`main.plainC`) against glibc also links the way
   upstream's lld link does, where compiler_rt is an archive of one
   member after `-lc` and no ubsan_rt is linked: names glibc defines
