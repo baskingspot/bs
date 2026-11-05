@@ -42,6 +42,7 @@ const Atom = @import("../../link/Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
 const asm_insn = @import("asm_insn.zig");
+const asm_src = @import("../asm_src.zig");
 const cpu_mod = @import("../../cpu.zig");
 const Ssa = @import("../Ssa.zig");
 const switch_br = @import("../switch_br.zig");
@@ -185,7 +186,7 @@ outermost_frame: bool = false,
 /// Assembling container-level assembly (`GlobalAsm`): where errors go.
 global_asm: ?GlobalAsm.Src = null,
 /// Assembling inline assembly: the template's line being assembled, from
-/// 0, where errors go (`asmSpan`).
+/// 0, where errors go (`asm_src.find`).
 asm_line: ?u32 = null,
 /// In a variadic C function: where the prologue saved the argument
 /// registers, and what the named parameters used of them and of the stack.
@@ -539,7 +540,7 @@ fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
     }
     const ip = cg.ip;
     const nav = ip.getNav(ip.keyPayload(.func, cg.ir.func).owner_nav);
-    if (cg.asm_line) |line| if (try cg.asmSpan(line)) |at| {
+    if (cg.asm_line) |line| if (try asm_src.find(cg.emit.zcu, cg.ir.func, if (cg.dbg_open.getLastOrNull()) |o| cg.dbg_inlines.items[o.index] else null, cg.dbg_files.items, cg.dbg_line, cg.dbg_column, line)) |at| {
         try cg.emit.addError(at.file, at.span, "bs codegen: " ++ fmt, args);
         return error.CodegenFail;
     };
@@ -547,39 +548,6 @@ fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
     const decl = cg.emit.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst);
     try cg.emit.addError(nav.file, tree.nodeToSpan(decl.src_node), "bs codegen: " ++ fmt, args);
     return error.CodegenFail;
-}
-
-/// Where the inline assembly being assembled is in its source: the first
-/// `asm` from the last statement's position (`dbg_line`) in the innermost
-/// inlined function's file, at its template's line `line` when that is a
-/// multiline string, else at the template's string or the `asm` keyword.
-fn asmSpan(cg: *CodeGen, line: u32) Error!?struct { file: u32, span: std.zig.Ast.Span } {
-    const ip = cg.ip;
-    const zcu = cg.emit.zcu;
-    const nav = ip.getNav(ip.keyPayload(.func, cg.ir.func).owner_nav);
-    var file = nav.file;
-    var base_line = zcu.file(nav.file).zir.getDeclaration(nav.zir_inst).src_line;
-    if (cg.dbg_open.getLastOrNull()) |open| {
-        const inl = cg.dbg_inlines.items[open.index];
-        if (inl.file != 0) file = cg.dbg_files.items[inl.file - 1];
-        base_line = inl.base_line;
-    }
-    const tree = try zcu.fe.tree(@fromBackingInt(file));
-    var offset: usize = 0;
-    for (0..base_line + cg.dbg_line) |_| offset = (std.mem.findScalarPos(u8, tree.source, offset, '\n') orelse return null) + 1;
-    offset += cg.dbg_column;
-    const tags = tree.tokens.items(.tag);
-    const starts = tree.tokens.items(.start);
-    var t: u32 = 0;
-    while (t < tags.len and (starts[t] < offset or tags[t] != .keyword_asm)) t += 1;
-    if (t == tags.len) return null;
-    var k = t + 1;
-    if (k < tags.len and tags[k] == .keyword_volatile) k += 1;
-    if (k < tags.len and tags[k] == .l_paren) k += 1;
-    const at = if (k + line < tags.len and tags[k] == .multiline_string_literal_line and tags[k + line] == .multiline_string_literal_line)
-        k + line
-    else if (k < tags.len and (tags[k] == .string_literal or tags[k] == .multiline_string_literal_line)) k else t;
-    return .{ .file = file, .span = tree.tokenToSpan(at) };
 }
 
 // ---------------------------------------------------------------------------

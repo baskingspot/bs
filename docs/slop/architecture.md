@@ -1146,7 +1146,8 @@ on a register destination or a `mov`, and a prefix alone on its line.
 and compares each with upstream's bytes. `mov`, `lea`, `push`, `pop`,
 branches, `crc32` and the SSE and AES instructions stay in CodeGen's
 `asmInst`. Errors point at the failing line of the template, found from
-the last statement's position (`asmSpan`).
+the last statement's position (`codegen/asm_src.zig`, which aarch64's
+errors use too).
 
 #### Container-level assembly (built 2026-11-05)
 

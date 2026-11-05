@@ -52,6 +52,7 @@ const Ref = Inst.Ref;
 const Type = @import("../../Type.zig");
 const Emit = @import("../../Emit.zig");
 const Atom = @import("../../link/Atom.zig");
+const asm_src = @import("../asm_src.zig");
 const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
 const vector = @import("vector.zig");
@@ -120,6 +121,9 @@ pending: std.ArrayList(Pending) = .empty,
 outermost_frame: bool = false,
 /// Assembling container-level assembly (`GlobalAsm`): where errors go.
 global_asm: ?GlobalAsm.Src = null,
+/// Assembling inline assembly: the template's line being assembled, from
+/// 0, where errors go (`asm_src.find`).
+asm_line: ?u32 = null,
 /// In a variadic C function: the stack bytes the named parameters use.
 va_stack: u32 = 0,
 /// Debug info, as in the x86_64 backend.
@@ -463,6 +467,10 @@ fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
         try cg.emit.addError(src.file, src.span, fmt, args);
         return error.CodegenFail;
     }
+    if (cg.asm_line) |line| if (try asm_src.find(cg.emit.zcu, cg.ir.func, if (cg.dbg_open.getLastOrNull()) |o| cg.dbg_inlines.items[o.index] else null, cg.dbg_files.items, cg.dbg_line, cg.dbg_column, line)) |at| {
+        try cg.emit.addError(at.file, at.span, "bs codegen (aarch64): " ++ fmt, args);
+        return error.CodegenFail;
+    };
     const ip = cg.ip;
     const nav = ip.getNav(ip.keyPayload(.func, cg.ir.func).owner_nav);
     const tree = try cg.emit.zcu.fe.tree(@fromBackingInt(nav.file));
@@ -4134,6 +4142,9 @@ const AsmArg = union(enum) { sym: struct { key: SymbolKey, off: i32 }, imm: i64,
 const AsmOut = union(enum) { gpr: Reg, fpr: VReg };
 
 fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
+    // Errors point at the statement, and `assemble` at the line in it.
+    cg.asm_line = 0;
+    defer cg.asm_line = null;
     const ip = cg.ip;
     const ir = cg.ir;
     const extra = ir.extraData(Ir.Asm, data.ty_pl.payload);
@@ -4438,7 +4449,11 @@ const LocalLabels = struct {
 fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg)) Error!void {
     var locals: LocalLabels = .{};
     var source_lines = std.mem.tokenizeScalar(u8, source, '\n');
+    var counted: usize = 0;
     while (source_lines.next()) |source_line| {
+        const start = source_line.ptr - source.ptr;
+        cg.asm_line.? += @intCast(std.mem.count(u8, source[counted..start], "\n"));
+        counted = start;
         var code = source_line;
         if (std.mem.find(u8, code, "//")) |i| code = code[0..i];
         var statements = std.mem.tokenizeScalar(u8, code, ';');
