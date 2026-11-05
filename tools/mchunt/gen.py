@@ -224,6 +224,37 @@ def _rb_decl():
                 terms.append(f"for (v.{f}) |e| h = (h ^ {w('e')}) *% 0x100000001b3;")
             else:
                 terms.append(f"h = (h ^ {w(f'v.{f}')}) *% 0x9E3779B97F4A7C15;")
+        # Results through error unions, and loops inside inlined callees (s_erragg).
+        fa, ta, na = next((x for x in fs if x[2]), fs[0])
+        fl = f"{fa}[i % {na}]" if na else fa
+        out.append(f"noinline fn eg{tn}(x: u64, k: u2) E!{tn} {{")
+        out.append("    if (k == 3) return error.Beta;")
+        out.append(f"    var r = mk2{tn}(x);")
+        out.append("    if (k == 2) {")
+        out.append(f"        r.{f2}{'[0]' if n2 else ''} = {cv(t2, 'x >> 3')};")
+        out.append("        return r;")
+        out.append("    }")
+        out.append(f"    return mk{tn}(x, k == 1);")
+        out.append("}")
+        out.append(f"inline fn il{tn}(x: u64, n: usize) {tn} {{")
+        out.append(f"    var r = mk2{tn}(x);")
+        out.append("    var i: usize = 0;")
+        out.append("    while (i < n) : (i += 1) {")
+        out.append(f"        r.{fl} +%= {cv(ta, 'i *% 7 +% x')};")
+        out.append(f"        r.{f1}{'[0]' if n1 else ''} ^= {cv(t1, 'i')};")
+        out.append("    }")
+        out.append("    return r;")
+        out.append("}")
+        out.append(f"inline fn ilE{tn}(x: u64, n: usize) E!{tn} {{")
+        out.append("    if (n > 5) return error.Gamma;")
+        out.append(f"    var r = try eg{tn}(x, @truncate(n));")
+        out.append(f"    for (0..n) |i| r.{fl} -%= {cv(ta, 'i')};")
+        out.append("    return r;")
+        out.append("}")
+        out.append(f"fn tr{tn}(x: u64, k: u2) E!u64 {{")
+        out.append(f"    const v = try eg{tn}(x, k);")
+        out.append(f"    return fold{tn}(&v);")
+        out.append("}")
         out.append(f"fn fold{tn}(v: *const {tn}) u64 {{")
         out.append(f"    var h: u64 = 0;")
         for t_ in terms:
@@ -1148,7 +1179,7 @@ class Gen:
             (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"), (3, "prove"),
             (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"), (2, "window"),
             (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
-            (2, "sroaesc"), (2, "retbig"),
+            (2, "sroaesc"), (2, "retbig"), (2, "erragg"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -2532,6 +2563,50 @@ class Gen:
             self.sink(ctx, field(w), U64)
         else:
             self.sink(ctx, f"fold{tn}(&{v})", U64)
+
+    def s_erragg(self, ctx):
+        """Large struct results through error unions (try, catch unreachable
+        into a var, catch with a fallback, if/else on the union) and loops
+        inside inlined callees."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        tn = self.pick(list(RB_TYPES))
+        e = lambda s_: self.emit(ctx, s_)
+        u64 = lambda: self.int_expr(ctx, U64, 1)
+        kq = lambda: f"@as(u2, @truncate({self.int_expr(ctx, U64, 1)})) % 3"  # never 3: no error
+        k = lambda: f"@as(u2, @truncate({self.int_expr(ctx, U64, 1)}))"
+        nn = lambda: f"@as(usize, @as(u3, @truncate({self.int_expr(ctx, U64, 1)})))"
+        w = self.fresh("ew")
+        e(f"var {w}: {tn} = eg{tn}({u64()}, {kq()}) catch unreachable;")
+        for _ in range(self.r.randint(1, 4)):
+            j = self.r.randrange(6)
+            if j == 0:
+                e(f"{w} = il{tn}(fold{tn}(&{w}), {nn() if self.chance(0.6) else self.r.randint(0, 6)});")
+            elif j == 1:
+                e(f"{w} = eg{tn}(fold{tn}(&{w}), {k()}) catch |err| switch (err) {{ error.Beta => mk2{tn}({u64()}), else => {w} }};")
+            elif j == 2:
+                e(f"{w} = ilE{tn}({u64()}, {nn()}) catch mk2{tn}({self.lit(U64)});")
+            elif j == 3:
+                self.sink(ctx, f"(tr{tn}({u64()}, {k()}) catch |err| @as(u64, switch (err) {{ error.Alpha => 1, error.Beta => 2, error.Gamma => 3 }}))", U64)
+            elif j == 4:
+                v = self.fresh("ev")
+                e(f"if (eg{tn}({u64()}, {k()})) |{v}| {{")
+                ctx["indent"] += 1
+                self.sink(ctx, f"fold{tn}(&{v})", U64)
+                ctx["indent"] -= 1
+                e("} else |err| {")
+                ctx["indent"] += 1
+                self.sink(ctx, f"@as(u8, @intFromBool(err == error.Beta))", Int(False, 8))
+                ctx["indent"] -= 1
+                e("}")
+            else:
+                i = self.fresh("ei")
+                e(f"for (0..{self.r.randint(1, 4)}) |{i}| {{")
+                ctx["indent"] += 1
+                e(f"{w} = il{tn}(fold{tn}(&{w}) +% {i}, {i} + 1);")
+                ctx["indent"] -= 1
+                e("}")
+        self.sink(ctx, f"fold{tn}(&{w})", U64)
 
     def s_bigcopy(self, ctx):
         """Whole copies of a 64-256 byte struct: into locals, globals and
