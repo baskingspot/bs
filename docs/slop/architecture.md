@@ -7713,10 +7713,14 @@ libraries as inputs. To be agreed with that thread.
   caches like one. When no C source's object references a `__ubsan_*`
   handler (none has `-fsanitize-c=full`, or its code has nothing UBSan
   checks, such as calls to `sin` and `cos`) and there are no object
-  inputs, nothing reports through a panic handler (`main.plainC`; on
-  x86_64 the build waits for the C objects before analysis to read
+  inputs, nothing reports through a panic handler (`main.plainC`: the
+  build waits for the C objects, ELF or Mach-O, before analysis to read
   their undefined symbols, as upstream's archive of ubsan_rt is pulled
-  only by a reference). The root then
+  only by a reference). On aarch64-macos such plain C roots neither
+  ubsan_rt nor ssp either (libSystem has `__stack_chk_fail`): hello
+  is 33 KB instead of 1.29 MB, a dylib of `sin` and `cos` 34 KB instead
+  of 1.31 MB; its names still bind to compiler_rt before libSystem,
+  where upstream imports libSystem's (2026-11-05). The root then
   sets `panic = std.debug.no_panic`: upstream's crt1.o and compiler_rt
   (built with no safety) have none either. Otherwise compiler_rt's
   `__stack_chk_fail` and the std functions it shares with the program

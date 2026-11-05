@@ -124,8 +124,8 @@ pub fn parseObject(arena: Allocator, path: []const u8, bytes: []const u8) Error!
 
 /// Whether ELF object `bytes` references, without defining, a symbol whose
 /// name starts with `prefix`; true if it does not parse.
-pub fn referencesUndefined(arena: Allocator, bytes: []const u8, prefix: []const u8) Allocator.Error!bool {
-    const o = parseObject(arena, "", bytes) catch |err| switch (err) {
+pub fn referencesUndefined(arena: Allocator, bytes: []const u8, arch: Atom.Unwind.Arch, prefix: []const u8) Allocator.Error!bool {
+    const o = parseObjectFor(arena, "", bytes, arch) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return true,
     };

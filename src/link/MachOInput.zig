@@ -165,6 +165,21 @@ fn thinSlice(bytes: []const u8) Error![]const u8 {
     return error.InvalidObject;
 }
 
+/// Whether Mach-O object `file` references, without defining, a symbol
+/// whose name, without its leading underscore, starts with `prefix`; true
+/// if it does not parse.
+pub fn referencesUndefined(arena: Allocator, file: []const u8, prefix: []const u8) Allocator.Error!bool {
+    const o = parseObject(arena, "", file) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return true,
+    };
+    for (o.syms) |sym| {
+        if (sym.isStab() or !sym.isExternal() or sym.kind() != macho.N_UNDF or sym.n_value != 0) continue;
+        if (std.mem.startsWith(u8, o.linkName(sym), prefix)) return true;
+    }
+    return false;
+}
+
 pub fn parseObject(arena: Allocator, path: []const u8, file: []const u8) Error!Object {
     const bytes = try thinSlice(file);
     if (bytes.len < @sizeOf(macho.mach_header_64)) return error.InvalidObject;

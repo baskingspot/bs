@@ -999,16 +999,18 @@ fn cxxRuntime(opts: *const Options) bool {
 /// inputs, which may. Upstream links ubsan_rt, an archive member, only
 /// when something references it, and its compiler_rt (an archive after
 /// libc, of one member) only for names libc lacks. Waits for the C
-/// objects of a build with `-fsanitize-c=full` sources; on aarch64, such
-/// a build counts as calling ubsan_rt.
+/// objects of a build with `-fsanitize-c=full` sources.
 fn plainC(arena: std.mem.Allocator, opts: *const Options, c_batch: ?*CSource.Batch) !bool {
     if (!opts.c_root or opts.link_inputs.len != 0) return false;
     for (opts.c_sources) |s| {
         if (s.flags.sanitizeC() == .full) break;
     } else return true;
-    if (opts.bs_target.arch() != .x86_64) return false;
     const b = c_batch orelse return false;
-    for ((try b.wait()).objects) |o| if (try ElfInput.referencesUndefined(arena, o.bytes, "__ubsan_")) return false;
+    for ((try b.wait()).objects) |o| if (switch (opts.bs_target) {
+        .aarch64_macos => try MachOInput.referencesUndefined(arena, o.bytes, "__ubsan_"),
+        .x86_64_linux => try ElfInput.referencesUndefined(arena, o.bytes, .x86_64, "__ubsan_"),
+        .aarch64_linux => try ElfInput.referencesUndefined(arena, o.bytes, .aarch64, "__ubsan_"),
+    }) return false;
     return true;
 }
 
@@ -1110,11 +1112,11 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
         // Only executables link the C runtimes; a library's C objects
         // reach them when an executable links the library, as upstream's.
-        // Plain C (`plainC`) against glibc links neither, as upstream's,
-        // and calls glibc's `__stack_chk_fail`; glibc before 2.4 lacks
-        // it, and upstream's then comes from compiler_rt.
+        // Plain C (`plainC`) against glibc or libSystem links neither, as
+        // upstream's, and calls the libc's `__stack_chk_fail`; glibc
+        // before 2.4 lacks it, and upstream's then comes from compiler_rt.
         .c_runtimes = !opts.objects_only and ((!opts.command.isObj() and opts.command != .build_lib) or opts.dynamic) and (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp) and
-            !(plain and opts.glibc_version != null and opts.glibc_version.?.order(.{ .major = 2, .minor = 4, .patch = 0 }) != .lt),
+            !(plain and (opts.bs_target == .aarch64_macos or opts.glibc_version != null and opts.glibc_version.?.order(.{ .major = 2, .minor = 4, .patch = 0 }) != .lt)),
     });
     defer fe.deinit();
     try fe.enableCache(job.cache_dirs);
