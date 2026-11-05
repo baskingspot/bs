@@ -1150,6 +1150,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     link_inputs.shared = emit.shared;
     link_inputs.dynamic = glibc != null or emit.shared;
     link_inputs.shared_libs = shared_libs;
+    link_inputs.lld = opts.c_root;
     if (c_batch) |b| if (!emit.obj or emit.shared) {
         emit.inputs = &link_inputs;
         emit.c_batch = b;

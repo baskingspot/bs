@@ -3649,8 +3649,14 @@ differs from the design above:
 - .symtab: each input function, object, thread-local and assembly
   label (STT_NOTYPE, without `.L` labels) gets an entry
   (`Elf.Options.local_symbols`: name, atom key, offset, size; type and
-  section from the atom's place), except the one that names its atom. Keyed links only; a numbered link rejects them until the cache
-  relinks inputs.
+  section from the atom's place), except the one that names its atom.
+  Entries are local, as upstream's own linker lists them in programs
+  with Zig code; in a C-only program (`ElfInput.lld`), which upstream
+  links with lld, the globals of default or protected visibility that
+  the link keeps are STB_GLOBAL or STB_WEAK as lld lists them
+  (`LocalSymbol.bind`), after every local entry (sh_info), and one at
+  offset 0 replaces its atom's own symbol (2026-11-05). Keyed links only;
+  a numbered link rejects them until the cache relinks inputs.
 - .dynsym: an import of a library's function (STT_FUNC or
   STT_GNU_IFUNC there, or not data in glibc's abilists) is STT_FUNC, as
   both of upstream's linkers write it; others are STT_NOTYPE, or

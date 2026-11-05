@@ -773,7 +773,7 @@ fn linkWithInputs(
 ) !?Linked {
     const gpa = inc.gpa;
     const io = inc.io;
-    var objects: ElfInput = .{ .arena = arena, .dynamic = glibc != null, .shared_libs = shared };
+    var objects: ElfInput = .{ .arena = arena, .dynamic = glibc != null, .shared_libs = shared, .lld = inc.lld };
     for (inc.link_objects, 0..) |path, n| {
         const bytes = try inc.mapInput(arena, maps, path) orelse return null;
         const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");

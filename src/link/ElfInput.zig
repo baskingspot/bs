@@ -54,6 +54,11 @@ dynamic: bool = false,
 /// them before the C++ runtime's archives (`addArchive`'s `runtime`), so
 /// a name one of them defines pulls no member from those archives.
 shared_libs: []const ElfShared = &.{},
+/// A C-only program, which upstream links with lld: the objects' globals
+/// of default or protected visibility are listed in .symtab as global
+/// (`Elf.LocalSymbol.bind`), as lld lists them, rather than local, as
+/// upstream's own linker lists them in programs with Zig code.
+lld: bool = false,
 
 pub const Def = struct { object: u32, sym: u32, weak: bool };
 pub const Common = struct { size: u64, alignment: u64 };
@@ -295,6 +300,12 @@ pub const Target = struct {
     import: bool = false,
 };
 
+/// Whether symbol `s` of `o` is the definition the link keeps for `name`.
+fn isKept(in: *const Inputs, o: *const Object, s: u32, name: []const u8) bool {
+    const d = in.defs.get(name) orelse return false;
+    return &in.objects.items[d.object] == o and d.sym == s;
+}
+
 /// The definition objects give `name`, or null.
 pub fn lookup(in: *Inputs, name: []const u8) Allocator.Error!?Target {
     if (in.defs.get(name)) |d| {
@@ -507,10 +518,18 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
             // Assembly labels are STT_NOTYPE; the assembler's own `.L`
             // labels stay out, as upstream's.
             if (ty != elf.STT_FUNC and ty != elf.STT_OBJECT and ty != elf.STT_TLS and ty != elf.STT_NOTYPE) continue;
-            if (sym.st_shndx >= o.shdrs.len or !c.whole[sym.st_shndx] or c.names[sym.st_shndx] == s_index) continue;
+            if (sym.st_shndx >= o.shdrs.len or !c.whole[sym.st_shndx]) continue;
             const name = o.symName(sym);
             if (name.len == 0 or std.mem.startsWith(u8, name, ".L")) continue;
-            try symbols.append(arena, .{ .name = name, .atom = sectionKey(o, sym.st_shndx), .offset = sym.st_value, .size = sym.st_size });
+            // The definition the link keeps, unless the merged visibility
+            // hides it.
+            const bind: @FieldType(Elf.LocalSymbol, "bind") = if (in.lld and s_index >= o.first_global and in.isKept(o, @intCast(s_index), name) and
+                (in.visibility.get(name) orelse 0) != 1 and (in.visibility.get(name) orelse 0) != 2)
+                if (sym.st_bind() == elf.STB_WEAK) .weak else .global
+            else
+                .local;
+            if (bind == .local and c.names[sym.st_shndx] == s_index) continue;
+            try symbols.append(arena, .{ .name = name, .atom = sectionKey(o, sym.st_shndx), .offset = sym.st_value, .size = sym.st_size, .bind = bind });
         }
     }
     for (in.commons.keys(), in.commons.values()) |name, common| {

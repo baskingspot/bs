@@ -142,6 +142,10 @@ pub const LocalSymbol = struct {
     atom: SymbolKey,
     offset: u64,
     size: u64,
+    /// A C global, listed STB_GLOBAL (or STB_WEAK) after every local
+    /// symbol, as lld lists them. At offset 0 it also replaces its atom's
+    /// own (local) symbol.
+    bind: enum { local, global, weak } = .local,
 };
 
 /// An input object's section that is copied rather than made atoms of
@@ -781,6 +785,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // Atom chunks, then debug chunks, then input sections.
     const failures = try gpa.alloc(?Failure, @max(n_chunks + n_debug_chunks + inputs.len, n_partitions));
     defer gpa.free(failures);
+    var unlisted: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty;
+    defer unlisted.deinit(gpa);
+    for (options.local_symbols) |ls| if (ls.bind != .local and ls.offset == 0) try unlisted.put(gpa, ls.atom, {});
     var l: Link = .{
         .gpa = gpa,
         .input = input,
@@ -799,6 +806,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .keys = keys,
         .chunks = chunks,
         .symbols = &symbols,
+        .unlisted = &unlisted,
         .failures = failures,
         .input_sections = inputs,
         .input_offs = input_offs,
@@ -843,6 +851,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     defer gpa.free(local_atoms);
     const local_sym = n_syms;
     const local_str = strtab_len;
+    // The global ones go last, after every local symbol (.symtab's sh_info).
+    var n_globals: u32 = 0;
     for (options.local_symbols, local_atoms) |ls, *atom| {
         atom.* = @intCast(symbols.get(ls.atom) orelse {
             diag.* = .{ .atom = ls.name, .target = ls.atom };
@@ -853,6 +863,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             return error.InvalidSymbols;
         }
         n_syms = std.math.add(u32, n_syms, 1) catch return error.OutOfMemory;
+        n_globals += @intFromBool(ls.bind != .local);
         strtab_len += ls.name.len + 1;
     }
     // A shared object's dynamic tables, and the atoms of its exports.
@@ -1295,11 +1306,19 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         const strs = try gpa.alloc(u8, strtab_len - local_str);
         defer gpa.free(strs);
         var at: usize = 0;
-        for (options.local_symbols, local_atoms, syms) |ls, atom, *sym| {
+        var k: usize = 0;
+        for ([_]bool{ false, true }) |globals| for (options.local_symbols, local_atoms) |ls, atom| {
+            if ((ls.bind != .local) != globals) continue;
             const p = places[atom];
+            const sym = &syms[k];
+            k += 1;
             sym.* = .{
                 .name = @intCast(local_str + at),
-                .info = .{ .type = sym_types[p.section], .bind = .LOCAL },
+                .info = .{ .type = sym_types[p.section], .bind = switch (ls.bind) {
+                    .local => .LOCAL,
+                    .global => .GLOBAL,
+                    .weak => .WEAK,
+                } },
                 .other = .{ .visibility = .DEFAULT },
                 .shndx = l.shndx[p.section],
                 .value = l.atomAddr(atom) + ls.offset - l.sym_bias[p.section],
@@ -1308,7 +1327,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             @memcpy(strs[at..][0..ls.name.len], ls.name);
             strs[at + ls.name.len] = 0;
             at += ls.name.len + 1;
-        }
+        };
         try l.put(symtab_off + @as(u64, local_sym) * @sizeOf(elf.Elf64.Sym), std.mem.sliceAsBytes(syms));
         try l.put(strtab_off + local_str, strs);
     }
@@ -1503,7 +1522,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         shdr(shName(".data"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
         shdr(shName(".bss"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
     } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ extra_shdrs ++ dyn_shdrs ++ interp_shdrs ++ version_shdrs ++ [_]elf.Elf64.Shdr{
-        .{ .name = shName(".symtab"), .type = .SYMTAB, .flags = .{ .shf = .{} }, .addr = 0, .offset = symtab_off, .size = n_syms * @sizeOf(elf.Elf64.Sym), .link = strtab_ndx, .info = n_syms, .addralign = 8, .entsize = @sizeOf(elf.Elf64.Sym) },
+        .{ .name = shName(".symtab"), .type = .SYMTAB, .flags = .{ .shf = .{} }, .addr = 0, .offset = symtab_off, .size = n_syms * @sizeOf(elf.Elf64.Sym), .link = strtab_ndx, .info = n_syms - n_globals, .addralign = 8, .entsize = @sizeOf(elf.Elf64.Sym) },
         nonAlloc(shName(".strtab"), .STRTAB, strtab_off, strtab_len),
         nonAlloc(shName(".shstrtab"), .STRTAB, shstrtab_off, shstr.len),
     };
@@ -1599,6 +1618,9 @@ fn LinkOf(comptime Input: type) type {
         /// Maps a key to the index of the atom kept for it, and from
         /// `resolveAddrs` on to its address.
         symbols: *SymbolTable,
+        /// The atoms a global `Options.local_symbols` entry lists instead
+        /// of their own symbol.
+        unlisted: *const std.AutoHashMapUnmanaged(SymbolKey, void),
         /// One slot per task. A phase reports the failure of the lowest atom,
         /// whatever the thread timing.
         failures: []?Failure,
@@ -1939,7 +1961,7 @@ fn LinkOf(comptime Input: type) type {
                 };
                 c.sizes[s] = off + a.size();
                 c.aligns[s] = c.aligns[s].max(a.alignment);
-                if (listed(a)) {
+                if (l.listed(a)) {
                     c.n_syms += 1;
                     c.str_len += @intCast(a.name.len + 1);
                 }
@@ -2172,6 +2194,11 @@ fn LinkOf(comptime Input: type) type {
 
         /// Sets `res` to the addresses or values of the targets of `a`, atom
         /// `i`, from `addrs`.
+        /// Whether atom `a` has its own symbol.
+        fn listed(l: *const Link, a: *const Atom) bool {
+            return listedAtom(a) and (l.unlisted.count() == 0 or !l.unlisted.contains(a.key));
+        }
+
         fn resolveNumbered(l: *Link, a: *const Atom, i: usize, chunk: usize, res: []u64) bool {
             const s = l.numbered.?;
             const first = s.atoms[i].targets;
@@ -2298,7 +2325,7 @@ fn LinkOf(comptime Input: type) type {
                         rela_at += @sizeOf(elf.Elf64.Rela);
                     };
                 }
-                if (!listed(a)) continue;
+                if (!l.listed(a)) continue;
                 const name = c.str + @as(u32, @intCast(str_off));
                 @memcpy(out[strtab][str_off..][0..a.name.len], a.name);
                 out[strtab][str_off + a.name.len] = 0;
@@ -2628,7 +2655,7 @@ fn symType(kind: Atom.Reloc.Kind) ?elf.R_X86_64 {
 /// Whether atom `a` has a symbol-table entry: not if it has no name or a
 /// section's (`.data`), as `ElfInput` names a C object's section that no
 /// one symbol covers, whose symbols it lists instead (`local_symbols`).
-fn listed(a: *const Atom) bool {
+fn listedAtom(a: *const Atom) bool {
     return a.name.len > 0 and a.name[0] != '.';
 }
 
@@ -2895,6 +2922,30 @@ test "links and runs a program that writes from rodata and exits with 42" {
     try std.testing.expectEqual(7 * @sizeOf(elf.Elf64.Sym), symtab.size);
     const in_sect = testSymbolAddr(unnamed_bytes, "in_sect").?;
     try std.testing.expectEqualStrings("efgh", unnamed_bytes[in_sect - testSectionAddr(unnamed_bytes, ".data") + testSection(unnamed_bytes, ".data").?.offset ..][0..4]);
+
+    // Global ones (a C-only program's, as lld lists them) come after every
+    // local symbol, where .symtab's sh_info points; one at offset 0
+    // replaces its atom's own symbol.
+    with_locals.local_symbols = &.{
+        .{ .name = "status", .atom = status, .offset = 0, .size = 4, .bind = .global },
+        .{ .name = "in_sect", .atom = sect, .offset = 4, .size = 4 },
+        .{ .name = "sect_weak", .atom = sect, .offset = 1, .size = 1, .bind = .weak },
+    };
+    const global_bytes = try emit(gpa, io, &unnamed, with_locals);
+    defer gpa.free(global_bytes);
+    const gsymtab = testSection(global_bytes, ".symtab").?;
+    const gstrtab = testSection(global_bytes, ".strtab").?;
+    const gsyms = std.mem.bytesAsSlice(elf.Elf64.Sym, global_bytes[gsymtab.offset..][0..gsymtab.size]);
+    // The null symbol, four named atoms (not `status`), `in_sect`, then the
+    // two global ones.
+    try std.testing.expectEqual(8, gsyms.len);
+    try std.testing.expectEqual(6, gsymtab.info);
+    for (gsyms[6..], [_][]const u8{ "status", "sect_weak" }, [_]elf.STB{ .GLOBAL, .WEAK }) |sym, name, bind| {
+        try std.testing.expectEqualStrings(name, std.mem.sliceTo(global_bytes[gstrtab.offset + sym.name ..], 0));
+        try std.testing.expectEqual(bind, sym.info.bind);
+    }
+    for (gsyms[0..6]) |sym| try std.testing.expectEqual(elf.STB.LOCAL, sym.info.bind);
+    try std.testing.expectEqual(testSymbolAddr(unnamed_bytes, "status").?, gsyms[6].value);
 }
 
 test "a shared object links the same with numbered symbols" {
