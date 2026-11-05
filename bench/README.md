@@ -463,3 +463,18 @@ targets, which the corpus checks out and records first), `--runs`, `--no-upstrea
 PATH.json`. Upstream's builds are kept in `bench/.work/realworld/bin` and
 reused; the compiler has no ReleaseSafe column, since LLVM needs more than an
 orb's 7 GB to build it.
+
+`--callgrind` builds every binary with `-fno-valgrind` and runs each once
+more under callgrind. Next to each wall time it reports the Ir spent in
+`std.heap.SafeAllocator.captureStackTrace`, and in a second table each
+binary's Ir with and without that capture. Judge codegen changes on the Ir
+without capture. In a Debug build (bs's, or upstream's Debug), std's
+`SafeAllocator` records a 7-frame stack trace on every allocation and
+free, unwinding through DWARF CFI with a 2048-slot direct-mapped cache
+keyed by a hash of each return address. When two return addresses the
+allocator passes through on every capture share a slot, every capture
+misses, so the cost depends on where code lands, not on what it does.
+Padding one unrelated function by 1 KB moved zig-sema between 35.5G and
+41.4G Ir (wall 3.2 s to 3.7 s), while its Ir without capture stayed within
+0.1%. The capture is about 30% of zig-sema's Ir and two thirds of
+zls-test's. Upstream's ReleaseSafe builds record no traces.

@@ -20,6 +20,14 @@ same output, and reports the median wall time of each:
             runs them all). A mode that fails to build or run is reported
             as failing; the other modes still run.
 
+With --callgrind, every build also gets -fno-valgrind, and each binary runs
+once more under callgrind. That run reports its instructions (Ir), and how
+many of them were spent in std's heap.SafeAllocator.captureStackTrace, the
+stack trace a Debug build records on every allocation and free. Which
+return addresses collide in std's unwinder cache depends on code layout, so
+that part swings by several billion Ir between builds whose code is the
+same (zig-sema, zls-test); compare codegen changes on the Ir without it.
+
 Upstream's builds of a workload do not change, so they are kept in the work
 directory and reused. The compiler has no ReleaseSafe build: LLVM needs more
 memory for it than an orb's 7 GB.
@@ -354,6 +362,46 @@ def fmt_s(s):
     return f"{s:.2f} s" if s >= 1 else f"{s * 1000:.0f} ms"
 
 
+def fmt_ir(n):
+    return f"{n / 1e9:.3f}G" if n >= 1e8 else f"{n / 1e6:.1f}M"
+
+
+# The Debug-only stack trace std's SafeAllocator records per allocation and
+# free; its cost depends on code layout (see the module docstring).
+CAPTURE = re.compile(r":heap\.SafeAllocator\.captureStackTrace(?: \[|$)")
+
+
+def callgrind(w, binary):
+    """Runs the program once under callgrind; returns (Ir, Ir in stack capture)."""
+    with tempfile.TemporaryDirectory(prefix="bs-rw-cg-") as tmp:
+        out = os.path.join(tmp, "callgrind.out")
+        argv = [binary if a == "{bin}" else a.replace("{tmp}", tmp) for a in w.run_argv]
+        r = subprocess.run(
+            ["valgrind", "--tool=callgrind", "--main-stacksize=1073741824", f"--callgrind-out-file={out}", *argv],
+            cwd=w.run_cwd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if not w.run_ok(r.returncode):
+            raise BuildError(f"callgrind run of {binary} exited with {r.returncode}:\n{r.stderr[-4000:]}")
+        ann = subprocess.run(
+            ["callgrind_annotate", "--inclusive=yes", "--threshold=100", out], capture_output=True, check=True
+        ).stdout.decode("utf-8", "replace")
+    total = capture = 0
+    for line in ann.splitlines():
+        m = re.match(r"\s*([\d,]+) \(", line)
+        if not m:
+            continue
+        n = int(m.group(1).replace(",", ""))
+        if "PROGRAM TOTALS" in line:
+            total = n
+        elif CAPTURE.search(line):
+            capture = max(capture, n)
+    return total, capture
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--compiler", default="zig-out/bin/bs", help="bs binary (default: zig-out/bin/bs)")
@@ -375,6 +423,11 @@ def main():
         help="work directory; keeps upstream's builds (default: bench/.work/realworld)",
     )
     ap.add_argument("--out", help="write PATH.json")
+    ap.add_argument(
+        "--callgrind",
+        action="store_true",
+        help="build with -fno-valgrind and also report each binary's callgrind Ir, with and without std's stack capture",
+    )
     args = ap.parse_args()
 
     bs = os.path.abspath(args.compiler)
@@ -393,13 +446,16 @@ def main():
         results[wname] = {}
         outputs = {}
         for mode in modes:
-            out = os.path.join(args.work, "bin", f"{w.key}-{mode}")
+            out = os.path.join(args.work, "bin", f"{w.key}-{mode}{'-novg' if args.callgrind else ''}")
             os.makedirs(os.path.dirname(out), exist_ok=True)
             compiler = bs if mode == "bs" else zig
             try:
                 if (w.key, mode) not in built and (mode == "bs" or not os.path.exists(out)):
                     print(f"building {w.key} with {mode}...", file=sys.stderr, flush=True)
-                    built[(w.key, mode)] = build(w.build_argv(compiler, mode, out), w.cwd, out)
+                    argv = w.build_argv(compiler, mode, out)
+                    if args.callgrind:
+                        argv.insert(2, "-fno-valgrind")
+                    built[(w.key, mode)] = build(argv, w.cwd, out)
                 times = []
                 for _ in range(args.runs):
                     t, o = w.run_once(out)
@@ -414,6 +470,14 @@ def main():
                 results[wname][mode] = {"error": str(e).splitlines()[0]}
                 continue
             results[wname][mode] = {"median": statistics.median(times), "min": min(times), "max": max(times)}
+            if args.callgrind:
+                print(f"callgrind: {wname} ({mode})...", file=sys.stderr, flush=True)
+                try:
+                    ir, capture = callgrind(w, out)
+                except BuildError as e:
+                    print(f"{wname} ({mode}): {e}", file=sys.stderr, flush=True)
+                    continue
+                results[wname][mode].update(ir=ir, capture_ir=capture)
         if len(set(outputs.values())) > 1:
             print(f"{wname}: the builds printed different output: {outputs}", file=sys.stderr, flush=True)
             results[wname]["output_differs"] = True
@@ -429,16 +493,37 @@ def main():
     def ratio(r, m):
         return f"{r['bs']['median'] / r[m]['median']:.2f}x" if ok(r, m) and ok(r, "bs") else "-"
 
-    header = "| workload | " + " | ".join(all_modes) + "".join(f" | bs / {m}" for m in all_modes[1:]) + " |"
+    def ir_cell(r, m, key):
+        return fmt_ir(r[m][key]) if m in r and key in r[m] else "-"
+
+    # With --callgrind, each wall time has its stack capture's Ir beside
+    # it, which tells a wall time that moved with layout from one that
+    # moved with the code.
+    cols = [f"{m} | {m} capture Ir" if args.callgrind else m for m in all_modes]
+    header = "| workload | " + " | ".join(cols) + "".join(f" | bs / {m}" for m in all_modes[1:]) + " |"
     print(header)
     print("|" + "---|" * (header.count("|") - 1))
     for wname, r in results.items():
+        cells = [cell(r, m) + (f" | {ir_cell(r, m, 'capture_ir')}" if args.callgrind else "") for m in all_modes]
         print(
             f"| {wname}{' (output differs)' if r.get('output_differs') else ''} | "
-            + " | ".join(cell(r, m) for m in all_modes)
+            + " | ".join(cells)
             + "".join(f" | {ratio(r, m)}" for m in all_modes[1:])
             + " |"
         )
+    if args.callgrind:
+        # Ir without the stack capture is the number to compare codegen on.
+        for r in results.values():
+            for v in r.values():
+                if isinstance(v, dict) and "ir" in v:
+                    v["ir_without_capture"] = v["ir"] - v["capture_ir"]
+        print()
+        header = "| workload | " + " | ".join(f"{m} Ir without capture | {m} Ir" for m in all_modes) + " |"
+        print(header)
+        print("|" + "---|" * (header.count("|") - 1))
+        for wname, r in results.items():
+            cells = [f"{ir_cell(r, m, 'ir_without_capture')} | {ir_cell(r, m, 'ir')}" for m in all_modes]
+            print(f"| {wname} | " + " | ".join(cells) + " |")
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"compiler": bs, "runs": args.runs, "results": results}, f, indent=1)
