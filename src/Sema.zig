@@ -17309,7 +17309,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
             },
             .bool => seen.values.count() == 2,
             .void => seen.values.count() == 1,
-            .int, .@"struct", .@"union" => sema.switchCoversAllInts(&seen, operand_ty),
+            .int, .@"struct", .@"union" => try sema.switchCoversAllInts(&seen, operand_ty),
             else => false,
         };
         if (all_handled) return sema.fail(parent, else_src, "unreachable else prong; all cases already handled", .{});
@@ -17360,7 +17360,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         } else if (!sema.isOwnIes(operand_ty))
             return sema.fail(parent, src, "else prong required when switching on type '{f}'", .{sema.fmtType(.anyerror_type)}),
         .void => if (cases.items.len == 0) return sema.fail(parent, src, "switch must handle all possibilities", .{}),
-        .int, .@"struct", .@"union" => if (!sema.switchCoversAllInts(&seen, operand_ty))
+        .int, .@"struct", .@"union" => if (!try sema.switchCoversAllInts(&seen, operand_ty))
             return sema.fail(parent, src, "switch must handle all possibilities", .{}),
         else => return sema.fail(parent, src, "else prong required when switching on type '{f}'", .{sema.fmtType(operand_ty)}),
     };
@@ -17631,7 +17631,7 @@ fn switchCaseMatches(sema: *Sema, c: SwitchCase, v: Index) !bool {
 /// Whether the items and ranges `seen` cover every value of int type `ty`,
 /// or of packed type `ty`'s backing integer: they are distinct values of
 /// the type, so they do if there are as many as it has values.
-fn switchCoversAllInts(sema: *Sema, seen: *const SwitchSeen, ty: Index) bool {
+fn switchCoversAllInts(sema: *Sema, seen: *const SwitchSeen, ty: Index) !bool {
     const ip = sema.ip;
     if (ty == .comptime_int_type) return false;
     if (Type.isPacked(ip, ty)) {
@@ -17641,7 +17641,20 @@ fn switchCoversAllInts(sema: *Sema, seen: *const SwitchSeen, ty: Index) bool {
     // The prongs' ranges are disjoint, so they cover the type when their
     // lengths add up to its size.
     const info = Type.intInfo(ip, ty);
-    if (info.bits > 128) return false;
+    if (info.bits > 128) {
+        var count = try BigInt.init(sema.arena);
+        var len = try BigInt.init(sema.arena);
+        for (seen.ranges.items) |r| {
+            const first = try sema.bigValue(r.first);
+            const last = try sema.bigValue(r.last);
+            try len.sub(&last, &first);
+            try len.addScalar(&len, 1);
+            try count.add(&count, &len);
+        }
+        var size = try BigInt.initSet(sema.arena, 1);
+        try size.shiftLeft(&size, info.bits);
+        return count.eql(size);
+    }
     var count: u256 = 0;
     for (seen.ranges.items) |r| {
         const first: i256 = if (info.signedness == .signed) ip.intValue(i128, r.first).? else ip.intValue(u128, r.first).?;
