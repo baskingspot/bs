@@ -622,6 +622,8 @@ const Hasher = struct {
 
     /// The child of pointer type `ty`, whose memory the code addresses.
     fn notePointee(h: *Hasher, ty: Index) Allocator.Error!void {
+        // An `alloc` can have no type (`Ssa.fillBase`).
+        if (ty == .none) return;
         switch (h.ip.indexToKey(ty)) {
             .ptr_type => |p| try h.noteValue(p.child),
             else => try h.noteValue(ty),
