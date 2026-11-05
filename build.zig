@@ -1349,6 +1349,20 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &dm.step, 40);
         test_step.dependOn(&dm.step);
     }
+    // A store entry across compilations whose types lay out differently:
+    // test/run/store_layout.sh.
+    {
+        const sl = b.addSystemCommand(&.{"sh"});
+        sl.setName("bs store entry across layouts");
+        sl.addFileArg(b.path("test/run/store_layout.sh"));
+        sl.addArtifactArg(bs);
+        _ = sl.addOutputDirectoryArg("work");
+        sl.addDirectoryArg(std_zir);
+        sl.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+        sl.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &sl.step, 15);
+        test_step.dependOn(&sl.step);
+    }
     // A compiler_rt edit without its old ZIR: test/run/edit_rt_old_zir.sh.
     {
         const rt = b.addSystemCommand(&.{"sh"});

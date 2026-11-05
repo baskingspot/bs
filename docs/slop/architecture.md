@@ -4495,7 +4495,15 @@ value model:
   object an import). A declaration's data is then no longer a function
   of its value alone: an edited object moves the definition, so a
   `nav_val` node's store entry (`exact_hash`) mixes in its atoms'
-  relocations, and an eager build with inputs writes the new record. A
+  relocations, and an eager build with inputs writes the new record.
+  Since 2026-11-05 it mixes in the whole records, as a function's does
+  (contents, section, alignment, zero-fill size, debug info): its type's
+  layout can differ under the same key, source and value in another
+  compilation of the same store seed. std.testing's `io_instance`, an
+  undefined `Io.Threaded`, is 880 bytes without libc and 1136 with it
+  (`posix.Sigaction`), and a `-lc` test reused a libc-less test's entry,
+  so its relink, and a donor build from its manifest, gave the variable
+  880 bytes (test/run/store_layout.sh). A
   lazy build keeps the data it does not lower, as the last build bound
   it (its inputs are unchanged, else it is eager, and it falls back when
   the exports change). It does not load link inputs, so one that lowers

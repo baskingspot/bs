@@ -3534,47 +3534,50 @@ const Graph = struct {
 
             const Self = @This();
             fn run(c: Self, lo: usize, hi: usize, _: usize) !void {
-                for (c.nodes[lo..hi]) |*n| switch (n.tag) {
-                    .func, .link, .content => {
-                        var h: Hash = 0;
-                        // What the atoms' records hold besides their contents:
-                        // a store entry is reused only if its records are
-                        // these, byte for byte.
-                        var rest: Hash = 0;
-                        for (n.atoms) |ai| {
-                            const a = &c.atoms[ai];
-                            h = h *% 31 +% contentsHash(a);
-                            rest = rest *% 31 +% cache.hash(@truncate(@backingInt(a.key)), "");
-                            if (c.debug_of[ai]) |d| {
-                                h +%= cache.hash(@truncate(h), d.lines);
-                                rest = rest *% 31 +% d.base_line +% cache.hash(6, d.file) +% cache.hash(7, d.name);
-                                rest = rest *% 31 +% cache.hash(8, d.unit);
-                                // Inline calls carry their callees' base lines,
-                                // which move without the caller changing.
-                                if (d.inlines.len | d.patches.len | d.files.len != 0) {
-                                    rest = rest *% 31 +% cache.hash(9, d.files) +% cache.hash(10, d.inline_names) +%
-                                        cache.hash(11, @ptrCast(d.inlines)) +% cache.hash(12, @ptrCast(d.inline_callees)) +% cache.hash(13, @ptrCast(d.patches));
-                                }
+                for (c.nodes[lo..hi]) |*n| {
+                    var h: Hash = 0;
+                    // What the atoms' records hold besides their contents:
+                    // a store entry is reused only if its records are
+                    // these, byte for byte.
+                    var rest: Hash = 0;
+                    for (n.atoms) |ai| {
+                        const a = &c.atoms[ai];
+                        h = h *% 31 +% contentsHash(a);
+                        rest = rest *% 31 +% cache.hash(@truncate(@backingInt(a.key)), "");
+                        if (c.debug_of[ai]) |d| {
+                            h +%= cache.hash(@truncate(h), d.lines);
+                            rest = rest *% 31 +% d.base_line +% cache.hash(6, d.file) +% cache.hash(7, d.name);
+                            rest = rest *% 31 +% cache.hash(8, d.unit);
+                            // Inline calls carry their callees' base lines,
+                            // which move without the caller changing.
+                            if (d.inlines.len | d.patches.len | d.files.len != 0) {
+                                rest = rest *% 31 +% cache.hash(9, d.files) +% cache.hash(10, d.inline_names) +%
+                                    cache.hash(11, @ptrCast(d.inlines)) +% cache.hash(12, @ptrCast(d.inline_callees)) +% cache.hash(13, @ptrCast(d.patches));
                             }
                         }
-                        n.result_hash = h;
-                        n.exact_hash = h ^ cache.hash(5, std.mem.asBytes(&rest));
-                    },
-                    else => {
-                        n.exact_hash = n.result_hash;
+                    }
+                    switch (n.tag) {
+                        .func, .link, .content => {
+                            n.result_hash = h;
+                            n.exact_hash = h ^ cache.hash(5, std.mem.asBytes(&rest));
+                        },
                         // A declaration's data follows from its value but
-                        // for the targets of addresses the link binds,
+                        // for what its type's layout decides, which can
+                        // differ under the same value: a variable of
+                        // `std.Io.Threaded` is 880 bytes without libc and
+                        // 1136 with it (`posix.Sigaction`), and another
+                        // compilation with the same store seed records the
+                        // same key, source and value. Nor does the value
+                        // cover the targets of addresses the link binds,
                         // such as an input object's definition of an
-                        // extern symbol (`Emit.externDataTarget`), which
-                        // move without the value changing.
-                        var h: Hash = 0;
-                        for (n.atoms) |ai| {
-                            const a = &c.atoms[ai];
-                            if (a.relocs.len != 0) h = h *% 31 +% cache.hash(a.relocs.len, @ptrCast(a.targets)) +% cache.hash(0, @ptrCast(a.relocs));
-                        }
-                        if (h != 0) n.exact_hash ^= cache.hash(14, std.mem.asBytes(&h));
-                    },
-                };
+                        // extern symbol (`Emit.externDataTarget`).
+                        else => if (n.atoms.len != 0) {
+                            n.exact_hash = n.result_hash ^ cache.hash(14, std.mem.asBytes(&[2]Hash{ h, rest }));
+                        } else {
+                            n.exact_hash = n.result_hash;
+                        },
+                    }
+                }
             }
         }{ .nodes = r.nodes.items, .atoms = emit.atoms.items, .debug_of = g.debug_of });
     }
