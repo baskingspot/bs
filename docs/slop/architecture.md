@@ -1772,6 +1772,14 @@ build, the passes, and the debug info treat them as Sema's inline calls
     not touch its callers. The size is the node's one result word, and
     every inlinable function's node is recorded, as an inferred error
     set's is, so a loaded function without one is not inlinable.
+  - **Returned lengths.** The edge also carries `ret_len`, which prove
+    reads at calls that stay calls ("Proving checks"): when every slice
+    `f` returns has an argument's length (`inline.retLen`, from `f`'s own
+    body before its callees are inlined, recorded before its callees are
+    decided so a cycle of calls reads it too), that argument plus one is
+    the node's second result word and is mixed into the result hash. A
+    function that is not inlinable but has one keeps a node too, with
+    the size `not_inlinable`, and its result is `salt ^ 1` mixed with it.
   - **Replay.** Loading a function reads its `func_inline` node back into
     `inline_results`. When a caller's `func_inline` dependee is outdated,
     replay decides it with `Emit.inlineFate`, which loads or analyzes `f`
@@ -2000,7 +2008,11 @@ user branches are coverage points and are only learned from.
   where the walk reaches it, not when a later compare asks: by then the
   variable may hold a later store. A `*const` alloc stored once is its
   value until paths merge, `slice_len` of equal slices are equal and of a
-  `slice` its length operand, and a widening `intcast` of the same
+  `slice` its length operand, and of a call's result (or its error
+  union's payload) the argument at the call that every slice the callee
+  returns has as its length (`Allocator.alloc(T, n)` returns `n`
+  elements; `Ir.ret_lens`, from the `func_inline` edge's `ret_len`; a
+  callee that is inlined needs none), and a widening `intcast` of the same
   signedness is its operand. Terms are mathematical integers: a constant
   is its value whatever type it was written in, and each fact records
   its compare's type, which bounds an operand only the fact bounds. An
@@ -2113,9 +2125,9 @@ user branches are coverage points and are only learned from.
   `prove_offset_wrap`, `prove_offset_store`, `prove_offset_loop`,
   `prove_offset_retry`, `prove_mem`, `prove_mem_merge`,
   `prove_mem_loop`, `prove_wrap_end`, `prove_sub`, `prove_bool`,
-  `prove_assert`, `prove_rem`, `prove_mul_narrow`, and `prove_mul_wide`
-  one that a wrong offset, loop, memory, range, product, or `bool` rule
-  would remove.
+  `prove_assert`, `prove_rem`, `prove_mul_narrow`, `prove_mul_wide`,
+  `prove_ret_len`, and `prove_ret_len_arg` one that a wrong offset, loop,
+  memory, range, product, returned-length, or `bool` rule would remove.
 
 #### Compile-time budget and how it is measured
 

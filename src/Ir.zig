@@ -27,10 +27,22 @@ rbrace_column: u32 = 0,
 /// The body called `@disableInstrumentation()`: no coverage points under
 /// `-ffuzz`.
 disable_instrumentation: bool = false,
+/// Callees of calls in this IR that return a slice whose length is one
+/// of their arguments (`inline.retLen`), owned. Set by Emit, read by
+/// prove.
+ret_lens: []const RetLen = &.{},
+
+pub const RetLen = struct {
+    callee: InternPool.Index,
+    /// The argument whose value every slice the callee returns has as
+    /// its length.
+    arg: u32,
+};
 
 pub fn deinit(ir: *Ir, gpa: std.mem.Allocator) void {
     ir.instructions.deinit(gpa);
     gpa.free(ir.extra);
+    gpa.free(ir.ret_lens);
     ir.* = undefined;
 }
 

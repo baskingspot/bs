@@ -633,7 +633,11 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
     var inline_result: ?Zcu.InlineResult = null;
     if (zcu.inline_salt != 0) if (m.find(try r.keyer.keyOf(.func_inline, &.{try r.keyer.unitKeyString(unit)}))) |n| {
         const words = m.result(n);
-        if (words.len == 1) inline_result = .{ .size = words[0], .hash = m.node(n).result_hash };
+        if (words.len == 1 or words.len == 2) inline_result = .{
+            .size = words[0],
+            .hash = m.node(n).result_hash,
+            .ret_len = if (words.len == 2) words[1] else 0,
+        };
     };
     if (r.lazy) {
         if (ies) |got| {
@@ -1256,8 +1260,9 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
 /// inlines that are.
 fn inlineMoved(r: *Replay, d: u32, depth: u32) !bool {
     const m = r.m;
-    // Not inlinable (no size): its callers keep the call.
-    if (m.result(d).len == 0) return false;
+    // Not inlinable (no size, or `not_inlinable`): its callers keep the
+    // call.
+    if (m.result(d).len == 0 or m.result(d)[0] == Zcu.InlineResult.not_inlinable) return false;
     for (m.deps(d)) |pe| {
         const p = Manifest.Edge.nodeOf(pe);
         if (r.inChangedInput(p)) return true;
