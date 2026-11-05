@@ -7721,10 +7721,17 @@ diagnostics.
   name its functions too (`atexit`, and before glibc 2.33 `stat` and
   `fstatat`; upstream's test/standalone/glibc_compat). A build of Zig
   only whose upstream zig is missing or not 0.17.1 links without it
-  rather than failing. It is a link input, so a first build that
-  replays a donor does so eagerly and records in full (`beginReplay`):
-  hello with `-lc` from a fresh local cache takes about 100 ms instead
-  of 25; edit builds about 2 ms more (built 2026-11-05). SDL's
+  rather than failing. It is a link input, and a first build that
+  replays a donor with link inputs does so eagerly and records in full,
+  since a log keeps the donor's paths: hello with `-lc` from a fresh
+  local cache took about 80 ms instead of 25. The runtime libraries are
+  the exception (`Incremental.donorSharesLinkInputs`, 2026-11-05): their
+  paths under `<global>/bs/o/` name their contents, so a donor that
+  links the same ones (the C++ runtime's three and libc_nonshared.a)
+  and nothing else replays lazily. Hello with `-lc` takes 15–19 ms
+  again, Zig with `-lc++` 24–31 ms instead of 96–108; a project's
+  objects, archives and shared libraries, and C objects, which are in
+  the local cache, keep the donor eager. SDL's
   `libSDL3.a` calls `atexit`;
   a shared library whose C calls `atexit` imported it unversioned
   before, which no loader resolves (test/link_input/so_libc.c).

@@ -125,6 +125,12 @@ link_objects: []const []const u8 = &.{},
 /// The index in `link_objects` where the C objects and the C++ runtime's
 /// archives start, which `ElfInput.addArchive` takes as `runtime`.
 link_runtime_from: usize = std.math.maxInt(usize),
+/// The index in `link_objects` where the runtime libraries start
+/// (`CSource.Batch.archives`: libc_nonshared.a, the C++ runtime), which
+/// come last. They are in the global cache under paths that name their
+/// contents, so every compilation keyed the same way links the same ones
+/// (`donorSharesLinkInputs`).
+link_archives_from: usize = std.math.maxInt(usize),
 /// Some of `link_objects` are still being made (a C source's record
 /// missed, and upstream's Clang is compiling it), so they may differ from
 /// the manifest's: the build replays eagerly, as after an edited object.
@@ -446,6 +452,26 @@ fn linkInputsChanged(inc: *const Incremental, m: *const Manifest) !bool {
     try m.changedInputs(inc.gpa, inc.io, inc.trusted_lib, &changed);
     for (changed.items) |i| if (isLinkInput(m.inputKey(i)) and !try inc.sameContents(m, i)) return true;
     return false;
+}
+
+/// Whether a donor's build may replay lazily as far as its link inputs go:
+/// they are only runtime libraries (`link_archives_from`), the very ones
+/// donor manifest `m` links, unchanged. Every `-lc` executable links
+/// libc_nonshared.a, so a donor of one has a link input whose path and
+/// contents are the same in every compilation keyed the same way; a
+/// project's objects, archives and shared libraries are not.
+fn donorSharesLinkInputs(inc: *const Incremental, m: *const Manifest) !bool {
+    if (inc.link_shared.len != 0 or inc.link_archives_from != 0) return false;
+    var links: usize = 0;
+    for (0..m.inputCount()) |i| {
+        const key = m.inputKey(@intCast(i));
+        if (!isLinkInput(key)) continue;
+        links += 1;
+        for (inc.link_objects) |p| {
+            if (std.mem.eql(u8, key[link_input_prefix.len..], p)) break;
+        } else return false;
+    }
+    return links == inc.link_objects.len and !try inc.linkInputsChanged(m);
 }
 
 /// The file in the compilation's directory that holds the stat the last
@@ -1159,12 +1185,12 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     if (std.mem.eql(u8, mode, "off") or inc.verify == .full) return;
     // A build whose objects or archives or shared libraries changed
     // records in full (`linkInputsChanged`, `link_objects_pending`), and so
-    // does a donor's with any: the log would keep the donor's paths. A
-    // donor's build is lazy only where `Replay.donorEager` allows; its log
-    // then follows the donor's manifest (`finishLazy`).
+    // does a donor's with project inputs: the log would keep the donor's
+    // paths. A donor's build is lazy only where `Replay.donorEager` allows;
+    // its log then follows the donor's manifest (`finishLazy`).
     const has_inputs = inc.link_objects.len + inc.link_shared.len != 0;
     const lazy = !std.mem.eql(u8, mode, "eager") and
-        (!has_inputs or (inc.donor == null and !inc.link_objects_pending and !try inc.linkInputsChanged(m)));
+        (!has_inputs or (!inc.link_objects_pending and if (inc.donor == null) !try inc.linkInputsChanged(m) else try inc.donorSharesLinkInputs(m)));
     const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy, inc.donor != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {

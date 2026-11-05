@@ -703,6 +703,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     if (c_batch) |b| if (inc_opt) |i| {
         i.link_objects = try std.mem.concat(init.arena.allocator(), []const u8, &.{ job.link_objects, try CSource.objectPaths(b, init.arena.allocator()) });
         i.link_runtime_from = job.link_objects.len;
+        i.link_archives_from = i.link_objects.len - b.archives.len;
     };
     while (true) return compileReplaying(init, job, inc_opt, if (rec) |*r| r else null, out_path, alt_path, prog, inputs, replay_mode, &pins, c_batch) catch |err| switch (err) {
         error.LazyFallback => {
