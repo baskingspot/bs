@@ -1714,7 +1714,7 @@ pub const TlsTarget = struct {
 /// binds `name`'s slot to (an input object's), through `externAddrKey`,
 /// as a constant's address of extern data. An executable imports a shared
 /// library's thread-local, through a content-addressed slot the loader
-/// writes (TPOFF64; ElfInput's `tlsSlot` is the same atom). bs's shared
+/// writes (TPOFF64 or TLS_TPREL64; ElfInput's `tlsSlot` is the same atom). bs's shared
 /// objects import no thread-locals.
 pub fn tlsTarget(emit: *Emit, name: []const u8) !TlsTarget {
     if (try emit.userExport(name)) |key| return .{ .key = key, .local = true };
@@ -1722,7 +1722,8 @@ pub fn tlsTarget(emit: *Emit, name: []const u8) !TlsTarget {
     if (!emit.obj and emit.sharedTls(name)) {
         const imp = try emit.useImport(name, .{ .tls = true });
         const zeros: [8]u8 = @splat(0);
-        return .{ .key = try emit.contentAtom(8, &zeros, &.{imp}, &.{.init(0, .x86_64_tpoff64, 0, 0)}), .local = false, .slot = true };
+        const kind: Atom.Reloc.Kind = if (emit.zcu.ip.target == .aarch64_linux) .aarch64_tprel64 else .x86_64_tpoff64;
+        return .{ .key = try emit.contentAtom(8, &zeros, &.{imp}, &.{.init(0, kind, 0, 0)}), .local = false, .slot = true };
     }
     if (emit.has_inputs) {
         _ = try emit.useExtern(name, false);

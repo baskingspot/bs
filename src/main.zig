@@ -2294,12 +2294,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
         opts.link_libc = false;
     } else if (opts.bs_target == .aarch64_linux) {
-        // Executables and tests, static or linking glibc dynamically, and
-        // static objects and libraries without libc, with C sources,
-        // objects, and archives, so far.
-        if (opts.link_libcpp)
-            setUnsupported(&opts, arena, "bs does not link libc++ for aarch64-linux yet; build this step with upstream zig", .{})
-        else if (opts.link_libc and (command.isObj() or command == .build_lib))
+        // Executables and tests, static or linking glibc (and libc++)
+        // dynamically, and static objects and libraries without libc, with
+        // C sources, objects, archives, and shared libraries, so far.
+        if (opts.link_libc and (command.isObj() or command == .build_lib))
             setUnsupported(&opts, arena, "bs does not build objects or libraries linking libc for aarch64-linux yet ('-lc'); build this step with upstream zig", .{})
         else if (opts.fuzz)
             setUnsupported(&opts, arena, "bs does not instrument code for fuzzing on aarch64-linux yet ('-ffuzz'); build this step with upstream zig", .{})

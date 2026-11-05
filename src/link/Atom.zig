@@ -299,6 +299,17 @@ pub const Reloc = extern struct {
         /// objects' TLS descriptor and initial-exec sequences.
         aarch64_tprel_g1,
         aarch64_tprel_g0_nc,
+        /// aarch64 data from C objects: S + A - P as an i64 (ELF
+        /// R_AARCH64_PREL64; Clang's `.gcc_except_table`). ELF only.
+        aarch64_prel64,
+        /// An aarch64 executable's 8-byte slot holding thread-local S's
+        /// offset from the thread pointer (as `aarch64_tprel_hi12`): a
+        /// shared library's, which the loader writes (ELF
+        /// R_AARCH64_TLS_TPREL64), the initial-exec GOT entry.
+        aarch64_tprel64,
+        /// An aarch64 GNU indirect function's slot, as `x86_64_irelative`
+        /// (ELF R_AARCH64_IRELATIVE).
+        aarch64_irelative,
     };
 };
 

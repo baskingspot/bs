@@ -232,6 +232,8 @@ pub const InputReloc = extern struct {
         /// A, for references to what the link dropped.
         const32,
         const64,
+        /// S + A - P, 64 bits (.eh_frame only).
+        pc64,
     };
 };
 
@@ -2015,14 +2017,14 @@ fn LinkOf(comptime Input: type) type {
                 .x86_64_abs64 => {},
                 // An aarch64 executable's addresses of imports.
                 .aarch64_abs64 => return isImport(l.exe_imports orelse return false, a.targets[r.info.target]),
-                .x86_64_tpoff64 => return isImport(l.exe_imports orelse return false, a.targets[r.info.target]),
+                .x86_64_tpoff64, .aarch64_tprel64 => return isImport(l.exe_imports orelse return false, a.targets[r.info.target]),
                 // A shared object's module ID, for `__tls_get_addr`, and
                 // its TLS descriptors.
                 .x86_64_dtpmod64, .x86_64_tlsdesc, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym, .x86_64_tlsdesc_sym => return l.exe_imports == null,
                 // A shared object's references to its own exports.
                 .x86_64_abs64_sym => return l.exe_imports == null,
                 // Every image's indirect functions.
-                .x86_64_irelative => return true,
+                .x86_64_irelative, .aarch64_irelative => return true,
                 else => return false,
             }
             const imports = l.exe_imports orelse return true;
@@ -2035,7 +2037,7 @@ fn LinkOf(comptime Input: type) type {
             const imports = l.exe_imports orelse return false;
             for (a.relocs) |r| {
                 const abs = switch (r.info.kind) {
-                    .x86_64_abs64, .x86_64_tpoff64, .aarch64_abs64 => true,
+                    .x86_64_abs64, .x86_64_tpoff64, .aarch64_abs64, .aarch64_tprel64 => true,
                     else => false,
                 };
                 if (abs and isImport(imports, a.targets[r.info.target])) return true;
@@ -2185,7 +2187,7 @@ fn LinkOf(comptime Input: type) type {
 
         fn inputReloc(l: *const Link, s: *const InputSection, r: InputReloc, dst: []u8, p_base: u64) Error!void {
             const wide = switch (r.kind) {
-                .abs64, .dtpoff64, .offset64, .const64 => true,
+                .abs64, .pc64, .dtpoff64, .offset64, .const64 => true,
                 .abs32, .pc32, .dtpoff32, .offset32, .const32 => false,
             };
             if (@as(u64, r.offset) + @as(u64, if (wide) 8 else 4) > dst.len) return error.InvalidInput;
@@ -2201,7 +2203,7 @@ fn LinkOf(comptime Input: type) type {
                     const t = l.resolveKey(s.targets[r.target]) orelse return error.UndefinedSymbol;
                     break :v switch (r.kind) {
                         .abs32, .abs64 => @as(i128, t) + r.addend,
-                        .pc32 => if (s.kind == .eh_frame) @as(i128, t) + r.addend - (p_base + r.offset) else return error.InvalidInput,
+                        .pc32, .pc64 => if (s.kind == .eh_frame) @as(i128, t) + r.addend - (p_base + r.offset) else return error.InvalidInput,
                         .dtpoff32, .dtpoff64 => if (t >= l.tls.start and t < l.tls.end) @as(i128, t - l.tls.start) + r.addend else return error.InvalidRelocation,
                         else => unreachable,
                     };
@@ -2352,10 +2354,13 @@ fn LinkOf(comptime Input: type) type {
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.TLSDESC), .sym = 0 }, .addend = @bitCast(v -% l.tls.start) }
                         else if (r.info.kind == .x86_64_irelative)
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.IRELATIVE), .sym = 0 }, .addend = @bitCast(v) }
+                        else if (r.info.kind == .aarch64_irelative)
+                            .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_AARCH64.IRELATIVE), .sym = 0 }, .addend = @bitCast(v) }
                         else if (t >= l.plt_start and t < l.plt_end)
                             .{ .offset = addr + r.offset, .info = .{ .type = switch (r.info.kind) {
                                 .x86_64_tpoff64 => @backingInt(elf.R_X86_64.TPOFF64),
                                 .aarch64_abs64 => @backingInt(elf.R_AARCH64.ABS64),
+                                .aarch64_tprel64 => @backingInt(elf.R_AARCH64.TLS_TPREL),
                                 else => @backingInt(elf.R_X86_64.@"64"),
                             }, .sym = @intCast(1 + (t - l.plt_start) / ElfDynamic.plt_entry_size) }, .addend = r.addend }
                         else
@@ -2604,7 +2609,7 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
             },
             // The resolver's address until the loader calls it, as
             // upstream writes it.
-            .x86_64_abs64, .x86_64_irelative, .aarch64_abs64 => {
+            .x86_64_abs64, .x86_64_irelative, .aarch64_abs64, .aarch64_irelative => {
                 const f = try relocField(a, dst, r.offset, 8, diag);
                 std.mem.writeInt(u64, f, s +% @as(u64, @bitCast(@as(i64, r.addend))), .little);
             },
@@ -2617,6 +2622,10 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
                 const v = @as(i64, @bitCast(s -% (p_base + r.offset))) +% r.addend;
                 std.mem.writeInt(i32, f, std.math.cast(i32, v) orelse return overflow(a, r, diag), .little);
             },
+            .aarch64_prel64 => {
+                const f = try relocField(a, dst, r.offset, 8, diag);
+                std.mem.writeInt(u64, f, s -% (p_base + r.offset) +% @as(u64, @bitCast(@as(i64, r.addend))), .little);
+            },
             .aarch64_abs32 => {
                 const f = try relocField(a, dst, r.offset, 4, diag);
                 const v = @as(i128, s) + r.addend;
@@ -2628,7 +2637,7 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
                 std.mem.writeInt(i32, f, std.math.cast(i32, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
             },
             .x86_64_tpoff32 => try tpoff32(a, r, dst, s, tls, diag),
-            .x86_64_tpoff64 => try tpoff64(a, r, dst, s, tls, diag),
+            .x86_64_tpoff64, .aarch64_tprel64 => try tpoff64(a, r, dst, s, tls, diag),
             // The loader's (`needsDynamicReloc`).
             .x86_64_dtpmod64, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym, .x86_64_abs64_sym => @memset(try relocField(a, dst, r.offset, 8, diag), 0),
             .x86_64_tlsdesc_sym => @memset(try relocField(a, dst, r.offset, 16, diag), 0),

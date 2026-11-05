@@ -349,7 +349,7 @@ fn symTarget(in: *Inputs, o: *const Object, s: u32, addend: i64) Allocator.Error
     if (shndx == elf.SHN_ABS or shndx >= elf.SHN_LORESERVE or shndx == elf.SHN_UNDEF) return null;
     // An indirect function is its stub, the address calls and pointers
     // use, as upstream's canonical PLT entry.
-    if (sym.st_type() == elf.STT_GNU_IFUNC and in.dynamic and in.arch == .x86_64) return .{ .key = (try in.ifuncAtoms(o, s)).stub.key, .offset = 0 };
+    if (sym.st_type() == elf.STT_GNU_IFUNC and in.dynamic) return .{ .key = (try in.ifuncAtoms(o, s)).stub.key, .offset = 0 };
     const sh = o.shdrs[shndx];
     const offset: u64 = sym.st_value;
     if (sh.sh_flags & elf.SHF_MERGE != 0) {
@@ -361,18 +361,27 @@ fn symTarget(in: *Inputs, o: *const Object, s: u32, addend: i64) Allocator.Error
 }
 
 /// GNU indirect function `s` of `o`: an 8-byte slot the loader fills
-/// with the address its resolver returns (`x86_64_irelative`), and the
-/// stub `jmp [rip + slot]` that stands for the function. Content-
-/// addressed, so the symbols of one resolver share them.
+/// with the address its resolver returns (`x86_64_irelative`,
+/// `aarch64_irelative`), and the stub `jmp [rip + slot]` (aarch64:
+/// `adrp x16, slot; ldr x16, [x16, :lo12:slot]; br x16`) that stands for
+/// the function. Content-addressed, so the symbols of one resolver share
+/// them.
 fn ifuncAtoms(in: *Inputs, o: *const Object, s: u32) Allocator.Error!struct { slot: Atom, stub: Atom } {
     const sym = o.syms[s];
+    const a64 = in.arch == .aarch64;
     const zeros: []const u8 = &@as([8]u8, @splat(0));
-    const jmp: []const u8 = &[_]u8{ 0xff, 0x25, 0, 0, 0, 0, 0xcc, 0xcc };
+    const jmp: []const u8 = if (a64)
+        &[_]u8{ 0x10, 0x00, 0x00, 0x90, 0x10, 0x02, 0x40, 0xf9, 0x00, 0x02, 0x1f, 0xd6, 0x00, 0x00, 0x20, 0xd4 } // ... brk #0
+    else
+        &[_]u8{ 0xff, 0x25, 0, 0, 0, 0, 0xcc, 0xcc };
     const slot_targets = try in.arena.dupe(SymbolKey, &.{sectionKey(o, sym.st_shndx)});
-    const slot_relocs = try in.arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_irelative, 0, @intCast(sym.st_value))});
+    const slot_relocs = try in.arena.dupe(Atom.Reloc, &.{.init(0, if (a64) .aarch64_irelative else .x86_64_irelative, 0, @intCast(sym.st_value))});
     const slot: Atom = .{ .key = .fromContents(.data, .@"8", zeros, slot_targets, slot_relocs), .name = "", .section = .data, .alignment = .@"8", .bytes = zeros, .targets = slot_targets, .relocs = slot_relocs };
     const stub_targets = try in.arena.dupe(SymbolKey, &.{slot.key});
-    const stub_relocs = try in.arena.dupe(Atom.Reloc, &.{.init(2, .x86_64_pc32, 0, -4)});
+    const stub_relocs: []const Atom.Reloc = if (a64)
+        try in.arena.dupe(Atom.Reloc, &.{ .init(0, .aarch64_page21, 0, 0), .init(4, .aarch64_pageoff12, 0, 0) })
+    else
+        try in.arena.dupe(Atom.Reloc, &.{.init(2, .x86_64_pc32, 0, -4)});
     const stub: Atom = .{ .key = .fromContents(.text, .@"8", jmp, stub_targets, stub_relocs), .name = o.symName(sym), .section = .text, .alignment = .@"8", .bytes = jmp, .targets = stub_targets, .relocs = stub_relocs };
     return .{ .slot = slot, .stub = stub };
 }
@@ -518,10 +527,6 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
         {
             if (!in.dynamic) {
                 try in.errors.append(arena, try std.fmt.allocPrint(arena, "{s}: bs links GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) only into executables that link libc and shared libraries, whose loader calls their resolvers: {s}", .{ o.path, o.symName(sym) }));
-                continue;
-            }
-            if (in.arch == .aarch64) {
-                try in.errors.append(arena, try std.fmt.allocPrint(arena, "{s}: bs does not link GNU indirect functions (STT_GNU_IFUNC) for aarch64-linux yet: {s}", .{ o.path, o.symName(sym) }));
                 continue;
             }
             const ifunc = try in.ifuncAtoms(o, @intCast(s_index));
@@ -836,12 +841,13 @@ fn Converter(comptime Ctx: type) type {
                 .ABS32 => .@"32",
                 .ABS64 => .@"64",
                 .PREL32 => .PC32,
+                .PREL64 => .PC64,
                 else => return c.unsupported(index, r.r_type()),
             } else std.enums.fromInt(R, r.r_type()) orelse return c.unsupported(index, r.r_type());
             const wide = switch (ty) {
                 .NONE => return,
                 .@"32", .PC32, .DTPOFF32 => false,
-                .@"64", .DTPOFF64 => true,
+                .@"64", .PC64, .DTPOFF64 => true,
                 else => return c.unsupported(index, r.r_type()),
             };
             var rel: Elf.InputReloc = .{ .offset = @intCast(new_offset), .target = 0, .addend = r.r_addend, .kind = undefined };
@@ -851,6 +857,7 @@ fn Converter(comptime Ctx: type) type {
                         .@"32" => .abs32,
                         .@"64" => .abs64,
                         .PC32 => .pc32,
+                        .PC64 => .pc64,
                         .DTPOFF32 => .dtpoff32,
                         .DTPOFF64 => .dtpoff64,
                         else => unreachable,
@@ -955,7 +962,7 @@ fn Converter(comptime Ctx: type) type {
             }
             s.bytes = if (dropped) kept[0..at] else bytes[0..off];
             for (relocs.items) |r| switch (r.kind) {
-                .pc32, .abs64, .abs32 => {},
+                .pc32, .pc64, .abs64, .abs32 => {},
                 else => if (r.addend != 0 or (r.kind != .const32 and r.kind != .const64))
                     return c.fail("{s}: .eh_frame references a dropped section or a shared library's symbol, which bs does not link yet", .{o.path}),
             };
@@ -1436,6 +1443,13 @@ fn Converter(comptime Ctx: type) type {
             const ty = std.enums.fromInt(R, r.r_type()) orelse return c.unsupported(index, r.r_type());
             const at: usize = @intCast(r.r_offset);
             const insn = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            switch (ty) {
+                .TLSDESC_ADR_PAGE21, .TLSDESC_LD64_LO12, .TLSDESC_ADD_LO12, .TLSDESC_CALL, .TLSIE_ADR_GOTTPREL_PAGE21, .TLSIE_LD64_GOTTPREL_LO12_NC => {
+                    const t = try c.target(r.r_sym(), r.r_addend) orelse return;
+                    if (t.import) return c.tlsImportA64(index, r, ty, insn, bytes, copy, t);
+                },
+                else => {},
+            }
             // The relaxed instruction, if this one changes.
             const relaxed: ?u32 = switch (ty) {
                 .TLSDESC_ADR_PAGE21, .TLSDESC_LD64_LO12 => {
@@ -1455,6 +1469,7 @@ fn Converter(comptime Ctx: type) type {
                 .ABS64 => .aarch64_abs64,
                 .ABS32 => .aarch64_abs32,
                 .PREL32 => .aarch64_prel32,
+                .PREL64 => .aarch64_prel64,
                 .CALL26, .JUMP26 => .aarch64_branch26,
                 .ADR_PREL_PG_HI21, .ADR_PREL_PG_HI21_NC => .aarch64_page21,
                 .ADD_ABS_LO12_NC, .LDST8_ABS_LO12_NC, .LDST16_ABS_LO12_NC, .LDST32_ABS_LO12_NC, .LDST64_ABS_LO12_NC, .LDST128_ABS_LO12_NC => .aarch64_pageoff12,
@@ -1467,7 +1482,14 @@ fn Converter(comptime Ctx: type) type {
             if ((kind == .aarch64_got_load_page21 or kind == .aarch64_got_load_pageoff12) and r.r_addend != 0)
                 return c.fail("{s}: GOT relocation with addend {d} in section '{s}'", .{ o.path, r.r_addend, o.sectionName(index) });
             const t = try c.target(r.r_sym(), r.r_addend) orelse return;
-            if (t.import) return c.importA64(index, r, kind);
+            if (t.import) return c.importA64(index, r, kind, .{ .key = t.key, .offset = 0 });
+            // A weak name nothing defines, as x86_64's (`reloc`): GOT loads
+            // and calls of a C-only executable go through an import.
+            if (t.key == undefined_weak_key and c.in.dynamic and !c.in.shared) switch (kind) {
+                .aarch64_branch26, .aarch64_got_load_page21, .aarch64_got_load_pageoff12 => if (try c.ctx.weakImport(o.symName(o.syms[r.r_sym()]))) |key|
+                    return c.importA64(index, r, kind, .{ .key = key, .offset = 0, .import = true }),
+                else => {},
+            };
             if (relaxed) |v| std.mem.writeInt(u32, (try c.writable(bytes, copy))[at..][0..4], v, .little);
             try c.add(r.r_offset, kind, t, r.r_addend);
         }
@@ -1477,10 +1499,9 @@ fn Converter(comptime Ctx: type) type {
         /// the loader writes; a call or jump goes through a stub that
         /// branches through the symbol's slot; a GOT load reads the slot;
         /// and PC-relative data references use the executable's copy.
-        fn importA64(c: *C, index: u32, r: elf.Elf64_Rela, kind: Atom.Reloc.Kind) !void {
+        fn importA64(c: *C, index: u32, r: elf.Elf64_Rela, kind: Atom.Reloc.Kind, t: Target) !void {
             const o = c.o;
             const sym = o.syms[r.r_sym()];
-            const t: Target = .{ .key = (try c.target(r.r_sym(), r.r_addend)).?.key, .offset = 0 };
             switch (kind) {
                 .aarch64_abs64 => try c.add(r.r_offset, .aarch64_abs64, t, r.r_addend),
                 .aarch64_branch26 => try c.add(r.r_offset, .aarch64_branch26, .{ .key = try c.stubA64(t), .offset = 0 }, r.r_addend),
@@ -1488,6 +1509,29 @@ fn Converter(comptime Ctx: type) type {
                 .aarch64_got_load_pageoff12 => try c.add(r.r_offset, .aarch64_pageoff12, .{ .key = try c.slot(t, .aarch64_abs64), .offset = 0 }, 0),
                 .aarch64_page21, .aarch64_pageoff12 => try c.add(r.r_offset, kind, .{ .key = try c.copied(index, sym) orelse return, .offset = 0 }, r.r_addend),
                 else => try c.fail("{s}: bs does not link relocation R_AARCH64_{s} against {s}, which a shared library defines, yet", .{ o.path, @tagName(@as(elf.R_AARCH64, @fromBackingInt(r.r_type()))), o.symName(sym) }),
+            }
+        }
+
+        /// aarch64 TLS descriptor or initial-exec relocation `r` to a
+        /// shared library's thread-local `t`: initial-exec through the
+        /// slot the loader writes its offset into (`tlsSlot`), as lld
+        /// relaxes descriptors: `adrp x0, slot; ldr x0, [x0, :lo12:slot];
+        /// nop; nop`, and the initial-exec pair reads the slot as is.
+        fn tlsImportA64(c: *C, index: u32, r: elf.Elf64_Rela, ty: elf.R_AARCH64, insn: u32, bytes: []const u8, copy: *?[]u8, t: Target) !void {
+            const at: usize = @intCast(r.r_offset);
+            const ie: Target = .{ .key = try c.tlsSlot(t), .offset = 0 };
+            switch (ty) {
+                .TLSDESC_ADR_PAGE21, .TLSIE_ADR_GOTTPREL_PAGE21 => {
+                    if (insn & 0x9f000000 != 0x90000000) return c.unsupported(index, r.r_type());
+                    try c.add(r.r_offset, .aarch64_page21, ie, 0);
+                },
+                .TLSDESC_LD64_LO12, .TLSIE_LD64_GOTTPREL_LO12_NC => {
+                    if (insn & 0xffc00000 != 0xf9400000) return c.unsupported(index, r.r_type());
+                    // The descriptor's `ldr x1, [x0, ...]` loads into x0.
+                    if (ty == .TLSDESC_LD64_LO12) std.mem.writeInt(u32, (try c.writable(bytes, copy))[at..][0..4], insn & ~@as(u32, 0x1f), .little);
+                    try c.add(r.r_offset, .aarch64_pageoff12, ie, 0);
+                },
+                else => std.mem.writeInt(u32, (try c.writable(bytes, copy))[at..][0..4], 0xd503201f, .little), // nop
             }
         }
 
@@ -1530,12 +1574,13 @@ fn Converter(comptime Ctx: type) type {
         }
 
         /// An 8-byte slot holding import `t`'s offset from the thread
-        /// pointer, which the loader writes (TPOFF64): initial-exec code's
+        /// pointer, which the loader writes (TPOFF64, or TLS_TPREL64 on
+        /// aarch64): initial-exec code's
         /// GOT entry, content-addressed as `slot`.
         fn tlsSlot(c: *C, t: Target) Allocator.Error!SymbolKey {
             const arena = c.in.arena;
             const targets = try arena.dupe(SymbolKey, &.{t.key});
-            const relocs = try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_tpoff64, 0, 0)});
+            const relocs = try arena.dupe(Atom.Reloc, &.{.init(0, if (c.in.arch == .aarch64) .aarch64_tprel64 else .x86_64_tpoff64, 0, 0)});
             const zeros: []const u8 = &@as([8]u8, @splat(0));
             const key: SymbolKey = .fromContents(.rodata, .@"8", zeros, targets, relocs);
             try c.atoms.append(arena, .{ .key = key, .name = "", .section = .rodata, .alignment = .@"8", .bytes = zeros, .targets = targets, .relocs = relocs });

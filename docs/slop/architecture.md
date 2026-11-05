@@ -3970,15 +3970,27 @@ stays one; CALL26/JUMP26 go through a stub `adrp x16; ldr x16; br x16`
 of the import's slot; GOT loads read the slot (page21 and pageoff12
 relocations of the `adrp` and `ldr`); PC-relative data references use
 the executable's copy. Shared library inputs (`-l<name>`, `.so`) are
-read for EM_AARCH64 (`ElfShared.parse`'s `arch`). Not yet: imported
-thread-locals, GNU indirect functions, undefined weak names imported
-for preloading, `-lc++`, objects and libraries with `-lc`, and bs's own
-shared libraries. Checked under
+read for EM_AARCH64 (`ElfShared.parse`'s `arch`). A shared library's
+thread-local is reached initial-exec through one slot the loader writes
+(`aarch64_tprel64`, R_AARCH64_TLS_TPREL64): the Zig code loads it and
+adds `tpidr_el0`; C's TLS descriptors become `adrp x0, slot; ldr x0,
+[x0, :lo12:slot]; nop; nop` as lld relaxes them (`tlsImportA64`), and
+initial-exec GOT loads read the slot as is. GNU indirect functions get
+an `aarch64_irelative` slot (R_AARCH64_IRELATIVE) and an x16 stub, and
+a C-only executable imports weak names nothing defines for its GOT
+loads and calls, as x86_64's. `-lc++` builds libc++, libc++abi and
+libunwind for aarch64-linux-gnu as x86_64's; Clang's `.eh_frame` and
+`.gcc_except_table` there use R_AARCH64_PREL64 (`pc64`,
+`aarch64_prel64`). Not yet: objects and libraries with `-lc`, and bs's
+own shared libraries. Checked under
 qemu with the aarch64 glibc as sysroot (`qemu-aarch64 -L
 /usr/aarch64-linux-gnu`, libc6-arm64-cross from .agents/setup): libc.zig
 and libc_edit.zig in test/run, the -fPIC C object and source of
 link_input/libc.c, a C-only executable, a shared library that Zig calls
-and a non-PIC object copies data from, and std's tests with `--libc`.
+and a non-PIC object copies data from, a shared library's thread-local
+from Zig, descriptor and initial-exec code, GNU indirect functions, weak
+references a preloaded library defines, a -lc++ build with exceptions,
+and std's tests with `--libc`.
 
 ### Comptime pointers to extern data (built 2026-11-04)
 

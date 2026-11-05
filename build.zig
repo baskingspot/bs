@@ -1634,6 +1634,88 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         so_run.addCheck(.{ .expect_stderr_exact = "42 143 42 143\n" });
         so_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&so_run.step);
+        // A shared library's thread-local from Zig and from C's TLS
+        // descriptors (aarch64's general-dynamic) and initial-exec code,
+        // through one slot the loader writes (R_AARCH64_TLS_TPREL64).
+        const tls_so = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux-gnu", "-shared", "-fPIC", "-Wl,-soname,libsotls.so" });
+        tls_so.addFileArg(b.path("test/link_input/so_tls.c"));
+        const tls_dir = tls_so.addPrefixedOutputFileArg("-o", "libsotls.so").dirname();
+        const tls_exe = b.addRunArtifact(bs);
+        tls_exe.setName("bs build-exe -lc -target aarch64-linux-gnu with a shared library's thread-local");
+        tls_exe.addArgs(&.{ "build-exe", "-lc", "-target", "aarch64-linux-gnu", "-lsotls" });
+        tls_exe.addPrefixedDirectoryArg("-L", tls_dir);
+        tls_exe.addFileArg(b.path("test/link_input/so_tls_main.zig"));
+        for ([_][]const []const u8{ &.{ "-fPIC", "-DSUFFIX=_gd" }, &.{ "-fPIC", "-DSUFFIX=_desc" }, &.{ "-fPIC", "-ftls-model=initial-exec", "-DSUFFIX=_ie" } }, [_][]const u8{ "gd", "desc", "ie" }) |flags, name| {
+            const tls_user = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux-gnu", "-c" });
+            tls_user.addArgs(flags);
+            tls_user.addFileArg(b.path("test/link_input/so_tls_user.c"));
+            tls_exe.addFileArg(tls_user.addPrefixedOutputFileArg("-o", b.fmt("so_tls_{s}.o", .{name})));
+        }
+        tls_exe.setEnvironmentVariable("BS_CACHE", "off");
+        const tls_run = b.addSystemCommand(&.{ "sh", "-c", "d=$1; shift; LD_LIBRARY_PATH=$d QEMU_SET_ENV=LD_LIBRARY_PATH=$d exec \"$@\"", "sh" });
+        tls_run.setName("run bs aarch64-linux link of a shared library's thread-local");
+        tls_run.addDirectoryArg(tls_dir);
+        tls_run.addArgs(runner);
+        tls_run.addFileArg(tls_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        tls_run.addCheck(.{ .expect_stderr_exact = "main: 3 3 3 3 103\nset: 1114 1114 1114 1114 1214\nthread: 3 3 3 3 103\nafter: 1114 1114 1114 1114 1214\n" });
+        tls_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&tls_run.step);
+        // GNU indirect functions: their slots (R_AARCH64_IRELATIVE) and
+        // stubs.
+        const ifunc_c = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux-gnu", "-fPIC", "-c" });
+        ifunc_c.addFileArg(b.path("test/link_input/ifunc.c"));
+        const ifunc_exe = b.addRunArtifact(bs);
+        ifunc_exe.setName("bs build-exe -lc -target aarch64-linux-gnu with GNU indirect functions");
+        ifunc_exe.addArgs(&.{ "build-exe", "-lc", "-target", "aarch64-linux-gnu" });
+        ifunc_exe.addFileArg(b.path("test/link_input/ifunc_main.zig"));
+        ifunc_exe.addFileArg(ifunc_c.addPrefixedOutputFileArg("-o", "ifunc.o"));
+        ifunc_exe.setEnvironmentVariable("BS_CACHE", "off");
+        const ifunc_run = std.Build.Step.Run.create(b, "run bs aarch64-linux link of GNU indirect functions");
+        ifunc_run.addArgs(runner);
+        ifunc_run.addFileArg(ifunc_exe.addPrefixedOutputFileArg("-femit-bin=", "ifunc"));
+        ifunc_run.addCheck(.{ .expect_stderr_exact = "42 42 6 15 9 true true\n" });
+        ifunc_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&ifunc_run.step);
+        // Weak references nothing defines, imported so that a library
+        // preloaded at run time defines them (QEMU_SET_ENV sets the
+        // emulated program's LD_PRELOAD).
+        const wexe = b.addRunArtifact(bs);
+        wexe.setName("bs build-exe -lc -target aarch64-linux-gnu with weak references nothing defines");
+        wexe.addArgs(&.{ "build-exe", "-lc", "-target", "aarch64-linux-gnu" });
+        wexe.addFileArg(b.path("test/link_input/weak_main.c"));
+        wexe.setEnvironmentVariable("BS_ZIG", zig);
+        const weak_exe = wexe.addPrefixedOutputFileArg("-femit-bin=", "weak_main");
+        const plain = std.Build.Step.Run.create(b, "run weak_main (aarch64-linux)");
+        plain.addArgs(runner);
+        plain.addFileArg(weak_exe);
+        plain.addCheck(.{ .expect_stdout_exact = "fn=-1 data=-1 ptr=0\n" });
+        test_step.dependOn(&plain.step);
+        const def = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux-gnu", "-shared", "-fPIC" });
+        def.addFileArg(b.path("test/link_input/weak_def.c"));
+        const preload = b.addSystemCommand(&.{ "sh", "-c", "p=$1; shift; LD_PRELOAD=$p QEMU_SET_ENV=LD_PRELOAD=$p exec \"$@\"", "sh" });
+        preload.setName("run weak_main with weak_def preloaded (aarch64-linux)");
+        preload.addFileArg(def.addPrefixedOutputFileArg("-o", "libweak_def.so"));
+        preload.addArgs(runner);
+        preload.addFileArg(weak_exe);
+        preload.addCheck(.{ .expect_stdout_exact = "fn=42 data=7 ptr=0\n" });
+        test_step.dependOn(&preload.step);
+        // A C++ source with -lc++: libc++, libc++abi and libunwind built
+        // from the zig lib directory for aarch64-linux-gnu; exceptions
+        // unwind through libunwind (.eh_frame's and .gcc_except_table's
+        // R_AARCH64_PREL64).
+        const cxx_exe = b.addRunArtifact(bs);
+        cxx_exe.setName("bs build-exe -lc++ -target aarch64-linux-gnu with a C++ source");
+        cxx_exe.addArgs(&.{ "build-exe", "-lc++", "-target", "aarch64-linux-gnu" });
+        cxx_exe.addFileArg(b.path("test/link_input/cxx_main.zig"));
+        cxx_exe.addFileArg(b.path("test/link_input/cxx.cpp"));
+        cxx_exe.setEnvironmentVariable("BS_ZIG", zig);
+        const cxx_run = std.Build.Step.Run.create(b, "run bs aarch64-linux -lc++ build of a C++ source");
+        cxx_run.addArgs(runner);
+        cxx_run.addFileArg(cxx_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        cxx_run.addCheck(.{ .expect_stdout_exact = "caught: boom at depth 4\ntype: 7Derived\nctor 42, tls tls42!, sum 6\n" });
+        cxx_run.addCheck(.{ .expect_stderr_exact = "result 151, link_libcpp true\n" });
+        cxx_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&cxx_run.step);
     }
     // Thread-locals through TLS descriptors (-mtls-dialect=gnu2), which
     // the link relaxes to local-exec: Clang's, with _TLS_MODULE_BASE_

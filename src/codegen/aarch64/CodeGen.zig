@@ -1929,11 +1929,17 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .extern_pcrel => return cg.fail("@extern with '.relocation = .pcrel' on aarch64-macos", .{}),
         .extern_tls => {
             if (cg.ip.target != .aarch64_linux) return cg.fail("thread-local externs on aarch64-macos", .{});
-            // A static executable's: a C object defines it, in the
-            // executable's own TLS block, so local-exec reaches it.
+            // A C object's, in the executable's own TLS block, which
+            // local-exec reaches; a shared library's through the slot of
+            // its offset, which the loader writes (initial-exec).
             const t = try cg.emit.tlsTarget(ip.stringSlice(@fromBackingInt(data.ty_pl.payload)));
-            if (t.slot or !t.local) return cg.fail("thread-local externs from shared libraries on aarch64-linux", .{});
-            try cg.e.threadLocalOffset(.x9, t.key);
+            if (t.slot) {
+                try cg.loadMem(.x9, .sym(t.key, 0), .usize_type);
+                try cg.e.raw(Encoder.System.mrs_tpidr_el0 | 10); // mrs x10, tpidr_el0
+                try cg.e.addSub(.add, .x, .x9, .x10, .{ .reg = .{ .reg = .x9 } });
+            } else if (!t.local) {
+                return cg.fail("thread-local externs in aarch64-linux objects", .{});
+            } else try cg.e.threadLocalOffset(.x9, t.key);
             try cg.setResult(inst, data.ty_pl.ty, .x9);
         },
         .c_va_start => {
