@@ -881,16 +881,25 @@ pub const PackedOp = enum(u8) {
     pcmpeqb = 0x74,
     pcmpeqw = 0x75,
     pcmpeqd = 0x76,
+    // Shifts of every lane by the count in the source's low 64 bits.
+    psrlw = 0xd1,
+    psrld = 0xd2,
+    psrlq = 0xd3,
     paddq = 0xd4,
     pmullw = 0xd5,
     pminub = 0xda,
     pand = 0xdb,
     pmaxub = 0xde,
     pandn = 0xdf,
+    psraw = 0xe1,
+    psrad = 0xe2,
     pminsw = 0xea,
     por = 0xeb,
     pmaxsw = 0xee,
     pxor = 0xef,
+    psllw = 0xf1,
+    pslld = 0xf2,
+    psllq = 0xf3,
     pmuludq = 0xf4,
     psubb = 0xf8,
     psubw = 0xf9,
@@ -1553,7 +1562,10 @@ test "packed SSE instructions match GNU as" {
     try e.crc32(.dword, .dword, .rdx, .{ .reg = .rbx });
     try e.lockCmpxchg16b(.at(.r10, 0));
     try e.lockCmpxchg16b(.at(.rbp, -32));
-    const expected = "660ffcca66440f744de066410fefc766440ffbc3410f58d2660f59080fc2dc0166450fc25c24100466410f70d44ef20f70d3b1f3440f70cb00660f71d10866410f72f21f660f73db04660f73f20166410fd7c166440fd7d10f50ca66450f50de660f6f4df0f3450f7f4a08f30f6f0500000000660f3800ca66440f38404df066410f3837c766440f383fe3f2480f38f0c666f2410f38f1c9f24c0f38f15f08f20f38f1d3f0490fc70af0480fc74de0";
+    try e.pint(.psrld, .xmm1, .{ .reg = .xmm5 });
+    try e.pint(.psllq, .xmm9, .{ .reg = .xmm4 });
+    try e.pint(.psraw, .xmm0, .{ .reg = .xmm12 });
+    const expected = "660ffcca66440f744de066410fefc766440ffbc3410f58d2660f59080fc2dc0166450fc25c24100466410f70d44ef20f70d3b1f3440f70cb00660f71d10866410f72f21f660f73db04660f73f20166410fd7c166440fd7d10f50ca66450f50de660f6f4df0f3450f7f4a08f30f6f0500000000660f3800ca66440f38404df066410f3837c766440f383fe3f2480f38f0c666f2410f38f1c9f24c0f38f15f08f20f38f1d3f0490fc70af0480fc74de0" ++ "660fd2cd" ++ "66440ff3cc" ++ "66410fe1c4";
     var buf: [expected.len / 2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
 }

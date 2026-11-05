@@ -90,7 +90,7 @@ pub fn lowers(cg: *CodeGen, inst: Inst.Index) bool {
     return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
         .cmp_vector, .reduce, .select, .shuffle => true,
         .min_int, .max_int => true,
-        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ip.keyTag(cg.typeOf(data.bin_op.lhs)) == .vector_type,
+        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ip.keyTag(cg.typeOf(data.bin_op.lhs)) == .vector_type,
         .neg_float, .abs_float, .sqrt => ip.keyTag(cg.typeOf(data.un_op)) == .vector_type,
         .not => ip.keyTag(data.ty_op.ty) == .vector_type,
         // Sema emits these on vectors only when `shared.native` says so.
@@ -345,6 +345,7 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
             try shuffle(cg, inst, data.ty_pl.ty, x.a, x.b, x.mask);
         },
         .min_float, .max_float => try floatMinMax(cg, inst, tag == .max_float, cg.typeOf(data.bin_op.lhs), data.bin_op.lhs, data.bin_op.rhs),
+        .shl, .shr => try shift(cg, inst, tag == .shl, cg.typeOf(data.bin_op.lhs), data.bin_op.lhs, data.bin_op.rhs),
         .neg_float, .abs_float, .sqrt => try floatUnary(cg, inst, tag, data.un_op),
         .aggregate_init => {
             const extra = cg.ir.extraData(Ir.Aggregate, data.ty_pl.payload);
@@ -762,6 +763,134 @@ fn signMem(cg: *CodeGen, lane: Lane) Error!Mem {
 
 // ---------------------------------------------------------------------------
 // Operations
+
+/// Shift of every lane of integer vector `lhs` (of type `ty`) left, or
+/// right (arithmetically if signed), by `rhs`, whose lanes all hold the
+/// same amount (Sema's `vectorShift`), so lane 0's is the count: an
+/// immediate when constant, else in xmm5 (and the derived counts below in
+/// xmm4). 16-, 32- and 64-bit lanes shift directly. Bytes shift as words,
+/// then a mask clears the bits that crossed from the neighbouring byte;
+/// signed bytes shift right as the high bytes of words (`punpck`) by 8
+/// more, then pack. A signed 64-bit lane shifts right logically, with its
+/// sign mask shifted left by 64 - n or'ed in.
+fn shift(cg: *CodeGen, inst: Inst.Index, left: bool, ty: Index, lhs: Ref, rhs: Ref) Error!void {
+    const ip = cg.ip;
+    const e = &cg.e;
+    const s = shape(ip, ty).?;
+    const signed = isSigned(cg, ty);
+    const Count = union(enum) { imm: u8, xmm: Xmm };
+    // The amount, and the one the lowering needs besides: 8 + n for signed
+    // bytes, 64 - n for signed 64-bit lanes.
+    const extra: ?u8 = if (left or !signed) null else switch (s.lane) {
+        .i8 => 8,
+        .i64 => 64,
+        else => null,
+    };
+    var n: Count = undefined;
+    var n2: Count = undefined;
+    if (rhs.toInterned()) |v| {
+        const k: u8 = @intCast(CodeGen.intBits(ip, elemValue(ip, v, 0)));
+        n = .{ .imm = k };
+        if (extra) |x| n2 = .{ .imm = if (x == 8) 8 + k else 64 - k };
+    } else {
+        switch (try chunk(cg, rhs, 0)) {
+            .reg => |x| {
+                try e.movFromXmm(.dword, .{ .reg = .rax }, x);
+                try e.movzx(.dword, .rax, .byte, .{ .reg = .rax });
+            },
+            .mem, .umem => |m| try e.movzx(.dword, .rax, .byte, .{ .mem = m }),
+            .zero, .ones => unreachable, // a constant
+        }
+        try e.movToXmm(.dword, .xmm5, .{ .reg = .rax });
+        n = .{ .xmm = .xmm5 };
+        if (extra) |x| {
+            if (x == 8) {
+                try e.alu(.add, .dword, .{ .reg = .rax }, .{ .imm = 8 });
+            } else {
+                try e.mov(.dword, .{ .reg = .rcx }, .{ .imm = 64 });
+                try e.alu(.sub, .dword, .{ .reg = .rcx }, .{ .reg = .rax });
+                try e.mov(.dword, .{ .reg = .rax }, .{ .reg = .rcx });
+            }
+            try e.movToXmm(.dword, .xmm4, .{ .reg = .rax });
+            n2 = .{ .xmm = .xmm4 };
+        }
+    }
+    const Op = struct {
+        fn by(enc: *Encoder, op: Encoder.PshiftOp, r: Xmm, c: Count) Error!void {
+            switch (c) {
+                .imm => |k| try enc.pshift(op, r, k),
+                .xmm => |x| try enc.pint(switch (op) {
+                    .psllw => .psllw,
+                    .pslld => .pslld,
+                    .psllq => .psllq,
+                    .psrlw => .psrlw,
+                    .psrld => .psrld,
+                    .psrlq => .psrlq,
+                    .psraw => .psraw,
+                    .psrad => .psrad,
+                    .psrldq, .pslldq => unreachable,
+                }, r, .{ .reg = x }),
+            }
+        }
+    };
+    // Unsigned bytes: the mask of the bits that stay in each byte, in xmm3.
+    if (s.lane == .i8 and (left or !signed)) switch (n) {
+        .imm => |k| {
+            const b: u8 = if (left) @truncate(@as(u16, 0xff) << @intCast(k)) else @as(u8, 0xff) >> @intCast(k);
+            try e.movdq(true, .{ .reg = .xmm3 }, .{ .mem = try constMem(cg, @splat(b)) });
+        },
+        .xmm => {
+            // 0x00ff in each word, shifted as the lanes are; its low byte
+            // is the mask, which packuswb copies to every byte.
+            try e.pint(.pcmpeqd, .xmm3, .{ .reg = .xmm3 });
+            try e.pshift(.psrlw, .xmm3, 8);
+            try Op.by(e, if (left) .psllw else .psrlw, .xmm3, n);
+            if (left) {
+                try e.pshift(.psllw, .xmm3, 8);
+                try e.pshift(.psrlw, .xmm3, 8);
+            }
+            try e.pint(.packuswb, .xmm3, .{ .reg = .xmm3 });
+        },
+    };
+    const dst = try Dst.of(cg, inst, ty);
+    for (0..s.chunks()) |kk| {
+        const k: u32 = @intCast(kk);
+        const r = dst.home orelse .xmm0;
+        try loadChunk(cg, r, lhs, k);
+        switch (s.lane) {
+            .i8 => if (left or !signed) {
+                try Op.by(e, if (left) .psllw else .psrlw, r, n);
+                try e.pint(.pand, r, .{ .reg = .xmm3 });
+            } else {
+                // Each byte as the high byte of a word, whose low byte the
+                // shift by 8 + n drops.
+                try e.movdq(true, .{ .reg = .xmm1 }, .{ .reg = r });
+                try e.pint(.punpcklbw, .xmm1, .{ .reg = r });
+                try e.movdq(true, .{ .reg = .xmm2 }, .{ .reg = r });
+                try e.pint(.punpckhbw, .xmm2, .{ .reg = r });
+                try Op.by(e, .psraw, .xmm1, n2);
+                try Op.by(e, .psraw, .xmm2, n2);
+                try e.pint(.packsswb, .xmm1, .{ .reg = .xmm2 });
+                try e.movdq(true, .{ .reg = r }, .{ .reg = .xmm1 });
+            },
+            .i16 => try Op.by(e, if (left) .psllw else if (signed) .psraw else .psrlw, r, n),
+            .i32 => try Op.by(e, if (left) .pslld else if (signed) .psrad else .psrld, r, n),
+            .i64 => if (left or !signed) {
+                try Op.by(e, if (left) .psllq else .psrlq, r, n);
+            } else {
+                // The sign of each lane in all its bits: its high dword's,
+                // copied to both dwords and shifted arithmetically.
+                try e.pshuf(.d, .xmm1, .{ .reg = r }, 0xf5);
+                try e.pshift(.psrad, .xmm1, 31);
+                try Op.by(e, .psrlq, r, n);
+                try Op.by(e, .psllq, .xmm1, n2);
+                try e.pint(.por, r, .{ .reg = .xmm1 });
+            },
+            else => unreachable,
+        }
+        try dst.put(cg, r, k);
+    }
+}
 
 fn arith(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void {
     const s = shape(cg.ip, ty).?;

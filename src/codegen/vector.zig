@@ -42,6 +42,10 @@ pub const Op = union(enum) {
     /// `@intCast` that widens (every source value fits the destination,
     /// so no lane needs a check) or `@truncate`, to this vector type.
     cast: Index,
+    /// `<<` and `>>` (arithmetic for signed lanes) by an amount that is
+    /// the same in every lane, as SIMD shifts take it; Sema checks that.
+    shl,
+    shr,
 };
 
 /// The element of a vector type as a SIMD lane.
@@ -165,6 +169,10 @@ pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Ind
             .mul => l == .i16 or l == .i32,
         },
         .shuffle => true,
+        // SSE2 shifts 16-, 32- and 64-bit lanes; bytes shift as words,
+        // masked or unpacked, and 64-bit lanes shift right arithmetically
+        // as logically with their sign bits shifted in.
+        .shl, .shr => !l.isFloat(),
         .cast => unreachable,
     };
 }

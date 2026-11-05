@@ -1363,7 +1363,8 @@ backend does, not scalarized. The split has three parts:
   lands, so its vectors stay scalarized.
 - **The IR**: the existing element-wise tags (`add_wrap`, `sub_wrap`,
   `mul_wrap`, `bit_and`, `bit_or`, `xor`, `not`, `add_float` ...
-  `max_float`, `neg_float`, `abs_float`, `sqrt`) carry vector operands,
+  `max_float`, `neg_float`, `abs_float`, `sqrt`, and `shl`/`shr` with a
+  vector amount) carry vector operands,
   and six tags are vector-only: `min_int` and `max_int`, `cmp_vector`
   (a bool vector), `reduce`, `select`, and `shuffle` (whose mask is a
   comptime `@Vector(n, i32)`, negative lanes taken from `b`).
@@ -1409,12 +1410,20 @@ from a call, loaded from read-only data), `@intCast` that widens
 narrowing one keeps its per-lane checks and stays scalar) and
 `@truncate` (pairs of chunks packed with `packuswb`, `packssdw` after
 clearing or sign-extending what saturation would change, or `pshufd`),
-and bitwise ops and `and`/`or`/`xor` reductions on bool vectors. A
+bitwise ops and `and`/`or`/`xor` reductions on bool vectors, and `<<`
+and `>>` by an amount that is the same in every lane (a constant splat,
+or a runtime `@splat`, which Sema checks in `vectorShift`, since SSE
+takes one count): `psll`/`psrl`/`psra` with an immediate or a count
+register, bytes as masked words or, signed, as the high bytes of words,
+and signed 64-bit lanes logically with their sign shifted in. So
+`std.math.rotr` on vectors (BLAKE3's rounds) is four instructions and
+inlines. A
 compare against a constant that splits the lanes at their sign bit
 (unsigned `x >= 0x80`, signed `x < 0`, their negations) is the sign
 bits themselves, one `pmovmskb` or `movmskps`. Upstream's Debug backend scalarizes compares, selects and
 shuffles; doing them here keeps results bit for bit (the same lanes,
-padding never observable). Still scalarized: shifts, overflow and
+padding never observable). Still scalarized: shifts by per-lane amounts
+(AVX2's `vpsllvd`, beyond the `-mcpu` limit), overflow and
 saturating arithmetic, division and remainder of integers, 64-bit
 `@min`/`@max`, float reductions (a left fold, in element order, as
 upstream; a tree would change the rounding and which zero `@min`
@@ -1469,9 +1478,9 @@ Salsa20, BLAKE3 and SHA-256 in TLS):
    with `@reduce(.Or/.And)` and `firstTrue`/`lastTrue`, bitwise ops,
    and bitcasts between 16-byte vectors, arrays and integers.
 2. 32-bit lanes: wrapping add, xor, `@shuffle` (`ext`, `rev64`, `tbl`)
-   for ChaCha20, Salsa20 and BLAKE3 rounds. Their rotates are shifts,
-   scalarized on x86_64 today; NEON `shl`/`ushr`/`sri` would make
-   shifts by a splat worth adding on both. SHA-256 on apple_m1 (which
+   for ChaCha20, Salsa20 and BLAKE3 rounds. Their rotates are shifts by
+   a splat, native on x86_64; NEON `shl`/`ushr`/`sri` (or `ushl`/`sshl`
+   by a register) lower the same `shl`/`shr`. SHA-256 on apple_m1 (which
    has the sha2 feature) is inline assembly with `@Vector(4, u32)`
    operands in V registers (`w` constraints); those operands already
    work through memory, so this step only keeps them in registers.

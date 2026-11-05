@@ -10846,6 +10846,7 @@ fn analyzeShift(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, lhs: Re
     if (sema.vectorLen(ty)) |len| {
         const rhs_len = sema.vectorLen(sema.typeOf(uncasted_rhs));
         if (rhs_len != null and rhs_len.? != len) return sema.fail(block, src, "vector length mismatch", .{});
+        if (try sema.vectorShift(block, src, tag, ty, lhs, uncasted_rhs)) |r| return r;
         return sema.vectorMap(block, src, len, ty, &.{ lhs, uncasted_rhs }, VectorArith{ .tag = tag });
     }
     if (sema.vectorLen(sema.typeOf(uncasted_rhs)) != null)
@@ -21872,6 +21873,53 @@ fn vectorArith(sema: *Sema, block: *Block, tag: Zir.Inst.Tag, ty: Index, lhs: Re
     };
     if (!try sema.vectorNative(block, op, ty, &.{ lhs, rhs })) return null;
     return try sema.addBinOp(block, ir_tag, lhs, rhs);
+}
+
+/// `lhs << rhs` or `lhs >> rhs` (`tag`, also exact) on vector type `ty` as
+/// one `shl` or `shr` (`vectorNative`), or null. SIMD shifts take one
+/// amount for every lane, so `rhs`, already of the amount type, must be
+/// uniform: a comptime splat, or a runtime `@splat`. The amount type keeps
+/// it below the lanes' bits, which are a power of two (lanes are not
+/// `narrow`), so only an exact shift needs a check: shifting back restores
+/// `lhs`.
+fn vectorShift(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) CompileError!?Ref {
+    const ip = sema.ip;
+    const left = switch (tag) {
+        .shl, .shl_exact => true,
+        .shr, .shr_exact => false,
+        else => return null,
+    };
+    const exact = tag == .shl_exact or tag == .shr_exact;
+    if (block.is_comptime or sema.bc != null) return null;
+    const elem = Type.childType(ip, ty);
+    if (Type.class(ip, elem) != .int) return null;
+    const len = ip.keyPayload(.vector_type, ty).len;
+    const bits = Type.intInfo(ip, elem).bits;
+    if (bits == 0 or bits > 64) return null;
+    if (sema.typeOf(rhs) != try sema.vectorType(len, try sema.intType(.unsigned, Type.log2IntBits(bits)))) return null;
+    if (!vector.native(&sema.zcu.cpu, ip, if (left) .shl else .shr, ty)) return null;
+    if (exact and block.want_safety and len > vector.max_bools) return null;
+    if (try sema.hasUndefElem(lhs) or try sema.hasUndefElem(rhs)) return null;
+    if (sema.resolveValue(lhs) != null and sema.resolveValue(rhs) != null) return null;
+    if (sema.resolveValue(rhs)) |v| {
+        const first = try sema.elemValue(v, 0);
+        for (1..len) |i| if (try sema.elemValue(v, @intCast(i)) != first) return null;
+    } else {
+        const i = rhs.toIndex() orelse return null;
+        if (sema.ir_insts.items(.tag)[@backingInt(i)] != .aggregate_init) return null;
+        const payload = sema.ir_insts.items(.data)[@backingInt(i)].ty_pl.payload;
+        const elems: []const Ref = @ptrCast(sema.ir_extra.items[payload + 1 ..][0..len]);
+        for (elems[1..]) |e| if (e != elems[0]) return null;
+    }
+    const result = try sema.addBinOp(block, if (left) .shl else .shr, lhs, rhs);
+    if (exact and block.want_safety) {
+        const back = try sema.addBinOp(block, if (left) .shr else .shl, result, rhs);
+        const eq = try sema.analyzeCmp(block, src, .eq, back, lhs);
+        const payload = try sema.addExtra(Ir.Reduce{ .operand = eq, .op = @backingInt(Ir.ReduceOp.@"and") });
+        const ok = try sema.addInst(block, .{ .tag = .reduce, .data = .{ .ty_pl = .{ .ty = .bool_type, .payload = payload } } });
+        try sema.addSafetyCheck(block, ok, if (left) .shl_overflow else .shr_overflow, .none, .none);
+    }
+    return result;
 }
 
 /// Float `-operand`, `@abs` or `@sqrt` (`op`, as IR tag `tag`), or integer
