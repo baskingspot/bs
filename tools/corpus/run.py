@@ -28,6 +28,9 @@ CORPUS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(os.path.dirname(CORPUS_DIR))
 WORK = os.path.join(CORPUS_DIR, ".work")
 
+# Zig's optimize mode flag, as `zig build` passes it.
+OPTIMIZE_FLAG = re.compile(r"-O(debug|release_?safe|release_?fast|release_?small)$", re.IGNORECASE)
+
 # Appended to the edit line: keeps the line count, and differs per edit.
 EDIT_SUFFIX = " std.mem.doNotOptimizeAway(@as(u32, {n}));"
 
@@ -141,10 +144,11 @@ def strip_common(words, cache_dir, out):
         w = words[i]
         if w in ("--listen=-", "-femit-docs"):
             pass
-        elif w.startswith("-O"):
+        elif OPTIMIZE_FLAG.match(w):
             # Every build is Debug: the baseline is upstream Debug, and
             # bs has no other mode. (Some build scripts force a release
-            # mode on their build-time tools.)
+            # mode on their build-time tools.) Not Clang's `-O…` flags in
+            # `-cflags`, such as raylib's `-ObjC` on macOS.
             res.append("-Odebug")
         elif w in ("--cache-dir", "--global-cache-dir", "--zig-lib-dir"):
             # The recording zig's lib dir: each compiler uses its own, so
@@ -196,7 +200,14 @@ def translate(compiler, words, cmds, cache_dir, src):
             continue
         tc = by_stem[os.path.basename(m.group(2))]
         argv = [compiler, "translate-c", *strip_translate(tc), "--cache-dir", cache_dir]
-        p = subprocess.run(argv, cwd=src, capture_output=True, text=True, errors="replace", check=False)
+        try:
+            # Upstream's translate-c of tokamak's src/c.h does not finish
+            # on aarch64-macos.
+            p = subprocess.run(
+                argv, cwd=src, capture_output=True, text=True, errors="replace", timeout=600, check=False
+            )
+        except subprocess.TimeoutExpired:
+            return None, f"{shlex.join(argv)}: timeout"
         if p.returncode != 0:
             return None, p.stdout + p.stderr
         out = os.path.join(cache_dir, "translated", os.path.basename(m.group(2)))
@@ -211,10 +222,15 @@ def compile_argv(compiler, words, cache_dir, out):
     """The command line of a target for either compiler: bs takes all of
     upstream's flags."""
     rest = strip_common(words, cache_dir, out)
-    # The baseline is upstream's Debug default on x86_64-linux: the
-    # self-hosted backend and linker, even where the build script asks for
-    # LLVM and LLD.
-    rest = ["-fno-llvm" if w == "-fllvm" else w for w in rest if w != "-flld"]
+    if sys.platform == "darwin":
+        # On aarch64-macos upstream's Debug default is LLVM: its
+        # self-hosted aarch64 backend does not finish even an empty main.
+        rest = [w for w in rest if w not in ("-fllvm", "-fno-llvm", "-flld", "-fno-lld")]
+    else:
+        # The baseline is upstream's Debug default on x86_64-linux: the
+        # self-hosted backend and linker, even where the build script asks
+        # for LLVM and LLD.
+        rest = ["-fno-llvm" if w == "-fllvm" else w for w in rest if w != "-flld"]
     return [compiler, words[1], *rest]
 
 

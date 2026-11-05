@@ -63,7 +63,13 @@ fresh checkout), `--results NAME` (write `.work/NAME.json` and
   - Every build is Debug: a release `-O` some build scripts force on their
     build-time tools becomes `-Odebug`, and upstream's `-fllvm` becomes
     `-fno-llvm`, so the baseline is upstream's Debug default on x86_64-linux
-    (the self-hosted backend).
+    (the self-hosted backend). On aarch64-macos (a Mac satellite: pass
+    `--zig ~/.cache/bs/zig-aarch64-macos-0.17.1/zig`) the baseline is
+    upstream's Debug default there, LLVM: the LLVM flags go, as upstream's
+    self-hosted aarch64 backend does not finish even an empty `main`.
+    Upstream's `translate-c -lc` does not finish on some headers there
+    (sqlite3.h, tokamak's and zigcli's); a translation gives up after 10
+    minutes.
   - bs gets the same command line as upstream: it takes every flag the
     corpus's build scripts pass.
   - A module that is a translated C header (`b.addTranslateC`, recorded
