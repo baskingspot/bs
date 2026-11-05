@@ -1333,6 +1333,8 @@ pub fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
     if (!Type.isInt(cg.ip, ty)) return; // bools stay 0 or 1
     const info = Type.intInfo(cg.ip, ty);
     if (info.bits >= 64) return;
+    // A zero-bit integer's only value.
+    if (info.bits == 0) return cg.e.movImm(.x, reg, 0);
     try cg.e.bitfield(if (info.signedness == .signed) .sbfm else .ubfm, .x, reg, reg, 0, @intCast(info.bits - 1));
 }
 
@@ -2424,6 +2426,9 @@ fn memset(cg: *CodeGen, data: Inst.Data) Error!void {
 /// The bit operations into x9.
 fn bitOp(cg: *CodeGen, tag: Inst.Tag, bits: u16, operand: Ref) Error!void {
     const e = &cg.e;
+    // A u0 at run time (`std.mem.writeInt` of no bytes): every result is
+    // 0.
+    if (bits == 0) return e.movImm(.x, .x9, 0);
     try cg.load(.x9, operand);
     // Only the operand's own bits.
     if (bits < 64) try e.bitfield(.ubfm, .x, .x9, .x9, 0, @intCast(bits - 1));

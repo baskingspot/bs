@@ -1,5 +1,5 @@
 //! exit: 0
-//! stderr: "sum=103658747345780558405425396738333792356 wide=-1180591620717411303424 div=-1180591620717411304\narea 6.75\narea 7\nf16: 2.5 2.5 -0\nf32: 1.5 -2.5 0\nf64: 1.25 1.25 -0\nf80: 1 -2 0\nf128: 1.5 1.5 -0\nf16 4.5 f128 3000000000000000000000000000000 true\nparse 123 Empty\nlist 1000 332833500 3b456bc8\n"
+//! stderr: "sum=103658747345780558405425396738333792356 wide=-1180591620717411303424 div=-1180591620717411304\narea 6.75\narea 7\nf16: 2.5 2.5 -0\nf32: 1.5 -2.5 0\nf64: 1.25 1.25 -0\nf80: 1 -2 0\nf128: 1.5 1.5 -0\nf16 4.5 f128 3000000000000000000000000000000 true\nparse 123 Empty\nlist 1000 332833500 3b456bc8\nbytes 24 2c486a1e59aaaaaa\n"
 //! targets: x86_64-linux aarch64-macos aarch64-linux
 
 // std programs that run unchanged on every target: integers wider than a
@@ -26,6 +26,20 @@ const Shape = union(enum) {
 fn parse(s: []const u8) error{Empty}!u32 {
     if (s.len == 0) return error.Empty;
     return std.fmt.parseInt(u32, s, 10) catch 0;
+}
+
+// An integer as many bytes wide as `buf`, as the zig compiler's
+// Dwarf.writeInt: with no bytes, `@byteSwap` and friends get a u0 at run
+// time.
+noinline fn writeInt(buf: []u8, int: u64, endian: std.lang.Endian) u32 {
+    switch (buf.len) {
+        inline 0...8 => |len| {
+            const v: @Int(.unsigned, len * 8) = @intCast(int);
+            std.mem.writeInt(@TypeOf(v), buf[0..len], @bitReverse(v), endian);
+            return @as(u32, @clz(v)) + @ctz(v) + @popCount(v);
+        },
+        else => unreachable,
+    }
 }
 
 fn mods(comptime T: type, a: T, b: T) void {
@@ -57,4 +71,9 @@ pub fn main() !void {
     var total: u64 = 0;
     for (list.items) |v| total +%= v;
     std.debug.print("list {d} {d} {x}\n", .{ list.items.len, total, @bitReverse(@as(u32, @intCast(total & 0xffff_ffff))) });
+    var bytes: [8]u8 = @splat(0xaa);
+    var endian: std.lang.Endian = .big;
+    _ = &endian;
+    const bits = writeInt(bytes[0..0], 0, endian) + writeInt(bytes[0..2], 0x1234, endian) + writeInt(bytes[2..5], 0x56789a, .little);
+    std.debug.print("bytes {d} {x}\n", .{ bits, bytes });
 }
