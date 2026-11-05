@@ -36,6 +36,10 @@ cold_start: u32 = 0,
 /// itself, or where it jumps if it is bypassed (`place`).
 cold: std.ArrayList(bool) = .empty,
 fwd: std.ArrayList(Block.Index) = .empty,
+/// Per block, from `liveness`: for a block from which every path ends the
+/// function's execution (doomed), where the clobber points that matter
+/// to its uses lie (`Doom`); `from` is `no_tie` for the other blocks.
+doom: std.ArrayList(Doom) = .empty,
 /// Per block, from `place`: no branch reaches it after jump threading
 /// (`thread`), so it is not emitted.
 unreached: std.ArrayList(bool) = .empty,
@@ -242,6 +246,7 @@ pub fn deinit(f: *Ssa, gpa: Allocator) void {
     f.order.deinit(gpa);
     f.cold.deinit(gpa);
     f.fwd.deinit(gpa);
+    f.doom.deinit(gpa);
     f.unreached.deinit(gpa);
     f.covered.deinit(gpa);
     f.extra.deinit(gpa);
@@ -598,14 +603,48 @@ fn endsCold(f: *const Ssa, ir: *const Ir, index: u32) bool {
 /// one entry per IR instruction already; `reg` and `tie` are the
 /// architecture's, which may mark them in `ctx.clobbers`. A value crosses a
 /// clobber point that lies after its definition and at or before its last
-/// use, except one in a block that does not continue, which matters only
-/// to the uses in that block after it.
+/// use, except one in a doomed block (`doom`), which matters only to the
+/// uses after it in the doomed blocks it reaches. A block is doomed when
+/// it does not continue (`deadEnd`) or when each of its successors
+/// follows it in the layout and is doomed: a failing check's call of
+/// `returnError` before the `br` to the block that returns.
 pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.Error!void {
     assert(f.live.len == ir.instructions.len);
     const s = f.live.slice();
     @memset(s.items(.uses), 0);
     @memset(s.items(.crosses), false);
     @memset(s.items(.weight), 0);
+    try f.doom.resize(gpa, f.blocks.items.len);
+    const doom = f.doom.items;
+    {
+        @memset(doom, .{ .from = no_tie, .reach = 0, .clobbers = 0 });
+        var k = f.layout.items.len;
+        // Each block's index in the layout, until `doom` holds its reach.
+        for (f.layout.items, 0..) |block, i| doom[@backingInt(block)].reach = @intCast(i);
+        while (k > 0) {
+            k -= 1;
+            const block = @backingInt(f.layout.items[k]);
+            const b = f.blocks.items[block];
+            const succ = b.term.succ;
+            const doomed = switch (b.term.tag) {
+                .ret, .unreach, .noreturn => true,
+                .jump, .fallthrough => doom[succ[0]].from != no_tie,
+                .branch => doom[succ[0]].from != no_tie and doom[succ[1]].from != no_tie,
+                .switch_br => false,
+            };
+            if (!doomed) continue;
+            var reach: u32 = @intCast(k);
+            for (b.term.succ[0..termSuccs(b.term.tag)]) |t| reach = @max(reach, doom[t].reach);
+            doom[block] = .{ .from = b.start, .reach = reach, .clobbers = 0 };
+        }
+        // Successors marked doomed follow in the layout.
+        for (f.layout.items) |block| {
+            const b = f.blocks.items[@backingInt(block)];
+            const from = doom[@backingInt(block)].from;
+            if (from == no_tie) continue;
+            for (b.term.succ[0..termSuccs(b.term.tag)]) |t| doom[t].from = @min(doom[t].from, from);
+        }
+    }
     // Prefix counts of the clobber points by position.
     try f.clobbers.resize(gpa, 2 * f.values.len + 3);
     const cl = f.clobbers.items;
@@ -615,27 +654,37 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
         cl[1] = counts;
         for (f.layout.items) |block| {
             const b = f.blocks.items[@backingInt(block)];
-            const k: usize = @intFromBool(deadEnd(b.term.tag));
+            const k: usize = @intFromBool(doom[@backingInt(block)].from != no_tie);
+            const before = counts[k];
             for (b.start..b.start + b.len) |i| {
                 if (ctx.clobbers(f.values.items(.inst)[i])) counts[k] += 1;
                 cl[2 * i + 2] = counts;
                 cl[2 * i + 3] = counts; // until the next value or terminator
             }
             if (ctx.termClobbers(block)) counts[k] += 1;
+            if (k == 1) doom[@backingInt(block)].clobbers = counts[1] - before;
             cl[2 * (b.start + b.len) + 1] = counts;
             cl[2 * (b.start + b.len) + 2] = counts;
         }
     }
     for (&f.slots.free) |*l| l.clearRetainingCapacity();
     f.slots.active.clearRetainingCapacity();
-    var w: LiveWalk = .{ .uses = s.items(.uses), .weight = s.items(.weight), .def = s.items(.def), .end = s.items(.end), .crosses = s.items(.crosses), .clobbers = cl, .loops = f.loops.items, .loop = no_loop, .pos = 0, .dead_start = null };
+    // Where each value's register starts to hold it, for `crosses`: its
+    // definition, or a block result's first `br`.
+    const born = try gpa.alloc(u32, ir.instructions.len);
+    defer gpa.free(born);
+    var arms: DeadArms = try .init(gpa, f);
+    defer arms.deinit(gpa);
+    var w: LiveWalk = .{ .uses = s.items(.uses), .weight = s.items(.weight), .def = s.items(.def), .end = s.items(.end), .born = born, .crosses = s.items(.crosses), .clobbers = cl, .arms = &arms, .loops = f.loops.items, .loop = no_loop, .pos = 0, .dead_start = null };
     const insts = f.values.items(.inst);
     const datas = ir.instructions.items(.data);
     const tags = ir.instructions.items(.tag);
-    for (f.layout.items) |block| {
+    for (f.layout.items, 0..) |block, k| {
         const b = f.blocks.items[@backingInt(block)];
         w.loop = f.block_loop.items[@backingInt(block)];
-        w.dead_start = if (deadEnd(b.term.tag)) 2 * b.start + 1 else null;
+        const from = doom[@backingInt(block)].from;
+        w.dead_start = if (from != no_tie) 2 * from + 1 else null;
+        arms.enter(k);
         const term_pos = 2 * (b.start + b.len) + 1;
         const term_data = datas[@backingInt(b.term.inst)];
         const cond: ?Inst.Index = if (b.term.tag == .branch) branchCond(ir, b.term).toIndex() else null;
@@ -647,6 +696,7 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
             const p: u32 = @intCast(2 * i + 2);
             w.def[@backingInt(inst)] = p;
             w.end[@backingInt(inst)] = p;
+            born[@backingInt(inst)] = if (tags[@backingInt(inst)] == .block) no_tie else p;
             w.pos = if ((cond != null and cond.? == inst) or (negated != null and negated.? == inst)) term_pos else p;
             forEachOperand(ir, inst, &w);
         }
@@ -657,6 +707,7 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
                 // The `br` writes the block's result.
                 const blk = @backingInt(term_data.br.block_inst);
                 w.end[blk] = @max(w.end[blk], term_pos);
+                born[blk] = @min(born[blk], term_pos);
             } else if (b.term.tag == .branch) w.use(term_data.pl_op.operand),
             .switch_br => w.use(term_data.pl_op.operand),
             .ret => w.use(term_data.un_op),
@@ -665,7 +716,7 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
     }
     for (f.values.items(.inst)) |inst| {
         const i = @backingInt(inst);
-        if (cl[w.end[i]][0] != cl[w.def[i]][0]) w.crosses[i] = true;
+        if (cl[w.end[i]][0] != cl[w.bornAt(i)][0]) w.crosses[i] = true;
     }
 }
 
@@ -1005,7 +1056,12 @@ fn shareTies(f: *Ssa, ir: *const Ir, w: Inst.Index, v: Inst.Index, start: u32) v
     const reg = live.items(.reg);
     const tie = live.items(.tie);
     const fate = live.items(.fate);
+    // `v` holds what is computed in its register: a block's result, which
+    // crosses only the clobber points after its first `br` (`liveness`),
+    // crosses those the values before it cross.
+    const crosses = live.items(.crosses);
     share[@backingInt(w)] = @backingInt(v);
+    crosses[@backingInt(v)] = crosses[@backingInt(v)] or crosses[@backingInt(w)];
     var x = @backingInt(w);
     while (true) {
         const u = tie[x];
@@ -1018,6 +1074,7 @@ fn shareTies(f: *Ssa, ir: *const Ir, w: Inst.Index, v: Inst.Index, start: u32) v
         forEachOperand(ir, @fromBackingInt(x), &c);
         if (c.other) break;
         share[u] = @backingInt(v);
+        crosses[@backingInt(v)] = crosses[@backingInt(v)] or crosses[u];
         x = u;
     }
 }
@@ -1910,13 +1967,104 @@ pub fn valuePos(i: usize) u32 {
     return @intCast(2 * i + 2);
 }
 
+fn termSuccs(tag: Term.Tag) usize {
+    return switch (tag) {
+        .jump, .fallthrough => 1,
+        .branch => 2,
+        else => 0,
+    };
+}
+
+pub const Doom = struct {
+    /// The first value index of the doomed blocks that reach this one,
+    /// which a clobber point must follow to matter to its uses.
+    from: u32,
+    /// The last layout index of a block this one reaches: its own or a
+    /// doomed successor's, since those follow it in the layout.
+    reach: u32,
+    /// Its clobber points, counted in `clobbers[..][1]`.
+    clobbers: u32,
+};
+
+/// The clobber points of the doomed blocks that cannot reach the current
+/// block of a walk over the layout (`enter`): an error return's call of
+/// `returnError` is not on the path from a value to its use on the
+/// success path after it. A doomed block cannot reach a block after its
+/// `reach` in the layout.
+pub const DeadArms = struct {
+    /// Doomed blocks with clobber points, by `reach`.
+    blocks: []Block.Index,
+    next: u32 = 0,
+    /// A Fenwick tree over block starts of the clobber points in the
+    /// blocks entered so far, and their total.
+    sums: []u32,
+    total: u32 = 0,
+    doom: []const Doom,
+    func_blocks: []const Block,
+
+    pub fn init(gpa: Allocator, f: *const Ssa) Allocator.Error!DeadArms {
+        var n: usize = 0;
+        for (f.doom.items) |d| n += @intFromBool(d.clobbers != 0);
+        const blocks = try gpa.alloc(Block.Index, n);
+        errdefer gpa.free(blocks);
+        n = 0;
+        for (f.doom.items, 0..) |d, i| if (d.clobbers != 0) {
+            blocks[n] = @fromBackingInt(@intCast(i));
+            n += 1;
+        };
+        const sums = try gpa.alloc(u32, if (n == 0) 0 else f.values.len + 1);
+        @memset(sums, 0);
+        std.sort.pdq(Block.Index, blocks, f.doom.items, struct {
+            fn lt(doom: []const Doom, a: Block.Index, b: Block.Index) bool {
+                return doom[@backingInt(a)].reach < doom[@backingInt(b)].reach;
+            }
+        }.lt);
+        return .{ .blocks = blocks, .sums = sums, .doom = f.doom.items, .func_blocks = f.blocks.items };
+    }
+
+    pub fn deinit(d: *DeadArms, gpa: Allocator) void {
+        gpa.free(d.blocks);
+        gpa.free(d.sums);
+        d.* = undefined;
+    }
+
+    /// Moves the walk to the block at layout index `k`, which no block
+    /// left so far reaches.
+    pub fn enter(d: *DeadArms, k: usize) void {
+        while (d.next < d.blocks.len) : (d.next += 1) {
+            const block = @backingInt(d.blocks[d.next]);
+            if (d.doom[block].reach >= k) break;
+            const c = d.doom[block].clobbers;
+            d.total += c;
+            var i = d.func_blocks[block].start + 1;
+            while (i < d.sums.len) : (i += i & -%i) d.sums[i] += c;
+        }
+    }
+
+    /// Whether a use at position `pos` in the current block crosses a
+    /// clobber point in a doomed block after position `lo`, not counting
+    /// `own` at `pos`.
+    pub fn crossed(d: *const DeadArms, cl: []const [2]u32, lo: u32, pos: u32, own: u32) bool {
+        const at = cl[pos][1] - own;
+        if (at == cl[lo][1] or lo >= pos) return at != cl[lo][1];
+        // The blocks left that start after `lo`, all of whose clobber
+        // points lie after it.
+        var left = d.total;
+        var k = (lo + 1) / 2;
+        while (k > 0) : (k -= k & -%k) left -= d.sums[k];
+        return at - cl[lo][1] > left;
+    }
+};
+
 const LiveWalk = struct {
     uses: []u32,
     weight: []u32,
     def: []u32,
     end: []u32,
+    born: []u32,
     crosses: []bool,
     clobbers: []const [2]u32,
+    arms: *const DeadArms,
     loops: []const Loop,
     /// The innermost loop around the current block, and the position of
     /// the current use.
@@ -1926,6 +2074,12 @@ const LiveWalk = struct {
     /// value.
     dead_start: ?u32,
 
+    /// A block result is written by its `br`s, the first of which every
+    /// path to a read passes after the clobber points before it.
+    fn bornAt(w: *const LiveWalk, inst: u32) u32 {
+        return if (w.born[inst] == no_tie) w.def[inst] else w.born[inst];
+    }
+
     fn use(w: *LiveWalk, ref: Inst.Ref) void {
         const inst = @backingInt(ref.toIndex() orelse return);
         w.uses[inst] += 1;
@@ -1934,7 +2088,7 @@ const LiveWalk = struct {
         while (q != no_loop and depth < 6) : (q = w.loops[q].parent) depth += 1;
         w.weight[inst] +|= @as(u32, 1) << @intCast(3 * depth);
         if (w.dead_start) |start| {
-            if (w.clobbers[w.pos][1] != w.clobbers[@max(start, w.def[inst])][1]) w.crosses[inst] = true;
+            if (w.arms.crossed(w.clobbers, @max(start, w.bornAt(inst)), w.pos, 0)) w.crosses[inst] = true;
         }
         // Live through the end of every loop around the use that does not
         // contain the definition.
