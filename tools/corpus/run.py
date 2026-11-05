@@ -254,6 +254,8 @@ TEST_SUMMARY = re.compile(
     r"^(?:\x1b\[[0-9;]*m)*(All \d+ tests passed\.|\d+ passed; \d+ skipped; \d+ failed\.|\d+ of \d+ tests passed)",
     re.MULTILINE,
 )
+# The test runner's line for a test it starts, without a terminal: "37/56 name...".
+TEST_STARTED = re.compile(r"^\d+/\d+ (.+?)\.\.\.", re.MULTILINE)
 
 
 def run_binary(path, args, cwd, timeout):
@@ -279,7 +281,12 @@ def run_binary(path, args, cwd, timeout):
 def summarize_run(r, is_test):
     if is_test:
         m = TEST_SUMMARY.search(r["stderr"])
-        return f"exit {r['exit']}, {m.group(1) if m else 'no summary'}"
+        if m:
+            return f"exit {r['exit']}, {m.group(1)}"
+        # A run that died names the test it died in: two crashes in
+        # different tests are different results.
+        started = TEST_STARTED.findall(r["stderr"])
+        return f"exit {r['exit']}, no summary" + (f", died in {started[-1]}" if started else "")
     return f"exit {r['exit']}"
 
 
