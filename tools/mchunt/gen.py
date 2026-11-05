@@ -564,6 +564,32 @@ def _ab_decl():
 
 EXTRA_DECL["argbase"] = _ab_decl()
 
+# Copies written back field by field from a const copy (s_sharefwd).
+EXTRA_DECL["sharefwd"] = [
+    "var gSfA: u32 = 11;",
+    "var gSfB: u32 = 22;",
+    "noinline fn sfMix(a: u64, b: u64) u64 { return a *% 31 +% b; }",
+    "inline fn sfIn(a: u64, b: u64) u64 { return (a ^ b) +% (a >> 3); }",
+]
+
+# Loads and copies around writes that may alias them (s_fwdalias).
+EXTRA_DECL["fwdalias"] = [
+    "const AQ = struct { a: u32, b: u32, c: u64 };",
+    "var gAQ: AQ = .{ .a = 1, .b = 2, .c = 3 };",
+    "var gAQp: *AQ = &gAQ;",
+    "var gAU: u32 = 5;",
+    "noinline fn aqWrite(p: *AQ, v: u32) void { p.a +%= v; p.c ^= v; }",
+    "noinline fn aqWriteG(v: u32) void { gAQ.b = v; gAU +%= v; }",
+    "noinline fn aqWriteSaved(v: u32) void { gAQp.a = v; gAQp.b +%= 1; }",
+    "noinline fn aqSave(p: *AQ) void { gAQp = p; }",
+    "noinline fn aqRead(p: *const AQ) u64 { return p.a +% p.b +% p.c; }",
+    "noinline fn aqTwo(p: *AQ, q: *const AQ) u64 { const x1 = q.a; p.a = 99; const x2 = q.a; return x1 *% 1000 +% x2; }",
+    "inline fn aqTwoI(p: *AQ, q: *const AQ) u64 { const x1 = q.b; p.* = .{ .a = 7, .b = 8, .c = 9 }; const x2 = q.b; return x1 *% 1000 +% x2; }",
+    "noinline fn aqFld(p: *AQ, f: *const u32) u64 { const x1 = f.*; p.* = .{ .a = x1 +% 1, .b = 5, .c = 6 }; return x1 *% 1000 +% f.*; }",
+    "noinline fn aqCopy(p: *AQ, q: *const AQ) u64 { const c = q.*; p.a = 50; p.b = 51; return @as(u64, c.a) *% 3 +% c.b +% q.a; }",
+    "inline fn aqCopyArg(c: AQ, p: *AQ) u64 { p.a = 77; return @as(u64, c.a) *% 5 +% c.b; }",
+]
+
 # Slices returned by noinline callees whose length is (or nearly is) one
 # argument (s_retlen).
 EXTRA_DECL["retlen"] = [
@@ -1518,6 +1544,7 @@ class Gen:
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
             (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
             (2, "swx"), (2, "scopenum"), (2, "argbase"), (2, "mulbound"), (2, "retlen"),
+            (2, "sharefwd"), (2, "fwdalias"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -3143,6 +3170,232 @@ class Gen:
             self.sink(ctx, f"{sl}[{j}]" if not near else f"{sl}[{j} + 1]", U32)
             ctx["indent"] -= 1
             e("}")
+
+    def s_sharefwd(self, ctx):
+        """A struct, array or tuple copied whole into a const in a loop, new
+        values computed from the copy, then written back field by field,
+        some from the copy and some from the computed values."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        self.extra.add("sharefwd")
+        e = lambda s_: self.emit(ctx, s_)
+        n = self.r.randint(1, 9)
+        cnt = self.fresh("fi")
+        kind = self.r.randrange(4)
+        outer = self.chance(0.3)
+        if outer:
+            e(f"for (0..{self.r.randint(1, 3)}) |_| {{")
+            ctx["indent"] += 1
+        # Fields: (name, type, init, combine(x, y) -> expr, to_u64(v))
+        kinds = {
+            "u64": ("u64", lambda: self.int_expr(ctx, U64, 1), lambda x, y: self.pick([f"{x} +% {y}", f"{x} % ({y} | 1)",
+                    f"sfMix({x}, {y})", f"sfIn({x}, {y})", f"{x} *% 3 +% {y}"]), lambda v: v),
+            "u32": ("u32", lambda: self.int_expr(ctx, U32, 1), lambda x, y: self.pick([f"{x} +% {y}", f"{x} ^ ({y} >> 1)",
+                    f"@as(u32, @truncate(sfMix({x}, {y})))"]), lambda v: f"@as(u64, {v})"),
+            "i16": ("i16", lambda: self.int_expr(ctx, Int(True, 16), 1), lambda x, y: f"{x} -% {y}",
+                    lambda v: f"@as(u64, @as(u16, @bitCast({v})))"),
+            "f64": ("f64", lambda: self.pick(["1.5", "-0.25", "3.0", "0.0"]), lambda x, y: self.pick([f"{x} + {y}", f"{x} * 0.5 - {y}"]),
+                    lambda v: f"@as(u64, @bitCast({v}))"),
+            "bool": ("bool", lambda: self.bool_expr(ctx, 1), lambda x, y: self.pick([f"{x} != {y}", f"!{x}", f"{x} and {y}"]),
+                     lambda v: f"@as(u64, @intFromBool({v}))"),
+            "ptr": ("*const u32", lambda: self.pick(["&gSfA", "&gSfB"]), lambda x, y: y, lambda v: f"@as(u64, {v}.*)"),
+        }
+        if kind <= 1:
+            nf = self.r.randint(2, 8)
+            fts = [self.pick(["u64", "u64", "u32", "i16", "f64", "bool", "ptr"]) for _ in range(nf)]
+            names = [f"f{i}" for i in range(nf)]
+            T = self.fresh("SF")
+            e(f"const {T} = struct {{ {', '.join(f'{nm}: {kinds[ft][0]}' for nm, ft in zip(names, fts))} }};")
+            v = self.fresh("sf")
+            e(f"var {v}: {T} = .{{ {', '.join(f'.{nm} = {kinds[ft][1]()}' for nm, ft in zip(names, fts))} }};")
+            acc = lambda c, i: f"{c}.{names[i]}"
+            store = lambda i, val: f"{v}.{names[i]} = {val};"
+            whole = None
+        elif kind == 2:
+            nf = self.r.randint(2, 6)
+            fts = ["u64"] * nf
+            v = self.fresh("sa")
+            e(f"var {v}: [{nf}]u64 = .{{ {', '.join(kinds['u64'][1]() for _ in range(nf))} }};")
+            acc = lambda c, i: f"{c}[{i}]"
+            store = lambda i, val: f"{v}[{i}] = {val};"
+            whole = "arr"
+        else:
+            nf = self.r.randint(2, 4)
+            fts = ["u64"] * nf
+            v = self.fresh("st")
+            e(f"var {v}: struct {{ {', '.join(['u64'] * nf)} }} = .{{ {', '.join(kinds['u64'][1]() for _ in range(nf))} }};")
+            acc = lambda c, i: f"{c}[{i}]"
+            store = lambda i, val: f"{v}[{i}] = {val};"
+            whole = "tuple"
+        e(f"var {cnt}: usize = 0;")
+        e(f"while ({cnt} < {n}) : ({cnt} += 1) {{")
+        ctx["indent"] += 1
+        t = self.fresh("sc")
+        e(f"const {t} = {v};")
+        # New values: copies of same-typed fields, or computed from them.
+        vals = []
+        for i, ft in enumerate(fts):
+            same = [j for j, g in enumerate(fts) if g == ft]
+            if self.chance(0.5):
+                vals.append(acc(t, self.pick(same)))
+            else:
+                nv = self.fresh("sn")
+                e(f"const {nv} = {kinds[ft][2](acc(t, self.pick(same)), acc(t, self.pick(same)))};")
+                vals.append(nv)
+        if whole is not None and self.chance(0.4):
+            e(f"{v} = .{{ {', '.join(vals)} }};")
+        else:
+            order = list(range(nf))
+            self.r.shuffle(order)
+            br = self.r.randrange(len(order) + 1) if self.chance(0.3) else -1
+            for pos, i in enumerate(order):
+                if pos == br:
+                    e(f"if ({self.bool_expr(ctx, 1)}) {{")
+                    ctx["indent"] += 1
+                    e(store(i, vals[i]))
+                    ctx["indent"] -= 1
+                    e("} else {")
+                    ctx["indent"] += 1
+                    e(store(i, acc(t, i)))
+                    ctx["indent"] -= 1
+                    e("}")
+                else:
+                    e(store(i, vals[i]))
+        ctx["indent"] -= 1
+        e("}")
+        for i, ft in enumerate(fts):
+            self.sink(ctx, kinds[ft][3](acc(v, i)), U64)
+        if outer:
+            ctx["indent"] -= 1
+            e("}")
+
+    def s_fwdalias(self, ctx):
+        """Loads and copies with writes in between that may alias them:
+        through another pointer to the same local or global, a field
+        pointer, the whole struct, calls that write through a given, global
+        or saved pointer, @memcpy/@memset, payload pointers, and loops that
+        write after the load."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        self.extra.add("fwdalias")
+        e = lambda s_: self.emit(ctx, s_)
+        u32 = lambda: self.int_expr(ctx, U32, 1)
+        sk = lambda x: self.sink(ctx, x, U64)
+        k = self.r.randrange(10)
+        if k <= 7:
+            # The target: a local (sometimes saved globally) or the global.
+            if self.chance(0.7):
+                l = self.fresh("al")
+                e(f"var {l}: AQ = .{{ .a = {u32()}, .b = {u32()}, .c = {self.int_expr(ctx, U64, 1)} }};")
+                tgt = f"&{l}"
+                if self.chance(0.4):
+                    e(f"aqSave(&{l});")
+                    e("defer aqSave(&gAQ);")
+            else:
+                tgt = "&gAQ"
+            p, q = self.fresh("ap"), self.fresh("aq")
+            e(f"const {p}: *AQ = {tgt};")
+            e(f"const {q}: *AQ = {self.pick([tgt, p, 'gAQp'])};")
+            e(f"_ = &{p};")
+            e(f"_ = &{q};")
+        x1, x2 = self.fresh("ax"), self.fresh("ay")
+        if k == 0:
+            f = self.pick(["a", "b", "c"])
+            e(f"const {x1} = {p}.{f};")
+            w = self.r.randrange(3)
+            if w == 0:
+                e(f"{q}.{f} = {'@as(u64, ' + u32() + ')' if f == 'c' else u32()};")
+            elif w == 1:
+                e(f"{q}.* = .{{ .a = {u32()}, .b = {u32()}, .c = 17 }};")
+            else:
+                fp = self.fresh("af")
+                e(f"const {fp}: *{'u64' if f == 'c' else 'u32'} = &{q}.{f};")
+                e(f"{fp}.* +%= 3;")
+            e(f"const {x2} = {p}.{f};")
+            sk(f"@as(u64, {x1}) *% 1000 +% {x2}")
+        elif k == 1:
+            f = self.pick(["a", "b"])
+            e(f"const {x1} = {p}.{f};")
+            e(self.pick([f"aqWrite({q}, {u32()});", f"aqWriteG({u32()});", f"aqWriteSaved({u32()});"]))
+            e(f"const {x2} = {p}.{f};")
+            sk(f"@as(u64, {x1}) *% 1000 +% {x2}")
+            sk(f"aqRead({p})")
+        elif k == 2:
+            c = self.fresh("ac")
+            e(f"const {c} = {p}.*;")
+            e(self.pick([f"{q}.a = {u32()};", f"aqWrite({q}, {u32()});", f"aqWriteSaved({u32()});", f"{q}.* = .{{ .a = 1, .b = 2, .c = 3 }};"]))
+            sk(f"@as(u64, {c}.a) *% 7 +% {c}.b +% {c}.c")
+            sk(f"aqRead({p})")
+        elif k == 3:
+            c = self.fresh("ac")
+            e(f"const {c} = {p}.*;")
+            e(f"{q}.* = .{{ .a = {c}.b, .b = {c}.a, .c = {c}.c +% {c}.a }};")
+            sk(f"aqRead({p})")
+            sk(f"@as(u64, {p}.a) << 32 | {p}.b")
+        elif k == 4:
+            e(f"const {x1} = {self.pick(['aqTwo', 'aqCopy'])}({p}, {q});")
+            sk(x1)
+            sk(f"aqRead({p})")
+        elif k == 5:
+            e(f"const {x1} = aqTwoI({p}, {q});")
+            sk(x1)
+            e(f"const {x2} = aqFld({p}, &{q}.{self.pick(['a', 'b'])});")
+            sk(x2)
+        elif k == 6:
+            e(f"const {x1} = aqCopyArg({p}.*, {q});")
+            sk(x1)
+            sk(f"aqRead({p})")
+        elif k == 7:
+            # A loop that writes after the load.
+            i = self.fresh("ai")
+            e(f"for (0..{self.r.randint(1, 5)}) |{i}| {{")
+            ctx["indent"] += 1
+            e(f"const {x1} = {p}.a;")
+            sk(x1)
+            e(self.pick([f"{q}.a +%= @intCast({i} + 1);", f"aqWrite({q}, @intCast({i}));", f"aqWriteSaved(@intCast({i} * 3));"]))
+            ctx["indent"] -= 1
+            e("}")
+            sk(f"aqRead({p})")
+        elif k == 8:
+            # @memcpy / @memset between two loads of the same element.
+            b, o = self.fresh("ab"), self.fresh("ao")
+            e(f"var {b}: [4]u32 = .{{ {u32()}, {u32()}, {u32()}, {u32()} }};")
+            e(f"var {o}: [4]u32 = @splat({u32()});")
+            e(f"_ = &{o};")
+            sl = self.fresh("as")
+            e(f"const {sl}: []u32 = {b}[{self.r.randint(0, 1)}..];")
+            e(f"_ = &{sl};")
+            idx = self.r.randint(1, 2)
+            e(f"const {x1} = {b}[{idx}];")
+            e(self.pick([f"@memset({sl}[0..2], {u32()});", f"@memcpy({sl}[0..2], {o}[0..2]);", f"@memset({b}[0..], 9);"]))
+            e(f"const {x2} = {b}[{idx}];")
+            sk(f"@as(u64, {x1}) *% 1000 +% {x2}")
+        else:
+            # Optional and error-union payload pointers.
+            if self.chance(0.5):
+                o = self.fresh("ao")
+                e(f"var {o}: ?AQ = .{{ .a = {u32()}, .b = {u32()}, .c = 4 }};")
+                pp = self.fresh("app")
+                e(f"if ({o}) |*{pp}| {{")
+                ctx["indent"] += 1
+                e(f"const {x1} = {pp}.a;")
+                e(self.pick([f"{o}.?.a = {u32()};", f"{o} = .{{ .a = 5, .b = 6, .c = 7 }};", f"aqWrite(&{o}.?, 3);"]))
+                e(f"const {x2} = {pp}.a;")
+                sk(f"@as(u64, {x1}) *% 1000 +% {x2}")
+                ctx["indent"] -= 1
+                e("}")
+            else:
+                o = self.fresh("ae")
+                e(f"var {o}: E!u32 = {u32()};")
+                pp = self.fresh("app")
+                e(f"if ({o}) |*{pp}| {{")
+                ctx["indent"] += 1
+                e(f"const {x1} = {pp}.*;")
+                e(f"{o} = {u32()};")
+                e(f"const {x2} = {pp}.*;")
+                sk(f"@as(u64, {x1}) *% 1000 +% {x2}")
+                ctx["indent"] -= 1
+                e("} else |_| {}")
 
     def s_retlen(self, ctx):
         """Slices from noinline callees whose returned length is one argument
