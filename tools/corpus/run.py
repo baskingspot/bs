@@ -118,6 +118,11 @@ def setup(proj, zig, refresh):
             if "--name" not in words:
                 continue
             name = words[words.index("--name") + 1]
+            if name in cmds and cmds[name] != words:
+                # Another step with the same name (zwasm has several
+                # `test`s): the later ones are `<name>:<root file>`.
+                root = next((w.split("=", 1)[1] for w in words if w.startswith("-Mroot=")), "")
+                name = f"{name}:{root}"
             cmds.setdefault(name, words)
         if p.returncode != 0:
             log(f"  zig build {' '.join(args)} failed (exit {p.returncode}); recorded what ran:\n{p.stderr[-3000:]}")
@@ -206,8 +211,9 @@ def compile_argv(compiler, words, cache_dir, out):
     upstream's flags."""
     rest = strip_common(words, cache_dir, out)
     # The baseline is upstream's Debug default on x86_64-linux: the
-    # self-hosted backend, even where the build script asks for LLVM.
-    rest = ["-fno-llvm" if w == "-fllvm" else w for w in rest]
+    # self-hosted backend and linker, even where the build script asks for
+    # LLVM and LLD.
+    rest = ["-fno-llvm" if w == "-fllvm" else w for w in rest if w != "-flld"]
     return [compiler, words[1], *rest]
 
 
@@ -308,9 +314,11 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
     os.makedirs(out_dir, exist_ok=True)
     result = {"project": proj["name"], "target": name, "kind": words[1]}
     edit = tgt.get("edit")
+    # A path component: a repeated step's name holds its root file's path.
+    fname = name.replace("/", "_").replace(":", "_")
     for which, comp in compilers:
-        out = os.path.join(out_dir, f"{name}.{which}")
-        cache = os.path.join(WORK, "cache", proj["name"], f"{name}.{which}")
+        out = os.path.join(out_dir, f"{fname}.{which}")
+        cache = os.path.join(WORK, "cache", proj["name"], f"{fname}.{which}")
         shutil.rmtree(cache, ignore_errors=True)
         if os.path.exists(out):
             os.remove(out)
@@ -374,7 +382,7 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
             run = {"exit": None, "stdout": "", "stderr": ""}
         else:
             # Both binaries run from the same path: programs print argv[0].
-            run_path = os.path.join(out_dir, "run", name)
+            run_path = os.path.join(out_dir, "run", fname)
             os.makedirs(os.path.dirname(run_path), exist_ok=True)
             shutil.copy(out, run_path)
             cwd = os.path.join(src, expand(tgt.get("cwd", "."), proj))
