@@ -259,6 +259,10 @@ inline_bodies: std.ArrayList(Ir) = .empty,
 /// The functions whose fate is being decided, which a cycle of calls
 /// reaches again.
 inline_active: std.ArrayList(Index) = .empty,
+/// Each function seen so far that returns a slice whose length is one of
+/// its arguments: that argument (`inline_ir.retLen`), recorded before its
+/// callees are decided, so a cycle of calls reads it too.
+ret_lens: std.AutoHashMapUnmanaged(Index, u32) = .empty,
 
 /// The CodeGen workers. Sema hands each analyzed function over as a job
 /// (`functionOwned`); workers take jobs in order, and `mergeJobs` waits
@@ -536,6 +540,7 @@ pub fn deinit(emit: *Emit) void {
     for (emit.inline_bodies.items) |*b| b.deinit(gpa);
     emit.inline_bodies.deinit(gpa);
     emit.inline_active.deinit(gpa);
+    emit.ret_lens.deinit(gpa);
     if (emit.pool) |pool| {
         stopWorkers(pool);
         for (pool.workers) |*w| w.deinit();
@@ -698,6 +703,8 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     defer sites.deinit(gpa);
     var s = try inline_ir.scan(gpa, zcu, &ir, &sites);
     if (emit.inline_safe and s.panics) s.inlinable = false;
+    const ret_len = inline_ir.retLen(&zcu.ip, &ir);
+    if (ret_len) |k| try emit.ret_lens.put(gpa, func, k);
     // Every candidate call reads its callee's `func_inline`, inlined or
     // not: an edit that makes the callee inlinable changes the caller.
     var deps: std.ArrayList(Zcu.Dependee) = .empty;
@@ -720,6 +727,10 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     var callee_hash: cache.Hash = 0;
     var size = s.size;
     var all = s.inlinable;
+    // The callees of calls that stay calls that return a slice of an
+    // argument's length, for prove.
+    var ret_lens: std.ArrayList(Ir.RetLen) = .empty;
+    defer ret_lens.deinit(gpa);
     for (sites.items) |site| {
         const fate = switch (try emit.inlineFate(site.callee)) {
             .fate => |f| f,
@@ -729,10 +740,12 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
         const yes = switch (fate) {
             .no => {
                 all = false;
+                try emit.keepRetLen(&ret_lens, site.callee);
                 continue;
             },
             .yes => |y| if (y.size <= emit.inline_budget * @as(u32, if (site.in_loop) inline_ir.loop_factor else 1)) y else {
                 all = false;
+                try emit.keepRetLen(&ret_lens, site.callee);
                 continue;
             },
         };
@@ -742,6 +755,7 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
             error.Busy => return emit.handBack(&ir, &ir_owned, mode),
         } orelse {
             all = false;
+            try emit.keepRetLen(&ret_lens, site.callee);
             continue;
         };
         size += yes.size;
@@ -770,8 +784,9 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
         }
         return true;
     }
+    const ret_len1: u32 = if (ret_len) |k| k + 1 else 0;
     if (inlinable) {
-        const hash = cache.hash(size, std.mem.asBytes(&[2]cache.Hash{ own_hash, callee_hash })) ^ emit.inlineSalt();
+        const hash = cache.hash(size, std.mem.asBytes(&[2]cache.Hash{ own_hash, callee_hash })) ^ emit.inlineSalt() ^ Zcu.InlineResult.retLenHash(ret_len1);
         var copy = ir.instructions.toMultiArrayList();
         try emit.inline_bodies.append(gpa, .{
             .instructions = (try copy.clone(gpa)).slice(),
@@ -782,12 +797,28 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
             .rbrace_column = ir.rbrace_column,
         });
         try emit.inline_fates.put(gpa, func, .{ .yes = .{ .size = size, .hash = hash, .body = @intCast(emit.inline_bodies.items.len - 1) } });
-        try zcu.inline_results.put(gpa, func, .{ .size = size, .hash = hash });
-    } else try emit.inline_fates.put(gpa, func, .no);
+        try zcu.inline_results.put(gpa, func, .{ .size = size, .hash = hash, .ret_len = ret_len1 });
+    } else {
+        try emit.inline_fates.put(gpa, func, .no);
+        // Its callers' calls read its `ret_len` (`func_inline`).
+        if (ret_len1 != 0) try zcu.inline_results.put(gpa, func, .{
+            .size = Zcu.InlineResult.not_inlinable,
+            .hash = emit.inlineSalt() ^ 1 ^ Zcu.InlineResult.retLenHash(ret_len1),
+            .ret_len = ret_len1,
+        });
+    }
     if (mode == .body) return true;
+    ir.ret_lens = try ret_lens.toOwnedSlice(gpa);
     ir_owned = false;
     try emit.submit(ir, if (emit.pool != null) try emit.exportsSnapshot() else undefined);
     return true;
+}
+
+/// Adds `callee` to `list` if it returns a slice of an argument's length.
+fn keepRetLen(emit: *const Emit, list: *std.ArrayList(Ir.RetLen), callee: Index) Allocator.Error!void {
+    const k = emit.ret_lens.get(callee) orelse return;
+    for (list.items) |r| if (r.callee == callee) return;
+    try list.append(emit.gpa, .{ .callee = callee, .arg = k });
 }
 
 /// Mixed into every `func_inline` result, so a different budget or
@@ -813,10 +844,14 @@ pub fn inlineFate(emit: *Emit, func: Index) Allocator.Error!FateResult {
         .busy => return .busy,
         .failed => try emit.inline_fates.put(emit.gpa, func, .no),
         // Loaded from the cache: its recorded result.
-        .done => try emit.inline_fates.put(emit.gpa, func, if (emit.zcu.inline_results.get(func)) |r|
-            .{ .yes = .{ .size = r.size, .hash = r.hash, .body = no_body } }
-        else
-            .no),
+        .done => {
+            const res = emit.zcu.inline_results.get(func);
+            try emit.inline_fates.put(emit.gpa, func, if (res) |r| if (r.size != Zcu.InlineResult.not_inlinable)
+                .{ .yes = .{ .size = r.size, .hash = r.hash, .body = no_body } }
+            else
+                .no else .no);
+            if (res) |r| if (r.ret_len != 0) try emit.ret_lens.put(emit.gpa, func, r.ret_len - 1);
+        },
         .analyzed => |ir| if (!try emit.inlineProcess(ir, .generate)) return .busy,
     }
     return .{ .fate = emit.inline_fates.get(func).? };

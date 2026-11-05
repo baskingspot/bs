@@ -100,7 +100,9 @@ next_func: usize = 0,
 /// not change, only the link order (`BS_CACHE_VERIFY=full` compares them).
 sched_rng: ?std.Random.DefaultPrng = null,
 /// The inlinable functions (Emit, `codegen/inline.zig`): their size and
-/// the `func_inline` result hash. A function not here is not inlinable.
+/// the `func_inline` result hash, and the functions that are not
+/// inlinable but return a slice of an argument's length (`ret_len`). A
+/// function not here is not inlinable and has no `ret_len`.
 inline_results: std.AutoHashMapUnmanaged(InternPool.Index, InlineResult) = .empty,
 /// The `func_inline` result of a function that is not inlinable is this
 /// `^ 1`: the inlining variant (`Emit.inlineSalt`).
@@ -1481,7 +1483,22 @@ pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !bool {
     return true;
 }
 
-pub const InlineResult = struct { size: u32, hash: cache.Hash };
+pub const InlineResult = struct {
+    /// `not_inlinable` for a function here only for its `ret_len`.
+    size: u32,
+    hash: cache.Hash,
+    /// One more than the argument that is the length of every slice the
+    /// function returns (`inline.retLen`); 0 for none.
+    ret_len: u32 = 0,
+
+    pub const not_inlinable = std.math.maxInt(u32);
+
+    /// Mixed into the `func_inline` result, so callers that read
+    /// `ret_len` change with it.
+    pub fn retLenHash(ret_len: u32) cache.Hash {
+        return if (ret_len == 0) 0 else cache.hash(ret_len, "ret_len");
+    }
+};
 
 pub const FuncBody = union(enum) {
     /// Its analysis failed.

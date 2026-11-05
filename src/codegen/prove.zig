@@ -997,6 +997,8 @@ const Walker = struct {
                 // The length a `slice` was made with (`asBytes`, `@ptrCast`).
                 if (t.tag == .inst and ir.instructions.items(.tag)[t.a] == .slice)
                     return w.term(ir.extraData(Ir.Bin, ir.instructions.items(.data)[t.a].ty_pl.payload).data.rhs);
+                // The length a callee returns: its argument (`Ir.ret_lens`).
+                if (w.retLenArg(t)) |arg| return w.term(arg);
                 return switch (t.tag) {
                     .inst => .{ .tag = .len_inst, .a = t.a },
                     .variable => .{ .tag = .len_variable, .a = t.a, .b = t.b },
@@ -1013,6 +1015,30 @@ const Walker = struct {
         const c = w.s.canon.items[@backingInt(i)];
         if (c.tag != .none) return c;
         return .{ .tag = .inst, .a = @backingInt(i) };
+    }
+
+    /// For `t` a call's result, or its error union's payload, where the
+    /// callee returns slices of an argument's length (`Ir.ret_lens`):
+    /// that argument at the call.
+    fn retLenArg(w: *const Walker, t: Term) ?Inst.Ref {
+        const ir = w.ir;
+        if (ir.ret_lens.len == 0 or t.tag != .inst) return null;
+        const tags = ir.instructions.items(.tag);
+        const datas = ir.instructions.items(.data);
+        var c = t.a;
+        if (tags[c] == .unwrap_errunion_payload) {
+            const u = w.term(datas[c].ty_op.operand);
+            if (u.tag != .inst) return null;
+            c = u.a;
+        }
+        if (tags[c] != .call) return null;
+        const callee = datas[c].pl_op.operand.toInterned() orelse return null;
+        for (ir.ret_lens) |r| if (r.callee == callee) {
+            const x = ir.extraData(Ir.Call, datas[c].pl_op.payload);
+            if (r.arg >= x.data.args_len) return null;
+            return ir.refSlice(x.end, x.data.args_len)[r.arg];
+        };
+        return null;
     }
 
     /// Whether `intcast` `r` of `operand` widens it keeping its sign.

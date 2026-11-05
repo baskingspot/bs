@@ -9,6 +9,7 @@ const InternPool = @import("../InternPool.zig");
 const Index = InternPool.Index;
 const Ir = @import("../Ir.zig");
 const Inst = Ir.Inst;
+const Type = @import("../Type.zig");
 const Zcu = @import("../Zcu.zig");
 const Zir = std.zig.Zir;
 
@@ -460,6 +461,76 @@ pub const Copier = struct {
         c.insts.set(@backingInt(c.index(i)), .{ .tag = tag, .data = data });
     }
 };
+
+/// For a function that returns a slice or an error union of one, the
+/// parameter whose value is the length of every slice it returns, when
+/// each `ret` returns an error or `ptr[0..n]` with `n` that parameter
+/// (`Allocator.alloc`'s `n`), through `wrap_errunion_payload`, `bitcast`s
+/// (which keep the length), and blocks whose every `br` does. From `ir`'s
+/// own body, before its callees are inlined, so the same in every build
+/// and schedule. Prove reads it at the calls that stay calls
+/// (`Ir.ret_lens`). Instructions are scanned whether reachable or not,
+/// which can only lose the summary.
+pub fn retLen(ip: *const InternPool, ir: *const Ir) ?u32 {
+    const f = ip.keyPayload(.func, ir.func);
+    if (!sliceResult(ip, ip.keyPayload(.func_type, f.ty).return_type)) return null;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    // The values the function may return, resolved one at a time.
+    var stack: [16]Inst.Ref = undefined;
+    var len: usize = 0;
+    for (tags, datas) |tag, data| if (tag == .ret) {
+        if (len == stack.len) return null;
+        stack[len] = data.un_op;
+        len += 1;
+    };
+    var arg: ?u32 = null;
+    var blocks: u32 = 0;
+    while (len > 0) {
+        len -= 1;
+        const r = stack[len];
+        const i = r.toIndex() orelse {
+            // An error constant returns no slice.
+            const v = r.toInterned().?;
+            if (ip.keyTag(v) == .error_union and ip.keyPayload(.error_union, v).val == .err_name) continue;
+            return null;
+        };
+        const data = datas[@backingInt(i)];
+        switch (tags[@backingInt(i)]) {
+            .wrap_errunion_err => {},
+            .wrap_errunion_payload, .bitcast => {
+                if (!sliceResult(ip, ir.typeOf(data.ty_op.operand, ip))) return null;
+                if (len == stack.len) return null;
+                stack[len] = data.ty_op.operand;
+                len += 1;
+            },
+            .block => {
+                blocks += 1;
+                if (blocks > 4) return null;
+                for (tags, datas) |t, d| if (t == .br and d.br.block_inst == i) {
+                    if (len == stack.len) return null;
+                    stack[len] = d.br.operand;
+                    len += 1;
+                };
+            },
+            .slice => {
+                const n = ir.extraData(Ir.Bin, data.ty_pl.payload).data.rhs.toIndex() orelse return null;
+                if (tags[@backingInt(n)] != .arg) return null;
+                const k = datas[@backingInt(n)].arg.index;
+                if (arg != null and arg.? != k) return null;
+                arg = k;
+            },
+            else => return null,
+        }
+    }
+    return arg;
+}
+
+/// A slice type, or an error union of one.
+fn sliceResult(ip: *const InternPool, ty: Index) bool {
+    const t = if (ip.keyTag(ty) == .error_union_type) ip.keyPayload(.error_union_type, ty).payload_type else ty;
+    return Type.isSlice(ip, t);
+}
 
 /// A hash of `ir`'s own body (before its callees are inlined) that is the
 /// same in every build that analyzes the function alike: instructions in

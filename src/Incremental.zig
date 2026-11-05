@@ -3826,10 +3826,13 @@ fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.
             range.result = .{ @intCast(start), @intCast(words.items.len - start) };
             e.units += 1;
         }
-        // An inlinable function's size; none when it is not inlinable.
+        // An inlinable function's size (`not_inlinable` when it is here
+        // only for its `ret_len`), then its `ret_len` if any; none when it
+        // is not inlinable and has none.
         if (d == .func_inline) if (zcu.inline_results.get(d.func_inline)) |res| {
-            range.result = .{ @intCast(words.items.len), 1 };
+            range.result = .{ @intCast(words.items.len), if (res.ret_len != 0) 2 else 1 };
             try words.append(gpa, res.size);
+            if (res.ret_len != 0) try words.append(gpa, res.ret_len);
         };
     }
     e.ms = ms(t0, now(io));
