@@ -2231,6 +2231,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "expected type '{f}', found '{f}'", .@"type-mismatch" },
     .{ "expected type '{f}', found pointer", .@"type-mismatch" },
     .{ "incompatible types: '{f}' and '{f}'", .@"type-mismatch" },
+    .{ "struct field '{d}' has conflicting types", .@"type-mismatch" },
     .{ "payload types of error unions must match", .@"type-mismatch" },
     .{ "pointer element type '{f}' cannot coerce into element type '{f}'", .@"type-mismatch" },
     .{ "runtime coercion to union '{f}' from non-exhaustive enum", .@"type-mismatch" },

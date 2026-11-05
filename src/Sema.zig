@@ -140,6 +140,9 @@ ies_anyerror: bool = false,
 bool_vector_inits: std.AutoHashMapUnmanaged(Ref, Ref) = .empty,
 /// Whether a peer of the current `resolvePeerTypes` is comptime-known.
 peers_comptime_known: bool = false,
+/// The field types of the last tuple peers that failed to resolve with
+/// "struct field has conflicting types", for its "type here" notes.
+peer_field_tys: ?[2]Index = null,
 branch_quota: u32 = 1000,
 branch_count: u32 = 0,
 /// The largest `@setEvalBranchQuota` of the comptime call in progress,
@@ -3919,7 +3922,8 @@ fn runtimeBreak(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!b
     while (it) |cur| : (it = cur.parent) {
         const label = cur.label orelse continue;
         if (label.zir_block == target) {
-            try sema.addBr(block, label, sema.resolveInst(brk.operand), breakOperandSrc(block, brk_extra, block.nodeSrc(.zero)));
+            // As upstream's `addRuntimeBreak`, the break has no source.
+            try sema.addBr(block, label, sema.resolveInst(brk.operand), block.nodeSrc(.zero));
             return true;
         }
     }
@@ -4447,8 +4451,8 @@ fn resolveBlock(sema: *Sema, parent: *Block, src: Src, child: *Block, merges: *B
     if (sema.bc != null) for (results[1..]) |r| {
         if (sema.typeOf(r) != sema.typeOf(results[0])) try sema.bcRefuse();
     };
-    for (results, merges.srcs.items) |result, result_src| try sema.validateRuntimeValue(child, result_src, result);
-    const result_ty = try sema.resolvePeerTypes(parent, src, results);
+    for (results, merges.srcs.items) |result, result_src| try sema.validateRuntimeValue(child, if (isNoSrc(result_src)) src else result_src, result);
+    const result_ty = try sema.resolvePeerTypesAt(parent, src, results, merges.srcs.items);
     try sema.resolveLayout(parent, src, result_ty);
     if (try sema.isComptimeOnlyResolved(parent, src, result_ty)) {
         // As upstream: a runtime branch cannot choose a comptime value.
@@ -4507,6 +4511,12 @@ fn addBr(sema: *Sema, b: *Block, label: *Block.Label, operand: Ref, src: Src) !v
     try label.merges.results.append(sema.gpa, operand);
     try label.merges.brs.append(sema.gpa, br.toIndex().?);
     try label.merges.srcs.append(sema.gpa, src);
+}
+
+/// Whether `src`, a merge's source, stands for none (upstream's `null`):
+/// the declaration's node.
+fn isNoSrc(src: Src) bool {
+    return src.loc == .node and src.loc.node == .zero;
 }
 
 /// Where the operand of ZIR `break` `extra` comes from.
@@ -4579,8 +4589,8 @@ fn zirLoop(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         return .unreachable_value;
     }
     const src = parent.nodeSrc(data.src_node);
-    for (label.merges.results.items, label.merges.srcs.items) |result, result_src| try sema.validateRuntimeValue(parent, result_src, result);
-    const result_ty = try sema.resolvePeerTypes(parent, src, label.merges.results.items);
+    for (label.merges.results.items, label.merges.srcs.items) |result, result_src| try sema.validateRuntimeValue(parent, if (isNoSrc(result_src)) src else result_src, result);
+    const result_ty = try sema.resolvePeerTypesAt(parent, src, label.merges.results.items, label.merges.srcs.items);
     for (label.merges.brs.items, label.merges.results.items) |br, result| try sema.coerceBrOperand(&outer, br, result_ty, result, src);
     try sema.addBlock(parent, block_inst, result_ty, outer.instructions.items);
     return block_inst.toRef();
@@ -5987,7 +5997,10 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             _ = try sema.analyzeInlineBody(&child, body, inst);
             const refs = try sema.arena.alloc(Ref, ext.small);
             for (refs, 0..) |*r, k| r.* = sema.resolveInst(@fromBackingInt(sema.code.extra[extra.end + k]));
-            break :blk .fromInterned(try sema.resolvePeerTypes(block, src, refs));
+            if (refs.len == 1) break :blk .fromInterned(sema.typeOf(refs[0]));
+            const srcs = try sema.arena.alloc(Src, refs.len);
+            for (srcs, 0..) |*s, k| s.* = sema.callArgSrc(src, false, k);
+            break :blk .fromInterned(try sema.resolvePeerTypesAt(block, src, refs, srcs));
         },
         .builtin_extern => sema.zirBuiltinExtern(block, inst),
         .field_parent_ptr => sema.zirFieldParentPtr(block, inst),
@@ -10161,6 +10174,67 @@ fn coercePtrTo(sema: *Sema, block: *Block, ptr: Ref, ty: Index) CompileError!Ref
 }
 
 fn resolvePeerTypes(sema: *Sema, block: *Block, src: Src, refs: []const Ref) CompileError!Index {
+    return sema.resolvePeerTypesAt(block, src, refs, &.{});
+}
+
+/// `resolvePeerTypes` of peers at `srcs` (or none). As upstream, a
+/// conflict names the two peers that conflict in source order, with a
+/// "type here" note at each.
+fn resolvePeerTypesAt(sema: *Sema, block: *Block, src: Src, refs: []const Ref, srcs: []const Src) CompileError!Index {
+    const n = sema.zcu.errors.items.len;
+    return sema.resolvePeerTypesInner(block, src, refs, srcs) catch |err| {
+        if (err != error.AnalysisFail or sema.zcu.errors.items.len != n + 1) return err;
+        const old = sema.zcu.errors.pop().?;
+        // The peer the candidate type came from and the peer that does not
+        // resolve with it, probed in source order.
+        sema.peer_field_tys = null;
+        var chosen: Index = .noreturn_type;
+        var ci: usize = 0;
+        const pair: [2]usize = for (refs, 0..) |r, k| {
+            const t = sema.typeOf(r);
+            if (t == .noreturn_type) continue;
+            if (chosen == .noreturn_type) {
+                chosen = t;
+                ci = k;
+                continue;
+            }
+            if (sema.peerPair(block, src, chosen, t)) |p| {
+                if (p == t) ci = k;
+                chosen = p;
+            } else |e| {
+                if (e != error.AnalysisFail or sema.zcu.errors.items.len != n + 1) return e;
+                break .{ ci, k };
+            }
+        } else {
+            sema.zcu.errors.shrinkRetainingCapacity(n);
+            try sema.zcu.errors.append(sema.gpa, old);
+            return err;
+        };
+        const probe = sema.zcu.errors.items[n].msg;
+        var tys: [2]Index = .{ sema.typeOf(refs[pair[0]]), sema.typeOf(refs[pair[1]]) };
+        if (std.mem.startsWith(u8, probe, "struct field '")) {
+            tys = sema.peer_field_tys orelse return err;
+        } else if (std.mem.startsWith(u8, probe, "incompatible types: ") or std.mem.eql(u8, probe, "vector length mismatch")) {
+            sema.zcu.errors.shrinkRetainingCapacity(n);
+            const e = sema.fail(block, src, "incompatible types: '{f}' and '{f}'", .{ FmtType{ .ip = sema.ip, .ty = tys[0], .decl_note = false }, FmtType{ .ip = sema.ip, .ty = tys[1], .decl_note = false } });
+            if (e != error.AnalysisFail) return e;
+        } else {
+            sema.zcu.errors.shrinkRetainingCapacity(n);
+            try sema.zcu.errors.append(sema.gpa, old);
+            return err;
+        }
+        if (srcs.len == refs.len) {
+            const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+            // No note for a peer without a source (an `if`'s missing
+            // `else`), as upstream.
+            for (pair, tys) |k, t| if (!isNoSrc(srcs[k]))
+                try sema.zcu.addNote(sema.file, srcs[k].span(tree), "type '{f}' here", .{sema.fmtType(t)});
+        }
+        return err;
+    };
+}
+
+fn resolvePeerTypesInner(sema: *Sema, block: *Block, src: Src, refs: []const Ref, srcs: []const Src) CompileError!Index {
     var chosen: Index = .noreturn_type;
     sema.peers_comptime_known = false;
     for (refs) |r| sema.peers_comptime_known = sema.peers_comptime_known or sema.resolveValue(r) != null;
@@ -10205,8 +10279,13 @@ fn resolvePeerTypes(sema: *Sema, block: *Block, src: Src, refs: []const Ref) Com
         const f = for (refs, 0..) |fr, fi| {
             if (Type.class(sema.ip, sema.typeOf(fr)) == .float) break fi;
         } else continue;
-        const a, const b = if (i < f) .{ r, refs[f] } else .{ refs[f], r };
-        return sema.fail(block, src, "incompatible types: '{f}' and '{f}'", .{ sema.fmtType(sema.typeOf(a)), sema.fmtType(sema.typeOf(b)) });
+        const a, const b = if (i < f) .{ i, f } else .{ f, i };
+        const e = sema.fail(block, src, "incompatible types: '{f}' and '{f}'", .{ sema.fmtType(sema.typeOf(refs[a])), sema.fmtType(sema.typeOf(refs[b])) });
+        if (srcs.len == refs.len) {
+            const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+            for ([_]usize{ a, b }) |k| try sema.zcu.addNote(sema.file, srcs[k].span(tree), "type '{f}' here", .{sema.fmtType(sema.typeOf(refs[k]))});
+        }
+        return e;
     };
     return chosen;
 }
@@ -10324,8 +10403,19 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
         if (ta.types.len == tb.types.len) {
             const types = try sema.arena.alloc(Index, ta.types.len);
             const values = try sema.arena.alloc(Index, ta.types.len);
-            for (types, values, ta.types, tb.types) |*t, *v, x, y| {
-                t.* = try sema.peerPair(block, src, x, y);
+            for (types, values, ta.types, tb.types, 0..) |*t, *v, x, y, i| {
+                const n = sema.zcu.errors.items.len;
+                t.* = sema.peerPair(block, src, x, y) catch |e| {
+                    // As upstream, the field is named, with the conflict
+                    // of its types as a note.
+                    if (e != error.AnalysisFail or sema.zcu.errors.items.len != n + 1 or
+                        !std.mem.startsWith(u8, sema.zcu.errors.items[n].msg, "incompatible types: ")) return e;
+                    const inner = sema.zcu.errors.pop().?;
+                    const err = sema.fail(block, src, "struct field '{d}' has conflicting types", .{i});
+                    try sema.zcu.appendNote(.{ .file = inner.file, .span = inner.span, .msg = inner.msg });
+                    sema.peer_field_tys = .{ x, y };
+                    return err;
+                };
                 v.* = .none;
             }
             return sema.intern(.{ .tuple_type = .{ .types = types, .values = values } });
@@ -10573,7 +10663,8 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
             return sema.analyzePtrArithmetic(block, src, tag == .add, uncasted_lhs, uncasted_rhs);
         }
     }
-    const ty = try sema.resolvePeerTypes(block, src, &.{ uncasted_lhs, uncasted_rhs });
+    try sema.checkVectorizable(block, src, sema.typeOf(uncasted_lhs), sema.typeOf(uncasted_rhs));
+    const ty = try sema.resolvePeerTypesAt(block, src, &.{ uncasted_lhs, uncasted_rhs }, &.{ src.operandSrc(0), src.operandSrc(1) });
     if (sema.vectorLen(ty)) |len| {
         const lhs = try sema.vectorOperand(block, src, ty, uncasted_lhs);
         const rhs = try sema.vectorOperand(block, src, ty, uncasted_rhs);
@@ -11198,7 +11289,7 @@ fn analyzeBitNot(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileErro
 }
 
 fn analyzeOverflowBuiltin(sema: *Sema, block: *Block, src: Src, op: Zir.Inst.Extended, uncasted_lhs: Ref, uncasted_rhs: Ref) CompileError!Ref {
-    const ty = try sema.resolvePeerTypes(block, src, &.{ uncasted_lhs, uncasted_rhs });
+    const ty = try sema.resolvePeerTypesAt(block, src, &.{ uncasted_lhs, uncasted_rhs }, &.{ src.operandSrc(0), src.operandSrc(1) });
     if (sema.vectorLen(ty)) |len| if (Type.class(sema.ip, Type.childType(sema.ip, ty)) == .int)
         return sema.vectorOverflow(block, src, op, len, ty, try sema.coerce(block, ty, uncasted_lhs, src), try sema.coerce(block, ty, uncasted_rhs, src));
     if (Type.class(sema.ip, ty) != .int) return sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(ty)});
@@ -12090,7 +12181,7 @@ fn compareOperatorName(op: std.math.CompareOperator) []const u8 {
 /// Fails comparison `op` at `src` of operands whose peer type does not
 /// support it, as upstream (or their peer type resolution's error).
 fn failNotComparable(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator, lhs: Ref, rhs: Ref) CompileError {
-    const ty = try sema.resolvePeerTypes(block, src, &.{ lhs, rhs });
+    const ty = try sema.resolvePeerTypesAt(block, src, &.{ lhs, rhs }, &.{ src.operandSrc(0), src.operandSrc(1) });
     return sema.fail(block, src, "operator {s} not allowed for type '{f}'", .{ compareOperatorName(op), sema.fmtType(ty) });
 }
 
@@ -12101,7 +12192,8 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
     const lc = Type.class(ip, lt);
     const rc = Type.class(ip, rt);
     if (lc == .vector or rc == .vector) {
-        const ty = try sema.resolvePeerTypes(block, src, &.{ lhs, rhs });
+        try sema.checkVectorizable(block, src, lt, rt);
+        const ty = try sema.resolvePeerTypesAt(block, src, &.{ lhs, rhs }, &.{ src.operandSrc(0), src.operandSrc(1) });
         const len = sema.vectorLen(ty).?;
         const l = try sema.vectorOperand(block, src, ty, lhs);
         const r = try sema.vectorOperand(block, src, ty, rhs);
@@ -12282,7 +12374,7 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
             }
         };
         try sema.requireRuntime(block, src);
-        const ty = try sema.resolvePeerTypes(block, src, &.{ lhs, rhs });
+        const ty = try sema.resolvePeerTypesAt(block, src, &.{ lhs, rhs }, &.{ src.operandSrc(0), src.operandSrc(1) });
         return sema.addBinOp(block, if (op == .eq) .cmp_eq else .cmp_neq, try sema.coerce(block, ty, lhs, src), try sema.coerce(block, ty, rhs, src));
     }
     const l_int = lc == .int or lc == .comptime_int;
@@ -22370,6 +22462,31 @@ fn elemCoercionWidens(sema: *Sema, dest: Index, src: Index) bool {
 
 fn coerceElem(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) CompileError!Ref {
     return sema.coerce(block, dest_ty, operand, src);
+}
+
+/// As upstream's `checkVectorizableBinaryOperands`: with a vector operand,
+/// the other must be a vector or array of its length.
+fn checkVectorizable(sema: *Sema, block: *Block, src: Src, lt: Index, rt: Index) CompileError!void {
+    const ip = sema.ip;
+    const lc = Type.class(ip, lt);
+    const rc = Type.class(ip, rt);
+    if (lc != .vector and rc != .vector) return;
+    const lv = lc == .vector or lc == .array;
+    const rv = rc == .vector or rc == .array;
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    if (lv and rv) {
+        const ll: u64 = sema.vectorLen(lt) orelse ip.keyPayload(.array_type, lt).len;
+        const rl: u64 = sema.vectorLen(rt) orelse ip.keyPayload(.array_type, rt).len;
+        if (ll == rl) return;
+        const e = sema.fail(block, src, "vector length mismatch", .{});
+        try sema.zcu.addNote(sema.file, src.operandSrc(0).span(tree), "length {d} here", .{ll});
+        try sema.zcu.addNote(sema.file, src.operandSrc(1).span(tree), "length {d} here", .{rl});
+        return e;
+    }
+    const e = sema.fail(block, src, "mixed scalar and vector operands: '{f}' and '{f}'", .{ sema.fmtType(lt), sema.fmtType(rt) });
+    try sema.zcu.addNote(sema.file, src.operandSrc(0).span(tree), "{s} here", .{if (lv) "vector" else "scalar"});
+    try sema.zcu.addNote(sema.file, src.operandSrc(1).span(tree), "{s} here", .{if (lv) "scalar" else "vector"});
+    return e;
 }
 
 /// An operand of a vector operation of type `vec_ty`. A vector of another
