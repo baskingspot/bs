@@ -79,6 +79,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -295,12 +296,13 @@ def test_runner(args, cfg):
     return HERE / ("bs_runner.zig" if bs_runner else "test_runner.zig")
 
 
-def compile_unit(compiler, unit, cfg, args, workdir, env=None, run_env=None, suffix=""):
+def compile_unit(compiler, unit, cfg, args, workdir, env=None, run_env=None, generated=False):
     """Builds the unit's test binary. `env` is an edit build's environment:
     the unit's generated root, and a failure is edit_verify_failed. Else
     `run_env`, if given, is the build's environment; a failure that the
-    cache's checks report is edit_verify_failed too."""
-    bin_path = workdir / "bin" / cfg["name"] / (unit[: -len(".zig")] + suffix + ".test")
+    cache's checks report is edit_verify_failed too. With `generated`, the
+    root is the one `unit_root` made, as it is."""
+    bin_path = workdir / "bin" / cfg["name"] / (unit[: -len(".zig")] + ".test")
     bin_path.parent.mkdir(parents=True, exist_ok=True)
     if bin_path.exists():
         bin_path.unlink()
@@ -308,7 +310,7 @@ def compile_unit(compiler, unit, cfg, args, workdir, env=None, run_env=None, suf
     argv = [
         str(compiler),
         "test",
-        str(unit_root(unit, workdir, editable) if env is None and not suffix else generated_root(unit, workdir)),
+        str(unit_root(unit, workdir, editable) if env is None and not generated else generated_root(unit, workdir)),
     ]
     if not args.default_runner:
         argv += ["--test-runner", str(test_runner(args, cfg))]
@@ -667,36 +669,51 @@ def generated_root(unit, workdir):
 
 
 def sched_check(compiler, unit, cfg, args, workdir):
-    """--sched-check: builds the unit twice with the cache off and one
-    thread, generating each function's code as soon as it is analyzed, and
-    with BS_SCHED_FUZZ=late only when analysis waits for CodeGen, after
-    whatever it resolved meanwhile. The binaries must be identical: a
-    difference is code that depends on when a declaration was resolved,
-    which differs between a full build, an edit build, and runs under
-    load. Returns a failure, if any."""
-    base = dict(os.environ, BS_CACHE="off", BS_THREADS="1")
-    paths = []
-    for suffix, extra in ((".early", {}), (".late", {"BS_SCHED_FUZZ": "late"})):
-        path, failure = compile_unit(compiler, unit, cfg, args, workdir, run_env=dict(base, **extra), suffix=suffix)
+    """--sched-check: builds the unit again three ways on one thread:
+    generating each function's code as soon as it is analyzed; with
+    BS_SCHED_FUZZ=late, only when analysis waits for CodeGen, after
+    whatever it resolved meanwhile; and with BS_SCHED_FUZZ=sema:<seed>,
+    analyzing in a random order. Each is a full build checked node by node
+    against the unit's last build (BS_CACHE_VERIFY=full), which also seeds
+    the error codes from it, as edit builds are: codes are numbered in the
+    order names are first used. The binaries must be identical, and the
+    nodes the same: a difference is code or a cache record that depends on
+    when a declaration was resolved or on analysis order, which differ
+    between a full build, an edit build, and runs under load. Returns a
+    failure, if any."""
+    seed = args.sched_seed + zlib.crc32(unit.encode())
+    base = dict(os.environ, BS_THREADS="1", BS_CACHE_VERIFY="full", BS_CACHE_CHECK="1")
+    builds = (
+        ("BS_THREADS=1", {}),
+        ("BS_SCHED_FUZZ=late", {"BS_SCHED_FUZZ": "late"}),
+        (f"BS_SCHED_FUZZ=sema:{seed}", {"BS_SCHED_FUZZ": f"sema:{seed}"}),
+    )
+    contents, sizes = [], []
+    for label, extra in builds:
+        # The unit's own command line, so its compilation and the manifest
+        # its last build wrote.
+        path, failure = compile_unit(compiler, unit, cfg, args, workdir, run_env=dict(base, **extra), generated=True)
         if failure:
+            failure["status"] = "sched_check_failed"
+            failure["log"] = f"{label} with BS_CACHE_VERIFY=full:\n" + failure["log"]
             return failure
-        paths.append(path)
-    early, late = (p.read_bytes() for p in paths)
-    sizes = [symbol_sizes(p) for p in paths]
-    for p in paths:
-        p.unlink(missing_ok=True)
-    if early == late:
-        return None
-    at = next((i for i, (x, y) in enumerate(zip(early, late)) if x != y), min(len(early), len(late)))
-    log = f"the binary differs between BS_THREADS=1 and BS_SCHED_FUZZ=late at byte {at} ({len(early)} vs {len(late)} bytes)"
-    differ = [
-        f"{name}: {sizes[0].get(name)} vs {sizes[1].get(name)} bytes"
-        for name in sorted(set(sizes[0]) | set(sizes[1]))
-        if sizes[0].get(name) != sizes[1].get(name)
-    ]
-    if differ:
-        log += "\nsymbols whose size differs:\n" + "\n".join(differ[:20])
-    return {"status": "sched_check_failed", "log": log, "tests": {}}
+        contents.append(path.read_bytes())
+        sizes.append(symbol_sizes(path))
+    for k in range(1, len(builds)):
+        if contents[k] == contents[0]:
+            continue
+        a, b = contents[0], contents[k]
+        at = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+        log = f"the binary differs between BS_THREADS=1 and {builds[k][0]} at byte {at} ({len(a)} vs {len(b)} bytes)"
+        differ = [
+            f"{name}: {sizes[0].get(name)} vs {sizes[k].get(name)} bytes"
+            for name in sorted(set(sizes[0]) | set(sizes[k]))
+            if sizes[0].get(name) != sizes[k].get(name)
+        ]
+        if differ:
+            log += "\nsymbols whose size differs:\n" + "\n".join(differ[:20])
+        return {"status": "sched_check_failed", "log": log, "tests": {}}
+    return None
 
 
 def symbol_sizes(path):
@@ -1607,7 +1624,10 @@ def main():
     p.add_argument(
         "--sched-check",
         action="store_true",
-        help="bs only: also build each file twice with the cache off on one thread, generating code as each function is analyzed and with BS_SCHED_FUZZ=late; differing binaries fail the file as sched_check_failed",
+        help="bs only: also build each file again on one thread three ways (code generated as each function is analyzed, BS_SCHED_FUZZ=late, and BS_SCHED_FUZZ=sema:<seed>), each a full build checked node by node against its last build (BS_CACHE_VERIFY=full), which must give identical binaries; a difference fails the file as sched_check_failed",
+    )
+    p.add_argument(
+        "--sched-seed", type=int, default=0, help="for --sched-check: added to each file's seed for BS_SCHED_FUZZ=sema"
     )
     p.add_argument("-v", "--verbose", action="store_true", help="print each file's result to stderr")
     args = p.parse_args()

@@ -6404,6 +6404,28 @@ state. Built for step 1:
   difference in about one behavior unit in a hundred). run.py's
   `--sched-check` builds every unit both ways with the cache off and
   requires the same bytes; it names the symbols whose size differs.
+- `BS_SCHED_FUZZ=sema:<seed>` (`Zcu.sched_rng`, 2026-11-05): the queue
+  shuffle of step 2's stage A. `Zcu.analyzeAll` keeps its work in
+  `Queues`, one queue per kind (comptime declarations, exports, tests,
+  declarations, deferred defaults, runtime units, ready IRs, functions),
+  and each step takes one item from the first kind that has work. With a
+  seed, the root files are queued in random order, the kinds are tried
+  in a new random order every step, and the declaration, defaults,
+  ready-IR and function queues hand out a random item instead of the
+  oldest. Comptime declarations, exports and tests keep source order
+  (the last export of a name wins; `comptime` blocks' effects are
+  ordered). Without a seed the order is the one before. `--sched-check`
+  builds every unit a third way with it (seed `--sched-seed` plus the
+  unit name's CRC-32). Each of its three builds is a full build on one
+  thread checked node by node against the unit's last build
+  (`BS_CACHE_VERIFY=full`), so the cache's dependencies, references and
+  atom records must not depend on the order either, and the three
+  binaries must be identical. The check needs the cache on: error codes
+  are numbered as names are first used (rule 5's global order is not
+  built), so with the cache off a shuffled build numbers them
+  differently (behavior's fn_delegation.zig: two entries of the error
+  name table swap), while `BS_CACHE_VERIFY=full` seeds them from the
+  last build as edit builds do. The eager-resolve mode stays planned.
 - `zig build -Dsanitize-thread -Doptimize=ReleaseFast`: a
   ThreadSanitizer build of bs, linked with libc so that the allocator is
   malloc, which ThreadSanitizer intercepts. (std's SafeAllocator, the

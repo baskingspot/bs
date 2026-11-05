@@ -94,6 +94,11 @@ func_refs: std.AutoArrayHashMapUnmanaged(FuncRef, void) = .empty,
 /// the reference trace of its errors.
 referenced_by: std.AutoHashMapUnmanaged(AnalUnit, Reference) = .empty,
 next_func: usize = 0,
+/// `BS_SCHED_FUZZ=sema:<seed>`: `analyzeAll` takes its roots and queues
+/// in a random order, and a random item of the declarations, defaults and
+/// functions queued, as parallel analysis would. The cache's records must
+/// not change, only the link order (`BS_CACHE_VERIFY=full` compares them).
+sched_rng: ?std.Random.DefaultPrng = null,
 /// The inlinable functions (Emit, `codegen/inline.zig`): their size and
 /// the `func_inline` result hash. A function not here is not inlinable.
 inline_results: std.AutoHashMapUnmanaged(InternPool.Index, InlineResult) = .empty,
@@ -1647,108 +1652,156 @@ fn sinkFunction(zcu: *Zcu, sink: anytype, ir: Ir) !void {
 pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
     // Upstream's analysis roots: std (whose start code imports the root
     // module) and, under `bs test`, the module under test.
-    for (zcu.rootFiles()) |root| if (root) |f| {
+    var roots = zcu.rootFiles();
+    if (zcu.sched_rng) |*rng| rng.random().shuffle(?u32, &roots);
+    for (roots) |root| if (root) |f| {
         _ = try zcu.fileRootType(f);
     };
     // A lazy edit build also walks the last build's graph from them.
     const lazy = if (zcu.replay) |r| r.lazy else false;
     if (lazy) try zcu.replay.?.startWalk();
-    var done_exports: usize = 0;
-    var done_comptime: usize = 0;
-    var done_tests: usize = 0;
-    var done_rt: usize = 0;
-    var done_navs: usize = 0;
-    var done_defaults: usize = 0;
+    var queues: Queues = .{};
     while (true) {
         if (lazy and zcu.replay.?.walking()) {
             try zcu.replay.?.walk();
             continue;
         }
-        if (done_comptime < zcu.comptime_decls.count()) {
-            const c = zcu.comptime_decls.keys()[done_comptime];
-            done_comptime += 1;
-            if (zcu.replay) |r| if (r.loadComptime(c)) continue;
-            Sema.analyzeComptimeDecl(zcu, c) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {},
-            };
-            continue;
-        }
-        if (done_exports < zcu.exports.items.len) {
-            const e = zcu.exports.items[done_exports];
-            done_exports += 1;
-            if (e.target != .nav) continue;
-            zcu.ensureNavVal(e.target.nav) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => continue,
-            };
-            // An exported function is emitted whether or not it is called.
-            const val = zcu.ip.getNav(e.target.nav).val;
-            if (zcu.ip.keyTag(val) == .func) _ = try zcu.queueFunc(val);
-            continue;
-        }
-        if (done_tests < zcu.test_functions.items.len) {
-            const nav = zcu.test_functions.items[done_tests];
-            done_tests += 1;
-            zcu.ensureNavVal(nav) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => continue,
-            };
-            _ = try zcu.queueFunc(zcu.ip.getNav(nav).val);
-            continue;
-        }
-        if (done_navs < zcu.nav_queue.items.len) {
-            const nav = zcu.nav_queue.items[done_navs];
-            done_navs += 1;
-            zcu.ensureNavVal(nav) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {},
-            };
-            continue;
-        }
-        if (done_defaults < zcu.defaults_queue.items.len) {
-            const ty = zcu.defaults_queue.items[done_defaults];
-            done_defaults += 1;
-            zcu.ensureStructDefaults(ty) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {},
-            };
-            continue;
-        }
-        if (done_rt < zcu.rt_helpers.count()) {
-            const key = zcu.rt_helpers.keys()[done_rt];
-            done_rt += 1;
-            try zcu.resolveCompilerRt(key);
-            continue;
-        }
-        if (zcu.ready_irs.items.len != 0) {
-            try zcu.sinkFunction(sink, zcu.ready_irs.orderedRemove(0));
-            continue;
-        }
-        if (zcu.next_func == zcu.func_queue.items.len) {
-            if (@hasDecl(@TypeOf(sink.*), "sync")) try sink.sync(zcu);
-            if (done_rt != zcu.rt_helpers.count() or done_navs != zcu.nav_queue.items.len or done_defaults != zcu.defaults_queue.items.len) continue;
-            if (lazy and try zcu.replay.?.settle()) continue;
-            break;
-        }
-        const func = zcu.func_queue.items[zcu.next_func];
-        zcu.next_func += 1;
-        const state = zcu.funcs.getPtr(func).?;
-        if (state.* != .queued) continue;
-        state.* = .in_progress;
-        if (zcu.replay) |r| if (r.loadFunc(func)) {
-            zcu.funcs.getPtr(func).?.* = .done;
-            continue;
-        };
-        // Analysis can grow `funcs`, so the state is looked up again after.
-        const ir = Sema.analyzeFuncBody(zcu, func) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                zcu.funcs.getPtr(func).?.* = .failed;
-                continue;
-            },
-        };
-        zcu.funcs.getPtr(func).?.* = .done;
-        try zcu.sinkFunction(sink, ir);
+        // In this order, or in a random one each time under `sched_rng`.
+        var kinds = std.enums.values(Queues.Kind)[0..].*;
+        if (zcu.sched_rng) |*rng| rng.random().shuffle(Queues.Kind, &kinds);
+        const worked = for (kinds) |kind| {
+            if (try queues.step(zcu, sink, kind)) break true;
+        } else false;
+        if (worked) continue;
+        if (@hasDecl(@TypeOf(sink.*), "sync")) try sink.sync(zcu);
+        if (queues.pending(zcu)) continue;
+        if (lazy and try zcu.replay.?.settle()) continue;
+        break;
     }
+}
+
+/// `analyzeAll`'s work: how far it got through each queue.
+const Queues = struct {
+    comptime_decls: usize = 0,
+    exports: usize = 0,
+    tests: usize = 0,
+    navs: usize = 0,
+    defaults: usize = 0,
+    rt: usize = 0,
+
+    /// Taken in this order, each until it is empty, unless `sched_rng`
+    /// shuffles them.
+    const Kind = enum { comptime_decl, @"export", @"test", nav, defaults, rt, ready_ir, func };
+
+    fn pending(q: *const Queues, zcu: *const Zcu) bool {
+        return q.comptime_decls < zcu.comptime_decls.count() or q.exports < zcu.exports.items.len or
+            q.tests < zcu.test_functions.items.len or q.navs < zcu.nav_queue.items.len or
+            q.defaults < zcu.defaults_queue.items.len or q.rt < zcu.rt_helpers.count() or
+            zcu.ready_irs.items.len != 0 or zcu.next_func < zcu.func_queue.items.len;
+    }
+
+    /// Does one item of `kind`'s queue, or returns false if it is empty.
+    /// Under `sched_rng`, a random one of the declarations, defaults,
+    /// ready functions and functions queued; the others keep their order
+    /// (the last of several exports of a name wins; a `comptime` block's
+    /// effects are in order).
+    fn step(q: *Queues, zcu: *Zcu, sink: anytype, kind: Kind) !bool {
+        switch (kind) {
+            .comptime_decl => {
+                if (q.comptime_decls == zcu.comptime_decls.count()) return false;
+                const c = zcu.comptime_decls.keys()[q.comptime_decls];
+                q.comptime_decls += 1;
+                if (zcu.replay) |r| if (r.loadComptime(c)) return true;
+                Sema.analyzeComptimeDecl(zcu, c) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                };
+            },
+            .@"export" => {
+                if (q.exports == zcu.exports.items.len) return false;
+                const e = zcu.exports.items[q.exports];
+                q.exports += 1;
+                if (e.target != .nav) return true;
+                zcu.ensureNavVal(e.target.nav) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return true,
+                };
+                // An exported function is emitted whether or not it is called.
+                const val = zcu.ip.getNav(e.target.nav).val;
+                if (zcu.ip.keyTag(val) == .func) _ = try zcu.queueFunc(val);
+            },
+            .@"test" => {
+                if (q.tests == zcu.test_functions.items.len) return false;
+                const nav = zcu.test_functions.items[q.tests];
+                q.tests += 1;
+                zcu.ensureNavVal(nav) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return true,
+                };
+                _ = try zcu.queueFunc(zcu.ip.getNav(nav).val);
+            },
+            .nav => {
+                if (q.navs == zcu.nav_queue.items.len) return false;
+                zcu.pickNext(InternPool.NavIndex, zcu.nav_queue.items, q.navs);
+                const nav = zcu.nav_queue.items[q.navs];
+                q.navs += 1;
+                zcu.ensureNavVal(nav) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                };
+            },
+            .defaults => {
+                if (q.defaults == zcu.defaults_queue.items.len) return false;
+                zcu.pickNext(InternPool.Index, zcu.defaults_queue.items, q.defaults);
+                const ty = zcu.defaults_queue.items[q.defaults];
+                q.defaults += 1;
+                zcu.ensureStructDefaults(ty) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                };
+            },
+            .rt => {
+                if (q.rt == zcu.rt_helpers.count()) return false;
+                const key = zcu.rt_helpers.keys()[q.rt];
+                q.rt += 1;
+                try zcu.resolveCompilerRt(key);
+            },
+            .ready_ir => {
+                if (zcu.ready_irs.items.len == 0) return false;
+                zcu.pickNext(Ir, zcu.ready_irs.items, 0);
+                try zcu.sinkFunction(sink, zcu.ready_irs.orderedRemove(0));
+            },
+            .func => {
+                if (zcu.next_func == zcu.func_queue.items.len) return false;
+                zcu.pickNext(InternPool.Index, zcu.func_queue.items, zcu.next_func);
+                const func = zcu.func_queue.items[zcu.next_func];
+                zcu.next_func += 1;
+                const state = zcu.funcs.getPtr(func).?;
+                if (state.* != .queued) return true;
+                state.* = .in_progress;
+                if (zcu.replay) |r| if (r.loadFunc(func)) {
+                    zcu.funcs.getPtr(func).?.* = .done;
+                    return true;
+                };
+                // Analysis can grow `funcs`, so the state is looked up again after.
+                const ir = Sema.analyzeFuncBody(zcu, func) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {
+                        zcu.funcs.getPtr(func).?.* = .failed;
+                        return true;
+                    },
+                };
+                zcu.funcs.getPtr(func).?.* = .done;
+                try zcu.sinkFunction(sink, ir);
+            },
+        }
+        return true;
+    }
+};
+
+/// Under `sched_rng`, swaps a random item of `items[next..]` to `next`.
+fn pickNext(zcu: *Zcu, comptime T: type, items: []T, next: usize) void {
+    const rng = if (zcu.sched_rng) |*r| r else return;
+    if (next >= items.len) return;
+    std.mem.swap(T, &items[next], &items[next + rng.random().uintLessThan(usize, items.len - next)]);
 }

@@ -1198,10 +1198,13 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     const threads: usize = if (env.get("BS_THREADS")) |v| std.fmt.parseInt(usize, v, 10) catch 1 else std.Thread.getCpuCount() catch 1;
     // `BS_SCHED_FUZZ=<seed>`: perturb the workers' timing (`Emit.Pool.fuzz`);
     // `BS_SCHED_FUZZ=late`: generate code only when analysis waits for it
-    // (`Emit.Pool.late`).
+    // (`Emit.Pool.late`); `BS_SCHED_FUZZ=sema:<seed>`: analyze in a random
+    // order (`Zcu.sched_rng`).
     const fuzz_env = env.get("BS_SCHED_FUZZ");
     const late = if (fuzz_env) |v| std.mem.eql(u8, v, "late") else false;
-    const fuzz: ?u64 = if (late) null else if (fuzz_env) |v| std.fmt.parseInt(u64, v, 10) catch 1 else null;
+    const sema_fuzz = if (fuzz_env) |v| std.mem.startsWith(u8, v, "sema:") else false;
+    if (sema_fuzz) zcu.sched_rng = .init(std.fmt.parseInt(u64, fuzz_env.?["sema:".len..], 10) catch 1);
+    const fuzz: ?u64 = if (late or sema_fuzz) null else if (fuzz_env) |v| std.fmt.parseInt(u64, v, 10) catch 1 else null;
     emit.has_inputs = !emit.obj and !emit.shared and (opts.link_inputs.len != 0 or c_batch != null);
     try emit.startPool(@max(threads, 1) - 1, fuzz, late);
     const sema_node = prog.start("Analyze and Generate Code", 0);
