@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "4\nabcd\n7\n9\n0\nB\n3\n10\n3\n6\n8\n14\n44\n"
+//! stdout: "4\nabcd\n7\n9\n0\nB\n3\n10\n3\n6\n8\n14\n44\n5\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -87,6 +87,15 @@ fn main() callconv(.c) noreturn {
     _ = &opt_arr;
     const empty_opt: ?Range = .{ .lo = 1 };
     rt.printInt(span(.{ .lo = lo, .hi = 9 }) + span(empty_opt) + (pairOrFail(false) catch unreachable).hi - opt_arr.?[1] + opt_arr.?[0] + 1);
+    // `&.{}`, a pointer to an empty array, to a mutable or overaligned
+    // `[*]T`, optional or in an error union, and to `[*c]T`: there is no
+    // memory to write, as upstream (std.c.kevent's empty changelist).
+    const many: [*]align(64) u32 = &.{};
+    const maybe_many: ?[*]u32 = &.{};
+    const many_or_err: error{Bad}![*]u32 = &.{};
+    const empty_c: [*c]u32 = @as(*const [0]u32, &.{});
+    rt.printInt(firstOr(&.{}, 0) + firstOr(many, 0) + @intFromBool(maybe_many != null) + @intFromBool(empty_c != null) +
+        firstOr(many_or_err catch unreachable, 0) + firstOr(emptyMany(&.{}), 0) + 3);
     rt.exit(0);
 }
 
@@ -104,6 +113,12 @@ fn span(r: ?Range) u8 {
 fn pairOrFail(fail: bool) error{Bad}!Range {
     if (fail) return error.Bad;
     return .{ .lo = 3 };
+}
+fn firstOr(p: [*]u32, n: usize) u32 {
+    return if (n == 0) 0 else p[0];
+}
+noinline fn emptyMany(p: *const [0]u32) [*]u32 {
+    return p;
 }
 fn maybe(x: u64) ?u64 {
     return if (x == 0) null else x;

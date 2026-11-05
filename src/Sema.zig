@@ -10085,6 +10085,18 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
     if (sema.ptrCoercibleInPlace(src_ty, dest_ty)) return try sema.coercePtrTo(block, inst, dest_ty);
     const s = Type.ptrInfo(ip, src_ty);
     const d = Type.ptrInfo(ip, dest_ty);
+    // A pointer to a zero-length array without a sentinel (`&.{}`) to a
+    // `[*]T` or `[*c]T` of any constness and alignment, as upstream's
+    // `checkPtrAttributes`: there is no memory to write or misalign.
+    if (s.flags.size == .one and (d.flags.size == .many or d.flags.size == .c) and ip.keyTag(s.child) == .array_type) {
+        const a = ip.keyPayload(.array_type, s.child);
+        if (a.len == 0 and a.sentinel == .none) {
+            var info = s;
+            info.flags.is_const = d.flags.is_const;
+            info.flags.alignment = d.flags.alignment;
+            if (sema.ptrCoercibleInPlace(try sema.ptrType(info), dest_ty)) return try sema.coercePtrTo(block, inst, dest_ty);
+        }
+    }
     // `*[N]T` to `[]T`.
     if (s.flags.size == .one and d.flags.size == .slice and ip.keyTag(s.child) == .array_type) {
         const a = ip.keyPayload(.array_type, s.child);
