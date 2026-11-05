@@ -1,5 +1,6 @@
-//! arm64 Mach-O linker: a position-independent executable dynamically linked
-//! against libSystem and ad-hoc code signed. Takes the whole set of Atoms,
+//! arm64 Mach-O linker: a position-independent executable, or a dylib
+//! (`Options.dylib`), dynamically linked against libSystem and ad-hoc code
+//! signed. Takes the whole set of Atoms,
 //! lays out sections, resolves relocations, and writes the executable in one
 //! pass into one buffer, like `Elf.zig`, whose thread pool, symbol table,
 //! and output buffers it shares.
@@ -7,7 +8,7 @@
 //! File layout, with every segment starting on a 16 KiB page and the
 //! loaded segments mapped at `base_address + file offset`:
 //!
-//!   __PAGEZERO    4 GiB, no access, not in the file
+//!   __PAGEZERO    4 GiB, no access, not in the file (not in a dylib)
 //!   __TEXT        r-x  header and load commands, __text, __stubs, __const,
 //!                      __unwind_info (with debug info)
 //!   __DATA_CONST  rw-, read-only after fixups  __got, __const
@@ -29,6 +30,11 @@
 //! `widgets.TextInput.update`); the symbol table and the imports' names
 //! get Darwin's leading underscore, and DW_AT_linkage_name leaves it out,
 //! as LLVM and ld64 write them. Atom symbols are local.
+//!
+//! A dylib keeps the executable's layout and preferred base, which dyld
+//! slides, without __PAGEZERO, LC_MAIN or LC_LOAD_DYLINKER; it gets an
+//! LC_ID_DYLIB, and its exports go in the exports trie, which is what
+//! dyld, dlsym and ld64 read, and as external symbols for nm.
 //!
 //! The code signature is the one ld64 emits by default ("linker-signed"):
 //! one CodeDirectory with a SHA-256 hash per 4 KiB page of everything
@@ -80,8 +86,11 @@ comptime {
 
 pub const Options = struct {
     /// Called as `main(argc, argv, envp, apple)` by dyld (LC_MAIN); returning
-    /// from it exits with its result.
+    /// from it exits with its result. Not used for a dylib.
     entry: SymbolKey,
+    /// Link a dynamic library (MH_DYLIB) instead of an executable. Not
+    /// with `symbols`.
+    dylib: ?*const Dylib = null,
     /// Symbols imported from libSystem. An atom with the same key overrides
     /// the import.
     imports: []const Import = &.{},
@@ -140,6 +149,28 @@ pub const Symbols = struct {
     /// Numbers are below this; numbers with no atom, import, or value are
     /// undefined, which is an error only if a relocation uses one.
     len: u32,
+};
+
+/// What makes the output a dynamic library: no __PAGEZERO, no entry
+/// point or dyld path, an LC_ID_DYLIB, and its exports in the exports
+/// trie and as external symbols, as ld64 writes one.
+pub const Dylib = struct {
+    /// LC_ID_DYLIB's name: what a program linked against the library
+    /// records to load it by (`@rpath/libfoo.dylib`).
+    install_name: []const u8,
+    /// `major << 16 | minor << 8 | patch`, as LC_ID_DYLIB holds them.
+    current_version: u32 = 0x10000,
+    compatibility_version: u32 = 0x10000,
+    /// Names without Darwin's leading underscore, unique, of atoms (at
+    /// `offset` in them) the link defines.
+    exports: []const Export,
+};
+
+pub const Export = struct {
+    key: SymbolKey,
+    name: []const u8,
+    offset: u64 = 0,
+    weak: bool = false,
 };
 
 pub const Import = struct {
@@ -344,7 +375,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const n_partitions = std.math.ceilPowerOfTwoAssert(usize, @min(n_threads, 8));
 
     const numbered = options.symbols;
-    if (numbered) |s| if (s.atoms.len != n_atoms or s.entry >= s.len or s.imports.len != options.imports.len or s.aliases.len != options.aliases.len or options.local_symbols.len != 0) return error.InvalidSymbols;
+    if (numbered) |s| if (s.atoms.len != n_atoms or s.entry >= s.len or s.imports.len != options.imports.len or s.aliases.len != options.aliases.len or options.local_symbols.len != 0 or options.dylib != null) return error.InvalidSymbols;
     var symbols: SymbolTable = if (numbered == null) try .init(n_atoms + options.aliases.len, n_partitions) else .empty;
     defer symbols.deinit();
     // With numbered symbols, each number's address, import, or value.
@@ -455,7 +486,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // With numbered symbols, the entry's atom is found while resolving
     // addresses.
     var entry_index: usize = undefined;
-    if (numbered == null) {
+    const dylib = options.dylib;
+    if (numbered == null and dylib == null) {
         entry_index = symbols.get(options.entry) orelse {
             diag.* = .{ .target = options.entry };
             return error.UndefinedSymbol;
@@ -478,6 +510,28 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         strtab_len += 1 + ls.name.len + 1;
     }
     const n_locals = std.math.add(u32, n_atom_syms, @intCast(local_atoms.len)) catch return error.OutOfMemory;
+    // A dylib's exports, sorted by name, with their atoms; an executable
+    // exports `__mh_execute_header` only.
+    const exports = try gpa.alloc(Export, if (dylib) |d| d.exports.len else 0);
+    defer gpa.free(exports);
+    const export_atoms = try gpa.alloc(u32, exports.len);
+    defer gpa.free(export_atoms);
+    if (dylib) |d| {
+        @memcpy(exports, d.exports);
+        std.mem.sortUnstable(Export, exports, {}, struct {
+            fn lt(_: void, a: Export, b: Export) bool {
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.lt);
+        for (exports, export_atoms) |x, *atom| {
+            atom.* = @intCast(symbols.get(x.key) orelse {
+                diag.* = .{ .atom = x.name, .target = x.key };
+                return error.UndefinedSymbol;
+            });
+            strtab_len += 1 + x.name.len + 1;
+        }
+    } else strtab_len += mh_execute_header.len + 1;
+    const n_ext: u32 = if (dylib == null) 1 else @intCast(exports.len);
 
     var values: SymbolTable = .empty;
     defer values.deinit();
@@ -508,7 +562,6 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             if (!e.used) e.* = .{ .key = imp.key, .value = i, .used = true };
         }
     }
-    strtab_len += mh_execute_header.len + 1;
     sizes[stubs] = @as(u64, n_imports) * stub_size;
     aligns[stubs] = .@"4";
     sizes[got] = @as(u64, n_imports) * 8;
@@ -538,19 +591,29 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         index.* = next_index;
         next_index += 1;
     };
-    // Segments in the file, including __PAGEZERO and __LINKEDIT.
-    var n_segs: u32 = 2;
+    // Segments in the file, including __LINKEDIT and an executable's
+    // __PAGEZERO.
+    var n_segs: u32 = if (dylib == null) 2 else 1;
     for (seg_present) |p| n_segs += @intFromBool(p);
 
-    // Load commands.
+    // Load commands. An executable has __PAGEZERO, the dyld path and
+    // LC_MAIN; a dylib has LC_ID_DYLIB instead.
     const dylinker_cmd_size = std.mem.alignForward(u32, @sizeOf(macho.dylinker_command) + dylinker_path.len + 1, 8);
     const dylib_cmd_size = std.mem.alignForward(u32, @sizeOf(macho.dylib_command) + libsystem_path.len + 1, 8);
-    var sizeofcmds: u32 = 2 * @sizeOf(macho.segment_command_64) + // __PAGEZERO, __LINKEDIT
+    const id_cmd_size = if (dylib) |d| std.mem.alignForward(u32, @intCast(@sizeOf(macho.dylib_command) + d.install_name.len + 1), 8) else 0;
+    var sizeofcmds: u32 = @sizeOf(macho.segment_command_64) + // __LINKEDIT
         2 * @sizeOf(macho.linkedit_data_command) + // chained fixups, exports trie
-        @sizeOf(macho.symtab_command) + @sizeOf(macho.dysymtab_command) + dylinker_cmd_size +
-        @sizeOf(macho.uuid_command) + @sizeOf(macho.build_version_command) + @sizeOf(macho.entry_point_command) +
+        @sizeOf(macho.symtab_command) + @sizeOf(macho.dysymtab_command) +
+        @sizeOf(macho.uuid_command) + @sizeOf(macho.build_version_command) +
         dylib_cmd_size + 2 * @sizeOf(macho.linkedit_data_command); // function starts, code signature
-    var ncmds: u32 = 13;
+    var ncmds: u32 = 10;
+    if (dylib == null) {
+        sizeofcmds += @sizeOf(macho.segment_command_64) + dylinker_cmd_size + @sizeOf(macho.entry_point_command);
+        ncmds += 3;
+    } else {
+        sizeofcmds += id_cmd_size;
+        ncmds += 1;
+    }
     for (seg_present, seg_nsects) |p, n| if (p) {
         sizeofcmds += @sizeOf(macho.segment_command_64) + n * @sizeOf(macho.section_64);
         ncmds += 1;
@@ -601,14 +664,29 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
 
     // __LINKEDIT contents.
     const fixups_seg = [3]bool{ false, n_fixups[got] + n_fixups[mod_init_func] + n_fixups[data_const] > 0, n_fixups[data] + n_fixups[thread_vars] + n_fixups[thread_data] > 0 };
-    const cf = ChainedFixupsLayout.init(n_segs, seg_present, fixups_seg, seg_start, seg_mem_end, bind_imports);
+    const cf = ChainedFixupsLayout.init(n_segs, @intFromBool(dylib == null), seg_present, fixups_seg, seg_start, seg_mem_end, bind_imports);
     const fixups_off = linkedit_off;
     const trie_off = fixups_off + cf.size;
+    // A dylib's exports trie, from where its atoms went.
+    const base = base_address;
+    for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
+    const trie: []const u8 = if (dylib == null) exports_trie else trie: {
+        const entries = try gpa.alloc(TrieEntry, exports.len);
+        defer gpa.free(entries);
+        for (entries, exports, export_atoms) |*e, x, atom| e.* = .{
+            .name = x.name,
+            .flags = (if (places[atom].section == thread_vars) macho.EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL else 0) |
+                (if (x.weak) macho.EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION else 0),
+            .offset = l.atomAddr(atom) + x.offset - base,
+        };
+        break :trie try buildExportsTrie(gpa, entries);
+    };
+    defer if (dylib != null) gpa.free(trie);
     // Function starts: ULEB128 deltas between the file offsets of
     // successive functions, from 0, then a 0 and padding to 8 bytes.
     // Without them lldb takes the binary for stripped and does not unwind
     // by emulating instructions, which a fault in a prologue needs.
-    const func_starts_off = trie_off + exports_trie.len;
+    const func_starts_off = trie_off + trie.len;
     var func_starts_len: u64 = 0;
     {
         var prev: u64 = 0;
@@ -623,7 +701,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     }
     const func_starts_size = std.mem.alignForward(u64, func_starts_len + 1, 8);
     const symtab_off = func_starts_off + func_starts_size;
-    const n_syms: u32 = n_locals + 1 + n_bind_imports;
+    const n_syms: u32 = n_locals + n_ext + n_bind_imports;
     const indirect_off = symtab_off + @as(u64, n_syms) * @sizeOf(macho.nlist_64);
     const n_indirect = 2 * n_imports;
     const strtab_off = indirect_off + @as(u64, n_indirect) * 4;
@@ -636,10 +714,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const file_len = sig_off + sig_size;
     if (sig_off > std.math.maxInt(u32)) return error.OutOfMemory;
 
-    const base = base_address;
     // Numbered symbols keep addresses as 31-bit offsets from the base.
     if (numbered != null and linkedit_vm >= value_tag) return error.OutOfMemory;
-    for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
     if (numbered != null) {
         try parallel(io, n_threads, n_chunks, &l, Link.resolveAddrsNumbered);
     } else {
@@ -663,7 +739,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var dsym_layout: DsymLayout = undefined;
     if (has_dsym) {
         dwarf = try .place(gpa, debug_chunks, options.comp_dir, base + starts[text], dwarf_language);
-        var segs_size: u32 = @sizeOf(macho.segment_command_64); // __PAGEZERO
+        var segs_size: u32 = if (dylib == null) @sizeOf(macho.segment_command_64) else 0; // __PAGEZERO
         for (seg_present, seg_nsects) |p, n| if (p) {
             segs_size += @sizeOf(macho.segment_command_64) + n * @sizeOf(macho.section_64);
         };
@@ -762,10 +838,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // Chained fixups: header, per-segment page starts with each page's
     // fixups linked into a chain, imports, and their names.
     cf.write(buf, fixups_off, fixups, bind_imports);
-    @memcpy(buf[trie_off..][0..exports_trie.len], exports_trie);
+    @memcpy(buf[trie_off..][0..trie.len], trie);
 
-    // Symbols after the atoms': those within atoms, __mh_execute_header
-    // (exported), then the imports (undefined), and their names.
+    // Symbols after the atoms': those within atoms, the exported ones
+    // (__mh_execute_header, or a dylib's exports), then the imports
+    // (undefined), and their names.
     {
         var sym_off = symtab_off + @as(u64, n_atom_syms) * @sizeOf(macho.nlist_64);
         var str_off = local_str;
@@ -778,11 +855,21 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             buf[strtab_off + str_off + 1 + ls.name.len] = 0;
             str_off += 1 + ls.name.len + 1;
         }
-        writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_SECT | macho.N_EXT, 1, macho.REFERENCED_DYNAMICALLY, base));
-        sym_off += @sizeOf(macho.nlist_64);
-        @memcpy(buf[strtab_off + str_off ..][0..mh_execute_header.len], mh_execute_header);
-        buf[strtab_off + str_off + mh_execute_header.len] = 0;
-        str_off += mh_execute_header.len + 1;
+        if (dylib == null) {
+            writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_SECT | macho.N_EXT, 1, macho.REFERENCED_DYNAMICALLY, base));
+            sym_off += @sizeOf(macho.nlist_64);
+            @memcpy(buf[strtab_off + str_off ..][0..mh_execute_header.len], mh_execute_header);
+            buf[strtab_off + str_off + mh_execute_header.len] = 0;
+            str_off += mh_execute_header.len + 1;
+        }
+        for (exports, export_atoms) |x, atom| {
+            writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_SECT | macho.N_EXT, sect_index[places[atom].section], if (x.weak) macho.N_WEAK_DEF else 0, l.atomAddr(atom) + x.offset));
+            sym_off += @sizeOf(macho.nlist_64);
+            buf[strtab_off + str_off] = '_';
+            @memcpy(buf[strtab_off + str_off + 1 ..][0..x.name.len], x.name);
+            buf[strtab_off + str_off + 1 + x.name.len] = 0;
+            str_off += 1 + x.name.len + 1;
+        }
         for (bind_imports, 0..) |imp, i| {
             // Two-level namespace: library ordinal 1, libSystem.
             writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_UNDF | macho.N_EXT, 0, 1 << 8, 0));
@@ -793,7 +880,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             str_off += 1 + imp.name.len + 1;
             // Indirect symbols: the stubs' entries, then the GOT's.
             if (i == n_imports) break;
-            const sym_index = n_locals + 1 + @as(u32, @intCast(i));
+            const sym_index = n_locals + n_ext + @as(u32, @intCast(i));
             std.mem.writeInt(u32, buf[indirect_off + 4 * i ..][0..4], sym_index, .little);
             std.mem.writeInt(u32, buf[indirect_off + 4 * (n_imports + i) ..][0..4], sym_index, .little);
         }
@@ -804,12 +891,12 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     writeStruct(buf, macho.mach_header_64{
         .cputype = macho.CPU_TYPE_ARM64,
         .cpusubtype = macho.CPU_SUBTYPE_ARM_ALL,
-        .filetype = macho.MH_EXECUTE,
+        .filetype = if (dylib == null) macho.MH_EXECUTE else macho.MH_DYLIB,
         .ncmds = ncmds,
         .sizeofcmds = sizeofcmds,
-        .flags = macho.MH_NOUNDEFS | macho.MH_DYLDLINK | macho.MH_TWOLEVEL | macho.MH_PIE | @as(u32, if (has_tlv) macho.MH_HAS_TLV_DESCRIPTORS else 0),
+        .flags = macho.MH_NOUNDEFS | macho.MH_DYLDLINK | macho.MH_TWOLEVEL | @as(u32, if (dylib == null) macho.MH_PIE else macho.MH_NO_REEXPORTED_DYLIBS) | @as(u32, if (has_tlv) macho.MH_HAS_TLV_DESCRIPTORS else 0),
     });
-    w.put(macho.segment_command_64{ .cmdsize = @sizeOf(macho.segment_command_64), .segname = name16("__PAGEZERO"), .vmsize = base });
+    if (dylib == null) w.put(macho.segment_command_64{ .cmdsize = @sizeOf(macho.segment_command_64), .segname = name16("__PAGEZERO"), .vmsize = base });
     for (seg_present, 0..) |p, seg| if (p) {
         const rx: macho.vm_prot_t = .{ .READ = true, .EXEC = true };
         const rw: macho.vm_prot_t = .{ .READ = true, .WRITE = true };
@@ -852,24 +939,33 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .initprot = .{ .READ = true },
     });
     w.put(macho.linkedit_data_command{ .cmd = .DYLD_CHAINED_FIXUPS, .dataoff = @intCast(fixups_off), .datasize = @intCast(cf.size) });
-    w.put(macho.linkedit_data_command{ .cmd = .DYLD_EXPORTS_TRIE, .dataoff = @intCast(trie_off), .datasize = exports_trie.len });
+    w.put(macho.linkedit_data_command{ .cmd = .DYLD_EXPORTS_TRIE, .dataoff = @intCast(trie_off), .datasize = @intCast(trie.len) });
     w.put(macho.symtab_command{ .symoff = @intCast(symtab_off), .nsyms = n_syms, .stroff = @intCast(strtab_off), .strsize = @intCast(strtab_len) });
     w.put(macho.dysymtab_command{
         .ilocalsym = 0,
         .nlocalsym = n_locals,
         .iextdefsym = n_locals,
-        .nextdefsym = 1,
-        .iundefsym = n_locals + 1,
+        .nextdefsym = n_ext,
+        .iundefsym = n_locals + n_ext,
         .nundefsym = n_bind_imports,
         .indirectsymoff = if (n_indirect > 0) @intCast(indirect_off) else 0,
         .nindirectsyms = n_indirect,
     });
-    w.putWithString(macho.dylinker_command{ .cmd = .LOAD_DYLINKER, .cmdsize = dylinker_cmd_size, .name = @sizeOf(macho.dylinker_command) }, dylinker_path, dylinker_cmd_size);
+    if (dylib) |d| {
+        w.putWithString(macho.dylib_command{ .cmd = .ID_DYLIB, .cmdsize = id_cmd_size, .dylib = .{
+            .name = @sizeOf(macho.dylib_command),
+            .timestamp = 1,
+            .current_version = d.current_version,
+            .compatibility_version = d.compatibility_version,
+        } }, d.install_name, id_cmd_size);
+    } else {
+        w.putWithString(macho.dylinker_command{ .cmd = .LOAD_DYLINKER, .cmdsize = dylinker_cmd_size, .name = @sizeOf(macho.dylinker_command) }, dylinker_path, dylinker_cmd_size);
+    }
     const uuid_at = w.at + @offsetOf(macho.uuid_command, "uuid");
     w.put(macho.uuid_command{ .uuid = @splat(0) });
     const version = (@as(u32, @intCast(options.min_os.major)) << 16) | (@as(u32, @intCast(options.min_os.minor)) << 8) | @as(u32, @intCast(options.min_os.patch));
     w.put(macho.build_version_command{ .cmdsize = @sizeOf(macho.build_version_command), .platform = .MACOS, .minos = version, .sdk = version, .ntools = 0 });
-    w.put(macho.entry_point_command{ .entryoff = l.atomAddr(entry_index) - base, .stacksize = options.stack_size });
+    if (dylib == null) w.put(macho.entry_point_command{ .entryoff = l.atomAddr(entry_index) - base, .stacksize = options.stack_size });
     w.putWithString(macho.dylib_command{ .cmd = .LOAD_DYLIB, .cmdsize = dylib_cmd_size, .dylib = .{
         .name = @sizeOf(macho.dylib_command),
         .timestamp = 2,
@@ -880,7 +976,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     w.put(macho.linkedit_data_command{ .cmd = .CODE_SIGNATURE, .dataoff = @intCast(sig_off), .datasize = @intCast(sig_size) });
     std.debug.assert(w.at == cmds_end);
 
-    try sign(io, n_threads, buf, @intCast(sig_off), uuid_at, identifier, seg_file_end[0]);
+    try sign(io, n_threads, buf, @intCast(sig_off), uuid_at, identifier, seg_file_end[0], dylib == null);
 
     if (has_dsym) {
         // The dSYM's parts outside the debug chunks': its header and
@@ -1919,6 +2015,115 @@ const CmdWriter = struct {
     }
 };
 
+/// One symbol of a dylib's exports trie: its name without Darwin's
+/// underscore, its EXPORT_SYMBOL_FLAGS, and its offset from the header.
+const TrieEntry = struct { name: []const u8, flags: u8, offset: u64 };
+
+/// The exports trie (LC_DYLD_EXPORTS_TRIE) of `entries`, sorted by name
+/// and unique, owned by the caller: a prefix tree whose edges out of a
+/// node start with different bytes, as dyld's lookup requires (it follows
+/// the first edge that is a prefix of the rest of the name), each node a
+/// ULEB128 terminal size, the terminal (flags, offset), a child count,
+/// and each child's edge string and ULEB128 node offset; zero-padded to
+/// 8 bytes. Nodes are laid out in preorder, sizing offsets until they no
+/// longer change, as ld64 does.
+fn buildExportsTrie(gpa: Allocator, entries: []const TrieEntry) Allocator.Error![]u8 {
+    const Node = struct {
+        terminal: ?*const TrieEntry = null,
+        /// Indices into `edges`.
+        first_edge: u32 = 0,
+        n_edges: u32 = 0,
+        offset: u32 = 0,
+    };
+    const Edge = struct { label: []const u8, node: u32 };
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var nodes: std.ArrayList(Node) = .empty;
+    var edges: std.ArrayList(Edge) = .empty;
+    // Builds the node for `entries[lo..hi]`, which share the first
+    // `depth` bytes of their underscored names, and its subtree.
+    const Builder = struct {
+        nodes: *std.ArrayList(Node),
+        edges: *std.ArrayList(Edge),
+        arena: Allocator,
+        names: []const []const u8,
+        entries: []const TrieEntry,
+
+        fn node(b: *const @This(), lo_in: usize, hi: usize, depth: usize) Allocator.Error!u32 {
+            var lo = lo_in;
+            const index: u32 = @intCast(b.nodes.items.len);
+            try b.nodes.append(b.arena, .{});
+            if (b.names[lo].len == depth) {
+                b.nodes.items[index].terminal = &b.entries[lo];
+                lo += 1;
+            }
+            // Children: runs of names with the same next byte, each under
+            // an edge of the run's common prefix.
+            var children: std.ArrayList(Edge) = .empty;
+            var i = lo;
+            while (i < hi) {
+                var j = i + 1;
+                while (j < hi and b.names[j][depth] == b.names[i][depth]) j += 1;
+                const first = b.names[i];
+                const last = b.names[j - 1];
+                var end = depth + 1;
+                while (end < first.len and end < last.len and first[end] == last[end]) end += 1;
+                try children.append(b.arena, .{ .label = first[depth..end], .node = try b.node(i, j, end) });
+                i = j;
+            }
+            b.nodes.items[index].first_edge = @intCast(b.edges.items.len);
+            b.nodes.items[index].n_edges = @intCast(children.items.len);
+            try b.edges.appendSlice(b.arena, children.items);
+            return index;
+        }
+    };
+    const names = try arena.alloc([]const u8, entries.len);
+    for (names, entries) |*n, e| n.* = try std.mem.concat(arena, u8, &.{ "_", e.name });
+    if (entries.len > 0) {
+        const b: Builder = .{ .nodes = &nodes, .edges = &edges, .arena = arena, .names = names, .entries = entries };
+        _ = try b.node(0, entries.len, 0);
+    } else try nodes.append(arena, .{});
+    // Nodes are created in preorder, so offsets grow with the index.
+    var len: u32 = 0;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        len = 0;
+        for (nodes.items) |*n| {
+            if (n.offset != len) changed = true;
+            n.offset = len;
+            const term_len = if (n.terminal) |t| ulebLen(t.flags) + ulebLen(t.offset) else 0;
+            len += ulebLen(term_len) + term_len + 1;
+            for (edges.items[n.first_edge..][0..n.n_edges]) |e| len += @intCast(e.label.len + 1 + ulebLen(nodes.items[e.node].offset));
+        }
+    }
+    const out = try gpa.alloc(u8, std.mem.alignForward(u32, len, 8));
+    @memset(out, 0);
+    var at: u32 = 0;
+    for (nodes.items) |n| {
+        std.debug.assert(at == n.offset);
+        if (n.terminal) |t| {
+            at += writeUleb(out[at..], ulebLen(t.flags) + ulebLen(t.offset));
+            at += writeUleb(out[at..], t.flags);
+            at += writeUleb(out[at..], t.offset);
+        } else {
+            out[at] = 0;
+            at += 1;
+        }
+        out[at] = @intCast(n.n_edges);
+        at += 1;
+        for (edges.items[n.first_edge..][0..n.n_edges]) |e| {
+            @memcpy(out[at..][0..e.label.len], e.label);
+            out[at + e.label.len] = 0;
+            at += @intCast(e.label.len + 1);
+            at += writeUleb(out[at..], nodes.items[e.node].offset);
+        }
+    }
+    std.debug.assert(at == len);
+    return out;
+}
+
 /// An exports trie with the one symbol every executable exports,
 /// `__mh_execute_header` at offset 0: the root node, with no terminal and
 /// one edge to the child at offset 0x17, then the child, with a terminal of
@@ -1969,7 +2174,9 @@ const ChainedFixupsLayout = struct {
     const DYLD_CHAINED_PTR_START_NONE = 0xffff;
     const DYLD_CHAINED_IMPORT = 1;
 
-    fn init(n_segs: u32, present: [3]bool, has_fixups: [3]bool, seg_start: [3]u64, seg_mem_end: [3]u64, imports: []const Import) ChainedFixupsLayout {
+    /// `first_ordinal` is __TEXT's segment index: 1 after an executable's
+    /// __PAGEZERO, 0 in a dylib.
+    fn init(n_segs: u32, first_ordinal: u32, present: [3]bool, has_fixups: [3]bool, seg_start: [3]u64, seg_mem_end: [3]u64, imports: []const Import) ChainedFixupsLayout {
         var cf: ChainedFixupsLayout = .{
             .n_segs = n_segs,
             .seg_info = @splat(0),
@@ -1980,7 +2187,7 @@ const ChainedFixupsLayout = struct {
             .size = undefined,
             .seg_ordinal = undefined,
         };
-        var ordinal: u32 = 1; // __PAGEZERO is 0
+        var ordinal = first_ordinal;
         for (present, &cf.seg_ordinal) |p, *o| {
             o.* = ordinal;
             ordinal += @intFromBool(p);
@@ -2073,7 +2280,7 @@ fn checkEntry(l: anytype, index: usize, key: SymbolKey, diag: *Diagnostic) Error
     return error.InvalidRelocation;
 }
 
-fn sign(io: std.Io, n_threads: usize, buf: []u8, sig_off: u32, uuid_at: usize, identifier: []const u8, text_end: u64) !void {
+fn sign(io: std.Io, n_threads: usize, buf: []u8, sig_off: u32, uuid_at: usize, identifier: []const u8, text_end: u64, main_binary: bool) !void {
     const n_slots = std.math.divCeil(u32, sig_off, sig_page_size) catch unreachable;
     const cd_off = sig_off + @sizeOf(macho.SuperBlob) + @sizeOf(macho.BlobIndex);
     const ident_off = @sizeOf(macho.CodeDirectory);
@@ -2138,7 +2345,7 @@ fn sign(io: std.Io, n_threads: usize, buf: []u8, sig_off: u32, uuid_at: usize, i
         .codeLimit64 = 0,
         .execSegBase = 0,
         .execSegLimit = text_end,
-        .execSegFlags = macho.CS_EXECSEG_MAIN_BINARY,
+        .execSegFlags = if (main_binary) macho.CS_EXECSEG_MAIN_BINARY else 0,
     };
     std.mem.byteSwapAllFields(macho.CodeDirectory, &cd);
     writeStruct(buf[cd_off..], cd);
@@ -2971,4 +3178,140 @@ fn testUnwindEncoding(bytes: []const u8, addr: u64) ?u32 {
         }
     }
     return entries[left].encoding;
+}
+
+/// dyld's `trieWalk`, for the tests: from the root, take the first edge
+/// whose label is a prefix of what is left of the name. Returns the
+/// terminal's flags and offset.
+fn trieLookup(t: []const u8, symbol: []const u8) ?[2]u64 {
+    const uleb = struct {
+        fn f(bytes: []const u8, at: *usize) u64 {
+            var v: u64 = 0;
+            var shift: u6 = 0;
+            while (true) {
+                const b = bytes[at.*];
+                at.* += 1;
+                v |= @as(u64, b & 0x7f) << shift;
+                if (b & 0x80 == 0) return v;
+                shift += 7;
+            }
+        }
+    }.f;
+    var node: usize = 0;
+    var rest = symbol;
+    while (true) {
+        var at = node;
+        const term = uleb(t, &at);
+        if (rest.len == 0 and term != 0) {
+            const flags = uleb(t, &at);
+            return .{ flags, uleb(t, &at) };
+        }
+        at += @intCast(term);
+        const n = t[at];
+        at += 1;
+        var next: ?usize = null;
+        for (0..n) |_| {
+            const label = std.mem.sliceTo(t[at..], 0);
+            at += label.len + 1;
+            const child = uleb(t, &at);
+            if (next == null and std.mem.startsWith(u8, rest, label)) {
+                next = @intCast(child);
+                rest = rest[label.len..];
+            }
+        }
+        node = next orelse return null;
+    }
+}
+
+test "exports trie lookups follow dyld's walk" {
+    const gpa = std.testing.allocator;
+    // Names that are prefixes of others and share prefixes, and offsets
+    // that need multi-byte ULEB128s, so node offsets grow while sizing.
+    var entries: [300]TrieEntry = undefined;
+    var name_buf: [300][8]u8 = undefined;
+    for (&entries, &name_buf, 0..) |*e, *nb, i| {
+        const name = std.fmt.bufPrint(nb, "f{d}", .{i * 7}) catch unreachable;
+        e.* = .{ .name = name, .flags = @intCast(i % 2 * macho.EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION), .offset = 0x4000 + i * 0x123 };
+    }
+    std.mem.sortUnstable(TrieEntry, &entries, {}, struct {
+        fn lt(_: void, a: TrieEntry, b: TrieEntry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+    const trie = try buildExportsTrie(gpa, &entries);
+    defer gpa.free(trie);
+    try std.testing.expectEqual(0, trie.len % 8);
+    for (entries) |e| {
+        var buf: [9]u8 = undefined;
+        const found = trieLookup(trie, std.fmt.bufPrint(&buf, "_{s}", .{e.name}) catch unreachable) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual([2]u64{ e.flags, e.offset }, found);
+    }
+    // Prefixes of names and names past them are not exported.
+    for ([_][]const u8{ "_f", "_f1", "_f13", "_f20999", "f0", "_g0" }) |missing| try std.testing.expectEqual(null, trieLookup(trie, missing));
+    const empty = try buildExportsTrie(gpa, &.{});
+    defer gpa.free(empty);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0 }, empty);
+}
+
+test "a dylib has its install name, exports and fixups, and no __PAGEZERO or entry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const f: SymbolKey = .fromName("f");
+    const g: SymbolKey = .fromName("g");
+    const ptr: SymbolKey = .fromName("ptr");
+    const write: SymbolKey = .fromName("import.write");
+    // g: bl write; f: ret. ptr: .quad f, a rebase in __DATA.
+    const atoms = [_]Atom{
+        .{ .key = g, .name = "g", .section = .text, .alignment = .@"4", .bytes = &.{ 0, 0, 0, 0x94 }, .targets = &.{write}, .relocs = &.{.init(0, .aarch64_branch26, 0, 0)} },
+        .{ .key = f, .name = "f", .section = .text, .alignment = .@"4", .bytes = &.{ 0xc0, 0x03, 0x5f, 0xd6 } },
+        .{ .key = ptr, .name = "ptr", .section = .data, .alignment = .@"8", .bytes = &@as([8]u8, @splat(0)), .targets = &.{f}, .relocs = &.{.init(0, .aarch64_abs64, 0, 0)} },
+    };
+    const dylib: Dylib = .{ .install_name = "@rpath/libt.dylib", .current_version = 0x10203, .exports = &.{ .{ .key = ptr, .name = "ptr" }, .{ .key = f, .name = "f", .weak = true } } };
+    const out = try emit(gpa, io, &atoms, .{ .entry = undefined, .dylib = &dylib, .imports = &.{.{ .key = write, .name = "write" }}, .threads = 1 });
+    defer gpa.free(out);
+
+    const mh = std.mem.bytesToValue(macho.mach_header_64, out[0..@sizeOf(macho.mach_header_64)]);
+    try std.testing.expectEqual(macho.MH_DYLIB, mh.filetype);
+    try std.testing.expectEqual(0, mh.flags & macho.MH_PIE);
+    var at: usize = @sizeOf(macho.mach_header_64);
+    var segs: std.ArrayList([]const u8) = .empty;
+    defer segs.deinit(gpa);
+    var id: ?[]const u8 = null;
+    var trie: []const u8 = &.{};
+    var fixups: []const u8 = &.{};
+    for (0..mh.ncmds) |_| {
+        const lc = std.mem.bytesToValue(macho.load_command, out[at..][0..@sizeOf(macho.load_command)]);
+        switch (lc.cmd) {
+            .SEGMENT_64 => try segs.append(gpa, std.mem.sliceTo(out[at + 8 ..][0..16], 0)),
+            .ID_DYLIB => {
+                const d = std.mem.bytesToValue(macho.dylib_command, out[at..][0..@sizeOf(macho.dylib_command)]);
+                try std.testing.expectEqual(0x10203, d.dylib.current_version);
+                id = std.mem.sliceTo(out[at + d.dylib.name ..][0 .. lc.cmdsize - d.dylib.name], 0);
+            },
+            .DYLD_EXPORTS_TRIE, .DYLD_CHAINED_FIXUPS => {
+                const d = std.mem.bytesToValue(macho.linkedit_data_command, out[at..][0..@sizeOf(macho.linkedit_data_command)]);
+                (if (lc.cmd == .DYLD_EXPORTS_TRIE) trie else fixups) = out[d.dataoff..][0..d.datasize];
+            },
+            .MAIN, .LOAD_DYLINKER => return error.TestUnexpectedResult,
+            else => {},
+        }
+        at += lc.cmdsize;
+    }
+    try std.testing.expectEqualStrings("@rpath/libt.dylib", id.?);
+    const names = [_][]const u8{ "__TEXT", "__DATA_CONST", "__DATA", "__LINKEDIT" };
+    try std.testing.expectEqual(names.len, segs.items.len);
+    for (names, segs.items) |want, got_name| try std.testing.expectEqualStrings(want, got_name);
+    // Chain starts for the GOT's bind and ptr's rebase are those of
+    // segments 1 and 2, counted without __PAGEZERO.
+    const image = fixups[std.mem.readInt(u32, fixups[4..8], .little)..];
+    try std.testing.expectEqual(4, std.mem.readInt(u32, image[0..4], .little));
+    for ([_]bool{ false, true, true, false }, 0..) |has, i|
+        try std.testing.expectEqual(has, std.mem.readInt(u32, image[4 + 4 * i ..][0..4], .little) != 0);
+    // The trie: f (weak) and ptr at their offsets from the header, which
+    // are their file offsets.
+    try std.testing.expectEqual(0, trie.len % 8);
+    const f_off = std.mem.indexOf(u8, out, &.{ 0xc0, 0x03, 0x5f, 0xd6 }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual([2]u64{ macho.EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, f_off }, trieLookup(trie, "_f").?);
+    try std.testing.expectEqual(0, trieLookup(trie, "_ptr").?[0]);
+    try std.testing.expectEqual(null, trieLookup(trie, "_g"));
 }

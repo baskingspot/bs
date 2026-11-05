@@ -4058,8 +4058,20 @@ The other direction, bs's own relocatable output, is new:
 - ld64 (through clang), upstream zig and bs itself link both and run
   the result on the Mac; libvaxis's `bs build test` runs all 48 steps
   and the same 232 of 237 tests as upstream.
-Still refused on aarch64-macos: dynamic libraries, `build-obj` that
-would merge C sources or objects into its output, and `-lc++`.
+- `build-lib -dynamic` links an MH_DYLIB through MachO.zig
+  (`Options.dylib`): the executable's layout without __PAGEZERO, LC_MAIN
+  and LC_LOAD_DYLINKER, an LC_ID_DYLIB from `-install_name` (else the
+  output path, as upstream's) and `--version`, and an exports trie of
+  the non-hidden exports, Zig's and the C inputs' (`MachOInput.
+  dynamicExports`). It is named `lib<name>.dylib` (`lib<name>.<version>
+  .dylib`), as upstream's, and keeps the executable's preferred base,
+  which dyld slides (upstream's starts at 0). Its dSYM symbolizes panics
+  inside it. One difference from upstream: std's weak
+  `_mh_execute_header` is exported as it is, where upstream's linker
+  drops it.
+Still refused on aarch64-macos: linking against dylibs or `.tbd`
+files other than libSystem, `build-obj` that would merge C sources or
+objects into its output, and `-lc++`.
 
 ### compiler_rt (decided 2026-11-02)
 

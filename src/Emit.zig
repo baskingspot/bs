@@ -90,6 +90,11 @@ pic: enum { none, pic, pie } = .none,
 shared: bool = false,
 /// The shared object's DT_SONAME.
 soname: ?[]const u8 = null,
+/// An aarch64-macos dylib's install name (`-install_name`; else its
+/// output path, as upstream's) and current version (`--version`, else
+/// 1.0.0), for LC_ID_DYLIB.
+install_name: ?[]const u8 = null,
+dylib_version: u32 = 0x10000,
 /// `--stack`: the executable's main thread stack size.
 stack_size: u64 = 16 * 1024 * 1024,
 /// `-ffuzz`: CodeGen instruments the main module family's functions with
@@ -1046,7 +1051,7 @@ fn convertInputs(emit: *Emit, inputs: Inputs) !bool {
 }
 
 /// `convertInputs` for Mach-O inputs, which have no sections to copy and
-/// no shared libraries to copy data from or export to.
+/// no shared libraries to copy data from.
 fn convertMachOInputs(emit: *Emit, in: *MachOInput) !bool {
     const converted = try in.convert(InputResolver{ .emit = emit });
     for (in.errors.items) |msg| try emit.zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{msg});
@@ -1056,6 +1061,8 @@ fn convertMachOInputs(emit: *Emit, in: *MachOInput) !bool {
     for (converted.atoms) |atom| try emit.addAtom(atom);
     try emit.error_values.appendSlice(emit.gpa, converted.values);
     emit.input_symbols = converted.symbols;
+    // A dylib exports the objects' globals too, as upstream's.
+    if (emit.shared) try emit.exports.appendSlice(emit.gpa, try in.dynamicExports(InputResolver{ .emit = emit }));
     return true;
 }
 
@@ -1447,7 +1454,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     // Source paths are as the compiler opened them, relative to the cwd.
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
-    if (emit.zcu.ip.target == .aarch64_macos and emit.obj) {
+    if (emit.zcu.ip.target == .aarch64_macos and emit.obj and !emit.shared) {
         const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
         defer emit.gpa.free(imports);
         for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak };
@@ -1461,7 +1468,14 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         const imports = try emit.gpa.alloc(MachO.Import, emit.imports.count());
         defer emit.gpa.free(imports);
         for (imports, emit.imports.keys()) |*imp, name| imp.* = .{ .key = importKey(name), .name = name };
-        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry.?, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .aliases = emit.aliases.items, .local_symbols = emit.input_symbols }) catch |err| {
+        // A dylib exports what other images can bind to: not hidden
+        // symbols, such as compiler_rt's.
+        var dylib_exports: std.ArrayList(MachO.Export) = .empty;
+        defer dylib_exports.deinit(emit.gpa);
+        if (emit.shared) for (emit.exports.items) |x| if (x.visibility != .hidden)
+            try dylib_exports.append(emit.gpa, .{ .key = x.key, .name = x.name, .offset = x.offset, .weak = x.weak });
+        const dylib: MachO.Dylib = .{ .install_name = emit.install_name orelse sub_path, .current_version = emit.dylib_version, .exports = dylib_exports.items };
+        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry orelse undefined, .dylib = if (emit.shared) &dylib else null, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .aliases = emit.aliases.items, .local_symbols = emit.input_symbols }) catch |err| {
             std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
             return false;
         };

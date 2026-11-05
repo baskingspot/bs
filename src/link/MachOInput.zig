@@ -18,6 +18,7 @@ const Atom = @import("Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Archive = @import("Archive.zig");
 const Elf = @import("Elf.zig");
+const ElfDynamic = @import("ElfDynamic.zig");
 
 const Inputs = @This();
 
@@ -396,6 +397,33 @@ pub fn lookup(in: *Inputs, name: []const u8) Allocator.Error!?Target {
     }
     if (in.commons.contains(name)) return .{ .key = commonKey(name), .offset = 0 };
     return null;
+}
+
+/// The objects' external definitions a dylib exports, sorted by name:
+/// every N_EXT symbol but private externals (N_PEXT) and the names
+/// `skip.zigExport` claims, and the COMMON symbols, as ld64 exports them.
+pub fn dynamicExports(in: *Inputs, skip: anytype) ![]ElfDynamic.Export {
+    var out: std.ArrayList(ElfDynamic.Export) = .empty;
+    var it = in.defs.iterator();
+    while (it.next()) |d| {
+        const name = d.key_ptr.*;
+        if (try skip.zigExport(name) != null) continue;
+        const o = &in.objects.items[d.value_ptr.object];
+        const sym = o.syms[d.value_ptr.sym];
+        if (sym.kind() != macho.N_SECT or sym.n_type & macho.N_PEXT != 0) continue;
+        const t = symTarget(o, sym) orelse continue;
+        try out.append(in.arena, .{ .key = t.key, .name = name, .offset = t.offset, .weak = d.value_ptr.weak });
+    }
+    for (in.commons.keys()) |name| {
+        if (in.defs.contains(name) or try skip.zigExport(name) != null) continue;
+        try out.append(in.arena, .{ .key = commonKey(name), .name = name });
+    }
+    std.mem.sortUnstable(ElfDynamic.Export, out.items, {}, struct {
+        fn lt(_: void, a: ElfDynamic.Export, b: ElfDynamic.Export) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+    return out.items;
 }
 
 fn commonKey(name: []const u8) SymbolKey {

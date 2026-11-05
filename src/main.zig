@@ -323,7 +323,7 @@ pub fn main(init_std: std.process.Init) !void {
         else if (command == .run or command == .@"test")
             try runBinPath(arena, init.io, job.bsLocal(arena), job.compile_args, job.zig_lib_dir, job.stem)
         else
-            try outputName(arena, command, opts.dynamic, opts.version, job.stem),
+            try outputName(arena, command, opts.dynamic, opts.version, job.stem, opts.bs_target == .aarch64_macos),
     };
     if (opts.emit_bin == .default and (command == .run or command == .@"test")) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
     var inc = job.openCache(out_path);
@@ -1117,10 +1117,12 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     emit.pic = if (opts.pie) .pie else if (opts.pic) .pic else .none;
     emit.shared = opts.dynamic;
     if (opts.dynamic) emit.soname = switch (opts.soname) {
-        .default => if (opts.version) |v| try std.fmt.allocPrint(arena, "lib{s}.so.{d}", .{ job.stem, v.major }) else try outputName(arena, .build_lib, true, null, job.stem),
+        .default => if (opts.version) |v| try std.fmt.allocPrint(arena, "lib{s}.so.{d}", .{ job.stem, v.major }) else try outputName(arena, .build_lib, true, null, job.stem, false),
         .name => |n| n,
         .none => null,
     };
+    emit.install_name = opts.install_name;
+    if (opts.version) |v| emit.dylib_version = @as(u32, @intCast(@min(v.major, 0xffff))) << 16 | @as(u32, @intCast(@min(v.minor, 0xff))) << 8 | @as(u32, @intCast(@min(v.patch, 0xff)));
     emit.stack_size = opts.stack_size;
     emit.fuzz = opts.fuzz;
     emit.prove_on = proving(job.environ_map);
@@ -1328,13 +1330,17 @@ fn printEnv(init: std.process.Init) !void {
     try out.interface.flush();
 }
 
-/// The output's file name in its directory, as upstream names it.
-fn outputName(arena: std.mem.Allocator, command: Command, dynamic: bool, version: ?std.SemanticVersion, stem: []const u8) ![]const u8 {
+/// The output's file name in its directory, as upstream names it; a
+/// dylib's on macOS.
+fn outputName(arena: std.mem.Allocator, command: Command, dynamic: bool, version: ?std.SemanticVersion, stem: []const u8, macos: bool) ![]const u8 {
     return switch (command) {
         .build_obj => std.fmt.allocPrint(arena, "{s}.o", .{stem}),
         .build_lib => if (!dynamic)
             std.fmt.allocPrint(arena, "lib{s}.a", .{stem})
-        else if (version) |v|
+        else if (macos) if (version) |v|
+            std.fmt.allocPrint(arena, "lib{s}.{d}.{d}.{d}.dylib", .{ stem, v.major, v.minor, v.patch })
+        else
+            std.fmt.allocPrint(arena, "lib{s}.dylib", .{stem}) else if (version) |v|
             std.fmt.allocPrint(arena, "lib{s}.so.{d}.{d}.{d}", .{ stem, v.major, v.minor, v.patch })
         else
             std.fmt.allocPrint(arena, "lib{s}.so", .{stem}),
@@ -1438,7 +1444,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     var outs: [2]Out = undefined;
     if (job) |*j| {
         _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, j.cache_target);
-        const name = try outputName(arena, opts.command, opts.dynamic, opts.version, j.stem);
+        const name = try outputName(arena, opts.command, opts.dynamic, opts.version, j.stem, opts.bs_target == .aarch64_macos);
         // A step without a binary (`-fno-emit-bin`, such as a `check`
         // step) still links one there when the cache can take the build:
         // the cache answers a build whose inputs did not change only from
@@ -2171,7 +2177,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
                 try c_files.append(arena, .{ .path = arg, .extra_flags = extra_cflags, .cc_argv = &.{}, .flags = .{}, .lang = lang });
             } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or (isSharedLib(arg) and command != .build_obj and command != .build_lib)) {
                 try link_inputs.append(arena, arg);
-            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.indexOf(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib"))
+            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.indexOf(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib") or std.mem.eql(u8, ext, ".dylib") or std.mem.eql(u8, ext, ".tbd"))
                 setUnsupported(&opts, arena, "bs does not link object files or libraries ('{s}'); build this step with upstream zig", .{arg})
             else
                 setUnsupported(&opts, arena, "bs does not compile C, C++, or assembly sources ('{s}'); build this step with upstream zig", .{arg});
@@ -2188,9 +2194,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // against libSystem, which is macOS's libc (`-lc` asks for nothing
     // more), with C sources, Mach-O objects and archives.
     if (opts.bs_target == .aarch64_macos) {
-        if ((command == .build_obj or command == .build_lib) and link_mode == .dynamic)
-            setUnsupported(&opts, arena, "bs does not build dynamic libraries for aarch64-macos yet; build this step with upstream zig", .{})
-        else if (command == .build_obj and (c_files.items.len != 0 or link_inputs.items.len != 0))
+        if (command == .build_obj and (c_files.items.len != 0 or link_inputs.items.len != 0))
             setUnsupported(&opts, arena, "bs does not merge C sources or objects into aarch64-macos objects yet; build this step with upstream zig", .{})
         else if (opts.link_libcpp)
             setUnsupported(&opts, arena, "bs does not link libc++ for aarch64-macos yet; build this step with upstream zig", .{})
@@ -2614,12 +2618,12 @@ test {
     _ = @import("codegen/x86_64/CodeGen.zig");
     _ = @import("link/MachO.zig");
     _ = @import("link/MachOInput.zig");
+    _ = @import("link/MachOObject.zig");
     _ = @import("codegen/aarch64/Encoder.zig");
     _ = @import("codegen/Ssa.zig");
     _ = @import("codegen/rewrite.zig");
     _ = @import("codegen/prove.zig");
     _ = @import("InternPool.zig");
-    _ = @import("link/MachOObject.zig");
     _ = Zcu;
     _ = @import("Sema.zig");
     _ = @import("diag.zig");
