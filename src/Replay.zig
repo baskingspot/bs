@@ -954,6 +954,14 @@ fn resolveRefs(r: *Replay, g: Green, is_func: bool) !?[]Ref {
 fn commitLazy(r: *Replay, g: Green, loaded: bool) !void {
     r.deps.shrinkRetainingCapacity(g.deps_start);
     r.state[g.node] = .green;
+    // A green function's inferred error set and inline result are as
+    // recorded too. Nothing else may decide them: a non-empty set has a
+    // node whether or not a unit reads it, so the walk need not reach it.
+    if (r.m.node(g.node).tag == @backingInt(Tag.func)) {
+        for (r.m.rdeps(g.node)) |part| for (part) |p| if (r.producedBy(p, g.node)) {
+            r.state[p] = .green;
+        };
+    }
     if (loaded) r.loaded.set(g.node);
     r.stats.loaded += 1;
     try r.visit(g.node);
@@ -1269,6 +1277,15 @@ fn inlineMoved(r: *Replay, d: u32, depth: u32) !bool {
 fn inChangedInput(r: *Replay, n: u32) bool {
     const input = r.m.source(n).input;
     return input < r.changed_input.bit_length and r.changed_input.isSet(input);
+}
+
+/// Whether node `p` is function node `f`'s inferred error set or inline
+/// result, outdated and not decided yet.
+fn producedBy(r: *const Replay, p: u32, f: u32) bool {
+    const tag = r.m.node(p).tag;
+    if (tag != @backingInt(Tag.func_ies) and tag != @backingInt(Tag.func_inline)) return false;
+    const deps = r.m.deps(p);
+    return deps.len == 1 and Manifest.Edge.nodeOf(deps[0]) == f and r.outdated.isSet(p) and r.state[p] == .unknown;
 }
 
 fn namespaceOutdated(r: *Replay, n: u32) bool {

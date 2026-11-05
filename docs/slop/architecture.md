@@ -5145,6 +5145,11 @@ records only what changed, and links from the manifest.
   removes a public declaration in an imported file left the node
   undecided with its old names (`BS_CACHE_VERIFY` on zls's Server.zig;
   test/run/edit_ns_decl.zig).
+  A function an edit reached that turns out green decides its inferred
+  error set and inline result as recorded (`Replay.commitLazy`): a
+  non-empty set has a node whether or not a unit reads it, so the walk
+  may never reach it, and std's tests left seven `Io.Future` sets
+  undecided after a body edit in `std.debug.print`.
 - *Walking only the edits' cone* (2026-11-04). Every node records
   whether a walk from the roots reaches it (`Flags.reached`: a full
   build's record sets it from reach, a lazy one's from `reachedNow`),
