@@ -30,6 +30,7 @@ Changes a user of bs notices, newest first, in the
 ### Fixed
 
 - In `bs build`, the first build after a cold one no longer compiles shared libraries and `-fPIC` objects again when they link other steps' outputs, nor reruns every step that depends on them.
+- In `bs build`, the first build after a cold one no longer compiles shared libraries and `-fPIC` objects again when their C sources include a header another step generated, nor reruns every step that depends on them.
 - In an ELF object (`bs build-obj`), a constant table of extern function pointers that code copies, such as `const libs = [_]Lib{ .{ .open = c.luaopen_base }, ... }` read in a `for` loop, keeps its relocations to those functions, instead of leaving null pointers that crash when called.
 - On aarch64-macos, static libraries index their members' hidden (private external) definitions, as upstream's do, so another member or a program linking the library can pull them.
 - On aarch64-macos, C and Objective-C objects whose functions catch exceptions (`@try`/`@catch`, C++ `try`) link: their `__eh_frame` is kept and their compact unwind entries reach `__unwind_info`, and the POINTER_TO_GOT relocations of their personality pointers are resolved, so a throw finds its handler as with upstream, instead of the link refusing the relocations.

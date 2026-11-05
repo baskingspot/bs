@@ -37,13 +37,18 @@ pub fn build(b: *std.Build) void {
     // A shared library: -fPIC, which bs's cache does not take; its
     // inputs record still makes a build with no change a cache hit, also
     // the first after a cold build, which wrote its link input, the
-    // archive, moments before it linked.
+    // archive, moments before it linked, and whose C source includes a
+    // header that another step wrote moments before.
     const shared = b.addLibrary(.{ .name = "shared", .linkage = .dynamic, .root_module = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     }) });
     shared.root_module.linkLibrary(answer);
+    const generated = b.addWriteFiles();
+    _ = generated.add("generated.h", "#define GENERATED_VALUE 7\n");
+    shared.root_module.addIncludePath(generated.getDirectory());
+    shared.root_module.addCSourceFile(.{ .file = b.path("c/generated.c") });
     b.installArtifact(shared);
     // A C header translated to Zig, imported by a program that links
     // glibc: `bs translate-c --listen=-`.

@@ -28,6 +28,7 @@ build)
 [ "$(./zig-out/bin/hello x 2>&1)" = "hello 1" ] || fail "zig-out/bin/hello prints 'hello 1'"
 [ "$(ar t zig-out/lib/libanswer.a)" = "lib.o" ] || fail "zig-out/lib/libanswer.a holds lib.o"
 grep -q hello_answer zig-out/lib/libanswer.a || fail "libanswer.a's index names hello_answer"
+nm -D zig-out/lib/libshared.so | grep -q hello_generated || fail "libshared.so exports hello_generated"
 
 # Nothing changed: the compile steps are cache hits, the shared library's
 # too, from its inputs record.

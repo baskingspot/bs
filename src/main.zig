@@ -944,9 +944,8 @@ const InputsRecord = struct {
             try Incremental.inputPath(arena, &path_buf, fe, f.module, f.sub_path);
             if (!try r.add(arena, io, &buf, path_buf.items, Frontend.hashSource(f.bytes), true)) return;
         }
-        // Files the build did not hash itself are hashed now. One that
-        // changed since the build started may not be what the build read:
-        // then there is no record, and the next build builds.
+        // Files the build did not hash itself are hashed now, as upstream's
+        // cache hashes a depfile's files after the compile.
         var it = std.mem.splitScalar(u8, c_inputs, 0);
         while (it.next()) |path| if (path.len != 0) {
             if (!try r.addHashed(arena, io, &buf, path, true)) return;
@@ -982,11 +981,11 @@ const InputsRecord = struct {
         return true;
     }
 
-    /// `add` with the hash of `path`'s contents now; false if it changed
-    /// since the build started.
+    /// `add` with the hash of `path`'s contents now. A file too new to
+    /// trust, such as a header another step of `zig build` generated
+    /// moments before, is recorded as racy and rehashed by the next check,
+    /// as upstream's cache does, rather than costing the whole record.
     fn addHashed(r: *const InputsRecord, arena: std.mem.Allocator, io: Io, buf: *std.ArrayList(u8), path: []const u8, reported: bool) !bool {
-        const stat = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
-        if (r.racy(stat)) return false;
         const src = Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited) catch return false;
         return r.add(arena, io, buf, path, Frontend.hashSource(src), reported);
     }
