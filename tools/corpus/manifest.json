@@ -2458,6 +2458,496 @@
      "name": "test"
     }
    ]
+  },
+  {
+   "name": "zprof",
+   "url": "https://github.com/ANDRVV/zprof",
+   "commit": "7f480e9cbe6ed34cc14d7840978186b3cb8e8ca3",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zprof"
+    },
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "csv-zero",
+   "url": "https://github.com/peymanmortazavi/csv-zero",
+   "commit": "6581656637a2b8566005e21291573837771ce8ab",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "csvzero"
+    },
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "ChipZ",
+   "url": "https://github.com/Arwalk/ChipZ",
+   "commit": "6c29f776863f6ac9de6438f59c2e6bbab07a783c",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "verse",
+   "url": "https://github.com/GrayHatter/verse",
+   "commit": "bd1c11aba0d66045aa5651c5fab2e5adbe010657",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    },
+    {
+     "name": "test:src/verse.zig"
+    },
+    {
+     "name": "basic"
+    },
+    {
+     "name": "template"
+    },
+    {
+     "name": "template-enum"
+    },
+    {
+     "name": "template-extra"
+    },
+    {
+     "name": "websocket"
+    }
+   ]
+  },
+  {
+   "name": "marionette",
+   "url": "https://github.com/sb2bg/marionette",
+   "commit": "40e8502f3a0fb2afd6e0284e5c12cab579c2918a",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "marionette-run"
+    },
+    {
+     "name": "marionette-tidy"
+    },
+    {
+     "name": "test"
+    },
+    {
+     "name": "test:examples/root.zig"
+    },
+    {
+     "name": "test:src/root.zig"
+    },
+    {
+     "name": "test:tests/root.zig"
+    },
+    {
+     "name": "test:validation/bounded_queue_concurrency.zig"
+    },
+    {
+     "name": "test:validation/kv_compat.zig"
+    }
+   ]
+  },
+  {
+   "name": "polyrole",
+   "url": "https://github.com/getz3/polyrole",
+   "commit": "6c91db6c60768277ee7a1d95b0457bfd53105da5",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "wild",
+   "url": "https://github.com/jeremytregunna/wild",
+   "commit": "e618537fc7a8161bdd5f246836be0919086715c8",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "wild"
+    },
+    {
+     "name": "benchmark"
+    },
+    {
+     "name": "test"
+    },
+    {
+     "name": "test:tests/test_batch_read.zig"
+    },
+    {
+     "name": "test:tests/test_wild_storage.zig"
+    },
+    {
+     "name": "test:src/root.zig"
+    },
+    {
+     "name": "test:src/test_slab_allocator.zig"
+    },
+    {
+     "name": "test:src/client.zig"
+    }
+   ]
+  },
+  {
+   "name": "zeptun",
+   "url": "https://github.com/Noisemux/zeptun",
+   "commit": "4dfb332aadf6b14fe48f7436d923fefe1bb7e3d2",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zeptun:src/cli/main.zig"
+    },
+    {
+     "name": "test"
+    },
+    {
+     "name": "test:src/bench/main.zig"
+    },
+    {
+     "name": "test:src/ffi/ffi.zig"
+    },
+    {
+     "name": "test:src/cli/main.zig"
+    }
+   ]
+  },
+  {
+   "name": "s2s",
+   "url": "https://github.com/ziglibs/s2s",
+   "commit": "db21113b2f8ee3298486e6a31febdb9d49abd5b4",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "knoedel",
+   "url": "https://github.com/Lommix/knoedel",
+   "commit": "6b318e8130e5ecd12c96ebef81c639beaaf8ccda",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "serde.zig",
+   "url": "https://github.com/OrlovEvgeny/serde.zig",
+   "commit": "87425173b8807d5e2bbb6e15d09a4b14de91f217",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    },
+    {
+     "name": "test:test/toon_test.zig"
+    },
+    {
+     "name": "test:test/serde_options_test.zig"
+    },
+    {
+     "name": "test:test/tokens_test.zig"
+    },
+    {
+     "name": "test:test/etf_test.zig"
+    },
+    {
+     "name": "test:src/root.zig"
+    },
+    {
+     "name": "test:test/json_diagnostics_test.zig"
+    },
+    {
+     "name": "test:bench/main.zig"
+    },
+    {
+     "name": "test:test/contracts_test.zig"
+    },
+    {
+     "name": "test:test/roundtrip_test.zig"
+    },
+    {
+     "name": "test:test/core_regressions_test.zig"
+    },
+    {
+     "name": "test:test/edge_cases_test.zig"
+    },
+    {
+     "name": "test:test/reader_test.zig"
+    },
+    {
+     "name": "test:test/stress_test.zig"
+    },
+    {
+     "name": "test:test/adversarial_test.zig"
+    }
+   ]
+  },
+  {
+   "name": "oma",
+   "url": "https://github.com/ATTron/oma",
+   "commit": "c94eae96bdf4f2cfb32c77b91c4dd11eec970d7d",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "comptime-serde",
+   "url": "https://github.com/jiacai2050/comptime-serde",
+   "commit": "c6d99a34a5cab03622ac846a82d32ea9d88b3e7a",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "zitrus",
+   "url": "https://github.com/GasInfinity/zitrus",
+   "commit": "afcac03c912a28b488e44c2c9c9be2914f84e45e",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zitrus"
+    },
+    {
+     "name": "zitrus-mod-tests"
+    },
+    {
+     "name": "zitrus-exe-tests"
+    }
+   ]
+  },
+  {
+   "name": "zigdown",
+   "url": "https://github.com/JacobCrabill/zigdown",
+   "commit": "3f62ac7f8d64123e899718af79c1d20479330b6a",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zigdown"
+    },
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "sandopolis",
+   "url": "https://github.com/pixel-clover/sandopolis",
+   "commit": "c7da731d181549a56460cec9b0a53e01f8337a2d",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test-unit"
+    ],
+    [
+     "test-property"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "sandopolis"
+    },
+    {
+     "name": "test"
+    },
+    {
+     "name": "test:tests/property_tests.zig"
+    }
+   ]
+  },
+  {
+   "name": "evm.zig",
+   "url": "https://github.com/0xjojoex/evm.zig",
+   "commit": "0204256d231e662467bccc8c8a04b39dd8566d41",
+   "ref": "main",
+   "license": "MIT OR Apache-2.0",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "evmz:tools/main.zig"
+    },
+    {
+     "name": "test"
+    },
+    {
+     "name": "mpt-key-tests"
+    },
+    {
+     "name": "test:pkg/mpt/test.zig"
+    },
+    {
+     "name": "test:pkg/rlp/src/test.zig"
+    },
+    {
+     "name": "evmz-native-tests"
+    }
+   ]
   }
  ],
  "excluded": [

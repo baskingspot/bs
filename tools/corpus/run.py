@@ -279,6 +279,7 @@ TEST_STARTED = re.compile(r"^\d+/\d+ (.+?)\.\.\.", re.MULTILINE)
 
 
 def run_binary(path, args, cwd, timeout):
+    t = time.monotonic()
     try:
         p = subprocess.run(
             [path, *args],
@@ -295,7 +296,12 @@ def run_binary(path, args, cwd, timeout):
             "stderr": (e.stderr or b"").decode(errors="replace"),
         }
     code = p.returncode if p.returncode >= 0 else f"signal {-p.returncode}"
-    return {"exit": code, "stdout": p.stdout.decode(errors="replace"), "stderr": p.stderr.decode(errors="replace")}
+    return {
+        "exit": code,
+        "secs": time.monotonic() - t,
+        "stdout": p.stdout.decode(errors="replace"),
+        "stderr": p.stderr.decode(errors="replace"),
+    }
 
 
 def summarize_run(r, is_test):
@@ -420,6 +426,7 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
             run = run_binary(run_path, run_args, cwd, tgt.get("timeout", 600))
             os.remove(run_path)
             r["run"] = summarize_run(run, is_test)
+            r["run_secs"] = run.get("secs")
         r["run_exit"] = run["exit"]
         r["stdout_sha"] = hashlib.sha256(run["stdout"].encode()).hexdigest()
         # A file the run writes (`output`) counts as part of its stdout.
@@ -510,8 +517,8 @@ def write_scoreboard(results, manifest, path, tool_secs=None):
     lines = [
         "| Project | Target | Verdict | upstream run | bs run | cold-local zig / bs |"
         + (" cold-local zig / bs with donors |" if donors else "")
-        + " edit zig / bs |",
-        "|---|---|---|---|---|---:|" + ("---:|" if donors else "") + "---:|",
+        + " edit zig / bs | run zig / bs |",
+        "|---|---|---|---|---|---:|" + ("---:|" if donors else "") + "---:|---:|",
     ]
     for res in results:
         u, z = res.get("zig") or {}, res.get("bs") or {}
@@ -532,7 +539,7 @@ def write_scoreboard(results, manifest, path, tool_secs=None):
             else ""
         )
         lines.append(
-            "| {} | {} | {} | {} | {} | {} / {}{} |{} {} / {}{} |".format(
+            "| {} | {} | {} | {} | {} | {} / {}{} |{} {} / {}{} | {} / {}{} |".format(
                 res["project"],
                 res["target"],
                 res["verdict"].replace("|", "\\|"),
@@ -545,6 +552,9 @@ def write_scoreboard(results, manifest, path, tool_secs=None):
                 fmt_s(u.get("edit")),
                 fmt_s(z.get("edit")),
                 ratio(u.get("edit"), z.get("edit")),
+                fmt_s(u.get("run_secs")),
+                fmt_s(z.get("run_secs")),
+                ratio(u.get("run_secs"), z.get("run_secs")),
             )
         )
     if tool_secs is not None:
