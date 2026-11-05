@@ -58,6 +58,7 @@ const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
 const vector = @import("vector.zig");
 const int128 = @import("int128.zig");
+const shared_vector = @import("../vector.zig");
 const Ssa = @import("../Ssa.zig");
 const switch_br = @import("../switch_br.zig");
 const print = @import("../../Ir/print.zig");
@@ -642,11 +643,9 @@ fn allocateRegs(cg: *CodeGen) Error!void {
 
 /// The allocator's registers (as `allocateRegs` numbers them) that an
 /// inline assembly statement in the function names: in its template, as
-/// an operand's `{xN}`, or as a clobber; and v8-v15 when a statement has
-/// so many SIMD operands that `asmVReg` may give one of them out. An asm
-/// statement may call (`callFree`), so the values that meet it, its
-/// operands among them, cross a clobber point and keep out of v20-v29,
-/// which `asmVReg` gives out first.
+/// an operand's `{xN}`, or as a clobber; and v20-v29, then v8-v15, when a
+/// statement has so many SIMD operands that `asmVReg` may give one of
+/// them out after the scratch registers.
 fn asmRegs(cg: *CodeGen) u32 {
     const ir = cg.ir;
     const ip = cg.ip;
@@ -665,6 +664,13 @@ fn asmRegs(cg: *CodeGen) u32 {
         for (float_regs, 0..) |v, k| {
             if (mentionsVReg(source, @backingInt(v)) or extra.data.vec_clobbers >> @intCast(@backingInt(v)) & 1 != 0) mask |= @as(u32, 1) << @intCast(alloc_regs.len + k);
         }
+        const vreg_bits: u32 = ((@as(u32, 1) << vreg_count) - 1) << (alloc_regs.len + float_regs.len);
+        var scratch_free: u32 = 0;
+        for (asm_scratch_vregs) |r| scratch_free += @intFromBool(!mentionsVReg(source, r) and extra.data.vec_clobbers >> r & 1 == 0);
+        for (0..vreg_count) |k| {
+            const r: u5 = @intCast(vreg_first + k);
+            if (mentionsVReg(source, r) or extra.data.vec_clobbers >> r & 1 != 0) mask |= @as(u32, 1) << @intCast(alloc_regs.len + float_regs.len + k);
+        }
         var vec_ops: u32 = 0;
         var i = extra.end;
         for (0..extra.data.outputs_len + extra.data.inputs_len) |_| {
@@ -675,7 +681,8 @@ fn asmRegs(cg: *CodeGen) u32 {
             const r = parseReg(regConstraint(c) orelse continue) orelse continue;
             if (std.mem.findScalar(Reg, &alloc_regs, r.reg)) |k| mask |= @as(u32, 1) << @intCast(k);
         }
-        // `asmVReg` gives out v16-v31 and v0-v7 first.
+        // `asmVReg` gives out the scratch registers first, then v20-v29.
+        if (vec_ops > scratch_free) mask |= vreg_bits;
         if (vec_ops + named_v > 24) mask |= ((@as(u32, 1) << float_regs.len) - 1) << alloc_regs.len;
     }
     return mask;
@@ -711,7 +718,7 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         live.items(.tie)[@backingInt(inst)] = cg.tiedOperand(inst);
     } else if (cg.inVec(ty)) {
         live.items(.reg)[@backingInt(inst)] = Ssa.want_vec;
-        live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
+        live.items(.tie)[@backingInt(inst)] = cg.wrapperOperand(inst);
     } else if (cg.inPair(ty) and cg.pairResult(inst)) {
         live.items(.reg)[@backingInt(inst)] = Ssa.want_pair;
         live.items(.tie)[@backingInt(inst)] = int128.tiedOperand(cg, inst);
@@ -753,6 +760,8 @@ fn callFree(cg: *CodeGen, inst: Inst.Index) bool {
         .wrap_errunion_payload, .wrap_errunion_err, .aggregate_init, .union_init, .get_union_tag, .set_union_tag => true,
         .memcpy, .memmove, .memset, .int_from_bool, .int_from_ptr, .ret_addr, .frame_addr => true,
         .save_err_return_trace_index, .err_return_trace, .set_err_return_trace => true,
+        // Unless the template calls; a system call keeps v0-v31.
+        .assembly => !asmCalls(cg.ip.stringSlice(ir.extraData(Ir.Asm, data.ty_pl.payload).data.source)),
         // Integers in a register, and f32 and f64, have instructions.
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil => cg.nativeScalar(cg.typeOf(data.bin_op.lhs)),
         // A float remainder calls fmod.
@@ -782,9 +791,32 @@ fn nativeScalar(cg: *CodeGen, ty: Index) bool {
 
 /// As `inFloat`, for a vector only call-clobbered registers hold
 /// (`Ssa.want_vec`): 16 bytes or fewer of lanes (`vector.Shape`), not
-/// bool vectors, which are bits.
+/// bool vectors, which are bits; or a struct that wraps one
+/// (`shared_vector.wrappedField`).
 pub fn inVec(cg: *CodeGen, ty: Index) bool {
-    return vector.inVreg(cg.ip, ty);
+    if (vector.inVreg(cg.ip, ty)) return true;
+    const i = shared_vector.wrappedField(cg.ip, ty) orelse return false;
+    return cg.inVec(cg.ip.structInfo(ty).field_types[i]);
+}
+
+/// The operand a struct that wraps a vector, or the vector it wraps, is a
+/// copy of (`vector.copy`), whose register it may take (`Live.tie`).
+fn wrapperOperand(cg: *CodeGen, inst: Inst.Index) u32 {
+    const ir = cg.ir;
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    const ref: Ref = switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .struct_field_val => ref: {
+            const op = ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand;
+            if (!cg.inVec(cg.typeOf(op))) return Ssa.no_tie;
+            break :ref op;
+        },
+        .aggregate_init => ref: {
+            const i = shared_vector.wrappedField(cg.ip, data.ty_pl.ty) orelse return Ssa.no_tie;
+            break :ref ir.refSlice(ir.extraData(Ir.Aggregate, data.ty_pl.payload).end, i + 1)[i];
+        },
+        else => return Ssa.no_tie,
+    };
+    return if (ref.toIndex()) |i| @backingInt(i) else Ssa.no_tie;
 }
 
 /// The operand whose register value `inst` may take when the operand dies
@@ -1092,24 +1124,10 @@ fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
 }
 
 /// Whether `.auto` passes `ty` in a vector register as its bytes: a
-/// vector of 2 bytes or more that the vector registers hold (`inVec`),
-/// or a struct whose one runtime field is such a vector, as `crypto.aes`
-/// wraps its blocks.
+/// vector of 2 bytes or more that the vector registers hold, or a struct
+/// that wraps one, as `crypto.aes` wraps its blocks (`inVec`).
 fn autoVec(cg: *CodeGen, ty: Index) bool {
-    const ip = cg.ip;
-    const size = Type.abiSize(ip, ty);
-    if (size < 2) return false;
-    if (cg.inVec(ty)) return true;
-    if (ip.keyTag(ty) != .struct_type or Type.isPacked(ip, ty)) return false;
-    const info = ip.structInfo(ty);
-    var only: ?Index = null;
-    for (info.field_types, 0..) |ft, i| {
-        if (info.fieldIsComptime(i) or !Type.hasRuntimeBits(ip, ft)) continue;
-        if (only != null) return false;
-        only = ft;
-    }
-    const f = only orelse return false;
-    return Type.abiSize(ip, f) == size and cg.autoVec(f);
+    return Type.abiSize(cg.ip, ty) >= 2 and cg.inVec(ty);
 }
 
 const ArgLoc = union(enum) {
@@ -1916,7 +1934,7 @@ fn loadRegs(cg: *CodeGen, d: Regs, ref: Ref) Error!void {
 
 /// Copies the value `ref` to `dst`. Uses x9, x10, x16, x17, v30, and v31;
 /// `dst` must not be based on those.
-fn copyTo(cg: *CodeGen, dst: Mem, ref: Ref) Error!void {
+pub fn copyTo(cg: *CodeGen, dst: Mem, ref: Ref) Error!void {
     try cg.copyVal(dst, try cg.valOf(ref));
 }
 
@@ -2842,6 +2860,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             // Written by the overflow operation.
             if (sf.operand.toIndex()) |op| if (cg.fate(op) == .pair) return;
             const ty = data.ty_pl.ty;
+            // The field a vector-register struct wraps.
+            if (cg.inVec(ty) and cg.inVec(cg.typeOf(sf.operand))) return vector.copy(cg, inst, ty, sf.operand);
             const off = Type.fieldOffset(ip, cg.typeOf(sf.operand), sf.index);
             const src = try cg.memOf(sf.operand);
             if (cg.pairOf(inst.toRef())) |d| return cg.loadRegsMem(d, src.plus(off));
@@ -3038,9 +3058,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .aggregate_init => {
             const ty = data.ty_pl.ty;
-            const dst = try cg.resultMem(inst, ty) orelse return;
             const extra = ir.extraData(Ir.Aggregate, data.ty_pl.payload);
             const elems = ir.refSlice(extra.end, extra.data.len);
+            // A vector-register struct is the field it wraps.
+            if (ip.keyTag(ty) == .struct_type and cg.inVec(ty)) return vector.copy(cg, inst, ty, elems[shared_vector.wrappedField(ip, ty).?]);
+            const dst = try cg.resultMem(inst, ty) orelse return;
             if (ip.keyTag(ty) == .vector_type and ip.keyPayload(.vector_type, ty).child == .bool_type) {
                 // Bit-packed: element i is bit i % 8 of byte i / 8.
                 const size = Type.abiSize(ip, ty);
@@ -4620,6 +4642,14 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
 
     for (outputs, out_regs) |out, reg| {
         const ty = if (out.operand == .none) data.ty_pl.ty else Type.ptrInfo(ip, cg.typeOf(out.operand)).child;
+        // Into the result's register, unless the statement restores it.
+        if (out.operand == .none and reg == .fpr and cg.homes[@backingInt(inst)] == .vreg) {
+            const home = @backingInt(cg.homes[@backingInt(inst)].vreg);
+            if (home < 8 or home >= 16 or vsaved[home - 8] == null) {
+                try vector.move(cg, cg.homes[@backingInt(inst)].vreg, reg.fpr);
+                continue;
+            }
+        }
         const dst: Mem = if (out.operand == .none) try cg.resultMem(inst, ty) orelse continue else dst: {
             try cg.load(.x17, out.operand);
             break :dst .at(.x17, 0);
@@ -4647,11 +4677,16 @@ fn tiedOutput(c: []const u8, outputs: usize) ?usize {
     return if (k < outputs) k else null;
 }
 
+/// The SIMD registers no value is allocated, which `asmVReg` gives out
+/// first.
+const asm_scratch_vregs = [_]u5{ 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 30, 31 };
+
 /// A SIMD register for an asm operand that `used` does not have, of
-/// v0-v15 if `low`: v16-v31 first, then v0-v7, then v8-v15, which are
-/// saved to `vsaved` first.
+/// v0-v15 if `low`: the scratch registers first, then v20-v29, which
+/// values that meet the statement do not take (`asmRegs`), then v8-v15,
+/// which are saved to `vsaved` first.
 fn asmVReg(cg: *CodeGen, used: *u32, vsaved: *[8]?Mem, low: bool) Error!VReg {
-    const order = [_]u5{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    const order = asm_scratch_vregs ++ [_]u5{ 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 8, 9, 10, 11, 12, 13, 14, 15 };
     for (order) |r| {
         if (low and r >= 16) continue;
         if (used.* & (@as(u32, 1) << r) != 0) continue;
@@ -4690,6 +4725,16 @@ fn mentionsVReg(source: []const u8, r: u8) bool {
             continue;
         }
         k += 1;
+    }
+    return false;
+}
+
+/// Whether template `source` has a call instruction (`bl`, `blr` and its
+/// pointer-authenticating forms).
+fn asmCalls(source: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, source, " \t\n;");
+    while (it.next()) |tok| {
+        if (std.ascii.eqlIgnoreCase(tok, "bl") or (tok.len >= 3 and std.ascii.eqlIgnoreCase(tok[0..3], "blr"))) return true;
     }
     return false;
 }
