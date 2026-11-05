@@ -1652,9 +1652,12 @@ build, the passes, and the debug info treat them as Sema's inline calls
   callee, depth first. A callee not analyzed yet is analyzed out of queue
   order (`Zcu.takeFuncBody`, as `ensureFuncIes` does), and its own fate
   is decided and its IR handed to CodeGen in turn. A cycle of calls makes
-  the call stay a call; a callee whose analysis is in progress or waits on
-  a speculation stays a call when the caller is generated now, or defers
-  the caller to `ready_irs` when it was itself analyzed out of order. Each
+  the call stay a call, for every function on the cycle. A callee whose
+  analysis is in progress or waits on a speculation defers the caller to
+  `ready_irs` (or, for a body made from the cache, leaves it without one
+  for now) and never makes the call stay a call, so each decision reads
+  only decided fates and depends on the program, not on the order
+  functions finish in (edit builds analyze in another order). Each
   inlinable function keeps its body, already inlined into itself, for the
   rest of the build (`Emit.inline_bodies`); there is no waiting on other
   threads.

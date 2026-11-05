@@ -625,20 +625,31 @@ pub fn functionOwned(emit: *Emit, zcu: *Zcu, ir: Ir) !void {
     _ = try emit.inlineProcess(ir, .generate);
 }
 
+/// A callee of `ir`'s function cannot be decided now: a function to
+/// generate goes back to the Zcu (`ready_irs`), which hands it over again
+/// once its analysis queue moves on; a body is made again when asked for.
+fn handBack(emit: *Emit, ir: *Ir, owned: *bool, mode: ProcessMode) Allocator.Error!bool {
+    if (mode == .generate) {
+        try emit.zcu.ready_irs.append(emit.gpa, ir.*);
+        owned.* = false;
+    }
+    return false;
+}
+
 const ProcessMode = enum {
-    /// Generate the function; callees that cannot be decided now stay
-    /// calls.
+    /// Generate the function, unless a callee cannot be decided now: then
+    /// hand the IR back to the Zcu (`ready_irs`) for later.
     generate,
-    /// Generate it, unless a callee cannot be decided now: then hand the
-    /// IR back to the Zcu (`ready_irs`) for later.
-    generate_or_defer,
-    /// Only make its inlinable body: it was loaded from the cache.
+    /// Only make its inlinable body: it was loaded from the cache. A
+    /// callee that cannot be decided now leaves it without one for now.
     body,
 };
 
 /// Decides what `ir`'s function inlines and whether it is inlinable,
 /// splices the inlinable callees in, and hands it on as `mode` says.
-/// Returns false if it handed the IR back.
+/// Returns false if a callee could not be decided now (in progress, or
+/// waiting on a speculation): every decision reads only decided fates, so
+/// it is a function of the program, not of the order functions finish in.
 fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool {
     const gpa = emit.gpa;
     const zcu = emit.zcu;
@@ -679,11 +690,7 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
         const fate = switch (try emit.inlineFate(site.callee)) {
             .fate => |f| f,
             .cycle => Fate.no,
-            .busy => if (mode == .generate_or_defer) {
-                try zcu.ready_irs.append(gpa, ir);
-                ir_owned = false;
-                return false;
-            } else Fate.no,
+            .busy => return emit.handBack(&ir, &ir_owned, mode),
         };
         const yes = switch (fate) {
             .no => {
@@ -695,11 +702,7 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
         const body = emit.inlineBody(site.callee) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // As for a busy fate.
-            error.Busy => if (mode == .generate_or_defer) {
-                try zcu.ready_irs.append(gpa, ir);
-                ir_owned = false;
-                return false;
-            } else null,
+            error.Busy => return emit.handBack(&ir, &ir_owned, mode),
         } orelse {
             all = false;
             continue;
@@ -776,7 +779,7 @@ pub fn inlineFate(emit: *Emit, func: Index) Allocator.Error!FateResult {
             .{ .yes = .{ .size = r.size, .hash = r.hash, .body = no_body } }
         else
             .no),
-        .analyzed => |ir| if (!try emit.inlineProcess(ir, .generate_or_defer)) return .busy,
+        .analyzed => |ir| if (!try emit.inlineProcess(ir, .generate)) return .busy,
     }
     return .{ .fate = emit.inline_fates.get(func).? };
 }
@@ -804,7 +807,7 @@ fn inlineBody(emit: *Emit, func: Index) error{ OutOfMemory, Busy }!?u32 {
         error.Speculation => return error.Busy,
         else => return null,
     };
-    _ = try emit.inlineProcess(ir, .body);
+    if (!try emit.inlineProcess(ir, .body)) return error.Busy;
     const b = emit.inline_fates.get(func).?.yes.body;
     return if (b == no_body) null else b;
 }
