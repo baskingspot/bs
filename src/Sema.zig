@@ -11600,6 +11600,10 @@ fn analyzeMinMax(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operan
                 } else if (ty == .comptime_int_type) {
                     continue; // An undefined comptime_int.
                 } else {
+                    // The walker knows this operand's value, which narrows
+                    // the result type (`@min(x, x) +% 1` wraps at x's
+                    // width); a lowered body would type it by its type.
+                    if (val == null) try sema.bcRefuse();
                     lo = try sema.bigValue(try sema.minIntValue(ty));
                     hi = try sema.bigValue(try sema.maxIntValue(ty));
                 }

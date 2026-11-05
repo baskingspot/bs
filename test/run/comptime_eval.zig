@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "476\n6\n6765\n55\n258\n55\n18\n28739\n1228\n606\n179668\n88\n582\n708\n710\n11200\n"
+//! stdout: "476\n6\n6765\n55\n258\n55\n18\n28739\n1228\n606\n179668\n88\n582\n708\n710\n11200\n0\n"
 // Comptime calls repeated often enough for bs's comptime evaluator to run
 // them from lowered IR instead of the ZIR walker; the results must be the
 // walker's (and upstream's).
@@ -201,6 +201,20 @@ const osr_abort = blk: {
     break :blk count;
 };
 
+/// @min of comptime-known integers has the type that fits its value, so
+/// `+% 1` wraps there: 0 for every argument of the form 2^k - 1, also
+/// once the evaluator would run the calls.
+fn minWrap(x: u64) u64 {
+    var v = x;
+    _ = &v;
+    return @min(v, v) +% 1;
+}
+const min_wrap = blk: {
+    var s: u64 = 0;
+    for ([_]u64{ 15, 7, 3, 255, 1, 31, 63, 127 }) |a| s += minWrap(a);
+    break :blk s;
+};
+
 fn main() callconv(.c) noreturn {
     var s: u32 = 0;
     for (table) |w| s += w;
@@ -224,6 +238,7 @@ fn main() callconv(.c) noreturn {
     rt.printInt(comptime firstAbove(500000));
     rt.printInt(osr_abort);
     rt.printInt(osr_untaken);
+    rt.printInt(min_wrap);
     rt.exit(0);
 }
 
