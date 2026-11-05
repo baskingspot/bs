@@ -1762,9 +1762,11 @@ const Walker = struct {
                         .add_wrap => .{ .lo = a.lo + b.lo, .hi = a.hi + b.hi },
                         .sub_wrap => .{ .lo = a.lo - b.hi, .hi = a.hi - b.lo },
                         // Unsigned operands only (a product's bounds are
-                        // its operands' then).
+                        // its operands' then). Two 64-bit operands' sum
+                        // fits an i128, but even their smallest product
+                        // may not.
                         else => if (a.lo >= 0 and b.lo >= 0) .{
-                            .lo = a.lo * b.lo,
+                            .lo = std.math.mul(i128, a.lo, b.lo) catch break :blk_none,
                             .hi = std.math.mul(i128, a.hi, b.hi) catch break :blk_none,
                         } else break :blk_none,
                     };
