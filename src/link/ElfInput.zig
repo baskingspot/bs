@@ -332,10 +332,19 @@ fn isKept(in: *const Inputs, o: *const Object, s: u32, name: []const u8) bool {
 pub fn lookup(in: *Inputs, name: []const u8) Allocator.Error!?Target {
     if (in.defs.get(name)) |d| {
         const o = &in.objects.items[d.object];
+        const sym = o.syms[d.sym];
+        if (sym.st_shndx == elf.SHN_ABS) return .{ .key = absKey(sym.st_value), .offset = 0 };
         return try in.symTarget(o, d.sym, 0);
     }
     if (in.commons.contains(name)) return .{ .key = commonKey(name), .offset = 0 };
     return null;
+}
+
+/// The key of absolute value `value`, which `convert` lists in its
+/// values.
+fn absKey(value: u64) SymbolKey {
+    var buf: [32]u8 = undefined;
+    return .fromName(std.fmt.bufPrint(&buf, "obj:abs:{x}", .{value}) catch unreachable);
 }
 
 fn commonKey(name: []const u8) SymbolKey {
@@ -572,6 +581,15 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
             .alignment = .fromByteUnits(std.math.ceilPowerOfTwoAssert(u64, @max(1, common.alignment))),
             .zero_fill = common.size,
         });
+    }
+    // A global absolute definition (`.set sym, 0x1234`) binds through
+    // `lookup`, the Zig code's externs included, which no object
+    // relocation goes through, so its value is listed whether or not one
+    // names it.
+    var abs_defs = in.defs.valueIterator();
+    while (abs_defs.next()) |d| {
+        const sym = in.objects.items[d.object].syms[d.sym];
+        if (sym.st_shndx == elf.SHN_ABS) _ = try c.absolute(sym.st_value);
     }
     try c.reportUndefined();
     try sortArrays(arena, atoms.items, c.arrays.items);
@@ -1043,8 +1061,7 @@ fn Converter(comptime Ctx: type) type {
         }
 
         fn absolute(c: *C, value: u64) Allocator.Error!Target {
-            var buf: [32]u8 = undefined;
-            const key: SymbolKey = .fromName(std.fmt.bufPrint(&buf, "obj:abs:{x}", .{value}) catch unreachable);
+            const key = absKey(value);
             for (c.abs_values.items) |v| if (v.key == key) return .{ .key = key, .offset = 0 };
             try c.abs_values.append(c.in.arena, .{ .key = key, .value = value });
             return .{ .key = key, .offset = 0 };

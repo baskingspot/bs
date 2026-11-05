@@ -4087,7 +4087,9 @@ main, against upstream's link of the same objects.
 `Archive.Reader`; `build-exe`, `run` and `test` take `.o` and `.a`
 arguments (objects and libraries do not yet). Sections, merged strings
 and constants, COMMON, weak undefined names (a link-time value 0),
-absolute symbols, R_X86_64_64/PC32/PLT32/32/32S (`x86_64_abs32` and
+absolute symbols (a global one, `.set sym, 0x1234`, binds from every
+object and from Zig externs, through `lookup`, so `convert` lists the
+values of all of them), R_X86_64_64/PC32/PLT32/32/32S (`x86_64_abs32` and
 `x86_64_abs32s`, which pic links reject), GOTPCREL with ld's mov, call
 and jmp relaxations and a content-addressed slot otherwise, the TLS
 relaxations, COMDAT dropping, and lld-style archive pulling. Where it

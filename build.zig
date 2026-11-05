@@ -2348,6 +2348,8 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
 
     // Assembly sources: `.S` through the preprocessor (an include and a
     // `-D` from `-cflags`), `.s` as is, as upstream passes them to Clang.
+    // `asm_abs_value`, a global absolute symbol, binds from the other
+    // object and from a Zig extern.
     const asm_exe = b.addRunArtifact(bs);
     asm_exe.setName("bs build-exe with assembly sources");
     asm_exe.addArg("build-exe");
@@ -2358,7 +2360,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     asm_exe.setEnvironmentVariable("BS_ZIG", zig);
     const asm_run = std.Build.Step.Run.create(b, "run bs build with assembly sources");
     asm_run.addFileArg(asm_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
-    asm_run.addCheck(.{ .expect_stderr_exact = "142 42\n" });
+    asm_run.addCheck(.{ .expect_stderr_exact = "142 42 1234 1234\n" });
     asm_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&asm_run.step);
 

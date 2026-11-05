@@ -9,4 +9,9 @@ asm_cpp_add:
 	add $ASM_EXTRA, %rax
 #endif
 	ret
+	.globl asm_cpp_abs
+	.type asm_cpp_abs, @function
+asm_cpp_abs:
+	movabs $asm_abs_value, %rax
+	ret
 	.section .note.GNU-stack, "", @progbits
