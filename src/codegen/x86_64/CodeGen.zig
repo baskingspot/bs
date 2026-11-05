@@ -5617,6 +5617,10 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         } else {
             const reg_name = regConstraint(constraint) orelse return cg.fail("asm output constraint '{s}'", .{full});
             out_reg.* = (parseReg(reg_name) orelse return cg.fail("unknown register in asm constraint '{s}'", .{full})).reg;
+            // The template may name it too, at the operand's size.
+            const out_size = Type.abiSize(ip, ty);
+            if (out_size == 1 or out_size == 2 or out_size == 4 or out_size == 8)
+                try names.put(cg.gpa, ip.stringSlice(out.name), .{ .reg = .{ .reg = out_reg.*, .size = sizeOf(out_size) } });
         }
         if (read) {
             if (out.operand == .none) return cg.fail("asm output constraint '{s}'", .{full});
@@ -5640,6 +5644,11 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         } else if (regConstraint(constraint)) |reg_name| {
             const reg = parseReg(reg_name) orelse return cg.fail("unknown register '{s}' in asm constraint", .{reg_name});
             try cg.load(reg.reg, in.operand);
+            // The template may name it too (`callq *%[callee]`), at the
+            // operand's size.
+            const in_size = Type.abiSize(ip, cg.typeOf(in.operand));
+            if (in_size == 1 or in_size == 2 or in_size == 4 or in_size == 8)
+                try names.put(cg.gpa, ip.stringSlice(in.name), .{ .reg = .{ .reg = reg.reg, .size = sizeOf(in_size) } });
         } else if (std.mem.eql(u8, constraint, "X") or std.mem.eql(u8, constraint, "i") or std.mem.eql(u8, constraint, "n")) {
             const arg: AsmArg = switch (try cg.locOf(in.operand)) {
                 .imm => |v| .{ .imm = @bitCast(v) },
