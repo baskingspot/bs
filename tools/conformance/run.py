@@ -73,6 +73,17 @@ target, LLVM, a shared library, `-femit-asm` and the like). The projects
 upstream passes are recorded by --standalone --upstream in
 baseline/standalone-<target>.json.
 
+With --langref, the measure is upstream's doc/langref examples: each
+built from the workdir as upstream's tools/doctest.zig builds it (its
+manifest names the kind: exe, test, test_error, test_safety, obj, syntax,
+lib, and options), a built exe run. bs matches upstream on an example
+when the outcome is the same: both build or both fail; a failure's first
+error (file, line, column and message); an exe's exit status, stdout,
+normalized stderr, or, if it fails, its first panic line; a test's exit
+status, summary line and first panic line. Examples for other targets
+are skipped. Upstream's outcomes are recorded by --langref --upstream in
+baseline/langref-<target>.json.
+
 Portable to Linux and macOS: Python 3 standard library only.
 """
 
@@ -1743,6 +1754,222 @@ def standalone_target(compiler, cfg, args, workdir):
         print(f"  {n}: {results[n]['status']}")
 
 
+# ---------------------------------------------------------------- langref
+
+LANGREF_ROOT = REPO / "upstream" / "doc" / "langref"
+ERROR_RE = re.compile(r"^(\S+?):(\d+):(\d+): error(?:\[[\w-]+\])?: (.*)$", re.MULTILINE)
+# The test runner's last line: every test passed, the counts, or leaks.
+TEST_SUMMARY_RE = re.compile(r"^All \d+ tests passed|^\d+ passed; \d+ skipped; \d+ failed|tests? leaked memory")
+
+
+def parse_langref(src):
+    """A langref example's manifest, as upstream's tools/doctest.zig reads
+    it: the `//` lines after the last blank line, the first the example's
+    kind (`exe=succeed|fail|build_fail`, `test`, `test_error=<text>`,
+    `test_safety=<text>`, `obj`, `obj=<text>`, `syntax`, `lib`), then
+    options (`optimize=`, `target=`, `link_libc`, `additional_option=`,
+    `llvm=`, `link_mode=`, `disable_cache`)."""
+    start = src.rfind("\n\n// ")
+    lines = [ln[3:] for ln in src[start:].strip().split("\n")]
+    kind, _, expect = lines[0].partition("=")
+    opts = {"additional_option": []}
+    for ln in lines[1:]:
+        key, _, value = ln.partition("=")
+        if key == "additional_option":
+            opts[key].append(value)
+        else:
+            opts[key] = value
+    return kind, expect, opts
+
+
+def langref_argv(compiler, path, kind, opts, name):
+    """The command upstream's doctest runs for an example, from its
+    directory; None for a target that is not x86_64-linux."""
+    target = opts.get("target")
+    if target and not target.startswith("x86_64-linux"):
+        return None
+    sub = {"exe": "build-exe", "test": "test", "test_error": "test", "test_safety": "test", "lib": "build-lib"}.get(
+        kind, "build-obj"
+    )
+    argv = [str(compiler), sub, str(path)]
+    if sub == "build-exe":
+        argv += ["--name", name]
+    elif sub in ("build-obj", "build-lib"):
+        argv.append(f"-femit-bin={name}{'.o' if sub == 'build-obj' else '.a'}")
+    if "optimize" in opts:
+        argv += ["-O", opts["optimize"]]
+    if "link_libc" in opts:
+        argv.append("-lc")
+    if target:
+        argv += ["-target", target]
+    if "llvm" in opts:
+        argv.append("-fllvm" if opts["llvm"] == "true" else "-fno-llvm")
+    if "link_mode" in opts:
+        argv.append("-" + opts["link_mode"])
+    return argv + opts["additional_option"]
+
+
+def normalize_output(text, out_dir):
+    """Output with what differs between runs and compilers taken out: the
+    scratch and upstream directories, addresses, and thread ids."""
+    text = text.replace(str(out_dir) + "/", "").replace(str(LANGREF_ROOT) + "/", "")
+    text = re.sub(r"0x[0-9a-f]+", "0x?", text)
+    # `{*}`'s address after the type, and an anonymous type's number,
+    # which bs takes from its declaration instead of the analysis order
+    # (Sema's `anonTypeNumber`).
+    text = re.sub(r"@[0-9a-f]{6,}\b", "@?", text)
+    text = re.sub(r"__struct_\d+", "__struct_?", text)
+    return re.sub(r"thread \d+ panic", "thread ? panic", text)
+
+
+def first_error(stderr):
+    """The first compile error, as (file:line:col, message), the file by its
+    base name."""
+    m = ERROR_RE.search(stderr)
+    return (f"{Path(m[1]).name}:{m[2]}:{m[3]}", m[4].strip()) if m else None
+
+
+def panic_line(stderr):
+    """The first line of a run's panic or error message (not `zig test`'s
+    note that the test command failed)."""
+    for ln in stderr.splitlines():
+        if ln.startswith("error: the following test command"):
+            continue
+        if "panic: " in ln or ln.startswith("error: "):
+            return re.sub(r"thread \d+ panic", "thread ? panic", ln.strip())
+    return None
+
+
+def run_one_langref(compiler, path, args, workdir):
+    """Builds and runs one example as upstream's doctest does and records
+    what it saw: `outcome` (built, build_failed, unsupported, crash,
+    timeout, skip), the first error, and for a run its exit status,
+    stdout, normalized stderr, and first panic line."""
+    name = path.stem
+    kind, expect, opts = parse_langref(path.read_text(errors="replace"))
+    r = {"kind": kind + (f"={expect}" if expect else "")}
+    out_dir = workdir / "langref" / re.sub(r"[^\w.-]", "_", name)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    argv = langref_argv(compiler, path, kind, opts, name)
+    if argv is None:
+        r["outcome"] = "skip"
+        return name, r
+    code, out, err, timed_out = run_process(argv, out_dir, args.compile_timeout)
+    # A test that panics is a run, not a crash of the compiler.
+    runs = kind.startswith("test")
+    if timed_out:
+        r["outcome"] = "timeout"
+    elif "[unsupported]" in err:
+        r["outcome"], r["log"] = "unsupported", err[-LOG_LIMIT:]
+    elif code < 0 or code != 0 and "panic: " in err and not ERROR_RE.search(err) and not runs:
+        r["outcome"], r["crash"] = "crash", crash_frame(err)
+    elif kind.startswith("test"):
+        # `test` builds and runs: an error before the run fails the build.
+        e = first_error(err)
+        if code != 0 and e and "All " not in err and "passed" not in err:
+            r["outcome"], r["error"] = "build_failed", list(e)
+        else:
+            r["outcome"], r["exit"] = "built", code
+            r["summary"] = next((ln for ln in reversed(err.splitlines()) if TEST_SUMMARY_RE.search(ln)), None)
+            r["panic"] = panic_line(err)
+    elif code != 0:
+        e = first_error(err)
+        r["outcome"], r["error"] = "build_failed", list(e) if e else None
+        if not e:
+            r["log"] = err[-LOG_LIMIT:]
+    else:
+        r["outcome"] = "built"
+        if kind == "exe":
+            code, out, err, timed_out = run_process([str(out_dir / name)], out_dir, args.run_timeout)
+            r["exit"] = "timeout" if timed_out else code
+            r["stdout"] = out[-LOG_LIMIT:]
+            r["stderr"] = normalize_output(err, out_dir)[-LOG_LIMIT:]
+            r["panic"] = panic_line(err)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    return name, r
+
+
+def compare_langref(r, up):
+    """bs's status on an example given upstream's record: pass, or what
+    differs first."""
+    if r["outcome"] in ("unsupported", "crash", "timeout", "skip"):
+        return r["outcome"]
+    if up["outcome"] != r["outcome"]:
+        return "compile_error" if r["outcome"] == "build_failed" else "accepted"
+    if r["outcome"] == "build_failed":
+        if r["error"] == up["error"]:
+            return "pass"
+        same_loc = r["error"] and up["error"] and r["error"][0] == up["error"][0]
+        return "error_message" if same_loc else "error_location"
+    if r.get("exit") != up.get("exit"):
+        return "wrong_exit"
+    if r["kind"].startswith("test"):
+        return "pass" if r.get("summary") == up.get("summary") and r.get("panic") == up.get("panic") else "wrong_result"
+    if r.get("stdout") != up.get("stdout"):
+        return "wrong_stdout"
+    if r["kind"] == "exe=fail":
+        return "pass" if r.get("panic") == up.get("panic") else "wrong_panic"
+    if r.get("stderr") != up.get("stderr"):
+        return "wrong_stderr"
+    return "pass"
+
+
+def langref_target(compiler, cfg, args, workdir):
+    """--langref: upstream's doc/langref examples, each built (and run) as
+    upstream's doctest does, against baseline/langref-<target>.json."""
+    os.environ["BS_CACHE"] = "off"
+    paths = sorted(LANGREF_ROOT.glob("*.zig"))
+    if args.files:
+        paths = [p for p in paths if p.name in args.files or p.stem in args.files]
+    results = {}
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        futs = [ex.submit(run_one_langref, compiler, p, args, workdir) for p in paths]
+        for f in as_completed(futs):
+            name, r = f.result()
+            results[name] = r
+    data = {"format": FORMAT, "target": cfg["name"], "compiler": str(compiler)}
+    baseline_path = BASELINE_DIR / f"langref-{cfg['name']}.json"
+    if args.upstream:
+        zig_version = subprocess.run(
+            [str(compiler), "version"], capture_output=True, text=True, check=False
+        ).stdout.strip()
+        data["compiler"] = f"zig {zig_version}"
+        if args.files and baseline_path.exists():
+            results = {**json.loads(baseline_path.read_text())["examples"], **results}
+        data["examples"] = dict(sorted(results.items()))
+        ran = [r for r in results.values() if r["outcome"] in ("built", "build_failed")]
+        data["summary"] = {"examples": len(results), "compared": len(ran)}
+        write_json(baseline_path, data)
+        print(f"{cfg['name']} langref (upstream): {len(ran)}/{len(results)} examples run -> {rel(baseline_path)}")
+        return
+    baseline = json.loads(baseline_path.read_text())["examples"] if baseline_path.exists() else {}
+    counts = {}
+    for n, r in results.items():
+        up = baseline.get(n)
+        if up is None or up["outcome"] not in ("built", "build_failed"):
+            r["status"] = "skip"
+        else:
+            r["status"] = compare_langref(r, up)
+            r["upstream"] = {k: v for k, v in up.items() if k != "kind"}
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    compared = len(results) - counts.get("skip", 0)
+    passed = counts.get("pass", 0)
+    unsupported = counts.get("unsupported", 0)
+    data["summary"] = {"pass": passed, "of": compared, "supported": compared - unsupported, **counts}
+    data["examples"] = dict(sorted(results.items()))
+    out_path = args.out or workdir / f"langref-{cfg['name']}.json"
+    write_json(out_path, data)
+    fails = ", ".join(f"{counts[k]} {k.replace('_', ' ')}" for k in sorted(counts) if k not in ("pass", "skip"))
+    print(
+        f"{cfg['name']} langref: {passed}/{compared} match upstream, {passed}/{compared - unsupported} of those bs "
+        f"supports{'; ' + fails if fails else ''} -> {rel(out_path)}"
+    )
+    for n in sorted(results):
+        if results[n]["status"] not in ("pass", "skip", "unsupported"):
+            print(f"  {n}: {results[n]['status']}")
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -1799,6 +2026,11 @@ def main():
         action="store_true",
         help="measure upstream's test/standalone projects, each built with `build` (its default step), against baseline/standalone-<target>.json",
     )
+    p.add_argument(
+        "--langref",
+        action="store_true",
+        help="measure upstream's doc/langref examples, each built and run as upstream's doctest does and compared with baseline/langref-<target>.json",
+    )
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
     p.add_argument("--compile-timeout", type=float, default=300, help="seconds per file compile")
@@ -1852,6 +2084,8 @@ def main():
                 cases_target(compiler, cfg, args, args.workdir)
             elif args.standalone:
                 standalone_target(compiler, cfg, args, args.workdir)
+            elif args.langref:
+                langref_target(compiler, cfg, args, args.workdir)
             elif args.std or args.c_abi:
                 std_target(compiler, cfg, args, args.workdir)
             elif args.upstream:

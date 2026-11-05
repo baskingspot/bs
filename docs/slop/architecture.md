@@ -8111,6 +8111,18 @@ and `zig build -Dtarget=aarch64-macos`.
   in `baseline/standalone-<target>.json` (ios needs an iOS SDK and tsan
   does not build there), and the measure is the share of upstream's
   passes that bs passes, with the unsupported ones counted apart.
+- `run.py --langref` measures upstream's language reference examples
+  (`doc/langref`, 290 with a manifest; 286 on x86_64-linux, the rest
+  wasm or windows). Each is built from the workdir as upstream's
+  tools/doctest.zig builds it, from its manifest's kind and options, and
+  a built exe is run. bs matches upstream when the outcome is the same:
+  both build or both fail, a failure's first error (file, line, column,
+  message), an exe's exit status, stdout and normalized stderr (addresses
+  and anonymous type numbers taken out), a test's exit status, summary
+  and first panic line. `run.py --upstream --langref` records upstream's
+  outcomes in `baseline/langref-<target>.json`; the measure is the share
+  that matches, with the examples bs refuses (`-OReleaseFast`) counted
+  apart.
 
 ## Diagnostics (designed 2026-11-03, accepted by the owner; being built)
 
