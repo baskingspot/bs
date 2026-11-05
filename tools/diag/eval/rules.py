@@ -434,6 +434,78 @@ MIGRATIONS = [
         since="0.15",
     ),
     R(
+        "gpa-old-field",
+        [
+            (
+                r"debug_allocator: std\.heap\.DebugAllocator\(\.\{\}\),",
+                "debug_allocator: std.heap.GeneralPurposeAllocator(.{}),",
+            )
+        ],
+        [["DebugAllocator"]],
+        seeds=["cowsay"],
+        since="0.15",
+    ),
+    R(
+        "arraylist-managed-words",
+        [
+            (
+                r"var words: std\.ArrayList\(\[\]const u8\) = \.empty;",
+                "var words = std.ArrayList([]const u8).init(allocator);",
+            ),
+            (r"words\.deinit\(allocator\)", "words.deinit()"),
+            (r"words\.append\(allocator, ", "words.append("),
+        ],
+        [[".empty"], ["allocator"]],
+        seeds=["cowsay"],
+        since="0.15",
+    ),
+    R(
+        "stdout-getstdout-cowsay",
+        [
+            (
+                r"    const stdout = std\.Io\.File\.stdout\(\);\n    var output_buf: \[8192\]u8 = undefined;\n    var writer = stdout\.writer\(init\.io, &output_buf\);\n",
+                L("    const stdout = std.io.getStdOut();\n    var writer = stdout.writer();\n"),
+            )
+        ],
+        [["Io.File"], ["stdout"]],
+        seeds=["cowsay"],
+        since="0.15",
+    ),
+    R(
+        "stdout-writer-noio-cowsay",
+        [(r"stdout\.writer\(init\.io, &output_buf\)", "stdout.writer(&output_buf)")],
+        [["io: Io", "init.io"]],
+        seeds=["cowsay"],
+        since="0.16",
+    ),
+    R(
+        "fixed-buffer-stream-cowsay",
+        [
+            (
+                r"var fbs: std\.Io\.Writer = \.fixed\(&message_parts_buf\);",
+                "var fbs = std.io.fixedBufferStream(&message_parts_buf);",
+            ),
+            (r"fbs\.buffered\(\)", "fbs.getWritten()"),
+        ],
+        [[".fixed"]],
+        seeds=["cowsay"],
+        since="0.15",
+    ),
+    R(
+        "args-iterator-old",
+        [(r"var it = init\.minimal\.args\.iterate\(\);", "var it = std.process.args();")],
+        [["minimal.args"]],
+        seeds=["cowsay"],
+        since="0.16",
+    ),
+    R(
+        "mem-split-cowsay",
+        [(r"mem\.splitScalar\(u8, message, '\\n'\)", L('mem.split(u8, message, "\\n")'))],
+        [["splitScalar", "splitSequence", "splitAny"]],
+        seeds=["cowsay"],
+        since="0.12",
+    ),
+    R(
         "format-old-signature",
         [
             (
