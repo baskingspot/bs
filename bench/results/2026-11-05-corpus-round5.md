@@ -32,12 +32,20 @@ at 6 GB) and Linux 6.1.
 
 | Project | Target | Verdict | Class |
 |---|---|---|---|
-| wamr | wamr-exe, spec-test-runner, simd-bench-runner, test:src/root.zig | bs refuses inline `mfence`, then `incl %eax` | bs (x86_64 inline assembler), open |
-| zig-graph-compiler | zgc-executable-runner-test | bs refuses `--force_undefined` | bs (CLI and linker), open |
+| wamr | wamr-exe, spec-test-runner, simd-bench-runner, test:src/root.zig | bs refuses inline `mfence`, then `incl %eax` | bs (x86_64 inline assembler), fixed on main c0e63031 |
+| zig-graph-compiler | zgc-executable-runner-test | bs refuses `--force_undefined` | bs (CLI and linker), fixed on main c0e63031 |
 | zig-graph-compiler | test | comptime cost model picks a plan by `suggestVectorLength(f32)`; upstream at `-mcpu=x86_64_v2` fails the same way | CPU clamp, not a bug |
 | forklift | test (test_user) | both panic in flir.test.int2float | forklift's bug |
 
 ## The bs gaps
+
+Both are fixed on main c0e63031 (x86-asm-gaps and force-undefined).
+Rerun there with an unpatched wamr, all 5 targets match upstream:
+wamr-exe, spec-test-runner and simd-bench-runner build 1.6x to 2.2x
+faster cold, test:src/root.zig passes 20 tests and skips 2 under both,
+and zgc-executable-runner-test builds in 285 ms against 492 ms. A naked
+function with the 27 instructions below and 9 more variants assembles to
+the same bytes under both compilers.
 
 - **x86_64 inline assembler.** wamr's `memoryFenceSeqCst`
   (src/platform/platform.zig:501) is `asm volatile ("mfence" ::: .{

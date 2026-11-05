@@ -3207,8 +3207,7 @@
      "name": "zgc"
     },
     {
-     "name": "zgc-executable-runner-test",
-     "note": "bs refuses `--force_undefined`, which build.zig's `forceUndefinedSymbol(\"zgc_runtime_run\")` passes (bs, CLI and linker; open)."
+     "name": "zgc-executable-runner-test"
     },
     {
      "name": "test",
@@ -3490,16 +3489,13 @@
      "name": "wamrc"
     },
     {
-     "name": "wamr-exe",
-     "note": "bs's x86_64 inline assembler refuses `mfence` (src/platform/platform.zig:501), then `incl %%eax` in the naked longjmp (src/runtime/aot/trap_jmp.zig:110) (bs, backend; open). With both replaced in a work copy, the target matches upstream."
+     "name": "wamr-exe"
     },
     {
-     "name": "spec-test-runner",
-     "note": "bs's x86_64 inline assembler refuses `mfence` (src/platform/platform.zig:501), then `incl %%eax` in the naked longjmp (src/runtime/aot/trap_jmp.zig:110) (bs, backend; open). With both replaced in a work copy, the target matches upstream."
+     "name": "spec-test-runner"
     },
     {
-     "name": "simd-bench-runner",
-     "note": "bs's x86_64 inline assembler refuses `mfence` (src/platform/platform.zig:501), then `incl %%eax` in the naked longjmp (src/runtime/aot/trap_jmp.zig:110) (bs, backend; open). With both replaced in a work copy, the target matches upstream."
+     "name": "simd-bench-runner"
     },
     {
      "name": "test"
@@ -3514,8 +3510,7 @@
      "name": "test:src/runtime/common/execution_context.zig"
     },
     {
-     "name": "test:src/root.zig",
-     "note": "bs's x86_64 inline assembler refuses `mfence` (src/platform/platform.zig:501), then `incl %%eax` in the naked longjmp (src/runtime/aot/trap_jmp.zig:110) (bs, backend; open). With both replaced in a work copy, the target matches upstream."
+     "name": "test:src/root.zig"
     }
    ]
   },
