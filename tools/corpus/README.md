@@ -69,7 +69,11 @@ fresh checkout), `--results NAME` (write `.work/NAME.json` and
   - A module that is a translated C header (`b.addTranslateC`, recorded
     from upstream's `translate-c` command) is translated again by each
     compiler, `zig translate-c` or `bs translate-c`, into the build's
-    local cache, and that time counts in the cold build.
+    local cache, and that time counts in the cold build. bs compiles its
+    translate-c tool (Aro) on its first `bs translate-c` into the global
+    cache, once per bs binary (about 2 s), where upstream's is built in:
+    the run builds it before timing anything and reports that time on its
+    own, under the scoreboard.
 - Both binaries run from the same path (programs print `argv[0]`). A test
   binary's verdict is its exit status and summary line (`All N tests
   passed.`); an executable's is its exit status and stdout.

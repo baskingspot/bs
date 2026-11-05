@@ -21,6 +21,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 
 CORPUS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -453,7 +454,22 @@ def fmt_s(s):
     return "–" if s is None else (f"{s:.2f} s" if s >= 1 else f"{s * 1000:.0f} ms")
 
 
-def write_scoreboard(results, manifest, path):
+def warm_translate_c(bs):
+    """Builds bs's translate-c tool (Aro, which bs compiles on its first
+    `bs translate-c` into the global cache, once per bs binary) before any
+    build is timed, so that no target's cold build pays for it. Returns
+    the time that first translation took."""
+    with tempfile.TemporaryDirectory() as tmp:
+        header = os.path.join(tmp, "warm.h")
+        with open(header, "w") as f:
+            f.write("int warm(void);\n")
+        secs, code, output = timed([bs, "translate-c", header, "--cache-dir", os.path.join(tmp, "cache")], tmp)
+    if code != 0:
+        sys.exit(f"bs translate-c failed on an empty header:\n{output}")
+    return secs
+
+
+def write_scoreboard(results, manifest, path, tool_secs=None):
     """One row per target: the verdict, both runs, and both build times."""
     donors = any((r.get("bs") or {}).get("cold_local_donor") for r in results)
     lines = [
@@ -496,6 +512,12 @@ def write_scoreboard(results, manifest, path):
                 ratio(u.get("edit"), z.get("edit")),
             )
         )
+    if tool_secs is not None:
+        note = (
+            f"bs's translate-c tool, warmed before timing: {fmt_s(tool_secs)} (a first build of it, once per bs binary,"
+            " takes about 2 s; no cold-local time above includes it)."
+        )
+        lines += ["", note]
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -543,6 +565,7 @@ def main():
             old = {(r["project"], r["target"]): r for r in json.load(f)}
     os.makedirs(WORK, exist_ok=True)
     compilers = [("bs", os.path.abspath(args.bs))] + ([] if args.bs_only else [("zig", args.zig)])
+    tool_secs = None if args.list else warm_translate_c(os.path.abspath(args.bs))
     for proj in projects:
         log(f"{proj['name']} {proj['commit'][:12]}")
         src, cmds = setup(proj, args.zig, args.refresh)
@@ -573,7 +596,7 @@ def main():
     results = [old[k] for k in order if k in old]
     with open(results_path, "w") as f:
         json.dump(results, f, indent=1)
-    write_scoreboard(results, manifest, scoreboard_path)
+    write_scoreboard(results, manifest, scoreboard_path, tool_secs)
     with open(scoreboard_path) as f:
         print(f.read())
 
