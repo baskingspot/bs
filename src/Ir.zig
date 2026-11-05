@@ -643,22 +643,52 @@ pub const Asm = struct {
     outputs_len: u32,
     inputs_len: u32,
     is_volatile: u32,
-    /// The callee-saved registers the clobbers name, as bits in the order
-    /// of `callee_saved_names`, which the function must save.
-    callee_saved_clobbers: u32,
+    /// The general-purpose registers the clobbers name, by any of their
+    /// names, as bits by register number (`clobberReg`): the operands'
+    /// registers avoid them, and the function saves the callee-saved ones.
+    gpr_clobbers: u32,
+    /// As `gpr_clobbers`, for the vector registers (x86_64's xmm0-xmm31,
+    /// aarch64's v0-v31).
+    vec_clobbers: u32,
 
-    /// x86_64's, then aarch64's: x19-x28 (bits 5-14) and v8-v15 (bits
-    /// 15-22), which aarch64's other names of them (`w19`, `d8`, `z8`, ...)
-    /// also set (`Sema.clobberBit`).
-    pub const callee_saved_names = [_][]const u8{
-        "rbx", "r12", "r13", "r14", "r15",
-        "x19", "x20", "x21", "x22", "x23",
-        "x24", "x25", "x26", "x27", "x28",
-        "v8",  "v9",  "v10", "v11", "v12",
-        "v13", "v14", "v15",
-    };
-    pub const aarch64_x19_bit = 5;
-    pub const aarch64_v8_bit = 15;
+    pub const Clobber = struct { vec: bool, num: u5 };
+
+    /// The register clobber `name` names on `arch`, by its number: x86_64's
+    /// rax (0) to r15 (15) by their 64-, 32-, 16-, and 8-bit names, and
+    /// xmm, ymm, and zmm; aarch64's x0-x30 and w0-w30, and v, q, d, s, h,
+    /// b, and z. Null for flags, memory, and other state.
+    pub fn clobberReg(arch: std.Target.Cpu.Arch, name: []const u8) ?Clobber {
+        switch (arch) {
+            .x86_64 => {
+                const legacy = [_][]const []const u8{
+                    &.{ "rax", "eax", "ax", "al", "ah" }, &.{ "rcx", "ecx", "cx", "cl", "ch" },
+                    &.{ "rdx", "edx", "dx", "dl", "dh" }, &.{ "rbx", "ebx", "bx", "bl", "bh" },
+                    &.{ "rsp", "esp", "sp", "spl" },      &.{ "rbp", "ebp", "bp", "bpl" },
+                    &.{ "rsi", "esi", "si", "sil" },      &.{ "rdi", "edi", "di", "dil" },
+                };
+                for (legacy, 0..) |names, num| for (names) |n| {
+                    if (std.mem.eql(u8, n, name)) return .{ .vec = false, .num = @intCast(num) };
+                };
+                for ([_][]const u8{ "xmm", "ymm", "zmm" }) |prefix| if (std.mem.startsWith(u8, name, prefix)) {
+                    const num = std.fmt.parseInt(u5, name[3..], 10) catch return null;
+                    return .{ .vec = true, .num = num };
+                };
+                if (name.len < 2 or name[0] != 'r') return null;
+                const digits = std.mem.trimEnd(u8, name[1..], "dwb");
+                if (name.len - 1 - digits.len > 1) return null;
+                const num = std.fmt.parseInt(u5, digits, 10) catch return null;
+                return if (num >= 8 and num < 16) .{ .vec = false, .num = num } else null;
+            },
+            .aarch64 => {
+                if (name.len < 2) return null;
+                const vec = std.mem.findScalar(u8, "vqdshbz", name[0]) != null;
+                if (!vec and name[0] != 'x' and name[0] != 'w') return null;
+                const num = std.fmt.parseInt(u5, name[1..], 10) catch return null;
+                return if (vec or num < 31) .{ .vec = vec, .num = num } else null;
+            },
+            else => return null,
+        }
+    }
 
     pub const Operand = struct {
         name: InternPool.String,
