@@ -9383,15 +9383,8 @@ fn enumFromInt(sema: *Sema, block: *Block, src: Src, operand_src: Src, ty: Index
     }
     if (try sema.onePossibleValue(ty)) |v| return .fromInterned(v);
     try sema.requireRuntime(block, src);
-    if (!info.nonexhaustive and block.want_safety and info.field_defaults.len < std.math.maxInt(u16)) {
-        // The value must be one of the tags.
-        var ok: Ref = .fromInterned(.bool_false);
-        for (info.field_defaults) |v| {
-            const eq = try sema.addBinOp(block, .cmp_eq, operand, .fromInterned(v));
-            ok = if (ok == Ref.fromInterned(.bool_false)) eq else try sema.addBinOp(block, .bit_or, ok, eq);
-        }
-        try sema.addSafetyCheck(block, ok, .invalid_enum_value, .none, .none);
-    }
+    if (!info.nonexhaustive and block.want_safety and info.field_defaults.len < std.math.maxInt(u16))
+        try sema.addSafetyCheck(block, try sema.namedTagOk(block, operand, info), .invalid_enum_value, .none, .none);
     return sema.addTyOp(block, .bitcast, ty, operand);
 }
 
@@ -9437,12 +9430,51 @@ fn checkNamedEnumValue(sema: *Sema, block: *Block, operand: Ref, id: PanicId) Co
     const info = ip.structInfo(sema.typeOf(operand));
     if (!block.want_safety or info.field_defaults.len >= std.math.maxInt(u16)) return;
     const int = try sema.addTyOp(block, .bitcast, info.tag_type, operand);
+    try sema.addSafetyCheck(block, try sema.namedTagOk(block, int, info), id, .none, .none);
+}
+
+/// Whether tag integer `int` names one of enum `info`'s tags. When the tag
+/// values form one contiguous range, as an enum without explicit values
+/// does, that is a range check rather than one comparison per tag.
+fn namedTagOk(sema: *Sema, block: *Block, int: Ref, info: *const InternPool.ContainerInfo) CompileError!Ref {
+    const ip = sema.ip;
+    contiguous: {
+        var lo: i128 = std.math.maxInt(i128);
+        var hi: i128 = std.math.minInt(i128);
+        var lo_v: Index = .none;
+        var hi_v: Index = .none;
+        for (info.field_defaults) |v| {
+            const x: i128 = switch (ip.indexToKey(v).int.storage) {
+                .u64 => |x| x,
+                .i64 => |x| x,
+                .big => break :contiguous,
+            };
+            if (x < lo) {
+                lo = x;
+                lo_v = v;
+            }
+            if (x > hi) {
+                hi = x;
+                hi_v = v;
+            }
+        }
+        // Tag values are distinct, so `len` of them spanning `len` values
+        // fill the range.
+        if (lo_v == .none or hi - lo + 1 != info.field_defaults.len) break :contiguous;
+        var ok: Ref = .fromInterned(.bool_true);
+        if (lo_v != try sema.minIntValue(info.tag_type)) ok = try sema.addBinOp(block, .cmp_gte, int, .fromInterned(lo_v));
+        if (hi_v != try sema.maxIntValue(info.tag_type)) {
+            const le = try sema.addBinOp(block, .cmp_lte, int, .fromInterned(hi_v));
+            ok = if (ok == Ref.fromInterned(.bool_true)) le else try sema.addBinOp(block, .bit_and, ok, le);
+        }
+        return ok;
+    }
     var ok: Ref = .fromInterned(.bool_false);
     for (info.field_defaults) |v| {
         const eq = try sema.addBinOp(block, .cmp_eq, int, .fromInterned(v));
         ok = if (ok == Ref.fromInterned(.bool_false)) eq else try sema.addBinOp(block, .bit_or, ok, eq);
     }
-    try sema.addSafetyCheck(block, ok, id, .none, .none);
+    return ok;
 }
 
 /// The comptime-known result of `@tagName`: like upstream, a string
