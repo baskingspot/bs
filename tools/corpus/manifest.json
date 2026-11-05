@@ -2638,7 +2638,7 @@
     },
     {
      "name": "test:src/verse.zig",
-     "note": "bs bug, open: bs rejects `inline else` in a switch on a comptime-known value of a non-exhaustive enum (src/ContentType.zig:88: 'cannot enumerate values'); upstream analyzes only the matching prong."
+     "note": "Bug in verse, not bs: the test dumpDebugData (src/Frame.zig:379) declares `var frame: Frame = undefined;` and dumpDebugData branches on `frame.sensitive`, an undefined bool. Both compilers fill it with 0xAA; upstream's build reads that as false, bs's as true, so bs's run logs 'Skipping frame marked sensitive' with std.log.err and the test runner exits 1 (105 passed, 1 skipped under both)."
     },
     {
      "name": "basic"
@@ -2673,35 +2673,28 @@
    ],
    "targets": [
     {
-     "name": "marionette-run",
-     "note": "bs bug, open: bs rejects a decl literal call in callconv, `callconv(.withStackAlign(.c, @alignOf(StartClosure)))` (src/fiber.zig:692): 'union lang.CallingConvention has no member named withStackAlign'; upstream accepts it."
+     "name": "marionette-run"
     },
     {
      "name": "marionette-tidy"
     },
     {
-     "name": "test",
-     "note": "bs bug, open: bs rejects a decl literal call in callconv, `callconv(.withStackAlign(.c, @alignOf(StartClosure)))` (src/fiber.zig:692): 'union lang.CallingConvention has no member named withStackAlign'; upstream accepts it."
+     "name": "test"
     },
     {
-     "name": "test:examples/root.zig",
-     "note": "bs bug, open: bs rejects a decl literal call in callconv, `callconv(.withStackAlign(.c, @alignOf(StartClosure)))` (src/fiber.zig:692): 'union lang.CallingConvention has no member named withStackAlign'; upstream accepts it."
+     "name": "test:examples/root.zig"
     },
     {
-     "name": "test:src/root.zig",
-     "note": "bs bug, open: bs rejects a decl literal call in callconv, `callconv(.withStackAlign(.c, @alignOf(StartClosure)))` (src/fiber.zig:692): 'union lang.CallingConvention has no member named withStackAlign'; upstream accepts it."
+     "name": "test:src/root.zig"
     },
     {
-     "name": "test:tests/root.zig",
-     "note": "bs bug, open: bs rejects a decl literal call in callconv, `callconv(.withStackAlign(.c, @alignOf(StartClosure)))` (src/fiber.zig:692): 'union lang.CallingConvention has no member named withStackAlign'; upstream accepts it."
+     "name": "test:tests/root.zig"
     },
     {
-     "name": "test:validation/bounded_queue_concurrency.zig",
-     "note": "bs bug, open: bs rejects a decl literal call in callconv, `callconv(.withStackAlign(.c, @alignOf(StartClosure)))` (src/fiber.zig:692): 'union lang.CallingConvention has no member named withStackAlign'; upstream accepts it."
+     "name": "test:validation/bounded_queue_concurrency.zig"
     },
     {
-     "name": "test:validation/kv_compat.zig",
-     "note": "bs bug, open: bs rejects a decl literal call in callconv, `callconv(.withStackAlign(.c, @alignOf(StartClosure)))` (src/fiber.zig:692): 'union lang.CallingConvention has no member named withStackAlign'; upstream accepts it."
+     "name": "test:validation/kv_compat.zig"
     }
    ]
   },
@@ -2834,8 +2827,7 @@
    ],
    "targets": [
     {
-     "name": "test",
-     "note": "bs bug, open: a runtime function's call as an argument of a type-returning function is not evaluated at comptime (src/ecs.zig:528, `QueryF(struct { e: Entity }, .With(Ctag))`): 'unable to resolve comptime value'."
+     "name": "test"
     }
    ]
   },
@@ -2983,12 +2975,10 @@
    ],
    "targets": [
     {
-     "name": "zigdown",
-     "note": "bs bug, open: bs refuses to coerce a function with i32 parameters to a function pointer with c_int parameters (plutosvg.zig:91, writeStream passed to translate-c's plutovg_surface_write_to_png_stream)."
+     "name": "zigdown"
     },
     {
-     "name": "test",
-     "note": "bs bug, open: bs refuses to coerce a function with i32 parameters to a function pointer with c_int parameters (plutosvg.zig:91, writeStream passed to translate-c's plutovg_surface_write_to_png_stream)."
+     "name": "test"
     }
    ]
   },
@@ -3014,8 +3004,7 @@
      "name": "sandopolis"
     },
     {
-     "name": "test",
-     "note": "bs bug, open: a `return f(x)` that forwards an error union with a large payload keeps an extra copy of the payload in bs's frame, so the path through state_file.loadFromBuffer needs 68.8 MB of stack under bs (59.9 MB upstream) and overflows the test binary's 64 MiB stack in 'facade boots a sega cd from bios bytes and an in-memory iso'. With a 128 MiB stack bs passes all 602 tests."
+     "name": "test"
     },
     {
      "name": "test:tests/property_tests.zig"
