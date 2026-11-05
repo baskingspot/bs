@@ -1551,7 +1551,7 @@
     },
     {
      "name": "test",
-     "note": "bs bug: `bs build test` crashes in Screening.refine (src/Screening.zig:355, index out of bounds with a stack address as the slice start) where `zig build test` passes; bs miscompiles the loop that fills each job's two subslices."
+     "note": "The -mcpu x86_64_v3/x86_64_v4 kernel objects, as the astroz target's note says. Screening.refine's slice bounds once lost to r11 (test/run/fwd_result_r11.zig)."
     }
    ]
   },

@@ -2566,7 +2566,9 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    and the fallback clobber the rest). r11 is allocated too, to a value
    whose interval, definition and last use contain no lowering that may
    write it: `CodeGen.usesR11` and `termUsesR11` decide that before
-   allocation (deferred loads read through r11, division, bit counting,
+   allocation (deferred loads and values in the function's result read
+   through r11, as do loads forwarded from them, which take their home
+   only when emitted, so the check looks through `Live.fwd`; division, bit counting,
    wide integers, odd-sized moves, calls, overflow bits, vector masks), and
    every lowering names r11 through `CodeGen.r11`, so emission fails the
    function where one does where they said it does not. A clobber point in a block that ends

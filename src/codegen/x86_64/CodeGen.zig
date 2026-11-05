@@ -1604,6 +1604,18 @@ pub fn r11(cg: *CodeGen) Reg {
     return .r11;
 }
 
+/// The home value `x` is read from: a forwarded load takes the stored
+/// value's when it is emitted (`Live.fwd`), such as a slice in the
+/// function's result (`Home.result`).
+fn readHome(cg: *CodeGen, x: Inst.Index) Home {
+    const i = @backingInt(x);
+    if (cg.live and cg.ir.instructions.items(.tag)[i] == .load) {
+        const w = cg.ssa.live.items(.fwd)[i];
+        if (w != Ssa.no_tie) return cg.homes[w];
+    }
+    return cg.homes[i];
+}
+
 /// Whether value `inst`'s lowering may write r11 as scratch, decided
 /// before allocation, so that no value that lives across it, or that it
 /// reads last or computes, lives in r11. `genBlock` fails a function
@@ -1623,7 +1635,7 @@ fn usesR11(cg: *CodeGen, inst: Inst.Index) bool {
         const Self = @This();
         pub fn use(c: Self, r: Ref) void {
             const x = r.toIndex() orelse return;
-            switch (c.cg.homes[@backingInt(x)]) {
+            switch (c.cg.readHome(x)) {
                 .deferred, .result => c.found.* = true,
                 else => {},
             }
@@ -1681,7 +1693,7 @@ fn termUsesR11(cg: *CodeGen, block: Ssa.Block.Index) bool {
     const deferred = struct {
         fn f(c: *CodeGen, r: Ref) bool {
             const x = r.toIndex() orelse return false;
-            return switch (c.homes[@backingInt(x)]) {
+            return switch (c.readHome(x)) {
                 .deferred, .result => true,
                 else => false,
             };

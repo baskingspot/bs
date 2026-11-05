@@ -31,6 +31,7 @@ Changes a user of bs notices, newest first, in the
 
 ### Fixed
 
+- On x86_64, a slice or other value a function returns through its result pointer, read back through a local after it is written, no longer clobbers a value the register allocator kept in r11: astroz's `Screening.refine` got a stack address as a slice bound and failed its bounds check.
 - In `bs build`, the first build after a cold one no longer compiles shared libraries and `-fPIC` objects again when they link other steps' outputs, nor reruns every step that depends on them.
 - In `bs build`, the first build after a cold one no longer compiles shared libraries and `-fPIC` objects again when their C sources include a header another step generated, nor reruns every step that depends on them.
 - In an ELF object (`bs build-obj`), a constant table of extern function pointers that code copies, such as `const libs = [_]Lib{ .{ .open = c.luaopen_base }, ... }` read in a `for` loop, keeps its relocations to those functions, instead of leaving null pointers that crash when called.
