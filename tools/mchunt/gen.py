@@ -693,6 +693,8 @@ EXTRA_DECL["fwdalias"] = [
     "noinline fn aqFld(p: *AQ, f: *const u32) u64 { const x1 = f.*; p.* = .{ .a = x1 +% 1, .b = 5, .c = 6 }; return x1 *% 1000 +% f.*; }",
     "noinline fn aqCopy(p: *AQ, q: *const AQ) u64 { const c = q.*; p.a = 50; p.b = 51; return @as(u64, c.a) *% 3 +% c.b +% q.a; }",
     "inline fn aqCopyArg(c: AQ, p: *AQ) u64 { p.a = 77; return @as(u64, c.a) *% 5 +% c.b; }",
+    "fn aqCopyArgA(c: AQ, p: *AQ) u64 { const x = c.a; p.* = .{ .a = c.b, .b = x +% 1, .c = c.c }; return @as(u64, c.a) *% 7 +% c.b +% p.a; }",
+    "fn aqCopyArgL(c: AQ, p: *AQ, n: usize) u64 { var h: u64 = 0; for (0..n) |i| { h +%= c.a; p.a +%= @intCast(i + 1); } return h +% c.b; }",
 ]
 
 # Slices returned by noinline callees whose length is (or nearly is) one
@@ -3460,7 +3462,10 @@ class Gen:
             e(f"const {x2} = aqFld({p}, &{q}.{self.pick(['a', 'b'])});")
             sk(x2)
         elif k == 6:
-            e(f"const {x1} = aqCopyArg({p}.*, {q});")
+            e(f"const {x1} = {self.pick(['aqCopyArg', 'aqCopyArgA', 'aqCopyArgA'])}({p}.*, {q});")
+            if self.chance(0.4):
+                e(f"const {x2} = aqCopyArgL({q}.*, {p}, {self.r.randint(1, 3)});")
+                sk(x2)
             sk(x1)
             sk(f"aqRead({p})")
         elif k == 7:
