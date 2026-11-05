@@ -7,6 +7,7 @@ traces and thread ids are dropped, since they differ between compilers.
 """
 
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -18,6 +19,43 @@ WORK = os.path.join(TOOL_DIR, ".work")
 
 COMPILE_TIMEOUT = 120
 RUN_TIMEOUT = 10
+
+
+# Flags every configuration compiles with, upstream and bs alike (such
+# as -target or -mcpu), and the command that runs a binary built for
+# another architecture. A finding's meta.json keeps both (`target`).
+TARGET_FLAGS = []
+RUNNER = []
+
+
+def set_target(flags=(), runner=()):
+    TARGET_FLAGS[:] = flags
+    RUNNER[:] = runner
+
+
+def target_meta():
+    return {"flags": list(TARGET_FLAGS), "runner": list(RUNNER)}
+
+
+def target_for(target=None, mcpu=None):
+    """The flags and runner for a `-target` triple and an `-mcpu` CPU.
+    aarch64 binaries on another host run under qemu as a Cortex-A53,
+    as tools/conformance/run.py runs them."""
+    flags, runner = [], []
+    if target:
+        flags += ["-target", target]
+        arch = target.split("-")[0]
+        host = {"arm64": "aarch64", "AMD64": "x86_64"}.get(platform.machine(), platform.machine())
+        if arch != host:
+            if arch != "aarch64":
+                raise SystemExit(f"no runner for {target} on {host}")
+            q = shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")
+            if q is None:
+                raise SystemExit("no qemu-aarch64: .agents/setup installs qemu-user-static")
+            runner = [q, "-cpu", "cortex-a53"]
+    if mcpu:
+        flags.append(f"-mcpu={mcpu}")
+    return flags, runner
 
 
 class Config:
@@ -46,6 +84,13 @@ BY_NAME = {c.name: c for c in [UP_DEBUG, UP_SAFE, UP_LLVM, BS_DEBUG, BS_SAFE, BS
 # set_ref_env, bs itself with a pass turned off (no upstream run at all).
 ORACLE = UP_DEBUG
 REPORT = [UP_DEBUG, UP_SAFE]
+
+
+def set_oracle(name):
+    """Makes another upstream configuration (a finding's `oracle`, such
+    as zig-safe) the oracle."""
+    global ORACLE
+    ORACLE = BY_NAME[name]
 
 
 def set_ref_env(env):
@@ -117,7 +162,7 @@ def compile_prog(tools, cfg, src, out, cache_dir):
         argv = [tools.zig, "build-exe", src, f"-femit-bin={out}", "--cache-dir", cache_dir]
     if cfg.mode != "Debug":
         argv.append(f"-O{cfg.mode}")
-    argv += cfg.flags
+    argv += cfg.flags + TARGET_FLAGS
     try:
         p = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                            errors="replace", timeout=COMPILE_TIMEOUT, cwd=os.path.dirname(src))
@@ -135,8 +180,8 @@ def compile_prog(tools, cfg, src, out, cache_dir):
 
 def run_bin(path):
     try:
-        p = subprocess.run([path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
-                           timeout=RUN_TIMEOUT, stdin=subprocess.DEVNULL)
+        p = subprocess.run([*RUNNER, path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
+                           timeout=RUN_TIMEOUT * (5 if RUNNER else 1), stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return Outcome("timeout")
     lines = normalize(p.stderr + p.stdout)

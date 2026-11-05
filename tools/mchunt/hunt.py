@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Differential miscompile hunter for bs (see tools/mchunt/README.md).
 
-Generates random well-defined Zig programs (gen.py), compiles each with
+Generates random well-defined Zig programs (gen.py, or vgen.py's @Vector
+programs with --kind vector), compiles each with
 upstream zig 0.17.1 (Debug, the oracle) and with bs in several
 configurations, runs them, and compares what they print and how they
 exit. A mismatch is triaged (upstream ReleaseSafe as a second oracle,
@@ -9,6 +10,7 @@ pass toggles), saved under .work/found/, and minimized (reduce.py).
 
     python3 tools/mchunt/hunt.py                  # hunt until interrupted
     python3 tools/mchunt/hunt.py --hours 3 --follow   # rebuild bs when origin/main moves
+    python3 tools/mchunt/hunt.py --kind vector --target aarch64-linux   # under qemu
 """
 
 import argparse
@@ -26,6 +28,11 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gen  # noqa: E402
 import harness as H  # noqa: E402
+import vgen  # noqa: E402
+
+KINDS = {"gen": gen, "vector": vgen}
+# The generator this process uses (worker_init sets it in workers).
+KIND = ["gen"]
 
 FOUND = os.path.join(H.WORK, "found")
 
@@ -83,14 +90,23 @@ def known_bug(text, outs):
 
 def signature(cls, bad, up, res):
     first = res[bad[0]]
-    return f"{cls}|{','.join(bad)}|{up.kind()}|{first.kind()}"
+    sig = f"{cls}|{','.join(bad)}|{up.kind()}|{first.kind()}"
+    # Generators and targets count their reductions apart.
+    if H.TARGET_FLAGS:
+        sig = f"[{' '.join(H.TARGET_FLAGS)}]|{sig}"
+    if KIND[0] != "gen":
+        sig = f"{KIND[0]}|{sig}"
+    return sig
 
 
-def worker_init(boost, ref_env):
+def worker_init(boost, ref_env, kind="gen", target=None):
     """Settings a fork-server worker does not inherit."""
     gen.BOOST.update(boost)
     if ref_env:
         H.set_ref_env(ref_env)
+    KIND[0] = kind
+    if target:
+        H.set_target(target["flags"], target["runner"])
 
 
 def check(seed, tools, size, branch=None, base=None, text=None):
@@ -100,7 +116,7 @@ def check(seed, tools, size, branch=None, base=None, text=None):
     scratch = H.new_scratch()
     try:
         src = os.path.join(scratch, f"p{seed}.zig")
-        text = text or gen.generate(seed, size)
+        text = text or KINDS[KIND[0]].generate(seed, size)
         with open(src, "w") as f:
             f.write(text)
         t0 = time.time()
@@ -114,6 +130,16 @@ def check(seed, tools, size, branch=None, base=None, text=None):
                 rec["result"] = "discard"
                 rec["why"] = first.split("error: ", 1)[-1][:60] or f"{up.status} (seed {seed})"
             return rec
+        if up.status == "signal" and KIND[0] == "vector" and H.ORACLE is H.UP_DEBUG:
+            # Upstream's x86_64 backend crashes on some vector code (such
+            # as an aligned store to an array of three f32): LLVM is the
+            # oracle for that program, ReleaseSafe or else Debug.
+            for cfg in (H.UP_SAFE, H.UP_LLVM):
+                o = H.run_config(tools, cfg, src, scratch)
+                if o.status in ("ok", "panic"):
+                    rec["oracle"] = cfg.name
+                    up = o
+                    break
         if up.status in ("timeout", "signal", "exit"):
             rec["result"] = "upstream-" + up.status
             return rec
@@ -133,8 +159,14 @@ def check(seed, tools, size, branch=None, base=None, text=None):
         if cls is None:
             rec["result"] = "flaky"
             return rec
+        if cls == "miscompile" and KIND[0] == "vector" and not any(
+                res[n].compiled() for n in ("zig-safe", "zig-llvm") if n in res):
+            # LLVM rejects some vector programs ("Invalid record"), and
+            # upstream Debug alone is wrong too often on vectors (such as
+            # i32 `-|` at -mcpu=x86_64_v2) to call bs wrong on its word.
+            cls = "unconfirmed"
         sig = signature(cls, bad, up, res)
-        extra = {}
+        extra = {"oracle": rec["oracle"]} if "oracle" in rec else {}
         if cls == "miscompile":
             kb = known_bug(text, [up] + [res[n] for n in bad])
             if kb:
@@ -170,6 +202,9 @@ def save_finding(seed, text, tools, up, res, cls, bad, sig, extra=None):
     }
     if H.ORACLE.kind == "bs":
         meta["ref_env"] = H.ORACLE.env
+    meta["kind"] = KIND[0]
+    if H.TARGET_FLAGS or H.RUNNER:
+        meta["target"] = H.target_meta()
     with open(os.path.join(d, "meta.json"), "w") as f:
         json.dump(meta, f, indent=1)
     return d
@@ -249,13 +284,17 @@ def recheck_findings(tools):
             continue
         prog = os.path.join(d, "reduced.zig") if os.path.exists(os.path.join(d, "reduced.zig")) else os.path.join(d, "orig.zig")
         scratch = H.new_scratch()
+        mine = H.target_meta()
+        t = meta.get("target") or {"flags": [], "runner": []}
+        H.set_target(t["flags"], t["runner"])
         try:
             src = os.path.join(scratch, "p.zig")
             shutil.copy(prog, src)
-            up = H.run_config(tools, H.ORACLE, src, scratch)
+            up = H.run_config(tools, H.BY_NAME[meta["oracle"]] if meta.get("oracle") else H.ORACLE, src, scratch)
             still = any(H.run_config(tools, H.BY_NAME[n], src, scratch).key() != up.key() for n in meta["bad"])
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+            H.set_target(mine["flags"], mine["runner"])
         if not still:
             meta["fixed_in"] = bs_rev(tools.bs)
             json.dump(meta, open(mp, "w"), indent=1)
@@ -309,12 +348,19 @@ def main():
     ap.add_argument("--per-sig", type=int, default=2, help="reductions per finding signature")
     ap.add_argument("--one", type=int, help="check one seed and print its outcomes")
     ap.add_argument("--file", help="check one saved program and print its outcomes")
+    ap.add_argument("--kind", choices=sorted(KINDS), default="gen",
+                    help="the program generator: gen.py, or vgen.py's @Vector programs")
+    ap.add_argument("--target", help="compile every configuration for this target, such as aarch64-linux "
+                                     "(run under qemu when it is not the host's architecture)")
+    ap.add_argument("--mcpu", help="compile every configuration for this CPU, such as baseline or x86_64_v2")
     ap.add_argument("--boost", metavar="KIND=N,...", help="weight multipliers for statement kinds, such as vector=8")
     ap.add_argument("--ref-env", metavar="VAR=VALUE", action="append",
                     help="compare bs with bs under this environment (such as BS_PROVE=off) instead of upstream")
     args = ap.parse_args()
 
     tools = H.Tools(args.bs, args.zig)
+    KIND[0] = args.kind
+    H.set_target(*H.target_for(args.target, args.mcpu))
     if args.boost:
         gen.BOOST.update({k: float(v) for k, v in (x.split("=") for x in args.boost.split(","))})
     if args.ref_env:
@@ -334,7 +380,8 @@ def main():
         tools = H.Tools(build_bs(current), args.zig)
     if not os.path.exists(tools.bs):
         sys.exit(f"no bs at {tools.bs}: build it with `zig build -Doptimize=ReleaseFast` or pass --follow")
-    log(f"bs {tools.bs} ({bs_rev(tools.bs)[:10]}), zig {tools.zig}, {args.jobs} workers")
+    log(f"bs {tools.bs} ({bs_rev(tools.bs)[:10]}), zig {tools.zig}, {args.jobs} workers, {args.kind} programs"
+        + (f", {' '.join(H.TARGET_FLAGS)}" if H.TARGET_FLAGS else ""))
 
     import random
     seed = args.seed if args.seed is not None else random.randrange(1 << 40)
@@ -439,7 +486,8 @@ def main():
     # is running, and the follower would never see that pipe close.
     import multiprocessing as mp
     ctx = mp.get_context("forkserver")
-    init = (worker_init, (dict(gen.BOOST), H.ORACLE.env if H.ORACLE.kind == "bs" else None))
+    init = (worker_init, (dict(gen.BOOST), H.ORACLE.env if H.ORACLE.kind == "bs" else None, KIND[0],
+                          H.target_meta()))
     hunt = cf.ProcessPoolExecutor(args.jobs, mp_context=ctx, initializer=init[0], initargs=init[1])
     red = cf.ProcessPoolExecutor(args.reducers, mp_context=ctx, initializer=init[0], initargs=init[1])
     pending = set()

@@ -518,6 +518,10 @@ def reduce_finding(d, bs=None, zig=None, minutes=90):
     meta = json.load(open(os.path.join(d, "meta.json")))
     if meta.get("ref_env"):
         H.set_ref_env(meta["ref_env"])
+    t = meta.get("target") or {"flags": [], "runner": []}
+    H.set_target(t["flags"], t["runner"])
+    if meta.get("oracle"):
+        H.set_oracle(meta["oracle"])
     prop = property_for(meta, tools)
     logf = open(os.path.join(d, "reduce.log"), "a")
 
@@ -572,7 +576,10 @@ def main():
     ap.add_argument("--bs")
     ap.add_argument("--zig")
     ap.add_argument("--minutes", type=float, default=90)
+    ap.add_argument("--target", help="for a .zig file: the -target every configuration compiles for")
+    ap.add_argument("--mcpu", help="for a .zig file: the -mcpu every configuration compiles for")
     args = ap.parse_args()
+    H.set_target(*H.target_for(args.target, args.mcpu))
     if os.path.isdir(args.target):
         print(reduce_finding(args.target, args.bs, args.zig, args.minutes))
         return

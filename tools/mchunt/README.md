@@ -19,6 +19,8 @@ python3 tools/mchunt/hunt.py --one 1234              # one seed, with its outcom
 python3 tools/mchunt/hunt.py --file p.zig            # one saved program, with its outcomes
 python3 tools/mchunt/hunt.py --ref-env BS_PROVE=off # bs against bs with a pass off; no upstream
 python3 tools/mchunt/gen.py 1234 > p.zig             # just the program
+python3 tools/mchunt/hunt.py --kind vector --mcpu x86_64_v2   # @Vector programs (vgen.py)
+python3 tools/mchunt/hunt.py --kind vector --target aarch64-linux  # under qemu
 python3 tools/mchunt/reduce.py tools/mchunt/.work/found/miscompile-1234
 python3 tools/mchunt/reduce.py p.zig --bad bs --control bs-noinline > small.zig
 ```
@@ -76,6 +78,36 @@ unguarded, so a safety check that fires must fire the same way in both
 compilers. Those are only emitted where an operand is certainly
 runtime-known, since at comptime they would be compile errors, and a
 function containing one is never called at comptime.
+
+## Vector programs and targets
+
+`--kind vector` generates programs with `vgen.py` instead: each test
+function builds `@Vector`s of every length bs lowers differently (1, 3,
+5, 17, 33 and whole 16-, 32- and 64-byte registers) and element type
+(u1/i1 to u64, u24, i65, f16, f32, f64, bool) from runtime inputs, and
+runs them through lane ops, wrapping and saturating arithmetic, shifts
+by splats and by vectors, compares, select, shuffles with negative and
+undefined mask lanes, `@reduce` of every op, casts and bitcasts, memory
+(element stores, pointers, globals, struct fields, unaligned byte
+buffers), calls, and comptime calls of the same helpers. A checkpoint
+follows every statement (`ck <test>.<statement>`), so the first
+mismatching line names the statement. Float results hash every NaN
+alike and @min/@max add +0.0, since the backends differ on NaN payloads
+and on which zero a tie returns; bitcasts reshape only byte-sized lanes,
+since upstream's backends lay out other reshapes differently.
+
+Upstream's backends are weaker oracles on vectors than on scalars. When
+upstream Debug's binary crashes, ReleaseSafe (else `-fllvm`) is the
+program's oracle (`oracle` in `meta.json`). When LLVM rejects the
+program too, a mismatch is `unconfirmed` rather than `miscompile`:
+upstream Debug alone is wrong too often (`-|` on i32 lanes at
+`-mcpu=x86_64_v2`, for one).
+
+`--target` and `--mcpu` add `-target` and `-mcpu` to every
+configuration, upstream and bs alike; aarch64 binaries on an x86_64
+host run under `qemu-aarch64-static -cpu cortex-a53`. Both are saved in
+a finding's `meta.json`, so reduction, rechecks and `bisect_bs.py` use
+them too.
 
 ## Reduction
 

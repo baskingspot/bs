@@ -86,6 +86,10 @@ def main():
         cfgname = args.bad_config or ("bs" if "bs" in meta["bad"] else meta["bad"][0])
         if meta.get("ref_env"):
             H.set_ref_env(meta["ref_env"])
+        t = meta.get("target") or {"flags": [], "runner": []}
+        H.set_target(t["flags"], t["runner"])
+        if meta.get("oracle"):
+            H.set_oracle(meta["oracle"])
     else:
         meta, prog, cfgname = None, args.target, args.bad_config or "bs"
     cfg = H.BY_NAME[cfgname]
@@ -95,7 +99,7 @@ def main():
     src_dir = H.new_scratch("bisect-src-")
     src = os.path.join(src_dir, "repro.zig")
     shutil.copy(prog, src)
-    up = H.run_config(H.Tools(), H.UP_DEBUG, src, src_dir) if H.ORACLE.kind == "zig" else None
+    up = H.run_config(H.Tools(), H.ORACLE, src, src_dir) if H.ORACLE.kind == "zig" else None
     if up is None:
         up = H.Outcome("ok", [], 0, "")  # replaced per commit by the reference
     print(f"upstream: {up.text()}" if H.ORACLE.kind == "zig" else f"reference: bs with {H.ORACLE.env}", flush=True)
