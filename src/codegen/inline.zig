@@ -18,6 +18,10 @@ pub const budget = 30;
 /// A call inside a loop inlines callees up to this many times the budget:
 /// its cost is paid once per iteration, the code once.
 pub const loop_factor = 2;
+/// Elements an `aggregate_init` may have and still count as one
+/// instruction: a struct literal sroa splits into registers, or a short
+/// array.
+const small_aggregate = 8;
 
 /// A call that may be inlined: a direct call of an `.auto` function, not
 /// `never_inline`, outside cold code. `line:column` is the call's statement
@@ -149,6 +153,13 @@ const Scanner = struct {
                     try s.body(else_body, cold or isCold(ir, else_body));
                 },
                 .call => try s.call(inst, cold),
+                // A big array literal or `@splat` has an operand per element
+                // (`std.mem.zeroes` of a 1 MiB array has a million), and
+                // copying and rewriting it costs as much in every caller.
+                .aggregate_init => if (!cold) {
+                    const len = ir.extraData(Ir.Aggregate, data.ty_pl.payload).data.len;
+                    if (len > small_aggregate) s.out.size +|= len;
+                },
                 // A trap has no return address for synthetic frames.
                 .trap => {
                     s.out.panics = true;

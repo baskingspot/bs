@@ -1641,7 +1641,11 @@ build, the passes, and the debug info treat them as Sema's inline calls
   uses only instructions the splice maps (no `@returnAddress`,
   `@frameAddress`, inline assembly, error return trace access). Its size is its instructions with code
   outside cold bodies, less `block`s, their `br`s and the fields of an
-  overflow operation's result (`Scanner.free`), plus the sizes of the
+  overflow operation's result (`Scanner.free`), plus each element of an
+  `aggregate_init` with more than 8 (`@splat` of a runtime value has an
+  operand per element: `std.mem.zeroes` of a 1 MiB array counted as one
+  instruction, and its inlined copies cost 22 ms each in rewrite and
+  sroa), plus the sizes of the
   callees inlined into it (mid-stack inlining); the budget is 30, and
   twice that for a call inside a loop of the caller (`loop_factor`: its
   cost is paid each iteration, its code once). A function whose callees are
