@@ -538,7 +538,7 @@ fn typeIn(cx: Ctx, ty: InternPool.Index, w: *Writer) Writer.Error!void {
 /// options by its tag, and one with options in full.
 fn printCallconv(f: InternPool.FuncType, w: *std.Io.Writer) std.Io.Writer.Error!void {
     switch (f.cc) {
-        .auto, .naked, .@"inline" => return w.print("callconv(.{s})", .{@tagName(f.cc)}),
+        .auto, .naked, .@"inline" => return w.print("callconv(.{f})", .{std.zig.fmtId(@tagName(f.cc))}),
         .c => if (f.stack_align == 0) return w.writeAll("callconv(.c)"),
         .x86_64_win, .aarch64_preserve_none => {},
     }

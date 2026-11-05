@@ -1170,6 +1170,7 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
         if (Type.class(sema.ip, decl_ty) != .@"fn")
             try sema.checkExtern(&block, src.varTy(), decl_ty, .other, "extern variable cannot have type '{f}'", .{FmtType{ .ip = sema.ip, .ty = decl_ty, .decl_note = false }});
         if (decl.lib_name != .empty) try sema.checkExternLibName(&block, src, sema.code.nullTerminatedString(decl.lib_name));
+        try sema.checkDeclPlacement(&block, src, nav, decl, decl_ty);
         return sema.finish();
     }
     // Within the value body, the `declaration` instruction refers to the type.
@@ -1190,6 +1191,15 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
             if (decl.linksection_body != null) return sema.fail(&block, .{ .base = src.base, .loc = .{ .decl_section = .zero } }, "cannot specify linksection of {s}", .{what});
             return sema.fail(&block, .{ .base = src.base, .loc = .{ .decl_addrspace = .zero } }, "cannot specify addrspace of {s}", .{what});
         }
+        try sema.checkDeclPlacement(&block, src, nav, decl, sema.ip.typeOf(val));
+    }
+    // An `export` declaration's value, as upstream's `analyzeExportSelfNav`.
+    if (decl.linkage == .@"export") {
+        const ty = sema.ip.typeOf(val);
+        if (Type.class(sema.ip, ty) != .@"fn") try sema.resolveLayout(&block, src, ty);
+        // At the declaration's first token (`export`), as upstream.
+        const first = (try sema.zcu.fe.tree(@fromBackingInt(sema.file))).firstToken(src.base);
+        try sema.checkExtern(&block, .{ .base = src.base, .loc = .{ .token = .init(first, first) } }, ty, .other, "unable to export type '{f}'", .{FmtType{ .ip = sema.ip, .ty = ty, .decl_note = false }});
     }
     // A container-level `var` exists at runtime, as upstream checks at its
     // initializer.
@@ -1200,6 +1210,29 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
     // Emit lays out the value of any declaration code refers to.
     try sema.resolveLayoutIfIdle(&block, src, nav.ty);
     try sema.finish();
+}
+
+/// A declaration's `linksection` and `addrspace`, checked as upstream's
+/// `analyzeNavType` checks them. bs places every declaration in the
+/// generic address space, the only one its targets allow for one.
+fn checkDeclPlacement(sema: *Sema, block: *Block, src: Src, nav: *InternPool.Nav, decl: Zir.Inst.Declaration.Unwrapped, ty: Index) CompileError!void {
+    if (decl.linksection_body) |body| {
+        const section_src: Src = .{ .base = src.base, .loc = .{ .decl_section = .zero } };
+        const bytes = try sema.resolveConstString(block, section_src, try sema.resolveInlineBody(block, body, nav.zir_inst));
+        if (std.mem.indexOfScalar(u8, bytes, 0) != null) return sema.fail(block, section_src, "linksection cannot contain null bytes", .{});
+        if (bytes.len == 0) return sema.fail(block, section_src, "linksection cannot be empty", .{});
+    }
+    if (decl.addrspace_body) |body| {
+        const as_src: Src = .{ .base = src.base, .loc = .{ .decl_addrspace = .zero } };
+        const as_ty = try sema.stdLangType(block, as_src, "AddressSpace");
+        const val = try sema.resolveConstValue(block, as_src, try sema.coerce(block, as_ty, try sema.resolveInlineBody(block, body, nav.zir_inst), as_src), "address space must be comptime-known");
+        if (sema.isUndef(val)) return sema.fail(block, as_src, "use of undefined value here causes illegal behavior", .{});
+        const name = sema.enumTagName(val).?;
+        if (!std.mem.eql(u8, name, "generic")) {
+            const entity = if (decl.kind == .@"var") "mutable values" else if (Type.class(sema.ip, ty) == .@"fn") "functions" else "constant values";
+            return sema.fail(block, as_src, "{s} with address space '{s}' are not supported on {s}", .{ entity, name, @tagName(sema.ip.target.arch().family()) });
+        }
+    }
 }
 
 /// The first phase of a declaration's `nav_val` unit: its declared type
@@ -6161,6 +6194,8 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const node = sema.code.extraData(Zir.Inst.ReifySpirvType, ext.operand).data.node;
             break :blk sema.fail(block, .{ .base = node, .loc = .{ .node_abs = node } }, "builtin @SpirvType is only available when targeting SPIR-V; targeted CPU architecture is {s}", .{@tagName(sema.ip.target.arch())});
         },
+        // As upstream on targets other than GPUs.
+        .work_item_id, .work_group_size, .work_group_id => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.UnNode, ext.operand).data.node), "builtin only available on GPU targets; targeted architecture is {s}", .{@tagName(sema.ip.target.arch())}),
         // A declaration whose ZIR AstGen could not generate: AstGen
         // reported it, so it fails, as do the units that read it, with no
         // error of their own (upstream's `failTransitive`).
@@ -6628,9 +6663,9 @@ fn validateExtern(sema: *Sema, ty: Index, position: ExternPosition) bool {
         .void => position != .param_ty and position != .other,
         .noreturn => position == .ret_ty,
         .@"opaque", .bool, .@"anyframe" => true,
-        // As upstream, `f80` only where compiler-rt's float ABI for it is
-        // the hardware's.
-        .float => Type.floatBits(ip, ty) != 80 or ip.target == .x86_64_linux,
+        // As upstream (`compilerRtFloatAbi`): f80 only where C's `long
+        // double` is f80.
+        .float => Type.floatBits(ip, ty) != 80 or Type.floatBits(ip, .c_longdouble_type) == 80,
         .pointer => {
             const p = Type.ptrInfo(ip, ty);
             if (p.flags.size == .slice) return false;
@@ -7154,11 +7189,10 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
     };
     try sema.ensureNavVal(block, src, nav_index);
     const val = ip.getNav(nav_index).val;
-    // As upstream, an exported variable has a defined memory layout.
-    if (Type.class(ip, ip.typeOf(val)) != .@"fn") {
-        try sema.resolveLayout(block, src, ip.typeOf(val));
-        try sema.checkExtern(block, src, ip.typeOf(val), .other, "unable to export type '{f}'", .{FmtType{ .ip = ip, .ty = ip.typeOf(val), .decl_note = false }});
-    }
+    // As upstream, an exported value has a defined memory layout, and an
+    // exported function a convention other than Zig's.
+    if (Type.class(ip, ip.typeOf(val)) != .@"fn") try sema.resolveLayout(block, src, ip.typeOf(val));
+    try sema.checkExtern(block, src, ip.typeOf(val), .other, "unable to export type '{f}'", .{FmtType{ .ip = ip, .ty = ip.typeOf(val), .decl_note = false }});
     const export_nav = switch (ip.indexToKey(val)) {
         .func => |f| f.owner_nav,
         else => nav_index,
@@ -8591,12 +8625,6 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
         .auto
     else if (std.mem.eql(u8, name, "inline"))
         .@"inline"
-    else if (std.mem.eql(u8, name, ccName(sema.ip.target, .c)))
-        .c
-    else if (sema.ip.target == .x86_64_linux and std.mem.eql(u8, name, "x86_64_win"))
-        .x86_64_win
-    else if (sema.ip.target != .x86_64_linux and std.mem.eql(u8, name, "aarch64_preserve_none"))
-        .aarch64_preserve_none
     else {
         if (std.meta.stringToEnum(std.lang.CallingConvention.Tag, name) == null) {
             // As upstream; `.C` was 0.13's name for `.c`.
@@ -8609,8 +8637,20 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
         const cc_ty = (try sema.stdLangDecl(block, src, "CallingConvention")).toInterned().?;
         const i = try sema.unionFieldIndex(block, src, cc_ty, name);
         const field_ty = sema.ip.structInfo(cc_ty).field_types[i];
-        const payload = if (field_ty == .void_type) .void_value else try sema.structValue(block, src, field_ty, &.{});
-        return .fromInterned(try sema.intern(.{ .un = .{ .ty = cc_ty, .tag = try sema.unionFieldTagValue(cc_ty, i), .val = payload } }));
+        if (field_ty != .void_type) {
+            // As upstream, a tag with options does not coerce to the union
+            // on its own; the fix gives it the default options.
+            const err = if (sema.coerce(block, cc_ty, .fromInterned(try sema.unionFieldTagValue(cc_ty, i)), src)) |_| unreachable else |e| e;
+            if (err != error.AnalysisFail) return err;
+            const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+            const span = src.span(tree);
+            if (std.mem.eql(u8, tree.source[span.start..span.end], try std.fmt.allocPrint(sema.arena, ".{s}", .{name}))) {
+                const arena = sema.zcu.arena.allocator();
+                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .exact, .edits = try arena.dupe(@import("diag.zig").RawEdit, &.{.{ .start = span.start, .end = span.end, .text = try std.fmt.allocPrint(arena, ".{{ .{s} = .{{}} }}", .{name}) }}) };
+            }
+            return err;
+        }
+        return .fromInterned(try sema.intern(.{ .un = .{ .ty = cc_ty, .tag = try sema.unionFieldTagValue(cc_ty, i), .val = .void_value } }));
     };
     return .fromInterned(try sema.intern(.{ .calling_convention = cc }));
 }
@@ -14823,7 +14863,10 @@ fn ptrElemPtrKey(sema: *Sema, ptr: Index, i: u64, want_ty: bool) !struct { key: 
 fn fieldTypeByName(sema: *Sema, block: *Block, src: Src, ty: Index, name: []const u8) CompileError!Index {
     const ip = sema.ip;
     if (ty == .generic_poison_type) return .generic_poison_type;
-    if (ty == .clobbers_type) return .bool_type;
+    if (ty == .clobbers_type) {
+        try sema.checkClobberName(block, src, name);
+        return .bool_type;
+    }
     switch (ip.indexToKey(ty)) {
         .struct_type => {
             try sema.resolveStructFields(block, src, ty);
@@ -19710,6 +19753,22 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
 // ---------------------------------------------------------------------------
 // Inline assembly
 
+/// The target's `std.lang.assembly.Clobbers`, which `clobbers_type` stands
+/// for, or null without std. Only diagnostics need the real type.
+fn clobbersType(sema: *Sema, block: *Block, src: Src) CompileError!?Index {
+    if (sema.zcu.moduleRootFile(sema.family().std_mod) == null) return null;
+    const ty = try sema.stdLangType(block, src, "assembly.Clobbers");
+    try sema.resolveStructFields(block, src, ty);
+    return ty;
+}
+
+/// As upstream, a clobber names a field of the target's `Clobbers`.
+fn checkClobberName(sema: *Sema, block: *Block, src: Src, name: []const u8) CompileError!void {
+    const real = (try sema.clobbersType(block, src)) orelse return;
+    if (sema.ip.structInfo(real).fieldIndex(sema.ip, name) == null)
+        return sema.withCandidates(sema.fail(block, src, "no field named '{s}' in struct '{f}'", .{ name, sema.fmtType(real) }), real, name, .fields);
+}
+
 /// A value of `std.lang.Clobbers` (`clobbers_type`), which bs gives no
 /// fields of its own: it keeps only what CodeGen reads, the callee-saved
 /// registers clobbered, as one bool per `Ir.Asm.callee_saved_names`
@@ -19791,7 +19850,13 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         const clobbers_src: Src = .{ .base = src.base, .loc = .{ .node_abs = node } };
         // AstGen evaluates the clobbers at comptime and leaves the
         // coercion to Sema, as upstream.
-        const c = try sema.coerce(block, .clobbers_type, sema.resolveInst(extra.data.clobbers), clobbers_src);
+        // A value of another type must coerce to the target's
+        // `std.lang.assembly.Clobbers`, with upstream's errors.
+        const clobbers = sema.resolveInst(extra.data.clobbers);
+        if (sema.typeOf(clobbers) != .clobbers_type) if (try sema.clobbersType(block, src)) |real| {
+            _ = try sema.coerce(block, real, clobbers, clobbers_src);
+        };
+        const c = try sema.coerce(block, .clobbers_type, clobbers, clobbers_src);
         const v = try sema.resolveConstValue(block, clobbers_src, c, "clobber must be comptime-known");
         if (sema.isUndef(v)) return sema.fail(block, clobbers_src, "use of undefined value here causes illegal behavior", .{});
         const a = sema.ip.keyPayload(.aggregate, v);
@@ -19880,7 +19945,8 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const params = sema.params.items;
     sema.params = .empty;
 
-    var parsed_cc: Callconv = .{ .tag = if (sema.owner_nav != .none and ip.getNav(sema.owner_nav).linkage == .@"export") std.meta.stringToEnum(std.lang.CallingConvention.Tag, ccName(ip.target, .c)).? else .auto };
+    var parsed_cc: Callconv = .{ .tag = .auto };
+    var explicit_cc = false;
     var body_len: u32 = 0;
     var is_var_args = false;
     var noalias_bits: u32 = 0;
@@ -19905,6 +19971,7 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             cc_ref = sema.resolveInst(@fromBackingInt(sema.code.extra[extra.end]));
         }
         if (cc_ref != .none) {
+            explicit_cc = true;
             const v = try sema.resolveConstValue(block, cc_src, cc_ref, "calling convention must be comptime-known");
             parsed_cc = switch (ip.indexToKey(v)) {
                 .calling_convention => try sema.callconvOf(block, cc_src, v),
@@ -19921,6 +19988,10 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     } else {
         body_len = sema.code.extraData(Zir.Inst.Func, data.payload_index).data.body_len;
     }
+    // As upstream, an exported function declaration (one with a body, not a
+    // function type in its signature) defaults to the C convention.
+    if (!explicit_cc and body_len != 0 and sema.owner_nav != .none and ip.getNav(sema.owner_nav).linkage == .@"export")
+        parsed_cc = .{ .tag = std.meta.stringToEnum(std.lang.CallingConvention.Tag, ccName(ip.target, .c)).? };
     if (is_noinline and parsed_cc.tag == .@"inline") return sema.fail(block, cc_src, "'noinline' function cannot have calling convention 'inline'", .{});
     if (is_var_args) {
         const var_src: Src = .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(params.len) } } };
