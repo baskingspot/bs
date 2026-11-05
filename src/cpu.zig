@@ -8,6 +8,7 @@
 //! supports more").
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Cpu = std.Target.Cpu;
 const x86 = std.Target.x86;
 
@@ -119,7 +120,7 @@ const aarch64 = std.Target.aarch64;
 
 /// The default CPU of an explicit target for `arch` (aarch64-macos's when
 /// `macos`), as upstream's.
-pub fn targetDefault(arch: std.Target.Cpu.Arch, macos: bool) Cpu {
+pub fn targetDefault(arch: Cpu.Arch, macos: bool) Cpu {
     if (arch == .x86_64) return baseline;
     if (!macos) return aarch64.cpu.generic.toCpu(.aarch64);
     // Without fuse_aes, as `resolveTargetQuery` gives every Apple model.
@@ -146,7 +147,7 @@ pub fn clampAarch64(host: Cpu) Cpu {
 
 /// The host's CPU, clamped, when the host is aarch64.
 pub fn nativeAarch64(io: std.Io) ?Cpu {
-    if (@import("builtin").cpu.arch != .aarch64) return null;
+    if (builtin.cpu.arch != .aarch64) return null;
     const host = std.zig.system.resolveTargetQuery(io, .{}) catch return null;
     return clampAarch64(host.cpu);
 }
@@ -160,17 +161,17 @@ pub fn resolveAarch64(arena: std.mem.Allocator, io: std.Io, text: []const u8, ma
     const default = targetDefault(.aarch64, macos);
     if (std.mem.eql(u8, text, "native")) return .{ .cpu = nativeAarch64(io) orelse default };
     const query = std.Target.Query.parse(.{ .arch_os_abi = if (macos) "aarch64-macos" else "aarch64-linux", .cpu_features = text }) catch |err|
-        return .{ .cpu = default, .refused = std.fmt.allocPrint(arena, "invalid CPU '{s}' ('-mcpu'): {t}", .{ text, err }) catch "out of memory" };
+        return .{ .cpu = default, .refused = arena.print("invalid CPU '{s}' ('-mcpu'): {t}", .{ text, err }) catch "out of memory" };
     const target = std.zig.system.resolveTargetQuery(io, query) catch |err|
-        return .{ .cpu = default, .refused = std.fmt.allocPrint(arena, "unable to resolve CPU '{s}' ('-mcpu'): {t}", .{ text, err }) catch "out of memory" };
+        return .{ .cpu = default, .refused = arena.print("unable to resolve CPU '{s}' ('-mcpu'): {t}", .{ text, err }) catch "out of memory" };
     var names: std.ArrayList(u8) = .empty;
     for (Cpu.Arch.aarch64.allFeaturesList(), 0..) |f, i| {
         if (!target.cpu.features.isEnabled(@intCast(i)) or !isScalable(f.name)) continue;
-        if (names.items.len != 0) names.appendSlice(arena, ", ") catch {};
-        names.appendSlice(arena, f.name) catch {};
+        if (names.items.len != 0) names.appendSlice(arena, ", ") catch {}; // ziglint-ignore: Z026 -- out of memory only shortens the message
+        names.appendSlice(arena, f.name) catch {}; // ziglint-ignore: Z026 -- out of memory only shortens the message
     }
     if (names.items.len == 0) return .{ .cpu = target.cpu };
-    return .{ .cpu = default, .refused = std.fmt.allocPrint(arena, "bs does not generate SVE or SME code for aarch64; '-mcpu {s}' enables {s}", .{ text, names.items }) catch "out of memory" };
+    return .{ .cpu = default, .refused = arena.print("bs does not generate SVE or SME code for aarch64; '-mcpu {s}' enables {s}", .{ text, names.items }) catch "out of memory" };
 }
 
 test resolve {
