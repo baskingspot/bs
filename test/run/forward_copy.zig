@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "1 2 3 4 5 6 7 8 9 10\n2 11 9 3 6 2 3 7 4 6 21 10\n105 12\n"
+//! stdout: "1 2 3 4 5 6 7 8 9 10\n2 11 9 3 6 2 3 7 4 6 21 10\n105 12 78 79\n"
 
 // A `const` copy of an aggregate that is only read reads its source
 // (`codegen/forward.zig`), unless the source may be written while the copy
@@ -7,7 +7,8 @@
 // value from before. The second line: a load reads the value a store or a
 // load before it found, unless something in between may write the memory.
 // The third line: a copy of a copy reads the first source, which a write
-// after the middle copy's last read still changes.
+// after the middle copy's last read still changes; a call writes a local
+// only through its address, saved before or passed to it.
 const std = @import("std");
 
 const S = struct { a: u64, b: u64, c: [6]u64 };
@@ -201,6 +202,35 @@ noinline fn copyOfCopyCall(p: *C) u64 {
     return c[0] + a.x[0] + c[1];
 }
 
+var saved_c: *C = undefined;
+
+noinline fn saveC(p: *C) void {
+    saved_c = p;
+}
+
+noinline fn writeSaved() void {
+    saved_c.x[0] = 77;
+}
+
+noinline fn copyOfSaved(v: u64) u64 {
+    var a: C = .{ .x = @splat(v), .y = v };
+    saveC(&a);
+    const c = a.x;
+    writeSaved();
+    return c[0] + a.x[0];
+}
+
+noinline fn writeC(p: *C) void {
+    p.x[1] = 77;
+}
+
+noinline fn copyOfPassed(v: u64) u64 {
+    var a: C = .{ .x = @splat(v), .y = v };
+    const c = a.x;
+    writeC(&a);
+    return c[1] + a.x[1] + v;
+}
+
 pub fn main() void {
     var s: S = .{ .a = 1, .b = 1, .c = @splat(1) };
     var buf = [_]S{ s, s };
@@ -238,6 +268,6 @@ pub fn main() void {
         escapedLocal(),     throughAlias(1),        wholeStore(1, .{ .a = 20, .b = 0 }), storeThenUse(&x, 3, 4),
     }) catch unreachable;
     var t: C = .{ .x = .{ 1, 2, 3, 4 }, .y = 5 };
-    w.print("{} {}\n", .{ copyOfCopy(1), copyOfCopyCall(&t) }) catch unreachable;
+    w.print("{} {} {} {}\n", .{ copyOfCopy(1), copyOfCopyCall(&t), copyOfSaved(1), copyOfPassed(1) }) catch unreachable;
     std.Io.File.stdout().writeStreamingAll(std.Options.debug_io, w.buffered()) catch {};
 }

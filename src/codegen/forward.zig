@@ -318,12 +318,15 @@ const Walk = struct {
             // Nothing may write the source from the load to the local's last
             // read: no write to unknown memory, and when the source is in a
             // local, no store into that local.
-            // A local forwarded already is the memory it copies, whose
-            // writes count from here to the last read.
+            // A local whose address does not escape is written only
+            // through it. A local forwarded already is the memory it
+            // copies, whose writes count from here to the last read.
             const end = @max(w.last[ii], w.pos[store]);
-            if (prefix[end + 1] - prefix[w.pos[l] + 1] != 0) continue;
             var r = w.rootOf(src) orelse none;
             while (r != none and w.flags[r].forwarded) r = w.rootOf(datas[r].ty_op.operand) orelse none;
+            if (r == none or w.flags[r].escaped) {
+                if (prefix[end + 1] - prefix[w.pos[l] + 1] != 0) continue;
+            }
             if (r != none) {
                 if (for (w.order[w.pos[l] + 1 .. end + 1]) |i| {
                     if (w.writes(i, r)) break true;
@@ -972,6 +975,14 @@ const Walk = struct {
         w.flags[r].escaped = true;
     }
 
+    /// Whether an instruction that writes through pointers it was given or
+    /// loaded may write `local` (any memory, for `none`): only if its
+    /// address escapes, since every pointer derived from it is an operand
+    /// that escapes it.
+    fn reaches(w: *const Walk, local: u32) bool {
+        return local == none or w.flags[local].escaped;
+    }
+
     /// Whether `i` may write memory a pointer can reach that does not
     /// point into a local whose address does not escape, or, with `local`
     /// set, whether it may write that local.
@@ -983,8 +994,8 @@ const Walk = struct {
             .optional_payload_ptr_set, .errunion_payload_ptr_set => data.ty_op.operand,
             // A call that returns may write anything; a panic does not
             // return.
-            .call => return ir.extraData(Ir.Call, data.pl_op.payload).data.ret_ty != .noreturn_type,
-            .atomic_store, .atomic_rmw, .cmpxchg, .assembly, .vector_store_elem, .c_va_start, .c_va_arg, .c_va_copy => return true,
+            .call => return ir.extraData(Ir.Call, data.pl_op.payload).data.ret_ty != .noreturn_type and w.reaches(local),
+            .atomic_store, .atomic_rmw, .cmpxchg, .assembly, .vector_store_elem, .c_va_start, .c_va_arg, .c_va_copy => return w.reaches(local),
             else => return false,
         };
         const r = w.rootOf(target) orelse return true;

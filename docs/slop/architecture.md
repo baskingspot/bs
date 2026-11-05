@@ -2217,8 +2217,12 @@ rewrites use it:
   `p.*` (also through Sema's inline-call argument tuple) and only read,
   becomes `p` itself when the load dominates the local in the same loop
   and nothing may write `*p` from the load to the local's last read:
-  no store through an escaped or unknown pointer, no returning call,
-  atomic or assembly, and when `p` points into a local, no store into it.
+  when `p` points into a local whose address does not escape, no store
+  into it (a call, atomic or assembly reaches it only through its
+  address, so the by-value `ctx` of AES's `encrypt` keeps no copy of
+  its key schedule across the round calls); otherwise also no store
+  through an escaped or unknown pointer, returning call, atomic or
+  assembly. A local forwarded already counts as the memory it copies.
   This removes the frame copy of `const x = p.*`, `const x = buf[i]`, and
   by-value parameters of inline calls whose callee only reads them.
   Scalar replacement leaves such copies of other memory whole for this
