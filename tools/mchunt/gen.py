@@ -266,6 +266,87 @@ def _rb_decl():
 
 RB_DECL = _rb_decl()
 
+# Packed structs for s_packstore. Fields: (name, kind, default or None);
+# kinds are ("u", bits), ("i", bits), "bool", "PE", or a packed type name.
+PK_TYPES = {
+    "PN": (6, [("x", ("u", 2), None), ("y", ("i", 4), None)]),
+    "P8": (8, [("a", ("u", 3), None), ("b", "bool", "true"), ("c", ("i", 4), None)]),
+    "P16": (16, [("a", ("u", 5), "3"), ("b", "PE", None), ("c", "PN", None), ("d", "bool", None), ("e", ("u", 1), "1")]),
+    "P32": (32, [("a", ("i", 7), None), ("b", ("u", 9), "100"), ("c", "PN", None), ("d", "PE", ".c"), ("e", "bool", None),
+                 ("f", ("u", 6), None)]),
+    "P64": (64, [("a", ("u", 20), None), ("b", ("i", 13), "-5"), ("c", "P8", None), ("d", "PE", None), ("e", ("u", 17), "0x1abcd"),
+                 ("f", "bool", "false"), ("g", ("u", 2), None)]),
+    "P128": (128, [("a", ("u", 60), None), ("b", ("i", 30), "-77"), ("c", "P16", None), ("d", ("u", 22), None)]),
+}
+PK_HOSTS = ["P8", "P16", "P32", "P64", "P128"]
+
+
+def pk_bits(kind):
+    if isinstance(kind, tuple):
+        return kind[1]
+    return {"bool": 1, "PE": 3}.get(kind) or PK_TYPES[kind][0]
+
+
+def pk_to_u64(e, kind):
+    """A packed field's value as u64 bits (u128 hosts fold their halves)."""
+    if kind == "bool":
+        return f"@as(u64, @intFromBool({e}))"
+    if kind == "PE":
+        return f"@as(u64, @intFromEnum({e}))"
+    b = pk_bits(kind)
+    if b == 128:
+        return f"blk: {{ const w: u128 = @bitCast({e}); break :blk @as(u64, @truncate(w)) ^ @as(u64, @truncate(w >> 64)); }}"
+    return f"@as(u64, @as(u{b}, @bitCast({e})))"
+
+
+def pk_from_u64(e, kind, checked=False):
+    """A field value of `kind` from the u64 expression `e`; `checked` uses
+    @intCast (a safety check that can fire) instead of @truncate."""
+    if kind == "bool":
+        return f"(({e}) & 1 == 1)"
+    if kind == "PE":
+        return f"@as(PE, @enumFromInt(@as(u3, @truncate({e})) % 5))"
+    if isinstance(kind, tuple):
+        sg, b = kind
+        if sg == "u":
+            return f"@as(u{b}, @intCast({e}))" if checked else f"@as(u{b}, @truncate({e}))"
+        if checked:
+            return f"@as(i{b}, @intCast(@as(i64, @bitCast({e}))))"
+        return f"@as(i{b}, @bitCast(@as(u{b}, @truncate({e}))))"
+    return f"@as({kind}, @bitCast(@as(u{PK_TYPES[kind][0]}, @truncate({e}))))"
+
+
+def _pk_decl():
+    out = ["const PE = enum(u3) { a, b, c, d, e };"]
+    for tn, (bits, fs) in PK_TYPES.items():
+        fl = []
+        for f, k, d in fs:
+            ty = k if isinstance(k, str) else f"{k[0]}{k[1]}"
+            fl.append(f"{f}: {ty}" + (f" = {d}" if d is not None else ""))
+        out.append(f"const {tn} = packed struct(u{bits}) {{ {', '.join(fl)} }};")
+    for tn in PK_HOSTS:
+        b = PK_TYPES[tn][0]
+        out.append(f"var g{tn}: {tn} = @bitCast(@as(u{b}, {hex((0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a >> (128 - b)))}));")
+        # A whole literal built from x, through an inlined function.
+        fs = PK_TYPES[tn][1]
+        lit = ", ".join(f".{f} = {pk_from_u64(f'x >> {i * 7}', k)}" for i, (f, k, _) in enumerate(fs))
+        out.append(f"inline fn pkSet{tn}(p: *{tn}, x: u64) void {{ p.* = .{{ {lit} }}; }}")
+    out.append("var gPA: [3]P32 = @bitCast([3]u32{ 0x01234567, 0x89abcdef, 0x0f1e2d3c });")
+    out.append("var gPS: struct { pad: u8, p: P16 } = .{ .pad = 7, .p = @bitCast(@as(u16, 0xbeef)) };")
+    # A failed safety check prints the hosts' bits, so the memory at the
+    # check is compared, and exits 0.
+    out.append("pub const panic = std.debug.FullPanic(pkPanic);")
+    out.append("fn pkPanic(msg: []const u8, _: ?usize) noreturn {")
+    out.append('    std.debug.print("ck pkpanic {s} {x} {x} {x} {x} {x} {x} {x} {x} {x}\\n", .{ msg, @as(u8, @bitCast(gP8)), '
+               '@as(u16, @bitCast(gP16)), @as(u32, @bitCast(gP32)), @as(u64, @bitCast(gP64)), @as(u128, @bitCast(gP128)), '
+               '@as(u32, @bitCast(gPA[0])), @as(u32, @bitCast(gPA[1])), @as(u32, @bitCast(gPA[2])), @as(u16, @bitCast(gPS.p)) });')
+    out.append("    std.process.exit(0);")
+    out.append("}")
+    return out
+
+
+PK_DECL = _pk_decl()
+
 SE_DECL = [
     "const SE = struct {",
     "    a: u64,",
@@ -318,6 +399,7 @@ class Gen:
         self.size = size
         self.n = 0
         self.out = []
+        self.use_pk = False
         self.placeholders = {}  # id -> Var
         self.funcs = []
         self.globals = []
@@ -1179,7 +1261,7 @@ class Gen:
             (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"), (3, "prove"),
             (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"), (2, "window"),
             (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
-            (2, "sroaesc"), (2, "retbig"), (2, "erragg"),
+            (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -2608,6 +2690,85 @@ class Gen:
                 e("}")
         self.sink(ctx, f"fold{tn}(&{w})", U64)
 
+    def s_packstore(self, ctx):
+        """Packed struct stores: whole literals through pointers, array
+        elements and fields, with defaults, field values that read the
+        destination, checked casts inside them, separate field writes,
+        volatile pointers, loops, and inlined functions."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        self.use_pk = True
+        e = lambda s_: self.emit(ctx, s_)
+        tn = self.pick(PK_HOSTS + ["P32", "P16"])
+        fs = PK_TYPES[tn][1]
+        u64 = lambda: self.int_expr(ctx, U64, 1)
+        # The destination.
+        where = self.r.randrange(5)
+        if where == 0 and tn == "P32":
+            dest = f"&gPA[{self.r.randint(0, 2)}]"
+        elif where == 1 and tn == "P16":
+            dest = "&gPS.p"
+        elif where == 2:
+            loc = self.fresh("pl")
+            e(f"var {loc}: {tn} = g{tn};")
+            dest = f"&{loc}"
+        else:
+            dest = f"&g{tn}"
+        p = self.fresh("pp")
+        vol = self.chance(0.2)
+        e(f"const {p}: *{'volatile ' if vol else ''}{tn} = {dest};")
+
+        def value(f, k, idx=None):
+            r = self.r.random()
+            if r < 0.3:
+                # Read the destination itself (an earlier or later field).
+                g, gk, _ = self.pick(fs)
+                src = pk_to_u64(f"{p}.{g}", gk)
+                extra = f" +% {idx}" if idx else ""
+                return pk_from_u64(f"({src} +% {self.r.randint(0, 3)}{extra})", k)
+            if r < 0.45 and isinstance(k, tuple):
+                # A checked cast that fires when the value does not fit.
+                small = self.r.randint(0, (1 << (k[1] - 1)) + 2)
+                return pk_from_u64(f"(@as(u64, {small}) +% (@as(u64, @as(u8, @bitCast(gP8))) & 1))", k, checked=True)
+            if r < 0.55 and k in PK_TYPES:
+                sub = PK_TYPES[k][1]
+                return ".{ " + ", ".join(f".{sf} = {pk_from_u64(u64(), sk)}" for sf, sk, _ in sub) + " }"
+            return pk_from_u64(u64() + (f" +% {idx}" if idx else ""), k)
+
+        def literal(idx=None):
+            parts = []
+            for f, k, d in fs:
+                if d is not None and self.chance(0.5):
+                    continue  # the field default
+                parts.append(f".{f} = {value(f, k, idx)}")
+            return ".{ " + ", ".join(parts) + " }" if parts else ".{}"
+
+        form = self.r.randrange(6)
+        if form <= 1:
+            e(f"{p}.* = {literal()};")
+        elif form == 2:
+            for f, k, _ in self.r.sample(fs, self.r.randint(1, len(fs))):
+                e(f"{p}.{f} = {value(f, k)};")
+        elif form == 3:
+            i = self.fresh("pi")
+            e(f"for (0..{self.r.randint(1, 4)}) |{i}| {{")
+            ctx["indent"] += 1
+            e(f"{p}.* = {literal(i)};")
+            ctx["indent"] -= 1
+            e("}")
+        elif form == 4 and not vol:
+            e(f"pkSet{tn}({p}, {u64()});")
+            f, k, _ = self.pick(fs)
+            e(f"{p}.{f} = {value(f, k)};")
+        else:
+            # Copy one host into another through the pointer, then a literal.
+            e(f"{p}.* = g{tn};")
+            e(f"{p}.* = {literal()};")
+        self.sink(ctx, pk_to_u64(f"{p}.*", tn), U64)
+        if self.chance(0.4):
+            f, k, _ = self.pick(fs)
+            self.sink(ctx, pk_to_u64(f"{p}.{f}", k), U64)
+
     def s_bigcopy(self, ctx):
         """Whole copies of a 64-256 byte struct: into locals, globals and
         through pointers, by value into callees that write the source, and
@@ -3369,6 +3530,8 @@ class Gen:
         self.emit(mctx, "mix(macc);")
         self.emit(mctx, 'std.debug.print("ck end {x}\\n", .{ck});')
         out.append("}")
+        if self.use_pk:
+            out.extend(PK_DECL)
         return self.resolve("\n".join(out) + "\n")
 
     def sink_value_main(self, ctx, e, t):
