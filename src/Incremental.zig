@@ -42,6 +42,7 @@ const ElfMerge = @import("link/ElfMerge.zig");
 const ElfInput = @import("link/ElfInput.zig");
 const ElfShared = @import("link/ElfShared.zig");
 const Replay = @import("Replay.zig");
+const compiler_rt_exports = @import("compiler_rt_exports.zig");
 
 const Incremental = @This();
 
@@ -988,7 +989,7 @@ fn sameObjectRequests(
     // compiler_rt functions, less those the Zig code needs (struck below).
     var old: std.array_hash_map.Auto(Atom.SymbolKey, void) = .empty;
     for (m.link_symbols) |ls| if (ls.kind == .import) try old.put(arena, @fromBackingInt(ls.key), {});
-    for (@import("compiler_rt_exports.zig").exports) |e| {
+    for (compiler_rt_exports.exports) |e| {
         var buf: [128]u8 = undefined;
         const key: Atom.SymbolKey = .fromName(Zcu.compilerRtKey(&buf, e[1], e[2]));
         const n = m.symbol(@backingInt(key)) orelse continue;

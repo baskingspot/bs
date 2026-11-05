@@ -15,6 +15,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const InternPool = @import("InternPool.zig");
+const cpu_mod = @import("cpu.zig");
 
 pub const OutputMode = enum { Exe, Obj, Lib };
 
@@ -66,7 +67,7 @@ pub const Options = struct {
     /// `-lc++`.
     link_libcpp: bool = false,
     /// `-mcpu` (`cpu.resolve`).
-    cpu: std.Target.Cpu = @import("cpu.zig").baseline,
+    cpu: std.Target.Cpu = cpu_mod.baseline,
     target: InternPool.Target = .x86_64_linux,
 };
 

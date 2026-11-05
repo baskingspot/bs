@@ -21,6 +21,8 @@ const Replay = @import("Replay.zig");
 const Sema = @import("Sema.zig");
 const diag = @import("diag.zig");
 const print = @import("Ir/print.zig");
+const Incremental = @import("Incremental.zig");
+const cpu_mod = @import("cpu.zig");
 
 const Zcu = @This();
 
@@ -42,7 +44,7 @@ conditional_deps: std.AutoHashMapUnmanaged(AnalUnit, []const u32) = .empty,
 /// Empty dependee maps with their capacity kept, for Sema's per-unit sets
 /// (`Sema.takeDepMap`), so that each of the many units does not grow a
 /// fresh one. Per analysis thread once Sema runs in parallel.
-dep_maps: std.ArrayList(@import("Incremental.zig").DependeeMap) = .empty,
+dep_maps: std.ArrayList(Incremental.DependeeMap) = .empty,
 /// Recently interned strings by the address of their bytes, for
 /// `Sema.getString` (allocated on first use). Sema-only.
 string_cache: []StringCacheEntry = &.{},
@@ -167,7 +169,7 @@ is_test: bool = false,
 single_threaded: bool = false,
 /// `-mcpu`: the CPU code is generated for, whose features say which vector
 /// operations the backend lowers natively (`codegen/vector.zig`).
-cpu: std.Target.Cpu = @import("cpu.zig").baseline,
+cpu: std.Target.Cpu = cpu_mod.baseline,
 /// `-lc`: `extern "c"` declarations may be used (`Sema.checkExternLibName`).
 link_libc: bool = false,
 /// `-lc++`: `extern "c++"` and `extern "unwind"` declarations may be used.
@@ -626,12 +628,12 @@ pub fn fileFqn(zcu: *Zcu, index: u32) ![]const u8 {
 }
 
 /// The root file of module `mod`, if anything loaded it.
-pub fn moduleRootFile(zcu: *Zcu, mod: @import("Frontend.zig").Module.Index) ?u32 {
+pub fn moduleRootFile(zcu: *Zcu, mod: Frontend.Module.Index) ?u32 {
     return zcu.moduleFile(mod, zcu.fe.module(mod).root_file);
 }
 
 /// The loaded file `sub_path` of module `mod`, if any.
-pub fn moduleFile(zcu: *Zcu, mod: @import("Frontend.zig").Module.Index, sub_path: []const u8) ?u32 {
+pub fn moduleFile(zcu: *Zcu, mod: Frontend.Module.Index, sub_path: []const u8) ?u32 {
     var buf: [std.fs.max_path_bytes + 16]u8 = undefined;
     const key = std.mem.print(&buf, "{d}:{s}", .{ @backingInt(mod), sub_path }) catch return null;
     const index = zcu.fe.file_map.get(key) orelse return null;
@@ -1029,7 +1031,7 @@ pub fn createContainerType(
     // compiler_rt's export blocks are not analyzed, except the stack
     // protector's when it is a root (`Frontend.ubsan_rt`).
     const f = zcu.file(file_index);
-    const skip_comptime = f.module == .compiler_rt and !(zcu.fe.ubsan_rt != null and std.mem.eql(u8, f.sub_path, @import("Frontend.zig").ssp_sub_path));
+    const skip_comptime = f.module == .compiler_rt and !(zcu.fe.ubsan_rt != null and std.mem.eql(u8, f.sub_path, Frontend.ssp_sub_path));
     for (decls) |decl_inst| {
         const d = zir.getDeclaration(decl_inst);
         const simple: []const u8 = switch (d.kind) {
@@ -1685,7 +1687,7 @@ pub fn rootFiles(zcu: *Zcu) [8]?u32 {
         if (fuzzer) |r| zcu.moduleRootFile(r) else null,
         if (fuzzer) |r| zcu.moduleRootFile(zcu.fe.module(r).std_mod) else null,
         if (ubsan_rt) |r| zcu.moduleRootFile(r) else null,
-        if (ubsan_rt != null) zcu.moduleFile(.compiler_rt, @import("Frontend.zig").ssp_sub_path) else null,
+        if (ubsan_rt != null) zcu.moduleFile(.compiler_rt, Frontend.ssp_sub_path) else null,
         if (zcu.fe.zigc) |z| zcu.moduleRootFile(z) else null,
     };
 }

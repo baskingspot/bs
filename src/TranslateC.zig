@@ -29,6 +29,8 @@ const ToolRecord = @import("ToolRecord.zig");
 const CSource = @import("CSource.zig");
 const toolchain = @import("toolchain.zig");
 const InternPool = @import("InternPool.zig");
+const cpu_mod = @import("cpu.zig");
+const builtin = @import("builtin");
 
 const Request = struct {
     source: []const u8,
@@ -94,7 +96,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         } else if (std.mem.eql(u8, arg, "-target")) {
             opts.target = next(args, &i);
         } else if (std.mem.eql(u8, arg, "-mcpu") or std.mem.startsWith(u8, arg, "-mcpu=")) {
-            const r = @import("cpu.zig").resolve(arena, io, if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else next(args, &i));
+            const r = cpu_mod.resolve(arena, io, if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else next(args, &i));
             opts.cpu = r.cpu;
             mcpu = true;
             if (r.refused) |msg| main.setUnsupported(&opts, arena, "{s}", .{msg});
@@ -146,7 +148,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
     }
     const target = opts.target orelse "native";
     var native_includes: []const []const u8 = &.{};
-    const host = @import("builtin").target;
+    const host = builtin.target;
     if (std.mem.eql(u8, target, "native") and host.cpu.arch == .aarch64 and host.os.tag == .macos) {
         main.checkTarget(&opts, arena, io, target);
     } else if (std.mem.eql(u8, target, "native")) {
@@ -154,7 +156,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
             main.setUnsupported(&opts, arena, "bs translates C only for x86_64-linux and aarch64-macos so far ('native'); pass -target x86_64-linux", .{})
         else if (std.zig.system.resolveTargetQuery(io, .{})) |native| {
             // The host's CPU, clamped, as a compilation's without -mcpu.
-            if (!mcpu) opts.cpu = @import("cpu.zig").resolve(arena, io, "native").cpu;
+            if (!mcpu) opts.cpu = cpu_mod.resolve(arena, io, "native").cpu;
             if (native.abi.isGnu()) opts.glibc_version = native.os.version_range.linux.glibc;
             if (named_libs) if (std.zig.system.NativePaths.detect(arena, io, &native, init.environ_map)) |paths| {
                 native_includes = paths.include_dirs.items;

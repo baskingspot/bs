@@ -11,6 +11,7 @@
 const std = @import("std");
 const Io = std.Io;
 const main = @import("main.zig");
+const cache = @import("cache.zig");
 
 const wasm = @embedFile("build_web_wasm");
 
@@ -48,7 +49,7 @@ pub fn serve(init: std.process.Init, opts: *const main.Options) !void {
                 var d = try Io.Dir.cwd().createDirPathOpen(io, dir, .{});
                 defer d.close(io);
                 const hit = if (d.access(io, "build-web.wasm", .{})) |_| true else |_| false;
-                if (!hit) try @import("cache.zig").writeReplace(io, d, "build-web.wasm", &.{wasm});
+                if (!hit) try cache.writeReplace(io, d, "build-web.wasm", &.{wasm});
                 try server.serveEmitDigest(&digest, .{ .flags = .{ .cache_hit = hit } });
                 try server.serveErrorBundle(.error_bundle, .empty);
             },

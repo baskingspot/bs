@@ -35,6 +35,7 @@ pub const Pack = @import("cache/Pack.zig");
 pub const atoms = @import("cache/atoms.zig");
 pub const seeds = @import("cache/seeds.zig");
 pub const results = @import("cache/results.zig");
+const Incremental = @import("Incremental.zig");
 
 /// A 128-bit content or identity hash.
 pub const Hash = u128;
@@ -146,7 +147,7 @@ fn outputDirs(name: []const u8) ?[2][34]u8 {
     if (name.len != 32) return null;
     _ = std.fmt.hexToBytes(&bytes, name) catch return null;
     var dirs: [2][34]u8 = undefined;
-    for (&dirs, @import("Incremental.zig").outputDigests(std.mem.readInt(Hash, &bytes, .little))) |*d, digest| {
+    for (&dirs, Incremental.outputDigests(std.mem.readInt(Hash, &bytes, .little))) |*d, digest| {
         d[0..2].* = "o/".*;
         d[2..].* = std.fmt.bytesToHex(digest, .lower);
     }

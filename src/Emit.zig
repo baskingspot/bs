@@ -45,6 +45,7 @@ const unroll = @import("codegen/unroll.zig");
 const forward = @import("codegen/forward.zig");
 const Sema = @import("Sema.zig");
 const cache = @import("cache.zig");
+const Builtin = @import("Builtin.zig");
 
 const Emit = @This();
 
@@ -121,7 +122,7 @@ link_diagnostic: ?Diag.Diagnostic = null,
 /// `--stack`: the executable's main thread stack size.
 stack_size: u64 = 16 * 1024 * 1024,
 /// aarch64-macos: the minimum macOS, LC_BUILD_VERSION's.
-macos_min: std.SemanticVersion = @import("Builtin.zig").macos_default.min,
+macos_min: std.SemanticVersion = Builtin.macos_default.min,
 /// aarch64-macos: the SDK's version (`main.Options.macos_sdk`),
 /// LC_BUILD_VERSION's.
 macos_sdk: ?std.SemanticVersion = null,

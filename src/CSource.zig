@@ -21,6 +21,11 @@ const cache = @import("cache.zig");
 const diag = @import("diag.zig");
 const ToolRecord = @import("ToolRecord.zig");
 const toolchain = @import("toolchain.zig");
+const cpu_mod = @import("cpu.zig");
+const ar = @import("link/Archive.zig");
+const Incremental = @import("Incremental.zig");
+const main = @import("main.zig");
+const Musl = @import("Musl.zig");
 
 const CSource = @This();
 
@@ -134,7 +139,7 @@ pub const Options = struct {
     /// for `x86_64-linux`.
     glibc_version: ?std.SemanticVersion,
     /// `-mcpu` (`cpu.resolve`).
-    cpu: std.Target.Cpu = @import("cpu.zig").baseline,
+    cpu: std.Target.Cpu = cpu_mod.baseline,
     link_libc: bool,
     /// `-lc++`: libc++'s headers and configuration for every source, as
     /// upstream gives them to C sources too.
@@ -451,7 +456,7 @@ pub const Batch = struct {
             const bytes = try Io.Dir.cwd().readFileAlloc(io, jobs[0].out_path, arena, .unlimited);
             return cache.writeReplace(io, Io.Dir.cwd(), a.path, &.{bytes});
         }
-        const members = try arena.alloc(@import("link/Archive.zig").Input, jobs.len);
+        const members = try arena.alloc(ar.Input, jobs.len);
         for (members, jobs) |*m, j| m.* = .{ .name = Io.Dir.path.basename(j.out_path), .bytes = try Io.Dir.cwd().readFileAlloc(io, j.out_path, arena, .unlimited) };
         try Io.Dir.cwd().createDirPath(io, Io.Dir.path.dirname(a.path).?);
         // Marked as a tool, and held until the batch reads it.
@@ -461,7 +466,7 @@ pub const Batch = struct {
                 return err;
             };
         } else |_| {}
-        try @import("link/Archive.zig").write(b.gpa, io, Io.Dir.cwd(), a.path, members);
+        try ar.write(b.gpa, io, Io.Dir.cwd(), a.path, members);
     }
 };
 
@@ -521,7 +526,7 @@ const Summary = struct {
     const Entry = extern struct { inode: u64, size: u64, mtime: i64, path_len: u32, _pad: u32 = 0 };
 
     fn path(arena: std.mem.Allocator, io: Io, cwd: []const u8, local: []const u8, lib: []const u8, zig_id: []const u8, common: Common, sources: []const CSource, o: Options) ![]const u8 {
-        _, const bs_key = try @import("Incremental.zig").compilationKey(arena, io, &.{}, lib, "c batch");
+        _, const bs_key = try Incremental.compilationKey(arena, io, &.{}, lib, "c batch");
         var h: std.crypto.hash.Blake3 = .init(.{});
         h.update(std.mem.asBytes(&bs_key));
         h.update(zig_id);
@@ -1237,7 +1242,7 @@ const musl_libc: RuntimeLib = .{ .name = "c", .dir = "libc", .files = &.{}, .mus
 /// `-fno-builtin`, sections, the compilation's PIC, which is off, and
 /// unwind tables, no libc), then musl's own (`Musl.ccArgs`).
 fn muslJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: RuntimeLib, common: Common, lib: []const u8, o: Options) !void {
-    const files = if (rl.object) rl.files else try @import("Musl.zig").sources(arena, o.cpu.arch);
+    const files = if (rl.object) rl.files else try Musl.sources(arena, o.cpu.arch);
     for (files) |file| {
         const lang: Lang = if (std.mem.endsWith(u8, file, ".S")) .asm_cpp else if (std.mem.endsWith(u8, file, ".s")) .assembly else .c;
         var argv: std.ArrayList([]const u8) = .empty;
@@ -1256,7 +1261,7 @@ fn muslJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Runti
             .libcpp = false,
             .libunwind = false,
         });
-        try argv.appendSlice(arena, try @import("Musl.zig").ccArgs(arena, lib, o.cpu.arch, @import("Musl.zig").wantsO3(file)));
+        try argv.appendSlice(arena, try Musl.ccArgs(arena, lib, o.cpu.arch, Musl.wantsO3(file)));
         if (rl.object) try argv.append(arena, "-DCRT");
         try out.append(arena, .{ .argv = argv.items, .dep_at = dep_at });
     }
@@ -1341,7 +1346,7 @@ pub fn libcIncludeDirs(arena: std.mem.Allocator, io: Io, environ: *const std.pro
         };
     } else if (native_abi) if (nativeLibcIncludes(arena, io, environ, global_cache) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
-        else => @import("main.zig").fatal("failed to find libc installation: {t}", .{err}),
+        else => main.fatal("failed to find libc installation: {t}", .{err}),
     }) |dirs| return .{ .includes = dirs };
     return .{ .includes = (try std.zig.LibCDirs.detectFromBuilding(arena, .{ .root_dir = .cwd(), .sub_path = lib }, target)).libc_include_dir_list };
 }

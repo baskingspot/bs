@@ -4,6 +4,7 @@
 //! docs/slop/architecture.md for the output form and its rules.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Writer = std.Io.Writer;
 
 /// A kind of error, stable once released: never renamed or reused. Text
@@ -2609,7 +2610,7 @@ test matchFormat {
 test "every AstGen error format has a code" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const path = try std.Io.Dir.path.join(gpa, &.{ @import("build_options").zig_lib_dir, "std", "zig", "AstGen.zig" });
+    const path = try std.Io.Dir.path.join(gpa, &.{ build_options.zig_lib_dir, "std", "zig", "AstGen.zig" });
     defer gpa.free(path);
     const src = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4 << 20));
     defer gpa.free(src);

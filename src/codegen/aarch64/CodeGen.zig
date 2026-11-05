@@ -57,6 +57,7 @@ const Encoder = @import("Encoder.zig");
 const vector = @import("vector.zig");
 const Ssa = @import("../Ssa.zig");
 const switch_br = @import("../switch_br.zig");
+const print = @import("../../Ir/print.zig");
 const Reg = Encoder.Reg;
 const VReg = Encoder.VReg;
 const Size = Encoder.Size;
@@ -5962,7 +5963,7 @@ const FmtType = struct {
     ip: *const InternPool,
     ty: Index,
     pub fn format(f: FmtType, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try @import("../../Ir/print.zig").printType(f.ip, f.ty, w);
+        try print.printType(f.ip, f.ty, w);
     }
 };
 

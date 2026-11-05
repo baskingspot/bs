@@ -26,6 +26,12 @@ const CSource = @import("CSource.zig");
 const toolchain = @import("toolchain.zig");
 const cpu_mod = @import("cpu.zig");
 const InternPool = @import("InternPool.zig");
+const BuildRunner = @import("BuildRunner.zig");
+const TranslateC = @import("TranslateC.zig");
+const zig_fmt = @import("fmt.zig");
+const ast_check = @import("ast_check.zig");
+const Sema = @import("Sema.zig");
+const print = @import("Ir/print.zig");
 
 pub const zig_version = "0.17.1";
 
@@ -318,8 +324,8 @@ pub fn main(init_std: std.process.Init) !void {
     const raw_args = try init.minimal.args.toSlice(arena);
     if (raw_args.len < 2) fatalUsage();
     const cmd = raw_args[1];
-    if (std.mem.eql(u8, cmd, "build")) return @import("BuildRunner.zig").run(init, raw_args[2..]);
-    if (std.mem.eql(u8, cmd, "translate-c")) return @import("TranslateC.zig").run(init, raw_args[2..]);
+    if (std.mem.eql(u8, cmd, "build")) return BuildRunner.run(init, raw_args[2..]);
+    if (std.mem.eql(u8, cmd, "translate-c")) return TranslateC.run(init, raw_args[2..]);
     const args = raw_args;
     const command: Command = if (std.mem.eql(u8, cmd, "build-exe"))
         .build_exe
@@ -337,9 +343,9 @@ pub fn main(init_std: std.process.Init) !void {
         try Io.File.stdout().writeStreamingAll(init.io, zig_version ++ "\n");
         return;
     } else if (std.mem.eql(u8, cmd, "fmt")) {
-        return @import("fmt.zig").run(init.gpa, arena, init.io, raw_args[2..]);
+        return zig_fmt.run(init.gpa, arena, init.io, raw_args[2..]);
     } else if (std.mem.eql(u8, cmd, "ast-check")) {
-        return @import("ast_check.zig").run(arena, init.io, raw_args[2..]);
+        return ast_check.run(arena, init.io, raw_args[2..]);
     } else if (std.mem.eql(u8, cmd, "env")) {
         return printEnv(init);
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
@@ -1404,7 +1410,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         return error.NamesRerun;
     }
     // A lazy edit build leaves the test list as the last build linked it.
-    if (is_test and !(if (zcu.replay) |r| r.lazy else false)) @import("Sema.zig").populateTestFunctions(&zcu) catch |err| switch (err) {
+    if (is_test and !(if (zcu.replay) |r| r.lazy else false)) Sema.populateTestFunctions(&zcu) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {},
     };
@@ -1953,7 +1959,7 @@ const DumpSink = struct {
     w: *Io.Writer,
 
     pub fn function(s: *DumpSink, zcu: *Zcu, ir: *const Ir) !void {
-        try @import("Ir/print.zig").dump(ir, &zcu.ip, s.w);
+        try print.dump(ir, &zcu.ip, s.w);
     }
 };
 
@@ -2988,7 +2994,7 @@ test {
     _ = @import("codegen/prove.zig");
     _ = @import("InternPool.zig");
     _ = Zcu;
-    _ = @import("Sema.zig");
+    _ = Sema;
     _ = @import("diag.zig");
     _ = Ir;
     _ = Emit;

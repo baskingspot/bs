@@ -26,6 +26,8 @@ const Type = @import("Type.zig");
 const Zcu = @import("Zcu.zig");
 const print = @import("Ir/print.zig");
 const vector = @import("codegen/vector.zig");
+const diag = @import("diag.zig");
+const Incremental = @import("Incremental.zig");
 
 const Sema = @This();
 
@@ -2097,12 +2099,12 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
 /// Reports an error at `src`. Its code follows from `fmt`
 /// (`diag.formatCode`); a new format needs an entry there.
 pub fn fail(sema: *Sema, block: *const Block, src: Src, comptime fmt: []const u8, args: anytype) CompileError {
-    return sema.failCode(block, src, comptime @import("diag.zig").formatCode(fmt), fmt, args);
+    return sema.failCode(block, src, comptime diag.formatCode(fmt), fmt, args);
 }
 
 /// `fail` with a code other than its format's. As upstream, each
 /// declared type the message names gets a note at its declaration.
-fn failCode(sema: *Sema, block: *const Block, src: Src, code: @import("diag.zig").Code, comptime fmt: []const u8, args: anytype) CompileError {
+fn failCode(sema: *Sema, block: *const Block, src: Src, code: diag.Code, comptime fmt: []const u8, args: anytype) CompileError {
     _ = block;
     const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
     try sema.zcu.addErrorCode(sema.file, src.span(tree), code, fmt, args);
@@ -2157,7 +2159,6 @@ fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames
             }
         }
     };
-    const diag = @import("diag.zig");
     const last = &zcu.errors.items[zcu.errors.items.len - 1];
     // The name accessed after the missing one (`AnyWriter` in
     // `std.io.AnyWriter`), for a hint about that path.
@@ -2182,7 +2183,6 @@ fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames
 /// at `name` with no migration hint.
 fn attachCandidates(sema: *Sema, names: []const []const u8, name: []const u8, fields: bool) !void {
     const zcu = sema.zcu;
-    const diag = @import("diag.zig");
     const last = &zcu.errors.items[zcu.errors.items.len - 1];
     var close: std.ArrayList([]const u8) = .empty;
     try diag.closeNames(sema.arena, name, names, fields, &close);
@@ -2282,7 +2282,7 @@ fn failSwitchEnum(sema: *Sema, block: *Block, src: Src, enum_ty: Index, union_ty
         } else try zcu.addNote(sema.file, span, "unhandled enumeration value: '{s}'", .{name});
     }
     if (decl) |d| try zcu.addDeclNote(d.file, decl_tree.?.nodeToSpan(d.node), "enum '{f}' declared here", .{sema.fmtType(enum_ty)});
-    zcu.errors.items[zcu.errors.items.len - 1].fix = try @import("diag.zig").prongsFix(zcu.arena.allocator(), tree, span.main, prongs);
+    zcu.errors.items[zcu.errors.items.len - 1].fix = try diag.prongsFix(zcu.arena.allocator(), tree, span.main, prongs);
     return err;
 }
 
@@ -2372,7 +2372,6 @@ fn failUnsupported(sema: *Sema, block: *Block, src: Src, what: []const u8) Compi
 /// (`diag.originNote`), as `Zcu.argumentOrigin` does for generic calls,
 /// whose arguments' types it reads from the instance.
 noinline fn noteInlineArgOrigin(sema: *Sema, block: *Block, src: Src, args: []const Ref, has_receiver: bool, n_errors: usize) CompileError!void {
-    const diag = @import("diag.zig");
     const zcu = sema.zcu;
     if (zcu.errors.items.len != n_errors + 1) return;
     {
@@ -2409,14 +2408,14 @@ fn inLib(sema: *Sema, file: u32) bool {
     return std.mem.startsWith(u8, root, fe.zig_lib_dir);
 }
 
-fn noteCallSite(sema: *Sema, block: *Block, src: Src, n_errors: usize, err: CompileError, kind: @import("diag.zig").CallKind) CompileError {
+fn noteCallSite(sema: *Sema, block: *Block, src: Src, n_errors: usize, err: CompileError, kind: diag.CallKind) CompileError {
     _ = block;
     return sema.noteCallSiteIn(sema.file, src, n_errors, err, kind);
 }
 
 /// `noteCallSite` for a call in `file`, which is not the file being
 /// analyzed while the callee's parameter or return types are.
-fn noteCallSiteIn(sema: *Sema, file: u32, src: Src, n_errors: usize, err: CompileError, kind: @import("diag.zig").CallKind) CompileError {
+fn noteCallSiteIn(sema: *Sema, file: u32, src: Src, n_errors: usize, err: CompileError, kind: diag.CallKind) CompileError {
     // Only for an error of this unit's analysis: a function body analyzed
     // meanwhile on its own (for its inferred error set) reports its errors
     // without the frames that happened to reach it, as upstream.
@@ -2888,7 +2887,7 @@ fn declareDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !void {
     // Declaring a dependency again changes nothing, unless it turns a
     // conditional one plain, or lowering or a memoizable call in progress
     // records it too.
-    const h: u8 = @truncate(@import("Incremental.zig").DependeeContext.hash(.{}, dependee));
+    const h: u8 = @truncate(Incremental.DependeeContext.hash(.{}, dependee));
     const slot = &sema.dep_cache[h];
     if (sema.bc == null) {
         if (sema.memo_start) |start| {
@@ -3895,7 +3894,7 @@ noinline fn failShiftAmount(sema: *Sema, block: *Block, src: Src, ty: Index, val
     const info = Type.intInfo(ip, operand_ty);
     const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
     const span = src.span(tree);
-    const shift = @import("diag.zig").shiftOf(tree, span.start, span.end);
+    const shift = diag.shiftOf(tree, span.start, span.end);
     const lhs = if (shift) |sh| sh.lhs else "x";
     const amount = ip.intValue(u64, val);
     try sema.zcu.addNote(sema.file, span, "shifting '{f}' by {d} or more is not allowed; '{f}' holds 0 to {d}", .{ sema.fmtType(operand_ty), info.bits, sema.fmtType(ty), info.bits -| 1 });
@@ -5042,7 +5041,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 const err = sema.fail(block, src.operandSrc(0), "expected error set type, found '{f}'", .{sema.fmtType(.bool_type)});
                 const span = src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
                 try sema.zcu.addNote(sema.file, span, "'||' merges error sets; 'or' performs boolean OR", .{});
-                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .exact, .edits = try sema.zcu.arena.allocator().dupe(@import("diag.zig").RawEdit, &.{.{ .start = span.main, .end = span.main + 2, .text = "or" }}) };
+                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .exact, .edits = try sema.zcu.arena.allocator().dupe(diag.RawEdit, &.{.{ .start = span.main, .end = span.main + 2, .text = "or" }}) };
                 break :blk err;
             }
             const a = try sema.resolveType(block, src.operandSrc(0), extra.lhs);
@@ -7719,7 +7718,7 @@ fn importZon(sema: *Sema, block: *Block, src: Src, path: []const u8, dep: ?Front
     if (zoir.hasCompileErrors()) {
         const e = zoir.compile_errors[0];
         const msg = e.msg.get(&zoir);
-        try sema.zcu.addEmbedError(@intCast(index), zoirSpan(&tree, e.token, e.node_or_offset), @import("diag.zig").classifyAstGen(msg), "{s}", .{msg});
+        try sema.zcu.addEmbedError(@intCast(index), zoirSpan(&tree, e.token, e.node_or_offset), diag.classifyAstGen(msg), "{s}", .{msg});
         for (e.getNotes(&zoir)) |note|
             try sema.zcu.addEmbedNote(@intCast(index), zoirSpan(&tree, note.token, note.node_or_offset), "{s}", .{note.msg.get(&zoir)});
         return sema.failedHere();
@@ -7764,7 +7763,7 @@ const Zon = struct {
     /// import, as upstream.
     fn fail(z: *const Zon, node: Node, comptime fmt: []const u8, args: anytype) CompileError {
         const sema = z.sema;
-        try sema.zcu.addEmbedError(z.embed, z.tree.nodeToSpan(node.getAstNode(z.zoir)), comptime @import("diag.zig").formatCode(fmt), fmt, args);
+        try sema.zcu.addEmbedError(z.embed, z.tree.nodeToSpan(node.getAstNode(z.zoir)), comptime diag.formatCode(fmt), fmt, args);
         try sema.zcu.addNote(sema.file, z.src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "imported here", .{});
         return sema.failedHere();
     }
@@ -8720,7 +8719,7 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
             const span = src.span(tree);
             if (std.mem.eql(u8, tree.source[span.start..span.end], try sema.arena.print(".{s}", .{name}))) {
                 const arena = sema.zcu.arena.allocator();
-                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .exact, .edits = try arena.dupe(@import("diag.zig").RawEdit, &.{.{ .start = span.start, .end = span.end, .text = try arena.print(".{{ .{s} = .{{}} }}", .{name}) }}) };
+                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .exact, .edits = try arena.dupe(diag.RawEdit, &.{.{ .start = span.start, .end = span.end, .text = try arena.print(".{{ .{s} = .{{}} }}", .{name}) }}) };
             }
             return err;
         }
@@ -8856,7 +8855,7 @@ noinline fn failCoerce(sema: *Sema, block: *Block, src: Src, dest_ty: Index, ins
                 const text = tree.source[span.start..span.end];
                 if (text.len != 0 and for (text) |c| {
                     if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '.') break false;
-                } else true) sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(@import("diag.zig").RawEdit, &.{.{ .start = span.end, .end = span.end, .text = try sema.zcu.arena.allocator().print("[0..{d}]", .{ip.keyPayload(.array_type, d.child).len}) }}) };
+                } else true) sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(diag.RawEdit, &.{.{ .start = span.end, .end = span.end, .text = try sema.zcu.arena.allocator().print("[0..{d}]", .{ip.keyPayload(.array_type, d.child).len}) }}) };
                 return err;
             };
             if (sema.isUndef(v) or ip.keyPayload(.slice, v).len == .undef_usize) {
@@ -8893,7 +8892,7 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
             // `&` gives a constant pointer to a temporary or a constant.
             if (w.flags.is_const) {
                 const span = src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
-                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(@import("diag.zig").RawEdit, &.{.{ .start = span.start, .end = span.start, .text = "&" }}) };
+                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(diag.RawEdit, &.{.{ .start = span.start, .end = span.start, .text = "&" }}) };
             }
             return err;
         }
@@ -8934,7 +8933,7 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
                     const source = try sema.zcu.fe.source(@fromBackingInt(loc.file));
                     const last = &sema.zcu.errors.items[sema.zcu.errors.items.len - 1];
                     last.hint = try arena.print("return type '!{s}' lets the function return errors", .{source[loc.span.start..loc.span.end]});
-                    last.fix = .{ .applicability = .maybe, .edits = try arena.dupe(@import("diag.zig").RawEdit, &.{.{ .start = loc.span.start, .end = loc.span.start, .text = "!" }}), .file = loc.file };
+                    last.fix = .{ .applicability = .maybe, .edits = try arena.dupe(diag.RawEdit, &.{.{ .start = loc.span.start, .end = loc.span.start, .text = "!" }}), .file = loc.file };
                 }
             } else try sema.zcu.addDeclNote(loc.file, loc.span, "function return type declared here", .{});
         },
@@ -8956,7 +8955,7 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
         },
         else => null,
     };
-    if (cast) |c| try sema.addFix(src, @import("diag.zig").wrapFix, .{ c, ")" });
+    if (cast) |c| try sema.addFix(src, diag.wrapFix, .{ c, ")" });
     // Where the value comes from, after upstream's notes.
     // The payload need only be of the wanted kind (`[]u8` for `[]const u8`).
     if (ip.keyTag(actual) == .error_union_type and Type.class(ip, ip.keyPayload(.error_union_type, actual).payload_type) == Type.class(ip, wanted))
@@ -11095,7 +11094,7 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
                 const l = src.operandSrc(0).span(tree);
                 const r = src.operandSrc(1).span(tree);
                 if (l.end <= r.start and std.mem.eql(u8, std.mem.trim(u8, tree.source[l.end..r.start], " \t\r\n"), "/"))
-                    sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(@import("diag.zig").RawEdit, &.{
+                    sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(diag.RawEdit, &.{
                         .{ .start = l.start, .end = l.start, .text = "@divTrunc(" },
                         .{ .start = l.end, .end = r.start, .text = ", " },
                         .{ .start = r.end, .end = r.end, .text = ")" },
@@ -15300,8 +15299,7 @@ const OriginKind = @import("diag.zig").OriginKind;
 /// (`diag.originNote`), as agents need when the mistake is at the
 /// declaration rather than the use. `try` is offered only where the
 /// function can return the error.
-fn noteOrigin(sema: *Sema, block: *Block, operand: Src, depth: @import("diag.zig").OriginDepth, kind: OriginKind) CompileError!void {
-    const diag = @import("diag.zig");
+fn noteOrigin(sema: *Sema, block: *Block, operand: Src, depth: diag.OriginDepth, kind: OriginKind) CompileError!void {
     const zcu = sema.zcu;
     const tree = try zcu.fe.tree(@fromBackingInt(sema.file));
     const span = operand.span(tree);
@@ -16308,7 +16306,7 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
 /// Notes on the most recent error, about the value at `src` (`depth`
 /// into it) of type `ty`, that an optional or error union needs
 /// unwrapping first, and where it comes from (`noteOrigin`).
-fn noteUnwrap(sema: *Sema, block: *Block, src: Src, depth: @import("diag.zig").OriginDepth, ty: Index) CompileError!void {
+fn noteUnwrap(sema: *Sema, block: *Block, src: Src, depth: diag.OriginDepth, ty: Index) CompileError!void {
     const kind: OriginKind = switch (Type.class(sema.ip, ty)) {
         .optional => .optional,
         .error_union => .error_union,
@@ -17063,7 +17061,7 @@ noinline fn failExpectedOptional(sema: *Sema, block: *Block, src: Src, ty: Index
         const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
         const span = src.span(tree);
         try sema.zcu.addNote(sema.file, span, "consider using 'try', 'catch', or 'if'", .{});
-        sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = try @import("diag.zig").keywordFix(sema.zcu.arena.allocator(), tree, span.main, .keyword_orelse, "catch");
+        sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = try diag.keywordFix(sema.zcu.arena.allocator(), tree, span.main, .keyword_orelse, "catch");
     }
     try sema.addDeclaredHereNote(ty);
     return err;
@@ -17245,7 +17243,7 @@ noinline fn failExpectedErrorUnion(sema: *Sema, block: *Block, src: Src, ty: Ind
     if (Type.class(sema.ip, ty) == .optional) {
         const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
         const last = &sema.zcu.errors.items[sema.zcu.errors.items.len - 1];
-        last.fix = try @import("diag.zig").keywordFix(sema.zcu.arena.allocator(), tree, src.span(tree).main, .keyword_catch, "orelse");
+        last.fix = try diag.keywordFix(sema.zcu.arena.allocator(), tree, src.span(tree).main, .keyword_catch, "orelse");
         if (last.fix != null) last.hint = "'catch' unwraps an error union; 'orelse' unwraps an optional";
     }
     return err;
@@ -17300,7 +17298,7 @@ fn zirTry(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_ptr: bool) Compi
         // Delete the `try `, unless the callee is what lacks the `!`.
         if (try sema.callsErrorBody(eu)) |callee| {
             if (try sema.fnTypeExprSrc(callee, null)) |loc| try sema.zcu.addDeclNote(loc.file, loc.span, "the function returns errors, but its return type has no '!'", .{});
-        } else sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(@import("diag.zig").RawEdit, &.{.{ .start = src.span(tree).main, .end = operand_span.start, .text = "" }}) };
+        } else sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(diag.RawEdit, &.{.{ .start = src.span(tree).main, .end = operand_span.start, .text = "" }}) };
         return err;
     }
     const is_non_err = try sema.analyzeIsNonErr(parent, src, eu);
@@ -17652,7 +17650,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
                     try sema.zcu.addNote(sema.file, span, "unhandled error value: 'error.{s}'", .{p.*});
                     p.* = try sema.arena.print("error.{f} => @panic(\"TODO\"),", .{std.zig.fmtId(p.*)});
                 }
-                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = try @import("diag.zig").prongsFix(sema.zcu.arena.allocator(), tree, span.main, prongs.items);
+                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = try diag.prongsFix(sema.zcu.arena.allocator(), tree, span.main, prongs.items);
                 return err;
             }
         } else if (!sema.isOwnIes(operand_ty))
@@ -19065,7 +19063,7 @@ fn failIgnoredError(sema: *Sema, block: *Block, src: Src, ty: Index, err: Compil
             .void, .noreturn => true,
             else => false,
         };
-        try sema.addFix(src, @import("diag.zig").tryFix, .{payload_void});
+        try sema.addFix(src, diag.tryFix, .{payload_void});
     }
     return err;
 }

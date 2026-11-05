@@ -4,6 +4,7 @@
 //! in docs/slop/architecture.md). Read in place.
 
 const std = @import("std");
+const Atom = @import("Atom.zig");
 const elf = std.elf;
 const Allocator = std.mem.Allocator;
 
@@ -45,7 +46,7 @@ pub const Error = error{ OutOfMemory, InvalidShared };
 /// DT_NEEDED name if it has no DT_SONAME: as upstream's linkers name
 /// such a library, the file name of one `-l` found, else its path as
 /// given.
-pub fn parse(arena: Allocator, path: []const u8, needed_name: []const u8, bytes: []const u8, arch: @import("Atom.zig").Unwind.Arch) Error!ElfShared {
+pub fn parse(arena: Allocator, path: []const u8, needed_name: []const u8, bytes: []const u8, arch: Atom.Unwind.Arch) Error!ElfShared {
     if (bytes.len < @sizeOf(elf.Elf64_Ehdr) or !std.mem.eql(u8, bytes[0..4], elf.MAGIC)) return error.InvalidShared;
     const eh = std.mem.bytesToValue(elf.Elf64_Ehdr, bytes[0..@sizeOf(elf.Elf64_Ehdr)]);
     if (eh.e_ident[elf.EI.CLASS] != elf.ELFCLASS64 or eh.e_ident[elf.EI.DATA] != elf.ELFDATA2LSB) return error.InvalidShared;

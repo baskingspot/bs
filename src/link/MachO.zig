@@ -73,6 +73,7 @@ const Dwarf = @import("Dwarf.zig");
 const dwarf_language = std.dwarf.LANG.C99;
 const Elf = @import("Elf.zig");
 const a64 = @import("aarch64.zig");
+const MachODylib = @import("MachODylib.zig");
 const pageDelta = a64.pageDelta;
 const patchAdrp = a64.patchAdrp;
 const pageOffScale = a64.pageOffScale;
@@ -3618,7 +3619,7 @@ test "a dylib has its install name, exports and fixups, and no __PAGEZERO or ent
     // What an executable linking against it reads back.
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    const read = try @import("MachODylib.zig").parse(arena_state.allocator(), "libt.dylib", out);
+    const read = try MachODylib.parse(arena_state.allocator(), "libt.dylib", out);
     try std.testing.expectEqualStrings("@rpath/libt.dylib", read.install_name);
     try std.testing.expectEqual(0x10203, read.current_version);
     try std.testing.expectEqual(2, read.exports.count());
