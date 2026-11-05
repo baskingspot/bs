@@ -1481,7 +1481,7 @@ class Gen:
             (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
             (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
-            (2, "swx"), (2, "scopenum"), (2, "argbase"),
+            (2, "swx"), (2, "scopenum"), (2, "argbase"), (2, "mulbound"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -3107,6 +3107,143 @@ class Gen:
             self.sink(ctx, f"{sl}[{j}]" if not near else f"{sl}[{j} + 1]", U32)
             ctx["indent"] -= 1
             e("}")
+
+    def s_mulbound(self, ctx):
+        """Checked products of widened operands: proven when the operands'
+        bounds multiply into the type (u32 x u32 in u64, u64 x u64 in u128),
+        not when one bit more could overflow (u33 x u32, u127, u65); operands
+        narrowed by masks, % and guards with near misses; products fed into
+        indices and other products; signed and mixed operands; constants;
+        @mulWithOverflow; the same product on two paths."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        ctx["fn"].risky = True
+        e = lambda s_: self.emit(ctx, s_)
+        U = lambda b: Int(False, b)
+        I = lambda b: Int(True, b)
+        # Operand values picked at run time from each width's interesting values.
+        def operand(t, near_max=True):
+            mx = (1 << (t.bits - 1)) - 1 if t.signed else (1 << t.bits) - 1
+            mn = -(1 << (t.bits - 1)) if t.signed else 0
+            vals = sorted(v for v in {0, 1, 2, 3, mx, mx - 1, mx >> 1, (mx >> 1) + 1, mn, mn + 1} if mn <= v <= mx)
+            sel, v = self.fresh("mv"), self.fresh("mo")
+            e(f"var {sel}: [{len(vals)}]{t.name()} = .{{ {', '.join(f'@as({t.name()}, {x})' for x in vals)} }};")
+            e(f"_ = &{sel};")
+            e(f"const {v}: {t.name()} = {sel}[@as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % {len(vals)}];")
+            return v
+        k = self.r.randrange(9)
+        r = self.fresh("mp")
+        if k == 0:
+            # Widened products: fits (a+b <= W) or one bit over.
+            W = self.pick([64, 64, 128, 127, 96])
+            ta, tb = self.pick([(32, 32), (33, 32), (16, 48), (31, 33), (32, 31), (48, 17), (64, 64), (65, 64), (64, 63), (63, 64),
+                                (1, 64), (40, 24)])
+            if ta + tb > W + 1:
+                ta, tb = W // 2, W - W // 2 + self.r.randint(0, 1)
+            a, b = operand(U(ta)), operand(U(tb))
+            if self.chance(0.4):
+                wa = self.fresh("mw")
+                e(f"const {wa}: u{W} = {a};")
+                e(f"const {r}: u{W} = {wa} * @as(u{W}, {b});")
+            else:
+                e(f"const {r}: u{W} = @as(u{W}, {a}) * @as(u{W}, {b});")
+            self.sink(ctx, f"@as(u64, @truncate({r} ^ ({r} >> 32)))", U64)
+        elif k == 1:
+            # Narrowed by a mask, % or a guard; near misses one past.
+            x, y = self.int_expr(ctx, U64, 1), self.int_expr(ctx, U64, 1)
+            near = self.chance(0.35)
+            a, b = self.fresh("ma"), self.fresh("mb")
+            how = self.r.randrange(3)
+            if how == 0:
+                e(f"const {a}: u64 = {x} & 0x{'1ffff' if near else 'ffff'};")
+                e(f"const {b}: u64 = ({y} & 0xffff_ffff_ffff) {'+ 0' if not near else '| 0x1_0000_0000_0000'};")
+                e(f"const {r}: u64 = {a} * {b};")
+            elif how == 1:
+                e(f"const {a}: u64 = {x} % {1000 if not near else 1001};")
+                e(f"const {b}: u64 = {y} % {(((1 << 64) - 1) // 1000) + (2 if near else 0)};")
+                e(f"const {r}: u64 = {a} * {b};")
+            else:
+                e(f"const {a}: u64 = {x};")
+                e(f"const {b}: u64 = {y} >> {44 if not near else 43};")
+                e(f"var {r}: u64 = 7;")
+                e(f"if ({a} < (1 << 20){' + 1' if near else ''}) {r} = {a} * {b};")
+            self.sink(ctx, r, U64)
+        elif k == 2:
+            # A product as an index, and as an operand of another product.
+            n = self.r.randint(2, 9)
+            arr = self.fresh("mr")
+            e(f"var {arr}: [{n * n}]u16 = @splat({self.int_expr(ctx, Int(False, 16), 1)});")
+            e(f"{arr}[{self.r.randrange(n * n)}] ^= 5;")
+            i, j = self.fresh("mi"), self.fresh("mj")
+            near = self.chance(0.3)
+            e(f"const {i}: usize = @as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % {n + (1 if near else 0)};")
+            e(f"const {j}: usize = @as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % {n};")
+            self.sink(ctx, f"{arr}[{i} * {n} + {j}]", Int(False, 16))
+            a, b, c = operand(U(16)), operand(U(16)), operand(U(31 if not near else 32))
+            e(f"const {r}: u64 = (@as(u64, {a}) * @as(u64, {b})) * @as(u64, {c});")
+            self.sink(ctx, r, U64)
+            self.sink(ctx, f"(@as(u32, {a}) *% @as(u32, {b})) +% {c}", U32)
+        elif k == 3:
+            # Signed and mixed: nothing to prove.
+            a, b = operand(I(self.pick([32, 31, 16]))), operand(self.pick([I(32), U(31), U(32)]))
+            e(f"const {r}: i64 = @as(i64, {a}) * @as(i64, {b});")
+            self.sink(ctx, f"@as(u64, @bitCast({r}))", U64)
+        elif k == 4:
+            # Constant operands.
+            a = operand(U(self.pick([32, 33, 64])))
+            if self.chance(0.5):
+                e(f"const {r}: u64 = @as(u64, @truncate({a})) * 0xffff_ffff;")
+                self.sink(ctx, r, U64)
+            else:
+                w = self.pick([128, 128, 127])
+                e(f"const {r}: u{w} = @as(u{w}, {a}) * std.math.maxInt(u64);")
+                self.sink(ctx, f"@as(u64, @truncate({r} >> 1))", U64)
+        elif k == 5:
+            # @mulWithOverflow with the overflow bit used.
+            t = self.pick([U(32), U(64), U(16), I(32)])
+            a, b = operand(t), operand(t)
+            e(f"const {r} = @mulWithOverflow({a}, {b});")
+            e(f"if ({r}[1] == 0) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"{r}[0]", t)
+            self.sink(ctx, f"{a} * {b}", t)
+            ctx["indent"] -= 1
+            e("} else {")
+            ctx["indent"] += 1
+            self.sink(ctx, f"@as(u8, 0xee)", Int(False, 8))
+            ctx["indent"] -= 1
+            e("}")
+        elif k == 6:
+            # The same product in two switch cases and after.
+            a, b = operand(U(33)), operand(U(32))
+            e(f"switch (@as(u2, @truncate({self.int_expr(ctx, U64, 1)}))) {{")
+            ctx["indent"] += 1
+            e(f"0 => {{ const {r}: u64 = @as(u64, @as(u32, @truncate({a}))) * @as(u64, {b}); mix({r}); }},")
+            e(f"1 => {{ const {r}: u64 = @as(u64, {a}) * @as(u64, {b}); mix({r}); }},")
+            e("else => {},")
+            ctx["indent"] -= 1
+            e("}")
+            self.sink(ctx, f"@as(u64, {a}) * @as(u64, {b})", U64)
+        elif k == 7:
+            # *% with an exact range, then used in a bound.
+            n = self.r.randint(4, 60)
+            arr = self.fresh("mr")
+            e(f"var {arr}: [{n}]u8 = @splat(3);")
+            e(f"{arr}[{n - 1}] = 9;")
+            a = self.fresh("ma")
+            near = self.chance(0.3)
+            e(f"const {a}: u32 = @as(u32, @truncate({self.int_expr(ctx, U64, 1)})) % {max(1, int((n - 1) ** 0.5)) + (1 if near else 0)};")
+            e(f"const {r}: u32 = {a} *% {a};")
+            self.sink(ctx, f"{arr}[{r}]", Int(False, 8))
+        else:
+            # A checked product whose check passed bounds a later index.
+            a = operand(U(8))
+            arr = self.fresh("mq")
+            e(f"var {arr}: [256]u8 = @splat(1);")
+            e(f"_ = &{arr};")
+            e(f"const {r}: u8 = {a} * 2;")
+            self.sink(ctx, f"{arr}[{r}]", Int(False, 8))
+            self.sink(ctx, f"{arr}[@as(usize, {r}) + 1]", Int(False, 8))
 
     def s_argbase(self, ctx):
         """By-value aggregates of 7 to 16 bytes read through an optional
