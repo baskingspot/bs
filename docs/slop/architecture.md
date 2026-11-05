@@ -7711,6 +7711,17 @@ and `zig build -Dtarget=aarch64-macos`.
   `--compile-errors` would call it exact. `run.py --upstream --cases`
   records upstream's results in `baseline/cases-<target>.json`, and the
   measure is the share of upstream's passes that bs passes.
+- `run.py --standalone` measures upstream's `test/standalone`: each
+  project (63) is copied to the workdir and built there with `build`, its
+  default step, which is what upstream's standalone step runs, so its
+  cache stays inside it as in upstream's tree. A project passes when the
+  build succeeds. It is unsupported when every failed step failed on a
+  bs `[unsupported]` diagnostic (another target or libc, LLVM, shared
+  libraries, `-femit-asm`, `-fstrip`, linker scripts), and fails
+  otherwise. `run.py --upstream --standalone` records upstream's results
+  in `baseline/standalone-<target>.json` (ios needs an iOS SDK and tsan
+  does not build there), and the measure is the share of upstream's
+  passes that bs passes, with the unsupported ones counted apart.
 
 ## Diagnostics (designed 2026-11-03, accepted by the owner; being built)
 

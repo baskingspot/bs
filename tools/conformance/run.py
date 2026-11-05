@@ -65,6 +65,14 @@ compile case only built, an error case compared as --compile-errors
 compares. The cases upstream passes are recorded by --cases --upstream
 in baseline/cases-<target>.json.
 
+With --standalone, the measure is upstream's test/standalone: each
+project copied to the workdir and built there with `build` (its default
+step, which upstream's standalone step runs) on the host. A project passes when the build succeeds; it is "unsupported"
+when each failed step failed on a bs `[unsupported]` diagnostic (another
+target, LLVM, a shared library, `-femit-asm` and the like). The projects
+upstream passes are recorded by --standalone --upstream in
+baseline/standalone-<target>.json.
+
 Portable to Linux and macOS: Python 3 standard library only.
 """
 
@@ -1558,6 +1566,114 @@ def cases_target(compiler, cfg, args, workdir):
         print(f"  {n}: {results.get(n, {}).get('status', 'missing')}")
 
 
+# ---------------------------------------------------------------- standalone
+
+STANDALONE_ROOT = UPSTREAM_TEST / "standalone"
+SUMMARY_RE = re.compile(r"^Build Summary: (\d+)/(\d+) steps succeeded", re.MULTILINE)
+
+
+def run_one_standalone(compiler, name, args, workdir, env):
+    """Runs `<compiler> build` (the project's default step, as upstream's
+    standalone step runs it) on a copy in the workdir of one project of
+    upstream's test/standalone, whose cache stays inside it as in
+    upstream's tree (run_cwd runs a program by a path relative to it).
+    The result:
+    `status` (pass; unsupported when each failed step failed on a bs
+    `[unsupported]` diagnostic; fail; timeout), the steps that succeeded,
+    and the failed steps' output."""
+    out_dir = workdir / "standalone" / name
+    shutil.rmtree(out_dir, ignore_errors=True)
+    shutil.copytree(STANDALONE_ROOT / name, out_dir)
+    argv = [str(compiler), "build", "--summary", "all"]
+    code, _out, err, timed_out = run_process(argv, out_dir, args.compile_timeout, env)
+    r = {}
+    m = SUMMARY_RE.search(err)
+    if m:
+        r["steps"] = f"{m[1]}/{m[2]}"
+    if timed_out:
+        r["status"] = "timeout"
+    elif code == 0:
+        r["status"] = "pass"
+    else:
+        # The build runner prints each failed step's output, then its
+        # "failed command:" line.
+        chunks = err.split("failed command:")[:-1] or [err]
+        real = [c for c in chunks if "[unsupported]" not in c]
+        r["status"] = "fail" if real else "unsupported"
+        r["log"] = (real or chunks)[0][-LOG_LIMIT:]
+    shutil.rmtree(out_dir, ignore_errors=True)
+    return name, r
+
+
+def standalone_target(compiler, cfg, args, workdir):
+    """--standalone: upstream's test/standalone projects built and run with
+    `build`, against baseline/standalone-<target>.json."""
+    names = sorted(p.parent.name for p in STANDALONE_ROOT.glob("*/build.zig"))
+    if args.files:
+        names = [n for n in names if n in args.files]
+    global_cache = workdir / "standalone-global"
+    shutil.rmtree(global_cache, ignore_errors=True)
+    env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(global_cache))
+    results = {}
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        futs = [ex.submit(run_one_standalone, compiler, n, args, workdir, env) for n in names]
+        for f in as_completed(futs):
+            name, r = f.result()
+            results[name] = r
+            if args.verbose:
+                print(f"  {name}: {r['status']}", file=sys.stderr)
+    shutil.rmtree(global_cache, ignore_errors=True)
+    data = {
+        "format": FORMAT,
+        "target": cfg["name"],
+        "compiler": str(compiler),
+        "projects": dict(sorted(results.items())),
+    }
+    baseline_path = BASELINE_DIR / f"standalone-{cfg['name']}.json"
+    if args.upstream:
+        zig_version = subprocess.run(
+            [str(compiler), "version"], capture_output=True, text=True, check=False
+        ).stdout.strip()
+        data["compiler"] = f"zig {zig_version}"
+        if args.files and baseline_path.exists():
+            # Only the projects run are recomputed.
+            data["projects"] = dict(sorted({**json.loads(baseline_path.read_text())["projects"], **results}.items()))
+        projects = data["projects"]
+        data["summary"] = {"projects": len(projects), "pass": sum(r["status"] == "pass" for r in projects.values())}
+        write_json(baseline_path, data)
+        print(
+            f"{cfg['name']} standalone (upstream): {data['summary']['pass']}/{len(projects)} pass -> {rel(baseline_path)}"
+        )
+        return
+    baseline = json.loads(baseline_path.read_text())["projects"] if baseline_path.exists() else {}
+    up_pass = [n for n, b in baseline.items() if b["status"] == "pass" and n in results]
+    passed = [n for n in up_pass if results[n]["status"] == "pass"]
+    unsupported = [n for n in up_pass if results[n]["status"] == "unsupported"]
+    for n, r in results.items():
+        if n in baseline:
+            r["upstream"] = baseline[n]["status"]
+    counts = {}
+    for r in results.values():
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    supported = len(up_pass) - len(unsupported)
+    data["summary"] = {
+        "pass": len(passed),
+        "of": len(up_pass),
+        "supported": supported,
+        "projects": len(results),
+        **counts,
+    }
+    out_path = args.out or workdir / f"standalone-{cfg['name']}.json"
+    write_json(out_path, data)
+    print(
+        f"{cfg['name']} standalone: {len(passed)}/{len(up_pass)} pass of upstream's, "
+        f"{len(passed)}/{supported} of those bs supports ({len(unsupported)} need what bs does not support) "
+        f"-> {rel(out_path)}"
+    )
+    for n in sorted(set(up_pass) - set(passed) - set(unsupported)):
+        print(f"  {n}: {results[n]['status']}")
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -1608,6 +1724,11 @@ def main():
         "--cases",
         action="store_true",
         help="measure upstream's test/cases outside compile_errors (run, compile and error cases), against baseline/cases-<target>.json",
+    )
+    p.add_argument(
+        "--standalone",
+        action="store_true",
+        help="measure upstream's test/standalone projects, each built with `build` (its default step), against baseline/standalone-<target>.json",
     )
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
@@ -1660,6 +1781,8 @@ def main():
                 compile_errors_target(compiler, cfg, args, args.workdir)
             elif args.cases:
                 cases_target(compiler, cfg, args, args.workdir)
+            elif args.standalone:
+                standalone_target(compiler, cfg, args, args.workdir)
             elif args.std or args.c_abi:
                 std_target(compiler, cfg, args, args.workdir)
             elif args.upstream:
