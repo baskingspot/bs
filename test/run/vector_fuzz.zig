@@ -1,5 +1,5 @@
 //! exit: 0
-//! stderr: "undef lanes 263\n"
+//! stderr: "undef lanes 263\ni1 to bool 5 2\n"
 //! targets: x86_64-linux aarch64-macos aarch64-linux
 
 // Vector miscompiles found by tools/mchunt's vector programs
@@ -30,6 +30,16 @@ fn undefLanes() void {
     std.debug.print("undef lanes {x}\n", .{bits});
 }
 
+/// @bitCast of an i1 vector to a bool vector: a lane of -1 is all ones
+/// in a register, and the bool built from it set its neighbors' bits.
+fn i1ToBool() void {
+    const x: @Vector(3, i1) = .{ @truncate(@as(i64, @bitCast(in[1]))), @truncate(@as(i64, @bitCast(in[2]))), -1 };
+    const b: @Vector(3, bool) = @bitCast(x);
+    const y: @Vector(2, i1) = .{ @truncate(@as(i64, @bitCast(in[2]))), @truncate(@as(i64, @bitCast(in[3]))) };
+    std.debug.print("i1 to bool {} {}\n", .{ @as(u3, @bitCast(b)), @as(u2, @bitCast(@as(@Vector(2, bool), @bitCast(y)))) });
+}
+
 pub fn main() void {
     undefLanes();
+    i1ToBool();
 }

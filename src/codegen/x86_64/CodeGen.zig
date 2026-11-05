@@ -4510,6 +4510,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 const src_ty = cg.typeOf(data.ty_op.operand);
                 if (!Type.isInt(ip, ty) or (Type.isInt(ip, src_ty) and intFits(Type.intInfo(ip, src_ty), Type.intInfo(ip, ty)))) {
                     try cg.load(d, data.ty_op.operand);
+                    // A bool from an i1 (a lane of a vector bitcast): its
+                    // register holds -1 as all ones.
+                    if (ty == .bool_type and src_ty != .bool_type) try cg.e.alu(.@"and", .dword, .{ .reg = d }, .{ .imm = 1 });
                 } else {
                     const info = Type.intInfo(ip, ty);
                     const src = try cg.locOf(data.ty_op.operand);

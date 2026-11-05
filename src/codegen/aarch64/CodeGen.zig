@@ -2140,6 +2140,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             if (cg.passInRegs(ty) and cg.passInRegs(src_ty)) {
                 try cg.load(.x9, data.ty_op.operand);
                 if (Type.isInt(ip, ty)) try cg.normalize(.x9, ty);
+                // A bool from an i1 (a lane of a vector bitcast): its
+                // register holds -1 as all ones.
+                if (ty == .bool_type and src_ty != .bool_type) try cg.e.logic(.@"and", .x, .x9, .x9, .{ .imm = 1 });
                 return cg.setResult(inst, ty, .x9);
             }
             const dst = try cg.resultMem(inst, ty) orelse return;
