@@ -1,7 +1,6 @@
 // On aarch64-macos, upstream's Debug backend is LLVM, which has tail calls
 // and 128-bit atomics. A tail call's callee must have the caller's type,
-// whose inferred error set is its own. Until the aarch64 backend lowers
-// tail calls, it refuses them rather than make an ordinary call.
+// whose inferred error set is its own.
 fn countdown(n: u32) !void {
     if (n == 0) return error.Done;
     return @call(.always_tail, countdown, .{n - 1});
@@ -28,14 +27,10 @@ pub fn main() void {
 
 // error
 // args: -target aarch64-macos
-// tail_call_aarch64.zig:5:1: error[unsupported]: bs codegen (aarch64): tail calls
-//   | fn countdown(n: u32) !void {
-// tail_call_aarch64.zig:10:12: error[bad-call]: unable to perform tail call: type of function being called 'fn (u32) @typeInfo(@typeInfo(@TypeOf(tail_call_aarch64.countdown)).@"fn".return_type.?).error_union.error_set!void' does not match type of calling function 'fn (u32) @typeInfo(@typeInfo(@TypeOf(tail_call_aarch64.other)).@"fn".return_type.?).error_union.error_set!void'
+// tail_call_aarch64.zig:9:12: error[bad-call]: unable to perform tail call: type of function being called 'fn (u32) @typeInfo(@typeInfo(@TypeOf(tail_call_aarch64.countdown)).@"fn".return_type.?).error_union.error_set!void' does not match type of calling function 'fn (u32) @typeInfo(@typeInfo(@TypeOf(tail_call_aarch64.other)).@"fn".return_type.?).error_union.error_set!void'
 //   | return @call(.always_tail, countdown, .{n});
-//   ref: main tail_call_aarch64.zig:26:10 (+2 std frames)
-// tail_call_aarch64.zig:12:1: error[unsupported]: bs codegen (aarch64): atomic read-modify-write of 16 bytes
-//   | fn wide(x: *u128) ?u128 {
-// tail_call_aarch64.zig:17:24: error[operand-type]: expected 128-bit integer type or smaller; found 129-bit integer type
+//   ref: main tail_call_aarch64.zig:25:10 (+2 std frames)
+// tail_call_aarch64.zig:16:24: error[operand-type]: expected 128-bit integer type or smaller; found 129-bit integer type
 //   | return @atomicLoad(u129, x, .seq_cst);
-//   ref: main tail_call_aarch64.zig:24:14 (+2 std frames)
-// 4 errors
+//   ref: main tail_call_aarch64.zig:23:14 (+2 std frames)
+// 2 errors

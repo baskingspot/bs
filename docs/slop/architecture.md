@@ -882,7 +882,15 @@ comptime arguments are run-time values in the lowered code (uucode's
   float aggregates and vectors are rejected for now. f16 arithmetic is
   native (FEAT_FP16); f80 and f128 call compiler_rt. Atomics use LSE
   (`ldadd`, `swp`, `cas`, ...) with acquire-release, `ldar`/`stlr` for
-  loads and stores. Inline assembly is parsed from GNU/LLVM syntax: the
+  loads and stores; 16-byte ones load and store with `ldp`/`stp` and
+  `dmb ish` (FEAT_LSE2) and exchange in `caspal` loops, as LLVM lowers
+  them for Apple Silicon (the float operations other than `.Xchg` on f80
+  and f128 are refused). `@call(.always_tail, ...)` places the arguments
+  where the caller's own came (Sema made the two function types equal),
+  stack ones through slots since they may read the caller's, passes the
+  caller's result pointer in x8, pops the frame and branches; an
+  argument passed by reference is refused, as its copy lives in the
+  popped frame. Inline assembly is parsed from GNU/LLVM syntax: the
   loads, stores, moves, arithmetic, branches, barriers, hints, and `mrs`
   of the thread registers that std uses, and the NEON instructions of
   std's AES, GHASH/POLYVAL and SHA-256 code (`aese`/`aesmc`, `pmull`,

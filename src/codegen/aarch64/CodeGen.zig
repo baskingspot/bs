@@ -1476,6 +1476,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const ty = data.ty_op.ty;
             const size = Type.abiSize(ip, ty);
             if (size == 0) return;
+            if (size == 16) return cg.atomicLoad16(inst, ty, data.ty_op.operand);
             if (!cg.passInRegs(ty)) return cg.fail("atomic load of {d} bytes", .{size});
             try cg.load(.x12, data.ty_op.operand);
             try cg.e.ldar(sizeOf(size), .x9, .x12);
@@ -1484,6 +1485,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .atomic_store => {
             const size = Type.abiSize(ip, cg.typeOf(data.bin_op.rhs));
             if (size == 0) return;
+            if (size == 16) return cg.atomicStore16(data.bin_op.lhs, data.bin_op.rhs);
             if (!cg.passInRegs(cg.typeOf(data.bin_op.rhs))) return cg.fail("atomic store of {d} bytes", .{size});
             try cg.load(.x12, data.bin_op.lhs);
             try cg.load(.x9, data.bin_op.rhs);
@@ -1494,6 +1496,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const x = ir.extraData(Ir.Cmpxchg, data.ty_pl.payload).data;
             const elem_ty = cg.typeOf(x.expected);
             const bytes = Type.abiSize(ip, elem_ty);
+            if (bytes == 16) return cg.cmpxchg16(inst, data.ty_pl.ty, x);
             if (!cg.passInRegs(elem_ty)) return cg.fail("cmpxchg of {d} bytes", .{bytes});
             const size = sizeOf(bytes);
             try cg.load(.x12, x.ptr);
@@ -2255,6 +2258,7 @@ fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const x = cg.ir.extraData(Ir.AtomicRmw, data.ty_pl.payload).data;
     const ty = data.ty_pl.ty;
     const bytes = Type.abiSize(ip, ty);
+    if (bytes == 16) return cg.atomicRmw16(inst, ty, x);
     if (!cg.passInRegs(ty)) return cg.fail("atomic read-modify-write of {d} bytes", .{bytes});
     const size = sizeOf(bytes);
     const is_signed = Type.isInt(ip, ty) and Type.intInfo(ip, ty).signedness == .signed;
@@ -2305,6 +2309,130 @@ fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         .Nand => unreachable,
     }
     try cg.setResult(inst, ty, .x9);
+}
+
+// 16-byte atomics (u128, f128, packed structs backed by u128) work on
+// register pairs, as LLVM lowers them for Apple Silicon: FEAT_LSE2 makes an
+// aligned `ldp` or `stp` single-copy atomic, with `dmb ish` for sequential
+// consistency, and `caspal` (whose pairs start at even registers) does the
+// rest.
+
+/// `ldp`, `stp` and `caspal` need 16-byte alignment, which f80 and f128
+/// lack under LLVM's layout (upstream's LLVM build fails to compile their
+/// atomics on aarch64-macos too).
+fn atomic16Aligned(cg: *CodeGen, ty: Index) Error!void {
+    if (Type.abiAlignment(cg.ip, ty) < 16) return cg.fail("atomic operation on '{f}', which is aligned to fewer than 16 bytes", .{cg.fmtType(ty)});
+}
+
+fn atomicLoad16(cg: *CodeGen, inst: Inst.Index, ty: Index, ptr: Ref) Error!void {
+    try cg.atomic16Aligned(ty);
+    try cg.load(.x12, ptr);
+    try cg.e.ldp(.dword, .x10, .x11, .at(.x12, 0));
+    try cg.e.dmb(.ish);
+    const dst = try cg.resultMem(inst, ty) orelse return;
+    try cg.storePair16(dst, .x10, .x11);
+}
+
+fn atomicStore16(cg: *CodeGen, ptr: Ref, operand: Ref) Error!void {
+    try cg.atomic16Aligned(cg.typeOf(operand));
+    const v = try cg.pairVal(operand);
+    try cg.load(.x12, ptr);
+    try cg.loadPair(.x10, .x11, v);
+    try cg.e.dmb(.ish);
+    try cg.e.stp(.dword, .x10, .x11, .at(.x12, 0));
+    try cg.e.dmb(.ish);
+}
+
+/// `ref`'s value in memory, which `loadPair` then loads with x16 alone.
+fn pairVal(cg: *CodeGen, ref: Ref) Error!Val {
+    const v = try cg.valOf(ref);
+    return memVal(v.ty, try cg.valMem(v));
+}
+
+fn storePair16(cg: *CodeGen, dst: Mem, lo: Reg, hi: Reg) Error!void {
+    try cg.storeReg(dst, lo, 8);
+    try cg.storeReg(dst.plus(8), hi, 8);
+}
+
+/// `caspal` of x10:x11 (the expected value, then the old one) and x2:x3
+/// (the new value) at [x12]; sets `ne` if it failed. Uses x4-x7.
+fn casPair(cg: *CodeGen) Error!void {
+    const e = &cg.e;
+    try e.mov(.x, .x4, .x10);
+    try e.mov(.x, .x5, .x11);
+    try e.casp(.dword, .acq_rel, .x10, .x2, .x12);
+    try e.logic(.eor, .x, .x6, .x10, .r(.x4));
+    try e.logic(.eor, .x, .x7, .x11, .r(.x5));
+    try e.logic(.orr, .x, .x6, .x6, .r(.x7));
+    try e.cmp(.x, .x6, .{ .imm = 0 });
+}
+
+fn cmpxchg16(cg: *CodeGen, inst: Inst.Index, ty: Index, x: Ir.Cmpxchg) Error!void {
+    try cg.atomic16Aligned(cg.typeOf(x.expected));
+    const expected = try cg.pairVal(x.expected);
+    const new = try cg.pairVal(x.new);
+    try cg.load(.x12, x.ptr);
+    try cg.loadPair(.x10, .x11, expected);
+    try cg.loadPair(.x2, .x3, new);
+    try cg.casPair();
+    const dst = try cg.resultMem(inst, ty) orelse return;
+    try cg.e.cset(.x, .x13, .ne);
+    try cg.storeReg(dst.plus(Type.optionalFlagOffset(cg.ip, ty)), .x13, 1);
+    try cg.storePair16(dst, .x10, .x11);
+}
+
+/// A `caspal` loop computing the new value in x2:x3 from the old in
+/// x10:x11 and the operand in x8:x9.
+fn atomicRmw16(cg: *CodeGen, inst: Inst.Index, ty: Index, x: Ir.AtomicRmw) Error!void {
+    const e = &cg.e;
+    try cg.atomic16Aligned(ty);
+    const op = x.operation();
+    if (op != .Xchg and cg.isFloat(ty)) return cg.fail("atomic float operation on '{f}'", .{cg.fmtType(ty)});
+    const operand = try cg.pairVal(x.operand);
+    try cg.load(.x12, x.ptr);
+    try cg.loadPair(.x8, .x9, operand);
+    try e.ldp(.dword, .x10, .x11, .at(.x12, 0));
+    const top = try e.newLabel();
+    e.bind(top);
+    switch (op) {
+        .Xchg => {
+            try e.mov(.x, .x2, .x8);
+            try e.mov(.x, .x3, .x9);
+        },
+        .Add => {
+            try e.addSub(.adds, .x, .x2, .x10, .r(.x8));
+            try e.carry(.adc, .x, .x3, .x11, .x9);
+        },
+        .Sub => {
+            try e.addSub(.subs, .x, .x2, .x10, .r(.x8));
+            try e.carry(.sbc, .x, .x3, .x11, .x9);
+        },
+        .And, .Nand, .Or, .Xor => {
+            const l: Encoder.LogicOp = switch (op) {
+                .Or => .orr,
+                .Xor => .eor,
+                else => .@"and",
+            };
+            try e.logic(l, .x, .x2, .x10, .r(.x8));
+            try e.logic(l, .x, .x3, .x11, .r(.x9));
+            if (op == .Nand) {
+                try e.mvn(.x, .x2, .x2);
+                try e.mvn(.x, .x3, .x3);
+            }
+        },
+        .Max, .Min => {
+            // Flags of old - operand; the old value stays where it wins.
+            try e.cmp(.x, .x10, .r(.x8));
+            try e.carry(.sbcs, .x, .zr, .x11, .x9);
+            const keep: Cond = if (op == .Max) (if (cg.signed(ty)) .ge else .hs) else (if (cg.signed(ty)) .lt else .lo);
+            try e.csel(.csel, .x, .x2, .x10, .x8, keep);
+            try e.csel(.csel, .x, .x3, .x11, .x9, keep);
+        },
+    }
+    try cg.casPair();
+    try e.bcond(.ne, top);
+    const dst = try cg.resultMem(inst, ty) orelse return;
+    try cg.storePair16(dst, .x10, .x11);
 }
 
 fn ret(cg: *CodeGen, operand: Ref) Error!void {
@@ -2391,9 +2519,11 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const ip = cg.ip;
     const ir = cg.ir;
     const extra = ir.extraData(Ir.Call, data.pl_op.payload);
-    // TODO: reuse the caller's frame; a plain call would overflow the
-    // stack where upstream's LLVM build does not.
-    if (extra.data.flags.always_tail) return cg.fail("tail calls", .{});
+    // `@call(.always_tail, ...)`: Sema made the callee's type the
+    // caller's, so its arguments go where the caller's own came, and its
+    // result where the caller's goes; the caller's frame is popped and the
+    // callee branched to.
+    const tail = extra.data.flags.always_tail;
     const args = ir.refSlice(extra.end, extra.data.args_len);
     const callee_ref = data.pl_op.operand;
     const callee_val: ?Index = if (callee_ref.toInterned()) |v| switch (ip.indexToKey(v)) {
@@ -2404,14 +2534,16 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const callee_ty = cg.calleeType(callee_ref);
     const ret_ty = extra.data.ret_ty;
     const is_c = callee_ty.cc == .c;
-    const dst = try cg.resultMem(inst, ret_ty);
+    const dst = if (tail) null else try cg.resultMem(inst, ret_ty);
 
     const vals = try cg.gpa.alloc(Val, args.len);
     defer cg.gpa.free(vals);
     for (args, vals) |arg, *v| v.* = try cg.valOf(arg);
     if (is_c) {
         if (cg.cClass(ret_ty) == .unsupported) return cg.fail("C call returning '{f}'", .{cg.fmtType(ret_ty)});
-        try cg.cCallArgs(vals, if (callee_ty.is_var_args) callee_ty.param_types.len else null, if (cg.cClass(ret_ty) == .indirect) dst else null);
+        if (tail and callee_ty.is_var_args) return cg.fail("tail call to a variadic function", .{});
+        try cg.cCallArgs(vals, if (callee_ty.is_var_args) callee_ty.param_types.len else null, tail);
+        if (cg.cClass(ret_ty) == .indirect) try cg.resultPtrTo(dst, tail);
     } else {
         const tys = try cg.gpa.alloc(Index, args.len);
         defer cg.gpa.free(tys);
@@ -2419,16 +2551,18 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         defer cg.gpa.free(locs);
         for (vals, tys) |v, *t| t.* = v.ty;
         _ = cg.autoArgs(tys, locs);
-        try cg.placeArgs(vals, locs);
-        if (cg.autoClass(ret_ty) == .memory) if (dst) |m| try cg.addrTo(.x8, m);
+        try cg.placeArgs(vals, locs, tail);
+        if (cg.autoClass(ret_ty) == .memory) try cg.resultPtrTo(dst, tail);
         try cg.loadTrace(.x15);
     }
-    if (callee_val) |f| {
-        try cg.e.bl(.{ .sym = try cg.emit.funcKey(f) });
-    } else {
-        try cg.load(.x16, callee_ref);
-        try cg.e.blr(.x16);
+    if (callee_val == null) try cg.load(.x16, callee_ref);
+    if (tail) {
+        try cg.e.mov(.x, .sp, .fp);
+        try cg.e.ldp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .post = 16 } });
+        if (callee_val) |f| try cg.e.b(.{ .sym = try cg.emit.funcKey(f) }) else try cg.e.br(.x16);
+        return;
     }
+    if (callee_val) |f| try cg.e.bl(.{ .sym = try cg.emit.funcKey(f) }) else try cg.e.blr(.x16);
     const m = dst orelse return;
     if (is_c) return cg.cCallResult(ret_ty, m);
     const size = Type.abiSize(ip, ret_ty);
@@ -2443,15 +2577,31 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     }
 }
 
+/// Puts x8, the address a call's result returned in memory goes to: `dst`,
+/// or for a tail call the caller's own result pointer.
+fn resultPtrTo(cg: *CodeGen, dst: ?Mem, tail: bool) Error!void {
+    if (tail) return cg.loadMem(.x8, cg.ret_ptr_slot.?, .usize_type);
+    if (dst) |m| try cg.addrTo(.x8, m);
+}
+
 /// Puts call arguments where `locs` says. Only general registers that are
 /// arguments and v0-v7 are written besides the scratch registers, and each
 /// argument register is written once, after the copies that use scratch
-/// registers.
-fn placeArgs(cg: *CodeGen, vals: []const Val, locs: []const ArgLoc) Error!void {
+/// registers. A tail call's stack arguments replace the caller's incoming
+/// ones (at fp + 16), which they may be computed from, so they are copied
+/// to slots first.
+fn placeArgs(cg: *CodeGen, vals: []const Val, locs: []const ArgLoc, tail: bool) Error!void {
     const ip = cg.ip;
-    for (vals, locs) |v, l| switch (l) {
-        .stack => |off| try cg.copyVal(.at(.sp, @intCast(off)), v),
+    const temps = try cg.gpa.alloc(Mem, if (tail) vals.len else 0);
+    defer cg.gpa.free(temps);
+    for (vals, locs, 0..) |v, l, i| switch (l) {
+        .stack => |off| if (tail) {
+            temps[i] = try cg.allocSlot(Type.abiSize(ip, v.ty), @min(Type.abiAlignment(ip, v.ty), 16));
+            try cg.copyVal(temps[i], v);
+        } else try cg.copyVal(.at(.sp, @intCast(off)), v),
         .gpr_indirect, .stack_indirect => {
+            // The copy lives in the caller's frame, which a tail call pops.
+            if (tail) return cg.fail("tail call passing '{f}' by reference", .{cg.fmtType(v.ty)});
             // A copy the callee may modify.
             const size = Type.abiSize(ip, v.ty);
             const copy = try cg.allocSlot(size, @min(Type.abiAlignment(ip, v.ty), 16));
@@ -2465,6 +2615,10 @@ fn placeArgs(cg: *CodeGen, vals: []const Val, locs: []const ArgLoc) Error!void {
         },
         else => {},
     };
+    if (tail) for (vals, locs, 0..) |v, l, i| switch (l) {
+        .stack => |off| try cg.copyVal(.at(.fp, @intCast(16 + off)), memVal(v.ty, temps[i])),
+        else => {},
+    };
     for (vals, locs) |v, l| switch (l) {
         .gpr => |r| try cg.loadGprVal(argReg(r), v),
         .gpr_pair => |r| try cg.loadPair(argReg(r), argReg(r + 1), v),
@@ -2473,9 +2627,8 @@ fn placeArgs(cg: *CodeGen, vals: []const Val, locs: []const ArgLoc) Error!void {
     };
 }
 
-/// Places the arguments of a call to a C function; a result returned in
-/// memory goes to `sret`, whose address is passed in x8.
-fn cCallArgs(cg: *CodeGen, vals: []const Val, var_from: ?usize, sret: ?Mem) Error!void {
+/// Places the arguments of a call to a C function, as `placeArgs`.
+fn cCallArgs(cg: *CodeGen, vals: []const Val, var_from: ?usize, tail: bool) Error!void {
     const tys = try cg.gpa.alloc(Index, vals.len);
     defer cg.gpa.free(tys);
     const locs = try cg.gpa.alloc(ArgLoc, vals.len);
@@ -2485,8 +2638,7 @@ fn cCallArgs(cg: *CodeGen, vals: []const Val, var_from: ?usize, sret: ?Mem) Erro
         if (cg.cClass(v.ty) == .unsupported) return cg.fail("C argument of type '{f}'", .{cg.fmtType(v.ty)});
     }
     _ = cg.cArgs(tys, var_from, locs);
-    try cg.placeArgs(vals, locs);
-    if (sret) |m| try cg.addrTo(.x8, m);
+    try cg.placeArgs(vals, locs, tail);
 }
 
 /// Stores the result of a C call, of type `ret_ty`, to `dst`.
@@ -3306,7 +3458,8 @@ fn rtCall(cg: *CodeGen, file: []const u8, name: []const u8, args: []const Val, r
     for (args) |a| if (cg.cClass(a.ty) == .unsupported) return cg.fail("compiler_rt call with an argument of type '{f}'", .{cg.fmtType(a.ty)});
     if (cg.cClass(ret_ty) == .unsupported) return cg.fail("compiler_rt call returning '{f}'", .{cg.fmtType(ret_ty)});
     const key: SymbolKey = .fromName(try cg.emit.requestCompilerRt(file, name));
-    try cg.cCallArgs(args, null, if (cg.cClass(ret_ty) == .indirect) dst else null);
+    try cg.cCallArgs(args, null, false);
+    if (cg.cClass(ret_ty) == .indirect) try cg.addrTo(.x8, dst);
     try cg.e.bl(.{ .sym = key });
     try cg.cCallResult(ret_ty, dst);
 }
