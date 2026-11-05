@@ -240,15 +240,14 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     @memset(f.live.items(.reg), Ssa.no_reg);
     if (!naked) {
         // preserve_none passes arguments in x20-x28, where values live, and
-        // its callee clobbers them all, so such functions get no registers,
-        // as with inline assembly.
-        if (cg.fn_ty.cc == .aarch64_preserve_none or cg.callsPreserveNone()) f.has_asm = true;
+        // its callee clobbers them all, so such functions get no registers.
+        if (cg.fn_ty.cc == .aarch64_preserve_none or cg.callsPreserveNone()) f.no_regs = true;
         // `clobbers` marks the values that want a register.
         try f.liveness(gpa, ir, &cg);
         try f.plan(gpa, ir, ip, &cg);
         f.bypassUnread(ir);
         cg.live = true;
-        if (!f.has_asm) try cg.allocateRegs();
+        if (!f.no_regs) try cg.allocateRegs();
     } else @memset(f.live.items(.fate), .normal);
 
     // The prologue belongs to the declaration's line.
@@ -523,7 +522,10 @@ const vreg_count = 10;
 /// Gives the values `clobbers` marked their registers (`Ssa.allocate`)
 /// and records the pairs the prologue saves: x19/x20 through x27/x28 in
 /// bits 0-4 and d8/d9 through d14/d15 in bits 8-11 of `saved`, compact
-/// unwind's frame-mode bits.
+/// unwind's frame-mode bits. A value that meets an inline assembly
+/// statement (an operand, its result, or one live across it) takes none
+/// of the registers an assembly statement names (`asmRegs`); the
+/// statement saves those around itself for the others.
 fn allocateRegs(cg: *CodeGen) Error!void {
     const f = &cg.emit.ssa;
     const live = f.live.slice();
@@ -538,7 +540,10 @@ fn allocateRegs(cg: *CodeGen) Error!void {
     defer split.deinit(cg.gpa);
     const survive = alloc_regs.len + float_regs.len;
     const n = survive + vreg_count;
-    const used = f.allocate(alloc_regs.len, float_regs.len + vreg_count, (1 << survive) - 1, &.{}, &split, 0, &.{});
+    var counts: std.ArrayList(u32) = .empty;
+    defer counts.deinit(cg.gpa);
+    const restrictions: []const Ssa.Restriction = if (try f.asmCounts(cg.gpa, cg.ir, &counts)) |c| &.{.{ .regs = cg.asmRegs(), .counts = c }} else &.{};
+    const used = f.allocate(alloc_regs.len, float_regs.len + vreg_count, (1 << survive) - 1, &.{}, &split, restrictions);
     for (0..5) |k| if (used >> @intCast(2 * k) & 3 != 0) {
         cg.saved |= @as(u16, 1) << @intCast(k);
     };
@@ -558,6 +563,48 @@ fn allocateRegs(cg: *CodeGen) Error!void {
     }
 }
 
+/// The allocator's registers (as `allocateRegs` numbers them) that an
+/// inline assembly statement in the function names: in its template, as
+/// an operand's `{xN}`, or as a clobber; and v8-v15 when a statement has
+/// so many SIMD operands that `asmVReg` may give one of them out. An asm
+/// statement may call (`callFree`), so the values that meet it, its
+/// operands among them, cross a clobber point and keep out of v20-v29,
+/// which `asmVReg` gives out first.
+fn asmRegs(cg: *CodeGen) u32 {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    var mask: u32 = 0;
+    for (cg.emit.ssa.values.items(.inst)) |inst| {
+        if (ir.instructions.items(.tag)[@backingInt(inst)] != .assembly) continue;
+        const extra = ir.extraData(Ir.Asm, ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload);
+        const source = ip.stringSlice(extra.data.source);
+        const clobbered = extra.data.callee_saved_clobbers;
+        for (alloc_regs, 0..) |r, k| {
+            if (mentionsReg(source, @backingInt(r)) or clobbered >> @intCast(Ir.Asm.aarch64_x19_bit + k) & 1 != 0) mask |= @as(u32, 1) << @intCast(k);
+        }
+        var named_v: u32 = 0;
+        for (0..32) |r| if (mentionsVReg(source, @intCast(r))) {
+            named_v += 1;
+        };
+        for (float_regs, 0..) |v, k| {
+            if (mentionsVReg(source, @backingInt(v)) or clobbered >> @intCast(Ir.Asm.aarch64_v8_bit + k) & 1 != 0) mask |= @as(u32, 1) << @intCast(alloc_regs.len + k);
+        }
+        var vec_ops: u32 = 0;
+        var i = extra.end;
+        for (0..extra.data.outputs_len + extra.data.inputs_len) |_| {
+            const op = ir.extraData(Ir.Asm.Operand, i).data;
+            i += 3;
+            const c = asmAlternative(std.mem.trimStart(u8, ip.stringSlice(op.constraint), "=+&"));
+            if (vecConstraint(c) != null) vec_ops += 1;
+            const r = parseReg(regConstraint(c) orelse continue) orelse continue;
+            if (std.mem.indexOfScalar(Reg, &alloc_regs, r.reg)) |k| mask |= @as(u32, 1) << @intCast(k);
+        }
+        // `asmVReg` gives out v16-v31 and v0-v7 first.
+        if (vec_ops + named_v > 24) mask |= ((@as(u32, 1) << float_regs.len) - 1) << alloc_regs.len;
+    }
+    return mask;
+}
+
 // `Ssa.liveness` and `Ssa.plan` hooks.
 
 /// Whether value `inst`'s lowering may write a register a value holds:
@@ -567,7 +614,7 @@ fn allocateRegs(cg: *CodeGen) Error!void {
 /// floating-point ones, and vectors in v20-v29 (`inVec`), other than
 /// allocs (`Ssa.plan` promotes variables) and block results.
 pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
-    if (cg.emit.ssa.has_asm) return false;
+    if (cg.emit.ssa.no_regs) return false;
     switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
         .alloc, .block => return false,
         else => {},
