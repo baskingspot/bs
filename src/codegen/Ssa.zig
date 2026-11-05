@@ -100,7 +100,8 @@ pub const Live = struct {
     /// Set by the architecture with `want`: the operand (an IR instruction
     /// index, or `no_tie`) whose register the value may take when the
     /// operand's last use is the value's definition, because the lowering
-    /// reads the other operands before writing the result over it.
+    /// reads the other operands before writing the result over it; both
+    /// registers, for a `want_pair` value and operand.
     tie: u32,
     /// A clobber point (`liveness`) lies inside the interval, where the
     /// value is still needed afterwards.
@@ -2153,6 +2154,18 @@ pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, s
                 continue;
             }
             if (reg[inst] == want_pair) {
+                // Take over a tied pair's registers, which die here.
+                const t = tie[inst];
+                if (t != no_tie and end[t] == def[inst] and reg[t] < total and reg2[t] != no_reg and
+                    usable >> @intCast(reg[t]) & 1 != 0 and usable >> @intCast(reg2[t]) & 1 != 0 and
+                    (share[t] == no_tie or reg[share[t]] != reg[t]))
+                {
+                    const k = std.mem.findScalar(u32, active[0..active_len], t).?;
+                    reg[inst] = reg[t];
+                    reg2[inst] = reg2[t];
+                    active[k] = inst;
+                    continue;
+                }
                 // Two registers or none; a pair evicts none.
                 const avail = free & usable;
                 if (@popCount(avail) < 2) {

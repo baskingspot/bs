@@ -939,7 +939,8 @@ comptime arguments are run-time values in the lowered code (uucode's
   those operations read gets one register or none (folded into its
   operand's, `want_fold`), a truncation to 64 bits takes none but reads
   its pair's half, and a right shift by 64 or more that only a
-  truncation reads is not emitted. Block results stay in slots. A value that meets an inline assembly statement (an operand,
+  truncation reads is not emitted. A pair result may take a dying pair
+  operand's registers (`Live.tie`). Block results stay in slots. A value that meets an inline assembly statement (an operand,
   its result, or a value live across it) takes none of the x19-x28 and
   v8-v15 an assembly statement in the function names in its template,
   pins or clobbers (`asmRegs`, an `Ssa.allocate` restriction); the
