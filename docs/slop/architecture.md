@@ -4392,10 +4392,21 @@ value model:
   reference name whose `extaddr` key the manifest numbers, so a manifest
   without any costs one lookup per name. A new extern symbol in such a
   constant changes the externs, which a lazy build falls back on.
-- `&f` of an `extern fn` at comptime is the pointer `@extern` gives (an
-  `extern_func` uav base); in data it binds as extern data does, so an
+- `&f` of an `extern fn`, and its coercion to a function pointer, is the
+  pointer `@extern` gives (an `extern_func` uav base), in run-time code
+  too, as upstream: an inner function may read a local array of them
+  (siv's `luaopen_*` table). In data it binds as extern data does, so an
   input object's definition counts (it went to `exportTarget`, which
   saw only exports, compiler_rt and libraries).
+- `@extern` of a weak function gives the same value with `extern_func`'s
+  `is_weak` set, so a container-level constant holds it (siv's
+  `__cxa_thread_atexit_impl`). Comptime sees it non-null, as upstream.
+  Run-time `orelse`, `if`, `.?` and `== null` test the address the link
+  gives instead (Sema's `runtimeWeakExtern` reads it with `extern_ptr`),
+  so an undefined weak symbol is null, where upstream folds the test to
+  non-null (its ELF linker refuses the undefined symbol). CodeGen
+  requests the slot weak (`useExtern(name, is_weak)`). Stored in data,
+  an undefined one is still "undefined symbol".
 - A data-only reference to a symbol that only an unpulled archive member
   defines is "undefined symbol": archive members are pulled from the
   slots' names during analysis. Weak and thread-local extern data at

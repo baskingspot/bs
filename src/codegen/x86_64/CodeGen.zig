@@ -1077,9 +1077,10 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
             if (p.base == .int) return .{ .imm = p.byte_offset };
             // The address of an extern function is in its link slot.
             if (p.base == .uav and ip.keyTag(p.base.uav.val) == .extern_func and p.byte_offset == 0) {
-                const name = ip.stringSlice(ip.keyPayload(.extern_func, p.base.uav.val).name);
+                const f = ip.keyPayload(.extern_func, p.base.uav.val);
+                const name = ip.stringSlice(f.name);
                 _ = try cg.emit.requestCompilerRtExport(name);
-                return .{ .mem = Mem.sym(try cg.emit.useExtern(name, false), 0) };
+                return .{ .mem = Mem.sym(try cg.emit.useExtern(name, f.is_weak), 0) };
             }
             if (ptrToZeroBit(ip, val)) return .{ .imm = 0xaaaaaaaaaaaaaaaa };
             const t = try ptrTarget(cg.emit, val);
@@ -4199,7 +4200,10 @@ fn keepSymbols(cg: *CodeGen, inst: Ir.Inst.Index) Error!void {
             },
             .uav => |u| switch (ip.keyTag(u.val)) {
                 .extern_var => _ = try cg.emit.useExtern(ip.stringSlice(ip.keyPayload(.extern_var, u.val).name), false),
-                .extern_func => _ = try cg.emit.useExtern(ip.stringSlice(ip.keyPayload(.extern_func, u.val).name), false),
+                .extern_func => {
+                    const f = ip.keyPayload(.extern_func, u.val);
+                    _ = try cg.emit.useExtern(ip.stringSlice(f.name), f.is_weak);
+                },
                 else => {},
             },
             else => {},

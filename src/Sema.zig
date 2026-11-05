@@ -7094,8 +7094,10 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     if (nav.linkage == .@"extern") {
         // At comptime, a pointer the link binds; the declaration is its site.
         if (block.is_comptime and !nav.is_threadlocal and isExternVar(sema.ip, nav)) return sema.externVarPtr(ptr_ty, nav.name, nav.key);
-        // An extern function's, as `@extern` gives it.
-        if (block.is_comptime and sema.ip.keyTag(nav.val) == .extern_func)
+        // An extern function's, as `@extern` gives it, comptime-known in
+        // runtime code too, as upstream (an array of C functions captured
+        // by an inner function).
+        if (sema.ip.keyTag(nav.val) == .extern_func)
             return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = nav.val, .orig_ty = ptr_ty } } } }));
         if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: bs resolves extern symbols at link time", .{});
         return sema.addInst(block, .{ .tag = if (nav.is_threadlocal) .extern_tls else .extern_ptr, .data = .{ .ty_pl = .{ .ty = ptr_ty, .payload = @backingInt(nav.name) } } });
@@ -7249,11 +7251,12 @@ fn zirBuiltinExtern(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
     const dll_import = try sema.fieldValue(options, info.fieldIndex(ip, "is_dll_import").?) == .bool_true;
     // A function's address is a comptime-known pointer to the extern
     // function, which CodeGen reads from the slot the link fills. Asked
-    // for as an optional, it is a comptime-known non-null one unless the
-    // symbol is weak, as upstream (`@extern(?*const fn () ..., ...) orelse
-    // @compileError(...)` compiles).
-    if (!is_weak and !pcrel and !is_tls and Type.class(ip, Type.ptrInfo(ip, ptr_ty).child) == .@"fn") {
-        const f = try sema.intern(.{ .extern_func = .{ .name = try sema.getString(name), .ty = Type.ptrInfo(ip, ptr_ty).child, .is_weak = false } });
+    // for as an optional, it is a comptime-known non-null one, as upstream
+    // (`@extern(?*const fn () ..., ...) orelse @compileError(...)`
+    // compiles). A weak symbol's is null at run time if the link leaves it
+    // undefined, so runtime code tests it (`weakExternOpt`).
+    if (!pcrel and !is_tls and Type.class(ip, Type.ptrInfo(ip, ptr_ty).child) == .@"fn") {
+        const f = try sema.intern(.{ .extern_func = .{ .name = try sema.getString(name), .ty = Type.ptrInfo(ip, ptr_ty).child, .is_weak = is_weak } });
         const ptr: Ref = .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = f, .orig_ty = ptr_ty } } } }));
         return if (ty == ptr_ty) ptr else sema.coerce(block, ty, ptr, src);
     }
@@ -9509,13 +9512,10 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 // (See also the `.@"fn"` case below.)
                 const d = Type.ptrInfo(ip, dest_ty);
                 const v = val orelse return null;
-                // An extern function's address is known at link time.
-                // At comptime (a global's initializer), the pointer the link
-                // binds, as `&f` gives it.
-                if (d.flags.size == .one and d.child == src_ty and ip.keyTag(v) == .extern_func) {
-                    if (block.is_comptime) return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .{ .uav = .{ .val = v, .orig_ty = dest_ty } } } }));
-                    return try sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = dest_ty, .payload = @backingInt(ip.keyPayload(.extern_func, v).name) } } });
-                }
+                // An extern function's address is the pointer the link
+                // binds, as `&f` gives it: comptime-known, as upstream.
+                if (d.flags.size == .one and d.child == src_ty and ip.keyTag(v) == .extern_func)
+                    return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .{ .uav = .{ .val = v, .orig_ty = dest_ty } } } }));
                 if (d.flags.size != .one or ip.keyTag(v) != .func) return null;
                 if (d.child != src_ty and !try sema.fnTypeCoercible(block, src, v, d.child)) return null;
                 const f = ip.keyPayload(.func, v);
@@ -16992,10 +16992,29 @@ fn analyzeIsNonNull(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileE
     if (try sema.noPossibleValue(block, src, child) or (Type.class(sema.ip, child) == .error_set and try sema.errSetIsEmpty(block, child))) return .fromInterned(.bool_false);
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(.undef_bool);
+        if (try sema.runtimeWeakExtern(block, v)) |rt| return sema.addUnOp(block, .is_non_null, rt);
         return .fromInterned(boolValue(sema.ip.keyPayload(.opt, v).val != .none));
     }
     try sema.requireRuntime(block, src);
     return sema.addUnOp(block, .is_non_null, operand);
+}
+
+/// In runtime code, the address of a weak extern function (`@extern` with
+/// `.linkage = .weak`) as an `extern_ptr`, if comptime-known optional `v`
+/// is one: null if the link leaves the symbol undefined. Comptime sees it
+/// non-null, as upstream does; runtime code tests the address the link
+/// gives (which upstream folds to non-null, an undefined weak symbol being
+/// a link error in its linker).
+fn runtimeWeakExtern(sema: *Sema, block: *Block, v: Index) !?Ref {
+    const ip = sema.ip;
+    if (block.is_comptime or ip.keyTag(v) != .opt) return null;
+    const p = ip.keyPayload(.opt, v).val;
+    if (p == .none or ip.keyTag(p) != .ptr) return null;
+    const base = ip.keyPayload(.ptr, p).base;
+    if (base != .uav or ip.keyTag(base.uav.val) != .extern_func) return null;
+    const f = ip.keyPayload(.extern_func, base.uav.val);
+    if (!f.is_weak or ip.keyPayload(.ptr, p).byte_offset != 0) return null;
+    return try sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = ip.typeOf(v), .payload = @backingInt(f.name) } } });
 }
 
 /// "expected optional type" with upstream's notes (`failWithExpectedOptionalType`),
@@ -17036,6 +17055,10 @@ fn optionalPayload(sema: *Sema, block: *Block, src: Src, operand: Ref, safe: boo
     const child = Type.childType(sema.ip, ty);
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(child));
+        if (try sema.runtimeWeakExtern(block, v)) |rt| {
+            if (safe and block.want_safety) try sema.addSafetyCheck(block, try sema.addUnOp(block, .is_non_null, rt), .unwrap_null, .none, .none);
+            return sema.addTyOp(block, .optional_payload, child, rt);
+        }
         const payload = sema.ip.keyPayload(.opt, v).val;
         if (payload == .none) return sema.unwrapKnownNull(block, src, safe);
         return .fromInterned(payload);
