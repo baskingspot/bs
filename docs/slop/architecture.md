@@ -2385,10 +2385,12 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    reads it without defining it) and counts clobber points. `Ssa.allocate`
    is linear scan without splitting: a value that does not fit is kept in
    memory for its whole life. When no register is free, the value that
-   ends last goes to memory, unless the uses of one, weighted by loop
-   depth (8 per level, `Live.weight`), weigh at most an eighth of the
-   others': a value used a loop level less often goes first, so an inner
-   loop's values keep their registers (SipHash's state). x86_64 values of scalar types (integers up
+   ends last goes to memory, unless one's deepest use is in a shallower
+   loop than the other's (`Live.weight`, 8 per level): it goes first, so an
+   inner loop's values keep their registers (SipHash's state). The depth,
+   not a sum over uses, so that many uses at one level do not keep a
+   long-lived value in a register over the short temporaries between
+   them (BLAKE3's state vectors). x86_64 values of scalar types (integers up
    to 64 bits, bools, pointers, error codes, optional pointers) that the
    lowering leaves in a register get one of rbx, r12–r15, which every
    lowering leaves alone and calls preserve, or, when their interval

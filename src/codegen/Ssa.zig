@@ -104,8 +104,8 @@ pub const Live = struct {
     /// A clobber point (`liveness`) lies inside the interval, where the
     /// value is still needed afterwards.
     crosses: bool,
-    /// From `liveness`: its uses weighted by loop depth, 8 per level (up
-    /// to 6), which `allocate` keeps in registers first.
+    /// From `liveness`: 8 to the power of the deepest loop level among its
+    /// uses (up to 6), which `allocate` keeps in registers first.
     weight: u32,
     /// After `allocate`, for a value marked `want_pair` that got registers:
     /// the register of its high eightbyte (`reg` holds the low one); else
@@ -1140,7 +1140,10 @@ const LiveWalk = struct {
         var depth: u32 = 0;
         var q = w.loop;
         while (q != no_loop and depth < 6) : (q = w.loops[q].parent) depth += 1;
-        w.weight[inst] +|= @as(u32, 1) << @intCast(3 * depth);
+        // The deepest level, not a sum: many uses at one level do not make
+        // a long-lived value (BLAKE3's 16 state vectors) outrank the short
+        // temporaries between them.
+        w.weight[inst] = @max(w.weight[inst], @as(u32, 1) << @intCast(3 * depth));
         if (w.dead_start) |start| {
             if (w.clobbers[w.pos][1] != w.clobbers[@max(start, w.def[inst])][1]) w.crosses[inst] = true;
         }
@@ -1409,8 +1412,8 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, 
 }
 
 /// Whether value `a` goes to memory before value `b` when registers run
-/// out: its uses weigh at most an eighth of `b`'s (a loop level less),
-/// or, unless `b`'s weigh that little against `a`'s, it ends later.
+/// out: its deepest use is in a shallower loop than `b`'s, or, at the
+/// same depth, it ends later.
 fn spillsBefore(weight: []const u32, end: []const u32, a: u32, b: u32) bool {
     const wa: u64 = weight[a];
     const wb: u64 = weight[b];
