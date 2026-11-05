@@ -9,3 +9,4 @@ __pycache__/
 /tools/cthunt/.work/
 .direnv/
 .envrc.local
+/tools/edithunt/.work/
