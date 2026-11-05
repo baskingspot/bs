@@ -501,13 +501,28 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // With numbered symbols, the entry's atom is found while resolving
     // addresses.
     var entry_index: usize = undefined;
+    // The entry may also be an alias of an atom (as `Elf`'s): an input's
+    // `main` after the function sanitizer's prefix in its section's atom,
+    // which Clang's `-fsanitize=undefined` without `-fno-sanitize=function`
+    // puts there (`-OReleaseSafe` C).
+    var entry_addend: u64 = 0;
     const dylib = options.dylib;
     if (numbered == null and dylib == null) {
-        entry_index = symbols.get(options.entry) orelse {
+        var entry_key = options.entry;
+        if (symbols.get(entry_key) == null) for (options.aliases) |a| if (a.key == options.entry and a.addend >= 0) {
+            entry_key = a.target;
+            entry_addend = @intCast(a.addend);
+            break;
+        };
+        entry_index = symbols.get(entry_key) orelse {
             diag.* = .{ .target = options.entry };
             return error.UndefinedSymbol;
         };
-        try checkEntry(&l, entry_index, options.entry, diag);
+        try checkEntry(&l, entry_index, entry_key, diag);
+        if (entry_addend >= input.atom(entry_index).size()) {
+            diag.* = .{ .atom = input.atom(entry_index).name, .target = options.entry };
+            return error.InvalidRelocation;
+        }
     }
     // The local symbols' atoms, while `symbols` maps keys to atoms.
     const local_atoms = try gpa.alloc(u32, options.local_symbols.len);
@@ -989,7 +1004,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     w.put(macho.uuid_command{ .uuid = @splat(0) });
     const version = (@as(u32, @intCast(options.min_os.major)) << 16) | (@as(u32, @intCast(options.min_os.minor)) << 8) | @as(u32, @intCast(options.min_os.patch));
     w.put(macho.build_version_command{ .cmdsize = @sizeOf(macho.build_version_command), .platform = .MACOS, .minos = version, .sdk = version, .ntools = 0 });
-    if (dylib == null) w.put(macho.entry_point_command{ .entryoff = l.atomAddr(entry_index) - base, .stacksize = options.stack_size });
+    if (dylib == null) w.put(macho.entry_point_command{ .entryoff = l.atomAddr(entry_index) + entry_addend - base, .stacksize = options.stack_size });
     w.putWithString(macho.dylib_command{ .cmd = .LOAD_DYLIB, .cmdsize = dylib_cmd_size, .dylib = .{
         .name = @sizeOf(macho.dylib_command),
         .timestamp = 2,

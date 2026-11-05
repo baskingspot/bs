@@ -172,6 +172,20 @@ pub fn build(b: *std.Build) void {
             c_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
             test_step.dependOn(&c_run.step);
         }
+        // An executable of C only in ReleaseSafe: Clang's function
+        // sanitizer puts a prefix before `main` in its section, so the
+        // entry point is inside the section's atom.
+        const c_exe = b.addRunArtifact(exe);
+        c_exe.setName("bs build-exe -OReleaseSafe -lc with only C sources on aarch64-macos");
+        c_exe.addArgs(&.{ "build-exe", "-OReleaseSafe", "-lc" });
+        c_exe.addFileArg(b.path("test/link_input/cmain.c"));
+        c_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+        const c_run = std.Build.Step.Run.create(b, "run bs -OReleaseSafe -lc build of only C sources on aarch64-macos");
+        c_run.addFileArg(c_exe.addPrefixedOutputFileArg("-femit-bin=", "cmain"));
+        c_run.addArg("5");
+        c_run.addCheck(.{ .expect_stdout_exact = "argc=2 q=478165905515354922\n" });
+        c_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
+        test_step.dependOn(&c_run.step);
     }
 }
 
