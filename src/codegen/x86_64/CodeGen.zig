@@ -119,6 +119,11 @@ saved: u32 = 0,
 /// From `planRegisters`: per position (as `Ssa.clobbers`), how many
 /// values and terminators before it may write r11 (`usesR11`).
 r11_clobbers: std.ArrayList(u32) = .empty,
+/// From `planR11`: per value (by position in `Ssa.values`) and per block's
+/// terminator, whether `usesR11` said it may write r11 when the allocator
+/// was told, which emission checks against.
+r11_values: std.DynamicBitSetUnmanaged = .{},
+r11_terms: std.DynamicBitSetUnmanaged = .{},
 /// A lowering named r11 (`r11`) since the value or terminator being
 /// emitted began, which `usesR11` must have said it may.
 r11_used: bool = false,
@@ -347,6 +352,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.stub_open.deinit(gpa);
         cg.cover_pcs.deinit(gpa);
         cg.r11_clobbers.deinit(gpa);
+        cg.r11_values.deinit(gpa);
+        cg.r11_terms.deinit(gpa);
         cg.asm_counts.deinit(gpa);
     }
     if (cover) cg.cover_key = Emit.coverageKeys(try emit.funcKey(ir.func))[0];
@@ -2036,6 +2043,10 @@ fn planR11(cg: *CodeGen) Error!void {
     const f = cg.ssa;
     try cg.r11_clobbers.resize(cg.gpa, f.clobbers.items.len);
     const cl = cg.r11_clobbers.items;
+    try cg.r11_values.resize(cg.gpa, f.values.len, false);
+    cg.r11_values.unsetAll();
+    try cg.r11_terms.resize(cg.gpa, f.blocks.items.len, false);
+    cg.r11_terms.unsetAll();
     var count: u32 = 0;
     cl[0] = 0;
     cl[1] = 0;
@@ -2043,11 +2054,17 @@ fn planR11(cg: *CodeGen) Error!void {
         const b = f.blocks.items[@backingInt(block)];
         for (b.start..b.start + b.len) |i| {
             const inst = f.values.items(.inst)[i];
-            if (f.live.items(.fate)[@backingInt(inst)] != .dead and cg.usesR11(inst)) count += 1;
+            if (f.live.items(.fate)[@backingInt(inst)] != .dead and cg.usesR11(inst)) {
+                count += 1;
+                cg.r11_values.set(i);
+            }
             cl[2 * i + 2] = count;
             cl[2 * i + 3] = count;
         }
-        if (cg.termUsesR11(block)) count += 1;
+        if (cg.termUsesR11(block)) {
+            count += 1;
+            cg.r11_terms.set(@backingInt(block));
+        }
         cl[2 * (b.start + b.len) + 1] = count;
         cl[2 * (b.start + b.len) + 2] = count;
     }
@@ -4676,12 +4693,12 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
         const q = Ssa.valuePos(idx);
         cg.r11_used = false;
         if (cg.split_vals.items.len != 0 and !std.meta.eql(cl[q], cl[q - 1])) try cg.genSplit(inst, q) else try cg.genInst(inst);
-        if (cg.r11_used and !cg.has_asm and !cg.usesR11(inst))
+        if (cg.r11_used and !cg.has_asm and !(if (cg.live) cg.r11_values.isSet(idx) else cg.usesR11(inst)))
             return cg.fail("internal error: '{t}' uses r11, which may hold a value", .{cg.ir.instructions.items(.tag)[@backingInt(inst)]});
     }
     cg.r11_used = false;
     try cg.genTerm(cg.ssa.blocks.items[@backingInt(block)].term, next);
-    if (cg.r11_used and !cg.has_asm and !cg.termUsesR11(block))
+    if (cg.r11_used and !cg.has_asm and !(if (cg.live) cg.r11_terms.isSet(@backingInt(block)) else cg.termUsesR11(block)))
         return cg.fail("internal error: a '{t}' terminator uses r11, which may hold a value", .{b.term.tag});
 }
 
