@@ -2497,12 +2497,21 @@ user branches are coverage points and are only learned from.
   subtractions, `%`, `@mod`, `&`, `>>` of unsigned values, `@intCast`,
   `@truncate`, `@min`, `@max`, exact unsigned products, from facts whose other side has bounds
   (transitively, depth-limited), and `t != k` at an end of `t`'s range
-  moves that end.
+  moves that end. A compare the facts leave undecided is tried again
+  with an operand replaced by a value a fact makes equal to it, directly
+  or through one more equality (at most four others, never a constant,
+  which bounds already read): after `assert(d.len == m.len)` and
+  `assert(y.len == d.len)`, a loop to `m.len` indexes `y` without
+  checks (`std.crypto.ff`'s `montgomeryLoop`). Facts name values, so a
+  length loaded after a store or call is another value and no fact
+  before it applies.
 - **Offsets.** An unsigned value that is a chain of constant additions
   is `x + c`. From `x + c < y` (or `<=`), when no addition in `x + c`
   can have wrapped (each an overflow operation whose check passed, or
   one made wrapping by a proof, never `+%`), follow `x + d < y` for `d
-  <= c` (`<=` when `d == c` and the fact is `<=`), so `x <= y`, `x + d`
+  <= c` (`<=` when `d == c` and the fact is `<=`), and the same from `x
+  + c' < y - k` for an exact `y - k` with `c = c' + k` (`for (1..n)
+  |j|` counts to `n - 1`, and `j` is the count plus one), so `x <= y`, `x + d`
   cannot overflow, and a `+%` chain bounded so computes `x + d`; and `x +
   c <= x + d` for `c <= d` when both sums are exact. So `s[i..][0..16]`
   after `i + 32 < s.len` keeps none of its three checks, nor does the
