@@ -4942,7 +4942,8 @@ and manifest are a full build's, which `BS_CACHE_VERIFY` checks.
   unit: after the unit's build it prepends a line to its file, adds a
   statement to its first test, and appends a declaration, builds,
   restores the file and builds again, both verified with
-  `BS_CACHE_CHECK` on.
+  `BS_CACHE_CHECK` on. The unit's first build is verified too: with
+  donors it is an edit build of another unit's graph.
 
 **Step 4b as built** (2026-11-03). An edit build is lazy by default
 (`BS_CACHE_REPLAY=eager` selects 4a): it loads only what analysis reads,
@@ -6217,6 +6218,17 @@ state. Built for step 1:
   worker generates which job varies; each worker's jobs stay ascending,
   which `mergeOut`'s deduplication relies on, so step 1 does not shuffle
   the queue itself.
+- `BS_SCHED_FUZZ=late` (`Emit.Pool.late`, 2026-11-05): no job is
+  handed over until analysis waits for CodeGen (`mergeJobs`), where the
+  Sema thread runs them, so CodeGen sees everything analysis resolved
+  meanwhile; `BS_THREADS=1` generates each function as soon as it is
+  analyzed and sees the least. Sleeps cannot reach that far: the
+  test runner's `mainServer` stored into a global whose value
+  `ptrRoot` read before the Sema thread had resolved it, 70 bytes
+  longer than when it had, which only load showed (a `BS_CACHE_VERIFY`
+  difference in about one behavior unit in a hundred). run.py's
+  `--sched-check` builds every unit both ways with the cache off and
+  requires the same bytes; it names the symbols whose size differs.
 - `zig build -Dsanitize-thread -Doptimize=ReleaseFast`: a
   ThreadSanitizer build of bs, linked with libc so that the allocator is
   malloc, which ThreadSanitizer intercepts. (std's SafeAllocator, the

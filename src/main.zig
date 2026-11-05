@@ -1159,10 +1159,14 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // CodeGen on the others; 1 generates on the Sema thread. The output
     // is the same for every n.
     const threads: usize = if (env.get("BS_THREADS")) |v| std.fmt.parseInt(usize, v, 10) catch 1 else std.Thread.getCpuCount() catch 1;
-    // `BS_SCHED_FUZZ=<seed>`: perturb the workers' timing (`Emit.Pool.fuzz`).
-    const fuzz: ?u64 = if (env.get("BS_SCHED_FUZZ")) |v| std.fmt.parseInt(u64, v, 10) catch 1 else null;
+    // `BS_SCHED_FUZZ=<seed>`: perturb the workers' timing (`Emit.Pool.fuzz`);
+    // `BS_SCHED_FUZZ=late`: generate code only when analysis waits for it
+    // (`Emit.Pool.late`).
+    const fuzz_env = env.get("BS_SCHED_FUZZ");
+    const late = if (fuzz_env) |v| std.mem.eql(u8, v, "late") else false;
+    const fuzz: ?u64 = if (late) null else if (fuzz_env) |v| std.fmt.parseInt(u64, v, 10) catch 1 else null;
     emit.has_inputs = !emit.obj and !emit.shared and (opts.link_inputs.len != 0 or c_batch != null);
-    try emit.startPool(@max(threads, 1) - 1, fuzz);
+    try emit.startPool(@max(threads, 1) - 1, fuzz, late);
     const sema_node = prog.start("Analyze and Generate Code", 0);
     if (inc_opt) |i| try i.beginReplay(&fe, &zcu, &emit, replay_mode);
     // A lazy edit build relinks from the manifest, which reads the

@@ -279,6 +279,13 @@ pub const Pool = struct {
     /// which job varies, but each worker's jobs stay ascending, which the
     /// merge relies on (`mergeOut`).
     fuzz: ?u64 = null,
+    /// `BS_SCHED_FUZZ=late`: jobs are handed over only when analysis
+    /// waits for CodeGen (`mergeJobs`), and run there, on the Sema thread:
+    /// CodeGen sees everything analysis resolved meanwhile, where
+    /// `BS_THREADS=1` sees only what was resolved when each function was.
+    /// The output must not change; a difference is code that depends on
+    /// when a declaration's type, value, or layout was resolved.
+    late: bool = false,
     /// The Sema thread's random state and batch length under `fuzz`.
     fuzz_rng: std.Random.DefaultPrng = .init(0),
     batch_target: usize = batch_len,
@@ -527,7 +534,7 @@ fn stopWorkers(pool: *Pool) void {
 
 /// Starts CodeGen workers on `threads` threads besides the Sema thread; 0
 /// generates each function on the Sema thread, with the same output.
-pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64) !void {
+pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64, late: bool) !void {
     const gpa = emit.gpa;
     const io = emit.zcu.io;
     // One per thread, the Sema thread's, and the loads'.
@@ -546,7 +553,7 @@ pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64) !void {
         w.has_inputs = emit.has_inputs;
     }
     const pool = try gpa.create(Pool);
-    pool.* = .{ .io = io, .workers = workers, .fuzz = fuzz };
+    pool.* = .{ .io = io, .workers = workers, .fuzz = fuzz, .late = late };
     if (fuzz) |seed| pool.fuzz_rng = .init(seed);
     emit.pool = pool;
     emit.analyzing = true;
@@ -841,7 +848,7 @@ fn submit(emit: *Emit, ir_in: Ir, exports: ExportsView) !void {
         defer owned.deinit(emit.gpa);
         return emit.generateFunction(&owned);
     };
-    if (pool.threads == 0) {
+    if (pool.threads == 0 and !pool.late) {
         const t0 = std.Io.Timestamp.now(zcu.io, .awake);
         defer emit.codegen_ns += @intCast(t0.durationTo(.now(zcu.io, .awake)).nanoseconds);
         const out = try runJob(&pool.workers[0], ir, exports);
@@ -850,7 +857,7 @@ fn submit(emit: *Emit, ir_in: Ir, exports: ExportsView) !void {
     }
     try pool.batch.append(emit.gpa, .{ .ir = ir, .exports = exports });
     pool.batch_irs += 1;
-    if (pool.batch_irs >= pool.batch_target) try publish(pool, emit.gpa);
+    if (pool.batch_irs >= pool.batch_target and !pool.late) try publish(pool, emit.gpa);
     if (pool.fuzz != null) fuzzDelay(pool.io, pool.fuzz_rng.random());
 }
 

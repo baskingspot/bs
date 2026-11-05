@@ -101,6 +101,7 @@ STATUS_LABELS = {
     "compile_timeout": "compile timeouts",
     "incomplete": "incomplete runs",
     "edit_verify_failed": "edit-verify failures",
+    "sched_check_failed": "sched-check failures",
 }
 
 
@@ -256,8 +257,12 @@ def test_runner(args, cfg):
     return HERE / ("bs_runner.zig" if bs_runner else "test_runner.zig")
 
 
-def compile_unit(compiler, unit, cfg, args, workdir, env=None):
-    bin_path = workdir / "bin" / cfg["name"] / (unit[: -len(".zig")] + ".test")
+def compile_unit(compiler, unit, cfg, args, workdir, env=None, run_env=None, suffix=""):
+    """Builds the unit's test binary. `env` is an edit build's environment:
+    the unit's generated root, and a failure is edit_verify_failed. Else
+    `run_env`, if given, is the build's environment; a failure that the
+    cache's checks report is edit_verify_failed too."""
+    bin_path = workdir / "bin" / cfg["name"] / (unit[: -len(".zig")] + suffix + ".test")
     bin_path.parent.mkdir(parents=True, exist_ok=True)
     if bin_path.exists():
         bin_path.unlink()
@@ -265,21 +270,17 @@ def compile_unit(compiler, unit, cfg, args, workdir, env=None):
     argv = [
         str(compiler),
         "test",
-        str(
-            unit_root(unit, workdir, editable)
-            if env is None
-            else workdir / "units" / unit[: -len(".zig")] / "behavior.zig"
-        ),
+        str(unit_root(unit, workdir, editable) if env is None and not suffix else generated_root(unit, workdir)),
     ]
     if not args.default_runner:
         argv += ["--test-runner", str(test_runner(args, cfg))]
     argv += ["-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}"]
     for f in unit_filters(unit):
         argv += ["--test-filter", f]
-    code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout, env)
+    code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout, env if env is not None else run_env)
     if code == 0 and not timed_out and bin_path.exists():
         return bin_path, None
-    if env is not None:
+    if env is not None or (run_env is not None and "error: BS_CACHE_" in err):
         return None, {
             "status": "edit_verify_failed",
             "log": describe_exit(code, timed_out, args.compile_timeout) + "\n" + tail(err + out),
@@ -620,13 +621,76 @@ def edit_verify(compiler, unit, cfg, args, workdir):
     return result
 
 
+def generated_root(unit, workdir):
+    """The root `unit_root` made for `unit`, as it is."""
+    if unit == ROOT_UNIT:
+        return UPSTREAM_TEST / "behavior.zig"
+    return workdir / "units" / unit[: -len(".zig")] / "behavior.zig"
+
+
+def sched_check(compiler, unit, cfg, args, workdir):
+    """--sched-check: builds the unit twice with the cache off and one
+    thread, generating each function's code as soon as it is analyzed, and
+    with BS_SCHED_FUZZ=late only when analysis waits for CodeGen, after
+    whatever it resolved meanwhile. The binaries must be identical: a
+    difference is code that depends on when a declaration was resolved,
+    which differs between a full build, an edit build, and runs under
+    load. Returns a failure, if any."""
+    base = dict(os.environ, BS_CACHE="off", BS_THREADS="1")
+    paths = []
+    for suffix, extra in ((".early", {}), (".late", {"BS_SCHED_FUZZ": "late"})):
+        path, failure = compile_unit(compiler, unit, cfg, args, workdir, run_env=dict(base, **extra), suffix=suffix)
+        if failure:
+            return failure
+        paths.append(path)
+    early, late = (p.read_bytes() for p in paths)
+    sizes = [symbol_sizes(p) for p in paths]
+    for p in paths:
+        p.unlink(missing_ok=True)
+    if early == late:
+        return None
+    at = next((i for i, (x, y) in enumerate(zip(early, late)) if x != y), min(len(early), len(late)))
+    log = f"the binary differs between BS_THREADS=1 and BS_SCHED_FUZZ=late at byte {at} ({len(early)} vs {len(late)} bytes)"
+    differ = [
+        f"{name}: {sizes[0].get(name)} vs {sizes[1].get(name)} bytes"
+        for name in sorted(set(sizes[0]) | set(sizes[1]))
+        if sizes[0].get(name) != sizes[1].get(name)
+    ]
+    if differ:
+        log += "\nsymbols whose size differs:\n" + "\n".join(differ[:20])
+    return {"status": "sched_check_failed", "log": log, "tests": {}}
+
+
+def symbol_sizes(path):
+    """Each symbol's size in the binary at `path`, by name (nm -S), or none
+    without nm."""
+    try:
+        out = subprocess.run(["nm", "-S", str(path)], capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    sizes = {}
+    for line in out.splitlines():
+        parts = line.split(maxsplit=3)
+        if len(parts) == 4:
+            sizes[parts[3]] = int(parts[1], 16)
+    return sizes
+
+
 def run_one(compiler, unit, cfg, args, workdir):
-    bin_path, failure = compile_unit(compiler, unit, cfg, args, workdir)
+    # A first build that a donor seeds is an edit build of the donor's
+    # graph: checked as the edit builds are.
+    first_env = dict(os.environ, BS_CACHE_VERIFY="1", BS_CACHE_CHECK="1") if args.edit_verify else None
+    bin_path, failure = compile_unit(compiler, unit, cfg, args, workdir, run_env=first_env)
     if failure:
         return failure
     if args.edit_verify and unit != ROOT_UNIT:
         bin_path, failure = edit_verify(compiler, unit, cfg, args, workdir)
         if failure:
+            return failure
+    if args.sched_check:
+        failure = sched_check(compiler, unit, cfg, args, workdir)
+        if failure:
+            bin_path.unlink(missing_ok=True)
             return failure
     try:
         run = run_unit_default if args.default_runner else run_unit
@@ -1271,7 +1335,12 @@ def main():
     p.add_argument(
         "--edit-verify",
         action="store_true",
-        help="bs only: after each file's build, edit it and build again, then restore it and build once more, checking each edit build against a full build (BS_CACHE_VERIFY, BS_CACHE_CHECK); a difference fails the file as edit_verify_failed",
+        help="bs only: verify each file's first build (which a donor may seed), then edit it and build again, then restore it and build once more, checking each edit build against a full build (BS_CACHE_VERIFY, BS_CACHE_CHECK); a difference fails the file as edit_verify_failed",
+    )
+    p.add_argument(
+        "--sched-check",
+        action="store_true",
+        help="bs only: also build each file twice with the cache off on one thread, generating code as each function is analyzed and with BS_SCHED_FUZZ=late; differing binaries fail the file as sched_check_failed",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="print each file's result to stderr")
     args = p.parse_args()
