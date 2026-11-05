@@ -931,7 +931,7 @@ pub fn fileRootType(zcu: *Zcu, file_index: u32) !InternPool.Index {
     if (zcu.file_root_types.items[file_index] != .none) return zcu.file_root_types.items[file_index];
     const key = try zcu.fileKey(file_index);
     const ty = try zcu.createContainerType(.@"struct", file_index, .main_struct_inst, &.{}, .{ .creator = 0, .template = .{ .bytes = try zcu.fileFqn(file_index) } }, key, Namespace.none, null);
-    std.debug.assert(zcu.ip.stableHash(ty) == InternPool.rootStructHash(key));
+    assert(zcu.ip.stableHash(ty) == InternPool.rootStructHash(key));
     zcu.file_root_types.items[file_index] = ty;
     return ty;
 }
@@ -940,7 +940,7 @@ pub const ContainerKind = enum { @"struct", @"enum", @"union", @"opaque" };
 
 /// The end of a container type's stable key: the stable hashes of its
 /// captures, `(h1,h2)`, or nothing if it has none.
-pub fn writeCaptures(ip: *const InternPool, w: *std.Io.Writer, captures: []const InternPool.Index) std.Io.Writer.Error!void {
+pub fn writeCaptures(ip: *const InternPool, w: *Io.Writer, captures: []const InternPool.Index) Io.Writer.Error!void {
     if (captures.len == 0) return;
     try w.writeAll("(");
     for (captures, 0..) |c, i| {
@@ -1008,10 +1008,10 @@ pub fn createContainerType(
     // The caller's names may live in a Sema arena.
     const decl_prefix = try std.mem.concat(arena, u8, &.{ key, if (parent_ns == Namespace.none) ":" else "." });
     const ns_key = decl_prefix[0..key.len];
-    var caps: std.Io.Writer.Allocating = .init(zcu.gpa);
+    var caps: Io.Writer.Allocating = .init(zcu.gpa);
     defer caps.deinit();
     writeCaptures(ip, &caps.writer, captures) catch return error.OutOfMemory;
-    std.debug.assert(std.mem.endsWith(u8, key, caps.written()));
+    assert(std.mem.endsWith(u8, key, caps.written()));
     try zcu.namespaces.append(zcu.gpa, .{
         .file = file_index,
         .parent = if (parent_ns != Namespace.none and zcu.namespaces.items[parent_ns].in_fn) zcu.namespaces.items[parent_ns].parent else parent_ns,
@@ -1063,7 +1063,7 @@ pub fn createContainerType(
         // Upstream's filter semantics: unnamed tests always run; named
         // ones only if their fqn contains some filter.
         if (d.kind != .unnamed_test and zcu.test_filters.len > 0) {
-            var aw: std.Io.Writer.Allocating = .init(zcu.gpa);
+            var aw: Io.Writer.Allocating = .init(zcu.gpa);
             defer aw.deinit();
             print.writeNavName(ip, nav, &aw.writer, .read) catch return error.OutOfMemory;
             const decl_fqn = aw.written();
@@ -1188,7 +1188,7 @@ pub fn offerName(zcu: *Zcu, ty: InternPool.Index, name: NameCandidate) !void {
 }
 
 fn nameAlloc(ip: *const InternPool, ty: InternPool.Index, gpa: Allocator) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(gpa);
+    var aw: Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
     print.writeTypeName(ip, ty, &aw.writer, .render) catch return error.OutOfMemory;
     return aw.toOwnedSlice();
@@ -1213,7 +1213,7 @@ pub fn finalizeNames(zcu: *Zcu, pin_arena: Allocator) !?*const NamePins {
     const pins = try pin_arena.create(NamePins);
     pins.* = .empty;
     const ip = &zcu.ip;
-    var aw: std.Io.Writer.Allocating = .init(pin_arena);
+    var aw: Io.Writer.Allocating = .init(pin_arena);
     for (0..ip.locals.len) |local| for (ip.localNames(local)) |name| {
         if (name.ty == .none) continue;
         aw.clearRetainingCapacity();
@@ -1283,7 +1283,7 @@ pub fn recordDeps(zcu: *Zcu, unit: AnalUnit, deps: []const Dependee, conditional
 
 /// Renders a unit's stable key, which does not depend on analysis order or
 /// in-memory indices.
-pub fn unitKey(zcu: *Zcu, unit: AnalUnit, w: *std.Io.Writer) !void {
+pub fn unitKey(zcu: *Zcu, unit: AnalUnit, w: *Io.Writer) !void {
     const ip = &zcu.ip;
     switch (unit) {
         .nav_val => |nav| try w.writeAll(ip.stringSlice(ip.getNav(nav).key)),
@@ -1347,7 +1347,7 @@ pub fn printUnitTiming(zcu: *Zcu) void {
     std.debug.print("\n", .{});
     for (t.ns.keys()[0..@min(t.top, t.ns.count())], t.ns.values()[0..@min(t.top, t.ns.count())]) |unit, ns| {
         var buf: [256]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&buf);
+        var w: Io.Writer = .fixed(&buf);
         zcu.unitKey(unit, &w) catch {};
         std.debug.print("{d:>9.2} ms  {s} {s}\n", .{ @as(f64, @floatFromInt(ns)) / 1e6, @tagName(unit), w.buffered() });
     }

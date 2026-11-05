@@ -1042,7 +1042,7 @@ fn noteMiss(r: *Replay, unit: Zcu.AnalUnit, what: []const u8) void {
     r.stats.misses += 1;
     if (!r.check) return;
     var buf: [512]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
+    var w: Io.Writer = .fixed(&buf);
     r.zcu.unitKey(unit, &w) catch {};
     const dm = r.decoder.miss;
     std.debug.print("cache replay: could not load {t} {s}: {s}", .{ unit, w.buffered(), what });
@@ -1437,8 +1437,8 @@ pub fn contributeNames(r: *Replay, zcu: *Zcu) !void {
     const ip = &zcu.ip;
     const Names = results.Names;
     const types = &r.type_names;
-    const t0 = std.Io.Clock.awake.now(r.io);
-    defer if (r.timing) std.debug.print("cache: contributed type names of {d} types in {d:.2} ms\n", .{ types.count(), @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(r.io)).toNanoseconds())) / 1e6 });
+    const t0 = Io.Clock.awake.now(r.io);
+    defer if (r.timing) std.debug.print("cache: contributed type names of {d} types in {d:.2} ms\n", .{ types.count(), @as(f64, @floatFromInt(t0.durationTo(Io.Clock.awake.now(r.io)).toNanoseconds())) / 1e6 });
     // The types that matter: those this build has, and those whose
     // winning offer is in a node the build did not keep (its least
     // creator may have left). Most of the manifest's are neither.
@@ -1499,10 +1499,10 @@ pub fn contributeNames(r: *Replay, zcu: *Zcu) !void {
     // Types that analyzed units offered names: their templates may differ
     // from the recorded ones under the same creator (an anonymous type's
     // name has its instruction's index).
-    var fresh: std.AutoHashMapUnmanaged(InternPool.Index, void) = .empty;
+    var fresh: std.AutoHashMapUnmanaged(Index, void) = .empty;
     defer fresh.deinit(gpa);
     for (zcu.name_offers.keys()) |o| try fresh.put(gpa, o.ty, {});
-    var aw: std.Io.Writer.Allocating = .init(gpa);
+    var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     // A type whose holes' names changed is not listed: its holes are.
     for (wanted.keys()) |h| {
@@ -1576,7 +1576,7 @@ fn rootName(r: *Replay, ty: InternPool.Hash) !?[]const u8 {
 pub fn finalTypeName(r: *Replay, ty: InternPool.Hash) !?[]const u8 {
     const ip = &r.zcu.ip;
     if (try ip.indexOfHash(ty)) |index| {
-        var aw: std.Io.Writer.Allocating = .init(r.zcu.arena.allocator());
+        var aw: Io.Writer.Allocating = .init(r.zcu.arena.allocator());
         print.writeTypeName(ip, index, &aw.writer, .render) catch return error.OutOfMemory;
         return aw.written();
     }
@@ -1597,7 +1597,7 @@ pub fn wonName(r: *Replay, o: results.Names.Offer) ![]const u8 {
     const ip = &r.zcu.ip;
     if (try ip.indexOfHash(o.ty)) |ty| {
         if (ip.nameOf(ty).creator != o.creator) return "";
-        var aw: std.Io.Writer.Allocating = .init(r.zcu.arena.allocator());
+        var aw: Io.Writer.Allocating = .init(r.zcu.arena.allocator());
         print.writeTypeName(ip, ty, &aw.writer, .render) catch return error.OutOfMemory;
         return aw.written();
     }
@@ -1620,7 +1620,7 @@ pub fn finalName(r: *Replay, ty: InternPool.Hash) !?[]const u8 {
     if (e.rendering) return null;
     e.rendering = true;
     const ip = &r.zcu.ip;
-    var aw: std.Io.Writer.Allocating = .init(r.zcu.arena.allocator());
+    var aw: Io.Writer.Allocating = .init(r.zcu.arena.allocator());
     const w = &aw.writer;
     var from: usize = 0;
     for (0..best.holeCount()) |k| {

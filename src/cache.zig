@@ -94,12 +94,12 @@ pub fn useTool(io: Io, dir_path: []const u8) !Io.File {
 /// Entries in `bs/o` and translation records used this recently are not
 /// deleted over the size limit: they hold no lock, and a build that just
 /// found one may not have read it yet.
-const in_use_grace_ns = std.time.ns_per_hour;
+const in_use_grace_ns = 60 * std.time.ns_per_min;
 
 /// Over the size limit, a tool goes after the compilations and programs
 /// used up to this much later than it: rebuilding one (libc++ and
 /// libc++abi, the build runner) takes tens of seconds.
-const tool_bias_ns = std.time.ns_per_day;
+const tool_bias_ns = 24 * std.time.ns_per_hour;
 
 /// Compilation directories unused this long are deleted by
 /// `maintainCompilations`. They hold hard links to store packs, which keep
@@ -120,7 +120,7 @@ pub fn globalShares(max_bytes: u64) struct { store: u64, compilations: u64 } {
 }
 
 /// `maintainCompilations` scans at most this often.
-const compilations_scan_ns = std.time.ns_per_min;
+const compilations_scan_ns = 60 * std.time.ns_per_s;
 
 /// Parses a size limit: bytes, or a number followed by K, M, G, or T
 /// (binary multiples).
@@ -366,7 +366,7 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
 
 /// Temporary files in `bs/tmp` (test binaries, deleted once they ran)
 /// older than this were left by a build that was killed.
-const max_temporary_ns = std.time.ns_per_day;
+const max_temporary_ns = 24 * std.time.ns_per_hour;
 
 fn trimTemporary(io: Io, local_cache: Io.Dir, now: Io.Timestamp) void {
     var tmp = local_cache.openDir(io, "bs/tmp", .{ .iterate = true }) catch return;

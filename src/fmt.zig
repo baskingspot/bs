@@ -42,7 +42,7 @@ const Fmt = struct {
     gpa: Allocator,
     arena: Allocator,
     io: Io,
-    out_buffer: std.Io.Writer.Allocating,
+    out_buffer: Io.Writer.Allocating,
     stdout_writer: *Io.File.Writer,
 
     complexity: bool,

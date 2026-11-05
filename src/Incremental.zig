@@ -1909,8 +1909,8 @@ pub const Recorder = struct {
 /// thread of `Recorder.prepare`.
 pub const Keyer = struct {
     zcu: *Zcu,
-    key_buf: std.Io.Writer.Allocating,
-    unit_buf: std.Io.Writer.Allocating,
+    key_buf: Io.Writer.Allocating,
+    unit_buf: Io.Writer.Allocating,
 
     /// A key for `parts`, distinct per `tag`.
     pub fn init(zcu: *Zcu, gpa: Allocator) Keyer {
@@ -4385,7 +4385,7 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
         missed += 1;
         if (missed > 10) continue;
         // Name it by its unit, if it is one.
-        var name: std.Io.Writer.Allocating = .init(gpa);
+        var name: Io.Writer.Allocating = .init(gpa);
         defer name.deinit();
         for (r.unit_list.items, r.unit_info) |u, info| if (info.key == n.key) {
             r.zcu.unitKey(u, &name.writer) catch {};
@@ -4745,7 +4745,7 @@ fn markReached(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *Manif
         const what: []const u8 = if (n.atoms.len != 0 and !reached) "is not reached" else if (n.atoms.len == 0 and reached and n.tag == .func) "is reached but has no atoms" else continue;
         if (n.atoms.len != 0) missed += 1 else extra += 1;
         if (missed + extra > 10) continue;
-        var name: std.Io.Writer.Allocating = .init(gpa);
+        var name: Io.Writer.Allocating = .init(gpa);
         defer name.deinit();
         for (r.unit_list.items, r.unit_info) |u, info| if (info.key == n.key) {
             r.zcu.unitKey(u, &name.writer) catch {};
@@ -4774,7 +4774,7 @@ fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const resul
     var mismatched: usize = 0;
     const Check = struct {
         fn report(z: *Zcu, dec: anytype, unit: anytype, what: []const u8) void {
-            var name: std.Io.Writer.Allocating = .init(z.gpa);
+            var name: Io.Writer.Allocating = .init(z.gpa);
             defer name.deinit();
             z.unitKey(unit, &name.writer) catch {};
             std.debug.print("cache check: the result of {t} {s} does not round-trip: {s}", .{ unit, name.written(), what });
@@ -4988,13 +4988,13 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         fn report(rec: *const Recorder, ni: usize, n: *const Node, what: []const u8, count: *usize) void {
             count.* += 1;
             if (count.* > 20) return;
-            var name: std.Io.Writer.Allocating = .init(rec.gpa);
+            var name: Io.Writer.Allocating = .init(rec.gpa);
             defer name.deinit();
             nodeName(rec, ni, &name.writer);
             std.debug.print("cache verify: {t} node {x} {s}: {s}\n", .{ n.tag, n.key, name.written(), what });
         }
         /// The unit or dependee behind node `ni`, for messages.
-        fn nodeName(rec: *const Recorder, ni: usize, w: *std.Io.Writer) void {
+        fn nodeName(rec: *const Recorder, ni: usize, w: *Io.Writer) void {
             const z = rec.zcu;
             for (rec.unit_list.items, rec.unit_info) |unit, info| if (info.node == ni) {
                 z.unitKey(unit, w) catch {};
@@ -5054,7 +5054,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
             for (x) |p| {
                 while (j < y.len and y[j][0] < p[0]) j += 1;
                 if (j < y.len and y[j][0] == p[0]) continue;
-                var name: std.Io.Writer.Allocating = .init(rec.gpa);
+                var name: Io.Writer.Allocating = .init(rec.gpa);
                 defer name.deinit();
                 nodeName(rec, @intCast(p[1]), &name.writer);
                 std.debug.print("cache verify:   the edit build lacks its dependency on {t} {s}\n", .{ rec.nodes.items[@intCast(p[1])].tag, name.written() });

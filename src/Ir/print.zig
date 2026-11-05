@@ -536,7 +536,7 @@ fn typeIn(cx: Ctx, ty: InternPool.Index, w: *Writer) Writer.Error!void {
 /// A function type's `callconv(...)`, as upstream prints it: the target's
 /// C convention with default options as `.c`, a convention without
 /// options by its tag, and one with options in full.
-fn printCallconv(f: InternPool.FuncType, w: *std.Io.Writer) std.Io.Writer.Error!void {
+fn printCallconv(f: InternPool.FuncType, w: *Writer) Writer.Error!void {
     switch (f.cc) {
         .auto, .naked, .@"inline" => return w.print("callconv(.{f})", .{std.zig.fmtId(@tagName(f.cc))}),
         .c => if (f.stack_align == 0) return w.writeAll("callconv(.c)"),

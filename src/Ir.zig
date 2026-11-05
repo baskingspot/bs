@@ -543,7 +543,7 @@ pub const SwitchCases = struct {
 
     /// The else body, once `next` returned every case.
     pub fn elseBody(it: *const SwitchCases) []const Inst.Index {
-        std.debug.assert(it.left == 0);
+        assert(it.left == 0);
         return it.ir.bodySlice(it.at, it.else_len);
     }
 };

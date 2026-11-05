@@ -6592,7 +6592,7 @@ fn analyzeBitOp(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operand
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(result_ty));
         var space: [2]std.math.big.Limb = undefined;
         const big = ip.intToBig(v, &space);
-        var m = try std.math.big.int.Managed.init(sema.arena);
+        var m = try BigInt.init(sema.arena);
         try m.ensureTwosCompCapacity(info.bits);
         var mut = m.toMutable();
         switch (tag) {
@@ -13427,11 +13427,11 @@ fn packedInsert(sema: *Sema, block: *Block, host: Ref, bit_offset: u16, val: Ref
     const bits = Type.packedBits(ip, sema.typeOf(val)).?;
     if (bits == 0) return host;
     // host & ~(mask << bit_offset) | (val << bit_offset)
-    var mask = try std.math.big.int.Managed.initSet(sema.arena, 1);
+    var mask = try BigInt.initSet(sema.arena, 1);
     try mask.shiftLeft(&mask, bits);
     try mask.addScalar(&mask, -1);
     try mask.shiftLeft(&mask, bit_offset);
-    var all = try std.math.big.int.Managed.initSet(sema.arena, 1);
+    var all = try BigInt.initSet(sema.arena, 1);
     try all.shiftLeft(&all, host_bits);
     try all.addScalar(&all, -1);
     try mask.bitXor(&mask, &all);

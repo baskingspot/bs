@@ -435,7 +435,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         // the functions before this one. `fn f() align(n)` raises it.
         .alignment = .fromByteUnits(@max(64, nav.alignment)),
         .bytes = try arena.dupe(u8, cg.e.code.items),
-        .targets = try arena.dupe(Atom.SymbolKey, cg.e.refs.targets.keys()),
+        .targets = try arena.dupe(SymbolKey, cg.e.refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
         // `cg.saved` has `Atom.Unwind.saved`'s x86_64 bits: the prologue
         // pushes `alloc_regs`' callee-saved ones in that order.
@@ -1859,7 +1859,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
         // callee-saved register (cpuid's `={ebx}`) or a clobber of one
         // (zio's context switch) writes it, so the prologue saves it.
         comptime for (Ir.Asm.callee_saved_names[0..@popCount(callee_saved)], alloc_regs[0..@popCount(callee_saved)]) |name, r| {
-            std.debug.assert(std.mem.eql(u8, name, @tagName(r)));
+            assert(std.mem.eql(u8, name, @tagName(r)));
         };
         for (f.values.items(.inst)) |inst| {
             if (ir.instructions.items(.tag)[@backingInt(inst)] != .assembly) continue;
@@ -4246,14 +4246,14 @@ fn emitBlocks(cg: *CodeGen) Error!void {
 /// were generated: upstream's Debug code keeps such a load, so the
 /// declaration's data is linked, and an undefined symbol it names is an
 /// error (`_ = p.*` for `var p: *u8 = &undefined_extern`).
-fn keepSymbols(cg: *CodeGen, inst: Ir.Inst.Index) Error!void {
-    var refs: std.ArrayList(Ir.Inst.Ref) = .empty;
+fn keepSymbols(cg: *CodeGen, inst: Inst.Index) Error!void {
+    var refs: std.ArrayList(Ref) = .empty;
     defer refs.deinit(cg.gpa);
     const Collect = struct {
-        refs: *std.ArrayList(Ir.Inst.Ref),
-        gpa: std.mem.Allocator,
+        refs: *std.ArrayList(Ref),
+        gpa: Allocator,
         failed: *bool,
-        pub fn use(c: @This(), ref: Ir.Inst.Ref) void {
+        pub fn use(c: @This(), ref: Ref) void {
             if (ref.toInterned() != null) c.refs.append(c.gpa, ref) catch {
                 c.failed.* = true;
             };

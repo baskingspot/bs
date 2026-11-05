@@ -606,7 +606,7 @@ fn cast(cg: *CodeGen, inst: Inst.Index, ty: Index, operand: Ref) Error!void {
     }
 }
 
-fn wider(l: shared.Lane) shared.Lane {
+fn wider(l: Lane) Lane {
     return switch (l) {
         .i8 => .i16,
         .i16 => .i32,
@@ -620,7 +620,7 @@ fn wider(l: shared.Lane) shared.Lane {
 /// computed in lanes twice as wide, in `r` and the next register, then
 /// each lane's low half kept, in order. Source chunks past the operand's
 /// are padding, never read. Uses `r` up to xmm3 and xmm5.
-fn packTree(cg: *CodeGen, operand: Ref, s: Shape, out: shared.Lane, first: u32, count: u32, r: Xmm) Error!void {
+fn packTree(cg: *CodeGen, operand: Ref, s: Shape, out: Lane, first: u32, count: u32, r: Xmm) Error!void {
     const e = &cg.e;
     if (count == 1) return loadChunk(cg, r, operand, first);
     const in = wider(out);

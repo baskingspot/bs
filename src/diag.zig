@@ -351,7 +351,7 @@ test closeNames {
 /// file again for candidates and fixes.
 pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorBundle, out: *std.ArrayList(Diagnostic)) !void {
     // The file read again most recently: a file's errors come together.
-    var reread: ?struct { path: []const u8, tree: std.zig.Ast } = null;
+    var reread: ?struct { path: []const u8, tree: Ast } = null;
     for (bundle.getMessages()) |idx| {
         const m = bundle.getErrorMessage(idx);
         const notes = try arena.alloc(Note, m.notes_len);
@@ -382,7 +382,7 @@ pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorB
                     // The file vanished since: no facts.
                     else => break :facts,
                 };
-                reread = .{ .path = path, .tree = try std.zig.Ast.parse(arena, source, .{ .mode = .zig }) };
+                reread = .{ .path = path, .tree = try Ast.parse(arena, source, .{ .mode = .zig }) };
             }
             const tree = &reread.?.tree;
             // The file changed since AstGen read it: its offsets mean nothing.
@@ -693,7 +693,7 @@ const primitive_names = [_][]const u8{
 /// function around `offset`, and its local constants, variables and
 /// captures declared before `offset` (block scopes are not tracked: a
 /// candidate is a hint), and the primitive names.
-fn scopeNames(arena: std.mem.Allocator, tree: *const std.zig.Ast, offset: u32, out: *std.ArrayList([]const u8)) !void {
+fn scopeNames(arena: std.mem.Allocator, tree: *const Ast, offset: u32, out: *std.ArrayList([]const u8)) !void {
     try out.appendSlice(arena, &primitive_names);
     const tags = tree.nodes.items(.tag);
     var buf: [2]Ast.Node.Index = undefined;

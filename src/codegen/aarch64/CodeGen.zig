@@ -354,7 +354,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .section = .text,
         .alignment = .fromByteUnits(@max(4, nav.alignment)),
         .bytes = try arena.dupe(u8, cg.e.code.items),
-        .targets = try arena.dupe(Atom.SymbolKey, cg.e.refs.targets.keys()),
+        .targets = try arena.dupe(SymbolKey, cg.e.refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
         .unwind = if (cg.outermost_frame) .outermost else if (naked) .none else unwind,
     }, debug);
@@ -2209,7 +2209,7 @@ const SwitchEmit = struct {
     pub fn branch(s: SwitchEmit, key: u64, cond: std.math.CompareOperator, l: u32, again: bool) Error!void {
         if (!again) try s.cmpImm(.x9, key ^ s.flip);
         const is_signed = s.flip != 0;
-        const cc: Encoder.Cond = switch (cond) {
+        const cc: Cond = switch (cond) {
             .lt => if (is_signed) .lt else .lo,
             .lte => if (is_signed) .le else .ls,
             .eq => .eq,

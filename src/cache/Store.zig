@@ -138,10 +138,10 @@ comptime {
 }
 
 pub const max_packs = 16;
-pub const used_refresh_ns = std.time.ns_per_hour;
+pub const used_refresh_ns = 60 * std.time.ns_per_min;
 pub const max_unused_ns = 5 * std.time.ns_per_day;
 pub const copy_forward_ns = max_unused_ns / 2;
-const trim_interval_ns = std.time.ns_per_day;
+const trim_interval_ns = 24 * std.time.ns_per_hour;
 /// `maintainStale` and `commit` run `maintain` at least this often, so
 /// that what the packs' sizes do not show (donors, the global ZIR) is
 /// counted against the limit within minutes of being written.

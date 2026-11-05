@@ -1003,7 +1003,7 @@ const Superseded = extern struct {
 };
 
 /// How long superseded ZIR that no build mapped since stays.
-const superseded_grace_ns = std.time.ns_per_hour;
+const superseded_grace_ns = 60 * std.time.ns_per_min;
 
 const IndexHeader = extern struct {
     magic: [8]u8 = index_magic,
@@ -1473,7 +1473,7 @@ pub fn loadFile(fe: *Frontend, mod: Module.Index, sub_path: []const u8) !?File.I
         fe.late_errors.appendAssumeCapacity(try errors.toOwnedBundle(""));
         return error.AstGenFailed;
     }
-    std.debug.assert(ok);
+    assert(ok);
     return index[0];
 }
 
@@ -2183,7 +2183,7 @@ test "drops the ZIR of edited sources once no build maps it" {
 
     // `a/main.zig` at `sources[i]`, built with its own local cache.
     const build = struct {
-        fn build(dir: std.Io.Dir, b: []const u8, g: []const u8, sub: []const u8, src: ?[]const u8) !Frontend {
+        fn build(dir: Io.Dir, b: []const u8, g: []const u8, sub: []const u8, src: ?[]const u8) !Frontend {
             const path = try gpa.print("{s}/main.zig", .{sub});
             defer gpa.free(path);
             if (src) |s| {
