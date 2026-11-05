@@ -1084,41 +1084,46 @@ const max_insn_len = 16;
 /// Appends raw bytes: prefixes (such as the fs segment override, 0x64) and
 /// instructions without operands that have no method of their own.
 /// Allocates a stack frame of `size` bytes, more than a page, touching each
-/// page first, then jumps to `resume_at`: upstream's probe sequences, so a
-/// frame cannot step over a guard page, except that each probe writes the
-/// frame's not yet used memory where upstream's `test` reads it. A read
-/// of an untouched stack page maps the shared zero page, and the frame's
-/// first write to it then copies it and flushes every thread's TLB: a
-/// multithreaded program (the build runner's Fetch workers, each with a
-/// 64 KiB `undefined` buffer) pays inter-processor interrupts per page.
-/// Below 5 pages, unrolled:
-///   mov [rsp - 4096 * k], esp   (each k with 4096 * k < size)
-///   sub rsp, size
+/// page first, then jumps to `resume_at`, so that a frame cannot step over
+/// a guard page. Each step moves rsp down a page and then writes the page
+/// at rsp, so nothing is written below rsp (Valgrind grows the main
+/// thread's stack only for accesses at or above it). The probes write
+/// where upstream's `test` reads: a read of an untouched stack page maps
+/// the shared zero page, and the frame's first write to it then copies it
+/// and flushes every thread's TLB, which a multithreaded program (the
+/// build runner's Fetch workers, each with a 64 KiB `undefined` buffer)
+/// pays in inter-processor interrupts per page. With n = size / 4096
+/// pages, below 5 pages unrolled:
+///   sub rsp, 4096; mov [rsp], esp   (n times)
+///   sub rsp, size % 4096            (if not 0)
 /// otherwise a loop, with r10 (upstream's linker scratch register, which
 /// carries no argument):
-///   mov r10d, size; sub rsp, r10
-///   1: mov [rsp + r10 - 4096], esp; sub r10, 4096; jae 1b
+///   mov r10d, n
+///   1: sub rsp, 4096; mov [rsp], esp; dec r10d; jnz 1b
+///   sub rsp, size % 4096            (if not 0)
 pub fn probedFrameAlloc(e: *Encoder, size: u32, resume_at: u32) !void {
     const page = 4096;
     assert(size > page);
-    try e.code.ensureUnusedCapacity(e.gpa, 4 * 7 + 7 + 5);
+    try e.code.ensureUnusedCapacity(e.gpa, 4 * 10 + 7 + 5);
+    const pages = size / page;
     if (size < 5 * page) {
-        var off: u32 = page;
-        while (off < size) : (off += page) {
-            e.bytes(&.{ 0x89, 0xa4, 0x24 });
-            e.int(i32, -@as(i32, @intCast(off)));
+        for (0..pages) |_| {
+            e.bytes(&.{ 0x48, 0x81, 0xec });
+            e.int(u32, page);
+            e.bytes(&.{ 0x89, 0x24, 0x24 });
         }
-        e.bytes(&.{ 0x48, 0x81, 0xec });
-        e.int(u32, size);
     } else {
         e.bytes(&.{ 0x41, 0xba });
-        e.int(u32, size);
-        e.bytes(&.{ 0x4c, 0x29, 0xd4 });
-        e.bytes(&.{ 0x42, 0x89, 0xa4, 0x14 });
-        e.int(i32, -page);
-        e.bytes(&.{ 0x49, 0x81, 0xea });
+        e.int(u32, pages);
+        e.bytes(&.{ 0x48, 0x81, 0xec });
         e.int(u32, page);
-        e.bytes(&.{ 0x73, 0xef }); // back over the jae, sub, and test (17 bytes)
+        e.bytes(&.{ 0x89, 0x24, 0x24 });
+        e.bytes(&.{ 0x41, 0xff, 0xca });
+        e.bytes(&.{ 0x75, 0xf1 }); // back over the jnz, dec, mov, and sub (15 bytes)
+    }
+    if (size % page != 0) {
+        e.bytes(&.{ 0x48, 0x81, 0xec });
+        e.int(u32, size % page);
     }
     e.byte(0xe9);
     e.int(u32, 0);
