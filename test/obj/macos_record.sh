@@ -36,7 +36,9 @@ echo 'pub const n = 1;' >greet.zig
 build() {
     env ${3:-} "$bs" build-exe main.zig --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1 || fail "build ($1)"
     [ "$(./main 2>&1)" = "$2" ] || fail "$1: main prints '$2'"
-    stamp=$(stat -f '%i %Fm' main)
+    # The devshell puts GNU coreutils' stat first, whose -f is the filesystem,
+    # so name the host's BSD stat.
+    stamp=$(/usr/bin/stat -f '%i %Fm' main)
 }
 
 build "first" "hi 1"
