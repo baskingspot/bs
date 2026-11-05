@@ -4944,7 +4944,35 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         var changed: std.ArrayList(u32) = .empty;
         defer changed.deinit(gpa);
         try m.changedInputs(gpa, inc.io, null, &changed);
+        // Only the inputs this build reads: the edit build may have left
+        // one it no longer reads as it was (an `@embedFile` whose
+        // reference went, then the file), which says nothing about
+        // its nodes.
+        var read: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var it = read.keyIterator();
+            while (it.next()) |k| gpa.free(k.*);
+            read.deinit(gpa);
+        }
+        const fe = r.zcu.fe;
+        var path_buf: std.ArrayList(u8) = .empty;
+        defer path_buf.deinit(gpa);
+        for (fe.files.items) |*f| {
+            try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
+            const gop = try read.getOrPut(gpa, path_buf.items);
+            if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, path_buf.items);
+        }
+        for (r.zcu.embed_files.values()) |f| {
+            try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
+            const gop = try read.getOrPut(gpa, path_buf.items);
+            if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, path_buf.items);
+        }
+        for (0..inc.link_objects.len + inc.link_shared.len) |n| {
+            const gop = try read.getOrPut(gpa, inc.linkPath(n));
+            if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, inc.linkPath(n));
+        }
         for (changed.items) |i| {
+            if (!read.contains(m.input(i)[1])) continue;
             if (try inc.sameContents(m, i)) continue;
             _, const path = m.input(i);
             std.debug.print("cache verify: {s} changed since the last build; BS_CACHE_VERIFY=full only compares a full build with a manifest of the same inputs (set BS_CACHE_VERIFY=1 to verify an edit build)\n", .{path});

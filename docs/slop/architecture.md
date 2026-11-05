@@ -5755,7 +5755,9 @@ and manifest are a full build's, which `BS_CACHE_VERIFY` checks.
   relink, no replay), whose `record` compares its nodes with the edit
   build's manifest (set by hand with an input changed since that
   manifest, `full` fails saying so rather than compare with an older
-  build): the same nodes with the same kinds, source hashes,
+  build; only inputs the full build reads count, since an edit build
+  leaves one it no longer reads as it was, such as an `@embedFile`d
+  file deleted after its last reference went): the same nodes with the same kinds, source hashes,
   results, dependencies (by key and kind), references, and atom records
   byte for byte (so `base_line`s too). Not the output's bytes: a lazy
   build links in manifest order with its new nodes last. A difference

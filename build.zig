@@ -1374,6 +1374,18 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &en.step, 10);
         test_step.dependOn(&en.step);
     }
+    // A deleted `@embedFile`d file: test/run/edit_embed_gone.sh.
+    {
+        const em = b.addSystemCommand(&.{"sh"});
+        em.setName("bs edit around a deleted embedded file");
+        em.addFileArg(b.path("test/run/edit_embed_gone.sh"));
+        em.addArtifactArg(bs);
+        _ = em.addOutputDirectoryArg("work");
+        em.addDirectoryArg(std_zir);
+        em.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &em.step, 10);
+        test_step.dependOn(&em.step);
+    }
 
     const bs_run = b.addRunArtifact(bs);
     bs_run.setName("bs run args");
