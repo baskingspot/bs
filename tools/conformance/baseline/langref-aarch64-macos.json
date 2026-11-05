@@ -1,0 +1,1981 @@
+{
+ "format": 1,
+ "target": "aarch64-macos",
+ "compiler": "zig 0.17.1",
+ "examples": {
+  "Assembly Syntax Explained": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "TopLevelFields": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "addWithOverflow_builtin": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "overflowed result: 9\n",
+   "panic": null
+  },
+  "anonymous_struct_name": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "assign_undefined": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "1",
+   "panic": null
+  },
+  "bad_default_value": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: reached unreachable code\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/debug.zig:442:14: 0x? in assert (bad_default_value)\n    if (!ok) unreachable; // assertion failure\n             ^\n../../../../..bad_default_value.zig:8:15: 0x? in categorize (bad_default_value)\n        assert(t.maximum >= t.minimum);\n              ^\n../../../../..bad_default_value.zig:19:42: 0x? in main (bad_default_value)\n    const category = threshold.categorize(0.90);\n                                         ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (bad_default_value)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: reached unreachable code"
+  },
+  "base64": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "build": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "build_c": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "build_object": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "catch": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "catch_err_return": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "change_active_union_field": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "value: 12.34\n",
+   "panic": null
+  },
+  "checking_null_in_zig": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "cli_allocation": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "ptr=i32@?\n",
+   "panic": null
+  },
+  "comments": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "Hello, world!\n",
+   "panic": null
+  },
+  "compile-time_duck_typing": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "compile_variables": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "compiler_generated_function": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "constant_identifier_cannot_change": {
+   "kind": "exe=build_fail",
+   "outcome": "build_failed",
+   "error": [
+    "constant_identifier_cannot_change.zig:8:5",
+    "cannot assign to constant"
+   ]
+  },
+  "defer_unwind": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "\n2 1 ",
+   "panic": null
+  },
+  "destructuring_arrays": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "x = 1, y = 2\n{ 0, 165, 255, 255 }\n",
+   "panic": null
+  },
+  "destructuring_block": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "min = 0\nmax = 9\n",
+   "panic": null
+  },
+  "destructuring_mixed": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "x = 1, y = 2, z = 3\nx = 2\n",
+   "panic": null
+  },
+  "destructuring_return_value": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "10 / 3 = 3\n10 % 3 = 1\n",
+   "panic": null
+  },
+  "destructuring_to_existing": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "tuple: x = 1, y = 2, z = 3\narray: x = 4, y = 5, z = 6\nvector: x = 7, y = 8, z = 9\n",
+   "panic": null
+  },
+  "destructuring_vectors": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "{ 1, 5, 2, 6 }",
+   "panic": null
+  },
+  "doc_comments": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "entry_point": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "Hello, World!\n",
+   "panic": null
+  },
+  "enum_export": {
+   "kind": "obj",
+   "outcome": "built"
+  },
+  "enum_export_error": {
+   "kind": "obj=parameter of type 'enum_export_error.Foo' not allowed in function with calling convention 'x86_64_sysv'",
+   "outcome": "skip"
+  },
+  "error_return_trace": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": 1,
+   "stdout": "",
+   "stderr": "error: PermissionDenied\n../../../../..error_return_trace.zig:34:5: 0x? in bang1 (error_return_trace)\n    return error.FileNotFound;\n    ^\n../../../../..error_return_trace.zig:22:5: 0x? in baz (error_return_trace)\n    try bang1();\n    ^\n../../../../..error_return_trace.zig:38:5: 0x? in bang2 (error_return_trace)\n    return error.PermissionDenied;\n    ^\n../../../../..error_return_trace.zig:30:5: 0x? in hello (error_return_trace)\n    try bang2();\n    ^\n../../../../..error_return_trace.zig:17:31: 0x? in bar (error_return_trace)\n        error.FileNotFound => try hello(),\n                              ^\n../../../../..error_return_trace.zig:7:9: 0x? in foo (error_return_trace)\n        try bar();\n        ^\n../../../../..error_return_trace.zig:2:5: 0x? in main (error_return_trace)\n    try foo(12);\n    ^\n",
+   "panic": "error: PermissionDenied"
+  },
+  "error_union_parsing_u64": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "export_any_symbol_name": {
+   "kind": "obj",
+   "outcome": "built"
+  },
+  "export_builtin": {
+   "kind": "obj",
+   "outcome": "built"
+  },
+  "export_builtin_equivalent_code": {
+   "kind": "obj",
+   "outcome": "built"
+  },
+  "fibonacci_comptime_infinite_recursion": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "float_literals": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "float_mode_exe": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "float_mode_obj": {
+   "kind": "obj",
+   "outcome": "built"
+  },
+  "float_special_values": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "generic_data_structure": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "handle_error_with_catch_block": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "hello": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "Hello, World!\n",
+   "stderr": "",
+   "panic": null
+  },
+  "hello_again": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "Hello, World!\n",
+   "panic": null
+  },
+  "identifiers": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "inline_assembly": {
+   "kind": "exe=succeed",
+   "outcome": "skip"
+  },
+  "inline_call": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "runtime a = 1200 b = 34",
+   "panic": null
+  },
+  "inline_prong_range": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "integer_literals": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "invalid_doc-comment": {
+   "kind": "obj=expected type expression, found 'a document comment'",
+   "outcome": "build_failed",
+   "error": [
+    "invalid_doc-comment.zig:1:16",
+    "expected type expression, found 'a document comment'"
+   ]
+  },
+  "lang.CallModifier struct": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "libc_export_entry_point": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "Hello! argv[0] is 'libc_export_entry_point'\n",
+   "panic": null
+  },
+  "math": {
+   "kind": "exe=succeed",
+   "outcome": "skip"
+  },
+  "math_add": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": 1,
+   "stdout": "",
+   "stderr": "unable to add one: Overflow\nerror: Overflow\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/math.zig:571:21: 0x? in add__func_853 (math_add)\n    if (ov[1] != 0) return error.Overflow;\n                    ^\n../../../../..math_add.zig:8:9: 0x? in main (math_add)\n        return err;\n        ^\n",
+   "panic": "error: Overflow"
+  },
+  "mathtest": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "multiline_string_literals": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "mutable_var": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "5679",
+   "panic": null
+  },
+  "not_atomic_cmpxchgStrong": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "null": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "optional_integer": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "packed_struct_mmio": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "panic_handler": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": 1,
+   "stdout": "",
+   "stderr": "Panic! integer overflow\n",
+   "panic": null
+  },
+  "poc_printValue_fn": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "poc_print_fn": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "print": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "here is a string: 'foobar' here is a number: 1234\n",
+   "panic": null
+  },
+  "print_comptime-known_format": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "here is a string: 'foobar' here is a number: 1234\n",
+   "panic": null
+  },
+  "redundant_fqn": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "redundant_fqn.json.JsonValue\n",
+   "panic": null
+  },
+  "result_location_interfering_with_swap": {
+   "kind": "test_error",
+   "outcome": "built",
+   "exit": 1,
+   "summary": "0 passed; 0 skipped; 1 failed.",
+   "panic": null
+  },
+  "result_type_propagation": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "runtime_divExact_remainder": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: exact division produced remainder\n../../../../..runtime_divExact_remainder.zig:7:15: 0x? in main (runtime_divExact_remainder)\n    const c = @divExact(a, b);\n              ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_divExact_remainder)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: exact division produced remainder"
+  },
+  "runtime_division_by_zero": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: division by zero\n../../../../..runtime_division_by_zero.zig:7:17: 0x? in main (runtime_division_by_zero)\n    const c = a / b;\n                ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_division_by_zero)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: division by zero"
+  },
+  "runtime_incorrect_pointer_alignment": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: incorrect alignment\n../../../../..runtime_incorrect_pointer_alignment.zig:9:64: 0x? in foo (runtime_incorrect_pointer_alignment)\n    const int_slice = mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(slice4)));\n                                                               ^\n../../../../..runtime_incorrect_pointer_alignment.zig:5:12: 0x? in main (runtime_incorrect_pointer_alignment)\n    if (foo(bytes) != 0x?) return error.Wrong;\n           ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_incorrect_pointer_alignment)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: incorrect alignment"
+  },
+  "runtime_index_out_of_bounds": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: index out of bounds: index 5, len 5\n../../../../..runtime_index_out_of_bounds.zig:7:13: 0x? in foo (runtime_index_out_of_bounds)\n    return x[5];\n            ^\n../../../../..runtime_index_out_of_bounds.zig:2:18: 0x? in main (runtime_index_out_of_bounds)\n    const x = foo(\"hello\");\n                 ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_index_out_of_bounds)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: index out of bounds: index 5, len 5"
+  },
+  "runtime_invalid_cast": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: integer does not fit in destination type\n../../../../..runtime_invalid_cast.zig:6:27: 0x? in main (runtime_invalid_cast)\n    const unsigned: u32 = @intCast(value);\n                          ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_invalid_cast)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: integer does not fit in destination type"
+  },
+  "runtime_invalid_cast_truncate": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: integer does not fit in destination type\n../../../../..runtime_invalid_cast_truncate.zig:6:22: 0x? in main (runtime_invalid_cast_truncate)\n    const byte: u8 = @intCast(spartan_count);\n                     ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_invalid_cast_truncate)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: integer does not fit in destination type"
+  },
+  "runtime_invalid_enum_cast": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: invalid enum value\n../../../../..runtime_invalid_enum_cast.zig:10:20: 0x? in foo (runtime_invalid_enum_cast)\n    const b: Foo = @fromBackingInt(a);\n                   ^\n../../../../..runtime_invalid_enum_cast.zig:15:8: 0x? in main (runtime_invalid_enum_cast)\n    foo(3);\n       ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_invalid_enum_cast)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: invalid enum value"
+  },
+  "runtime_invalid_error_code": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: invalid error code\n../../../../..runtime_invalid_error_code.zig:7:5: 0x? in main (runtime_invalid_error_code)\n    const invalid_err = @errorFromInt(number);\n    ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_invalid_error_code)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: invalid error code"
+  },
+  "runtime_invalid_error_set_cast": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: unexpected error code, found error.B\n../../../../..runtime_invalid_error_set_cast.zig:15:21: 0x? in foo (runtime_invalid_error_set_cast)\n    const x: Set2 = @errorCast(set1);\n                    ^\n../../../../..runtime_invalid_error_set_cast.zig:12:8: 0x? in main (runtime_invalid_error_set_cast)\n    foo(Set1.B);\n       ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_invalid_error_set_cast)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: unexpected error code, found error.B"
+  },
+  "runtime_invalid_null_pointer_cast": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: cast causes pointer to be null\n../../../../..runtime_invalid_null_pointer_cast.zig:4:23: 0x? in main (runtime_invalid_null_pointer_cast)\n    const ptr: *i32 = @ptrCast(opt_ptr);\n                      ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_invalid_null_pointer_cast)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: cast causes pointer to be null"
+  },
+  "runtime_out_of_bounds_float_to_integer_cast": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: integer part of floating point value out of bounds\n../../../../..runtime_out_of_bounds_float_to_integer_cast.zig:4:22: 0x? in main (runtime_out_of_bounds_float_to_integer_cast)\n    const int: i32 = @intFromFloat(float);\n                     ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_out_of_bounds_float_to_integer_cast)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: integer part of floating point value out of bounds"
+  },
+  "runtime_overflow": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: integer overflow\n../../../../..runtime_overflow.zig:5:10: 0x? in main (runtime_overflow)\n    byte += 1;\n         ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_overflow)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: integer overflow"
+  },
+  "runtime_reaching_unreachable": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: reached unreachable code\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/debug.zig:442:14: 0x? in assert (runtime_reaching_unreachable)\n    if (!ok) unreachable; // assertion failure\n             ^\n../../../../..runtime_reaching_unreachable.zig:4:21: 0x? in main (runtime_reaching_unreachable)\n    std.debug.assert(false);\n                    ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_reaching_unreachable)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: reached unreachable code"
+  },
+  "runtime_remainder_division_by_zero": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: division by zero\n../../../../..runtime_remainder_division_by_zero.zig:7:17: 0x? in main (runtime_remainder_division_by_zero)\n    const c = a % b;\n                ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_remainder_division_by_zero)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: division by zero"
+  },
+  "runtime_shlExact_overflow": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: left shift overflowed bits\n../../../../..runtime_shlExact_overflow.zig:6:5: 0x? in main (runtime_shlExact_overflow)\n    const y = @shlExact(x, 2);\n    ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_shlExact_overflow)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: left shift overflowed bits"
+  },
+  "runtime_shrExact_overflow": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: right shift overflowed bits\n../../../../..runtime_shrExact_overflow.zig:6:5: 0x? in main (runtime_shrExact_overflow)\n    const y = @shrExact(x, 2);\n    ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_shrExact_overflow)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: right shift overflowed bits"
+  },
+  "runtime_unwrap_error": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: attempt to unwrap error: UnableToReturnNumber\nerror return context:\n../../../../..runtime_unwrap_error.zig:9:5: 0x? in getNumberOrFail (runtime_unwrap_error)\n    return error.UnableToReturnNumber;\n    ^\n\nstack trace:\n../../../../..runtime_unwrap_error.zig:4:44: 0x? in main (runtime_unwrap_error)\n    const number = getNumberOrFail() catch unreachable;\n                                           ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_unwrap_error)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: attempt to unwrap error: UnableToReturnNumber"
+  },
+  "runtime_unwrap_null": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: attempt to use null value\n../../../../..runtime_unwrap_null.zig:6:35: 0x? in main (runtime_unwrap_null)\n    const number = optional_number.?;\n                                  ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_unwrap_null)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: attempt to use null value"
+  },
+  "runtime_vs_comptime": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "runtime_wrong_union_field_access": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: access of union field 'float' while field 'int' is active\n../../../../..runtime_wrong_union_field_access.zig:14:6: 0x? in bar (runtime_wrong_union_field_access)\n    f.float = 12.34;\n     ^\n../../../../..runtime_wrong_union_field_access.zig:10:8: 0x? in main (runtime_wrong_union_field_access)\n    bar(&f);\n       ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (runtime_wrong_union_field_access)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: access of union field 'float' while field 'int' is active"
+  },
+  "sentinel-terminated_pointer": {
+   "kind": "exe=build_fail",
+   "outcome": "build_failed",
+   "error": [
+    "sentinel-terminated_pointer.zig:11:16",
+    "expected type '[*:0]const u8', found '*const [14]u8'"
+   ]
+  },
+  "single_value_error_set": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "single_value_error_set_shortcut": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "slicing_by_length": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "stack_trace": {
+   "kind": "exe=fail",
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: PermissionDenied\n../../../../..stack_trace.zig:38:5: 0x? in bang2 (stack_trace)\n    @panic(\"PermissionDenied\");\n    ^\n../../../../..stack_trace.zig:30:10: 0x? in hello (stack_trace)\n    bang2();\n         ^\n../../../../..stack_trace.zig:17:14: 0x? in bar (stack_trace)\n        hello();\n             ^\n../../../../..stack_trace.zig:7:12: 0x? in foo (stack_trace)\n        bar();\n           ^\n../../../../..stack_trace.zig:2:8: 0x? in main (stack_trace)\n    foo(12);\n       ^\n/Users/runner/.cache/bs/zig-aarch64-macos-0.17.1/lib/std/start.zig:788:64: 0x? in callMain (stack_trace)\n    if (fn_info.param_types.len == 0) return wrapMain(root.main());\n                                                               ^\n???:?:?: 0x? in start (/usr/lib/dyld)\n",
+   "panic": "thread ? panic: PermissionDenied"
+  },
+  "std_options": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "string_literals": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "*const [5:0]u8\n5\ne\n0\ntrue\n128169\n128175\n⚡\ntrue\ntrue\n0x?\n0x?\n",
+   "panic": null
+  },
+  "struct_default_field_values": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "struct_default_value": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "struct_name": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "variable: struct_name.main.Foo\nanonymous: struct_name.main__struct_?\nfunction: struct_name.List(i32)\n",
+   "panic": null
+  },
+  "test_TypeOf_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_aligned_struct_fields": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_allocator": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_allowzero": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_ambiguous_coercion": {
+   "kind": "test_error",
+   "outcome": "build_failed",
+   "error": [
+    "test_ambiguous_coercion.zig:3:25",
+    "ambiguous coercion of division operands 'comptime_float' and 'comptime_int'; non-zero remainder '4'"
+   ]
+  },
+  "test_anonymous_struct": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_anonymous_union": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_arrays": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 4 tests passed.",
+   "panic": null
+  },
+  "test_assertion_failure": {
+   "kind": "test_error",
+   "outcome": "built",
+   "exit": 1,
+   "summary": null,
+   "panic": "1/1 test_assertion_failure.test.this will fail...thread ? panic: reached unreachable code"
+  },
+  "test_basic_slices": {
+   "kind": "test_safety=index out of bounds",
+   "outcome": "built",
+   "exit": 1,
+   "summary": null,
+   "panic": "1/1 test_basic_slices.test.basic slices...thread ? panic: index out of bounds: index 10, len 4"
+  },
+  "test_bitOffsetOf_offsetOf": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_blocks": {
+   "kind": "test_error=use of undeclared identifier 'x'",
+   "outcome": "build_failed",
+   "error": [
+    "test_blocks.zig:6:5",
+    "use of undeclared identifier 'x'"
+   ]
+  },
+  "test_call_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_coerce_error_subset_to_superset": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_coerce_error_superset_to_subset": {
+   "kind": "test_error=not a member of destination error set",
+   "outcome": "build_failed",
+   "error": [
+    "test_coerce_error_superset_to_subset.zig:16:12",
+    "expected type 'error{OutOfMemory}', found 'error{AccessDenied,FileNotFound,OutOfMemory}'"
+   ]
+  },
+  "test_coerce_large_to_small": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_coerce_optional_wrapped_error_union": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_coerce_optionals": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_coerce_slices_arrays_and_pointers": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 8 tests passed.",
+   "panic": null
+  },
+  "test_coerce_to_error_union": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_coerce_tuples_arrays": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_coerce_unions_enums": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_compileLog_builtin": {
+   "kind": "test_error=found compile log statement",
+   "outcome": "build_failed",
+   "error": [
+    "test_compileLog_builtin.zig:5:5",
+    "found compile log statement"
+   ]
+  },
+  "test_comptime_call_extern_function": {
+   "kind": "test_error=comptime call of extern function",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_call_extern_function.zig:5:13",
+    "comptime call of extern function"
+   ]
+  },
+  "test_comptime_divExact_remainder": {
+   "kind": "test_error=exact division produced remainder",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_divExact_remainder.zig:4:15",
+    "exact division produced remainder"
+   ]
+  },
+  "test_comptime_division_by_zero": {
+   "kind": "test_error=division by zero",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_division_by_zero.zig:4:19",
+    "division by zero here causes illegal behavior"
+   ]
+  },
+  "test_comptime_evaluation": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_comptime_incorrect_pointer_alignment": {
+   "kind": "test_error=pointer address 0x1 is not aligned to 4 bytes",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_incorrect_pointer_alignment.zig:3:47",
+    "pointer address 0x1 is not aligned to 4 bytes"
+   ]
+  },
+  "test_comptime_index_out_of_bounds": {
+   "kind": "test_error=index 5 outside array of length 5",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_index_out_of_bounds.zig:3:27",
+    "index 5 outside array of length 5"
+   ]
+  },
+  "test_comptime_invalid_cast": {
+   "kind": "test_error=type 'u32' cannot represent integer value '-1'",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_invalid_cast.zig:3:36",
+    "type 'u32' cannot represent integer value '-1'"
+   ]
+  },
+  "test_comptime_invalid_cast_truncate": {
+   "kind": "test_error=type 'u8' cannot represent integer value '300'",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_invalid_cast_truncate.zig:3:31",
+    "type 'u8' cannot represent integer value '300'"
+   ]
+  },
+  "test_comptime_invalid_enum_cast": {
+   "kind": "test_error=enum 'test_comptime_invalid_enum_cast.Foo' has no tag with value '3'",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_invalid_enum_cast.zig:8:20",
+    "enum 'test_comptime_invalid_enum_cast.Foo' has no tag with value '3'"
+   ]
+  },
+  "test_comptime_invalid_error_code": {
+   "kind": "test_error=integer value '12345' represents no error",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_invalid_error_code.zig:2:23",
+    "integer value '12345' represents no error"
+   ]
+  },
+  "test_comptime_invalid_error_set_cast": {
+   "kind": "test_error='error.B' not a member of error set 'error{A,C}'",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_invalid_error_set_cast.zig:10:19",
+    "'error.B' not a member of error set 'error{A,C}'"
+   ]
+  },
+  "test_comptime_invalid_null_pointer_cast": {
+   "kind": "test_error=null pointer casted to type",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_invalid_null_pointer_cast.zig:3:32",
+    "null pointer casted to type '*i32'"
+   ]
+  },
+  "test_comptime_max_with_bool": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_comptime_mismatched_type": {
+   "kind": "test_error=operator > not allowed for type 'bool'",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_mismatched_type.zig:2:18",
+    "operator > not allowed for type 'bool'"
+   ]
+  },
+  "test_comptime_out_of_bounds_float_to_integer_cast": {
+   "kind": "test_error=float value '4294967296' cannot be stored in integer type 'i32'",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_out_of_bounds_float_to_integer_cast.zig:3:36",
+    "float value '4294967296' cannot be stored in integer type 'i32'"
+   ]
+  },
+  "test_comptime_overflow": {
+   "kind": "test_error=overflow of integer type 'u8' with value '256'",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_overflow.zig:3:10",
+    "overflow of integer type 'u8' with value '256'"
+   ]
+  },
+  "test_comptime_pointer_conversion": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_comptime_pointers": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_comptime_reaching_unreachable": {
+   "kind": "test_error=reached unreachable code",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_reaching_unreachable.zig:5:14",
+    "reached unreachable code"
+   ]
+  },
+  "test_comptime_remainder_division_by_zero": {
+   "kind": "test_error=division by zero",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_remainder_division_by_zero.zig:4:19",
+    "division by zero here causes illegal behavior"
+   ]
+  },
+  "test_comptime_shlExact_overflow": {
+   "kind": "test_error=overflow of integer type 'u8' with value '340'",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_shlExact_overflow.zig:2:15",
+    "overflow of integer type 'u8' with value '340'"
+   ]
+  },
+  "test_comptime_shrExact_overflow": {
+   "kind": "test_error=exact shift shifted out 1 bits",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_shrExact_overflow.zig:2:15",
+    "exact shift shifted out 1 bits"
+   ]
+  },
+  "test_comptime_unreachable": {
+   "kind": "test_error=unreachable code",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_unreachable.zig:10:16",
+    "unreachable code"
+   ]
+  },
+  "test_comptime_unwrap_error": {
+   "kind": "test_error=caught unexpected error 'UnableToReturnNumber'",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_unwrap_error.zig:2:44",
+    "caught unexpected error 'UnableToReturnNumber'"
+   ]
+  },
+  "test_comptime_unwrap_null": {
+   "kind": "test_error=unable to unwrap null",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_unwrap_null.zig:3:35",
+    "unable to unwrap null"
+   ]
+  },
+  "test_comptime_variables": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_comptime_wrong_union_field_access": {
+   "kind": "test_error=access of union field 'float' while field 'int' is active",
+   "outcome": "build_failed",
+   "error": [
+    "test_comptime_wrong_union_field_access.zig:3:6",
+    "access of union field 'float' while field 'int' is active"
+   ]
+  },
+  "test_defer": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_defining_variadic_function": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_empty_block": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_enum_literals": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_enums": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 9 tests passed.",
+   "panic": null
+  },
+  "test_error_union": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_exhaustive_switch": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_expression_ignored": {
+   "kind": "test_error=ignored",
+   "outcome": "build_failed",
+   "error": [
+    "test_expression_ignored.zig:2:8",
+    "value of type 'i32' ignored"
+   ]
+  },
+  "test_failed_int_to_float_coercion": {
+   "kind": "test_error",
+   "outcome": "build_failed",
+   "error": [
+    "test_failed_int_to_float_coercion.zig:4:24",
+    "expected type 'f32', found 'u25'"
+   ]
+  },
+  "test_fibonacci_comptime_overflow": {
+   "kind": "test_error=overflow of integer type",
+   "outcome": "build_failed",
+   "error": [
+    "test_fibonacci_comptime_overflow.zig:5:28",
+    "overflow of integer type 'u32' with value '-1'"
+   ]
+  },
+  "test_fibonacci_comptime_unreachable": {
+   "kind": "test_error=reached unreachable",
+   "outcome": "build_failed",
+   "error": [
+    "debug.zig:442:14",
+    "reached unreachable code"
+   ]
+  },
+  "test_fibonacci_recursion": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_field_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_fn_reflection": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_fn_type_inference": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_for": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 5 tests passed.",
+   "panic": null
+  },
+  "test_for_nested_break": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_functions": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_global_assembly": {
+   "kind": "test",
+   "outcome": "skip"
+  },
+  "test_hasDecl_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_if": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 3 tests passed.",
+   "panic": null
+  },
+  "test_if_optionals": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_illegal_behavior": {
+   "kind": "test_error=reached unreachable code",
+   "outcome": "built",
+   "exit": 1,
+   "summary": null,
+   "panic": "1/1 test_illegal_behavior.test.safety check...thread ? panic: reached unreachable code"
+  },
+  "test_incorrect_pointer_alignment": {
+   "kind": "test_safety=incorrect alignment",
+   "outcome": "built",
+   "exit": 1,
+   "summary": null,
+   "panic": "1/1 test_incorrect_pointer_alignment.test.pointer alignment safety...thread ? panic: incorrect alignment"
+  },
+  "test_inferred_error_sets": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_inline_else": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_inline_for": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_inline_switch": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_inline_switch_union_tag": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_inline_while": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_intCast_builtin": {
+   "kind": "test_error=integer does not fit in destination type",
+   "outcome": "built",
+   "exit": 1,
+   "summary": null,
+   "panic": "1/1 test_intCast_builtin.test.integer cast panic...thread ? panic: integer does not fit in destination type"
+  },
+  "test_int_to_float_coercion": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_integer_pointer_conversion": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_integer_widening": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 3 tests passed.",
+   "panic": null
+  },
+  "test_invalid_defer": {
+   "kind": "test_error=cannot return from defer expression",
+   "outcome": "build_failed",
+   "error": [
+    "test_invalid_defer.zig:3:9",
+    "cannot return from defer expression"
+   ]
+  },
+  "test_labeled_break": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_locally_scoped_global_variable": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_merging_error_sets": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_misaligned_pointer": {
+   "kind": "test_error=expected type",
+   "outcome": "build_failed",
+   "error": [
+    "test_misaligned_pointer.zig:17:28",
+    "expected type '*const u3', found '*align(1:3:1) u3'"
+   ]
+  },
+  "test_missized_packed_struct": {
+   "kind": "test_error=backing integer bit width does not match total bit width of fields",
+   "outcome": "build_failed",
+   "error": [
+    "test_missized_packed_struct.zig:2:22",
+    "backing integer bit width does not match total bit width of fields"
+   ]
+  },
+  "test_multidimensional_arrays": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_namespace-level_comptime_expressions": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_namespace_level_variables": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_namespaced_variable": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_no_op_casts": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_noreturn": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_noreturn_from_exit": {
+   "kind": "test",
+   "outcome": "skip"
+  },
+  "test_null_terminated_array": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_null_terminated_slice": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_null_terminated_slicing": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_opaque": {
+   "kind": "test_error=expected type '*test_opaque.Derp', found '*test_opaque.Wat'",
+   "outcome": "build_failed",
+   "error": [
+    "test_opaque.zig:6:9",
+    "expected type '*test_opaque.Derp', found '*test_opaque.Wat'"
+   ]
+  },
+  "test_optional_pointer": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_optional_type": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_overaligned_packed_struct": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_packed_struct_backing_int": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_packed_struct_equality": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_packed_struct_field_address": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_packed_structs": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_packed_union_equality": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_pass_by_reference_or_value": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_peer_type_resolution": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 9 tests passed.",
+   "panic": null
+  },
+  "test_pointer_arithmetic": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_pointer_casting": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_pointer_coerce_const_optional": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_pointer_to_non-byte_aligned_field": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_print_too_many_args": {
+   "kind": "test_error=unused argument in 'here is a string: '{s}' here is a number: {}",
+   "outcome": "build_failed",
+   "error": [
+    "Writer.zig:822:18",
+    "unused argument in 'here is a string: '{s}' here is a number: {}"
+   ]
+  },
+  "test_reduce_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_round_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_scopes": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_sentinel_mismatch": {
+   "kind": "test_safety=sentinel mismatch",
+   "outcome": "built",
+   "exit": 1,
+   "summary": null,
+   "panic": "1/1 test_sentinel_mismatch.test.sentinel mismatch...thread ? panic: sentinel mismatch: expected 0, found 1"
+  },
+  "test_setEvalBranchQuota_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_setRuntimeSafety_builtin": {
+   "kind": "test_safety=integer overflow",
+   "outcome": "built",
+   "exit": 1,
+   "summary": null,
+   "panic": "1/1 test_setRuntimeSafety_builtin.test.@setRuntimeSafety...thread ? panic: integer overflow"
+  },
+  "test_shadowing": {
+   "kind": "test_error=local variable shadows declaration",
+   "outcome": "build_failed",
+   "error": [
+    "test_shadowing.zig:6:13",
+    "local variable shadows declaration of 'pi'"
+   ]
+  },
+  "test_shuffle_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_simple_union": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_single_item_pointer": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 3 tests passed.",
+   "panic": null
+  },
+  "test_slice_bounds": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_slices": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_splat_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_src_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_string_literal_to_const_slice": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_string_literal_to_slice": {
+   "kind": "test_error=expected type '[]u8', found '*const [5:0]u8'",
+   "outcome": "build_failed",
+   "error": [
+    "test_string_literal_to_slice.zig:6:9",
+    "expected type '[]u8', found '*const [5:0]u8'"
+   ]
+  },
+  "test_struct_result": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_structs": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 4 tests passed.",
+   "panic": null
+  },
+  "test_switch": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_switch_continue": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_switch_continue_equivalent": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_switch_dispatch_loop": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_switch_modify_tagged_union": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_switch_non-exhaustive": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_switch_on_errors": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_switch_tagged_union": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_tagName": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_tagged_union": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_tagged_union_with_tag_values": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_this_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_thread_local_variables": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_truncate_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_tuples": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_type_coercion": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 3 tests passed.",
+   "panic": null
+  },
+  "test_unhandled_enumeration_value": {
+   "kind": "test_error=unhandled enumeration value",
+   "outcome": "build_failed",
+   "error": [
+    "test_unhandled_enumeration_value.zig:9:5",
+    "switch must handle all possibilities"
+   ]
+  },
+  "test_union_method": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_unreachable": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_unresolved_comptime_value": {
+   "kind": "test_error=unable to resolve comptime value",
+   "outcome": "build_failed",
+   "error": [
+    "test_unresolved_comptime_value.zig:8:28",
+    "unable to resolve comptime value"
+   ]
+  },
+  "test_variable_alignment": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_variable_func_alignment": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_variadic_function": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_vector": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_void_ignored": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_void_in_hashmap": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_volatile": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_wasmMemoryGrow_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "0 passed; 1 skipped; 0 failed.",
+   "panic": null
+  },
+  "test_while": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_while_break": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_while_continue": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_while_continue_expression": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_while_else": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_while_error_capture": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_while_nested_break": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "test_while_null_capture": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_without_setEvalBranchQuota_builtin": {
+   "kind": "test_error=evaluation exceeded 1000 backwards branches",
+   "outcome": "build_failed",
+   "error": [
+    "test_without_setEvalBranchQuota_builtin.zig:4:9",
+    "evaluation exceeded 1000 backwards branches"
+   ]
+  },
+  "test_wraparound_semantics": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_wrong_union_access": {
+   "kind": "test_error=access of union field 'float' while field 'int' is active",
+   "outcome": "built",
+   "exit": 1,
+   "summary": null,
+   "panic": "1/1 test_wrong_union_access.test.simple union...thread ? panic: access of union field 'float' while field 'int' is active"
+  },
+  "testing_detect_leak": {
+   "kind": "test_error=1 tests leaked memory",
+   "outcome": "built",
+   "exit": 1,
+   "summary": "1 tests leaked memory.",
+   "panic": null
+  },
+  "testing_detect_test": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "testing_error_with_if": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "got error: UnableToReturnNumber\n",
+   "panic": null
+  },
+  "testing_failure": {
+   "kind": "test_error",
+   "outcome": "built",
+   "exit": 1,
+   "summary": "1 passed; 0 skipped; 1 failed.",
+   "panic": null
+  },
+  "testing_introduction": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "testing_namespace": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
+  },
+  "testing_null_with_if": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "it's null\n",
+   "panic": null
+  },
+  "testing_skip": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "0 passed; 1 skipped; 0 failed.",
+   "panic": null
+  },
+  "tldoc_comments": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "try": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "unattached_doc-comment": {
+   "kind": "obj=unattached documentation comment",
+   "outcome": "build_failed",
+   "error": [
+    "unattached_doc-comment.zig:3:1",
+    "unattached documentation comment"
+   ]
+  },
+  "undefined_active_union_field": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "value: 12.34\n",
+   "panic": null
+  },
+  "values": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "1 + 1 = 2\n7.0 / 3.0 = 2.3333333\nfalse\ntrue\nfalse\n\noptional 1\ntype: ?[]const u8\nvalue: null\n\noptional 2\ntype: ?[]const u8\nvalue: hi\n\nerror union 1\ntype: error{ExampleErrorVariant}!i32\nvalue: error.ExampleErrorVariant\n\nerror union 2\ntype: error{ExampleErrorVariant}!i32\nvalue: 1234\n",
+   "panic": null
+  },
+  "var_must_be_initialized": {
+   "kind": "exe=build_fail",
+   "outcome": "build_failed",
+   "error": [
+    "var_must_be_initialized.zig:2:15",
+    "expected '=', found ';'"
+   ]
+  },
+  "wasi_args": {
+   "kind": "exe=succeed",
+   "outcome": "skip"
+  },
+  "wasi_preopens": {
+   "kind": "exe=succeed",
+   "outcome": "skip"
+  },
+  "zero_bit_types": {
+   "kind": "syntax",
+   "outcome": "built"
+  }
+ },
+ "summary": {
+  "examples": 290,
+  "compared": 283
+ }
+}

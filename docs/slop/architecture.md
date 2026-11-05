@@ -8115,9 +8115,12 @@ and `zig build -Dtarget=aarch64-macos`.
   passes that bs passes, with the unsupported ones counted apart.
 - `run.py --langref` measures upstream's language reference examples
   (`doc/langref`, 290 with a manifest; 286 on x86_64-linux, the rest
-  wasm or windows). Each is built from the workdir as upstream's
-  tools/doctest.zig builds it, from its manifest's kind and options, and
-  a built exe is run. bs matches upstream when the outcome is the same:
+  wasm or windows; 283 on aarch64-linux and aarch64-macos, which also
+  skip the three that name x86_64-linux). Each is built from the workdir
+  as upstream's tools/doctest.zig builds it, from its manifest's kind and
+  options, and a built exe is run. Under an emulator (aarch64-linux on an
+  x86_64 host) a test is built with `--test-no-exec` and its binary run
+  under the emulator, as `test` would run it. bs matches upstream when the outcome is the same:
   both build or both fail, a failure's first error (file, line, column,
   message), an exe's exit status, stdout and normalized stderr (addresses
   and anonymous type numbers taken out), a test's exit status, summary

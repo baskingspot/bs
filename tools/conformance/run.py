@@ -81,7 +81,8 @@ when the outcome is the same: both build or both fail; a failure's first
 error (file, line, column and message); an exe's exit status, stdout,
 normalized stderr, or, if it fails, its first panic line; a test's exit
 status, summary line and first panic line. Examples for other targets
-are skipped. Upstream's outcomes are recorded by --langref --upstream in
+are skipped; under an emulator, a test is built with --test-no-exec and
+run under it. Upstream's outcomes are recorded by --langref --upstream in
 baseline/langref-<target>.json.
 
 Portable to Linux and macOS: Python 3 standard library only.
@@ -1782,12 +1783,16 @@ def parse_langref(src):
     return kind, expect, opts
 
 
-def langref_argv(compiler, path, kind, opts, name):
+def langref_argv(compiler, path, kind, opts, name, cfg):
     """The command upstream's doctest runs for an example, from its
-    directory; None for a target that is not x86_64-linux."""
+    directory, for target cfg; None for an example that names another
+    target. Off the host, the target is passed and a test is only built
+    (`--test-no-exec`), to run under the emulator."""
     target = opts.get("target")
-    if target and not target.startswith("x86_64-linux"):
+    if target and not target.startswith(cfg["name"]):
         return None
+    if not target and exec_prefix:
+        target = cfg["zig_target"].rsplit("-", 1)[0] + ("-gnu" if "link_libc" in opts else "")
     sub = {"exe": "build-exe", "test": "test", "test_error": "test", "test_safety": "test", "lib": "build-lib"}.get(
         kind, "build-obj"
     )
@@ -1796,6 +1801,8 @@ def langref_argv(compiler, path, kind, opts, name):
         argv += ["--name", name]
     elif sub in ("build-obj", "build-lib"):
         argv.append(f"-femit-bin={name}{'.o' if sub == 'build-obj' else '.a'}")
+    elif exec_prefix:
+        argv += ["--test-no-exec", f"-femit-bin={name}"]
     if "optimize" in opts:
         argv += ["-O", opts["optimize"]]
     if "link_libc" in opts:
@@ -1807,6 +1814,14 @@ def langref_argv(compiler, path, kind, opts, name):
     if "link_mode" in opts:
         argv.append("-" + opts["link_mode"])
     return argv + opts["additional_option"]
+
+
+def langref_exec(cfg, opts, bin_path):
+    """The command that runs a built example: under the emulator off the
+    host, with the target's glibc for one that links libc."""
+    if exec_prefix and "link_libc" in opts and cfg.get("emulated_glibc"):
+        return exec_prefix + ["-L", cfg["emulated_glibc"], str(bin_path)]
+    return exec_argv(bin_path)
 
 
 def normalize_output(text, out_dir):
@@ -1840,7 +1855,7 @@ def panic_line(stderr):
     return None
 
 
-def run_one_langref(compiler, path, args, workdir):
+def run_one_langref(compiler, path, cfg, args, workdir):
     """Builds and runs one example as upstream's doctest does and records
     what it saw: `outcome` (built, build_failed, unsupported, crash,
     timeout, skip), the first error, and for a run its exit status,
@@ -1851,7 +1866,7 @@ def run_one_langref(compiler, path, args, workdir):
     out_dir = workdir / "langref" / re.sub(r"[^\w.-]", "_", name)
     shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True)
-    argv = langref_argv(compiler, path, kind, opts, name)
+    argv = langref_argv(compiler, path, kind, opts, name, cfg)
     if argv is None:
         r["outcome"] = "skip"
         return name, r
@@ -1864,6 +1879,17 @@ def run_one_langref(compiler, path, args, workdir):
         r["outcome"], r["log"] = "unsupported", err[-LOG_LIMIT:]
     elif code < 0 or code != 0 and "panic: " in err and not ERROR_RE.search(err) and not runs:
         r["outcome"], r["crash"] = "crash", crash_frame(err)
+    elif runs and exec_prefix:
+        # Built only: run the test binary under the emulator, as `test`
+        # would run it.
+        e = first_error(err)
+        if code != 0:
+            r["outcome"], r["error"] = "build_failed", list(e) if e else None
+        else:
+            code, out, err, timed_out = run_process(langref_exec(cfg, opts, out_dir / name), out_dir, args.run_timeout)
+            r["outcome"], r["exit"] = "built", "timeout" if timed_out else code
+            r["summary"] = next((ln for ln in reversed(err.splitlines()) if TEST_SUMMARY_RE.search(ln)), None)
+            r["panic"] = panic_line(err)
     elif kind.startswith("test"):
         # `test` builds and runs: an error before the run fails the build.
         e = first_error(err)
@@ -1881,7 +1907,7 @@ def run_one_langref(compiler, path, args, workdir):
     else:
         r["outcome"] = "built"
         if kind == "exe":
-            code, out, err, timed_out = run_process([str(out_dir / name)], out_dir, args.run_timeout)
+            code, out, err, timed_out = run_process(langref_exec(cfg, opts, out_dir / name), out_dir, args.run_timeout)
             r["exit"] = "timeout" if timed_out else code
             r["stdout"] = out[-LOG_LIMIT:]
             r["stderr"] = normalize_output(err, out_dir)[-LOG_LIMIT:]
@@ -1924,7 +1950,7 @@ def langref_target(compiler, cfg, args, workdir):
         paths = [p for p in paths if p.name in args.files or p.stem in args.files]
     results = {}
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        futs = [ex.submit(run_one_langref, compiler, p, args, workdir) for p in paths]
+        futs = [ex.submit(run_one_langref, compiler, p, cfg, args, workdir) for p in paths]
         for f in as_completed(futs):
             name, r = f.result()
             results[name] = r
