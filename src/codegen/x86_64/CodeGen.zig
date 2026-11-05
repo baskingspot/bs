@@ -1414,10 +1414,22 @@ fn copyTail(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
     }
 }
 
-/// Above 128 bytes, `rep stosb` (upstream always fills undefined memory
-/// with it); its callers allow rdi and rcx to be clobbered there (a store
-/// of such a value is a clobber point, see `clobbers`).
+/// The largest fill `fillMem` and `fillSplat` make with a loop of 16-byte
+/// stores; `rep stos` above, whose start (about 8 ns) the loop only loses
+/// to past about 1 KB.
+const fill_loop_max = 1024;
+
+/// Above 128 bytes, a loop of stores (`fillLoop`) up to `fill_loop_max`,
+/// and `rep stosb` above (upstream always fills undefined memory with
+/// it); its callers allow rdi and rcx to be clobbered there (a store of
+/// such a value is a clobber point, see `clobbers`).
 fn fillMem(cg: *CodeGen, dst: Mem, size: u64, byte: u8) Error!void {
+    if (size > 128 and size <= fill_loop_max) {
+        try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = @as(u32, byte) * 0x0101_0101 });
+        try cg.e.movToXmm(.dword, .xmm0, .{ .reg = .rax });
+        try cg.e.pshuf(.d, .xmm0, .{ .reg = .xmm0 }, 0);
+        return cg.fillLoop(dst, size);
+    }
     if (size > 128) {
         try cg.e.lea(.qword, .rdi, dst);
         try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(size) });
@@ -1463,10 +1475,50 @@ fn fillSplat(cg: *CodeGen, dst: Mem, elem: Ref, count: u64) Error!bool {
         return true;
     }
     try cg.load(.rax, elem);
+    if (count * size > 128 and count * size <= fill_loop_max) {
+        try cg.splatXmm0(size);
+        try cg.fillLoop(dst, count * size);
+        return true;
+    }
     try cg.e.lea(.qword, .rdi, dst);
     try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(count) });
     try cg.e.repStos(sizeOf(size));
     return true;
+}
+
+/// Repeats the element of `size` bytes (1, 2, 4 or 8) in rax across xmm0.
+fn splatXmm0(cg: *CodeGen, size: u64) Error!void {
+    if (size == 8) {
+        try cg.e.movToXmm(.qword, .xmm0, .{ .reg = .rax });
+        return cg.e.pshuf(.d, .xmm0, .{ .reg = .xmm0 }, 0x44);
+    }
+    if (size == 1) {
+        try cg.e.movzx(.dword, .rax, .byte, .{ .reg = .rax });
+        try cg.e.imul(.dword, .rax, .{ .reg = .rax }, 0x0101_0101);
+    }
+    try cg.e.movToXmm(.dword, .xmm0, .{ .reg = .rax });
+    if (size == 2) try cg.e.pshuf(.lw, .xmm0, .{ .reg = .xmm0 }, 0);
+    try cg.e.pshuf(.d, .xmm0, .{ .reg = .xmm0 }, 0);
+}
+
+/// Stores xmm0 over the `size` bytes at `dst` (129 to `fill_loop_max`):
+/// 64-byte blocks, then 16-byte stores ending at the end, overlapping the
+/// last block. Every store is at a multiple of 16 bytes from `dst` or
+/// from its end, so an element of 1, 2, 4 or 8 bytes that `size` is a
+/// multiple of stays in phase. Uses rdi and rcx.
+fn fillLoop(cg: *CodeGen, dst: Mem, size: u64) Error!void {
+    try cg.e.lea(.qword, .rdi, dst);
+    try cg.e.mov(.dword, .{ .reg = .rcx }, .{ .imm = @intCast(size / 64) });
+    const top = try cg.e.newLabel();
+    cg.e.bind(top);
+    var off: i32 = 0;
+    while (off < 64) : (off += 16) try cg.e.movups(.{ .mem = Mem.at(.rdi, off) }, .{ .reg = .xmm0 });
+    try cg.e.alu(.add, .qword, .{ .reg = .rdi }, .{ .imm = 64 });
+    try cg.e.alu(.sub, .dword, .{ .reg = .rcx }, .{ .imm = 1 });
+    try cg.e.jcc(.ne, .{ .label = top });
+    const rest: i32 = @intCast(size % 64);
+    off = rest - std.mem.alignForward(i32, rest, 16);
+    while (off < rest) : (off += 16) try cg.e.movups(.{ .mem = Mem.at(.rdi, off) }, .{ .reg = .xmm0 });
 }
 
 /// Writes `total` bytes at `dst` (8 to 128) of a run of runtime scalar
@@ -5397,6 +5449,20 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .memset => {
             const elem = data.bin_op.rhs;
             const elem_ty = cg.typeOf(elem);
+            const dest = Type.ptrInfo(ip, cg.typeOf(data.bin_op.lhs));
+            if (dest.flags.size != .slice) switch (Type.abiSize(ip, elem_ty)) {
+                // An array of 129 bytes to 1 KB: a loop of stores.
+                1, 2, 4, 8 => |size| {
+                    const total = ip.keyPayload(.array_type, dest.child).len * size;
+                    if (total > 128 and total <= fill_loop_max) {
+                        try cg.load(.rdi, data.bin_op.lhs);
+                        try cg.load(.rax, elem);
+                        try cg.splatXmm0(size);
+                        return cg.fillLoop(Mem.at(.rdi, 0), total);
+                    }
+                },
+                else => {},
+            };
             if (Type.abiSize(ip, elem_ty) == 1) {
                 _ = try cg.memDest(.rdi, .rcx, data.bin_op.lhs);
                 try cg.load(.rax, elem);

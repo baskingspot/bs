@@ -2821,6 +2821,12 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      element until it spans 64 bytes and repeats it with one forward
      `copyMem` (32 bytes a loop iteration): `std.mem.zeroes` of an 8 MiB
      array went from 8 million `strb`s (a 100 MB function) to a loop.
+     A splat of a scalar of 1, 2, 4 or 8 bytes is now one `rep stos`
+     (`fillSplat`), except from 129 bytes to 1 KB, where it, an undefined
+     fill (`fillMem`) and an `@memset` of an array are a loop of 64-byte
+     blocks of `movups` stores of the element repeated in xmm0
+     (`fillLoop`): `rep stos` takes about 8 ns to start, and the loop
+     fills 129 bytes in 2.7 ns and 1 KB in 10.1 (13.5 for `rep stosb`).
    nbody's `Vec.sub` went from 64 instructions to 26. Against main
    2cc5b3e (`bench/runtime.py`, two interleaved runs): nbody 279–283 →
    158–174 ms, hash 224–236 → 185–191, fmt 100–103 → 92–93, sieve and
