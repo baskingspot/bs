@@ -2460,6 +2460,15 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         n_new += 1;
         break :blk n_prev + n_new - 1;
     };
+    // A node the build has is not gone, though the walk found its subject
+    // gone (`Replay.die`): a container whose type an edit made again,
+    // such as a file whose struct gained a field, has no type to resolve
+    // until analysis makes it, and then the same namespace key. A unit
+    // that reads its declarations (`@typeInfo(@This())` in
+    // `Builtin.hash`) depends on it again, and the reach flags must
+    // follow that edge, or the next build's full walk reaches a namespace
+    // flagged unreached.
+    for (final) |f| if (f < n_prev) rp.dead.unset(f);
     const new_tags = try gpa.alloc(Tag, n_new);
     defer gpa.free(new_tags);
     for (nodes, final) |n, f| if (f >= n_prev) {
