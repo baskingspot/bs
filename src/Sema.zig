@@ -8687,6 +8687,10 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
         .@"inline"
     else {
         if (std.meta.stringToEnum(std.lang.CallingConvention.Tag, name) == null) {
+            // A declaration of the union (`.winapi`, `.withStackAlign(...)`),
+            // as a decl literal of its type.
+            const cc_ty = (try sema.stdLangDecl(block, src, "CallingConvention")).toInterned().?;
+            if (try sema.lookupInType(cc_ty, name) != null) return sema.analyzeDeclLiteral(block, src, name, cc_ty, false);
             // As upstream; `.C` was 0.13's name for `.c`.
             const err = sema.fail(block, src, "union 'lang.CallingConvention' has no member named '{s}'", .{name});
             // The tags and the union's declarations (`.c`, `.winapi`).
