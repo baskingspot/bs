@@ -923,7 +923,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   slots from sp above a fixed outgoing argument area (the most any call
   needs, computed before emission). Frames over 4 KiB call
   `___chkstk_darwin` from code after the body that the prologue branches
-  to. x9-x14 are per-instruction scratch, x16/x17 legalize addresses and
+  to; a frame of 2^24 bytes or more (beyond `sub sp, sp, #imm`'s reach)
+  takes the same out-of-line path on every OS and subtracts its size
+  from x17. x9-x14 are per-instruction scratch, x16/x17 legalize addresses and
   hold call targets. `.auto` passes values of up to 8 bytes in one of
   x0-x7, up to 16 in two, f16/f32/f64 in v0-v7, the rest in the outgoing
   area; results come back the same way or through x8, and the error
@@ -2605,7 +2607,10 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      movs, frame 0xc210 → 0x4190 bytes, 21.0 → 3.4–4.8 s for 10M calls
      (upstream Debug 3.4–3.7 s; the spread is the 16-aligned frame's
      placement against 64-byte lines). Compile time within noise on std
-     and the zig workload; std's binary −87 KB.
+     and the zig workload; std's binary −87 KB. aarch64 writes the
+     element until it spans 64 bytes and repeats it with one forward
+     `copyMem` (32 bytes a loop iteration): `std.mem.zeroes` of an 8 MiB
+     array went from 8 million `strb`s (a 100 MB function) to a loop.
    nbody's `Vec.sub` went from 64 instructions to 26. Against main
    2cc5b3e (`bench/runtime.py`, two interleaved runs): nbody 279–283 →
    158–174 ms, hash 224–236 → 185–191, fmt 100–103 → 92–93, sieve and

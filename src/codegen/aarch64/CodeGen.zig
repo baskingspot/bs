@@ -316,13 +316,15 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
 /// Writes the frame allocation at `frame_at`: `sub sp` of the frame size.
 /// On macOS, a frame over 4 KiB probes its pages first, as clang does, out of line:
 /// the prologue branches to `mov x9, #size; blr ___chkstk_darwin; sub sp`
-/// after the body, which branches back to `body`.
+/// after the body, which branches back to `body`. A frame of 2^24 bytes or
+/// more takes the same out-of-line path, since its `sub sp` needs the size
+/// in x17.
 fn allocFrame(cg: *CodeGen, frame_at: u32, body: Encoder.Label) Error!void {
     const frame = std.mem.alignForward(u32, cg.out_args_size + cg.slots_size, 16);
-    if (frame >= 1 << 24) return cg.fail("stack frame of {d} bytes is too large", .{frame});
     // Upstream's LLVM backend probes the stack only on x86 off Darwin
     // (`supportsStackProbing`), so aarch64-linux frames are not probed.
-    if (frame <= 4096 or cg.ip.target == .aarch64_linux) {
+    const probe = frame > 4096 and cg.ip.target != .aarch64_linux;
+    if (!probe and frame < 1 << 24) {
         var tmp: Encoder = .init(cg.gpa);
         defer tmp.deinit();
         try subSp(&tmp, frame);
@@ -332,15 +334,22 @@ fn allocFrame(cg: *CodeGen, frame_at: u32, body: Encoder.Label) Error!void {
     const stub = try cg.e.newLabel();
     cg.e.bind(stub);
     try cg.e.line(0, 0);
-    try cg.e.movImm(.x, .x9, frame);
-    try cg.callExtern("__chkstk_darwin");
+    if (probe) {
+        try cg.e.movImm(.x, .x9, frame);
+        try cg.callExtern("__chkstk_darwin");
+    }
     try subSp(&cg.e, frame);
     try cg.e.b(.{ .label = body });
     try cg.e.branchFrom(frame_at, stub);
 }
 
-/// `sub sp, sp, #size` in at most two instructions (`size < 2^24`).
+/// `sub sp, sp, #size`: at most two immediate instructions below 2^24, else
+/// the size moved into x17 (free in a prologue) and subtracted.
 fn subSp(e: *Encoder, size: u32) !void {
+    if (size >= 1 << 24) {
+        try e.movImm(.x, .x17, size);
+        return e.addSub(.sub, .x, .sp, .sp, .r(.x17));
+    }
     if (size >> 12 != 0) try e.addSub(.sub, .x, .sp, .sp, .{ .imm = size & 0xfff000 });
     if (size & 0xfff != 0) try e.addSub(.sub, .x, .sp, .sp, .{ .imm = size & 0xfff });
 }
@@ -2446,7 +2455,25 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 }
                 return;
             }
-            for (elems, 0..) |elem, i| {
+            // A run of one element over 128 bytes (a `@splat`), as the
+            // x86_64 backend: copies of the element until they span 64
+            // bytes, then one forward copy of what is written repeats it
+            // (`copyMem` reads 32 bytes behind its writes at most).
+            var first: usize = 0;
+            if (elems.len > 1 and ip.keyTag(ty) != .struct_type and ip.keyTag(ty) != .tuple_type) {
+                const elem_size = Type.abiSize(ip, cg.typeOf(elems[0]));
+                const run = for (elems, 0..) |elem, i| {
+                    if (elem != elems[0]) break i;
+                } else elems.len;
+                const total = run * elem_size;
+                if (total > 128) {
+                    var span: u64 = 0;
+                    while (span < 64) : (span += elem_size) try cg.copyTo(dst.plus(span), elems[0]);
+                    try cg.copyMem(dst.plus(span), dst, total - span);
+                    first = run;
+                }
+            }
+            for (elems[first..], first..) |elem, i| {
                 const off = switch (ip.indexToKey(ty)) {
                     .array_type => |a| i * Type.abiSize(ip, a.child),
                     .vector_type => |v| i * Type.abiSize(ip, v.child),
