@@ -675,11 +675,11 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
 ///   (`removable`) are `dead`. Their operands lose a use, so chains of them
 ///   go in the same backward sweep (operands come first in the layout).
 ///   Intervals stay as `liveness` computed them, which is only longer.
-/// - An overflow operation whose fields are read right after it, with
-///   nothing between that gets a register, and by nothing else, is a
-///   `pair`: the fields' intervals start at the operation, which writes
-///   them. Its bit is `fused` when only its block's branch tests it, if
-///   nothing between sets the flags and `ctx.ovfFlagsOnly(tag, bits)`.
+/// - An overflow operation whose fields only `struct_field_val`s later in
+///   its block read is a `pair`: the fields' intervals start at the
+///   operation, which writes them, and `allocate` takes them there. Its
+///   bit is `fused` when only its block's branch tests it, if nothing
+///   between sets the flags and `ctx.ovfFlagsOnly(tag, bits)`.
 /// - A condition only its block's branch reads is `fused` if
 ///   `ctx.fusable(inst)`.
 /// - Arguments are all moved at the entry, so an unused one, whose interval
@@ -758,14 +758,16 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
                     if (!ctx.inGpr(op_ty)) continue;
                     var fields: [2]u32 = .{ no_tie, no_tie };
                     var n: u32 = 0;
+                    // The fields' reads anywhere later in the block: the
+                    // tuple does not change, and a field that now lives
+                    // across a clobber point is marked so below.
                     for (values[k + 1 ..]) |next| {
+                        if (n == uses[i]) break;
                         const j = @backingInt(next);
-                        // A destructuring `const r, const o = @addWithOverflow(..)`
-                        // stores each field before reading the next.
-                        if (tags[j] == .dbg_stmt or tags[j] == .store or fate[j] == .dead) continue;
-                        if (tags[j] != .struct_field_val) break;
+                        if (tags[j] != .struct_field_val or fate[j] == .dead) continue;
                         const sf = ir.extraData(Ir.StructField, datas[j].ty_pl.payload).data;
-                        if (sf.operand != inst.toRef() or fields[sf.index] != no_tie) break;
+                        if (sf.operand != inst.toRef()) continue;
+                        if (fields[sf.index] != no_tie) break;
                         fields[sf.index] = j;
                         n += 1;
                     }
@@ -2096,113 +2098,121 @@ pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, s
     var active_len: u8 = 0;
     var free: u32 = gprs | floats;
     var used: u32 = 0;
-    for (f.values.items(.inst)) |inst_index| {
-        const inst = @backingInt(inst_index);
-        if (reg[inst] == want_fold) {
-            const b = fold[inst];
-            if (reg[b] < total) {
-                // An evicted value would be in memory for its whole
-                // interval, under the folded value's users too.
-                held[reg[b]] = @max(held[reg[b]], end[b]);
-                reg[inst] = folded;
+    const fate = s.items(.fate);
+    for (f.values.items(.inst), 0..) |inst_index, idx| {
+        // An overflow pair's fields are allocated at the operation, which
+        // writes them: in order of definition, so that no register is
+        // freed before them that is still read at the operation.
+        var order: [2]u32 = .{ @backingInt(inst_index), no_tie };
+        if (fate[order[0]] == .pair) order = f.pairs.get(order[0]).? else if (def[order[0]] != valuePos(idx)) continue;
+        for (order) |inst| {
+            if (inst == no_tie) continue;
+            if (reg[inst] == want_fold) {
+                const b = fold[inst];
+                if (reg[b] < total) {
+                    // An evicted value would be in memory for its whole
+                    // interval, under the folded value's users too.
+                    held[reg[b]] = @max(held[reg[b]], end[b]);
+                    reg[inst] = folded;
+                    continue;
+                }
+                reg[inst] = if (reg[b] == folded) folded else want_reg;
+                if (reg[inst] == folded) continue;
+            }
+            if (!wants(reg[inst])) continue;
+            var j: u8 = 0;
+            while (j < active_len) {
+                const a = active[j];
+                if (end[a] < def[inst]) {
+                    free |= @as(u32, 1) << @intCast(reg[a]);
+                    if (reg2[a] != no_reg) free |= @as(u32, 1) << @intCast(reg2[a]);
+                    active_len -= 1;
+                    active[j] = active[active_len];
+                } else j += 1;
+            }
+            const h = hint[inst];
+            pending &= ~(regBit(h[0]) | regBit(h[1]));
+            const splits = crosses[inst] and split.isSet(inst);
+            var keep_out: u32 = 0;
+            for (restrictions) |r| {
+                const rc = r.counts;
+                if (rc[end[inst]] != rc[def[inst]] or rc[def[inst]] != rc[def[inst] - 1]) keep_out |= r.regs;
+            }
+            const class: u32 = switch (reg[inst]) {
+                want_float => floats,
+                want_vec => floats & ~survives,
+                else => gprs,
+            };
+            const usable: u32 = class & ~keep_out & if (crosses[inst] and !splits) survives else ~@as(u32, 0);
+            const v = share[inst];
+            if (v != no_tie and reg[v] < total) {
+                reg[inst] = reg[v];
+                held[reg[v]] = @max(held[reg[v]], end[inst]);
+                if (reg2[v] != no_reg) reg2[inst] = reg2[v];
                 continue;
             }
-            reg[inst] = if (reg[b] == folded) folded else want_reg;
-            if (reg[inst] == folded) continue;
-        }
-        if (!wants(reg[inst])) continue;
-        var j: u8 = 0;
-        while (j < active_len) {
-            const a = active[j];
-            if (end[a] < def[inst]) {
-                free |= @as(u32, 1) << @intCast(reg[a]);
-                if (reg2[a] != no_reg) free |= @as(u32, 1) << @intCast(reg2[a]);
-                active_len -= 1;
-                active[j] = active[active_len];
-            } else j += 1;
-        }
-        const h = hint[inst];
-        pending &= ~(regBit(h[0]) | regBit(h[1]));
-        const splits = crosses[inst] and split.isSet(inst);
-        var keep_out: u32 = 0;
-        for (restrictions) |r| {
-            const rc = r.counts;
-            if (rc[end[inst]] != rc[def[inst]] or rc[def[inst]] != rc[def[inst] - 1]) keep_out |= r.regs;
-        }
-        const class: u32 = switch (reg[inst]) {
-            want_float => floats,
-            want_vec => floats & ~survives,
-            else => gprs,
-        };
-        const usable: u32 = class & ~keep_out & if (crosses[inst] and !splits) survives else ~@as(u32, 0);
-        const v = share[inst];
-        if (v != no_tie and reg[v] < total) {
-            reg[inst] = reg[v];
-            held[reg[v]] = @max(held[reg[v]], end[inst]);
-            if (reg2[v] != no_reg) reg2[inst] = reg2[v];
-            continue;
-        }
-        if (reg[inst] == want_pair) {
-            // Two registers or none; a pair neither evicts nor is evicted.
-            const avail = free & usable;
-            if (@popCount(avail) < 2) {
+            if (reg[inst] == want_pair) {
+                // Two registers or none; a pair neither evicts nor is evicted.
+                const avail = free & usable;
+                if (@popCount(avail) < 2) {
+                    reg[inst] = no_reg;
+                    continue;
+                }
+                const cheap = if (@popCount(avail & ~survives) >= 2 and !crosses[inst]) avail & ~survives else avail;
+                const pick = if (@popCount(cheap & ~pending) >= 2) cheap & ~pending else cheap;
+                const lo: u8 = if (h[0] < max_regs and avail >> @intCast(h[0]) & 1 != 0) h[0] else @intCast(@ctz(pick & ~regBit(h[1])));
+                const rest = avail & ~regBit(lo);
+                const hi: u8 = if (h[1] < max_regs and rest >> @intCast(h[1]) & 1 != 0) h[1] else @intCast(@ctz(if (pick & rest != 0) pick & rest else rest));
+                const bits = @as(u32, 1) << @intCast(lo) | @as(u32, 1) << @intCast(hi);
+                free &= ~bits;
+                used |= bits;
+                reg[inst] = lo;
+                reg2[inst] = hi;
+                active[active_len] = inst;
+                active_len += 1;
+                continue;
+            }
+            const t = tie[inst];
+            // Not a register a load shares, which its variable still holds.
+            if (t != no_tie and end[t] == def[inst] and reg[t] < total and usable >> @intCast(reg[t]) & 1 != 0 and
+                reg2[t] == no_reg and (share[t] == no_tie or reg[share[t]] != reg[t]))
+            {
+                // Take over the tied operand's register, which dies here.
+                const k = std.mem.findScalar(u32, active[0..active_len], t).?;
+                reg[inst] = reg[t];
+                active[k] = inst;
+                continue;
+            }
+            if (free & usable != 0) {
+                const cheap = if ((h[0] == hint_saved or splits) and free & usable & survives != 0)
+                    free & usable & survives
+                else if (free & usable & ~survives != 0 and !crosses[inst]) free & usable & ~survives else free & usable;
+                const pick = if (cheap & ~pending != 0) cheap & ~pending else if (free & usable & ~pending != 0) free & usable & ~pending else cheap;
+                const r: u8 = if (h[0] < max_regs and (free & usable) >> @intCast(h[0]) & 1 != 0) h[0] else @intCast(@ctz(pick));
+                free &= ~(@as(u32, 1) << @intCast(r));
+                used |= @as(u32, 1) << @intCast(r);
+                reg[inst] = r;
+                active[active_len] = inst;
+                active_len += 1;
+                continue;
+            }
+            // Out of registers: a value used a loop level less often than the
+            // others goes to memory, else the one that ends last.
+            var last: ?u8 = null;
+            for (active[0..active_len], 0..) |a, k| {
+                if (usable >> @intCast(reg[a]) & 1 == 0 or held[reg[a]] >= def[inst] or reg2[a] != no_reg or hint[a][1] == hint_pinned) continue;
+                if (last == null or spillsBefore(weight, end, a, active[last.?])) last = @intCast(k);
+            }
+            const victim = if (last) |l| active[l] else {
                 reg[inst] = no_reg;
                 continue;
-            }
-            const cheap = if (@popCount(avail & ~survives) >= 2 and !crosses[inst]) avail & ~survives else avail;
-            const pick = if (@popCount(cheap & ~pending) >= 2) cheap & ~pending else cheap;
-            const lo: u8 = if (h[0] < max_regs and avail >> @intCast(h[0]) & 1 != 0) h[0] else @intCast(@ctz(pick & ~regBit(h[1])));
-            const rest = avail & ~regBit(lo);
-            const hi: u8 = if (h[1] < max_regs and rest >> @intCast(h[1]) & 1 != 0) h[1] else @intCast(@ctz(if (pick & rest != 0) pick & rest else rest));
-            const bits = @as(u32, 1) << @intCast(lo) | @as(u32, 1) << @intCast(hi);
-            free &= ~bits;
-            used |= bits;
-            reg[inst] = lo;
-            reg2[inst] = hi;
-            active[active_len] = inst;
-            active_len += 1;
-            continue;
+            };
+            if (spillsBefore(weight, end, victim, inst)) {
+                reg[inst] = reg[victim];
+                reg[victim] = no_reg;
+                active[last.?] = inst;
+            } else reg[inst] = no_reg;
         }
-        const t = tie[inst];
-        // Not a register a load shares, which its variable still holds.
-        if (t != no_tie and end[t] == def[inst] and reg[t] < total and usable >> @intCast(reg[t]) & 1 != 0 and
-            reg2[t] == no_reg and (share[t] == no_tie or reg[share[t]] != reg[t]))
-        {
-            // Take over the tied operand's register, which dies here.
-            const k = std.mem.findScalar(u32, active[0..active_len], t).?;
-            reg[inst] = reg[t];
-            active[k] = inst;
-            continue;
-        }
-        if (free & usable != 0) {
-            const cheap = if ((h[0] == hint_saved or splits) and free & usable & survives != 0)
-                free & usable & survives
-            else if (free & usable & ~survives != 0 and !crosses[inst]) free & usable & ~survives else free & usable;
-            const pick = if (cheap & ~pending != 0) cheap & ~pending else if (free & usable & ~pending != 0) free & usable & ~pending else cheap;
-            const r: u8 = if (h[0] < max_regs and (free & usable) >> @intCast(h[0]) & 1 != 0) h[0] else @intCast(@ctz(pick));
-            free &= ~(@as(u32, 1) << @intCast(r));
-            used |= @as(u32, 1) << @intCast(r);
-            reg[inst] = r;
-            active[active_len] = inst;
-            active_len += 1;
-            continue;
-        }
-        // Out of registers: a value used a loop level less often than the
-        // others goes to memory, else the one that ends last.
-        var last: ?u8 = null;
-        for (active[0..active_len], 0..) |a, k| {
-            if (usable >> @intCast(reg[a]) & 1 == 0 or held[reg[a]] >= def[inst] or reg2[a] != no_reg or hint[a][1] == hint_pinned) continue;
-            if (last == null or spillsBefore(weight, end, a, active[last.?])) last = @intCast(k);
-        }
-        const victim = if (last) |l| active[l] else {
-            reg[inst] = no_reg;
-            continue;
-        };
-        if (spillsBefore(weight, end, victim, inst)) {
-            reg[inst] = reg[victim];
-            reg[victim] = no_reg;
-            active[last.?] = inst;
-        } else reg[inst] = no_reg;
     }
     return used;
 }
