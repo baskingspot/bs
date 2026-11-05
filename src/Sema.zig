@@ -6888,6 +6888,14 @@ fn intFromPtr(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!R
         if (sema.ip.keyTag(v) == .ptr and sema.ip.keyPayload(.ptr, v).base == .int)
             return .fromInterned(try sema.intValue(.usize_type, sema.ip.keyPayload(.ptr, v).byte_offset));
     }
+    if (block.is_comptime and sema.resolveValue(ptr) == null) {
+        // A runtime pointer (`&s.a` of a runtime `s`), as upstream.
+        const err = sema.fail(block, src, "unable to evaluate comptime expression", .{});
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        try sema.zcu.addNote(sema.file, sema.callArgSrc(src, false, 0).span(tree), "operation is runtime due to this operand", .{});
+        if (block.comptime_reason) |r| try sema.zcu.addNote(sema.file, src.span(tree), "{s}", .{r});
+        return err;
+    }
     if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: pointer address is not known until link time", .{});
     return sema.addUnOp(block, .int_from_ptr, ptr);
 }
@@ -15063,7 +15071,8 @@ fn unionFieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, i: u32, initial
         };
         return sema.fieldPtrAt(block, src, ptr, field_ty, i);
     };
-    try sema.requireRuntime(block, src);
+    // In a comptime block, only the pointer's type is read (`fieldPtrAt`).
+    if (block.is_comptime and !block.discards_runtime) return sema.fieldPtrAt(block, src, ptr, field_ty, i);
     if (info.has_runtime_tag) {
         const tag: Ref = .fromInterned(try sema.unionRuntimeTag(union_ty, i));
         if (initializing) {
@@ -16074,7 +16083,7 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = i } } } }));
             }
         }
-        try sema.requireRuntime(block, src);
+        if (block.is_comptime and !block.discards_runtime) return sema.runtimeDummy(result_ty);
         return sema.packedFieldPtr(block, ptr, result_ty, i);
     }
     if (ip.keyTag(p.child) == .union_type and Type.isPacked(ip, p.child)) {
@@ -16092,7 +16101,7 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = i } } } }));
             }
         }
-        try sema.requireRuntime(block, src);
+        if (block.is_comptime and !block.discards_runtime) return sema.runtimeDummy(result_ty);
         return sema.packedFieldPtr(block, ptr, result_ty, i);
     }
     const ptr_ty = sema.typeOf(ptr);
@@ -16122,7 +16131,10 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
             return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = i } } } }));
         }
     }
-    try sema.requireRuntime(block, src);
+    // As upstream, a field pointer of a runtime pointer in a comptime block
+    // is no error of its own: only its type is read (`s.a.len` of an array
+    // field), and what needs its value comptime-known reports it.
+    if (block.is_comptime and !block.discards_runtime) return sema.runtimeDummy(result_ty);
     return sema.addStructField(block, .struct_field_ptr, result_ty, ptr, i);
 }
 
@@ -16652,6 +16664,8 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             elem_ty = a.child;
             ptr_sentinel = a.sentinel;
             len = .fromInterned(try sema.intValue(.usize_type, a.len));
+            // A runtime pointer (to a runtime object's field, in a comptime block).
+            if (sema.resolveValue(ptr) == null) try sema.requireRuntime(block, src.operandSrc(0));
             base = try sema.coercePtrTo(block, ptr, try sema.ptrType(.{ .child = a.child, .flags = .{ .size = .many, .is_const = is_const, .address_space = address_space } }));
         },
         .ptr_type => |cp| {
@@ -16818,6 +16832,9 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     };
     const many_ty = sema.typeOf(base);
     const base_val = sema.resolveValue(base);
+    // A runtime pointer (a field pointer of a runtime object in a comptime
+    // block) or start.
+    if (base_val == null or start_val == null) try sema.requireRuntime(block, src);
     const new_ptr: Ref = if (start_val != null and ip.intValue(u64, start_val.?).? == 0)
         base
     else if (base_val != null and sema.isUndef(base_val.?))

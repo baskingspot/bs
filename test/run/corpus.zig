@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n42\n12\n42\nb\n4\n42\n7\n24\n42\n199\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n42\n12\n42\nb\n4\n42\n7\n24\n42\n199\nhello\n74\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -460,6 +460,34 @@ fn externTable() c_int {
     }.run(1);
 }
 
+// ghostty (apprt/surface.zig): an array field's `len`, read through a
+// runtime object in a comptime argument, is comptime-known from its type.
+const Titled = struct {
+    title: [63:0]u8,
+    alt: union { arr: [11]u8, n: u32 },
+    fn init(t: []const u8) Titled {
+        var result: Titled = undefined;
+        copyZ(result.title.len, &result.title, t);
+        return result;
+    }
+    fn copyZ(comptime cap: usize, dst: *[cap:0]u8, src: []const u8) void {
+        const len = @min(src.len, cap);
+        @memcpy(dst[0..len], src[0..len]);
+        dst[len] = 0;
+    }
+    fn lens(self: Titled) usize {
+        return comptimeLen(self.title.len) + comptimeLen(self.alt.arr.len);
+    }
+};
+fn comptimeLen(comptime n: usize) usize {
+    return n;
+}
+fn titleLen(t: *const [63:0]u8) usize {
+    var n: usize = 0;
+    while (t[n] != 0) n += 1;
+    return n;
+}
+
 // zigdown (plutosvg.zig): a function taking and returning `i32` coerces to
 // a pointer to one with `c_int`, the same integer in memory.
 const CIntCb = ?*const fn (c_int) callconv(.c) c_int;
@@ -606,5 +634,9 @@ fn main() callconv(.c) noreturn {
     rt.printInt(elemOffset(elems, 3));
     rt.printInt(weakTwice(21) orelse 0);
     rt.printInt(@intCast(externTable()));
+    const titled = Titled.init("hello");
+    rt.print(titled.title[0..titleLen(&titled.title)]);
+    rt.print("\n");
+    rt.printInt(titled.lens());
     rt.exit(0);
 }
