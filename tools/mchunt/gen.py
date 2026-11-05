@@ -22,6 +22,7 @@ resolved once their scope has been generated.
 """
 
 import random
+import re
 import sys
 
 # ---------------------------------------------------------------- types
@@ -1387,7 +1388,7 @@ class Gen:
             (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
             (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
-            (2, "swx"),
+            (2, "swx"), (2, "scopenum"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -2877,9 +2878,11 @@ class Gen:
                 e(f"{p}.{f} = {value(f, k)};")
         elif form == 3:
             i = self.fresh("pi")
-            e(f"for (0..{self.r.randint(1, 4)}) |{i}| {{")
+            lt = literal(i)
+            used = re.search(rf"\b{i}\b", lt) is not None
+            e(f"for (0..{self.r.randint(1, 4)}) |{i if used else '_'}| {{")
             ctx["indent"] += 1
-            e(f"{p}.* = {literal(i)};")
+            e(f"{p}.* = {lt};")
             ctx["indent"] -= 1
             e("}")
         elif form == 4 and not vol:
@@ -3011,6 +3014,147 @@ class Gen:
             self.sink(ctx, f"{sl}[{j}]" if not near else f"{sl}[{j} + 1]", U32)
             ctx["indent"] -= 1
             e("}")
+
+    def s_scopenum(self, ctx):
+        """The same checked expression (a + K, s.len - i, i * i) computed on
+        one path only (an if side, a switch case, a loop body left by a
+        break inside an if, a labeled block with one break) and computed
+        again elsewhere, then a bounds check that depends on it. Operands
+        near the type's end make the recomputation overflow on paths where
+        the first one never ran."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        ctx["fn"].risky = True
+        e = lambda s_: self.emit(ctx, s_)
+        kind = self.r.randrange(3)
+        x = self.fresh("nx")
+        sel = self.fresh("nv")
+        if kind == 0:
+            t = self.pick([Int(False, 8), Int(True, 8), Int(False, 16), USIZE, Int(False, 5)])
+            K = self.r.randint(1, 6)
+            mx = (1 << (t.bits - 1)) - 1 if t.signed else (1 << t.bits) - 1
+            cands = [0, 1, mx - K - 1, mx - K, mx - K + 1, mx]
+            if t.signed:
+                cands.append(-(1 << (t.bits - 1)))
+            expr = lambda: f"{x} + {K}"
+            # ar[t - x] is in bounds exactly when t == x + K.
+            arlen = K + 1
+            idx = lambda tv: f"@as(usize, @intCast({tv} - {x}))"
+            ty = t.name()
+        elif kind == 1:
+            t = USIZE
+            n = self.r.randint(1, 6)
+            sl = self.fresh("ns")
+            arr = self.fresh("na")
+            e(f"var {arr}: [{n}]u16 = @splat({self.int_expr(ctx, Int(False, 16), 1)});")
+            e(f"const {sl}: []u16 = {arr}[{self.r.randint(0, n - 1)}..];")
+            cands = [0, 1, n - 1, n, n + 1, n + 7]
+            expr = lambda: f"{sl}.len - {x}"
+            arlen = None
+            idx = lambda tv: f"{tv} -| 1"
+            ty = "usize"
+        else:
+            t = Int(False, 8)
+            cands = [0, 3, 14, 15, 16, 17, 255]
+            expr = lambda: f"{x} * {x}"
+            arlen = 226
+            idx = lambda tv: f"@min(@as(usize, {tv}), 225)"
+            ty = "u8"
+        cands = sorted(set(cands))
+        lit = lambda v: f"@as({ty}, {v})"
+        e(f"var {sel}: [{len(cands)}]{ty} = .{{ {', '.join(lit(c) for c in cands)} }};")
+        e(f"_ = &{sel};")
+        e(f"const {x}: {ty} = {sel}[@as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % {len(cands)}];")
+        ar = self.fresh("nr")
+        if kind == 1:
+            ar_use = lambda tv: f"{sl}[{idx(tv)} % {sl}.len]" if False else f"{arr}[@min({idx(tv)}, {n - 1})]"
+            ar_t = Int(False, 16)
+        else:
+            e(f"var {ar}: [{arlen}]u8 = @splat({self.int_expr(ctx, Int(False, 8), 1)});")
+            e(f"{ar}[{arlen - 1}] +%= 1;")
+            ar_use = lambda tv: f"{ar}[{idx(tv)}]"
+            ar_t = Int(False, 8)
+        to64 = (lambda v: f"@as(u64, @bitCast(@as(i64, {v})))") if (ty.startswith("i")) else (lambda v: f"@as(u64, {v})")
+
+        def first():
+            t1 = self.fresh("n1")
+            e(f"const {t1} = {expr()};")
+            self.sink(ctx, to64(t1), U64)
+
+        def again():
+            t2 = self.fresh("n2")
+            e(f"const {t2} = {expr()};")
+            self.sink(ctx, ar_use(t2), ar_t)
+
+        def block(fn):
+            ctx["indent"] += 1
+            fn()
+            ctx["indent"] -= 1
+
+        place = self.r.randrange(6)
+        c = lambda: self.bool_expr(ctx, 1)
+        if place == 0:  # one side of an if, then after
+            e(f"if ({c()}) {{")
+            block(first)
+            e("} else {")
+            block(lambda: self.sink(ctx, f"@as(u8, {self.r.randint(0, 9)})", Int(False, 8)))
+            e("}")
+            again()
+        elif place == 1:  # one side, then the other side
+            e(f"if ({c()}) {{")
+            block(first)
+            e("} else {")
+            block(again)
+            e("}")
+        elif place == 2:  # a switch case, the next case, and after
+            sv = f"@as(u2, @truncate({self.int_expr(ctx, U64, 1)}))"
+            e(f"switch ({sv}) {{")
+            ctx["indent"] += 1
+            e("0 => {")
+            block(first)
+            e("},")
+            e("1 => {")
+            block(again)
+            e("},")
+            e("else => {},")
+            ctx["indent"] -= 1
+            e("}")
+            if self.chance(0.6):
+                again()
+        elif place == 3:  # a loop left by a break inside an if
+            i = self.fresh("ni")
+            e(f"var {i}: u32 = 0;")
+            e(f"while ({i} < {self.r.randint(1, 4)}) : ({i} += 1) {{")
+            ctx["indent"] += 1
+            e(f"if ({c()} or {i} == {self.r.randint(0, 3)}) {{")
+            block(first)
+            ctx["indent"] += 1
+            e("break;")
+            ctx["indent"] -= 1
+            e("}")
+            ctx["indent"] -= 1
+            e("}")
+            again()
+        elif place == 4:  # a labeled block with one break; the first is under an if
+            b = self.fresh("nb")
+            e(f"{b}: {{")
+            ctx["indent"] += 1
+            e(f"if ({c()}) {{")
+            block(first)
+            e("}")
+            e(f"break :{b};")
+            ctx["indent"] -= 1
+            e("}")
+            again()
+        else:  # a labeled block with one break; the first runs on every path to it
+            b = self.fresh("nb")
+            e(f"{b}: {{")
+            block(first)
+            ctx["indent"] += 1
+            e(f"break :{b};")
+            ctx["indent"] -= 1
+            e("}")
+            again()
 
     def _sw_int(self):
         """An integer type for a switch operand: u8..u64, i8..i64, odd
