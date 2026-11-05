@@ -19134,26 +19134,43 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
 // Inline assembly
 
 /// The callee-saved registers an `asm`'s clobbers (`.{ .rbx = true }`)
-/// name, as `Ir.Asm.callee_saved_clobbers` bits.
-fn asmCalleeSavedClobbers(sema: *Sema, ref: Zir.Inst.Ref) u32 {
+/// name, as `Ir.Asm.callee_saved_clobbers` bits. A literal's value
+/// (`std.lang.Clobbers`, `clobbers_type`) has no fields, so its ZIR is
+/// read; any other expression, such as a named constant, has the value
+/// of std's `std.lang.assembly.Clobbers`, whose fields are read.
+fn asmCalleeSavedClobbers(sema: *Sema, ref: Zir.Inst.Ref) !u32 {
+    if (ref == .none) return 0;
     const code = sema.code;
     // The `comptime` block around the struct literal.
     var r = ref;
-    const ci = while (r != .none) {
-        const i = r.toIndex() orelse return 0;
+    const ci: ?Zir.Inst.Index = while (true) {
+        const i = r.toIndex() orelse break null;
         switch (code.instructions.items(.tag)[@backingInt(i)]) {
             .struct_init => break i,
             .block_comptime => {
                 const b = code.extraData(Zir.Inst.BlockComptime, code.instructions.items(.data)[@backingInt(i)].pl_node.payload_index);
                 const body = code.bodySlice(b.end, b.data.body_len);
                 const last = body[body.len - 1];
-                if (code.instructions.items(.tag)[@backingInt(last)] != .break_inline) return 0;
+                if (code.instructions.items(.tag)[@backingInt(last)] != .break_inline) break null;
                 r = code.instructions.items(.data)[@backingInt(last)].@"break".operand;
             },
-            else => return 0,
+            else => break null,
         }
-    } else return 0;
-    const extra = code.extraData(Zir.Inst.StructInit, code.instructions.items(.data)[@backingInt(ci)].pl_node.payload_index);
+    };
+    const lit = ci orelse {
+        const ip = sema.ip;
+        const v = sema.resolveValue(sema.resolveInst(ref)) orelse return 0;
+        const ty = ip.typeOf(v);
+        if (sema.isUndef(v) or ip.keyTag(ty) != .struct_type) return 0;
+        const info = ip.structInfo(ty);
+        var mask: u32 = 0;
+        for (Ir.Asm.callee_saved_names, 0..) |n, bit| {
+            const f = info.fieldIndex(ip, n) orelse continue;
+            if (try sema.fieldValue(v, f) == .bool_true) mask |= @as(u32, 1) << @intCast(bit);
+        }
+        return mask;
+    };
+    const extra = code.extraData(Zir.Inst.StructInit, code.instructions.items(.data)[@backingInt(lit)].pl_node.payload_index);
     var mask: u32 = 0;
     var i = extra.end;
     for (0..extra.data.fields_len) |_| {
@@ -19240,7 +19257,7 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         .outputs_len = small.outputs_len,
         .inputs_len = small.inputs_len,
         .is_volatile = @intFromBool(small.is_volatile),
-        .callee_saved_clobbers = sema.asmCalleeSavedClobbers(extra.data.clobbers),
+        .callee_saved_clobbers = try sema.asmCalleeSavedClobbers(extra.data.clobbers),
     });
     for (operands.items) |op| _ = try sema.addExtra(op);
     return sema.addInst(block, .{ .tag = .assembly, .data = .{ .ty_pl = .{ .ty = result_ty, .payload = payload } } });

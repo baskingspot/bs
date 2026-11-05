@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n42\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -208,6 +208,34 @@ noinline fn liveAcrossClobber(x: u64) u64 {
     const b = x +% 11;
     clobberCalleeSaved();
     return a +% b;
+}
+
+// zwasm (engine/codegen/shared/entry.zig): an asm whose clobbers are a
+// named constant, not a literal, saves the callee-saved registers they
+// name.
+fn zeroRbx() callconv(.naked) void {
+    asm volatile (
+        \\ xorl %%ebx, %%ebx
+        \\ xorl %%r12d, %%r12d
+        \\ retq
+    );
+}
+var zero_rbx: *const fn () callconv(.c) void = @ptrCast(&zeroRbx);
+const jit_clobbers: @import("std").lang.assembly.Clobbers = .{ .rbx = true, .r12 = true, .memory = true };
+noinline fn jitTrampoline() callconv(.c) void {
+    zero_rbx();
+    asm volatile ("" ::: jit_clobbers);
+}
+fn rbxAcrossTrampoline() u64 {
+    return asm volatile (
+        \\ pushq %%rbx
+        \\ movq $42, %%rbx
+        \\ callq *%[f]
+        \\ movq %%rbx, %[out]
+        \\ popq %%rbx
+        : [out] "={rax}" (-> u64),
+        : [f] "r" (&jitTrampoline),
+        : .{ .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 // tokamak (meta.zig): a comptime variable written a byte at a time
@@ -459,5 +487,6 @@ fn main() callconv(.c) noreturn {
     rt.printInt(@intCast(cPipe(&fds)[1] + fds[1]));
     rt.printInt(dataPtr(true).?.* + @intFromBool(dataPtr(false) == null));
     rt.printInt(app.frameFn() catch 42);
+    rt.printInt(rbxAcrossTrampoline());
     rt.exit(0);
 }
