@@ -29,7 +29,8 @@ pub fn emit(gpa: Allocator, io: Io, zig_lib_dir: []const u8, out_path: []const u
     defer lib_dir.close(io);
     for ([_][]const u8{ "docs/main.js", "docs/index.html" }) |sub_path|
         try lib_dir.copyFile(sub_path, out_dir, std.fs.path.basename(sub_path), io, .{});
-    try out_dir.writeFile(io, .{ .sub_path = "main.wasm", .data = viewer });
+    // Executable, as upstream's, which copies the viewer its linker wrote.
+    try out_dir.writeFile(io, .{ .sub_path = "main.wasm", .data = viewer, .flags = .{ .permissions = .executable_file } });
 
     // The modules, breadth-first from the root, as upstream: the root
     // module under the compilation's name, std, then each module's

@@ -119,6 +119,7 @@ misc)
 # Docs: upstream's viewer, its page, and the modules' sources.
 "$bs" build docs >"$work/log" 2>&1 || fail "bs build docs"
 for f in index.html main.js main.wasm sources.tar; do [ -s "zig-out/docs/$f" ] || fail "zig-out/docs/$f"; done
+[ -x zig-out/docs/main.wasm ] || fail "zig-out/docs/main.wasm is executable, as upstream's"
 tar tf zig-out/docs/sources.tar | grep -qx test/main.zig || fail "sources.tar holds test/main.zig"
 
 # As upstream: `bs test-obj` builds the tests and their runner as an
