@@ -44,6 +44,26 @@ const Loop = struct {
     body_len: u32,
     start: u64,
     trips: u32,
+    /// The body is a byte swap (`std.mem.swap`): done in words instead.
+    swap: ?Swap = null,
+};
+
+/// `std.mem.swap`'s loop over two constant-length byte slices of its
+/// `*T`s, unrolled:
+///   %ea = slice_elem_ptr(%sa, %i); %eb = slice_elem_ptr(%sb, %i)
+///   %x = load(u8, %ea); %y = load(u8, %eb); store(%ea, %y); store(%eb, %x)
+/// moves `chunk`-byte words instead of bytes, `chunks` of them in order.
+/// Both slices start `chunk`-aligned, so the loop's byte swaps within one
+/// word touch distinct residues mod `chunk` and commute, and a word of
+/// `a` and one of `b` either coincide or are disjoint: swapping a word at
+/// once is swapping its bytes in turn, even when `*a` and `*b` overlap.
+const Swap = struct {
+    /// The slices' `[*]u8` pointers.
+    a: Inst.Ref,
+    b: Inst.Ref,
+    ea: Inst.Index,
+    chunk_ty: Index,
+    chunks: u32,
 };
 
 /// Unrolls the loops that qualify; returns how many.
@@ -82,8 +102,12 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir) Alloca
     var copied: std.ArrayList(Inst.Index) = .empty;
     defer copied.deinit(gpa);
     for (loops.items) |l| {
-        copied.clearRetainingCapacity();
         const body = from.bodySlice(l.body_start, l.body_len);
+        if (l.swap) |sw| {
+            try swapWords(gpa, ip, tid, &from, &insts, &extra, l, sw, body);
+            continue;
+        }
+        copied.clearRetainingCapacity();
         try collect(gpa, &from, body, &copied);
         const ty = from.instructions.items(.data)[@backingInt(l.counter)].ty;
         const counter_ty = ip.keyPayload(.ptr_type, ty).child;
@@ -126,6 +150,56 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir) Alloca
     ir.extra = try extra.toOwnedSlice(gpa);
     ir.instructions = insts.slice();
     return @intCast(loops.items.len);
+}
+
+/// Replaces the body of swap loop `l`'s outer block with `sw.chunks`
+/// copies of `body` on words: the same instructions on the same lines.
+fn swapWords(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, from: *const Ir, insts: *std.MultiArrayList(Inst), extra: *std.ArrayList(u32), l: Loop, sw: Swap, body: []const Inst.Index) Allocator.Error!void {
+    const many = try ip.get(tid, .{ .ptr_type = .{ .child = sw.chunk_ty, .flags = .{ .size = .many } } });
+    const one = try ip.get(tid, .{ .ptr_type = .{ .child = sw.chunk_ty } });
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(gpa);
+    const pa = (@as(Inst.Index, @fromBackingInt(@intCast(insts.len)))).toRef();
+    try insts.append(gpa, .{ .tag = .bitcast, .data = .{ .ty_op = .{ .ty = many, .operand = sw.a } } });
+    const pb = (@as(Inst.Index, @fromBackingInt(@intCast(insts.len)))).toRef();
+    try insts.append(gpa, .{ .tag = .bitcast, .data = .{ .ty_op = .{ .ty = many, .operand = sw.b } } });
+    try out.appendSlice(gpa, &.{ @backingInt(pa.toIndex().?), @backingInt(pb.toIndex().?) });
+    const datas = from.instructions.items(.data);
+    for (0..sw.chunks) |m| {
+        const index: Inst.Ref = .fromInterned(try ip.getInt(tid, .usize_type, m));
+        // The body's instructions, in order, at their copies' indices.
+        const base: u32 = @intCast(insts.len);
+        const at = struct {
+            fn at(b: []const Inst.Index, x: Inst.Ref, base_: u32) Inst.Ref {
+                const k = std.mem.findScalar(Inst.Index, b, x.toIndex().?).?;
+                return (@as(Inst.Index, @fromBackingInt(base_ + @as(u32, @intCast(k))))).toRef();
+            }
+        }.at;
+        for (body) |i| {
+            const d = datas[@backingInt(i)];
+            const tag = from.instructions.items(.tag)[@backingInt(i)];
+            // The loop's `br` to its next iteration, last: the copies
+            // follow each other.
+            if (tag == .br) break;
+            try out.append(gpa, @intCast(insts.len));
+            switch (tag) {
+                .slice_elem_ptr => {
+                    const payload: u32 = @intCast(extra.items.len);
+                    try extra.appendSlice(gpa, &.{ @backingInt(if (i == sw.ea) pa else pb), @backingInt(index) });
+                    try insts.append(gpa, .{ .tag = .ptr_elem_ptr, .data = .{ .ty_pl = .{ .ty = one, .payload = payload } } });
+                },
+                .load => try insts.append(gpa, .{ .tag = .load, .data = .{ .ty_op = .{ .ty = sw.chunk_ty, .operand = at(body, d.ty_op.operand, base) } } }),
+                .store => try insts.append(gpa, .{ .tag = .store, .data = .{ .bin_op = .{ .lhs = at(body, d.bin_op.lhs, base), .rhs = at(body, d.bin_op.rhs, base) } } }),
+                else => try insts.append(gpa, .{ .tag = tag, .data = d }),
+            }
+        }
+    }
+    try out.append(gpa, @intCast(insts.len));
+    try insts.append(gpa, .{ .tag = .br, .data = .{ .br = .{ .block_inst = l.outer, .operand = .void_value } } });
+    const payload: u32 = @intCast(extra.items.len);
+    try extra.append(gpa, @intCast(out.items.len));
+    try extra.appendSlice(gpa, out.items);
+    insts.items(.data)[@backingInt(l.outer)].ty_pl.payload = payload;
 }
 
 const Counter = struct {
@@ -271,7 +345,10 @@ const Finder = struct {
             if (tags[@backingInt(s)] != .store or datas[@backingInt(s)].bin_op.lhs != counter.toRef()) continue;
             break f.int(datas[@backingInt(s)].bin_op.rhs) orelse return null;
         } else return null;
-        if (start >= end or end - start > max_trips) return null;
+        if (start >= end) return null;
+        if (start == 0) if (f.swapOf(then_body, load, cont, end)) |sw|
+            return .{ .outer = outer, .counter = counter, .cont = cont, .body_start = x.end, .body_len = x.data.then_body_len, .start = 0, .trips = 0, .swap = sw };
+        if (end - start > max_trips) return null;
         const trips: u32 = @intCast(end - start);
         var n: Nested = .{ .ir = ir, .out = undefined, .count_only = true };
         n.body(then_body) catch unreachable;
@@ -288,7 +365,22 @@ const Finder = struct {
         const datas = ir.instructions.items(.data);
         const i = @backingInt(ref.toIndex() orelse return null);
         if (tags[i] != .slice_len) return null;
-        var s = datas[i].ty_op.operand;
+        const s = f.sliceValue(datas[i].ty_op.operand) orelse return null;
+        if (s.toInterned()) |v| {
+            if (f.ip.keyTag(v) != .slice) return null;
+            return f.int(.fromInterned(f.ip.keyPayload(.slice, v).len));
+        }
+        const si = @backingInt(s.toIndex().?);
+        if (tags[si] != .slice) return null;
+        return f.int(ir.extraData(Ir.Bin, datas[si].ty_pl.payload).data.rhs);
+    }
+
+    /// The slice `s` is: through a `const` local stored once, as Sema keeps
+    /// `std.mem.swap`'s.
+    fn sliceValue(f: *const Finder, ref: Inst.Ref) ?Inst.Ref {
+        const tags = f.ir.instructions.items(.tag);
+        const datas = f.ir.instructions.items(.data);
+        var s = ref;
         if (s.toIndex()) |l| if (tags[@backingInt(l)] == .load) {
             // A `const` local stored once.
             const a = datas[@backingInt(l)].ty_op.operand.toIndex() orelse return null;
@@ -301,13 +393,57 @@ const Finder = struct {
             }
             s = stored orelse return null;
         };
-        if (s.toInterned()) |v| {
-            if (f.ip.keyTag(v) != .slice) return null;
-            return f.int(.fromInterned(f.ip.keyPayload(.slice, v).len));
+        return s;
+    }
+
+    /// The swap `then_body` (a loop's over `[0, n)`, counter `load`, next
+    /// iteration `cont`) does, if it is the byte swap `Swap` describes.
+    fn swapOf(f: *const Finder, then_body: []const Inst.Index, load: Inst.Index, cont: Inst.Index, n: u64) ?Swap {
+        const tags = f.ir.instructions.items(.tag);
+        const datas = f.ir.instructions.items(.data);
+        var ops: [7]Inst.Index = undefined;
+        var len: usize = 0;
+        for (then_body) |i| {
+            if (tags[@backingInt(i)] == .dbg_stmt) continue;
+            if (len == ops.len) return null;
+            ops[len] = i;
+            len += 1;
         }
-        const si = @backingInt(s.toIndex().?);
-        if (tags[si] != .slice) return null;
-        return f.int(ir.extraData(Ir.Bin, datas[si].ty_pl.payload).data.rhs);
+        if (len != ops.len) return null;
+        const want = [_]Inst.Tag{ .slice_elem_ptr, .slice_elem_ptr, .load, .load, .store, .store, .br };
+        for (ops, want) |i, t| if (tags[@backingInt(i)] != t) return null;
+        const ea, const eb, const x, const y, const st_a, const st_b, const br = ops;
+        if (datas[@backingInt(x)].ty_op.ty != .u8_type or datas[@backingInt(x)].ty_op.operand != ea.toRef()) return null;
+        if (datas[@backingInt(y)].ty_op.ty != .u8_type or datas[@backingInt(y)].ty_op.operand != eb.toRef()) return null;
+        if (datas[@backingInt(st_a)].bin_op.lhs != ea.toRef() or datas[@backingInt(st_a)].bin_op.rhs != y.toRef()) return null;
+        if (datas[@backingInt(st_b)].bin_op.lhs != eb.toRef() or datas[@backingInt(st_b)].bin_op.rhs != x.toRef()) return null;
+        if (datas[@backingInt(br)].br.block_inst != cont) return null;
+        var parts: [2]struct { ptr: Inst.Ref, alignment: u64 } = undefined;
+        for ([_]Inst.Index{ ea, eb }, &parts) |e, *part| {
+            const bin = f.ir.extraData(Ir.Bin, datas[@backingInt(e)].ty_pl.payload).data;
+            if (bin.rhs != load.toRef()) return null;
+            const s = (f.sliceValue(bin.lhs) orelse return null).toIndex() orelse return null;
+            if (tags[@backingInt(s)] != .slice) return null;
+            const sl = f.ir.extraData(Ir.Bin, datas[@backingInt(s)].ty_pl.payload).data;
+            if ((f.int(sl.rhs) orelse return null) != n) return null;
+            const pt = f.ip.keyPayload(.ptr_type, datas[@backingInt(s)].ty_pl.ty);
+            if (pt.child != .u8_type or pt.flags.is_volatile or pt.flags.address_space != .generic or pt.packed_offset.host_size != 0) return null;
+            part.* = .{ .ptr = sl.lhs, .alignment = if (pt.flags.alignment == 0) 1 else @as(u64, 1) << @intCast(pt.flags.alignment - 1) };
+        }
+        // The widest word both slices align that divides `n`.
+        const chunk = @min(8, parts[0].alignment, parts[1].alignment, n & -%n);
+        if (chunk < 2 or n / chunk > max_trips) return null;
+        return .{
+            .a = parts[0].ptr,
+            .b = parts[1].ptr,
+            .ea = ea,
+            .chunk_ty = switch (chunk) {
+                2 => .u16_type,
+                4 => .u32_type,
+                else => .u64_type,
+            },
+            .chunks = @intCast(n / chunk),
+        };
     }
 
     fn int(f: *const Finder, ref: Inst.Ref) ?u64 {
