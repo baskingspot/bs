@@ -5,7 +5,9 @@ of noinline test functions, each building vectors from runtime inputs
 and running them through lane ops, wrapping and saturating arithmetic,
 shifts by splats and by vectors, compares, select, shuffles (negative
 and undefined mask lanes), @reduce of every op, casts and bitcasts,
-memory, calls and comptime. Main calls each one and prints the running
+memory, calls and comptime, and runs of call-free lane ops that keep
+more vectors live than there are vector registers, some carried around
+a loop. Main calls each one and prints the running
 checksum after it (`ck <n> <hash>`), as gen.py's programs do.
 
 Every program is well defined: shift amounts are in range, divisors are
@@ -481,7 +483,7 @@ class Gen:
         return nm
 
     def stmt(self, depth):
-        c = self.r.randrange(12)
+        c = self.r.randrange(13)
         if c <= 3:
             t = self.rand_type()
             nm = self.define(t, self.vexpr(t, depth))
@@ -519,6 +521,8 @@ class Gen:
             self.s_memory(depth)
         elif c == 8:
             self.s_call(depth)
+        elif c == 12:
+            self.s_regs(depth)
         elif c == 9:
             # Bitcasts to integers and arrays.
             t = self.rand_type(kinds=("int", "bool"))
@@ -590,6 +594,79 @@ class Gen:
                 self.emit(f"{m} = @as(*align(1) const {V}, @ptrCast(&bytes[{off + self.r.choice([0, 0, 1, 4])}])).*;")
         self.emit(f"mixv({m});")
         self.pool.append((m, t))
+
+    def s_regs(self, depth):
+        # Vectors the register allocator can keep in vector registers (16
+        # bytes or fewer, no call between definition and use): more live at
+        # once than there are registers, and variables carried around a loop.
+        t = VT("int", 4, 32, False)
+        for _ in range(20):
+            c = self.rand_type(kinds=("int", "int", "float"))
+            if c.nbytes() <= 16 and c.bits in ((8, 16, 32, 64) if c.kind == "int" else (32, 64)):
+                t = c
+                break
+        V = self.alias(t)
+        names = []
+        for _ in range(self.r.randint(2, 5)):
+            nm = self.fresh("q")
+            if t.kind == "int":
+                self.emit(f"const {nm}: {V} = @as(*align(1) const {V}, @ptrCast(&bytes[{self.r.randrange(256)}])).*;")
+            else:
+                self.emit(f"const {nm}: {V} = ld({V}, {self.r.randrange(64)});")
+            names.append(nm)
+        saved = (self.pool, self.ct)
+        self.pool, self.ct = [(nm, t) for nm in names], True
+        for _ in range(self.r.randint(6, 16)):
+            nm = self.fresh("d")
+            self.emit(f"const {nm}: {V} = {self.reg_expr(t, depth)};")
+            self.pool.append((nm, t))
+            names.append(nm)
+        accs = [self.fresh("acc") for _ in range(self.r.randint(1, 4))]
+        for a in accs:
+            self.emit(f"var {a}: {V} = {self.r.choice(names)};")
+        self.pool += [(a, t) for a in accs]
+        n = self.fresh("n")
+        self.emit(f"var {n}: usize = @intCast(in[{self.r.randrange(64)}] % 4 + 1);")
+        self.emit(f"while ({n} != 0) : ({n} -= 1) {{")
+        self.indent += 1
+        for a in accs:
+            self.emit(f"{a} = {self.reg_expr(t, depth)};")
+        self.indent -= 1
+        self.emit("}")
+        self.pool, self.ct = saved
+        self.emit(f"mixv(.{{ {', '.join(names + accs)} }});")
+
+    def reg_expr(self, t, d):
+        # Lane ops of `s_regs`'s values, which lower without calls.
+        if self.chance(0.15):
+            return self.vexpr(t, d - 1)
+        if d <= 0 or self.chance(0.2):
+            return self.r.choice([nm for nm, pt in self.pool if pt == t])
+        V = self.alias(t)
+        x = lambda: self.reg_expr(t, d - 1)  # noqa: E731
+        c = self.r.randrange(6)
+        if c == 0:
+            return f"@select({t.elem()}, {x()} {self.r.choice(['<', '>=', '==', '!='])} {x()}, {x()}, {x()})"
+        if c == 1:
+            m = ", ".join(str(self.r.choice([i, ~i])) for i in (self.r.randrange(t.n) for _ in range(t.n)))
+            return f"@shuffle({t.elem()}, {x()}, {x()}, @Vector({t.n}, i32){{ {m} }})"
+        if c == 2:
+            return f"@as({V}, @splat(({x()})[{self.r.randrange(t.n)}]))"
+        if t.kind == "float":
+            if c == 3:
+                return f"({self.r.choice(['-', '@abs', '@sqrt'])}({x()}))"
+            if c == 4:
+                return f"(@{self.r.choice(['min', 'max'])}({x()}, {x()}) + {self.splat(t, '0.0')})"
+            return f"({x()} {self.r.choice(['+', '-', '*', '/'])} {x()})"
+        if c == 3:
+            return f"({self.r.choice(['~', '-%'])}{x()})"
+        if c == 4:
+            sh = self.r.choice(["<<", ">>"])
+            return f"({x()} {sh} @as({self.L(t)}, @splat({self.r.randrange(t.bits)})))"
+        op = self.r.choice(["+%", "-%", "*%", "&", "|", "^", "+|", "-|", "@min", "@max"])
+        if op[0] == "@":
+            return f"@as({V}, {op}({x()}, {x()}))"
+        return f"({x()} {op} {x()})"
 
     def s_call(self, depth):
         t = self.rand_type()
