@@ -5891,7 +5891,10 @@ records only what changed, and links from the manifest.
   if the instruction is gone. Items carry their length beside their tag
   for this. It refreshes the lines of green functions that are, or that
   inline a function, in a changed input (`refreshDebug`; the walk makes
-  the inlined callees' declarations). Node flags record what is linked:
+  the inlined callees' declarations). A function loaded green whose
+  recorded declaration does not map, as in a container whose fields
+  changed (which maps none of its declarations), takes its line from its
+  declaration now (`Replay.decl_insts`). Node flags record what is linked:
   `unlinked` for nodes with atoms that the walk and this build's nodes do
   not reach. `stale` marks nodes an edit reached that the build left
   undecided, which the next lazy build seeds again. The link then reads

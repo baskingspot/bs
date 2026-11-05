@@ -2979,7 +2979,7 @@ fn rewriteKept(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32, final
     var line: ?u32 = null;
     var moved_inst = false;
     if (refresh and src.input != Manifest.Source.no_input and rp.maps.maps.contains(src.input)) blk: {
-        const inst = rp.mapInst(src.input, @fromBackingInt(src.inst)) orelse break :blk;
+        const inst = rp.decl_insts.get(i) orelse rp.mapInst(src.input, @fromBackingInt(src.inst)) orelse break :blk;
         const file = rp.fileOf(src.input) orelse break :blk;
         const zir = &rp.zcu.file(file).zir;
         if (zir.instructions.items(.tag)[@backingInt(inst)] != .declaration) break :blk;

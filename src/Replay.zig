@@ -137,6 +137,11 @@ dead: std.DynamicBitSetUnmanaged = .{},
 /// Green functions whose line information may have moved: they or a
 /// function they inline are in a changed input (`Incremental.refreshDebug`).
 refresh: std.DynamicBitSetUnmanaged = .{},
+/// Functions in changed files that a lazy build loaded, by node, with
+/// their declarations now: for those whose recorded declaration does not
+/// map (a container whose fields changed maps none of its declarations),
+/// `Incremental.rewriteKept` takes the line from here.
+decl_insts: std.AutoHashMapUnmanaged(u32, Zir.Inst.Index) = .empty,
 stats: Stats = .{},
 /// `BS_CACHE_CHECK`: print each green unit that could not be loaded.
 check: bool = false,
@@ -465,6 +470,7 @@ pub fn destroy(r: *Replay) void {
     r.data_refs.deinit(gpa);
     r.dead.deinit(gpa);
     r.refresh.deinit(gpa);
+    r.decl_insts.deinit(gpa);
     r.late_mapped.deinit(gpa);
     r.rt_waiting.deinit(gpa);
     r.rt_effects.deinit(gpa);
@@ -660,6 +666,10 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
         }
         try r.commitLazy(g, false);
         if (inline_result) |res| try zcu.inline_results.put(zcu.gpa, func, res);
+        if (r.isChangedFile(owner.file)) {
+            try r.decl_insts.put(r.gpa, g.node, owner.zir_inst);
+            r.refresh.set(g.node);
+        }
         r.stats.loaded_funcs += 1;
         return true;
     }
