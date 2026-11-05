@@ -1734,6 +1734,36 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     wdef_run.addCheck(.{ .expect_stderr_exact = "2 20\n" });
     wdef_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&wdef_run.step);
+    // musl, linked statically from libc.a and crt1.o that bs builds from
+    // the zig lib directory's sources with upstream's Clang: the same C
+    // source, an executable of C only, and C++ with -lc++, on x86_64 and
+    // under qemu on aarch64.
+    for ([_]?[]const []const u8{ &.{}, aarch64LinuxRunner(b) }, [_][]const u8{ "x86_64", "aarch64" }) |runner_opt, arch| {
+        const runner = runner_opt orelse continue;
+        const target = b.fmt("{s}-linux-musl", .{arch});
+        const cases = [_]struct { what: []const u8, lib: []const u8, files: []const []const u8, args: []const []const u8 = &.{}, stdout: []const u8, stderr: []const u8 = "", code: u8 = 0 }{
+            .{ .what = "a C source", .lib = "-lc", .files = &.{ "libc_main.zig", "libc.c" }, .stdout = "x=21 twice=42 len=3\nbye from atexit\nbye\n", .stderr = "1 123\n" },
+            .{ .what = "only C sources", .lib = "-lc", .files = &.{"cmain.c"}, .args = &.{"5"}, .stdout = "argc=2 q=478165905515354922\n", .code = 7 },
+            .{ .what = "a C++ source", .lib = "-lc++", .files = &.{ "cxx_main.zig", "cxx.cpp" }, .stdout = "caught: boom at depth 4\ntype: 7Derived\nctor 42, tls tls42!, sum 6\n", .stderr = "result 151, link_libcpp true\n" },
+        };
+        for (cases) |case| {
+            const m_exe = b.addRunArtifact(bs);
+            m_exe.setName(b.fmt("bs build-exe {s} -target {s} with {s}", .{ case.lib, target, case.what }));
+            m_exe.addArgs(&.{ "build-exe", case.lib, "-target", target });
+            for (case.files) |f| m_exe.addFileArg(b.path(b.fmt("test/link_input/{s}", .{f})));
+            m_exe.setEnvironmentVariable("BS_ZIG", zig);
+            // With a cold global cache, libc.a's thousand sources.
+            takes(b, &m_exe.step, 40);
+            const m_run = std.Build.Step.Run.create(b, b.fmt("run bs {s} {s} build with {s}", .{ target, case.lib, case.what }));
+            m_run.addArgs(runner);
+            m_run.addFileArg(m_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            m_run.addArgs(case.args);
+            m_run.addCheck(.{ .expect_stdout_exact = case.stdout });
+            m_run.addCheck(.{ .expect_stderr_exact = case.stderr });
+            m_run.addCheck(.{ .expect_term = .{ .exited = case.code } });
+            test_step.dependOn(&m_run.step);
+        }
+    }
     // The same for aarch64-linux-gnu, as an -fPIC object and a source, and
     // an executable of C only, run under qemu with aarch64 glibc.
     if (aarch64LinuxGlibcRunner(b)) |runner| {
@@ -2261,6 +2291,15 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &tc_libc.step, 13);
         test_step.dependOn(&tc_libc.step);
     }
+    // A musl target takes the lib directory's musl headers.
+    const tc_musl = b.addRunArtifact(bs);
+    tc_musl.setName("bs translate-c -lc -target x86_64-linux-musl takes musl's headers");
+    tc_musl.addArgs(&.{ "translate-c", "-lc", "-target", "x86_64-linux-musl" });
+    tc_musl.addFileArg(b.path("test/link_input/tc_libc/s.h"));
+    tc_musl.addCheck(.{ .expect_stdout_match = "pub extern fn tcl_bundled() c_int;" });
+    tc_musl.addCheck(.{ .expect_stdout_match = "generic-musl/features.h" });
+    takes(b, &tc_musl.step, 13);
+    test_step.dependOn(&tc_musl.step);
     // SysV aggregates between Zig and C both ways: INTEGER, SSE and mixed
     // eightbytes, odd sizes, MEMORY, registers running out, a function
     // pointer, and variadic aggregates. Upstream prints the same except

@@ -7576,9 +7576,9 @@ glibc version, `dynamic_linker`, `link_libc`,
 (local-exec thread-locals, absolute addresses), as it is for
 `build-exe -fPIE`: the output is a non-PIE executable, where that changes
 nothing a program means. `-lc` on aarch64-macos changes nothing (libSystem
-is always linked); `-target x86_64-linux[-musl] -lc` and
-`x86_64-linux-none -lc` are `[unsupported]`, naming
-`-target x86_64-linux-gnu`.
+is always linked); `-target x86_64-linux[-musl] -lc` links musl
+statically (step 5), and `x86_64-linux-none -lc` is `[unsupported]`,
+naming the gnu and musl targets.
 
 **The link** (`Elf.Options.dynamic` with an executable kind, on the `pic`
 branch's `ElfDynamic`): ET_EXEC at bs's usual base (upstream's 16 MiB
@@ -8247,6 +8247,75 @@ diagnostics.
   (0.90–1.07 s), nearly all of it Clang on libc++'s headers; a Zig edit
   0.12 s (0.39 s). Builds without C++ do not change.
 
+### Step 5: musl, as built (2026-11-05)
+
+`-lc` with a musl target (`-target x86_64-linux-musl`, and plain
+`x86_64-linux` and `aarch64-linux`, whose default ABI is musl) links
+musl statically, as upstream does; flow (neurocyte's editor) defaults
+to it. `-dynamic` with musl is `[unsupported]`. The glibc paths do not
+change.
+
+- **libc.a and crt1.o** (`src/Musl.zig`, copied from upstream's
+  `src/libs/musl.zig` with its notice): the source list (1053 files on
+  x86_64, where an architecture's directory replaces the generic source
+  of the same name), compiled by upstream's Clang as runtime libraries
+  (`CSource.musl_crt1`, `musl_libc`). They use the flags of upstream's
+  sub-compilation: ReleaseFast `-O2 -DNDEBUG`, no PIC, `-fno-builtin`,
+  function and data sections, no stack protector or sanitizer, then
+  musl's `addCcArgs`, with `-O3` for `src/string` and `src/internal`
+  and `-Os` elsewhere, and `-DCRT` for crt1. They are cached under
+  `<global>/bs/o/<key>/` like libc_nonshared.a, keyed by upstream zig and
+  every command line. Two sources that share a stem (`clone`) compile in
+  numbered directories. There are no crti/crtn objects, as upstream.
+- **zigc**: upstream's `lib/c.zig` replaces the musl sources that libc.a
+  leaves out (`memcpy`, `malloc`, much of math and string). It is a
+  module of the compilation (`Frontend.zigc`, an analysis root,
+  `Zcu.rootFiles`), as upstream's `wantsZigC` makes it.
+- **Link**: user objects, C objects, crt1.o, the C++ runtime libraries,
+  libc.a, compiler_rt. crt1.o comes after the C objects rather than
+  first as in upstream's command line. It is a link input of the cache
+  in `CSource.objectPaths` order, so `Emit.sync` and the relink lay out
+  the same bytes, and the order changes nothing a program means (no
+  `.init` pieces). The output is a static non-PIE ET_EXEC, and builtin
+  says `link_libc`, `.static` and `abi = .musl`.
+- **Cache**: musl executables use the on-disk cache like glibc ones,
+  with libc.a and crt1.o as link inputs, but neither use nor give
+  donors: a donor whose builtin differs only in musl's `link_libc`
+  (`-target x86_64-linux-musl` against `-target x86_64-linux-musl -lc`,
+  or the native target against either) replays wrong results.
+  `BS_CACHE_CHECK` reports std's `Syscall.fail` instances as changed
+  with no changed source reaching them, and `Io.Threaded.addBuf` keeps
+  its `usize` iovlen where musl's is `u32`, so every write to stderr
+  panics. Lifting this waits for the cache to track what changes.
+- **C and C++ sources** target `<arch>-linux-musl` without `-fPIC`.
+  libc++ adds `-D_LIBCPP_HAS_MUSL_LIBC=1` and, as upstream, no
+  `HAVE___CXA_THREAD_ATEXIT_IMPL`, which glibc gets only from 2.18.
+- **translate-c** takes the triple's ABI (`x86_64-linux` is musl, with
+  or without `-lc`), and with `-lc` musl's headers from the lib
+  directory and `-fno-PIC`, without `__GLIBC_MINOR__`. Output matches
+  upstream's for stdio, pthread, errno and socket on both targets.
+- **Conformance**: `run.py --std --musl` builds std's tests with
+  `-lc -target <arch>-linux-musl` against `baseline/std-<arch>-linux-musl-libc.json`:
+  3369/3369 on x86_64, and 3330/3331 on aarch64 under qemu, where bs
+  skips `process.lockMemoryAll`, whose `mlockall` upstream's test
+  binary passes (a small program passes with both). `--cases` no longer maps `link_libc` cases to
+  gnu, so hello_world links musl, as upstream's does.
+- **flow** builds with its default target, renders the same screens
+  as upstream's build in a terminal (tmux captures with colors, before
+  and after editing and searching), and passes its tests (658/660, 2
+  skipped, as upstream).
+- **Cost** (ReleaseFast bs, against upstream 0.17.1, x86_64): hello
+  in Zig with `-lc -target x86_64-linux-musl`, empty caches: 6.1 s
+  (upstream 21.3 s, which also builds compiler_rt and its own zigc).
+  With a warm global cache and a new local one: 0.25 s (0.42 s), since
+  without a donor the build analyzes zigc and std in full. Unchanged:
+  0.027 s (0.37 s). A Zig edit: 0.045 s (0.43 s). std's tests with
+  `--musl`: 16.6 s cold (41.2 s). flow (`zig build`, its default
+  `<native>-linux-musl`, a warm global cache): new local cache 137 s
+  (161 s), unchanged 1.6 s (2.2 s), a Zig edit 1.8 s (11.8 s), a `.cpp`
+  edit in thespian 3.0 s (13.6 s). Builds without musl do not change:
+  std without libc took 6.12 s against main's 6.05 s, within the noise.
+
 ### Steps and checks
 
 1. `-lc`: builtin, start file, abilists imports, dynamic executable link,
@@ -8354,8 +8423,8 @@ and `zig build -Dtarget=aarch64-macos`.
   whose backends include the self-hosted one (170 on x86_64-linux). Each
   is built as upstream's case harness (test/src/Cases.zig) builds it:
   root `tmp.zig` in module `root`, Debug, the manifest's `-target`
-  verbatim (`native` when it names none; with `link_libc`, glibc, since
-  bs links no musl). A run case passes when its binary exits 0 with the
+  verbatim (`native` when it names none; with `link_libc` and
+  `x86_64-linux`, musl, as upstream). A run case passes when its binary exits 0 with the
   manifest's stdout, a compile case when it builds, an error case when
   `--compile-errors` would call it exact. `run.py --upstream --cases`
   records upstream's results in `baseline/cases-<target>.json`, and the

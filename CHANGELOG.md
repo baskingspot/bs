@@ -7,6 +7,7 @@ Changes a user of bs notices, newest first, in the
 
 ### Added
 
+- musl: `-lc` with `-target x86_64-linux-musl` or `aarch64-linux-musl`, and with plain `x86_64-linux` and `aarch64-linux`, whose default ABI is musl, builds static executables and tests against musl. libc.a and crt1.o are built once from the zig lib directory's sources with upstream's Clang and kept in the global cache. C and C++ sources (`-lc++`) and `bs translate-c` take musl's headers, and `bs build` steps that target musl build as upstream's do. `-dynamic` with musl is refused.
 - `-target aarch64-linux` for `bs build-exe`, `bs build-obj`, `bs build-lib`, `bs test`, and `bs run`: static executables, objects, and static libraries for the generic ARMv8.0 CPU, with C sources, objects, and archives, and `bs translate-c -target aarch64-linux`. Executables and tests link glibc with `-lc -target aarch64-linux-gnu[.version]`, shared libraries, and libc++ with `-lc++`. `bs build-lib -dynamic` builds shared libraries, with or without `-lc`, and `-fPIC`, `-fPIE` and `-lc` build position-independent objects and libraries. They use the on-disk cache as x86_64-linux builds do.
 - Container-level assembly (`comptime { asm (...); }`) is assembled into the program on all targets, so its `.global` labels satisfy `extern fn` declarations and C references, as with upstream's LLVM backend (upstream's self-hosted backends drop it). What bs cannot assemble is a compile error at the `asm`.
 - On aarch64-linux and aarch64-macos, C calls pass homogeneous float aggregates, vectors, and bool vectors as Clang does, and `callconv(.{ .aarch64_preserve_none = .{} })` works; upstream's C ABI tests pass.
@@ -15,6 +16,7 @@ Changes a user of bs notices, newest first, in the
 
 ### Changed
 
+- C sources for `-target x86_64-linux` and `aarch64-linux` compile for the musl ABI those targets resolve to, as upstream's do, and `bs translate-c` uses it in the target triple.
 - zap is now bs. The binary is `bs`, the environment variables are `BS_*`, and the caches are `<global cache>/bs`, `.zig-cache/bs`, and `~/.cache/bs`. Old `ZAP_*` variables are ignored; delete `~/.cache/zig/zap`, `.zig-cache/zap`, and `~/.cache/zap`.
 
 ### Fixed

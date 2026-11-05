@@ -985,7 +985,9 @@ pub fn sync(emit: *Emit, zcu: *Zcu) !void {
     if (emit.c_batch) |b| {
         emit.c_batch = null;
         const in = emit.inputs.?;
-        for ((try b.wait()).objects) |o| in.addObject(o.path, o.bytes) catch |err| switch (err) {
+        const result = try b.wait();
+        // In `CSource.objectPaths` order, as the cache's relink links them.
+        for ([2][]const CSource.Object{ result.objects, result.runtime_objects }) |list| for (list) |o| in.addObject(o.path, o.bytes) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             // As `convertInputs` reports the inputs' problems.
             else => try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{try std.fmt.allocPrint(emit.allocator(), "unable to link '{s}': {t}", .{ o.path, err })}),

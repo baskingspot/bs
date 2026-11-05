@@ -1654,8 +1654,9 @@ pub fn compilerRtExport(name: []const u8) ?RtExport {
 /// The files analysis starts from: builtin, std (whose start code imports
 /// the root module), under `bs test` the module under test, with
 /// `-ffuzz` the fuzzer's root (for its exports) and its std, and with C
-/// objects ubsan_rt and compiler_rt's stack protector (for theirs).
-pub fn rootFiles(zcu: *Zcu) [7]?u32 {
+/// objects ubsan_rt and compiler_rt's stack protector (for theirs), and
+/// with musl zigc.
+pub fn rootFiles(zcu: *Zcu) [8]?u32 {
     const fuzzer = if (zcu.linksFuzzer()) zcu.fe.fuzzer_root else null;
     const ubsan_rt = zcu.fe.ubsan_rt;
     return .{
@@ -1666,6 +1667,7 @@ pub fn rootFiles(zcu: *Zcu) [7]?u32 {
         if (fuzzer) |r| zcu.moduleRootFile(zcu.fe.module(r).std_mod) else null,
         if (ubsan_rt) |r| zcu.moduleRootFile(r) else null,
         if (ubsan_rt != null) zcu.moduleFile(.compiler_rt, @import("Frontend.zig").ssp_sub_path) else null,
+        if (zcu.fe.zigc) |z| zcu.moduleRootFile(z) else null,
     };
 }
 

@@ -38,13 +38,16 @@ upstream/lib (the source tree, which has std's testdata), as
 parsed as with --default-runner and compared with baseline/std-<target>.json.
 --std --libc links glibc (-lc, -target <arch>-linux-gnu, upstream's
 test-matrix entry for std with libc) and compares with
-baseline/std-<target>-gnu-libc.json.
+baseline/std-<target>-gnu-libc.json. --std --musl links musl instead
+(-lc, -target <arch>-linux-musl: libc.a and crt1.o built from the lib
+directory's sources, static) and compares with
+baseline/std-<target>-musl-libc.json.
 
 With --c-abi, the measure is upstream's C ABI tests instead:
 test/c_abi/main.zig with cfuncs.c (-std=c99), linked against glibc
 (-lc, -target <arch>-linux-gnu), built and run like --std, as upstream's
-test-c-abi step builds its self-hosted entry (which uses musl, which bs
-does not link), and compared with baseline/c-abi-<target>.json.
+test-c-abi step builds its self-hosted entry (with musl there; glibc
+here, bs's dynamic -lc path), and compared with baseline/c-abi-<target>.json.
 
 With --compile-errors, the measure is diagnostics instead: every case in
 upstream's test/cases/compile_errors that applies to the target, compiled
@@ -1082,6 +1085,8 @@ def std_target(compiler, cfg, args, workdir):
     global exec_prefix
     suite = "c-abi" if args.c_abi else "std"
     gnu = args.libc or args.c_abi
+    if gnu and args.musl:
+        sys.exit("--musl and --libc (or --c-abi) exclude each other")
     if gnu and exec_prefix:
         sysroot = cfg.get("emulated_glibc")
         if not sysroot or not Path(sysroot, "lib").is_dir():
@@ -1092,6 +1097,9 @@ def std_target(compiler, cfg, args, workdir):
         cfg = dict(cfg, zig_target=cfg["zig_target"].rsplit("-", 1)[0] + "-gnu")
     if args.libc:
         cfg = dict(cfg, name=cfg["name"] + "-gnu-libc")
+    if args.musl:
+        # Static, so the emulator needs no sysroot.
+        cfg = dict(cfg, zig_target=cfg["zig_target"].rsplit("-", 1)[0] + "-musl", name=cfg["name"] + "-musl-libc")
     baseline_path = BASELINE_DIR / f"{suite}-{cfg['name']}.json"
     baseline = None
     if not args.upstream:
@@ -1123,7 +1131,7 @@ def std_target(compiler, cfg, args, workdir):
             "--test-no-exec",
             f"-femit-bin={bin_path}",
         ]
-        + (["-lc"] if gnu else [])
+        + (["-lc"] if gnu or args.musl else [])
     )
     if args.upstream:
         # A fresh cache, so that the baseline's compile time is a cold build.
@@ -1490,10 +1498,6 @@ def case_target(cfg, kind, target):
         ):
             if parts[:2] != arch_os:
                 return "native"
-            # With libc, glibc: bs links no musl, the default ABI of
-            # x86_64-linux.
-            if len(parts) == 2 and cfg.get("link_libc") == "true" and arch_os[1] == "linux":
-                return t + "-gnu"
             return t
     return None
 
@@ -2282,6 +2286,11 @@ def main():
         "--libc",
         action="store_true",
         help="with --std: link glibc (-lc, -target <arch>-linux-gnu), baseline/std-<target>-gnu-libc.json",
+    )
+    p.add_argument(
+        "--musl",
+        action="store_true",
+        help="with --std: link musl (-lc, -target <arch>-linux-musl), baseline/std-<target>-musl-libc.json",
     )
     p.add_argument(
         "--c-abi",

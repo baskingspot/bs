@@ -49,6 +49,10 @@ pub const Options = struct {
     /// code, which glibc's crt1.o would provide, comes with it
     /// (`glibc_start`).
     glibc: ?std.SemanticVersion = null,
+    /// `-lc` with a musl target: musl's libc.a and crt1.o, linked
+    /// statically, which bring the start code; code stays as it is
+    /// without libc (no PIC).
+    musl: bool = false,
     /// Linux: the target as upstream resolves it (`main.checkTarget`),
     /// whose ABI, kernel and glibc versions and dynamic linker builtin
     /// states; without one, x86_64-linux-none.
@@ -360,10 +364,10 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         if (opts.fuzz) "true" else "false",
         if (opts.strip) "true" else "false",
     });
-    const libc = opts.glibc != null;
+    const libc = opts.glibc != null or opts.musl;
     // Objects and static libraries with -lc stay static and take no start
-    // code, as upstream's (`--show-builtin`).
-    const exe_libc = libc and opts.output_mode == .Exe;
+    // code, as upstream's (`--show-builtin`); so do musl's executables.
+    const exe_libc = opts.glibc != null and opts.output_mode == .Exe;
     const abi: std.Target.Abi = if (opts.linux) |t| t.abi else .none;
     const versions: std.Target.Os.LinuxVersionRange = if (opts.linux) |t| t.os.version_range.linux else .{
         .range = .{ .min = .{ .major = 5, .minor = 10, .patch = 0 }, .max = .{ .major = 7, .minor = 2, .patch = 0 } },
@@ -494,7 +498,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         if (opts.error_tracing) "true" else "false",
         if (opts.valgrind) "true" else "false",
         if (opts.fuzz) "true" else "false",
-        if (opts.pic or libc) "true" else "false",
+        if (opts.pic or opts.glibc != null) "true" else "false",
         if (opts.pie) "true" else "false",
         if (opts.strip) "true" else "false",
         if (exe_libc) "comptime {\n    _ = @import(\"glibc_start.zig\");\n}\n" else "",

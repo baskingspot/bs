@@ -138,6 +138,14 @@ pub const Options = struct {
     /// libc_nonshared.a (`atexit` and the others glibc's libc.so lacks)
     /// and link it last, as upstream does.
     libc_nonshared: bool = false,
+    /// A musl target (`x86_64-linux` is one): the triple's ABI, and with
+    /// `link_libc` musl's headers, no PIC and libc++'s musl configuration.
+    musl: bool = false,
+    /// An executable linking musl (`main.Options.musl`): build (or find)
+    /// musl's crt1.o and libc.a (Musl.zig) and link them, as upstream
+    /// does, but crt1.o after the C objects (`objectPaths`) and libc.a
+    /// after the other libraries.
+    musl_libc: bool = false,
     /// Where the runtime libraries go: `<global>/bs/o/<key>/`.
     global_cache: []const u8 = "",
     single_threaded: bool = false,
@@ -239,6 +247,9 @@ pub const Batch = struct {
         tmp_dir: []const u8 = "",
         first: usize = 0,
         len: usize = 0,
+        /// The library is its one object (musl's crt1.o), linked as an
+        /// object (`Result.runtime_objects`).
+        object: bool = false,
     };
 
     pub const Result = struct {
@@ -246,6 +257,9 @@ pub const Batch = struct {
         objects: []const Object,
         /// The C++ runtime libraries, in link order.
         archives: []const Object = &.{},
+        /// The runtime libraries that are one object (musl's crt1.o),
+        /// linked after `objects`, before `archives`.
+        runtime_objects: []const Object = &.{},
         errors: []const diag.Diagnostic,
         /// Every file Clang read, zero-separated.
         inputs: []const u8,
@@ -358,6 +372,7 @@ pub const Batch = struct {
             }
         }
         var archives: std.ArrayList(Object) = .empty;
+        var runtime_objects: std.ArrayList(Object) = .empty;
         for (b.archives) |a| {
             if (a.len != 0) {
                 b.writeArchive(arena, a) catch |err| {
@@ -369,9 +384,9 @@ pub const Batch = struct {
                 try errors.append(arena, .{ .loc = null, .msg = try std.fmt.allocPrint(arena, "unable to read '{s}': {t}", .{ a.path, err }) });
                 continue;
             };
-            try archives.append(arena, .{ .path = a.path, .bytes = bytes, .member = std.fs.path.basename(a.path) });
+            try (if (a.object) &runtime_objects else &archives).append(arena, .{ .path = a.path, .bytes = bytes, .member = std.fs.path.basename(a.path) });
         }
-        b.result = .{ .objects = objects.items, .archives = archives.items, .errors = errors.items, .inputs = inputs.items };
+        b.result = .{ .objects = objects.items, .archives = archives.items, .runtime_objects = runtime_objects.items, .errors = errors.items, .inputs = inputs.items };
         if (errors.items.len == 0) b.writeSummary();
         return &b.result.?;
     }
@@ -417,6 +432,17 @@ pub const Batch = struct {
         defer Io.Dir.cwd().deleteTree(io, a.tmp_dir) catch {};
         const jobs = b.jobs[a.first..][0..a.len];
         for (jobs) |j| if (j.state != .done) return error.CompileFailed;
+        if (a.object) {
+            try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(a.path).?);
+            if (cache.useTool(io, std.fs.path.dirname(a.path).?)) |use| {
+                b.tool_locks.append(b.gpa, use) catch |err| {
+                    use.close(io);
+                    return err;
+                };
+            } else |_| {}
+            const bytes = try Io.Dir.cwd().readFileAlloc(io, jobs[0].out_path, arena, .unlimited);
+            return cache.writeReplace(io, Io.Dir.cwd(), a.path, &.{bytes});
+        }
         const members = try arena.alloc(@import("link/Archive.zig").Input, jobs.len);
         for (members, jobs) |*m, j| m.* = .{ .name = std.fs.path.basename(j.out_path), .bytes = try Io.Dir.cwd().readFileAlloc(io, j.out_path, arena, .unlimited) };
         try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(a.path).?);
@@ -433,7 +459,8 @@ pub const Batch = struct {
 
 /// Where the objects are, in command-line order, compiled or not yet:
 /// a record's output keeps its path across edits of the source. Then the
-/// C++ runtime libraries, whose paths name their configuration.
+/// runtime libraries (musl's crt1.o first), whose paths name their
+/// configuration.
 pub fn objectPaths(b: *const Batch, arena: std.mem.Allocator) ![]const []const u8 {
     var paths: std.ArrayList([]const u8) = .empty;
     for (b.jobs) |j| if (j.archive == null) try paths.append(arena, try arena.dupe(u8, j.out_path));
@@ -594,18 +621,26 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         const st = Io.Dir.cwd().statFile(io, p, .{}) catch break :id "";
         break :id try std.fmt.allocPrint(s, "{s}\x00{d}\x00{d}\x00{d}", .{ p, st.inode, st.size, st.mtime.toNanoseconds() });
     } else "";
-    const target = if (o.macos) try macosTarget(io, o.macos_version) else try cTarget(io, o.glibc_version, o.cpu);
+    const target = if (o.macos) try macosTarget(io, o.macos_version) else try cTarget(io, o.glibc_version, o.musl, o.cpu);
     const common = try commonArgs(ra, io, environ, &target, lib, o);
 
     // The runtime libraries first, to know how many of their sources to
     // compile.
     var runtime: std.ArrayList(RuntimeJob) = .empty;
     var archives: std.ArrayList(Batch.Archive) = .empty;
-    for (runtime_libs ++ [_]RuntimeLib{nonshared_lib}) |rl| {
+    // crt1.o first: it is the one runtime library linked as an object, and
+    // `objectPaths` and `Emit.sync` link the objects before the archives.
+    for ([_]RuntimeLib{musl_crt1} ++ runtime_libs ++ [_]RuntimeLib{ nonshared_lib, musl_libc }) |rl| {
         const is_nonshared = std.mem.eql(u8, rl.name, nonshared_lib.name);
-        if (!(if (is_nonshared) o.libc_nonshared and zig.found != null else o.cxx_runtime)) continue;
+        const is_musl = rl.musl;
+        if (!(if (is_nonshared) o.libc_nonshared and zig.found != null else if (is_musl) o.musl_libc else o.cxx_runtime)) continue;
         const first = runtime.items.len;
-        if (is_nonshared) try nonsharedJobs(ra, &runtime, common, lib, o) else try runtimeJobs(ra, &runtime, rl, common, lib, o);
+        if (is_nonshared)
+            try nonsharedJobs(ra, &runtime, common, lib, o)
+        else if (is_musl)
+            try muslJobs(ra, &runtime, rl, common, lib, o)
+        else
+            try runtimeJobs(ra, &runtime, rl, common, lib, o);
         // Keyed by upstream zig and every compile's arguments, which name
         // the lib directory's sources; not by bs, whose rebuilds do not
         // change the library.
@@ -613,7 +648,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         try h.print(s, "bs c++ runtime 1\x00{s}\x00{s}\x00", .{ zig_id, rl.name });
         for (runtime.items[first..]) |rj| for (rj.argv) |a| try h.print(s, "{s}\x00", .{a});
         const hex = std.fmt.bytesToHex(@as([16]u8, @bitCast(cache.hash(2, h.items))), .lower);
-        const path = try std.fs.path.join(ra, &.{ o.global_cache, "bs", "o", &hex, try std.fmt.allocPrint(s, "lib{s}.a", .{rl.name}) });
+        const path = try std.fs.path.join(ra, &.{ o.global_cache, "bs", "o", &hex, if (rl.object) try std.fmt.allocPrint(s, "{s}.o", .{rl.name}) else try std.fmt.allocPrint(s, "lib{s}.a", .{rl.name}) });
         const found = found: {
             const use = cache.useTool(io, std.fs.path.dirname(path).?) catch break :found false;
             Io.Dir.cwd().access(io, path, .{}) catch {
@@ -628,7 +663,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         };
         if (found) {
             runtime.shrinkRetainingCapacity(first);
-            try archives.append(ra, .{ .path = path });
+            try archives.append(ra, .{ .path = path, .object = rl.object });
         } else if (is_nonshared and sources.len == 0 and !o.cxx_runtime and try checkZig(s, io, zig.found.?) != null) {
             // A build of Zig only does not fail for want of upstream zig
             // 0.17.1; it links without libc_nonshared.a, as before.
@@ -638,7 +673,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             io.random(&rand);
             const tmp_dir = try std.fs.path.join(ra, &.{ o.global_cache, "bs", "tmp", try std.fmt.allocPrint(s, "{s}-{s}", .{ rl.name, &std.fmt.bytesToHex(rand, .lower) }) });
             try Io.Dir.cwd().createDirPath(io, tmp_dir);
-            try archives.append(ra, .{ .path = path, .tmp_dir = tmp_dir, .first = sources.len + first, .len = runtime.items.len - first });
+            try archives.append(ra, .{ .path = path, .tmp_dir = tmp_dir, .first = sources.len + first, .len = runtime.items.len - first, .object = rl.object });
         }
     }
     b.archives = archives.items;
@@ -667,8 +702,8 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .no_builtin = src.flags.no_builtin orelse false,
             .stack_protector = o.link_libc and (src.flags.stack_protector orelse o.stack_protector),
             // glibc and shared libraries require PIC (`requiresPic`); else
-            // the module's, default off.
-            .pic = o.link_libc or o.pic or (src.flags.pic orelse false),
+            // (musl too) the module's, default off.
+            .pic = (o.link_libc and !o.musl) or o.pic or (src.flags.pic orelse false),
             .pie = o.pie,
             .function_sections = o.function_sections,
             .data_sections = o.data_sections,
@@ -709,19 +744,31 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         };
         misses += 1;
     };
-    for (archives.items, 0..) |a, ai| if (a.len != 0) for (runtime.items[a.first - sources.len ..][0..a.len], b.jobs[a.first..][0..a.len]) |rj, *j| {
-        j.* = .{
-            .arena = j.arena,
-            .source = rj.argv[2],
-            .abs_source = rj.argv[2],
-            .argv = rj.argv,
-            .dep_at = rj.dep_at,
-            .record_path = "",
-            .out_path = try std.fs.path.join(ra, &.{ a.tmp_dir, try std.fmt.allocPrint(ra, "{s}.o", .{std.fs.path.stem(rj.argv[2])}) }),
-            .archive = @intCast(ai),
-            .start_ns = start_ns,
-        };
-        misses += 1;
+    for (archives.items, 0..) |a, ai| if (a.len != 0) {
+        // Members are named after their sources' stems; a stem that comes
+        // again (musl's two `clone` sources) goes into a directory of its
+        // own, as upstream's objects each go into their own.
+        var stems: std.StringHashMapUnmanaged(u32) = .empty;
+        for (runtime.items[a.first - sources.len ..][0..a.len], b.jobs[a.first..][0..a.len]) |rj, *j| {
+            const stem = std.fs.path.stem(rj.argv[2]);
+            const seen = try stems.getOrPut(s, stem);
+            seen.value_ptr.* = if (seen.found_existing) seen.value_ptr.* + 1 else 0;
+            const dir = if (seen.value_ptr.* == 0) a.tmp_dir else try std.fmt.allocPrint(ra, "{s}/{d}", .{ a.tmp_dir, seen.value_ptr.* });
+            if (seen.value_ptr.* != 0) try Io.Dir.cwd().createDirPath(io, dir);
+            j.* = .{
+                .arena = j.arena,
+                .source = rj.argv[2],
+                .abs_source = rj.argv[2],
+                .argv = rj.argv,
+                .dep_at = rj.dep_at,
+                .depfile = !std.mem.endsWith(u8, rj.argv[2], ".s"),
+                .record_path = "",
+                .out_path = try std.fs.path.join(ra, &.{ dir, try std.fmt.allocPrint(ra, "{s}.o", .{stem}) }),
+                .archive = @intCast(ai),
+                .start_ns = start_ns,
+            };
+            misses += 1;
+        }
     };
     // Only a build that compiles C needs upstream zig, and checks its
     // version once.
@@ -753,9 +800,9 @@ pub fn destroy(b: *Batch) void {
 /// The target C compiles for: `cpu`'s architecture, glibc's version names
 /// the ABI, as the native target does upstream, and `cpu` is the
 /// compilation's (`-mcpu`).
-pub fn cTarget(io: Io, glibc_version: ?std.SemanticVersion, cpu: std.Target.Cpu) !std.Target {
+pub fn cTarget(io: Io, glibc_version: ?std.SemanticVersion, musl: bool, cpu: std.Target.Cpu) !std.Target {
     var buf: [64]u8 = undefined;
-    const text = if (glibc_version) |v| try std.fmt.bufPrint(&buf, "{t}-linux-gnu.{f}", .{ cpu.arch, v }) else try std.fmt.bufPrint(&buf, "{t}-linux-none", .{cpu.arch});
+    const text = if (glibc_version) |v| try std.fmt.bufPrint(&buf, "{t}-linux-gnu.{f}", .{ cpu.arch, v }) else try std.fmt.bufPrint(&buf, "{t}-linux-{s}", .{ cpu.arch, if (musl) "musl" else "none" });
     const query = try std.Target.Query.parse(.{ .arch_os_abi = text, .cpu_features = "baseline" });
     var target = try std.zig.system.resolveTargetQuery(io, query);
     target.cpu = cpu;
@@ -830,7 +877,7 @@ fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Envi
         if (o.single_threaded) "-D_LIBCPP_HAS_THREADS=0" else "-D_LIBCPP_HAS_THREADS=1",
         "-D_LIBCPP_HAS_MONOTONIC_CLOCK",
         "-D_LIBCPP_HAS_TERMINAL",
-        "-D_LIBCPP_HAS_MUSL_LIBC=0",
+        if (o.musl) "-D_LIBCPP_HAS_MUSL_LIBC=1" else "-D_LIBCPP_HAS_MUSL_LIBC=0",
         "-D_LIBCXXABI_DISABLE_VISIBILITY_ANNOTATIONS",
         "-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS",
         "-D_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS=0",
@@ -965,8 +1012,12 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
 // Copyright (c) Zig contributors. MIT licensed (see LICENSE-ZIG).
 
 const RuntimeLib = struct {
-    /// `lib<name>.a`.
+    /// `lib<name>.a`, or `<name>.o` for an object.
     name: []const u8,
+    /// One object, linked as an object, not an archive.
+    object: bool = false,
+    /// musl's (`muslJobs`).
+    musl: bool = false,
     /// The sources, relative to the lib directory.
     dir: []const u8,
     files: []const []const u8,
@@ -1168,6 +1219,41 @@ fn nonsharedJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), comm
     };
 }
 
+/// musl's crt1.o and libc.a (Musl.zig), linked into every executable of
+/// a musl target (`Options.musl_libc`).
+const musl_crt1: RuntimeLib = .{ .name = "crt1", .dir = "libc/musl", .files = &.{"crt/crt1.c"}, .object = true, .musl = true };
+const musl_libc: RuntimeLib = .{ .name = "c", .dir = "libc", .files = &.{}, .musl = true };
+
+/// Appends musl's crt1.o or libc.a compiles, with upstream's flags: its
+/// sub-compilation's (ReleaseFast, no sanitizer or stack protector,
+/// `-fno-builtin`, sections, the compilation's PIC, which is off, and
+/// unwind tables, no libc), then musl's own (`Musl.ccArgs`).
+fn muslJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: RuntimeLib, common: Common, lib: []const u8, o: Options) !void {
+    const files = if (rl.object) rl.files else try @import("Musl.zig").sources(arena, o.cpu.arch);
+    for (files) |file| {
+        const lang: Lang = if (std.mem.endsWith(u8, file, ".S")) .asm_cpp else if (std.mem.endsWith(u8, file, ".s")) .assembly else .c;
+        var argv: std.ArrayList([]const u8) = .empty;
+        const dep_at = try appendArgs(arena, &argv, common, try std.fs.path.join(arena, &.{ lib, rl.dir, file }), .{
+            .lang = lang,
+            .optimize = .fast,
+            .sanitize_c = .off,
+            .red_zone = true,
+            .no_builtin = true,
+            .pic = false,
+            .pie = false,
+            .function_sections = true,
+            .data_sections = true,
+            .unwind_tables = o.unwind_tables,
+            .link_libc = false,
+            .libcpp = false,
+            .libunwind = false,
+        });
+        try argv.appendSlice(arena, try @import("Musl.zig").ccArgs(arena, lib, o.cpu.arch, @import("Musl.zig").wantsO3(file)));
+        if (rl.object) try argv.append(arena, "-DCRT");
+        try out.append(arena, .{ .argv = argv.items, .dep_at = dep_at });
+    }
+}
+
 const RuntimeJob = struct { argv: []const []const u8, dep_at: usize };
 
 /// Appends the compiles of runtime library `rl`, with the flags upstream's
@@ -1215,7 +1301,8 @@ fn runtimeJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Ru
             try argv.appendSlice(arena, common.cxx_defines);
             try argv.appendSlice(arena, &.{ "-w", "-DNDEBUG", "-D_LIBCPP_BUILDING_LIBRARY", "-D_LIBCXXABI_BUILDING_LIBRARY" });
             if (!threads) try argv.append(arena, "-D_LIBCXXABI_HAS_NO_THREADS");
-            if (o.glibc_version.?.order(.{ .major = 2, .minor = 18, .patch = 0 }) != .lt) try argv.append(arena, "-DHAVE___CXA_THREAD_ATEXIT_IMPL");
+            // glibc 2.18 and later only, not musl.
+            if (o.glibc_version) |v| if (v.order(.{ .major = 2, .minor = 18, .patch = 0 }) != .lt) try argv.append(arena, "-DHAVE___CXA_THREAD_ATEXIT_IMPL");
             try argv.appendSlice(arena, &.{ "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-nostdinc++", "-fstrict-aliasing", "-std=c++23" });
             try argv.appendSlice(arena, &.{ "-I", cxxabi_include, "-I", cxx_include, "-I", cxx_src_include });
         } else {

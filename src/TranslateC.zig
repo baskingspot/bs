@@ -36,11 +36,15 @@ const Request = struct {
     link_libc: bool,
     /// The target's glibc, which the target triple names: the native
     /// system's without `-target`, as upstream's native target, with or
-    /// without `-lc`; null for `x86_64-linux(-none)` and `aarch64-linux`.
+    /// without `-lc`; null for musl and none ABIs.
     glibc_version: ?std.SemanticVersion,
     /// aarch64-macos: the macOS versions (`main.Options.macos_version`):
     /// the native system's without `-target`, as upstream's.
     macos_version: std.SemanticVersion.Range,
+    /// A musl target (`x86_64-linux` is one), with or without `-lc`: the
+    /// triple's ABI, and with `-lc` musl's headers, not
+    /// position-independent, as upstream's.
+    musl: bool,
     /// `-mcpu`, as for a compilation (`cpu.resolve`): it sets the macros
     /// the headers see (`__SSE4_1__`).
     cpu: std.Target.Cpu,
@@ -174,6 +178,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         .link_libc = opts.link_libc,
         .glibc_version = opts.glibc_version,
         .macos_version = opts.macos_version,
+        .musl = if (opts.linux) |t| t.abi == .musl else false,
         .cpu = opts.cpu,
         .cc_args = cc_args.items,
         .native_includes = native_includes,
@@ -219,7 +224,7 @@ fn serve(init: std.process.Init, req: *const Request) !void {
     try server.serveStringMessage(.zig_version, main.zig_version);
     try server.serveConfig(.{ .flags = .{
         .output_mode = .Obj,
-        .link_mode = if (req.link_libc) .dynamic else .static,
+        .link_mode = if (req.link_libc and !req.musl) .dynamic else .static,
         .link_libc = req.link_libc,
         .link_libcpp = false,
         .link_libunwind = false,
@@ -296,17 +301,17 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     // Darwin code is always position-independent.
     const macos = req.target == .aarch64_macos;
     try argv.appendSlice(arena, &.{
-        if (macos) "-fPIE" else "-fno-PIE", if (req.link_libc) "-fPIC" else "-fno-PIC",
+        if (macos) "-fPIE" else "-fno-PIE", if (req.link_libc and !req.musl) "-fPIC" else "-fno-PIC",
         "-gdwarf-4",                        "-gdwarf32",
         "-fno-lto",                         "-fhosted",
         "-nostdinc",
     });
     var target = if (macos) try CSource.macosTarget(io, req.macos_version) else target: {
-        const query_text = if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "{t}-linux-gnu.{f}", .{ req.cpu.arch, v }) else try std.fmt.allocPrint(arena, "{t}-linux-none", .{req.cpu.arch});
+        const query_text = if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "{t}-linux-gnu.{f}", .{ req.cpu.arch, v }) else try std.fmt.allocPrint(arena, "{t}-linux-{s}", .{ req.cpu.arch, if (req.musl) "musl" else "none" });
         break :target try std.zig.system.resolveTargetQuery(io, try std.Target.Query.parse(.{ .arch_os_abi = query_text, .cpu_features = "baseline" }));
     };
     target.cpu = req.cpu;
-    if (req.link_libc and !macos) try argv.append(arena, try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{req.glibc_version.?.minor}));
+    if (req.link_libc and !macos and !req.musl) try argv.append(arena, try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{req.glibc_version.?.minor}));
     try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ lib, "include" }) });
     const libc_dirs: CSource.LibcDirs = if (req.link_libc) try CSource.libcIncludeDirs(arena, io, init.environ_map, global, lib, &target, req.native_abi) else .{ .includes = &.{} };
     for (libc_dirs.includes) |d| try argv.appendSlice(arena, &.{ "-isystem", d });

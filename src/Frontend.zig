@@ -62,6 +62,12 @@ any_error_tracing: bool = true,
 /// the main std and builtin. compiler_rt's `ssp_sub_path` is a root then
 /// too, for `__stack_chk_fail` and `__stack_chk_guard`.
 ubsan_rt: ?Module.Index = null,
+/// With `Options.zigc`: the module of `<lib>/c.zig`, upstream's libc in
+/// Zig, whose weak exports (`memcpy`, `malloc`, the math functions and
+/// others) replace the musl sources that libc.a leaves out. It shares
+/// the main std and builtin, as upstream's `zigc` module in the
+/// compilation unit.
+zigc: ?Module.Index = null,
 /// What `loadAll` and `loadFile` did, for `BS_FRONTEND_TIMING`.
 stats: Stats = .{},
 /// AstGen errors in files `loadFile` loaded, for the caller to report
@@ -228,6 +234,9 @@ pub const Options = struct {
     /// compilation for their exports, as upstream links them for C code
     /// (`c_runtimes`).
     c_runtimes: bool = false,
+    /// An executable or test linking musl statically (`zigc`), as
+    /// upstream's `target_util.wantsZigC`.
+    zigc: bool = false,
 };
 
 /// Whether testing `main_src_path` tests the std module itself: as
@@ -363,6 +372,10 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     if (options.c_runtimes) {
         fe.ubsan_rt = @fromBackingInt(@intCast(fe.modules.items.len));
         try fe.modules.append(gpa, .{ .name = "=ubsan_rt", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "ubsan_rt.zig"), .cache = .global, .error_tracing = options.error_tracing });
+    }
+    if (options.zigc) {
+        fe.zigc = @fromBackingInt(@intCast(fe.modules.items.len));
+        try fe.modules.append(gpa, .{ .name = "=zigc", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "c.zig"), .cache = .global, .error_tracing = options.error_tracing });
     }
     return fe;
 }
@@ -1400,7 +1413,7 @@ fn freeImports(gpa: Allocator, imports: []const Import) void {
 /// through `@import`. Returns false and adds messages to `errors` if any file
 /// failed to lower. Call once.
 pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
-    var roots: [7]Root = undefined;
+    var roots: [8]Root = undefined;
     var n: usize = 0;
     roots[n] = .{ .module = .root, .sub_path = fe.module(.root).root_file };
     n += 1;
@@ -1427,7 +1440,11 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
         roots[n + 1] = .{ .module = .compiler_rt, .sub_path = ssp_sub_path };
         n += 2;
     }
-    var indices: [7]?File.Index = undefined;
+    if (fe.zigc) |z| {
+        roots[n] = .{ .module = z, .sub_path = fe.module(z).root_file };
+        n += 1;
+    }
+    var indices: [8]?File.Index = undefined;
     return fe.load(roots[0..n], indices[0..n], errors);
 }
 

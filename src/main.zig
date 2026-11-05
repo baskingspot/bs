@@ -150,6 +150,10 @@ pub const Options = struct {
     link_libc: bool = false,
     /// The glibc of a gnu target, linked or not (`checkTarget`).
     glibc_version: ?std.SemanticVersion = null,
+    /// `-lc` with a musl target: musl's libc.a and crt1.o, built from the
+    /// zig lib directory's sources by upstream's Clang (CSource.zig) and
+    /// linked statically, as upstream's.
+    musl: bool = false,
     /// A Linux target, resolved as upstream's (`checkTarget`), for
     /// builtin; `native_os` when the target names no OS, whose kernel,
     /// glibc and dynamic linker, or macOS version, this system decides.
@@ -526,6 +530,7 @@ pub const Job = struct {
             .pie = opts.pie,
             .dynamic = opts.dynamic,
             .glibc = if (opts.link_libc) opts.glibc_version else null,
+            .musl = opts.musl,
             .linux = opts.linux,
             .macos = opts.macos_version,
             .link_libcpp = opts.link_libcpp,
@@ -574,7 +579,7 @@ pub const Job = struct {
         }
         // The glibc version a -lc build links, which the arguments do not
         // spell for the native target. Keys only: `full_args` stay as given.
-        if (opts.link_libc) try compile_args.append(arena, try std.fmt.allocPrint(arena, "--bs-glibc={f}", .{opts.glibc_version.?}));
+        if (opts.link_libc and !opts.musl) try compile_args.append(arena, try std.fmt.allocPrint(arena, "--bs-glibc={f}", .{opts.glibc_version.?}));
         // What this system decides of a native OS, which builtin states.
         if (opts.native_os) if (opts.linux) |t| {
             const v = t.os.version_range.linux;
@@ -645,7 +650,11 @@ pub const Job = struct {
             return null;
         };
         i.check = env.get("BS_CACHE_CHECK") != null;
-        i.donors = !std.mem.eql(u8, env.get("BS_CACHE_DONOR") orelse "", "off");
+        // A donor whose builtin differs only in musl's `link_libc` replays
+        // wrong results (std's `Syscall.fail` instances, `Io.Threaded.addBuf`
+        // with musl's `u32` iovlen), so musl builds neither use donors nor
+        // give them, until the cache tracks what that changes.
+        i.donors = !std.mem.eql(u8, env.get("BS_CACHE_DONOR") orelse "", "off") and !job.opts.musl;
         i.stack_size = job.opts.stack_size;
         i.strip = job.opts.strip;
         i.link_objects = job.link_objects;
@@ -716,7 +725,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     // again with the first attempt's final names (`Zcu.finalizeNames`).
     var pins: ?*const Zcu.NamePins = null;
     // C sources compile while the build analyzes, once for every attempt.
-    const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0 or cxxRuntime(&job.opts) or libcNonshared(&job.opts)) try startC(init, job) else null;
+    const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0 or cxxRuntime(&job.opts) or libcNonshared(&job.opts) or linksMusl(&job.opts)) try startC(init, job) else null;
     defer if (c_batch) |b| CSource.destroy(b);
     if (job.opts.c_only) return compileCOnly(init, job, c_batch, out_path, alt_path, inputs);
     // The C objects are link-only inputs of the cache, after the object
@@ -1047,6 +1056,12 @@ fn libcNonshared(opts: *const Options) bool {
     return opts.link_libc and opts.glibc_version != null and !opts.command.isObj() and (opts.command != .build_lib or opts.dynamic);
 }
 
+/// Whether the build links musl's libc.a and crt1.o: an executable or
+/// test of a musl target with `-lc` (`Options.musl`), as upstream's.
+fn linksMusl(opts: *const Options) bool {
+    return opts.musl and !opts.command.isObj() and opts.command != .build_lib;
+}
+
 /// Starts compiling the job's C sources (CSource.zig).
 fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
     const opts = &job.opts;
@@ -1067,6 +1082,8 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .link_libcpp = opts.link_libcpp,
         .cxx_runtime = cxxRuntime(opts),
         .libc_nonshared = libcNonshared(opts),
+        .musl = if (opts.linux) |t| t.abi == .musl else false,
+        .musl_libc = linksMusl(opts),
         .global_cache = job.cache_dirs.global,
         .single_threaded = opts.single_threaded,
         .stack_protector = opts.c_only or opts.c_root or opts.use_llvm or macos,
@@ -1143,6 +1160,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         // before 2.4 lacks it, and upstream's then comes from compiler_rt.
         .c_runtimes = !opts.objects_only and ((!opts.command.isObj() and opts.command != .build_lib) or opts.dynamic) and (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp) and
             !(plain and (opts.bs_target == .aarch64_macos or opts.glibc_version != null and opts.glibc_version.?.order(.{ .major = 2, .minor = 4, .patch = 0 }) != .lt)),
+        .zigc = linksMusl(&opts),
     });
     defer fe.deinit();
     try fe.enableCache(job.cache_dirs);
@@ -1230,7 +1248,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     emit.forward_on = forwarding(job.environ_map);
     // Executables and shared libraries link glibc: an object or a static
     // library with -lc is an ordinary one, as upstream's.
-    const links_glibc = opts.link_libc and !opts.command.isObj() and (opts.command != .build_lib or opts.dynamic);
+    const links_glibc = opts.link_libc and !opts.musl and !opts.command.isObj() and (opts.command != .build_lib or opts.dynamic);
     var glibc: ?Glibc = if (links_glibc) try loadGlibc(init, job) else null;
     defer if (glibc) |*g| g.deinit();
     if (glibc) |*g| emit.glibc = g;
@@ -1567,7 +1585,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
             .build_lib => .Lib,
             else => .Exe,
         },
-        .link_mode = if (opts.dynamic or (opts.link_libc and !opts.command.isObj() and opts.command != .build_lib)) .dynamic else .static,
+        .link_mode = if (opts.dynamic or (opts.link_libc and !opts.musl and !opts.command.isObj() and opts.command != .build_lib)) .dynamic else .static,
         .link_libc = opts.link_libc,
         .link_libcpp = opts.link_libcpp,
         .link_libunwind = opts.link_libcpp,
@@ -2392,11 +2410,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     }
     if (opts.exe_dynamic and !opts.link_libc and command != .build_lib)
         setUnsupported(&opts, arena, "bs links executables statically unless they link libc ('-dynamic'); add -lc or build this step with upstream zig", .{});
-    // As upstream (`requiresPIC`): glibc makes objects and libraries
-    // position-independent, as their builtin says. bs links executables
-    // itself, non-PIE.
-    if (opts.link_libc and (command.isObj() or command == .build_lib)) opts.pic = true;
     if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena);
+    // As upstream (`requiresPIC`): glibc makes objects and libraries
+    // position-independent, as their builtin says; musl does not. bs
+    // links executables itself, non-PIE.
+    if (opts.link_libc and !opts.musl and (command.isObj() or command == .build_lib)) opts.pic = true;
     // C sources without any module: a library or executable of C only, as
     // upstream's; so are object inputs alone.
     if (root == null and !rootless_root and !command.isTest() and (c_files.items.len != 0 or link_inputs.items.len != 0)) rootless_root = true;
@@ -2857,14 +2875,21 @@ pub fn isGlibcLib(name: []const u8) bool {
     return glibc_libs.has(name);
 }
 
-/// Refuses a `-lc` build without glibc: bs links no other libc. The
-/// target (`checkTarget`) gives the glibc version, which for the native
-/// target is the system's, as upstream detects it.
+/// Resolves a `-lc` build's libc: glibc for a gnu target, whose version
+/// the target (`checkTarget`) gives (for the native target the system's,
+/// as upstream detects it), or musl for a musl target, linked statically;
+/// refuses the others.
 pub fn resolveGlibc(opts: *Options, arena: std.mem.Allocator) void {
     if (opts.glibc_version != null) return;
     const target = opts.target orelse "native";
+    if (opts.linux != null and opts.linux.?.abi == .musl) {
+        opts.musl = true;
+        if (opts.dynamic or opts.exe_dynamic)
+            setUnsupported(opts, arena, "bs links musl only statically ('-dynamic' with target '{s}'); build this step with upstream zig", .{target});
+        return;
+    }
     if (!std.mem.eql(u8, target, "native")) {
-        setUnsupported(opts, arena, "bs links only glibc ('-lc' with target '{s}', whose libc is musl or none); pass -target {s}-linux-gnu or no target", .{ target, if (std.mem.startsWith(u8, target, "aarch64")) "aarch64" else "x86_64" });
+        setUnsupported(opts, arena, "bs links only glibc and musl ('-lc' with target '{s}', whose libc is none); pass -target {s}-linux-gnu or -target {s}-linux-musl", .{ target, if (std.mem.startsWith(u8, target, "aarch64")) "aarch64" else "x86_64", if (std.mem.startsWith(u8, target, "aarch64")) "aarch64" else "x86_64" });
     } else {
         const abi: std.Target.Abi = if (opts.linux) |t| t.abi else .none;
         setUnsupported(opts, arena, "bs links only glibc ('-lc'), and this system's libc is not glibc ({t}); pass -target {t}-linux-gnu", .{ abi, builtin.cpu.arch });
