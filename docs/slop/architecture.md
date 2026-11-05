@@ -2031,7 +2031,13 @@ user branches are coverage points and are only learned from.
   than variables), at each loop entry and exit, and after a merge of
   paths one of which changed it. A check's failing side (only a call of
   its `noreturn` handler) does not change it, since nothing after it
-  runs. Loading `self.len` twice with no write between is one value.
+  runs. Loading `self.len` twice with no write between is one value,
+  and a load after a store through the same address, with no other write
+  between, is the value stored (a store is a write, so it starts a new
+  version, under which it records what it wrote): after
+  `self.items.len = n`, the slice `self.items` loaded next has length
+  `n`, which proves `appendSliceAssumeCapacity`'s
+  `self.items[old_len..][0..items.len]`.
   The table of first instructions holds only those that ran on every
   path to the point walked: what a branch side, a switch case, a loop
   body, or a block body adds is dropped at its end, except a straight
@@ -2126,8 +2132,9 @@ user branches are coverage points and are only learned from.
   `prove_offset_retry`, `prove_mem`, `prove_mem_merge`,
   `prove_mem_loop`, `prove_wrap_end`, `prove_sub`, `prove_bool`,
   `prove_assert`, `prove_rem`, `prove_mul_narrow`, `prove_mul_wide`,
-  `prove_ret_len`, and `prove_ret_len_arg` one that a wrong offset, loop,
-  memory, range, product, returned-length, or `bool` rule would remove.
+  `prove_ret_len`, `prove_ret_len_arg`, `prove_store`, and
+  `prove_store_len` one that a wrong offset, loop, memory, range,
+  product, returned-length, forwarding, or `bool` rule would remove.
 
 #### Compile-time budget and how it is measured
 

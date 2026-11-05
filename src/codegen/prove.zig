@@ -92,8 +92,12 @@ pub const Scratch = struct {
     vlog: std.ArrayList(VarState) = .empty,
     block_facts: std.ArrayList(Fact) = .empty,
     bool_blocks: std.AutoHashMapUnmanaged(u32, BoolFacts) = .empty,
+    /// Per load of a slice whose length a store just before wrote
+    /// (`Walker.forwardStore`): that length.
+    load_lens: std.AutoHashMapUnmanaged(u32, Term) = .empty,
 
     pub fn deinit(s: *Scratch, gpa: Allocator) void {
+        s.load_lens.deinit(gpa);
         s.canon.deinit(gpa);
         s.numbers.deinit(gpa);
         s.nlog.deinit(gpa);
@@ -278,6 +282,7 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *Scratch, fu
     scratch.vlog.clearRetainingCapacity();
     scratch.block_facts.clearRetainingCapacity();
     scratch.bool_blocks.clearRetainingCapacity();
+    scratch.load_lens.clearRetainingCapacity();
     classify(ip, ir, scratch.kind.items);
     var w: Walker = .{ .gpa = gpa, .ip = ip, .ir = ir, .s = scratch, .fuzz = fuzz };
     try w.body(ir.mainBody());
@@ -445,7 +450,10 @@ const Walker = struct {
             // version holds the stored value; an undefined value is
             // unknown, since two undefined values need not be equal.
             .store => {
-                const p = data.bin_op.lhs.toIndex() orelse return w.changeMem();
+                const p = data.bin_op.lhs.toIndex() orelse {
+                    w.changeMem();
+                    return w.forwardStore(data.bin_op.lhs, data.bin_op.rhs);
+                };
                 const pi = @backingInt(p);
                 const v: Term = if (w.isUndef(data.bin_op.rhs)) .none else w.term(data.bin_op.rhs);
                 switch (s.kind.items[pi]) {
@@ -459,10 +467,21 @@ const Walker = struct {
                         try w.setVar(pi, s.version.items[pi], v);
                         try s.stored.append(w.gpa, pi);
                     },
-                    .other, .stored_once => w.changeMem(),
+                    .other, .stored_once => {
+                        w.changeMem();
+                        try w.forwardStore(data.bin_op.lhs, data.bin_op.rhs);
+                    },
                 }
             },
-            .load => s.loads.items[ii] = try w.loadTerm(inst, data),
+            .load => {
+                s.loads.items[ii] = try w.loadTerm(inst, data);
+                // The length a store wrote into the slice loaded.
+                const t = s.loads.items[ii];
+                if (t.tag == .inst and Type.isSlice(w.ip, data.ty_op.ty)) {
+                    const key: Key = .{ .tag = .slice_len, .ty = .none, .x = w.mem, .a = w.term(data.ty_op.operand), .b = .none };
+                    if (s.numbers.get(key)) |len| try s.load_lens.put(w.gpa, t.a, len) else _ = s.load_lens.remove(t.a);
+                }
+            },
             .block => {
                 const x = ir.extraData(Ir.Block, data.ty_pl.payload);
                 const insts = ir.bodySlice(x.end, x.data.body_len);
@@ -962,6 +981,8 @@ const Walker = struct {
                     return w.term(ir.extraData(Ir.Bin, ir.instructions.items(.data)[t.a].ty_pl.payload).data.rhs);
                 // The length a callee returns: its argument (`Ir.ret_lens`).
                 if (w.retLenArg(t)) |arg| return w.term(arg);
+                // The length a store wrote (`forwardStore`).
+                if (t.tag == .inst) if (w.s.load_lens.get(t.a)) |len| return len;
                 return switch (t.tag) {
                     .inst => .{ .tag = .len_inst, .a = t.a },
                     .variable => .{ .tag = .len_variable, .a = t.a, .b = t.b },
@@ -978,6 +999,37 @@ const Walker = struct {
         const c = w.s.canon.items[@backingInt(i)];
         if (c.tag != .none) return c;
         return .{ .tag = .inst, .a = @backingInt(i) };
+    }
+
+    /// After a store of `val` through `ptr`, which changed memory: until
+    /// memory changes again, a load of `ptr` reads `val`, and when `ptr`
+    /// is a slice's `len` field, a load of the slice has length `val`
+    /// (`self.items.len = n` then `self.items[old..][0..k]`). In
+    /// `numbers`, under the new memory version, so it goes where the
+    /// store's path ends (`dropNumbers`).
+    fn forwardStore(w: *Walker, ptr: Inst.Ref, val: Inst.Ref) Allocator.Error!void {
+        if (w.isUndef(val)) return;
+        const ir = w.ir;
+        const ip = w.ip;
+        if (Type.ptrInfo(ip, ir.typeOf(ptr, ip)).flags.is_volatile) return;
+        const v = w.term(val);
+        _ = try w.numberOf(.{ .tag = .load, .ty = ir.typeOf(val, ip), .x = w.mem, .a = w.term(ptr), .b = .none }, v);
+        // The slice pointer whose `len` field `ptr` is: a field pointer
+        // instruction, or a constant field address (`&global.items.len`).
+        const slice_ptr: Inst.Ref = if (ptr.toIndex()) |pi| blk: {
+            if (ir.instructions.items(.tag)[@backingInt(pi)] != .struct_field_ptr) return;
+            const sf = ir.extraData(Ir.StructField, ir.instructions.items(.data)[@backingInt(pi)].ty_pl.payload).data;
+            if (sf.index != 1) return;
+            break :blk sf.operand;
+        } else blk: {
+            const c = ptr.toInterned().?;
+            if (ip.keyTag(c) != .ptr) return;
+            const k = ip.keyPayload(.ptr, c);
+            if (k.byte_offset != 0 or k.base != .field or k.base.field.index != 1) return;
+            break :blk .fromInterned(k.base.field.base);
+        };
+        if (!Type.isSlice(ip, Type.childType(ip, ir.typeOf(slice_ptr, ip)))) return;
+        _ = try w.numberOf(.{ .tag = .slice_len, .ty = .none, .x = w.mem, .a = w.term(slice_ptr), .b = .none }, v);
     }
 
     /// For `t` a call's result, or its error union's payload, where the
