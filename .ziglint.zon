@@ -1,5 +1,8 @@
 .{
-    .paths = .{ "build.zig", "src", "tools", "bench" },
+    // tools/diag/eval/seeds holds sample user programs for the diagnostics
+    // eval, written as users write them, so it is left out. ziglint has no
+    // exclude list, so the other tools directories are named one by one.
+    .paths = .{ "build.zig", "src", "tools/conformance", "tools/edithunt", "bench" },
     .rules = .{
         // bs keeps long lines: tables of flags and messages read better
         // unwrapped.
