@@ -569,6 +569,8 @@ const migration_fixes = [_]struct { []const u8, []const u8, []const u8, []const 
     .{ "Build", "standardReleaseOptions", "()", "standardOptimizeOption(.{})" },
     .{ "std", "build", ".Builder", "Build" },
     .{ "debug", "warn", "", "print" },
+    // Renamed in 0.14; the old name was an alias until 0.16 removed it.
+    .{ "heap", "GeneralPurposeAllocator", "", "DebugAllocator" },
     .{ "mem", "trimRight", "", "trimEnd" },
     .{ "mem", "trimLeft", "", "trimStart" },
     .{ "mem", "tokenize", "(", "tokenizeAny(" },
