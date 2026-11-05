@@ -13,12 +13,13 @@ zig build -Doptimize=ReleaseSafe
 python3 tools/edithunt/hunt.py libvaxis/test                  # hunt until ^C
 python3 tools/edithunt/hunt.py zig --sequences 3              # the zig compiler workload
 python3 tools/edithunt/hunt.py zls/test --target aarch64-linux
+python3 tools/edithunt/hunt.py swap --sibling                # donors across swapped modules
 python3 tools/edithunt/hunt.py --replay tools/edithunt/.work/found/<dir>
 python3 tools/edithunt/hunt.py --reduce tools/edithunt/.work/found/<dir>
 ```
 
 Projects: `zig` (upstream's `src/` with
-`bench/workloads/zig/build_options.zig`), `hello`, or a corpus target
+`bench/workloads/zig/build_options.zig`), `hello`, `swap`, or a corpus target
 `<project>/<target>` from `tools/corpus/manifest.json`, recorded the
 first time by `tools/corpus/run.py`'s setup (clone, fetch, generate).
 The sources are copied to `.work/run/<project>/tree`; edits go to the
@@ -26,6 +27,17 @@ The sources are copied to `.work/run/<project>/tree`; edits go to the
 own three times in four rather than its packages' (`zig-pkg/`).
 `--target aarch64-linux` cross-compiles and runs the binaries under
 `qemu-aarch64-static`.
+
+`--sibling` also builds, after each step, the project's sibling: the
+same program with two modules' names swapped (in a test, the main
+module and the next one; otherwise two others), each `--dep` still
+naming the module it named. Its first build, from an empty local cache
+and the session's global one, replays the program's donor, and must
+compile and behave as the sibling built without the cache. `swap`
+(`swap/`) is revo's layout for it: capi's `@import("revo")` gives the
+main module in the program and a module named `vm` in the sibling.
+Its findings are `sibling-build-failed`, `sibling-outcome`,
+`sibling-errors` and `sibling-behavior`.
 
 ## Edits
 

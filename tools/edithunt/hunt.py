@@ -72,6 +72,15 @@ class Project:
             self.src = os.path.join(REPO_DIR, "bench", "workloads", "hello")
             self.copy_to, self.extra = "", {}
             self.args = ["build-exe", "hello.zig"]
+        elif name == "swap":
+            # revo's shape (tools/edithunt/swap): its sibling makes vm.zig
+            # the root module and root.zig the module `vm`, so capi's
+            # `@import("revo")` names another module in each program.
+            self.src = os.path.join(TOOL_DIR, "swap")
+            self.copy_to, self.extra = "", {}
+            deps = ["--dep", "revo=root", "--dep", "vm", "--dep", "capi"]
+            self.args = ["test", "--test-no-exec"] + deps + ["-Mroot=root.zig"] + deps + ["-Mvm=vm.zig"] + deps + ["-Mcapi=capi.zig"]
+            self.is_test = True
         else:
             proj_name, tgt_name = name.split("/", 1)
             manifest = json.load(open(os.path.join(REPO_DIR, "tools", "corpus", "manifest.json")))
@@ -93,6 +102,44 @@ class Project:
             self.run_args = [corpus.expand(a, proj) for a in tgt.get("run", [])]
         if target:
             self.args += ["-target", target]
+
+    def sibling_args(self):
+        """The same program with two modules' names swapped, or None: the
+        root and another module in a test (whose root holds no `main`),
+        else two other modules. Every `--dep` still names the module it
+        named, so the program means the same, but each file is another
+        module's, and an import name gives a module of another name: a
+        donor from this program must not pass for the sibling's."""
+        names = [m.group(1) for a in self.args if (m := re.match(r"-M([^=]+)=", a))]
+        if len(names) == 1 and self.args[0] != "test":
+            return None
+        cands = [n for n in names if n != "root" or self.is_test]
+        if len(cands) < 2:
+            return None
+        x, y = cands[0], cands[1]
+        swap = {x: y, y: x}
+        # Each module's arguments, up to its -M, renamed; the first is the
+        # main module, so the two swap places too.
+        segs, cur, i = [], [], 1
+        while i < len(self.args):
+            a = self.args[i]
+            if a == "--dep" and i + 1 < len(self.args):
+                alias, _, target = self.args[i + 1].partition("=")
+                target = swap.get(target or alias, target or alias)
+                cur += ["--dep", alias if target == alias else f"{alias}={target}"]
+                i += 2
+                continue
+            m = re.match(r"-M([^=]+)=(.*)$", a)
+            if m:
+                segs.append((m.group(1), cur + [f"-M{swap.get(m.group(1), m.group(1))}={m.group(2)}"]))
+                cur = []
+            else:
+                cur.append(a)
+            i += 1
+        order = [n for n, _ in segs]
+        ix, iy = order.index(x), order.index(y)
+        segs[ix], segs[iy] = segs[iy], segs[ix]
+        return self.args[:1] + [w for _, seg in segs for w in seg] + cur
 
     def materialize(self, dest):
         """A fresh copy of the sources in `dest`; returns the directory
@@ -654,8 +701,11 @@ class Session:
     """A work tree and its caches. Each step's edit build continues the
     session's cache."""
 
-    def __init__(self, project, work, bs, runner):
+    def __init__(self, project, work, bs, runner, sibling=False):
         self.p, self.work, self.bs, self.runner = project, work, bs, runner
+        self.sib_args = project.sibling_args() if sibling else None
+        if sibling and self.sib_args is None:
+            sys.exit(f"{project.name} has no sibling program: it needs two modules to swap")
         self.tree = project.materialize(os.path.join(work, "tree"))
         self.local = os.path.join(work, "local")
         self.glob = os.path.join(work, "global")
@@ -668,8 +718,8 @@ class Session:
         self.files = reachable(project, self.tree)
         self.last_digest = None
 
-    def build(self, env, out, local=None):
-        argv = [self.bs] + self.p.args + [f"-femit-bin={out}"]
+    def build(self, env, out, local=None, args=None):
+        argv = [self.bs] + (args or self.p.args) + [f"-femit-bin={out}"]
         e = dict(os.environ, ZIG_LOCAL_CACHE_DIR=local or self.local, ZIG_GLOBAL_CACHE_DIR=self.glob, **env)
         for k in ("BS_CACHE", "BS_CACHE_VERIFY", "BS_CACHE_CHECK", "BS_CACHE_REPLAY"):
             if k not in env:
@@ -698,8 +748,43 @@ class Session:
         return f"exit {code}\n{out}"
 
     def step(self, verify):
-        """Builds the current sources three ways and compares. Returns
-        (finding class or None, details, stats)."""
+        """Builds the current sources three ways and compares, then the
+        sibling program if there is one. Returns (finding class or None,
+        details, stats)."""
+        cls, det, stats = self.step_main(verify)
+        if cls or self.sib_args is None:
+            return cls, det, stats
+        scls, sdet = self.sibling_step(stats)
+        return (scls, sdet, stats) if scls else (cls, det, stats)
+
+    def sibling_step(self, stats):
+        """The sibling program's first build, from an empty local cache
+        and the session's global one, whose donors are the program's: it
+        must build and behave as the sibling built without the cache."""
+        local = os.path.join(self.work, "sibling-local")
+        shutil.rmtree(local, ignore_errors=True)
+        out = os.path.join(self.work, "out", "sibling")
+        off_out = os.path.join(self.work, "out", "sibling-off")
+        d = self.build({"BS_CACHE_CHECK": "1", "BS_CACHE_TIMING": "1"}, out, local=local, args=self.sib_args)
+        off = self.build({"BS_CACHE": "off"}, off_out, args=self.sib_args)
+        stats["sibling_s"] = round(d["secs"], 2)
+        stats["donor"] = "replaying donor" in d["log"]
+        if internal(d["log"]) or not isinstance(d["code"], int) or d["code"] < 0 or (d["code"] != 0 and not ERROR_RE.search(d["log"])):
+            return "sibling-build-failed", tail(d["log"])
+        if (d["code"] == 0) != (off["code"] == 0):
+            return "sibling-outcome", f"donor build exit {d['code']}, without the cache exit {off['code']}\n--- donor\n{tail(d['log'])}\n--- off\n{tail(off['log'])}"
+        if d["code"] != 0:
+            de, oe = errors(d["log"]), errors(off["log"])
+            if de != oe:
+                return "sibling-errors", "only the donor build: %s\nonly without the cache: %s" % (sorted(de - oe)[:10], sorted(oe - de)[:10])
+            return None, ""
+        if not filecmp.cmp(out, off_out, shallow=False):
+            rd, ro = self.run(out), self.run(off_out)
+            if rd != ro:
+                return "sibling-behavior", f"donor build: {rd!r}\nwithout the cache: {ro!r}\n{describe_diff(out, off_out)}"
+        return None, ""
+
+    def step_main(self, verify):
         env = {"BS_CACHE_CHECK": "1", "BS_CACHE_TIMING": "1"}
         if verify:
             env["BS_CACHE_VERIFY"] = "1"
@@ -839,11 +924,11 @@ def runner_for(target):
 def hunt_one(project, args, seed, counts):
     rng = random.Random(seed)
     work = os.path.join(WORK, "run", f"{project.name.replace('/', '_')}{'-' + args.target if args.target else ''}")
-    s = Session(project, work, args.bs, runner_for(args.target))
+    s = Session(project, work, args.bs, runner_for(args.target), args.sibling)
     editor = Editor(rng, s.tree, s.files, Scanner(), f"s{seed}")
     n_steps = rng.randint(args.min_steps, args.max_steps)
     log(f"sequence {seed}: {n_steps} steps over {len(s.files)} reachable files")
-    seq = {"project": project.name, "target": args.target, "seed": seed, "steps": []}
+    seq = {"project": project.name, "target": args.target, "seed": seed, "sibling": args.sibling, "steps": []}
     # Step 0: the first build of the pristine sources.
     cls, det, st = s.step(verify=False)
     log(f"  step 0 (first build): {det} {st}")
@@ -913,7 +998,7 @@ def replay(seq, args, builds=None, quiet=False):
     finding class at the last step, or None."""
     project = Project(seq["project"], args.bs, seq.get("target"))
     work = os.path.join(WORK, "replay")
-    s = Session(project, work, args.bs, runner_for(seq.get("target")))
+    s = Session(project, work, args.bs, runner_for(seq.get("target")), seq.get("sibling", False))
     last = len(seq["steps"])
     cls, det, st = s.step(verify=False)
     if cls:
@@ -1001,6 +1086,10 @@ def main():
                     help="every Nth step's edit build also runs under BS_CACHE_VERIFY=1, whose full build then replaces "
                          "the session's records (default 0: never; each step's full build runs in a copy instead)")
     ap.add_argument("--keep-going", action="store_true", help="start the next sequence after a finding")
+    ap.add_argument("--sibling", action="store_true",
+                    help="after each step, also build the project's sibling (two modules' names swapped, the main "
+                         "module among them in a test) from an empty local cache, which replays the program's donor, "
+                         "and compare it with the sibling built without the cache")
     ap.add_argument("--replay", metavar="DIR")
     ap.add_argument("--reduce", metavar="DIR")
     args = ap.parse_args()
