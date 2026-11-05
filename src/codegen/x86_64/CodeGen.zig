@@ -184,6 +184,9 @@ arg_refs: std.ArrayList(ArgRef) = .empty,
 outermost_frame: bool = false,
 /// Assembling container-level assembly (`GlobalAsm`): where errors go.
 global_asm: ?GlobalAsm.Src = null,
+/// Assembling inline assembly: the template's line being assembled, from
+/// 0, where errors go (`asmSpan`).
+asm_line: ?u32 = null,
 /// In a variadic C function: where the prologue saved the argument
 /// registers, and what the named parameters used of them and of the stack.
 va: struct { save: i32 = 0, gp: u8 = 0, sse: u8 = 0, stack: u32 = 0 } = .{},
@@ -536,10 +539,47 @@ fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
     }
     const ip = cg.ip;
     const nav = ip.getNav(ip.keyPayload(.func, cg.ir.func).owner_nav);
+    if (cg.asm_line) |line| if (try cg.asmSpan(line)) |at| {
+        try cg.emit.addError(at.file, at.span, "bs codegen: " ++ fmt, args);
+        return error.CodegenFail;
+    };
     const tree = try cg.emit.zcu.fe.tree(@fromBackingInt(nav.file));
     const decl = cg.emit.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst);
     try cg.emit.addError(nav.file, tree.nodeToSpan(decl.src_node), "bs codegen: " ++ fmt, args);
     return error.CodegenFail;
+}
+
+/// Where the inline assembly being assembled is in its source: the first
+/// `asm` from the last statement's position (`dbg_line`) in the innermost
+/// inlined function's file, at its template's line `line` when that is a
+/// multiline string, else at the template's string or the `asm` keyword.
+fn asmSpan(cg: *CodeGen, line: u32) Error!?struct { file: u32, span: std.zig.Ast.Span } {
+    const ip = cg.ip;
+    const zcu = cg.emit.zcu;
+    const nav = ip.getNav(ip.keyPayload(.func, cg.ir.func).owner_nav);
+    var file = nav.file;
+    var base_line = zcu.file(nav.file).zir.getDeclaration(nav.zir_inst).src_line;
+    if (cg.dbg_open.getLastOrNull()) |open| {
+        const inl = cg.dbg_inlines.items[open.index];
+        if (inl.file != 0) file = cg.dbg_files.items[inl.file - 1];
+        base_line = inl.base_line;
+    }
+    const tree = try zcu.fe.tree(@fromBackingInt(file));
+    var offset: usize = 0;
+    for (0..base_line + cg.dbg_line) |_| offset = (std.mem.findScalarPos(u8, tree.source, offset, '\n') orelse return null) + 1;
+    offset += cg.dbg_column;
+    const tags = tree.tokens.items(.tag);
+    const starts = tree.tokens.items(.start);
+    var t: u32 = 0;
+    while (t < tags.len and (starts[t] < offset or tags[t] != .keyword_asm)) t += 1;
+    if (t == tags.len) return null;
+    var k = t + 1;
+    if (k < tags.len and tags[k] == .keyword_volatile) k += 1;
+    if (k < tags.len and tags[k] == .l_paren) k += 1;
+    const at = if (k + line < tags.len and tags[k] == .multiline_string_literal_line and tags[k + line] == .multiline_string_literal_line)
+        k + line
+    else if (k < tags.len and (tags[k] == .string_literal or tags[k] == .multiline_string_literal_line)) k else t;
+    return .{ .file = file, .span = tree.tokenToSpan(at) };
 }
 
 // ---------------------------------------------------------------------------
@@ -6348,6 +6388,9 @@ fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
 const AsmArg = union(enum) { sym: struct { key: SymbolKey, off: i32 }, imm: i64, reg: ParsedReg, xmm: Encoder.Xmm };
 
 fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
+    // Errors point at the statement, and `assemble` at the line in it.
+    cg.asm_line = 0;
+    defer cg.asm_line = null;
     const ip = cg.ip;
     const ir = cg.ir;
     const extra = ir.extraData(Ir.Asm, data.ty_pl.payload);
@@ -6537,7 +6580,11 @@ const AsmOperand = union(enum) {
 fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg)) Error!void {
     var locals: LocalLabels = .{};
     var source_lines = std.mem.tokenizeScalar(u8, source, '\n');
+    var counted: usize = 0;
     while (source_lines.next()) |source_line| {
+        const start = source_line.ptr - source.ptr;
+        cg.asm_line.? += @intCast(std.mem.count(u8, source[counted..start], "\n"));
+        counted = start;
         // `#` and `//` start comments.
         var code = source_line;
         if (std.mem.findScalar(u8, code, '#')) |i| code = code[0..i];

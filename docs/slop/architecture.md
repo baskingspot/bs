@@ -1145,7 +1145,8 @@ on a register destination or a `mov`, and a prefix alone on its line.
 `test/run/asm_x86_insns.zig` assembles 241 forms with both compilers
 and compares each with upstream's bytes. `mov`, `lea`, `push`, `pop`,
 branches, `crc32` and the SSE and AES instructions stay in CodeGen's
-`asmInst`.
+`asmInst`. Errors point at the failing line of the template, found from
+the last statement's position (`asmSpan`).
 
 #### Container-level assembly (built 2026-11-05)
 
