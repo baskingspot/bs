@@ -20497,6 +20497,18 @@ fn analyzeCall(
     // Arguments are analyzed in the caller, with the call instruction
     // standing for the parameter type.
     const args = try sema.arena.alloc(Ref, total_args);
+    // As upstream, a call that is comptime already (`@call(.compile_time,
+    // ...)`, or a non-inline call of a function whose non-generic return
+    // type is comptime-only) evaluates all its arguments at comptime, even
+    // to runtime parameters: `Q(W(2))` with `fn Q(n: u64) type` calls `W`
+    // at comptime.
+    const ct_args_reason: ?[]const u8 = if (block.is_comptime) null else if (modifier == .compile_time)
+        "call with 'compile_time' modifier is evaluated at comptime"
+    else if (fn_ty.cc != .@"inline" and modifier != .always_inline and fn_ty.return_type != .generic_poison_type and
+        try sema.isComptimeOnlyResolved(block, src, fn_ty.return_type))
+        try std.fmt.allocPrint(sema.arena, "call to function with comptime-only return type '{f}' is evaluated at comptime", .{sema.fmtType(fn_ty.return_type)})
+    else
+        null;
     var arg_i: usize = 0;
     if (first_arg != .none) {
         args[0] = if (fn_ty.param_types[0] == .generic_poison_type) first_arg else try sema.coerceCtx(block, fn_ty.param_types[0], first_arg, sema.callArgSrc(src, true, 0), .{ .param = .{ .func = func, .index = 0 } });
@@ -20535,6 +20547,9 @@ fn analyzeCall(
                 if (arg_i < 32 and (fn_ty.comptime_bits >> @intCast(arg_i)) & 1 != 0) {
                     ct_block.is_comptime = true;
                     ct_block.comptime_reason = "argument to comptime parameter must be comptime-known";
+                } else if (ct_args_reason) |r| {
+                    ct_block.is_comptime = true;
+                    ct_block.comptime_reason = r;
                 }
                 const arg = try sema.resolveInlineBody(if (ct_block.is_comptime) &ct_block else block, body, zir_args.call_inst);
                 // As upstream, an argument that does not return ends the
