@@ -186,6 +186,17 @@ offset from it, as their key has both. (Absolute instructions renamed them
 on an edit above the block while their key stayed: the block is analyzed
 again in every edit build, but a function of the type is loaded with its
 old symbol name.)
+The types a container's layout or defaults make in a member's body (a
+field's type, alignment, default or enum value, or the backing or tag
+type) are numbered the same way from that body's start, under the body's
+ordinal (`Sema.resolveMemberBody`: 3 times the field's index, plus 1 for
+the alignment and 2 for the default or value): `S@layout#3#2` is the type
+of instruction 2 of `S`'s second field's type. The container's
+declarations come before its fields in the ZIR, and an edit to one of
+them leaves the layout green, so numbering from the container's own
+instruction kept the old key of a field's anonymous type
+(`f: std.ArrayList(struct {...})`) in an edit build where a full build
+gave a new one, and with it the keys of every instance the type reaches.
 
 #### Type names
 

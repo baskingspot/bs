@@ -54,6 +54,10 @@ panic_ns: Index = .none,
 unwrap_err: Ref = .none,
 /// `@disableInstrumentation()` ran in `func`'s body (`Ir.disable_instrumentation`).
 disable_instrumentation: bool = false,
+/// The member body of a container that its layout or defaults are
+/// evaluating (`resolveMemberBody`): the anonymous types it makes are
+/// numbered from its start.
+member_base: ?MemberBase = null,
 ir_insts: std.MultiArrayList(Ir.Inst) = .empty,
 ir_extra: std.ArrayList(u32) = .empty,
 inst_map: InstMap = .{},
@@ -1422,7 +1426,7 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
             if (!field.is_comptime) continue;
             const body = field.default_body orelse
                 return sema.fail(&block, block.nodeSrc(.zero), "comptime field without default initialization value", .{});
-            defaults[field.idx] = try sema.fieldDefault(&block, cont_src.fieldSrc(field.idx, .value), key.zir_inst, types[field.idx], body);
+            defaults[field.idx] = try sema.fieldDefault(&block, cont_src.fieldSrc(field.idx, .value), key.zir_inst, types[field.idx], body, 3 * field.idx + 2);
         }
     }
     try sema.finish();
@@ -1455,9 +1459,9 @@ fn structFieldTypes(sema: *Sema, block: *Block, key: InternPool.ContainerType, i
         if (field.align_body) |body| {
             const align_src = cont_src.fieldSrc(i, .@"align");
             if (decl.layout == .@"packed") return sema.fail(block, align_src, "unable to override alignment of packed struct fields", .{});
-            aligns[i] = try sema.resolveFieldAlign(block, align_src, try sema.resolveInlineBody(block, body, key.zir_inst));
+            aligns[i] = try sema.resolveFieldAlign(block, align_src, try sema.resolveMemberBody(block, body, key.zir_inst, 3 * i + 1));
         }
-        const ty_ref = try sema.resolveInlineBody(block, field.type_body, key.zir_inst);
+        const ty_ref = try sema.resolveMemberBody(block, field.type_body, key.zir_inst, 3 * i);
         types[i] = try sema.analyzeAsType(block, cont_src.fieldSrc(i, .type), ty_ref);
     }
     info.field_names = names;
@@ -1492,17 +1496,17 @@ pub fn analyzeStructDefaults(zcu: *Zcu, ty: Index) CompileError!void {
     while (it.next()) |field| {
         if (field.is_comptime) continue;
         const body = field.default_body orelse continue;
-        defaults[field.idx] = try sema.fieldDefault(&block, cont_src.fieldSrc(field.idx, .value), key.zir_inst, info.field_types[field.idx], body);
+        defaults[field.idx] = try sema.fieldDefault(&block, cont_src.fieldSrc(field.idx, .value), key.zir_inst, info.field_types[field.idx], body, 3 * field.idx + 2);
     }
     try sema.finish();
 }
 
 /// A field's default value, from its ZIR body.
-fn fieldDefault(sema: *Sema, block: *Block, src: Src, struct_inst: Zir.Inst.Index, field_ty: Index, body: []const Zir.Inst.Index) CompileError!Index {
+fn fieldDefault(sema: *Sema, block: *Block, src: Src, struct_inst: Zir.Inst.Index, field_ty: Index, body: []const Zir.Inst.Index, ordinal: u32) CompileError!Index {
     // Within the default body, the struct instruction stands for the
     // field type (the result type of the default value).
     try sema.inst_map.put(sema.gpa, struct_inst, .fromInterned(field_ty));
-    const ref = try sema.resolveInlineBody(block, body, struct_inst);
+    const ref = try sema.resolveMemberBody(block, body, struct_inst, ordinal);
     const coerced = try sema.coerce(block, field_ty, ref, src);
     return sema.resolveConstValue(block, src, coerced, "struct field default value must be comptime-known");
 }
@@ -1671,7 +1675,7 @@ fn analyzeArgBody(sema: *Sema, block: *Block, baseline: Ast.Node.Index, body: []
     const outer = block.src_base;
     block.src_base = baseline;
     defer block.src_base = outer;
-    return sema.analyzeAsType(block, block.nodeSrc(.zero), try sema.resolveInlineBody(block, body, zir_inst));
+    return sema.analyzeAsType(block, block.nodeSrc(.zero), try sema.resolveMemberBody(block, body, zir_inst, member_arg));
 }
 
 fn analyzeEnumLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPool.ContainerInfo) CompileError!void {
@@ -1741,7 +1745,7 @@ fn enumTagValues(sema: *Sema, block: *Block, cont_src: Src, zir_inst: Zir.Inst.I
         const val_src = cont_src.fieldSrc(i, if (explicit[i]) .value else .name);
         values[i] = if (field.value_body) |body| blk: {
             try sema.inst_map.put(sema.gpa, zir_inst, .fromInterned(tag_ty));
-            const ref = try sema.coerce(block, tag_ty, try sema.resolveInlineBody(block, body, zir_inst), val_src);
+            const ref = try sema.coerce(block, tag_ty, try sema.resolveMemberBody(block, body, zir_inst, 3 * i + 2), val_src);
             const val = try sema.resolveConstValue(block, val_src, ref, "enum tag value must be comptime-known");
             // As upstream 0.17.1 (`resolveConstDefinedValue`).
             if (sema.isUndef(val)) return sema.fail(block, val_src, "use of undefined value here causes illegal behavior", .{});
@@ -1800,7 +1804,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                 const i = field.idx;
                 names[i] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
                 types[i] = if (field.type_body) |body|
-                    try sema.analyzeAsType(&block, cont_src.fieldSrc(i, .type), try sema.resolveInlineBody(&block, body, key.zir_inst))
+                    try sema.analyzeAsType(&block, cont_src.fieldSrc(i, .type), try sema.resolveMemberBody(&block, body, key.zir_inst, 3 * i))
                 else
                     .void_type;
                 if (field.align_body) |body| {
@@ -1808,7 +1812,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                         aligns = try ip.arena(Zcu.tid).alloc(u64, n);
                         @memset(aligns, 0);
                     }
-                    aligns[i] = try sema.resolveFieldAlign(&block, cont_src.fieldSrc(i, .@"align"), try sema.resolveInlineBody(&block, body, key.zir_inst));
+                    aligns[i] = try sema.resolveFieldAlign(&block, cont_src.fieldSrc(i, .@"align"), try sema.resolveMemberBody(&block, body, key.zir_inst, 3 * i + 1));
                 }
             }
             info.field_names = names;
@@ -8287,14 +8291,14 @@ fn anonTypeParent(sema: *Sema, block: *const Block, b: *print.TemplateBuilder) A
 fn anonTypeNumber(sema: *Sema, block: *const Block, inst: Zir.Inst.Index) AnonTypeNumber {
     const nav, const base = sema.anonTypeBase(block);
     return .{
-        .ordinal = if (nav == .none and sema.owner == .comptime_decl) sema.owner.comptime_decl.ordinal else null,
-        .offset = @backingInt(inst) - @backingInt(base),
+        .ordinal = if (nav != .none) null else if (sema.owner == .comptime_decl) sema.owner.comptime_decl.ordinal else if (sema.member_base) |m| m.ordinal else null,
+        .offset = @as(i64, @backingInt(inst)) - @backingInt(base),
     };
 }
 
 const AnonTypeNumber = struct {
     ordinal: ?u32,
-    offset: u32,
+    offset: i64,
 
     pub fn format(n: AnonTypeNumber, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (n.ordinal) |o| try w.print("{d}_", .{o});
@@ -8304,8 +8308,10 @@ const AnonTypeNumber = struct {
 
 /// The stable key of an anonymous container type made by ZIR instruction
 /// `inst` with `captures`: the path of the declaration whose code holds
-/// `inst` (`writeTypePath`), the offset of `inst` from that declaration,
-/// and the stable hashes of the captures. A type's identity is its ZIR
+/// `inst` (`writeTypePath`), the offset of `inst` from that declaration
+/// (in a container's layout or defaults, the ordinal of the member body
+/// and the offset from its start, `resolveMemberBody`), and the stable
+/// hashes of the captures. A type's identity is its ZIR
 /// instruction and captures, as upstream (`InternPool` compares them), so
 /// its key is a function of exactly those: not of the arguments of the
 /// comptime call that made it, nor of which instance of an enclosing
@@ -8317,6 +8323,7 @@ fn anonTypeKey(sema: *Sema, block: *Block, inst: Zir.Inst.Index, captures: []con
     const w = &aw.writer;
     const nav, const base = sema.anonTypeBase(block);
     sema.writeTypePath(w, nav) catch return error.OutOfMemory;
+    if (nav == .none and sema.owner != .comptime_decl) if (sema.member_base) |m| w.print("#{d}", .{m.ordinal}) catch return error.OutOfMemory;
     w.print("#{d}", .{@as(i64, @backingInt(inst)) - @backingInt(base)}) catch return error.OutOfMemory;
     Zcu.writeCaptures(sema.ip, w, captures) catch return error.OutOfMemory;
     return aw.written();
@@ -8361,11 +8368,39 @@ fn anonTypeBase(sema: *Sema, block: *const Block) struct { InternPool.NavIndex, 
     else
         sema.owner_nav;
     if (nav != .none) return .{ nav, ip.getNav(nav).zir_inst };
-    return .{ nav, switch (sema.owner) {
-        .comptime_decl => |c| c.inst,
-        .type_layout, .struct_defaults => |ty| ip.containerType(ty).?.zir_inst,
-        else => unreachable,
-    } };
+    return .{
+        nav,
+        switch (sema.owner) {
+            .comptime_decl => |c| c.inst,
+            // From the member body being evaluated: the container's other
+            // members, declarations included, come before it in the ZIR, and
+            // an edit to them changes neither this unit nor its result.
+            .type_layout, .struct_defaults => |ty| if (sema.member_base) |m| m.inst else ip.containerType(ty).?.zir_inst,
+            else => unreachable,
+        },
+    };
+}
+
+const MemberBase = struct {
+    inst: Zir.Inst.Index,
+    /// Which body of the container: `member_arg`, or 3 times the field's
+    /// index, plus 1 for its alignment and 2 for its default or value.
+    ordinal: u32,
+};
+
+/// The ordinal of a container's backing or tag type body (`MemberBase`).
+const member_arg = std.math.maxInt(u32);
+
+/// `resolveInlineBody` for a body of a container's member that its layout
+/// or defaults evaluate (`MemberBase`): the anonymous types it makes are
+/// numbered from the body's start under `ordinal`, not from the
+/// container's instruction, so that an edit to another member does not
+/// renumber them (`anonTypeKey`).
+fn resolveMemberBody(sema: *Sema, block: *Block, body: []const Zir.Inst.Index, break_target: Zir.Inst.Index, ordinal: u32) CompileError!Ref {
+    const outer = sema.member_base;
+    sema.member_base = if (body.len != 0) .{ .inst = body[0], .ordinal = ordinal } else null;
+    defer sema.member_base = outer;
+    return sema.resolveInlineBody(block, body, break_target);
 }
 
 /// Stable key of a comptime call: the callee's key and the stable hashes of
