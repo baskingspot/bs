@@ -122,6 +122,19 @@ with `-Dtarget=x86_64-linux-gnu`, since its default target is musl.
 Setup installs into `.work/install/`, deleted after each step, so a
 project's install output does not fill the disk.
 
+The 17 after XirAsm (zprof through evm.zig) were added on 2026-11-05
+toward code bs had seen least: comptime serializers (serde.zig, s2s,
+comptime-serde), an ECS (knoedel), SIMD (csv-zero, oma), emulators full
+of packed registers (ChipZ, sandopolis, zitrus), fibers and event loops
+(marionette, wild, zeptun), an allocator profiler (zprof), an EVM
+(evm.zig), comptime HTML templates (verse), a state-machine library
+(polyrole) and a Markdown renderer (zigdown); they are MIT (evm.zig
+MIT or Apache-2.0). ChipZ records only its test (its exe needs SDL2);
+sandopolis records `test-unit` and `test-property` (its full `test`
+needs ROMs). Each run is timed once
+(`run_secs`, the scoreboard's "run zig / bs" column), so run-time ratios
+to upstream come from the same run as the verdicts.
+
 ## Scoreboard
 
 2026-11-04, bs at main e97f36a plus c17b8ae (the inline-call fix that
