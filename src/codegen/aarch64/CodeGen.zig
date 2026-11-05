@@ -6,9 +6,10 @@
 //! branch computes, and which overflow results write their fields
 //! directly. Scalars in general-purpose registers (`inGpr`), including
 //! promoted variables, get one of the callee-saved x19-x28 from linear
-//! scan (`Ssa.allocate`); f32 and f64 (`inFloat`) one of d8-d15, whose
-//! low halves calls preserve, or of v20-v29; and vectors of up to 16
-//! bytes (`inVec`) one of v20-v29. Calls clobber v20-v29, so a value lives
+//! scan (`Ssa.allocate`), and slices, optional slices, and error unions
+//! with an 8-byte payload (`inPair`) two of them; f32 and f64 (`inFloat`)
+//! one of d8-d15, whose low halves calls preserve, or of v20-v29; and
+//! vectors of up to 16 bytes (`inVec`) one of v20-v29. Calls clobber v20-v29, so a value lives
 //! in one only when no instruction that may call (`callFree`) lies in its
 //! interval. The rest, and those the allocator leaves out, live in stack
 //! slots shared by lifetime (`Ssa.liveness`). Each instruction loads its
@@ -16,9 +17,8 @@
 //! its register only after reading every operand (results through
 //! `resultMem` are moved there once the instruction's code is done). No
 //! lowering uses an allocated register as scratch, so no value is
-//! spilled around a call.
-//! Functions with inline assembly, which names registers itself, keep
-//! every value in a slot.
+//! spilled around a call. A value that meets an inline assembly statement
+//! takes none of the registers the statement names (`asmRegs`).
 //!
 //! Frame (every non-naked function keeps a frame record, so compact
 //! unwind's frame mode and std's frame-pointer walk cover it):
@@ -74,6 +74,10 @@ ir: *const Ir,
 e: Encoder,
 fn_ty: InternPool.FuncType,
 homes: []Home,
+/// Per value: for a `slice_ptr` or `slice_len` read from its slice's
+/// registers (`lengthenIntervals`), the slice; else `no_base`. Indexed as
+/// `Ssa.allocate`'s `fold`.
+pair_base: []u32,
 ssa: *const Ssa,
 /// Each SSA block's label, by block index.
 labels: []Encoder.Label,
@@ -206,7 +210,13 @@ const Home = union(enum) {
     /// it there. Such values are larger than 16 bytes, which the lowerings
     /// that use x8 as scratch (`atomicRmw16`) never read.
     result: u32,
+    /// A 16-byte value (`inPair`) whose eightbytes are in these registers;
+    /// for an `alloc`, a promoted variable's. Code that reads it from
+    /// memory gets a copy (`valMem`).
+    regs: Regs,
 };
+
+const Regs = struct { lo: Reg, hi: Reg };
 
 /// Where an operand's value can be read.
 pub const Loc = union(enum) {
@@ -217,6 +227,8 @@ pub const Loc = union(enum) {
     reg: Reg,
     /// The f32, f64 or vector is in this register (d8-d15, v20-v29).
     vreg: VReg,
+    /// The 16-byte value is in these registers (x19-x28).
+    regs: Regs,
     /// The value is the address of this memory.
     addr: Mem,
     /// A scalar constant, already extended to 64 bits.
@@ -243,12 +255,14 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .e = .init(gpa),
         .fn_ty = ip.keyPayload(.func_type, func.ty),
         .homes = try gpa.alloc(Home, ir.instructions.len),
+        .pair_base = try gpa.alloc(u32, ir.instructions.len),
         .ssa = &emit.ssa,
         .labels = try gpa.alloc(Encoder.Label, emit.ssa.blocks.items.len),
     };
     defer {
         cg.e.deinit();
         gpa.free(cg.homes);
+        gpa.free(cg.pair_base);
         gpa.free(cg.labels);
         cg.dbg_inlines.deinit(gpa);
         cg.dbg_inline_names.deinit(gpa);
@@ -264,6 +278,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.stub_open.deinit(gpa);
     }
     @memset(cg.homes, .none);
+    @memset(cg.pair_base, no_base);
     const naked = cg.fn_ty.cc == .naked;
     const f = &emit.ssa;
     try f.live.resize(gpa, ir.instructions.len);
@@ -514,6 +529,7 @@ fn flushResults(cg: *CodeGen) Error!void {
                 try vector.loadMem(cg, v, p.mem, @intCast(Type.abiSize(cg.ip, ty)));
             } else try cg.loadFp(v, memVal(ty, p.mem));
         },
+        .regs => |d| try cg.loadRegsMem(d, p.mem),
         else => unreachable,
     };
     cg.pending.clearRetainingCapacity();
@@ -595,7 +611,7 @@ fn allocateRegs(cg: *CodeGen) Error!void {
     var counts: std.ArrayList(u32) = .empty;
     defer counts.deinit(cg.gpa);
     const restrictions: []const Ssa.Restriction = if (try f.asmCounts(cg.gpa, cg.ir, &counts)) |c| &.{.{ .regs = cg.asmRegs(), .counts = c }} else &.{};
-    const used = f.allocate(alloc_regs.len, float_regs.len + vreg_count, (1 << survive) - 1, &.{}, &split, restrictions);
+    const used = f.allocate(alloc_regs.len, float_regs.len + vreg_count, (1 << survive) - 1, cg.pair_base, &split, restrictions);
     for (0..5) |k| if (used >> @intCast(2 * k) & 3 != 0) {
         cg.saved |= @as(u16, 1) << @intCast(k);
     };
@@ -605,7 +621,9 @@ fn allocateRegs(cg: *CodeGen) Error!void {
     for (f.values.items(.inst)) |inst| {
         const i = @backingInt(inst);
         if (fates[i] != .normal or reg[i] >= n) continue;
-        cg.homes[i] = if (reg[i] < alloc_regs.len)
+        cg.homes[i] = if (live.items(.reg2)[i] != Ssa.no_reg)
+            .{ .regs = .{ .lo = alloc_regs[reg[i]], .hi = alloc_regs[live.items(.reg2)[i]] } }
+        else if (reg[i] < alloc_regs.len)
             .{ .reg = alloc_regs[reg[i]] }
         else if (reg[i] < survive)
             .{ .vreg = float_regs[reg[i] - alloc_regs.len] }
@@ -666,20 +684,48 @@ fn asmRegs(cg: *CodeGen) u32 {
 /// allocs (`Ssa.plan` promotes variables) and block results.
 pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
     if (cg.emit.ssa.no_regs) return false;
+    const live = cg.emit.ssa.live.slice();
     switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
         .alloc, .block => return false,
+        // Read from the slice's registers if it gets them, taking none of
+        // its own (`lengthenIntervals`).
+        .slice_ptr, .slice_len => {
+            const b = cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op.operand.toIndex();
+            if (b != null and live.items(.reg)[@backingInt(b.?)] == Ssa.want_pair) {
+                cg.pair_base[@backingInt(inst)] = @backingInt(b.?);
+                return false;
+            }
+        },
         else => {},
     }
     const ty = cg.ir.typeOfIndex(inst, cg.ip);
-    const live = cg.emit.ssa.live.slice();
     if (cg.inGpr(ty) or cg.inFloat(ty)) {
         live.items(.reg)[@backingInt(inst)] = if (cg.inGpr(ty)) Ssa.want_reg else Ssa.want_float;
         live.items(.tie)[@backingInt(inst)] = cg.tiedOperand(inst);
     } else if (cg.inVec(ty)) {
         live.items(.reg)[@backingInt(inst)] = Ssa.want_vec;
         live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
+    } else if (cg.inPair(ty) and cg.pairResult(inst)) {
+        live.items(.reg)[@backingInt(inst)] = Ssa.want_pair;
+        live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
     }
     return !cg.callFree(inst);
+}
+
+/// Whether value `inst`, of a type `inPair`, is computed by code that can
+/// leave it in two registers: a load or a copy of 16 bytes, a `slice`, an
+/// optional's or error union's wrapping or unwrapping, an argument, or an
+/// `.auto` call's result (x0 and x1). Other values of those types stay in
+/// memory, where their lowerings write them.
+fn pairResult(cg: *CodeGen, inst: Inst.Index) bool {
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    return switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .load, .slice, .slice_elem_val, .ptr_elem_val, .struct_field_val, .bitcast => true,
+        .optional_payload, .wrap_optional, .unwrap_errunion_payload, .wrap_errunion_payload, .wrap_errunion_err => true,
+        .arg => !isC(cg.fn_ty.cc),
+        .call => !isC(cg.calleeType(data.pl_op.operand).cc),
+        else => false,
+    };
 }
 
 /// Whether `inst`'s lowering certainly makes no call (`bl`, `blr`), so
@@ -755,10 +801,26 @@ pub fn termClobbers(_: *CodeGen, _: Ssa.Block.Index) bool {
     return false;
 }
 
-/// Whether variables of type `ty` are promoted to two registers
-/// (`Ssa.plan`): never, as no value has two registers yet.
-pub fn inPair(_: *CodeGen, _: Index) bool {
-    return false;
+/// Whether `ty`'s values live in two general-purpose registers when they
+/// get registers, and variables of it are promoted to two (`Ssa.plan`):
+/// slices, optional slices, and error unions with an 8-byte aligned
+/// payload of 8 bytes (the error code in the low eightbyte, the payload
+/// in the high one); all 16 bytes, the low eightbyte at offset 0.
+pub fn inPair(cg: *CodeGen, ty: Index) bool {
+    const ip = cg.ip;
+    return switch (Type.class(ip, ty)) {
+        .pointer => Type.isSlice(ip, ty),
+        // Not an optional `[]allowzero T`, which has a flag after the slice.
+        .optional => blk: {
+            const child = Type.childType(ip, ty);
+            break :blk Type.class(ip, child) == .pointer and Type.isSlice(ip, child) and Type.abiSize(ip, ty) == 16;
+        },
+        .error_union => blk: {
+            const payload = ip.keyPayload(.error_union_type, ty).payload_type;
+            break :blk Type.abiAlignment(ip, payload) == 8 and Type.abiSize(ip, payload) == 8;
+        },
+        else => false,
+    };
 }
 
 /// As `inPair`, for one floating-point register: f32 and f64.
@@ -768,9 +830,37 @@ pub fn inFloat(cg: *CodeGen, ty: Index) bool {
     return bits == 32 or bits == 64;
 }
 
-/// `Ssa.plan`'s hook for intervals the architecture lengthens: none
-/// here, since no address is folded into its users yet.
-pub fn lengthenIntervals(_: *CodeGen) void {}
+const no_base = std.math.maxInt(u32);
+
+/// In `Ssa.plan`, after forwarding: each `slice_ptr` and `slice_len` of a
+/// slice that wants two registers (`clobbers`) gets `want_fold`, and the
+/// slice (or the value its load forwards) in `pair_base`, for
+/// `Ssa.allocate`: it takes no register when the slice has two, and its
+/// users read the slice's (`genInst`). The slice lives as long as it does.
+pub fn lengthenIntervals(cg: *CodeGen) void {
+    const f = cg.ssa;
+    const live = f.live.slice();
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const crosses = live.items(.crosses);
+    const fwd = live.items(.fwd);
+    const cl = f.clobbers.items;
+    for (f.values.items(.inst)) |inst| {
+        const v = @backingInt(inst);
+        if (cg.pair_base[v] == no_base) continue;
+        if (live.items(.fate)[v] == .dead) {
+            cg.pair_base[v] = no_base;
+            continue;
+        }
+        var b = cg.pair_base[v];
+        if (fwd[b] != Ssa.no_tie) b = fwd[b];
+        end[b] = @max(end[b], end[v]);
+        crosses[b] = crosses[b] or crosses[v] or cl[end[b]][0] != cl[def[b]][0];
+        live.items(.reg)[v] = Ssa.want_fold;
+        live.items(.tie)[v] = Ssa.no_tie;
+        cg.pair_base[v] = b;
+    }
+}
 
 /// Whether `ty`'s values fit a general-purpose register.
 pub fn inGpr(cg: *CodeGen, ty: Index) bool {
@@ -810,9 +900,9 @@ pub fn ovfFlagsOnly(_: *CodeGen, tag: Inst.Tag, bits: u16) bool {
 /// that `flushResults` moves to the register when the instruction's code
 /// is done, after it read its operands.
 pub fn resultMem(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Mem {
-    if (cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .vreg) {
+    if (cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .vreg or cg.homes[@backingInt(inst)] == .regs) {
         if (!Type.hasRuntimeBits(cg.ip, ty)) return null;
-        const m = if (cg.homes[@backingInt(inst)] == .vreg) try cg.tempSlot16() else try cg.tempSlot();
+        const m = if (cg.homes[@backingInt(inst)] == .reg) try cg.tempSlot() else try cg.tempSlot16();
         try cg.pending.append(cg.gpa, .{ .inst = inst, .mem = m });
         return m;
     }
@@ -1395,6 +1485,18 @@ fn setupParams(cg: *CodeGen) Error!void {
             },
             else => unreachable,
         };
+        if (cg.homes[@backingInt(inst)] == .regs) {
+            const d = cg.homes[@backingInt(inst)].regs;
+            switch (l) {
+                .gpr_pair => |r| {
+                    try cg.e.mov(.x, d.lo, argReg(r));
+                    try cg.e.mov(.x, d.hi, argReg(r + 1));
+                },
+                .stack => |off| try cg.loadRegsMem(d, .at(.fp, @intCast(16 + off))),
+                else => unreachable,
+            }
+            continue;
+        }
         if (cg.homes[@backingInt(inst)] == .vreg and cg.inVec(ty)) {
             const v = cg.homes[@backingInt(inst)].vreg;
             switch (l) {
@@ -1463,6 +1565,7 @@ pub fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
             try cg.loadMem(.x8, cg.ret_ptr_slot.?, .usize_type);
             break :blk .{ .mem = .at(.x8, @intCast(off)) };
         },
+        .regs => |p| .{ .regs = p },
     };
     return cg.constLoc(ref.toInterned().?);
 }
@@ -1665,6 +1768,7 @@ fn loadVal(cg: *CodeGen, reg: Reg, v: Val) Error!void {
             try cg.e.fmovToGpr(.x, reg, .f64, r)
         else
             try cg.e.fmovToGpr(.w, reg, .f32, r),
+        .regs => return cg.fail("loading a 16-byte value into a register", .{}),
     }
 }
 
@@ -1742,6 +1846,62 @@ fn storeBytes(cg: *CodeGen, m: Mem, reg: Reg, n: u64) Error!void {
     }
 }
 
+/// `m` as the operand of a pair access of two 8-byte slots (ldp, stp),
+/// computing its address into `scratch` if the pair form's offset does not
+/// reach it.
+fn pairAccess(cg: *CodeGen, m: Mem, scratch: Reg) Error!Encoder.Mem {
+    switch (m.base) {
+        .sym => |k| {
+            try cg.e.loadAddr(scratch, k, m.off);
+            return .at(scratch, 0);
+        },
+        .reg => |r| {
+            if (m.off >= -512 and m.off < 512 and @rem(m.off, 8) == 0) return .at(r, m.off);
+            try cg.addImm(scratch, r, m.off);
+            return .at(scratch, 0);
+        },
+    }
+}
+
+/// Loads the 16 bytes at `m` into `d` (`Home.regs`). Uses only `d`.
+fn loadRegsMem(cg: *CodeGen, d: Regs, m: Mem) Error!void {
+    try cg.e.ldp(.dword, d.lo, d.hi, try cg.pairAccess(m, d.lo));
+}
+
+/// Stores the 16 bytes in `p` to `m`. Uses x16.
+fn storeRegsMem(cg: *CodeGen, m: Mem, p: Regs) Error!void {
+    try cg.e.stp(.dword, p.lo, p.hi, try cg.pairAccess(m, .x16));
+}
+
+/// The registers holding `ref` if it is a value in two (`Home.regs`).
+fn pairOf(cg: *CodeGen, ref: Ref) ?Regs {
+    const inst = ref.toIndex() orelse return null;
+    return switch (cg.homes[@backingInt(inst)]) {
+        .regs => |p| p,
+        else => null,
+    };
+}
+
+/// Loads 16-byte value `ref` (`inPair`) into `d`: a parallel move from
+/// the registers holding it, or a pair load. Uses x9 for a swap.
+fn loadRegs(cg: *CodeGen, d: Regs, ref: Ref) Error!void {
+    const v = try cg.valOf(ref);
+    if (v.loc != .regs) return cg.loadRegsMem(d, try cg.valMem(v));
+    const p = v.loc.regs;
+    if (p.hi == d.lo) {
+        if (p.lo == d.hi) {
+            try cg.e.mov(.x, .x9, p.lo);
+            try cg.e.mov(.x, d.lo, p.hi);
+            return cg.e.mov(.x, d.hi, .x9);
+        }
+        try cg.e.mov(.x, d.hi, p.hi);
+        if (p.lo != d.lo) try cg.e.mov(.x, d.lo, p.lo);
+        return;
+    }
+    if (p.lo != d.lo) try cg.e.mov(.x, d.lo, p.lo);
+    if (p.hi != d.hi) try cg.e.mov(.x, d.hi, p.hi);
+}
+
 /// Copies the value `ref` to `dst`. Uses x9, x10, x16, x17, v30, and v31;
 /// `dst` must not be based on those.
 fn copyTo(cg: *CodeGen, dst: Mem, ref: Ref) Error!void {
@@ -1756,6 +1916,7 @@ fn copyVal(cg: *CodeGen, dst: Mem, v: Val) Error!void {
         .mem => |src| try cg.copyMem(dst, src, size),
         .reg => |r| try cg.storeReg(dst, r, size),
         .vreg => |r| try vector.storeMem(cg, dst, r, @intCast(size)),
+        .regs => |p| try cg.storeRegsMem(dst, p),
         .imm => |x| if (cg.passInRegs(v.ty)) {
             if (x == 0) return cg.storeReg(dst, .zr, size);
             try cg.e.movImm(.x, .x9, x);
@@ -1874,6 +2035,11 @@ fn valMem(cg: *CodeGen, v: Val) Error!Mem {
         try vector.storeMem(cg, m, v.loc.vreg, @intCast(Type.abiSize(cg.ip, v.ty)));
         return m;
     }
+    if (v.loc == .regs) {
+        const m = try cg.tempSlot16();
+        try cg.storeRegsMem(m, v.loc.regs);
+        return m;
+    }
     const m = try cg.allocSlot(Type.abiSize(cg.ip, v.ty), Type.abiAlignment(cg.ip, v.ty));
     try cg.copyVal(m, v);
     return m;
@@ -1948,6 +2114,13 @@ fn promotedV(cg: *CodeGen, ptr: Ref) ?VReg {
     };
 }
 
+/// As `promoted`, for a variable in two registers (`inPair`).
+fn promotedPair(cg: *CodeGen, ptr: Ref) ?Regs {
+    const p = ptr.toIndex() orelse return null;
+    if (cg.ir.instructions.items(.tag)[@backingInt(p)] != .alloc) return null;
+    return cg.pairOf(ptr);
+}
+
 /// `d = ptr + off`.
 fn addrPlus(cg: *CodeGen, d: Reg, ptr: Ref, off: u64) Error!void {
     switch (try cg.locOf(ptr)) {
@@ -1963,6 +2136,7 @@ fn addrPlus(cg: *CodeGen, d: Reg, ptr: Ref, off: u64) Error!void {
 /// a slice. Uses x10 and x11; `d` is not one of them.
 fn elemAddrTo(cg: *CodeGen, d: Reg, is_slice: bool, base: Ref, index: Ref, size: u64) Error!void {
     const b = if (is_slice) b: {
+        if (cg.pairOf(base)) |p| break :b p.lo;
         try cg.loadMem(d, try cg.memOf(base), .usize_type);
         break :b d;
     } else try cg.use(base, d);
@@ -2362,7 +2536,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .dbg_inline_end => try cg.endInline(),
         .alloc => {
             // A promoted variable in a register needs no memory.
-            if (data.ty == .none or cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .vreg) return;
+            if (data.ty == .none or cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .vreg or cg.homes[@backingInt(inst)] == .regs) return;
             const info = Type.ptrInfo(ip, data.ty);
             const size = @max(Type.abiSize(ip, info.child), 1);
             const alignment = @max(Type.abiAlignment(ip, info.child), if (info.flags.alignment == 0) 1 else @as(u64, 1) << @intCast(info.flags.alignment - 1));
@@ -2404,6 +2578,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 if (cg.homes[@backingInt(inst)] == .reg and cg.homes[@backingInt(inst)].reg == v) return;
                 return cg.setResult(inst, ty, v);
             }
+            if (cg.promotedPair(data.ty_op.operand)) |p| {
+                if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
+                return cg.storeRegsMem((try cg.resultMem(inst, ty)) orelse return, p);
+            }
+            if (cg.pairOf(inst.toRef())) |d| return cg.loadRegsMem(d, try cg.ptrMem(data.ty_op.operand));
             if (cg.homes[@backingInt(inst)] == .vreg and cg.inVec(ty))
                 return vector.loadMem(cg, cg.homes[@backingInt(inst)].vreg, try cg.ptrMem(data.ty_op.operand), @intCast(Type.abiSize(ip, ty)));
             if (cg.passInRegs(ty)) {
@@ -2423,6 +2602,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const size = Type.abiSize(ip, cg.typeOf(val));
             if (size == 0) return;
             if (cg.promoted(data.bin_op.lhs)) |v| return cg.load(v, val);
+            if (cg.promotedPair(data.bin_op.lhs)) |p| return cg.loadRegs(p, val);
             if (cg.promotedV(data.bin_op.lhs)) |v| return if (cg.inVec(cg.typeOf(val))) vector.loadVec(cg, v, val) else cg.loadFp(v, try cg.valOf(val));
             const m = try cg.ptrMem(data.bin_op.lhs);
             if (val.toInterned()) |v| if (ip.keyTag(v) == .undef and !cg.passInRegs(cg.typeOf(val))) return cg.fillMem(m, size, 0xaa);
@@ -2585,6 +2765,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             }
             const size = Type.abiSize(ip, ty);
             const src_size = Type.abiSize(ip, src_ty);
+            if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
             // A vector in a register from an array or vector of its size.
             if (vector.bitcastToVreg(cg, inst)) {
                 const v = cg.homes[@backingInt(inst)].vreg;
@@ -2650,6 +2831,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const ty = data.ty_pl.ty;
             const off = Type.fieldOffset(ip, cg.typeOf(sf.operand), sf.index);
             const src = try cg.memOf(sf.operand);
+            if (cg.pairOf(inst.toRef())) |d| return cg.loadRegsMem(d, src.plus(off));
             if (cg.passInRegs(ty)) {
                 const d = cg.resultReg(inst, .x9);
                 try cg.loadMem(d, src.plus(off), ty);
@@ -2691,6 +2873,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const ty = ir.typeOfIndex(inst, ip);
             const size = Type.abiSize(ip, ty);
             try cg.elemAddrTo(.x12, tag == .slice_elem_val, data.bin_op.lhs, data.bin_op.rhs, size);
+            if (cg.pairOf(inst.toRef())) |d| return cg.loadRegsMem(d, .at(.x12, 0));
             if (cg.passInRegs(ty)) {
                 const d = cg.resultReg(inst, .x9);
                 try cg.loadMem(d, .at(.x12, 0), ty);
@@ -2718,6 +2901,15 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.copyMem(dst, .at(.x12, 0), size);
         },
         .slice_ptr, .slice_len => {
+            if (cg.pairOf(data.ty_op.operand)) |p| {
+                const r = if (tag == .slice_len) p.hi else p.lo;
+                // Folded: the slice's register itself (`lengthenIntervals`).
+                if (cg.pair_base[@backingInt(inst)] != no_base and cg.homes[@backingInt(inst)] == .none) {
+                    cg.homes[@backingInt(inst)] = .{ .reg = r };
+                    return;
+                }
+                return cg.setResult(inst, data.ty_op.ty, r);
+            }
             const src = try cg.memOf(data.ty_op.operand);
             const d = cg.resultReg(inst, .x9);
             try cg.loadMem(d, src.plus(if (tag == .slice_len) 8 else 0), .usize_type);
@@ -2725,6 +2917,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .slice => {
             const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+            if (cg.pairOf(inst.toRef())) |d| {
+                // A pair takes no operand's register (`Ssa.allocate`).
+                try cg.load(d.lo, bin.lhs);
+                return cg.load(d.hi, bin.rhs);
+            }
             const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
             try cg.load(.x9, bin.lhs);
             try cg.storeReg(dst, .x9, 8);
@@ -2735,6 +2932,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .is_null, .is_non_null, .is_err, .is_non_err, .cmp_lt_errors_len => try cg.genCond(inst),
         .optional_payload => {
             const child = data.ty_op.ty;
+            if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
             if (Type.optionalReprIsPtr(ip, child)) {
                 try cg.load(.x9, data.ty_op.operand);
                 return cg.setResult(inst, child, .x9);
@@ -2761,6 +2959,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .wrap_optional => {
             const opt_ty = data.ty_op.ty;
+            if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
             const dst = try cg.resultMem(inst, opt_ty) orelse return;
             try cg.copyTo(dst, data.ty_op.operand);
             if (!Type.optionalReprIsPayload(ip, Type.childType(ip, opt_ty))) {
@@ -2774,7 +2973,14 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const ty = data.ty_op.ty;
             const layout = Type.errorUnionLayout(ip, cg.typeOf(data.ty_op.operand));
             const off = if (tag == .unwrap_errunion_err) layout.err_offset else layout.payload_offset;
+            if (cg.pairOf(data.ty_op.operand)) |p| {
+                if (tag == .unwrap_errunion_payload) return cg.setResult(inst, ty, p.hi);
+                const d = cg.resultReg(inst, .x9);
+                try cg.e.uxt(.half, d, p.lo);
+                return cg.setResult(inst, ty, d);
+            }
             const src = try cg.memOf(data.ty_op.operand);
+            if (cg.pairOf(inst.toRef())) |d| return cg.loadRegsMem(d, src.plus(off));
             if (cg.passInRegs(ty)) {
                 const d = cg.resultReg(inst, .x9);
                 try cg.loadMem(d, src.plus(off), ty);
@@ -2796,6 +3002,12 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .wrap_errunion_payload, .wrap_errunion_err => {
             const eu_ty = data.ty_op.ty;
+            if (cg.pairOf(inst.toRef())) |d| {
+                // The payload is undefined in an error.
+                if (tag == .wrap_errunion_err) return cg.load(d.lo, data.ty_op.operand);
+                try cg.load(d.hi, data.ty_op.operand);
+                return cg.e.movImm(.x, d.lo, 0);
+            }
             const layout = Type.errorUnionLayout(ip, eu_ty);
             if (cg.homes[@backingInt(inst)] == .result) {
                 // Its payload is already there (`planRetCalls`).
@@ -2951,6 +3163,11 @@ fn memDest(cg: *CodeGen, ptr: Reg, len: Reg, dest: Ref) Error!u64 {
     const ip = cg.ip;
     const p = Type.ptrInfo(ip, cg.typeOf(dest));
     if (p.flags.size == .slice) {
+        if (cg.pairOf(dest)) |r| {
+            try cg.e.mov(.x, ptr, r.lo);
+            try cg.e.mov(.x, len, r.hi);
+            return Type.abiSize(ip, p.child);
+        }
         const m = try cg.memOf(dest);
         try cg.loadMem(ptr, m, .usize_type);
         try cg.loadMem(len, m.plus(8), .usize_type);
@@ -3136,6 +3353,11 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Cond {
             return .ls;
         },
         .is_err, .is_non_err => {
+            if (cg.pairOf(data.un_op)) |p| {
+                // The error code is the low 16 bits.
+                try cg.e.tst(.w, p.lo, .{ .imm = 0xffff });
+                return if (tag == .is_err) .ne else .eq;
+            }
             const layout = Type.errorUnionLayout(ip, cg.typeOf(data.un_op));
             try cg.loadMem(.x9, (try cg.memOf(data.un_op)).plus(layout.err_offset), .u16_type);
             try cg.e.cmp(.x, .x9, .{ .imm = 0 });
@@ -3146,6 +3368,10 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Cond {
             const child = Type.childType(ip, opt_ty);
             if (Type.optionalReprIsPtr(ip, child)) {
                 try cg.load(.x9, data.un_op);
+            } else if (cg.pairOf(data.un_op)) |p| {
+                // An optional slice: a null `ptr`.
+                try cg.e.cmp(.x, p.lo, .{ .imm = 0 });
+                return if (tag == .is_null) .eq else .ne;
             } else if (Type.optionalReprIsPayload(ip, child)) {
                 // A slice's `ptr` or an error code; zero is null.
                 try cg.loadMem(.x9, try cg.memOf(data.un_op), if (Type.isSlice(ip, child)) .usize_type else .u16_type);
@@ -3881,6 +4107,11 @@ fn loadGprVal(cg: *CodeGen, reg: Reg, v: Val) Error!void {
 
 /// Loads a value of 9 to 16 bytes into `lo` and `hi`.
 fn loadPair(cg: *CodeGen, lo: Reg, hi: Reg, v: Val) Error!void {
+    if (v.loc == .regs) {
+        // Into argument or result registers, none of x19-x28.
+        try cg.e.mov(.x, lo, v.loc.regs.lo);
+        return cg.e.mov(.x, hi, v.loc.regs.hi);
+    }
     const size = Type.abiSize(cg.ip, v.ty);
     const m = try cg.valMem(v);
     try cg.e.ldr(.dword, lo, try cg.access(m, 8, .x16));
@@ -3959,7 +4190,8 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         .result => |off| off,
         else => null,
     };
-    const dst = if (tail or in_reg or to_result != null) null else try cg.resultMem(inst, ret_ty);
+    const in_pair = if (tail) null else cg.pairOf(inst.toRef());
+    const dst = if (tail or in_reg or to_result != null or in_pair != null) null else try cg.resultMem(inst, ret_ty);
     var pn_save: ?Mem = null;
     var stack_args = false;
 
@@ -4016,6 +4248,11 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         if (vec_in_v0) return vector.move(cg, cg.homes[@backingInt(inst)].vreg, .v0);
         if (cg.homes[@backingInt(inst)] == .vreg) return cg.setFpResult(inst, ret_ty, .v0);
         return cg.setResult(inst, ret_ty, .x0);
+    }
+    if (in_pair) |d| {
+        // `.auto` returns 16 bytes in x0 and x1 (`pairResult`).
+        try cg.e.mov(.x, d.lo, .x0);
+        return cg.e.mov(.x, d.hi, .x1);
     }
     const m = dst orelse return;
     if (is_c) return cg.cCallResult(ret_ty, m);
