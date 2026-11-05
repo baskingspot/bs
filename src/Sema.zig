@@ -9368,6 +9368,12 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 if (try sema.fieldValue(v, @intCast(k)) == .bool_true) mask |= clobberBit(ip.stringSlice(name));
             }
             return .fromInterned(try sema.clobbersValue(mask));
+        } else if (dest_ty == .calling_convention_type and sc == .@"union" and
+            src_ty == try sema.stdLangType(block, src, "CallingConvention"))
+        {
+            // A value of std's union, which `callconv` takes as it is
+            // (`callconvOf`), options included.
+            return inst;
         },
         // Field by field, as upstream's `coerceTupleToTuple`.
         .tuple => if (sc == .tuple) {
