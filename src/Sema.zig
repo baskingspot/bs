@@ -5084,7 +5084,13 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.un_node.src_node);
             break :blk sema.derefPtr(block, src, sema.resolveInst(data.un_node.operand));
         },
-        .ret_ptr => sema.analyzeAlloc(block, block.nodeSrc(data.node), sema.currentRetTy(block), false, block.is_comptime),
+        // As upstream, a comptime-only return type's result location is a
+        // comptime one (an inline call's).
+        .ret_ptr => ret_ptr: {
+            const src = block.nodeSrc(data.node);
+            const ty = sema.currentRetTy(block);
+            break :ret_ptr sema.analyzeAlloc(block, src, ty, false, block.is_comptime or try sema.isComptimeOnlyResolved(block, src, ty));
+        },
 
         // Arithmetic.
         .add, .addwrap, .add_unsafe, .sub, .subwrap, .mul, .mulwrap, .div, .div_trunc, .div_floor, .div_exact, .div_ceil, .mod, .rem, .mod_rem, .shl, .shr, .bit_and, .bit_or, .xor => blk: {
