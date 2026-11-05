@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n42\n12\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n42\n12\n42\nb\n4\n42\n7\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -389,6 +389,52 @@ fn namesLen(entries: []const []const u8) usize {
     return n;
 }
 
+// marionette (fiber.zig): a decl literal of `std.lang.CallingConvention`
+// that calls one of its functions gives a calling convention.
+fn alignedInc(x: u32) callconv(.withStackAlign(.c, 16)) u32 {
+    return x + 1;
+}
+
+// verse (ContentType.zig): `inline else` over a comptime-known
+// non-exhaustive enum analyzes only the matching prong, though the type's
+// values cannot be enumerated.
+const Wide = enum(u8) { a, b, _ };
+fn wideName(comptime e: Wide) []const u8 {
+    return switch (e) {
+        inline else => |r| @tagName(r),
+    };
+}
+
+// knoedel (ecs.zig): a call of a function returning `type` is evaluated at
+// comptime with its arguments, even to runtime parameters.
+fn doubled(x: u64) u64 {
+    return x * 2;
+}
+fn ValueHolder(n: u64) type {
+    return struct {
+        const v = n;
+    };
+}
+
+// zigdown (plutosvg.zig): a function taking and returning `i32` coerces to
+// a pointer to one with `c_int`, the same integer in memory.
+const CIntCb = ?*const fn (c_int) callconv(.c) c_int;
+fn twiceI32(x: i32) callconv(.c) i32 {
+    return x * 2;
+}
+
+// zigdown (treez.zig): `@extern` of an optional function pointer to a
+// symbol that is not weak is comptime-known non-null, so `orelse
+// @compileError(...)` compiles.
+export fn corpus_tree_sitter_x() callconv(.c) u32 {
+    return 7;
+}
+fn externLanguage(comptime name: []const u8) u32 {
+    const ext = @extern(?*const fn () callconv(.c) u32, .{ .name = "corpus_tree_sitter_" ++ name }) orelse
+        @compileError("Cannot find extern corpus_tree_sitter_" ++ name);
+    return ext();
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -504,5 +550,12 @@ fn main() callconv(.c) noreturn {
         break :blk .{ 7, out };
     };
     rt.printInt(names_k + namesLen(&names));
+    rt.printInt(alignedInc(41));
+    rt.print(wideName(.b));
+    rt.print("\n");
+    rt.printInt(ValueHolder(doubled(2)).v);
+    const cint_cb: CIntCb = twiceI32;
+    rt.printInt(@intCast(cint_cb.?(21)));
+    rt.printInt(externLanguage("x"));
     rt.exit(0);
 }
