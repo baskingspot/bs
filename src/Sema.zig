@@ -16887,7 +16887,7 @@ fn optionalPayload(sema: *Sema, block: *Block, src: Src, operand: Ref, safe: boo
         if (safe and block.want_safety and !block.is_comptime) {
             const ok = try sema.analyzeIsNonNull(block, src, operand);
             if (sema.resolveValue(ok)) |v| {
-                if (v == .bool_false) return sema.fail(block, src, "unable to unwrap null", .{});
+                if (v == .bool_false) return sema.unwrapKnownNull(block, src, safe);
             } else try sema.addSafetyCheck(block, ok, .unwrap_null, .none, .none);
         }
         return operand;
@@ -16897,7 +16897,7 @@ fn optionalPayload(sema: *Sema, block: *Block, src: Src, operand: Ref, safe: boo
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(child));
         const payload = sema.ip.keyPayload(.opt, v).val;
-        if (payload == .none) return sema.fail(block, src, "unable to unwrap null", .{});
+        if (payload == .none) return sema.unwrapKnownNull(block, src, safe);
         return .fromInterned(payload);
     }
     // A payload type with no values (`?error{}`): null, known from the type.
@@ -16908,6 +16908,15 @@ fn optionalPayload(sema: *Sema, block: *Block, src: Src, operand: Ref, safe: boo
         try sema.addSafetyCheck(block, ok, .unwrap_null, .none, .none);
     }
     return sema.addTyOp(block, .optional_payload, child, operand);
+}
+
+/// `.?` of a null known at comptime: an error at comptime, and in
+/// runtime code the panic it would be at run time, as upstream's
+/// zirOptionalPayload; the code may never run (`if (c) maybe.?`).
+fn unwrapKnownNull(sema: *Sema, block: *Block, src: Src, safe: bool) CompileError!Ref {
+    if (block.is_comptime) return sema.fail(block, src, "unable to unwrap null", .{});
+    if (safe and block.want_safety) try sema.addPanic(block, .unwrap_null, .none, .none) else _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
+    return .unreachable_value;
 }
 
 fn optionalPayloadPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, safe: bool, set: bool) CompileError!Ref {
