@@ -8901,12 +8901,20 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
                 const rt_ty: Index = if (s) .i128_type else .u128_type;
                 const l: Val = .{ .ty = rt_ty, .loc = lhs.loc };
                 const r: Val = .{ .ty = rt_ty, .loc = rhs.loc };
-                if (want_q and adjust) {
+                if (want_q and adjust and s) {
+                    // One call for the quotient; the remainder is `a - q * b`
+                    // (`__divmodti4` would bring in all of int.zig).
+                    try cg.rtCall("udivmod.zig", "__divti3", &.{ l, r }, rt_ty, dst);
+                    try cg.mulLimbs(rem, dst, rhs.loc.mem, 2);
+                    for (0..2) |i| {
+                        try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(lhs.loc.mem, @intCast(i)) });
+                        try e.alu(if (i == 0) .sub else .sbb, .qword, .{ .reg = .rax }, .{ .mem = limb(rem, @intCast(i)) });
+                        try e.mov(.qword, .{ .mem = limb(rem, @intCast(i)) }, .{ .reg = .rax });
+                    }
+                } else if (want_q and adjust) {
                     // One call for both the quotient and the remainder.
                     const rem_ptr: Val = .{ .ty = .usize_type, .loc = .{ .addr = rem } };
-                    if (s) {
-                        try cg.rtCall("int.zig", "__divmodti4", &.{ l, r, rem_ptr }, rt_ty, dst);
-                    } else try cg.rtCall("udivmod.zig", "__udivmodti4", &.{ l, r, rem_ptr }, rt_ty, dst);
+                    try cg.rtCall("udivmod.zig", "__udivmodti4", &.{ l, r, rem_ptr }, rt_ty, dst);
                 } else if (want_q) {
                     try cg.rtCall("udivmod.zig", if (s) "__divti3" else "__udivti3", &.{ l, r }, rt_ty, dst);
                 } else try cg.rtCall("udivmod.zig", if (s) "__modti3" else "__umodti3", &.{ l, r }, rt_ty, rem);
