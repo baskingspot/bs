@@ -340,6 +340,7 @@ pub fn deinit(e: *Encoder) void {
     e.relaxed.deinit(e.gpa);
     e.lines.deinit(e.gpa);
     e.line_events.deinit(e.gpa);
+    e.* = undefined;
 }
 
 /// A line row at the current offset (see `Atom.LineProgram.addRow`).

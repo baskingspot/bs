@@ -120,6 +120,7 @@ pub const Scratch = struct {
         s.cands.deinit(gpa);
         s.undo.deinit(gpa);
         s.saved_exits.deinit(gpa);
+        s.* = undefined;
     }
 };
 

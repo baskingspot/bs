@@ -4404,6 +4404,7 @@ pub const GlobalAsm = struct {
 
     pub fn deinit(g: *GlobalAsm) void {
         g.cg.e.deinit();
+        g.* = undefined;
     }
 
     pub fn statement(g: *GlobalAsm, line: []const u8) Error!void {

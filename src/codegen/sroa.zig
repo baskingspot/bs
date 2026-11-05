@@ -42,6 +42,7 @@ pub const Scratch = struct {
         s.ins.deinit(gpa);
         s.events.deinit(gpa);
         s.seeds.deinit(gpa);
+        s.* = undefined;
     }
 };
 

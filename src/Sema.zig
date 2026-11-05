@@ -248,7 +248,7 @@ const InstMap = struct {
 
     fn deinit(m: *InstMap, gpa: Allocator) void {
         gpa.free(m.items);
-        m.* = .{};
+        m.* = undefined;
     }
 
     fn get(m: *const InstMap, inst: Zir.Inst.Index) ?Ref {
@@ -402,6 +402,7 @@ pub const Block = struct {
             m.results.deinit(gpa);
             m.brs.deinit(gpa);
             m.srcs.deinit(gpa);
+            m.* = undefined;
         }
     };
 
@@ -17857,6 +17858,7 @@ const SwitchSeen = struct {
     fn deinit(s: *SwitchSeen, gpa: Allocator) void {
         s.values.deinit(gpa);
         s.ranges.deinit(gpa);
+        s.* = undefined;
     }
 };
 

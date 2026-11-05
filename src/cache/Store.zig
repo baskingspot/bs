@@ -495,6 +495,7 @@ pub const Batch = struct {
     pub fn deinit(b: *Batch, gpa: Allocator) void {
         b.bytes.deinit(gpa);
         b.index.deinit(gpa);
+        b.* = undefined;
     }
 
     /// Adds an entry and returns its offset in the batch. In the pack
@@ -599,6 +600,7 @@ pub const PackWriter = struct {
     /// Discards the pack, unless `commitPack` placed it.
     pub fn deinit(w: *PackWriter, io: Io) void {
         w.af.deinit(io);
+        w.* = undefined;
     }
 };
 

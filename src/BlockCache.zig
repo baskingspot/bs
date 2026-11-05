@@ -44,6 +44,7 @@ pub fn deinit(c: *BlockCache) void {
         }
     }
     c.cached = 0;
+    c.* = undefined;
 }
 
 /// The class of a block of `len` bytes, or null if the child serves it

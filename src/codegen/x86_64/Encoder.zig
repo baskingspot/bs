@@ -190,6 +190,7 @@ pub fn deinit(e: *Encoder) void {
     e.saved.deinit(e.gpa);
     e.deltas.deinit(e.gpa);
     e.line_events.deinit(e.gpa);
+    e.* = undefined;
 }
 
 /// Patches branches to labels and jump table entries. Every label must be

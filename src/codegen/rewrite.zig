@@ -101,6 +101,7 @@ pub const Scratch = struct {
     pub fn deinit(s: *Scratch, gpa: Allocator) void {
         s.words.deinit(gpa);
         s.brs.deinit(gpa);
+        s.* = undefined;
     }
 };
 

@@ -180,6 +180,7 @@ pub fn load(gpa: Allocator, contents: []const u8, target: Version, arch: Arch) E
 
 pub fn deinit(g: *Glibc) void {
     g.arena.deinit();
+    g.* = undefined;
 }
 
 /// The dynamic tables of an executable that imports `imports` from glibc

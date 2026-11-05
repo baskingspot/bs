@@ -590,6 +590,7 @@ pub fn deinit(emit: *Emit) void {
         gpa.destroy(pool);
     }
     emit.arena.deinit();
+    emit.* = undefined;
 }
 
 /// Ends the worker threads once they finished the jobs left, which frees

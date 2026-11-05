@@ -402,6 +402,7 @@ const SymbolMap = struct {
 
     fn deinit(m: *SymbolMap, gpa: Allocator) void {
         gpa.free(m.slots);
+        m.* = undefined;
     }
 
     fn get(m: *const SymbolMap, key: Hash) ?u32 {
@@ -712,6 +713,7 @@ const Overlay = struct {
             gpa.free(g.fresh);
         }
         if (o.base_link_names) |n| gpa.free(n);
+        o.* = undefined;
     }
 };
 
@@ -1445,6 +1447,7 @@ const FileTable = struct {
         var it = ft.map.keyIterator();
         while (it.next()) |k| gpa.free(k.*);
         ft.map.deinit(gpa);
+        ft.* = undefined;
     }
 
     /// The index of `path`, which becomes `next` if it is new.
@@ -1521,6 +1524,7 @@ pub const Delta = struct {
         d.scratch_files.deinit(gpa);
         d.scratch_names.deinit(gpa);
         d.scratch_targets.deinit(gpa);
+        d.* = undefined;
     }
 
     /// Replaces a node's state after it was analyzed again. Its key stays.
@@ -1814,6 +1818,7 @@ pub const Builder = struct {
         b.symbol_keys.deinit(gpa);
         b.symbol_map.deinit(gpa);
         b.added.deinit(gpa);
+        b.* = undefined;
     }
 
     /// Starts from `base` with its log applied. `base` must stay open while

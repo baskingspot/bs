@@ -416,6 +416,7 @@ pub fn deinit(fe: *Frontend) void {
     for (&fe.caches) |*c| if (c.*) |*cd| cd.deinit(gpa, fe.io);
     for (fe.late_errors.items) |*b| b.deinit(gpa);
     fe.late_errors.deinit(gpa);
+    fe.* = undefined;
 }
 
 fn freeFile(gpa: Allocator, io: Io, f: *File) void {
@@ -626,6 +627,7 @@ pub const OldZir = struct {
 
     pub fn deinit(o: *OldZir, fe: *const Frontend) void {
         if (o.mapping) |*m| m.destroy(fe.io) else o.zir.deinit(fe.gpa);
+        o.* = undefined;
     }
 };
 
@@ -705,6 +707,7 @@ const CacheDir = struct {
     fn deinit(cd: *CacheDir, gpa: Allocator, io: Io) void {
         gpa.free(cd.index_bytes);
         cd.dir.close(io);
+        cd.* = undefined;
     }
 
     /// Deletes the ZIR that the index on disk does not name and that is
@@ -1225,6 +1228,7 @@ const Loader = struct {
         l.jobs.deinit(gpa);
         l.probe.deinit(gpa);
         l.lower.deinit(gpa);
+        l.* = undefined;
     }
 
     /// Returns the job for a file, creating and queueing it if it is new.
@@ -2092,6 +2096,7 @@ test "reuses cached ZIR, drops stale guessed imports, and reports errors in cach
         fn deinit(r: *Self) void {
             r.errors.deinit();
             r.fe.deinit();
+            r.* = undefined;
         }
 
         fn errorCount(r: *Self) !u32 {

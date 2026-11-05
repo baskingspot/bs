@@ -57,6 +57,7 @@ pub const InstMaps = struct {
         var it = im.maps.valueIterator();
         while (it.next()) |m| if (m.*) |*map| map.deinit(gpa);
         im.maps.deinit(gpa);
+        im.* = undefined;
     }
 };
 
@@ -193,6 +194,7 @@ const NameIndex = struct {
         var it = ni.by.valueIterator();
         while (it.next()) |v| v.deinit(gpa);
         ni.by.deinit(gpa);
+        ni.* = undefined;
     }
 
     fn get(ni: *NameIndex, gpa: Allocator, zir: *const Zir, container: Zir.Inst.Index) !*const std.StringHashMapUnmanaged(bool) {

@@ -579,6 +579,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.file_root_types.deinit(gpa);
     zcu.ip.deinit();
     zcu.arena.deinit();
+    zcu.* = undefined;
 }
 
 pub const tid: InternPool.Tid = .main;

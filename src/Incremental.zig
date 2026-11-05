@@ -1730,6 +1730,7 @@ pub const Recorder = struct {
         r.dependee_producer.deinit(gpa);
         gpa.free(r.unit_info);
         gpa.free(r.dependee_info);
+        r.* = undefined;
     }
 
     fn node(r: *Recorder, key: Hash, tag: Tag) !struct { u32, bool } {
@@ -1923,6 +1924,7 @@ pub const Keyer = struct {
     pub fn deinit(k: *Keyer) void {
         k.key_buf.deinit();
         k.unit_buf.deinit();
+        k.* = undefined;
     }
 
     pub fn keyOf(k: *Keyer, tag: Tag, parts: []const []const u8) !Hash {
@@ -3226,6 +3228,7 @@ const Graph = struct {
         g.freeTables();
         g.r.deinit();
         gpa.free(g.debug_of);
+        g.* = undefined;
     }
 
     /// Frees all but the nodes (with their `deps` and `atoms`) and the
@@ -4466,6 +4469,7 @@ const NewGraph = struct {
 
     fn deinit(g: *NewGraph, gpa: Allocator) void {
         gpa.free(g.written_at);
+        g.* = undefined;
     }
 
     fn next(g: *const NewGraph, gpa: Allocator, x: u32, out: *std.ArrayList(u32)) !void {

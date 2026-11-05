@@ -2515,6 +2515,7 @@ pub const SymbolTable = struct {
 
     pub fn deinit(t: *SymbolTable) void {
         if (t.entries.len != 0) std.heap.page_allocator.rawFree(std.mem.sliceAsBytes(t.entries), huge_page, @returnAddress());
+        t.* = undefined;
     }
 
     /// Faults in a partition's pages, writable, before it is used. Otherwise

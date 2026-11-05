@@ -258,6 +258,7 @@ pub fn deinit(f: *Ssa, gpa: Allocator) void {
     f.var_loads.deinit(gpa);
     f.var_load_loops.deinit(gpa);
     f.fills.deinit(gpa);
+    f.* = undefined;
 }
 
 pub fn blockInsts(f: *const Ssa, block: Block.Index) []const Inst.Index {
@@ -1113,6 +1114,7 @@ pub const Fills = struct {
         s.spans.deinit(gpa);
         s.pending.deinit(gpa);
         s.ok.deinit(gpa);
+        s.* = undefined;
     }
 
     const Pending = struct { block: u32, event: FillEvent };

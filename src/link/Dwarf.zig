@@ -383,6 +383,7 @@ fn skipString(bytes: []const u8, at: usize) usize {
 
 pub fn deinit(d: *Dwarf, gpa: Allocator) void {
     d.arena.promote(gpa).deinit();
+    d.* = undefined;
 }
 
 /// Whether there is debug info: an entry whose atom was kept.
@@ -632,6 +633,7 @@ pub const Chunk = struct {
         c.units.deinit(gpa);
         c.locals.deinit(gpa);
         c.local_starts.deinit(gpa);
+        c.* = undefined;
     }
 
     /// Bytes of the chunk's subprogram entries, range lists, line

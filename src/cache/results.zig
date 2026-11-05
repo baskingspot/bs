@@ -76,6 +76,7 @@ pub const Encoder = struct {
         e.starts.deinit(e.gpa);
         e.ids.deinit(e.gpa);
         e.scratch.deinit(e.gpa);
+        e.* = undefined;
     }
 
     /// The ref of `index`, encoding its closure first; null if it cannot be

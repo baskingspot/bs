@@ -359,6 +359,7 @@ pub const RelocList = struct {
     pub fn deinit(l: *RelocList, gpa: std.mem.Allocator) void {
         l.targets.deinit(gpa);
         l.relocs.deinit(gpa);
+        l.* = undefined;
     }
 
     pub fn append(l: *RelocList, gpa: std.mem.Allocator, offset: u32, kind: Reloc.Kind, target: SymbolKey, addend: i64) !void {
@@ -567,6 +568,7 @@ pub const LineProgram = struct {
     pub fn deinit(lp: *LineProgram, gpa: std.mem.Allocator) void {
         lp.bytes.deinit(gpa);
         lp.patches.deinit(gpa);
+        lp.* = undefined;
     }
 
     /// Makes the rows after it come from local file index `file`, with
