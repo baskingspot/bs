@@ -270,7 +270,10 @@ class Gen:
             return self.splat(t, f"cv({t.elem()}, in[{self.r.randrange(64)}])")
         if c < 0.8 and (t.kind == "float" or t.kind == "int" and t.bits in (8, 16, 32, 64)):
             off = self.r.randrange(0, 256)
-            return f"@as(*align(1) const {self.alias(t)}, @ptrCast(&bytes[{off}])).*"
+            ld = f"@as(*align(1) const {self.alias(t)}, @ptrCast(&bytes[{off}])).*"
+            # Adding zero quiets a signaling NaN, which @min/@max and
+            # @reduce(.Min/.Max) would treat differently by lane order.
+            return f"({ld} + {self.splat(t, '0.0')})" if t.kind == "float" else ld
         # A comptime-known operand.
         nm = self.fresh("k")
         self.emit(f"const {nm} = {self.vec_lit(t)};")
@@ -422,7 +425,8 @@ class Gen:
             return f"@as({V}, @floatFromInt({self.vexpr(src, d - 1)}))"
         if c == 10 and self.chance(0.3):
             src = VT("int", t.n, fb, self.chance(0.5))
-            return f"@as({V}, @bitCast({self.vexpr(src, d - 1)}))"
+            # Adding zero quiets a signaling NaN (see `leaf`).
+            return f"(@as({V}, @bitCast({self.vexpr(src, d - 1)})) + @as({V}, @splat(0.0)))"
         return self.shuffle_expr(t, d)
 
     def op_bool(self, t, d):
