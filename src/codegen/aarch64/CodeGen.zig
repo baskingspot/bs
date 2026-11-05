@@ -3540,6 +3540,7 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         } else {
             const reg_name = regConstraint(constraint) orelse return cg.fail("asm output constraint '{s}'", .{full});
             out_reg.* = .{ .gpr = (parseReg(reg_name) orelse return cg.fail("unknown register in asm constraint '{s}'", .{full})).reg };
+            try names.put(cg.gpa, ip.stringSlice(out.name), .{ .reg = out_reg.gpr });
         }
         if (read) {
             if (out.operand == .none) return cg.fail("asm output constraint '{s}'", .{full});
@@ -3586,6 +3587,7 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         } else if (regConstraint(constraint)) |reg_name| {
             const reg = parseReg(reg_name) orelse return cg.fail("unknown register '{s}' in asm constraint", .{reg_name});
             try cg.load(reg.reg, in.operand);
+            try names.put(cg.gpa, ip.stringSlice(in.name), .{ .reg = reg.reg });
         } else if (std.mem.eql(u8, constraint, "X") or std.mem.eql(u8, constraint, "i") or std.mem.eql(u8, constraint, "n") or std.mem.eql(u8, constraint, "N")) {
             const arg: AsmArg = switch (try cg.locOf(in.operand)) {
                 .imm => |v| .{ .imm = @bitCast(v) },
@@ -4014,6 +4016,26 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             .imm => |v| e.movImm(d.width, d.reg, @bitCast(v)),
             else => cg.asmUnsupported(line),
         };
+    }
+    if (std.mem.startsWith(u8, mnemonic, "crc32")) crc: {
+        // crc32{,c}{b,h,w,x} wd, wn, (wm or xm for x)
+        if (!cg.emit.zcu.cpu.has(.aarch64, .crc)) return cg.fail("inline assembly instruction '{s}' needs the target CPU feature 'crc', as upstream's assembler does", .{line});
+        const rest = mnemonic[5..];
+        const c = rest.len == 2 and rest[0] == 'c';
+        if (rest.len != @as(usize, 1) + @intFromBool(c)) break :crc;
+        const sz: u32 = switch (rest[rest.len - 1]) {
+            'b' => 0,
+            'h' => 1,
+            'w' => 2,
+            'x' => 3,
+            else => break :crc,
+        };
+        const d = reg(ops, 0) orelse return cg.asmUnsupported(line);
+        const n = reg(ops, 1) orelse return cg.asmUnsupported(line);
+        const m = reg(ops, 2) orelse return cg.asmUnsupported(line);
+        if (ops.len != 3 or d.width != .w or n.width != .w or m.width != (if (sz == 3) Encoder.Width.x else Encoder.Width.w)) return cg.asmUnsupported(line);
+        const sf: u32 = if (sz == 3) 1 << 31 else 0;
+        return e.raw(sf | 0x1ac04000 | @as(u32, @intFromBool(c)) << 12 | sz << 10 | @as(u32, @backingInt(m.reg)) << 16 | @as(u32, @backingInt(n.reg)) << 5 | @backingInt(d.reg));
     }
     if (eql(u8, mnemonic, "stp") or eql(u8, mnemonic, "ldp")) {
         const r1 = reg(ops, 0) orelse return cg.asmUnsupported(line);
