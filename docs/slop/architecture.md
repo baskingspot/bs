@@ -3000,7 +3000,12 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
   LC_MAIN carries `Options.stack_size` (16 MiB unless `-stack` says
   otherwise), as upstream writes it: the kernel gives the main thread
   that stack instead of RLIMIT_STACK's 8 MiB, as PT_GNU_STACK does
-  through std's start code on Linux.
+  through std's start code on Linux. The entry may be an alias, as in
+  ELF: C's `main` inside its object's `__text` atom (`bs.entry`, which
+  `Emit.finish` makes when `main` is not at offset 0, as in a
+  `-fsanitize-c=trap` or ReleaseSafe object) starts at the target's
+  address plus the addend, keyed or numbered (2026-11-05; before, such
+  a C-only aarch64-macos link failed with UndefinedSymbol).
   Thread-locals follow ld64: `.tdata` and `.tbss` atoms make up the
   template dyld copies per thread (__thread_data, then the zero-fill
   __thread_bss, its start aligned for both), and each gets a 24-byte

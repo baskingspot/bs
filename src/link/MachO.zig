@@ -415,6 +415,16 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // Atom chunks, then debug chunks.
     const failures = try gpa.alloc(?Failure, @max(n_chunks + n_debug_chunks, n_partitions));
     defer gpa.free(failures);
+    // The entry may be an alias, an input's `main` inside its section's
+    // atom (`Emit.finish`): its target's atom, moved by its addend.
+    // A dylib has none.
+    const entry_alias: ?usize = if (options.dylib != null) null else if (numbered) |s| for (s.aliases, 0..) |a, i| {
+        if (a.symbol == s.entry) break i;
+    } else null else for (options.aliases, 0..) |a, i| {
+        if (a.key == options.entry) break i;
+    } else null;
+    const entry_key = if (entry_alias) |i| options.aliases[i].target else options.entry;
+    const entry_addend: i64 = if (entry_alias) |i| options.aliases[i].addend else 0;
     var l: Link = .{
         .gpa = gpa,
         .input = input,
@@ -430,6 +440,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .failures = failures,
         .numbered = numbered,
         .addrs = addrs,
+        .entry_number = if (numbered) |s| (if (entry_alias) |i| s.aliases[i].target else s.entry) else undefined,
     };
 
     @memset(failures, null);
@@ -503,7 +514,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var entry_index: usize = undefined;
     const dylib = options.dylib;
     if (numbered == null and dylib == null) {
-        entry_index = symbols.get(options.entry) orelse {
+        entry_index = symbols.get(entry_key) orelse {
             diag.* = .{ .target = options.entry };
             return error.UndefinedSymbol;
         };
@@ -989,7 +1000,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     w.put(macho.uuid_command{ .uuid = @splat(0) });
     const version = (@as(u32, @intCast(options.min_os.major)) << 16) | (@as(u32, @intCast(options.min_os.minor)) << 8) | @as(u32, @intCast(options.min_os.patch));
     w.put(macho.build_version_command{ .cmdsize = @sizeOf(macho.build_version_command), .platform = .MACOS, .minos = version, .sdk = version, .ntools = 0 });
-    if (dylib == null) w.put(macho.entry_point_command{ .entryoff = l.atomAddr(entry_index) - base, .stacksize = options.stack_size });
+    if (dylib == null) w.put(macho.entry_point_command{ .entryoff = @intCast(@as(i64, @intCast(l.atomAddr(entry_index) - base)) + entry_addend), .stacksize = options.stack_size });
     w.putWithString(macho.dylib_command{ .cmd = .LOAD_DYLIB, .cmdsize = dylib_cmd_size, .dylib = .{
         .name = @sizeOf(macho.dylib_command),
         .timestamp = 2,
@@ -1333,9 +1344,11 @@ fn LinkOf(comptime Input: type) type {
         numbered: ?Symbols,
         /// With numbered symbols, the address table (see `unset`).
         addrs: []u32,
-        /// With numbered symbols, the atom numbered `Symbols.entry`, found by
-        /// `resolveAddrsNumbered`.
+        /// With numbered symbols, the atom numbered `entry_number`
+        /// (`Symbols.entry`, or the alias's target if it is an alias), found
+        /// by `resolveAddrsNumbered`.
         entry_atom: ?usize = null,
+        entry_number: u32,
         /// The dSYM's DWARF file, if one is written, and the file offsets
         /// of its debug sections.
         has_dsym: bool = false,
@@ -1386,7 +1399,7 @@ fn LinkOf(comptime Input: type) type {
                 if (n.symbol >= l.addrs.len) return l.fail(chunk, i, error.InvalidSymbols, .{ .atom = l.input.atom(i).name });
                 l.addrs[n.symbol] = @intCast(l.atomAddr(i) - base_address);
                 // Numbers are distinct, so one chunk at most writes this.
-                if (n.symbol == s.entry) l.entry_atom = i;
+                if (n.symbol == l.entry_number) l.entry_atom = i;
             }
         }
 
@@ -2599,6 +2612,43 @@ test "an alias links as a reference to its target, with numbered symbols too" {
     var moved = aliases;
     moved[1].addend = 8;
     try std.testing.expectError(error.InvalidRelocation, emit(gpa, io, &atoms[0], .{ .entry = main, .imports = &imports, .values = &values, .aliases = &moved }));
+}
+
+test "an entry that is an alias starts at its target plus the addend, with numbered symbols too" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // A C `main` 4 bytes into its section's atom (`Emit.finish`'s
+    // `bs.entry`), after another function's `ret`.
+    const text_key: SymbolKey = .fromName("m.o:__text");
+    const entry: SymbolKey = .fromName("bs.entry");
+    const atoms = [_]Atom{.{ .key = text_key, .name = "__text", .section = .text, .alignment = .@"4", .bytes = "\xc0\x03\x5f\xd6\x1f\x20\x03\xd5" }};
+    const aliases = [_]Elf.Alias{.{ .key = entry, .target = text_key, .addend = 4 }};
+    const at_atom = try emit(gpa, io, &atoms, .{ .entry = text_key });
+    defer gpa.free(at_atom);
+    const keyed = try emit(gpa, io, &atoms, .{ .entry = entry, .aliases = &aliases });
+    defer gpa.free(keyed);
+    const numbered = try emit(gpa, io, &atoms, .{ .entry = entry, .aliases = &aliases, .symbols = .{
+        .atoms = &.{.{ .symbol = 0, .targets = 0 }},
+        .targets = &.{},
+        .aliases = &.{.{ .symbol = 1, .target = 0 }},
+        .entry = 1,
+        .len = 2,
+    } });
+    defer gpa.free(numbered);
+    try std.testing.expectEqual(entryOffset(at_atom) + 4, entryOffset(keyed));
+    try std.testing.expectEqualSlices(u8, keyed, numbered);
+}
+
+/// LC_MAIN's `entryoff` in executable `bytes`.
+fn entryOffset(bytes: []const u8) u64 {
+    const header = std.mem.bytesToValue(macho.mach_header_64, bytes[0..@sizeOf(macho.mach_header_64)]);
+    var at: usize = @sizeOf(macho.mach_header_64);
+    for (0..header.ncmds) |_| {
+        const lc = std.mem.bytesToValue(macho.load_command, bytes[at..][0..@sizeOf(macho.load_command)]);
+        if (lc.cmd == .MAIN) return std.mem.bytesToValue(macho.entry_point_command, bytes[at..][0..@sizeOf(macho.entry_point_command)]).entryoff;
+        at += lc.cmdsize;
+    }
+    unreachable;
 }
 
 test "gives each thread its own thread-locals from __thread_data and __thread_bss" {
