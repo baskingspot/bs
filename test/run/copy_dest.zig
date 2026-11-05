@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "16932\n47532\n48232\n78132\n1632\n327828\n16932\n22730\n7620\n78134\n2496\n2983\n"
+//! stdout: "16932\n47532\n48232\n78132\n1632\n327828\n16932\n22730\n7620\n78134\n2496\n2983\n2496\n48237\n"
 //! A large load whose only user is a store, or a call, is copied straight
 //! from its memory to the destination when nothing between them writes
 //! memory, also across a bounds check, if the destination is the source or
@@ -111,6 +111,18 @@ noinline fn passChecked(i: usize) u64 {
     return sum(c) +% arr[(i + 1) % 8].a[2];
 }
 
+/// Copies from what a parameter points to into a global the parameter
+/// may overlap, and into a local, which it cannot.
+noinline fn paramToGlobal(q: *const C) void {
+    const p: *C = @ptrCast(&words[2]);
+    p.* = q.*;
+}
+noinline fn paramToLocal(q: *const C) u64 {
+    var c = q.*;
+    c.a[0] +%= 5;
+    return sum(c);
+}
+
 fn main() callconv(.c) noreturn {
     for (&arr, 0..) |*c, i| fill(c, 100 * i);
     fill(&g, 7);
@@ -136,5 +148,9 @@ fn main() callconv(.c) noreturn {
     out(wordSum());
     overlapCopy(0, 3);
     out(wordSum());
+    for (&words, 0..) |*x, i| x.* = i + 1;
+    paramToGlobal(@ptrCast(&words[0]));
+    out(wordSum());
+    out(paramToLocal(&arr[3]));
     rt.exit(0);
 }

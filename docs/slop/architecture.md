@@ -2807,7 +2807,12 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      load of a value in memory whose only user is a later `.auto` call, or
      the `ret` of a function returning through memory, in the same block,
      with nothing between that writes memory, is read in place by the call
-     or `ret` (`Home.deferred`), and its pointer lives until then.
+     or `ret` (`Home.deferred`), and its pointer lives until then. So is
+     one whose only user is a store, copied straight from its memory, when
+     the store's destination is the source or cannot overlap it
+     (`sameOrDisjoint`): different locals or globals, or a local and
+     memory a pointer parameter points to, which existed before this
+     call's locals (`f(p: *T) { var x = p.*; ... }`).
    - Stored aggregates (`planDeferred`): an `aggregate_init` or
      `union_init` in memory whose only user is the store right after it
      is built in the stored-to memory (`in_place`); no element is read

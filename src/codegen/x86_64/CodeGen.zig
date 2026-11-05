@@ -3536,12 +3536,16 @@ fn sameOrDisjoint(cg: *CodeGen, a: Ref, b: Ref) bool {
     const ra = cg.ptrRoot(a);
     const rb = cg.ptrRoot(b);
     if (ra == .none or rb == .none) return false;
+    // A parameter points to memory that existed before this call's
+    // locals, and to any of it, globals included.
+    if (ra == .arg or rb == .arg) return ra == .alloc or rb == .alloc;
     return !std.meta.eql(ra, rb);
 }
 
 /// The object pointer `ref` points into, if `sameOrDisjoint` can tell:
-/// a local (an `alloc`) or a global variable or constant.
-const PtrRoot = union(enum) { none, alloc: u32, nav: InternPool.NavIndex, uav: Index };
+/// a local (an `alloc`), a global variable or constant, or some object
+/// a pointer parameter points into (`arg`).
+const PtrRoot = union(enum) { none, alloc: u32, nav: InternPool.NavIndex, uav: Index, arg };
 
 fn ptrRoot(cg: *CodeGen, ref: Ref) PtrRoot {
     const ir = cg.ir;
@@ -3575,6 +3579,20 @@ fn ptrRoot(cg: *CodeGen, ref: Ref) PtrRoot {
         const data = ir.instructions.items(.data)[@backingInt(i)];
         switch (ir.instructions.items(.tag)[@backingInt(i)]) {
             .alloc => return .{ .alloc = @backingInt(i) },
+            .arg => return .arg,
+            // A pointer parameter reloaded from the `*const` local Sema
+            // stores it in, right after the local.
+            .load => {
+                const a = data.ty_op.operand.toIndex() orelse return .none;
+                const ai = @backingInt(a);
+                const tags = ir.instructions.items(.tag);
+                const datas = ir.instructions.items(.data);
+                if (tags[ai] != .alloc or datas[ai].ty == .none or !Type.ptrInfo(ip, datas[ai].ty).flags.is_const) return .none;
+                if (ai + 1 >= tags.len or tags[ai + 1] != .store or datas[ai + 1].bin_op.lhs != a.toRef()) return .none;
+                const v = datas[ai + 1].bin_op.rhs.toIndex() orelse return .none;
+                if (tags[@backingInt(v)] != .arg) return .none;
+                cur = v.toRef();
+            },
             .struct_field_ptr => cur = ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand,
             .ptr_elem_ptr, .ptr_add => cur = ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs,
             else => return .none,
