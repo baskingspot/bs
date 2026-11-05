@@ -10,10 +10,16 @@ the evaluator taking every function after one walker run (`bs-eval1`,
 BS_COMPTIME_EVAL=1), so a finding says whether the walker or the
 evaluator is at fault.
 
+Each target given with --target is a leg of its own: both compilers
+build for it, and aarch64-linux binaries run under qemu's user-mode
+emulator (qemu-aarch64-static, or qemu-aarch64), so layouts, C ABI types
+and vector sizes that differ between targets are compared too.
+
     python3 tools/cthunt/hunt.py                   # hunt until interrupted
     python3 tools/cthunt/hunt.py --count 500       # 500 programs
     python3 tools/cthunt/hunt.py --one 1234        # one seed, with its outcomes
     python3 tools/cthunt/hunt.py --file p.zig      # one saved program
+    python3 tools/cthunt/hunt.py --target x86_64-linux --target aarch64-linux
 """
 
 import argparse
@@ -53,10 +59,20 @@ def log(msg):
     print(time.strftime("%H:%M:%S ") + msg, file=sys.stderr, flush=True)
 
 
+TARGETS = ("x86_64-linux", "aarch64-linux")
+
+
 class Tools:
-    def __init__(self, bs=None, zig=None):
+    def __init__(self, bs=None, zig=None, target="x86_64-linux"):
         self.bs = os.path.abspath(bs or os.path.join(REPO_DIR, "zig-out", "bin", "bs"))
         self.zig = zig or shutil.which("zig") or "zig"
+        self.target = target
+        # Same CPU as tools/conformance/run.py's aarch64-linux leg.
+        qemu = shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64") or "qemu-aarch64"
+        self.runner = [] if target == "x86_64-linux" else [qemu, "-cpu", "cortex-a53"]
+
+    def leg(self, target):
+        return Tools(self.bs, self.zig, target)
 
 
 class Build:
@@ -132,6 +148,7 @@ def compile_run(tools, cfg, src, scratch):
         argv = [tools.bs, "build-exe", src, f"-femit-bin={out}"]
     else:
         argv = [tools.zig, "build-exe", src, f"-femit-bin={out}", "--cache-dir", os.path.join(scratch, "zc")]
+    argv += ["-target", tools.target]
     try:
         p = subprocess.run(
             argv,
@@ -164,7 +181,7 @@ def compile_run(tools, cfg, src, scratch):
         return Build("error", text, errors=ids)
     try:
         r = subprocess.run(
-            [out],
+            [*tools.runner, out],
             check=False,
             capture_output=True,
             text=True,
@@ -360,9 +377,12 @@ def test_kind(src_text, tid):
 
 def save(seed, src_text, tools, up, res, cls, tid, bad, msg, size, only, from_file):
     kind = test_kind(src_text, tid) if tid is not None else "-"
+    # A finding on the default target keeps its old signature and name.
+    leg = "" if tools.target == "x86_64-linux" else f"{tools.target}:"
+    sig = f"{leg}{cls}|{kind}|{','.join(bad)}|{re.sub(r'[0-9]+', 'N', msg)}"
     if seed == 0 and from_file and not SAVE[0]:
-        return {"dir": "", "sig": f"{cls}|{kind}|{','.join(bad)}|{re.sub(r'[0-9]+', 'N', msg)}"}
-    name = f"{cls}-{seed}" + (f"-t{tid}" if tid is not None else "")
+        return {"dir": "", "sig": sig}
+    name = leg.replace(":", "-") + f"{cls}-{seed}" + (f"-t{tid}" if tid is not None else "")
     d = os.path.join(FOUND, name)
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "orig.zig"), "w") as f:
@@ -370,9 +390,9 @@ def save(seed, src_text, tools, up, res, cls, tid, bad, msg, size, only, from_fi
     if tid is not None and not from_file:
         with open(os.path.join(d, "test.zig"), "w") as f:
             f.write(gen.generate(seed, size, {tid}))
-    sig = f"{cls}|{kind}|{','.join(bad)}|{re.sub(r'[0-9]+', 'N', msg)}"
     meta = {
         "seed": seed,
+        "target": tools.target,
         "class": cls,
         "test": tid,
         "kind": kind,
@@ -399,6 +419,12 @@ def main():
     ap.add_argument("--count", type=int, help="stop after this many programs")
     ap.add_argument("--hours", type=float, help="stop after this long")
     ap.add_argument("--size", type=float, default=1.0, help="tests per program factor")
+    ap.add_argument(
+        "--target",
+        action="append",
+        choices=TARGETS,
+        help="target to build for (repeatable, one leg each; default x86_64-linux)",
+    )
     ap.add_argument("--one", type=int, help="check one seed and print its record")
     ap.add_argument("--file", help="check one saved program and print its record")
     ap.add_argument(
@@ -410,17 +436,21 @@ def main():
     tools = Tools(args.bs, args.zig)
     if not os.path.exists(tools.bs):
         sys.exit(f"no bs at {tools.bs}")
+    legs = [tools.leg(t) for t in dict.fromkeys(args.target or ["x86_64-linux"])]
     if args.file:
-        print(json.dumps(check(0, tools, args.size, text=open(args.file).read()), indent=1))
+        for leg in legs:
+            print(json.dumps(check(0, leg, args.size, text=open(args.file).read()), indent=1))
         return
     if args.recheck:
         recheck(tools)
         return
     if args.one is not None:
-        print(json.dumps(check(args.one, tools, args.size), indent=1))
+        for leg in legs:
+            print(json.dumps(check(args.one, leg, args.size), indent=1))
         return
     seed = args.seed if args.seed is not None else random.randrange(1 << 40)
-    log(f"bs {tools.bs}, zig {tools.zig}, {args.jobs} workers, first seed {seed}")
+    targets = ", ".join(leg.target for leg in legs)
+    log(f"bs {tools.bs}, zig {tools.zig}, {targets}, {args.jobs} workers, first seed {seed}")
     start, t0 = seed, time.time()
     deadline = t0 + args.hours * 3600 if args.hours else None
     counts, sigs, why = {}, {}, {}
@@ -432,7 +462,8 @@ def main():
         while True:
             stop = (args.count is not None and seed - start >= args.count) or (deadline and time.time() > deadline)
             while not stop and len(pending) < args.jobs * 2:
-                pending.add(pool.submit(check, seed, tools, args.size))
+                for leg in legs:
+                    pending.add(pool.submit(check, seed, leg, args.size))
                 seed += 1
             if not pending:
                 break
@@ -456,12 +487,12 @@ def main():
                         log(f"seed {rec['seed']}: NEW {f['sig']} -> {os.path.relpath(f['dir'], REPO_DIR)}")
             if time.time() - last > 60:
                 last = time.time()
-                log(summary(seed - start - len(pending), t0, counts, tests, accepted, rejected, sigs, why))
+                log(summary(seed - start - len(pending) // len(legs), t0, counts, tests, accepted, rejected, sigs, why))
     except KeyboardInterrupt:
         log("interrupted")
     finally:
         pool.shutdown(cancel_futures=True)
-        log(summary(seed - start - len(pending), t0, counts, tests, accepted, rejected, sigs, why))
+        log(summary(seed - start - len(pending) // len(legs), t0, counts, tests, accepted, rejected, sigs, why))
         for s, n in sorted(sigs.items(), key=lambda kv: -kv[1]):
             log(f"  {n:4d}  {s}")
 
@@ -479,7 +510,9 @@ def recheck(tools):
         )
         if prog is None:
             continue
-        rec = check(0, tools, text=open(prog).read(), save_findings=False)
+        meta = os.path.join(d, "meta.json")
+        target = json.load(open(meta)).get("target", "x86_64-linux") if os.path.exists(meta) else "x86_64-linux"
+        rec = check(0, tools.leg(target), text=open(prog).read(), save_findings=False)
         sigs = sorted({f["sig"] for f in rec["findings"]})
         print(f"{name}: {'STILL ' + '; '.join(sigs) if sigs else 'fixed (' + rec['result'] + ')'}", flush=True)
 

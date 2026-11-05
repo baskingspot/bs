@@ -17,6 +17,15 @@ python3 tools/cthunt/hunt.py --recheck           # rerun every saved finding
 python3 tools/cthunt/gen.py 1234 > p.zig         # just the program
 ```
 
+## Targets
+
+`--target` (repeatable) picks the targets to build for, one leg each;
+the default is x86_64-linux. An aarch64-linux leg runs its binaries
+under qemu's user-mode emulator (`qemu-aarch64-static`, which
+`.agents/setup` installs, or `qemu-aarch64`), as tools/conformance does.
+A finding on another target than x86_64-linux names it in its
+signature and directory.
+
 ## Programs
 
 A program is 8 to 16 independent tests. Each is a declaration `tN`
@@ -53,7 +62,9 @@ enums, unions and tuples rebuilt from `@typeInfo` (`t_reify`); tuples
 `@memmove`/`@memset` and reinterpreting bytes through pointers
 (`t_ptr_arith`); `inline else` over unions, enums, error sets and ranges
 (`t_inline_switch`); recursive functions and types (`t_recursion`); and
-destructuring of comptime-built tuples (`t_destructure`). A test is a
+destructuring of comptime-built tuples (`t_destructure`); and
+target-dependent layouts and C types: extern and packed structs of C
+integer types, `c_longdouble`, `u128` and vectors (`t_target`). A test is a
 constant printed by `main`, or, for code that must run at run time
 (`t_destructure`'s runtime half), a function `main` calls.
 

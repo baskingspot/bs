@@ -2164,6 +2164,67 @@ class Gen:
         out.append("};")
         return out, "any"
 
+    def t_target(self, name):
+        """Target-dependent layout and C types: sizes, alignments and
+        offsets of extern and packed structs holding C integer types,
+        c_longdouble, u128 and odd-length vectors, c_char's signedness,
+        and values of those types computed at comptime and read at run
+        time."""
+        ctys = [
+            "c_char",
+            "c_short",
+            "c_int",
+            "c_long",
+            "c_ulonglong",
+            "c_longdouble",
+            "u128",
+            "f16",
+            "usize",
+            "bool",
+        ]
+        vt = f"@Vector({self.r.randint(1, 7)}, {self.ch(['u8', 'u16', 'u32', 'f32', 'bool', 'u7'])})"
+        # f80 rarely: off x86_64 it is not extern compatible, which
+        # rejects the test.
+        fields = [self.ch(ctys) if self.p(0.95) else "f80" for _ in range(self.r.randint(1, 5))]
+        s = self.fresh("S")
+        out = [f"const {s} = extern struct {{ " + ", ".join(f"f{i}: {t}" for i, t in enumerate(fields)) + " };"]
+        res = [f"@sizeOf({s})", f"@alignOf({s})", f'@offsetOf({s}, "f{len(fields) - 1}")']
+        res += [
+            f"@sizeOf({vt})",
+            f"@alignOf({vt})",
+            "@typeInfo(c_char).int.signedness == .signed",
+            "@bitSizeOf(c_longdouble)",
+        ]
+        if self.p(0.5):
+            p = self.fresh("P")
+            pf = [self.ch(["c_char", "u3", "c_short", "i5", "u128"]) for _ in range(self.r.randint(1, 4))]
+            out.append(f"const {p} = packed struct {{ " + ", ".join(f"g{i}: {t}" for i, t in enumerate(pf)) + " };")
+            res += [f"@sizeOf({p})", f"@alignOf({p})", f"@bitSizeOf({p})"]
+        out.append(f"const {name} = blk: {{")
+        out.append(f"    var x: {s} = std.mem.zeroes({s});")
+        for i, t in enumerate(fields):
+            if t in ("c_longdouble", "f80", "f16"):
+                out.append(f"    x.f{i} = @as({t}, 1.0) / 3.0 + {self.r.randint(-9, 9)};")
+            elif t == "bool":
+                out.append(f"    x.f{i} = {self.ch(['true', 'false'])};")
+            else:
+                out.append(
+                    f"    x.f{i} = @as({t}, {self.r.randint(0, 100)}) -% {self.r.randint(0, 120)};"
+                    if t != "c_char"
+                    else f"    x.f{i} = @bitCast(@as(u8, {self.r.randint(0, 255)}));"
+                )
+        out.append(f"    const v: {vt} = @splat({self.ch(['true', 'false'] if 'bool' in vt else ['1', '0', '5'])});")
+        out.append(f"    const va: [@typeInfo({vt}).vector.len]@typeInfo({vt}).vector.child = v;")
+        res.append("va")
+        out.append("    const bytes = std.mem.asBytes(&x);")
+        out.append("    var sum: u64 = 0;")
+        out.append("    for (bytes) |b| sum = sum *% 31 +% b;")
+        res.append("sum")
+        res.append("@as(i16, @as(c_char, @bitCast(@as(u8, 200))))")
+        out.append("    break :blk .{ " + ", ".join(res) + " };")
+        out.append("};")
+        return out, "any"
+
     KINDS = (
         (t_arith, 5),
         (t_fn_eval, 4),
@@ -2194,6 +2255,7 @@ class Gen:
         (t_inline_switch, 2),
         (t_recursion, 2),
         (t_destructure, 3),
+        (t_target, 3),
     )
 
     def test(self, i):
