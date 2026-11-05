@@ -107,6 +107,9 @@ dylib_version: u32 = 0x10000,
 /// an import one of them exports binds to the first such, else to
 /// libSystem. `runpath`'s directories become LC_RPATHs.
 macho_libs: []const MachODylib = &.{},
+/// The diagnostic of a failed link that the compiler reports as an error
+/// (`linkFailed`), not on stderr.
+link_diagnostic: ?Diag.Diagnostic = null,
 /// `--stack`: the executable's main thread stack size.
 stack_size: u64 = 16 * 1024 * 1024,
 /// aarch64-macos: the minimum macOS, LC_BUILD_VERSION's.
@@ -1554,7 +1557,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         defer emit.gpa.free(imports);
         for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak };
         MachOObject.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .min_os = emit.macos_min, .values = emit.error_values.items, .exports = emit.exports.items, .imports = imports, .aliases = emit.aliases.items, .diag = &diag }) catch |err| {
-            std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
+            try emit.linkFailed(err, diag);
             return false;
         };
         return true;
@@ -1602,7 +1605,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
             try dylib_exports.append(emit.gpa, .{ .key = x.key, .name = x.name, .offset = x.offset, .weak = x.weak });
         const dylib: MachO.Dylib = .{ .install_name = emit.install_name orelse sub_path, .current_version = emit.dylib_version, .exports = dylib_exports.items };
         MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry orelse undefined, .dylib = if (emit.shared) &dylib else null, .libs = libs, .rpaths = rpaths.items, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = if (emit.strip) &.{} else emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .min_os = emit.macos_min, .sdk = emit.macos_sdk, .aliases = emit.aliases.items, .local_symbols = emit.input_symbols }) catch |err| {
-            std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
+            try emit.linkFailed(err, diag);
             return false;
         };
         return true;
@@ -1657,10 +1660,41 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     else
         Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, options);
     result catch |err| {
-        std.debug.print("error: link failed: {t} (atom '{s}' target {x})\n", .{ err, diag.atom, if (diag.target) |t| @backingInt(t) else 0 });
+        try emit.linkFailed(err, diag);
         return false;
     };
     return true;
+}
+
+/// Reports link error `err`: one a program can fix as `link_diagnostic`,
+/// the rest on stderr.
+fn linkFailed(emit: *Emit, err: anyerror, diag: Elf.Diagnostic) !void {
+    if (err == error.RelocationOverflow and diag.reloc == .aarch64_branch26) {
+        emit.link_diagnostic = try branchRangeDiagnostic(emit.allocator(), diag.atom, emit.symbolName(diag.target.?, diag.addend));
+        return;
+    }
+    std.debug.print("error: link failed: {t} (atom '{s}' target {x})\n", .{ err, diag.atom, if (diag.target) |t| @backingInt(t) else 0 });
+}
+
+/// An aarch64 branch whose target is out of its ±128 MiB reach, which
+/// lld and ld64 extend with thunks and bs does not.
+fn branchRangeDiagnostic(arena: Allocator, caller: []const u8, target: []const u8) !Diag.Diagnostic {
+    return .{
+        .code = .@"branch-range",
+        .loc = null,
+        .msg = try std.fmt.allocPrint(arena, "'{s}' calls '{s}', which is out of range: .text exceeds aarch64's \u{b1}128 MiB branch range, and bs adds no range-extension thunks", .{ caller, target }),
+        .hint = "upstream zig links it: its linker adds the thunks",
+    };
+}
+
+/// The name of what is `offset` bytes into the atom or import `key`, for
+/// messages: a C object's symbol there (not an aarch64 mapping symbol,
+/// `$x` or `$d`), else the atom's name, else its key.
+fn symbolName(emit: *Emit, key: SymbolKey, offset: i64) []const u8 {
+    for (emit.input_symbols) |s| if (s.atom == key and s.offset == offset and !std.mem.startsWith(u8, s.name, "$")) return s.name;
+    for (emit.atoms.items) |a| if (a.key == key and a.name.len > 0) return a.name;
+    for (emit.imports.keys()) |name| if (importKey(name) == key) return name;
+    return std.fmt.allocPrint(emit.allocator(), "{x:0>32}", .{@backingInt(key)}) catch "?";
 }
 
 /// The key of the 8-byte slot holding the address of external symbol
@@ -2489,6 +2523,20 @@ fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {
         .targets = try arena.dupe(SymbolKey, refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, refs.relocs.items),
     });
+}
+
+test "an aarch64 branch out of range is an error that names both symbols" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const d = try branchRangeDiagnostic(arena_state.allocator(), "call_far", "far_away");
+    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buf.deinit();
+    try Diag.render(&buf.writer, &.{d}, .json);
+    try std.testing.expectEqualStrings(
+        \\{"code":"branch-range","msg":"'call_far' calls 'far_away', which is out of range: .text exceeds aarch64's ±128 MiB branch range, and bs adds no range-extension thunks","hint":"upstream zig links it: its linker adds the thunks"}
+        \\{"summary":{"errors":1}}
+        \\
+    , buf.written());
 }
 
 test "a relink in the manifest's order reproduces the fresh link, with mixed alignments and duplicates" {

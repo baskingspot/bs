@@ -1069,7 +1069,10 @@ comptime arguments are run-time values in the lowered code (uucode's
   `mov r, fs:0; lea r, [r + sym@tpoff]`). New kinds are appended, since
   the cache stores kinds by number. Sections: text, rodata, data, bss,
   and thread-local tdata and tbss. aarch64 addresses: absolute 64-bit (data only; Mach-O
-  turns it into a fixup), branch26 (b, bl), page21 (adrp) with pageoff12
+  turns it into a fixup), branch26 (b, bl; a target beyond its ±128 MiB
+  is an `error[branch-range]` that names the caller and the target, since
+  bs adds no range-extension thunks: the largest program measured, the
+  zig compiler, has 48 MiB of aarch64 .text), page21 (adrp) with pageoff12
   (add, or a load or store whose access size the linker reads from the
   instruction), and their GOT forms, which reach an import's GOT slot and
   are relaxed to the symbol itself when it is defined in the image, and

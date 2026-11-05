@@ -92,6 +92,8 @@ pub const Code = enum(u16) {
     @"compile-log",
     @"undefined-symbol",
     @"naked-fn",
+    // The linkers.
+    @"branch-range",
 };
 
 /// A location, resolved for rendering.

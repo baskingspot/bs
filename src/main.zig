@@ -1444,7 +1444,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     stages.mark("cache record (after the link)");
     stages.print();
     if (stages.on) emit.codegen_stats.print("bs: codegen");
-    if (!linked) return .failed;
+    if (!linked) return if (emit.link_diagnostic) |d| .{ .errors = try dupeDiagnostics(arena, &.{d}) } else .failed;
     return .{ .ok = .{ .cache_hit = false, .at_alt = alt_path != null } };
 }
 

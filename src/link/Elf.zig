@@ -324,6 +324,10 @@ pub const Diagnostic = struct {
     atom: []const u8 = "",
     /// The undefined or overflowing target, if any.
     target: ?SymbolKey = null,
+    /// The overflowing relocation's kind and addend, if a relocation
+    /// overflowed.
+    reloc: ?Atom.Reloc.Kind = null,
+    addend: i32 = 0,
     /// The input index of the atom, the lowest one if several failed.
     index: ?usize = null,
 };
@@ -2823,7 +2827,7 @@ fn invalidReloc(a: *const Atom, diag: *Diagnostic) Error {
 }
 
 fn overflow(a: *const Atom, r: Atom.Reloc, diag: *Diagnostic) Error {
-    diag.* = .{ .atom = a.name, .target = a.targets[r.info.target] };
+    diag.* = .{ .atom = a.name, .target = a.targets[r.info.target], .reloc = r.info.kind, .addend = r.addend };
     return error.RelocationOverflow;
 }
 
@@ -4118,4 +4122,21 @@ fn testSymbolize(di: *std.debug.Dwarf, arena: Allocator, addr: u64) !struct { na
     const sym = symbols.items[0];
     const loc = sym.source_location orelse return error.MissingDebugInfo;
     return .{ .name = sym.name orelse return error.MissingDebugInfo, .unit = sym.compile_unit_name.?, .file = loc.file_name, .line = loc.line, .column = loc.column };
+}
+
+test "an aarch64 branch out of range reports its caller, target and kind" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const main: SymbolKey = .fromName("main");
+    const far: SymbolKey = .fromName("far");
+    // `bl far+8`, with far 8 GiB up: beyond branch26's ±128 MiB.
+    const atoms = [_]Atom{
+        .{ .key = main, .name = "main", .section = .text, .alignment = .@"4", .bytes = &.{ 0, 0, 0, 0x94 }, .targets = &.{far}, .relocs = &.{.init(0, .aarch64_branch26, 0, 8)} },
+    };
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.RelocationOverflow, emit(gpa, io, &atoms, .{ .entry = main, .arch = .aarch64, .values = &.{.{ .key = far, .value = 1 << 33 }}, .diag = &diag }));
+    try std.testing.expectEqualStrings("main", diag.atom);
+    try std.testing.expectEqual(far, diag.target.?);
+    try std.testing.expectEqual(.aarch64_branch26, diag.reloc.?);
+    try std.testing.expectEqual(8, diag.addend);
 }

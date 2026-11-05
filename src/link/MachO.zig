@@ -1983,7 +1983,7 @@ fn LinkOf(comptime Input: type) type {
                 // end the atom.
                 const insn = if (width == 4) std.mem.readInt(u32, field[0..4], .little) else 0;
                 const invalid = error.InvalidRelocation;
-                errdefer diag.* = .{ .atom = a.name, .target = a.targets[r.info.target] };
+                errdefer diag.* = .{ .atom = a.name, .target = a.targets[r.info.target], .reloc = r.info.kind, .addend = r.addend };
                 switch (r.info.kind) {
                     .aarch64_branch26 => {
                         const s = switch (t.kind) {
