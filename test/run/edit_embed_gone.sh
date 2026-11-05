@@ -31,7 +31,9 @@ build() {
         [ -n "$2" ] || fail "$1: compiled"
         [ "$(./out)" = "$2" ] || fail "$1: wrong output"
     else
-        [ -z "$2" ] && grep -q 'failed opening "string.txt": FileNotFound' log || fail "$1"
+        if [ -n "$2" ] || ! grep -q 'failed opening "string.txt": FileNotFound' log; then
+            fail "$1"
+        fi
     fi
 }
 write string
