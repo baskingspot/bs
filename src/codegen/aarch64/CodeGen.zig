@@ -2573,7 +2573,16 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const src_ty = cg.typeOf(data.ty_op.operand);
             // Its operand's memory (`Home.result`).
             if (cg.homes[@backingInt(inst)] == .result) return;
-            if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(src_ty)) and Type.isInt(ip, ty)) return cg.genWide(inst, tag, data);
+            if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(src_ty)) and Type.isInt(ip, ty)) {
+                // A wide integer truncated to a register: its low limb.
+                if (tag != .bitcast and cg.passInRegs(ty) and Type.isInt(ip, src_ty)) {
+                    const d = cg.resultReg(inst, .x9);
+                    try cg.loadLimb(d, try cg.wideVal(data.ty_op.operand), 0);
+                    try cg.normalize(d, ty);
+                    return cg.setResult(inst, ty, d);
+                }
+                return cg.genWide(inst, tag, data);
+            }
             const size = Type.abiSize(ip, ty);
             const src_size = Type.abiSize(ip, src_ty);
             // A vector in a register from an array or vector of its size.
@@ -5617,6 +5626,113 @@ fn mulLimbs(cg: *CodeGen, dst: Mem, lhs: Mem, rhs: Mem, n: u32) Error!void {
     }
 }
 
+/// How a factor of a two-limb product extends its low limb into the high
+/// one: with zeros, with its sign, or both, when the low limb's top bit is
+/// clear. `imm` is the low limb of a constant.
+const Ext = struct { zero: bool, sign: bool, imm: ?u64 = null };
+
+/// The extension of product factor `ref`, when it is a constant or a
+/// widened integer of at most 64 bits.
+fn factorExt(cg: *CodeGen, ref: Ref) ?Ext {
+    const ip = cg.ip;
+    const ir = cg.ir;
+    if (ref.toInterned()) |v| {
+        if (ip.keyTag(v) != .int) return null;
+        return switch (ip.keyPayload(.int, v).storage) {
+            .u64 => |u| .{ .zero = true, .sign = u >> 63 == 0, .imm = u },
+            .i64 => |i| .{ .zero = i >= 0, .sign = true, .imm = @bitCast(i) },
+            .big => null,
+        };
+    }
+    const i = ref.toIndex().?;
+    if (ir.instructions.items(.tag)[@backingInt(i)] != .intcast) return null;
+    const src_ty = cg.typeOf(ir.instructions.items(.data)[@backingInt(i)].ty_op.operand);
+    if (Type.class(ip, src_ty) != .int) return null;
+    const info = Type.intInfo(ip, src_ty);
+    if (info.bits > 64) return null;
+    if (info.signedness == .signed) return .{ .zero = false, .sign = true };
+    return .{ .zero = true, .sign = info.bits < 64 };
+}
+
+/// `dst = lhs * rhs` for a two-limb product whose factors are extended
+/// 64-bit values (`factorExt`): one `mul` and one `umulh` or `smulh`, plus
+/// a correction of the high half when one factor is a zero-extended value
+/// with its top bit set and the other a sign-extended one. False, with
+/// nothing emitted, for other products. Uses x9-x13.
+fn mulWide(cg: *CodeGen, dst: Mem, lhs: Ref, rhs: Ref) Error!bool {
+    const e = &cg.e;
+    if (cg.limbCount(cg.typeOf(lhs)) != 2) return false;
+    const a = cg.factorExt(lhs) orelse return false;
+    const b = cg.factorExt(rhs) orelse return false;
+    for ([_]Reg{ .x9, .x10 }, [_]Ref{ lhs, rhs }, [_]Ext{ a, b }) |reg, ref, x| {
+        if (x.imm) |imm| try e.movImm(.x, reg, imm) else try cg.loadLimb(reg, try cg.wideVal(ref), 0);
+    }
+    const unsigned = a.zero and b.zero;
+    try e.mul(.x, .x11, .x9, .x10);
+    try e.mulHigh(!unsigned and a.sign and b.sign, .x12, .x9, .x10);
+    if (!unsigned and !(a.sign and b.sign)) {
+        // One factor is u (zero-extended, its top bit set or not), the
+        // other s (sign-extended): u * s is umulh(u, s) less u << 64 when
+        // s is negative.
+        const u: Reg, const s: Reg = if (a.zero) .{ .x9, .x10 } else .{ .x10, .x9 };
+        try e.logic(.@"and", .x, .x13, u, .{ .reg = .{ .reg = s, .shift = .asr, .amount = 63 } });
+        try e.addSub(.sub, .x, .x12, .x12, .r(.x13));
+    }
+    try cg.strLimb(dst, 0, .x11);
+    try cg.strLimb(dst, 1, .x12);
+    return true;
+}
+
+/// Shifts the wide integer `v` of type `ty` by the constant `k`, less
+/// than its width, into `dst`: each result limb combines at most two of
+/// `v`'s, or its extension past them. Uses x9 and x10.
+fn shiftWideConst(cg: *CodeGen, left: bool, dst: Mem, ty: Index, v: Val, k: u32) Error!void {
+    const e = &cg.e;
+    const n = cg.limbCount(ty);
+    const q = k / 64;
+    const r: u6 = @intCast(k % 64);
+    const s = cg.signed(ty);
+    for (0..n) |j| {
+        // Left shifts write the high limbs first and right shifts the low
+        // ones, so `dst` may be `v`'s memory.
+        const i: u32 = @intCast(if (left) n - 1 - j else j);
+        if (left) {
+            // (v[i-q] << r) | (v[i-q-1] >> (64 - r))
+            if (i < q) {
+                try cg.strLimb(dst, i, .zr);
+                continue;
+            }
+            try cg.loadLimb(.x9, v, i - q);
+            if (r != 0) {
+                try e.shiftImm(.lsl, .x, .x9, .x9, r);
+                if (i > q) {
+                    try cg.loadLimb(.x10, v, i - q - 1);
+                    try e.logic(.orr, .x, .x9, .x9, .{ .reg = .{ .reg = .x10, .shift = .lsr, .amount = @intCast(64 - @as(u7, r)) } });
+                }
+            }
+        } else {
+            // (v[i+q] >> r) | (v[i+q+1] << (64 - r)), limbs past n the
+            // extension.
+            if (i + q >= n and !s) {
+                try cg.strLimb(dst, i, .zr);
+                continue;
+            }
+            try cg.loadLimb(.x9, v, i + q);
+            if (r != 0) {
+                if (i + q + 1 < n or s) {
+                    try cg.loadLimb(.x10, v, i + q + 1);
+                    try e.shiftImm(.lsr, .x, .x9, .x9, r);
+                    try e.logic(.orr, .x, .x9, .x9, .{ .reg = .{ .reg = .x10, .shift = .lsl, .amount = @intCast(64 - @as(u7, r)) } });
+                } else {
+                    try e.shiftImm(.lsr, .x, .x9, .x9, r);
+                }
+            }
+        }
+        try cg.strLimb(dst, i, .x9);
+    }
+    try cg.normalizeWide(dst, ty);
+}
+
 fn mulLimbsLoop(cg: *CodeGen, dst: Mem, lhs: Mem, rhs: Mem, n: u32) Error!void {
     const e = &cg.e;
     const indexed = struct {
@@ -5753,13 +5869,17 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
         .mul_wrap => {
             const ty = cg.typeOf(data.bin_op.lhs);
             const dst = try cg.resultMem(inst, ty) orelse return;
-            try cg.mulLimbs(dst, (try cg.wideVal(data.bin_op.lhs)).loc.mem, (try cg.wideVal(data.bin_op.rhs)).loc.mem, cg.limbCount(ty));
+            if (!try cg.mulWide(dst, data.bin_op.lhs, data.bin_op.rhs)) {
+                try cg.mulLimbs(dst, (try cg.wideVal(data.bin_op.lhs)).loc.mem, (try cg.wideVal(data.bin_op.rhs)).loc.mem, cg.limbCount(ty));
+            }
             try cg.normalizeWide(dst, ty);
         },
         .shl, .shr => {
             const ty = cg.typeOf(data.bin_op.lhs);
             const dst = try cg.resultMem(inst, ty) orelse return;
-            try cg.shiftWide(tag == .shl, dst, ty, try cg.wideVal(data.bin_op.lhs), try cg.valOf(data.bin_op.rhs));
+            const v = try cg.wideVal(data.bin_op.lhs);
+            if (data.bin_op.rhs.toInterned()) |k| if (ip.keyTag(k) == .int) return cg.shiftWideConst(tag == .shl, dst, ty, v, @intCast(intBits(ip, k)));
+            try cg.shiftWide(tag == .shl, dst, ty, v, try cg.valOf(data.bin_op.rhs));
         },
         .not => {
             const ty = data.ty_op.ty;
