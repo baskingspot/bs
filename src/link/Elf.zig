@@ -1468,7 +1468,10 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     try l.put(0, head[0..headers_end]);
 
     const cfi_shdrs = [_]elf.Elf64.Shdr{
-        shdr(shName(".eh_frame"), .X86_64_UNWIND, .{ .ALLOC = true }, base, eh_off, eh_size, .@"8"),
+        // SHT_X86_64_UNWIND is x86_64's; other machines read the number
+        // as their own processor type (binutils then cannot tell the
+        // file's machine), so aarch64's is PROGBITS, as LLD writes it.
+        shdr(shName(".eh_frame"), if (options.arch == .aarch64) .PROGBITS else .X86_64_UNWIND, .{ .ALLOC = true }, base, eh_off, eh_size, .@"8"),
         shdr(shName(".eh_frame_hdr"), .PROGBITS, .{ .ALLOC = true }, base, hdr_off, hdr_size, .@"4"),
     };
     const debug_shdrs = [_]elf.Elf64.Shdr{
