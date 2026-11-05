@@ -40,6 +40,7 @@ const Emit = @import("../../Emit.zig");
 const Atom = @import("../../link/Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
+const vector = @import("vector.zig");
 const Ssa = @import("../Ssa.zig");
 const Reg = Encoder.Reg;
 const VReg = Encoder.VReg;
@@ -77,6 +78,8 @@ live: bool = false,
 ovf_cc: Cond = .vs,
 /// Emitting the cold blocks, after the others.
 in_cold: bool = false,
+/// The block being emitted.
+block: Ssa.Block.Index = .none,
 /// Per cold block, in `Ssa.order`, the debug state where it would have
 /// been emitted in place (as in the x86_64 backend).
 cold_starts: std.ArrayList(ColdStart) = .empty,
@@ -103,17 +106,17 @@ pub const Error = Allocator.Error || error{CodegenFail};
 
 /// A memory location: a register (sp, fp, or a scratch register holding a
 /// pointer) or a symbol's address, plus an offset.
-const Mem = struct {
+pub const Mem = struct {
     base: Base,
     off: i32,
 
     const Base = union(enum) { reg: Reg, sym: SymbolKey };
 
-    fn at(r: Reg, off: i32) Mem {
+    pub fn at(r: Reg, off: i32) Mem {
         return .{ .base = .{ .reg = r }, .off = off };
     }
 
-    fn sym(key: SymbolKey, off: i32) Mem {
+    pub fn sym(key: SymbolKey, off: i32) Mem {
         return .{ .base = .{ .sym = key }, .off = off };
     }
 
@@ -123,7 +126,7 @@ const Mem = struct {
         return m.off;
     }
 
-    fn plus(m: Mem, d: u64) Mem {
+    pub fn plus(m: Mem, d: u64) Mem {
         var r = m;
         r.off += @intCast(d);
         return r;
@@ -140,7 +143,7 @@ const Home = union(enum) {
 };
 
 /// Where an operand's value can be read.
-const Loc = union(enum) {
+pub const Loc = union(enum) {
     none,
     /// The value is stored in memory.
     mem: Mem,
@@ -390,7 +393,7 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
     return home;
 }
 
-fn fate(cg: *const CodeGen, inst: Inst.Index) Ssa.Fate {
+pub fn fate(cg: *const CodeGen, inst: Inst.Index) Ssa.Fate {
     return cg.ssa.live.items(.fate)[@backingInt(inst)];
 }
 
@@ -442,6 +445,7 @@ pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
             break :blk !cg.isFloat(ty) and !cg.isWideInt(ty) and cg.passInRegs(ty);
         },
         .is_err, .is_non_err, .is_null, .is_non_null => true,
+        .reduce => vector.fusable(cg, inst),
         else => false,
     };
 }
@@ -454,7 +458,7 @@ pub fn ovfFlagsOnly(_: *CodeGen, tag: Inst.Tag, bits: u16) bool {
 }
 
 /// The memory of a result slot.
-fn resultMem(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Mem {
+pub fn resultMem(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Mem {
     return switch (try cg.slotFor(inst, ty)) {
         .slot => |m| m,
         else => null,
@@ -797,11 +801,11 @@ fn setupParams(cg: *CodeGen) Error!void {
 // ---------------------------------------------------------------------------
 // Operands
 
-fn typeOf(cg: *CodeGen, ref: Ref) Index {
+pub fn typeOf(cg: *CodeGen, ref: Ref) Index {
     return cg.ir.typeOf(ref, cg.ip);
 }
 
-fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
+pub fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
     if (ref.toIndex()) |inst| return switch (cg.homes[@backingInt(inst)]) {
         .none => .none,
         .slot => |m| .{ .mem = m },
@@ -895,7 +899,7 @@ fn ptrToZeroBit(ip: *const InternPool, ptr: Index) bool {
 }
 
 /// The 64-bit extended bits of an integer value.
-fn intBits(ip: *const InternPool, val: Index) u64 {
+pub fn intBits(ip: *const InternPool, val: Index) u64 {
     if (ip.intValue(u64, val)) |v| return v;
     if (ip.intValue(i64, val)) |v| return @bitCast(v);
     unreachable; // wider than 64 bits; rejected before codegen
@@ -927,7 +931,7 @@ fn fitsOffset(off: i64, bytes: u32) bool {
 
 /// `m` as the operand of an access of `bytes` bytes, computing its address
 /// into `scratch` if no addressing form reaches it.
-fn access(cg: *CodeGen, m: Mem, bytes: u32, scratch: Reg) Error!Encoder.Mem {
+pub fn access(cg: *CodeGen, m: Mem, bytes: u32, scratch: Reg) Error!Encoder.Mem {
     switch (m.base) {
         .sym => |k| {
             try cg.e.loadAddr(scratch, k, m.off);
@@ -970,7 +974,7 @@ fn addrTo(cg: *CodeGen, reg: Reg, m: Mem) Error!void {
     }
 }
 
-fn load(cg: *CodeGen, reg: Reg, ref: Ref) Error!void {
+pub fn load(cg: *CodeGen, reg: Reg, ref: Ref) Error!void {
     try cg.loadVal(reg, try cg.valOf(ref));
 }
 
@@ -1002,7 +1006,7 @@ fn loadMem(cg: *CodeGen, reg: Reg, m: Mem, ty: Index) Error!void {
 }
 
 /// Stores the low `size` (1, 2, 4, or 8) bytes of `reg` to `m`. Uses x16.
-fn storeReg(cg: *CodeGen, m: Mem, reg: Reg, size: u64) Error!void {
+pub fn storeReg(cg: *CodeGen, m: Mem, reg: Reg, size: u64) Error!void {
     if (size == 0) return;
     assert(reg != .x16);
     try cg.e.str(sizeOf(size), reg, try cg.access(m, @intCast(size), .x16));
@@ -1140,7 +1144,7 @@ fn fillMem(cg: *CodeGen, dst: Mem, size: u64, byte: u8) Error!void {
 
 /// The memory holding value `ref`, materializing a constant into a
 /// scratch slot if needed.
-fn memOf(cg: *CodeGen, ref: Ref) Error!Mem {
+pub fn memOf(cg: *CodeGen, ref: Ref) Error!Mem {
     return cg.valMem(try cg.valOf(ref));
 }
 
@@ -1153,7 +1157,7 @@ fn valMem(cg: *CodeGen, v: Val) Error!Mem {
 
 /// Truncates the 64-bit value in `reg` to integer type `ty` and extends it
 /// back, so it is normalized.
-fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
+pub fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
     if (!Type.isInt(cg.ip, ty)) return; // bools stay 0 or 1
     const info = Type.intInfo(cg.ip, ty);
     if (info.bits >= 64) return;
@@ -1161,7 +1165,7 @@ fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
 }
 
 /// Stores value `inst` of type `ty`, computed in `reg`, to its slot.
-fn setResult(cg: *CodeGen, inst: Inst.Index, ty: Index, reg: Reg) Error!void {
+pub fn setResult(cg: *CodeGen, inst: Inst.Index, ty: Index, reg: Reg) Error!void {
     const m = try cg.resultMem(inst, ty) orelse return;
     try cg.storeReg(m, reg, Type.abiSize(cg.ip, ty));
 }
@@ -1310,6 +1314,7 @@ fn keepSymbols(cg: *CodeGen, inst: Inst.Index) Error!void {
 
 fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!void {
     cg.e.bind(cg.labels[@backingInt(block)]);
+    cg.block = block;
     for (cg.ssa.blockInsts(block)) |inst| {
         if (cg.fate(inst) != .dead) try cg.genInst(inst) else try cg.keepSymbols(inst);
     }
@@ -1422,11 +1427,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
     const tag = ir.instructions.items(.tag)[@backingInt(inst)];
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     try cg.checkNaked(tag);
+    if (vector.lowers(cg, inst)) return vector.gen(cg, inst, tag, data);
     switch (tag) {
         .arg => {},
         .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect, .comptime_exit => unreachable,
-        // Vector-only: `codegen/vector.zig` lowers no vector natively on
-        // aarch64 yet, so Sema scalarizes these.
+        // Vector-only, lowered in vector.zig.
         .cmp_vector, .reduce, .min_int, .max_int, .select, .shuffle => unreachable,
         .dbg_stmt => {
             cg.dbg_line = data.dbg_stmt.line;
@@ -2097,6 +2102,7 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Cond {
     const tag = cg.ir.instructions.items(.tag)[@backingInt(inst)];
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
     switch (tag) {
+        .reduce => return vector.condFlags(cg, inst),
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
             if (data.bin_op.lhs.toIndex()) |bit| if (cg.fate(bit) == .fused) {
                 // An overflow bit left in the flags.

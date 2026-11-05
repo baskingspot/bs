@@ -849,8 +849,8 @@ comptime arguments are run-time values in the lowered code (uucode's
   memory, vectors are laid out as upstream's x86_64 backend lays them
   out without AVX: bool vectors bit-packed (element i is bit i % 8 of
   byte i / 8), other vectors like arrays, aligned to 16.
-  aarch64-macos scalarizes every vector operation for now (no NEON
-  lowering yet) and uses the same layout, except that, as LLVM's layout
+  aarch64-macos lowers the same operations with NEON (see "Vectors")
+  and uses the same layout, except that, as LLVM's layout
   there, a vector is aligned to its bits in bytes rounded up to a power
   of two, at most 16, and its size rounds up to a power of two bytes
   (vectors of f80 or f128, soft floats there, are aligned and sized as
@@ -1391,8 +1391,9 @@ backend does, not scalarized. The split has three parts:
   safety checks, and the results are reassembled with `aggregate_init`.
   So an answer may change only together with the backend. Sema asks
   for `Zcu.cpu`: the `-mcpu` CPU on x86_64-linux, `apple_m1` on
-  aarch64-macos (main.zig), where it answers false until NEON lowering
-  lands, so its vectors stay scalarized.
+  aarch64-macos (main.zig). On aarch64 it answers by architecture alone,
+  since every ARMv8 core has NEON (f16 lanes, which need FEAT_FP16, are
+  not lanes).
 - **The IR**: the existing element-wise tags (`add_wrap`, `sub_wrap`,
   `mul_wrap`, `bit_and`, `bit_or`, `xor`, `not`, `add_float` ...
   `max_float`, `neg_float`, `abs_float`, `sqrt`, and `shl`/`shr` with a
@@ -1481,47 +1482,49 @@ f64 `@reduce(.Min/.Max/.Add/.Mul)` of 16 lanes in a mixed NaN, infinity
 and signed-zero test gives other bits than its own baseline build, which
 bs matches.
 
-**aarch64 NEON (planned, with the aarch64 backend).** `vector.native`
-keeps its target-neutral signature; its aarch64 arm (now `false`) gets
-its own answers next to the x86_64 ones, and the backend's lowering goes
-in `src/codegen/aarch64/vector.zig` behind the same CodeGen hooks
-(`lowers`, `deferOperands`, `gen`). The IR needs no change: a bool vector
-is an IR type, not a register layout. x86_64 keeps one as bits in a
-general register because `pmovmskb` is one instruction; NEON has no
-move-mask, so aarch64 keeps compare results as lane masks in a V
-register and makes bits only where they are read as bits (a bitcast to
-an integer or a store): `and` with lane weights and
-`addv`/`addp`, or `shrn` to a 64-bit nibble mask. `@reduce(.Or/.And)`
-of a compare reads the mask with `umaxv`/`uminv` and needs no bits, and
-`std.simd.firstTrue` is `shrn`, `rbit`, `clz`. So `max_bools` (64, a
-general register) is x86-only. NEON is also wider in places: `mul` on
-8-bit lanes, ordering compares (`cmgt`/`cmhi`) and `@min`/`@max` on all
-lane widths (64-bit through `cmgt` and `bsl`), and `tbl` for any byte
-shuffle. Float reductions stay left folds, as on x86_64.
+**aarch64 NEON.** `vector.native`'s aarch64 arm answers as x86_64's at
+SSE4.2 and adds `*` and `@reduce(.Mul)` on 8-bit lanes;
+`src/codegen/aarch64/vector.zig` lowers them behind one check at the top
+of `genInst` (`vector.lowers`, `vector.gen`) and the branch-fusion hooks
+(`fusable`, `condFlags`). The IR and memory layout are the same as on
+x86_64; bool vectors are bits in memory or a general register. Every
+value still lives in a stack slot there, and vectors stay memory class,
+so each operation loads its operands' 16-byte chunks into scratch V
+registers (v0–v7, v16–v19) with `ldr q` (a shorter vector with the load
+of its size, which zeroes the rest of the register), computes, and
+stores the result's chunks. Lanes: `add`, `sub`, `mul` (no 64-bit),
+`and`/`orr`/`eor`/`mvn`, `smin`/`umin` and `smax`/`umax` (64-bit lanes
+through `cmgt`/`cmhi` and `bsl`), `fadd` ... `fdiv`, `fneg`, `fabs`,
+`fsqrt`, and `fminnm`/`fmaxnm` (the scalar lowering's NaN rule).
+Compares (`cmeq`, `cmgt`, `cmhi`, `cmge`, `cmhs`, `fcmeq`, `fcmgt`,
+`fcmge`, operands swapped for `<`) give lane masks, gathered to bits by
+an `and` with each lane's bit and `addp`/`addv`; `@select` broadcasts the
+predicate's bits (`dup`), tests them (`cmtst`) and picks with `bsl`.
+`@reduce` sets the lanes past the length to the identity and uses
+`addv`, `umaxv`/`sminv`..., or halves combined with `ext`; `@shuffle` is
+`tbl` (then `tbx`) over at most four source chunks at a time with a
+constant byte index; `@splat` is `dup`; widening `@intCast` is
+`ushll`/`sshll` per doubling and `@truncate` a tree of `uzp1`; shifts by
+a splat are `shl`/`ushr`/`sshr` by an immediate, or `ushl`/`sshl` by the
+broadcast (negated) count. Fusions, when the operand is the reduce's
+only use and the value right before it in its block (no slot is taken
+between): `@reduce(.Or/.And)` of a compare reads the lane masks with
+`umaxv`/`uminv` and makes no bits, and the select of `firstTrue` and
+`lastTrue` (below) becomes `rbit`/`clz` of the predicate's bits. A
+reduce of bits that only its block's branch reads is fused into the
+branch, as on x86_64. Not yet: deferred (in-place) loads, and keeping
+vectors in V registers, which waits for register allocation there.
 
-What to lower first, by what the corpus and std run (ghostty's
-`terminal/stream.zig` escape scan, `simd/vt.zig`, and
-`terminal/snapshot/grid.zig`; std's `mem.indexOfScalarPos`,
-`splitScalar`, `tokenizeScalar`, `mem.eql` on bytes, `unicode`'s ASCII
-fast paths, `http.HeadParser`, `crypto.timing_safe.eql`, and ChaCha20,
-Salsa20, BLAKE3 and SHA-256 in TLS):
-
-1. 16-byte loads and stores, `@splat`, byte compares (`cmeq`, `cmhs`)
-   with `@reduce(.Or/.And)` and `firstTrue`/`lastTrue`, bitwise ops,
-   and bitcasts between 16-byte vectors, arrays and integers.
-2. 32-bit lanes: wrapping add, xor, `@shuffle` (`ext`, `rev64`, `tbl`)
-   for ChaCha20, Salsa20 and BLAKE3 rounds. Their rotates are shifts by
-   a splat, native on x86_64; NEON `shl`/`ushr`/`sri` (or `ushl`/`sshl`
-   by a register) lower the same `shl`/`shr`. SHA-256 on apple_m1 (which
-   has the sha2 feature) is inline assembly with `@Vector(4, u32)`
-   operands in V registers (`w` constraints); those operands already
-   work through memory, so this step only keeps them in registers.
-3. 16-bit lanes (UTF-16 ASCII checks, ghostty's surrogate test), and
-   `@truncate` of a vector to bytes (`xtn`; scalarized on both today).
-4. f32 lanes for graphics and linear-algebra code (none on the checked
-   corpus's hot paths): add, subtract, multiply, divide, `@min`/`@max`,
-   compares.
-5. 64-bit lanes (ghostty's `@Vector(2, u64)` style fills and masks).
+Measured on a Mac satellite (Apple M-series, mac.medium; ReleaseFast bs
+against the scalarizing parent, 64 MiB inputs, best of 5;
+2026-11-05), in ms: the ASCII decoder 46 against 690 (upstream Debug
+53, ReleaseSafe 4.3), `utf16LeToUtf8` 41 against 398 (39, 1.4),
+`mem.eql` 23 against 314 (285, 1.5), BLAKE3 1297 against 7368 (463,
+32), four `splitScalar` passes 271 against 2668 (242, 44), eight
+`indexOfScalarPos` passes 129 against 2691 (218, 10). What is left is
+mostly the slots: each operation's loads and stores, and vector copies
+through general registers. Compile time does not change (behavior, cache
+off: 0.33 s both).
 
 Narrow integers (`u4`, `i24`) sit in their ABI-size lane, extended as
 in memory, so the operations that keep lanes extended treat them as
@@ -1535,12 +1538,6 @@ least the last index) into a `bsf` of the predicate's bits, and
 `lastTrue`'s `.Max` with 0 into `bsr`. So `mem.indexOfScalarPos` and
 `splitScalar`, on `bs build`'s hot path, scan 16 bytes with
 `pcmpeqb`, `pmovmskb` and `bsf`, as upstream's Debug backend does.
-
-NEON maps onto the same interface: 128-bit `v` registers for vectors of
-up to 16 bytes, and the same chunking for longer ones. Its compares
-produce lane masks too, gathered to bits with a `ushr`/`addv` sequence
-(no `movemask`), and it orders 64-bit lanes natively (`cmgt`, `cmhi`),
-so its `native` answers may be broader than x86_64's.
 
 Measured (orb, 4 vCPU, ReleaseFast bs against main e89b24b,
 2026-11-04; best of 3):

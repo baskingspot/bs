@@ -117,15 +117,16 @@ pub const max_bools = 64;
 /// Whether the backend for `cpu` lowers `op` natively on vectors of type
 /// `ty` (the operands' type; for `select` and `shuffle` the result's).
 pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Index) bool {
-    switch (cpu.arch) {
-        .x86_64 => {},
-        // aarch64: none until the backend lowers NEON
-        // (docs/slop/architecture.md, "Vectors").
+    const neon = switch (cpu.arch) {
+        .x86_64 => false,
+        // Every ARMv8 core has NEON (Advanced SIMD); lanes of f16, which
+        // need FEAT_FP16, are not lanes here (`lane`).
+        .aarch64 => true,
         else => return false,
-    }
+    };
     // SSE4.2 orders 64-bit integers (pcmpgtq); SSE2 only in many
-    // instructions.
-    const order64 = cpu.has(.x86, .sse4_2);
+    // instructions. NEON orders them (cmgt, cmhi).
+    const order64 = neon or cpu.has(.x86, .sse4_2);
     const l = lane(ip, ty) orelse return false;
     const len = ip.keyPayload(.vector_type, ty).len;
     if (len == 0) return false;
@@ -154,8 +155,9 @@ pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Ind
     };
     return switch (op) {
         .add_wrap, .sub_wrap, .bit_and, .bit_or, .xor, .not => !l.isFloat(),
-        // SSE2 multiplies 16-bit lanes, and 32-bit ones through pmuludq.
-        .mul_wrap => l == .i16 or l == .i32,
+        // SSE2 multiplies 16-bit lanes, and 32-bit ones through pmuludq;
+        // NEON's mul takes bytes too, but no 64-bit lanes.
+        .mul_wrap => l == .i16 or l == .i32 or (neon and l == .i8),
         .add_float, .sub_float, .mul_float, .div_float, .neg, .abs, .sqrt => l.isFloat(),
         .min, .max => l != .i64 or order64,
         // A bool vector result lives in a general-purpose register.
@@ -166,12 +168,13 @@ pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Ind
         .reduce => |r| switch (r) {
             .@"and", .@"or", .xor, .add => !l.isFloat(),
             .min, .max => !l.isFloat() and (l != .i64 or order64),
-            .mul => l == .i16 or l == .i32,
+            .mul => l == .i16 or l == .i32 or (neon and l == .i8),
         },
         .shuffle => true,
         // SSE2 shifts 16-, 32- and 64-bit lanes; bytes shift as words,
         // masked or unpacked, and 64-bit lanes shift right arithmetically
-        // as logically with their sign bits shifted in.
+        // as logically with their sign bits shifted in. NEON shifts every
+        // lane width (shl, ushr, sshr; ushl, sshl by a register).
         .shl, .shr => !l.isFloat(),
         .cast => unreachable,
     };
