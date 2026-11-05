@@ -3057,7 +3057,7 @@ fn resolveLayout(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!v
     const ip = sema.ip;
     switch (ip.keyTag(ty)) {
         .struct_type, .enum_type, .union_type => {
-            try sema.declareDependency(.{ .type_layout = ty });
+            try sema.declareDep(.{ .type_layout = ty }, if (sema.bc) |bc| bc.local_layout else false);
             const info = ip.structInfo(ty);
             const status = info.status;
             // Resolved, and its defaults queued (`Zcu.ensureStructLayout`).
@@ -3074,6 +3074,32 @@ fn resolveLayout(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!v
         .error_union_type => try sema.resolveLayout(block, src, ip.keyPayload(.error_union_type, ty).payload_type),
         .tuple_type => for (ip.keyPayload(.tuple_type, ty).types) |ft| try sema.resolveLayout(block, src, ft),
         else => {},
+    }
+}
+
+/// `resolveLayout` (`.resolve`) or `isComptimeOnlyResolved`
+/// (`.comptime_only`, which it returns) of type `ty`, which a runtime local
+/// holds (or a part of one, which `bcLocal` tells). While lowering for the
+/// evaluator, the layouts are read conditionally: the walker keeps a
+/// comptime call's locals as comptime allocations, which read no layout to
+/// make, load or store, so plain reads would make a call's plain
+/// dependencies depend on which tier ran it (see "Dependencies"). std's
+/// `featureSet(&.{})` (`var x = Set.empty; ...; return x;`) gave the memo
+/// entries the evaluator made a `type_layout` of `Cpu.Feature.Set` that
+/// the walker's lacked, so `cpu.generic`'s edges followed analysis order.
+fn localLayout(sema: *Sema, block: *Block, src: Src, ty: Index, comptime op: enum { resolve, comptime_only }, local: bool) CompileError!bool {
+    const bc = if (local) sema.bc else null;
+    const saved = if (bc) |b| b.local_layout else false;
+    if (bc) |b| b.local_layout = true;
+    defer if (bc) |b| {
+        b.local_layout = saved;
+    };
+    switch (op) {
+        .resolve => {
+            try sema.resolveLayout(block, src, ty);
+            return false;
+        },
+        .comptime_only => return sema.isComptimeOnlyResolved(block, src, ty),
     }
 }
 
@@ -12362,8 +12388,8 @@ fn analyzeAlloc(sema: *Sema, block: *Block, src: Src, ty: Index, is_const: bool,
         return .fromInterned(try sema.createComptimeVar(block, ty, is_const));
     if (!is_const and Type.class(sema.ip, ty) == .@"opaque")
         return sema.fail(block, src.varTy(), "non-extern variable with opaque type '{f}'", .{sema.fmtType(ty)});
-    try sema.resolveLayout(block, src, ty);
-    if ((try sema.isComptimeOnlyResolved(block, src, ty))) {
+    _ = try sema.localLayout(block, src, ty, .resolve, true);
+    if (try sema.localLayout(block, src, ty, .comptime_only, true)) {
         // A constant of a comptime-only type is comptime.
         if (is_const) return .fromInterned(try sema.createComptimeAlloc(ty, false));
         return sema.failComptimeVar(block, src.varTy(), ty);
@@ -12373,6 +12399,25 @@ fn analyzeAlloc(sema: *Sema, block: *Block, src: Src, ty: Index, is_const: bool,
     const ref = try sema.addInst(block, .{ .tag = .alloc, .data = .{ .ty = ptr_ty } });
     if (is_const) try sema.const_allocs.put(sema.gpa, ref.toIndex().?, .{ .block = block });
     return ref;
+}
+
+/// Whether lowering for the evaluator addresses a local of the body, or a
+/// field, element or payload of one, through `ptr`: what the walker keeps
+/// in a comptime allocation. (Not through a reinterpreting pointer, whose
+/// comptime loads and stores read layouts.)
+fn bcLocal(sema: *Sema, ptr: Ref) bool {
+    if (sema.bc == null) return false;
+    var r = ptr;
+    while (r.toIndex()) |i| {
+        const data = sema.ir_insts.items(.data)[@backingInt(i)];
+        switch (sema.ir_insts.items(.tag)[@backingInt(i)]) {
+            .alloc => return true,
+            .struct_field_ptr, .ptr_elem_ptr => r = @fromBackingInt(sema.ir_extra.items[data.ty_pl.payload]),
+            .optional_payload_ptr_set, .errunion_payload_ptr_set, .optional_payload_ptr, .unwrap_errunion_payload_ptr => r = data.ty_op.operand,
+            else => return false,
+        }
+    }
+    return false;
 }
 
 /// The runtime `const` local that pointer `ptr` (a field or element
@@ -12557,10 +12602,10 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
         // comptime-known, as upstream; the runtime store goes unread.
         const coerced = try sema.coerce(block, ty, operands[0], src);
         if (sema.resolveValue(coerced)) |v| if (!sema.refersToComptimeAlloc(v)) {
-            try sema.resolveLayoutIfIdle(block, src, ty);
+            const comptime_only = try sema.localLayout(block, src, ty, .comptime_only, true);
             const const_ty = try sema.ptrType(.{ .child = ty, .flags = .{ .is_const = true } });
             sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = try sema.ptrType(.{ .child = ty }) };
-            if ((try sema.isComptimeOnlyResolved(block, src, ty))) {
+            if (comptime_only) {
                 // The runtime alloc cannot hold it: drop the store.
                 const payload = try sema.addExtra(Ir.Block{ .body_len = 0 });
                 sema.ir_insts.set(@backingInt(ia.stores.items[0]), .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = .void_type, .payload = payload } } });
@@ -12568,14 +12613,15 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
             return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = const_ty, .base = .{ .uav = .{ .val = v, .orig_ty = const_ty } } } }));
         };
     }
-    if ((try sema.isComptimeOnlyResolved(block, src, ty))) {
+    if (try sema.localLayout(block, src, ty, .comptime_only, true)) {
         // A constant that was not comptime-known above was stored under a
         // runtime condition, as upstream.
         if (ia.is_const) return sema.fail(block, src, "value with comptime-only type '{f}' depends on runtime control flow", .{sema.fmtType(ty)});
         return sema.failComptimeVar(block, src.varTy(), ty);
     }
     if (ia.is_const) for (operands) |op| try sema.validateRuntimeValue(block, src, op);
-    try sema.resolveLayout(block, src, ty);
+    // The walker reads an aligned comptime variable's layout too.
+    _ = try sema.localLayout(block, src, ty, .resolve, ia.alignment == 0);
     if (sema.func_is_naked and Type.hasRuntimeBits(sema.ip, ty)) return sema.fail(block, src, "local variable in naked function", .{});
     const ptr_ty = try sema.allocPtrType(ty, ia.alignment);
     sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = ptr_ty };
@@ -12629,7 +12675,7 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
         }
     };
     try sema.trackConstStore(block, ptr, operand);
-    try sema.resolveLayout(block, src, info.child);
+    _ = try sema.localLayout(block, src, info.child, .resolve, sema.bcLocal(ptr));
     // (The comptime evaluator's lowered code stores comptime variables of
     // the walker's at run time.)
     if (Type.isComptimeOnly(ip, info.child) and sema.bc == null) {
@@ -12724,7 +12770,7 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
         if (block.is_typeof and sema.isUndef(pv)) return .fromInterned(try sema.undefValue(info.child));
         if (try sema.comptimeLoadOrNull(block, src, pv)) |v| return .fromInterned(v);
     };
-    try sema.resolveLayout(block, src, info.child);
+    _ = try sema.localLayout(block, src, info.child, .resolve, sema.bcLocal(ptr));
     const zero_bit = !Type.hasRuntimeBits(ip, info.child) and !Type.isComptimeOnly(ip, info.child);
     // Even at comptime, through a runtime pointer.
     if (zero_bit) if (try sema.onePossibleValue(info.child)) |v| return .fromInterned(v);
@@ -20395,6 +20441,9 @@ const BcLowering = struct {
     /// The containers with effects lowering evaluated (`noteEffects`), for
     /// `Zcu.Bytecode.effects`. Arena-allocated.
     effects: std.ArrayList(Index) = .empty,
+    /// Lowering is resolving the layout of a local's type, which it reads
+    /// conditionally (`localLayout`).
+    local_layout: bool = false,
 };
 
 /// Backward branches a comptime loop takes, counting nested ones, before

@@ -706,7 +706,18 @@ So the run-time call's own reads are conditional: the callee's owner
 `nav_val`, and the `func_ies` of an inferred error set that only such a
 call introduced (`BcLowering.call_ies`). If they were plain, a unit's
 plain edges would depend on which tier ran a call. A plain declaration
-wins over a conditional one, and memo entries keep the flag. A unit's edges therefore cover what
+wins over a conditional one, and memo entries keep the flag. The
+walker keeps the body's locals as comptime allocations, which read no
+layout to make, load or store, while lowering makes them run-time locals
+that do: those layout reads are conditional too (`Sema.localLayout`,
+`bcLocal`; not an aligned variable's, which the walker reads, nor one
+through a reinterpreting pointer). Before, std's `featureSet(&.{})`
+(`var x = Set.empty; ...; return x;`) gave memo entries the evaluator
+made a plain `type_layout` of `Cpu.Feature.Set` that the walker's lacked,
+so `cpu.generic`'s edges followed analysis order
+(test/run/edit_eval_tier.zig; on std, a `BS_COMPTIME_EVAL=0` build then
+a `BS_COMPTIME_EVAL=1 BS_CACHE_VERIFY=full` one shows any such read).
+A unit's edges therefore cover what
 the walker would have read (plain) plus the lowering's other reads
 (conditional), whichever tier ran its calls; since call counts differ
 between an edit build and a full build, so can where lowering happens and
