@@ -572,6 +572,69 @@ EXTRA_DECL["sharefwd"] = [
     "inline fn sfIn(a: u64, b: u64) u64 { return (a ^ b) +% (a >> 3); }",
 ]
 
+# Loop-free callees of moderate size with safety checks, called from
+# nested loops (s_inlnest); inLp has a loop and must stay a call.
+EXTRA_DECL["inlnest"] = [
+    "const InP = struct { a: u32, b: i16, c: u8 };",
+    "fn inS(x: u32) u32 { return (x ^ 0x2b) +% (x >> 3); }",
+    "fn inA(x: u32, y: u32) u32 {",
+    "    if (x == 0) return y;",
+    "    const s = x + (y >> 4);",
+    "    const t: u16 = @intCast(s & 0xffff);",
+    "    var r = @as(u32, t) * 3 +% s;",
+    "    if (r & 1 == 1) r ^= 0x55;",
+    "    const q = @as(u8, @truncate(r)) +| 200;",
+    "    return r -% (x >> 1) +% q;",
+    "}",
+    "fn inB(sl: []const u32, i: usize) u32 {",
+    "    if (i + 1 >= sl.len) return sl[sl.len - 1] +% 7;",
+    "    const a = sl[i];",
+    "    const b = sl[i + 1];",
+    "    if (a > b) return a - b;",
+    "    return (b - a) *% 3 +% sl[(i * 3) % sl.len];",
+    "}",
+    "fn inC(o: ?u32, d: u32) u32 {",
+    "    if (d & 1 == 0 and o != null) return o.? *% 5 +% d;",
+    "    const v = o orelse (d +% 11);",
+    "    const w: u8 = @intCast(v % 251);",
+    "    return v ^ (@as(u32, w) << 3);",
+    "}",
+    "fn inD(x: u32) E!u32 {",
+    "    if (x % 7 == 3) return error.Beta;",
+    "    if (x % 11 == 5) return error.Gamma;",
+    "    const y = x / 3 + (x >> 2);",
+    "    return y ^ 0x5a5a;",
+    "}",
+    "fn inE(p: InP, k: u8) InP {",
+    "    var r = p;",
+    "    r.a = p.a +% @as(u32, k) *% 9;",
+    "    r.b = p.b -% @as(i16, @intCast(k & 0x7f));",
+    "    if (k > 200) return .{ .a = r.a ^ 1, .b = r.b, .c = p.c };",
+    "    r.c = p.c +% k;",
+    "    return r;",
+    "}",
+    "fn inF(x: u64, y: u64) u128 {",
+    "    const w = @as(u128, x) * y;",
+    "    if (w == 0) return @as(u128, x) << 64 | y;",
+    "    return w +% (@as(u128, y) << 32) +% inS(@truncate(x));",
+    "}",
+    "fn inG(x: u32, y: u32) u32 {",
+    "    const a = inS(x) +% inS(y);",
+    "    const b = inA(a & 0xffffff, y & 0xffff);",
+    "    return if (b & 2 == 0) b else inS(b) ^ a;",
+    "}",
+    "fn inH(x: u32) E!u32 {",
+    "    const a = try inD(x);",
+    "    const b = inD(x +% 1) catch |e| return if (e == error.Beta) a else error.Alpha;",
+    "    return a +% b;",
+    "}",
+    "fn inLp(x: u32, n: usize) u32 {",
+    "    var r = x;",
+    "    for (0..n) |i| r = r *% 31 +% @as(u32, @intCast(i));",
+    "    return r;",
+    "}",
+]
+
 # Byte loops over @ptrCast slices of *T and constant-length subslices
 # (s_unrollswap).
 EXTRA_DECL["unrollswap"] = [
@@ -1586,7 +1649,7 @@ class Gen:
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
             (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
             (2, "swx"), (2, "scopenum"), (2, "argbase"), (2, "mulbound"), (2, "retlen"),
-            (2, "sharefwd"), (2, "fwdalias"), (2, "storefwd"), (2, "unrollswap"), (1, "storelen"),
+            (2, "sharefwd"), (2, "fwdalias"), (2, "storefwd"), (2, "unrollswap"), (1, "storelen"), (2, "inlnest"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -3573,6 +3636,78 @@ class Gen:
             e("}")
             for j in range(L):
                 sk(f"@as(u64, {buf}[{j}])")
+
+    def s_inlnest(self, ctx):
+        """Calls to loop-free callees with safety checks (overflow, bounds,
+        .?, @intCast, error returns, orelse/catch, by-value struct and u128
+        results, nested inlinable helpers) from loops two or three deep,
+        the same callee at depth 1 too, and a callee with a loop at depth
+        2 as a control."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        ctx["fn"].risky = True
+        self.extra.add("inlnest")
+        e = lambda s_: self.emit(ctx, s_)
+        acc, st, w, buf = self.fresh("ia"), self.fresh("is"), self.fresh("iw"), self.fresh("ib")
+        big = self.chance(0.1)
+        mask = "" if big else " & 0xffffff"
+        e(f"var {acc}: u32 = @truncate({self.int_expr(ctx, U64, 1)}{mask});")
+        e(f"var {st}: InP = .{{ .a = {self.int_expr(ctx, U32, 1)}, .b = @bitCast(@as(u16, @truncate({self.int_expr(ctx, U64, 1)}))), .c = 1 }};")
+        e(f"var {w}: u128 = 0;")
+        e(f"_ = &{acc};")
+        e(f"_ = &{st};")
+        e(f"_ = &{w};")
+        e(f"var {buf}: [6]u32 = .{{ {', '.join(str(self.r.randint(0, 99)) for _ in range(6))} }};")
+        e(f"_ = &{buf};")
+        depth = 3 if self.chance(0.25) else 2
+        ivars = [self.fresh("ii") for _ in range(depth)]
+        def call(iv, jv):
+            k = self.r.randrange(10)
+            lo = f"@as(u32, @truncate({iv} *% 7 +% {jv}))"
+            if k == 0:
+                return f"{acc} = inA({lo}{' +% ' + acc if big else ''}, {acc}{mask});"
+            if k == 1:
+                return f"{acc} +%= inB({buf}[0..{self.r.randint(1, 6)}], {jv});"
+            if k == 2:
+                return f"{acc} ^= inC(if ({jv} & 1 == 0) null else {acc}, @intCast({iv}));"
+            if k == 3:
+                if ctx["fn"].err and self.chance(0.3):
+                    return f"{acc} = try inD({acc} +% {lo});"
+                return f"{acc} = inD({acc} +% {lo}) catch |er| switch (er) {{ error.Beta => 17, error.Gamma => 29, else => 3 }};"
+            if k == 4:
+                return f"{st} = inE({st}, @truncate({acc} +% {lo}));"
+            if k == 5:
+                return f"{w} +%= inF({acc}, @as(u64, {lo}) << {self.r.randint(0, 40)});"
+            if k == 6:
+                return f"{acc} = inG({acc}, {lo});"
+            if k == 7:
+                return f"{acc} +%= inH({acc}) catch 3;"
+            if k == 8:
+                return f"{acc} = inLp({acc}, {jv} % 4);"
+            return f"{buf}[{jv} % 6] = inS({buf}[{iv} % 6] +% {acc});"
+        for d, iv in enumerate(ivars):
+            n = self.pick([str(self.r.randint(1, 4)), f"@as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % 4"])
+            e(f"for (0..{n}) |{iv}| {{")
+            ctx["indent"] += 1
+            e(f"{acc} +%= @truncate({iv});")
+            if d == 0 and self.chance(0.5):
+                e(call(iv, iv))
+            if d > 0:
+                for _ in range(self.r.randint(1, 3)):
+                    e(call(ivars[d - 1], iv))
+                if d > 1 and self.chance(0.4):
+                    e(call(ivars[0], iv))
+            if d < depth - 1 and self.chance(0.3):
+                e(f"if ({acc} & 0x30 == 0x10) continue;")
+            if d == depth - 1 and self.chance(0.2):
+                e(f"if ({acc} & 0xf00 == 0xa00) break;")
+        for d in range(depth):
+            ctx["indent"] -= 1
+            e("}")
+        self.sink(ctx, acc, U32)
+        self.sink(ctx, f"{st}.a ^ @as(u32, @as(u16, @bitCast({st}.b))) ^ {st}.c", U32)
+        self.sink(ctx, f"@as(u64, @truncate({w} ^ ({w} >> 64)))", U64)
+        self.sink(ctx, f"{buf}[0] ^ {buf}[5]", U32)
 
     def s_storelen(self, ctx):
         """s_storefwd's slice-length cases only."""
