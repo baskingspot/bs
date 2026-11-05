@@ -44,13 +44,13 @@ build $cmd $out "relinked"
 sed 's/return counter + calls;/return counter + calls + 1;/' "$src" >lib.zig
 build $cmd $out "linked 2"
 # The imports change: built again eagerly.
-sed 's/return c_twice(x) + 1;/return x + 1;/' "$src" >lib.zig
+sed 's/return viaTable(x) + 1;/return x + 1;/' "$src" >lib.zig
 build $cmd $out "external symbols changed"
 # An export comes back with the import.
 cp "$src" lib.zig
 build $cmd $out "replayed"
 # The import becomes weak, then relinks with its flags from the manifest.
-sed 's/return c_twice(x) + 1;/return @extern(?*const fn (u32) callconv(.c) u32, .{ .name = "c_twice", .linkage = .weak }).?(x) + 1;/' "$src" >lib.zig
+sed 's/return viaTable(x) + 1;/return @extern(?*const fn (u32) callconv(.c) u32, .{ .name = "c_twice", .linkage = .weak }).?(x) + 1;/' "$src" >lib.zig
 build $cmd $out "external symbols changed"
 rm $out
 build $cmd $out "relinked"

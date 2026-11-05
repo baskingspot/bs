@@ -232,7 +232,12 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbo
         next += 1;
     }
 
-    // The atoms' relocations.
+    // The atoms' relocations. One to an alias (a constant's extern
+    // address, `Emit.externAddrKey`) relocates to its target, as the
+    // image bound it.
+    var aliases: std.HashMapUnmanaged(SymbolKey, Elf.Alias, KeyContext, 80) = .empty;
+    try aliases.ensureTotalCapacity(arena, @intCast(options.aliases.len));
+    for (options.aliases) |al| aliases.putAssumeCapacity(al.key, al);
     const a64 = options.arch == .aarch64;
     for (c.image_symtab[1..], atom_of[1..]) |s, i| {
         const av = input.atom(i);
@@ -242,13 +247,18 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbo
         const relas = &c.sections.items[k - 1].relas;
         const base = c.sectionOffset(s);
         for (a.relocs) |r| {
-            const t = a.targets[r.info.target];
+            var t = a.targets[r.info.target];
+            var addend: i64 = r.addend;
+            if (aliases.get(t)) |al| {
+                t = al.target;
+                addend += al.addend;
+            }
             const local = sym_of.get(t);
             const imp = if (local == null) import_index.get(t) orelse continue else null;
             const sym = if (local) |ts| index[ts] else imp.?.index;
             if (a64) {
                 const ty = try aarch64Type(a, r, image, c.sections.items[k - 1].shdr.offset + base, diag);
-                try relas.append(arena, .{ .offset = base + r.offset, .info = .{ .type = @backingInt(ty), .sym = sym }, .addend = r.addend });
+                try relas.append(arena, .{ .offset = base + r.offset, .info = .{ .type = @backingInt(ty), .sym = sym }, .addend = addend });
                 continue;
             }
             const ty: elf.R_X86_64 = switch (r.info.kind) {
@@ -269,7 +279,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbo
                 .value8 => .@"8",
                 else => unreachable, // the image's link rejected it
             };
-            try relas.append(arena, .{ .offset = base + r.offset, .info = .{ .type = @backingInt(ty), .sym = sym }, .addend = r.addend });
+            try relas.append(arena, .{ .offset = base + r.offset, .info = .{ .type = @backingInt(ty), .sym = sym }, .addend = addend });
         }
     }
 
