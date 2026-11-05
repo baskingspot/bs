@@ -630,8 +630,11 @@ const Walker = struct {
                 try w.merge(from);
                 w.mergeMem(clock);
             },
+            // Each case, like each side of a `cond_br`, sees neither the
+            // facts nor the stores of the others.
             .switch_br => {
                 const x = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
+                const depth = s.facts.items.len;
                 const from = s.stored.items.len;
                 const mem = w.mem;
                 const clock = w.clock;
@@ -642,12 +645,14 @@ const Walker = struct {
                     const items_len = ir.extra[i];
                     const body_len = ir.extra[i + 1];
                     try w.side(ir.bodySlice(i + 2 + items_len, body_len));
+                    s.facts.shrinkRetainingCapacity(depth);
                     w.dropNumbers(nlen);
                     w.rollback(log);
                     w.mem = mem;
                     i += 2 + items_len + body_len;
                 }
                 try w.side(ir.bodySlice(i, x.data.else_body_len));
+                s.facts.shrinkRetainingCapacity(depth);
                 w.dropNumbers(nlen);
                 try w.merge(from);
                 w.mergeMem(clock);
