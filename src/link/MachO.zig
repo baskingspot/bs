@@ -74,6 +74,7 @@ const dwarf_language = std.dwarf.LANG.C99;
 const Elf = @import("Elf.zig");
 const a64 = @import("aarch64.zig");
 const MachODylib = @import("MachODylib.zig");
+const Encoder = @import("../codegen/aarch64/Encoder.zig");
 const pageDelta = a64.pageDelta;
 const patchAdrp = a64.patchAdrp;
 const pageOffScale = a64.pageOffScale;
@@ -2538,7 +2539,6 @@ fn sign(io: std.Io, n_threads: usize, buf: []u8, sig_off: u32, uuid_at: usize, i
 test "links and runs a program that writes from __TEXT,__const and exits with 42" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const Encoder = @import("../codegen/aarch64/Encoder.zig");
 
     const msg_text = "Hello from bs!\n";
     const msg: SymbolKey = .fromContents(.rodata, .@"1", msg_text, &.{}, &.{});
@@ -2787,7 +2787,6 @@ test "gives each thread its own thread-locals from __thread_data and __thread_bs
     if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const Encoder = @import("../codegen/aarch64/Encoder.zig");
 
     const main: SymbolKey = .fromName("main");
     const run: SymbolKey = .fromName("run");
@@ -2971,7 +2970,6 @@ test "a pointer to an absolute value is written as is, with no fixup" {
 test "links many chunks of atoms and pages of fixups the same way on any number of threads" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const Encoder = @import("../codegen/aarch64/Encoder.zig");
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3193,7 +3191,6 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
 test "writes a dSYM that std.debug symbolizes and __unwind_info for each function" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const Encoder = @import("../codegen/aarch64/Encoder.zig");
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

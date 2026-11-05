@@ -60,6 +60,7 @@ const Atom = @import("Atom.zig");
 const Dwarf = @import("Dwarf.zig");
 const ElfDynamic = @import("ElfDynamic.zig");
 const a64 = @import("aarch64.zig");
+const Encoder = @import("../codegen/x86_64/Encoder.zig");
 /// DW_AT_language of the compile units: Zig, as upstream's self-hosted
 /// backend (its Linux Debug default) writes it, which gdb reads.
 const dwarf_language = std.dwarf.LANG.Zig;
@@ -2893,7 +2894,6 @@ test "links and runs a program that writes from rodata and exits with 42" {
     if (builtin.cpu.arch != .x86_64 or builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const Encoder = @import("../codegen/x86_64/Encoder.zig");
 
     const msg_text = "Hello from bs!\n";
     const msg: SymbolKey = .fromContents(.rodata, .@"1", msg_text, &.{}, &.{});
@@ -3339,7 +3339,6 @@ test "thread-locals in .tdata and .tbss read back after static TLS setup" {
     if (builtin.cpu.arch != .x86_64 or builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const Encoder = @import("../codegen/x86_64/Encoder.zig");
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3514,7 +3513,6 @@ test "links many chunks of atoms the same way on any number of threads" {
     if (builtin.cpu.arch != .x86_64 or builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const Encoder = @import("../codegen/x86_64/Encoder.zig");
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
