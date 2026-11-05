@@ -95,6 +95,9 @@ pub const Options = struct {
     stack_size: u64 = 16 * 1024 * 1024,
     /// `-fsingle-threaded`.
     single_threaded: bool = false,
+    /// `-fstrip` on the root module: no debug info in the output, as
+    /// upstream's (`builtin.strip_debug_info`).
+    strip: bool = false,
     /// `-ffuzz` on any module: instrument those modules for upstream's
     /// fuzzer and link it (docs/slop/architecture.md, "Fuzzing").
     fuzz: bool = false,
@@ -472,6 +475,7 @@ pub const Job = struct {
             .optimize = opts.optimize,
             .error_tracing = opts.error_tracing,
             .valgrind = opts.valgrind,
+            .strip = opts.strip,
             .pic = opts.pic,
             .pie = opts.pie,
             .dynamic = opts.dynamic,
@@ -602,6 +606,7 @@ pub const Job = struct {
         i.check = env.get("BS_CACHE_CHECK") != null;
         i.donors = !std.mem.eql(u8, env.get("BS_CACHE_DONOR") orelse "", "off");
         i.stack_size = job.opts.stack_size;
+        i.strip = job.opts.strip;
         i.link_objects = job.link_objects;
         i.link_shared = job.link_shared;
         i.link_shared_names = job.opts.shared_names;
@@ -1142,6 +1147,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     emit.install_name = opts.install_name;
     if (opts.version) |v| emit.dylib_version = @as(u32, @intCast(@min(v.major, 0xffff))) << 16 | @as(u32, @intCast(@min(v.minor, 0xff))) << 8 | @as(u32, @intCast(@min(v.patch, 0xff)));
     emit.stack_size = opts.stack_size;
+    emit.strip = opts.strip;
     emit.fuzz = opts.fuzz;
     emit.prove_on = proving(job.environ_map);
     // Executables and shared libraries link glibc: an object or a static
@@ -1819,7 +1825,7 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"-fno-llvm"},                      .{"-fno-lld"},
     .{"-fnew-linker"},                   .{"-fno-new-linker"},
     .{"-fallow-so-scripts"},             .{"-fno-allow-so-scripts"},
-    .{"-fentry"},                        .{"-fno-strip"},
+    .{"-fentry"},                        .{"-fno-emit-asm"},
     .{"-fstack-check"},                  .{"-fno-stack-check"},
     .{"-fstack-protector"},              .{"-fno-stack-protector"},
     .{"-fno-omit-frame-pointer"},        .{"-fno-sanitize-thread"},
@@ -1880,7 +1886,6 @@ fn addInclude(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), seen: 
 /// message.
 const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-fno-entry", "bs does not build executables without an entry point yet ('-fno-entry')" },
-    .{ "-fstrip", "bs does not strip debug info yet ('-fstrip'); remove '.strip = true'" },
     .{ "-fomit-frame-pointer", "bs always keeps frame pointers ('-fomit-frame-pointer'); remove '.omit_frame_pointer = true'" },
     .{ "-fsanitize-thread", "bs has no ThreadSanitizer ('-fsanitize-thread'); build this step with upstream zig" },
     .{ "-femit-asm", "bs does not emit assembly ('-femit-asm')" },
@@ -2042,6 +2047,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             mode.error_tracing = arg[2] == 'e';
         } else if (std.mem.eql(u8, arg, "-fvalgrind") or std.mem.eql(u8, arg, "-fno-valgrind")) {
             mode.valgrind = arg[2] == 'v';
+        } else if (std.mem.eql(u8, arg, "-fstrip") or std.mem.eql(u8, arg, "-fno-strip")) {
+            mode.strip = arg[2] == 's';
         } else if (std.mem.eql(u8, arg, "-O") or (std.mem.startsWith(u8, arg, "-O") and !std.mem.eql(u8, arg, "-ObjC"))) {
             const v = if (arg.len == 2) nextArg(args, &i, arg) else arg[2..];
             const o = std.lang.Optimize.fromString(v) orelse fatal("unrecognized optimization mode: '{s}'", .{v});
@@ -2416,6 +2423,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     opts.optimize = root_mode.optimize orelse .debug;
     opts.error_tracing = root_mode.error_tracing orelse (opts.optimize == .debug);
     opts.valgrind = root_mode.valgrind orelse (opts.optimize == .debug);
+    opts.strip = root_mode.strip orelse false;
     const seen = try arena.alloc(bool, modules.items.len);
     @memset(seen, false);
     const root_flags: Inherited = .{ .fuzz = opts.root_fuzz, .optimize = opts.optimize, .error_tracing = opts.error_tracing, .valgrind = opts.valgrind };
@@ -2444,6 +2452,7 @@ const Mode = struct {
     optimize: ?std.lang.Optimize = null,
     error_tracing: ?bool = null,
     valgrind: ?bool = null,
+    strip: ?bool = null,
 };
 
 /// The per-module flags a module passes to those that depend on it.

@@ -130,6 +130,10 @@ pub const Options = struct {
     /// data that must not depend on what its target binds to (`Alias`).
     /// With `symbols`, `Symbols.aliases` numbers them, in this order.
     aliases: []const Alias = &.{},
+    /// `-fstrip`: no debug info, neither bs's (`debug`, or the input's
+    /// entries) nor the input sections', and so none of bs's FDEs, which
+    /// come with its debug entries. The input sections' .eh_frame stays.
+    strip: bool = false,
 };
 
 /// A key that resolves as `target` does, `addend` bytes on: to an atom's
@@ -763,7 +767,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     populate(std.mem.sliceAsBytes(keys));
     const chunks = try gpa.alloc(Chunk, n_chunks);
     defer gpa.free(chunks);
-    const n_debug = input.debugLen();
+    const n_debug = if (options.strip) 0 else input.debugLen();
     const n_debug_chunks = std.math.divCeil(usize, n_debug, chunk_len) catch unreachable;
     const debug_chunks = try gpa.alloc(Dwarf.Chunk, n_debug_chunks);
     defer gpa.free(debug_chunks);
@@ -773,7 +777,16 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     defer gpa.free(file_of);
     // The input sections' places within their kinds' parts, and the FDEs
     // among them.
-    const inputs = options.input_sections;
+    const kept_inputs = try gpa.alloc(InputSection, if (options.strip) options.input_sections.len else 0);
+    defer gpa.free(kept_inputs);
+    const inputs = if (options.strip) kept: {
+        var n: usize = 0;
+        for (options.input_sections) |sec| if (sec.kind == .eh_frame) {
+            kept_inputs[n] = sec;
+            n += 1;
+        };
+        break :kept kept_inputs[0..n];
+    } else options.input_sections;
     var input_sizes: [n_input_kinds]u64 = @splat(0);
     const input_offs = try gpa.alloc(u64, inputs.len);
     defer gpa.free(input_offs);

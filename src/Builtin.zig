@@ -30,6 +30,8 @@ pub const Options = struct {
     optimize: std.lang.Optimize = .debug,
     error_tracing: bool = true,
     valgrind: bool = true,
+    /// `-fstrip`.
+    strip: bool = false,
     /// `-fPIC` and `-fPIE` on objects and libraries (see
     /// "Position-independent code" in docs/slop/architecture.md).
     pic: bool = false,
@@ -270,7 +272,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\pub const fuzz = {s};
         \\pub const position_independent_code = true;
         \\pub const position_independent_executable = true;
-        \\pub const strip_debug_info = false;
+        \\pub const strip_debug_info = {s};
         \\pub const code_model: std.lang.CodeModel = .default;
         \\pub const omit_frame_pointer = false;
         \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
@@ -284,6 +286,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         if (opts.link_libcpp) "true" else "false",
         if (opts.error_tracing) "true" else "false",
         if (opts.fuzz) "true" else "false",
+        if (opts.strip) "true" else "false",
     });
     const libc = opts.glibc != null;
     // Objects and static libraries with -lc stay static and take no start
@@ -311,7 +314,10 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     for (opts.cpu.arch.allFeaturesList(), 0..) |feature, i| {
         if (opts.cpu.features.isEnabled(@intCast(i))) try features.print(gpa, "        .{f},\n", .{std.zig.fmtIdPU(feature.name)});
     }
-    return std.fmt.allocPrint(gpa,
+    // Two calls: format takes at most 32 arguments.
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.print(gpa,
         \\const std = @import("std");
         \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
         \\pub const zig_version_string = "0.17.1";
@@ -355,31 +361,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\        .android = {d},
         \\    }}}},
         \\}};
-        \\pub const target: std.Target = .{{
-        \\    .cpu = cpu,
-        \\    .os = os,
-        \\    .abi = abi,
-        \\    .ofmt = object_format,
-        \\    .dynamic_linker = {s},
-        \\}};
-        \\/// Deprecated; to be removed in 0.18.0. Use `target.ofmt` instead.
-        \\pub const object_format: std.Target.ObjectFormat = .elf;
-        \\/// Deprecated, to be removed after 0.18.0
-        \\pub const mode = optimize;
-        \\pub const optimize: std.lang.Optimize = .{s};
-        \\pub const link_libc = {s};
-        \\pub const link_libcpp = {s};
-        \\pub const have_error_return_tracing = {s};
-        \\pub const valgrind_support = {s};
-        \\pub const sanitize_thread = false;
-        \\pub const fuzz = {s};
-        \\pub const position_independent_code = {s};
-        \\pub const position_independent_executable = {s};
-        \\pub const strip_debug_info = false;
-        \\pub const code_model: std.lang.CodeModel = .default;
-        \\pub const omit_frame_pointer = false;
-        \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
-        \\{s}
+        \\
     , .{
         // Upstream's Debug default: its own backend on x86_64-linux, LLVM
         // on aarch64-linux.
@@ -405,6 +387,34 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         glibc.minor,
         glibc.patch,
         versions.android,
+    });
+    try out.print(gpa,
+        \\pub const target: std.Target = .{{
+        \\    .cpu = cpu,
+        \\    .os = os,
+        \\    .abi = abi,
+        \\    .ofmt = object_format,
+        \\    .dynamic_linker = {s},
+        \\}};
+        \\/// Deprecated; to be removed in 0.18.0. Use `target.ofmt` instead.
+        \\pub const object_format: std.Target.ObjectFormat = .elf;
+        \\/// Deprecated, to be removed after 0.18.0
+        \\pub const mode = optimize;
+        \\pub const optimize: std.lang.Optimize = .{s};
+        \\pub const link_libc = {s};
+        \\pub const link_libcpp = {s};
+        \\pub const have_error_return_tracing = {s};
+        \\pub const valgrind_support = {s};
+        \\pub const sanitize_thread = false;
+        \\pub const fuzz = {s};
+        \\pub const position_independent_code = {s};
+        \\pub const position_independent_executable = {s};
+        \\pub const strip_debug_info = {s};
+        \\pub const code_model: std.lang.CodeModel = .default;
+        \\pub const omit_frame_pointer = false;
+        \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
+        \\{s}
+    , .{
         dynamic_linker,
         @tagName(opts.optimize),
         if (libc) "true" else "false",
@@ -414,8 +424,10 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         if (opts.fuzz) "true" else "false",
         if (opts.pic or libc) "true" else "false",
         if (opts.pie) "true" else "false",
+        if (opts.strip) "true" else "false",
         if (exe_libc) "comptime {\n    _ = @import(\"glibc_start.zig\");\n}\n" else "",
     });
+    return out.toOwnedSlice(gpa);
 }
 
 /// Writes the generated source to `<cache_dir>/builtin/<content hash>/builtin.zig`

@@ -100,6 +100,8 @@ check_failed: std.atomic.Value(bool) = .init(false),
 /// `--stack`, for a relink; part of the command line that keys the
 /// compilation.
 stack_size: u64 = 16 * 1024 * 1024,
+/// `-fstrip`: relinks link no debug info.
+strip: bool = false,
 /// What the build links, from the command (part of the compilation's key),
 /// and the stem of a library's object's name in its archive (its root
 /// source file's).
@@ -635,6 +637,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
         .diag = &diag,
         .comp_dir = cwd,
         .stack_size = inc.stack_size,
+        .strip = inc.strip,
     };
     const symbols: ElfObject.Symbols = .{ .exports = exports.items, .imports = imports.items };
     const result = switch (inc.output) {
@@ -927,6 +930,7 @@ fn linkWithInputs(
         .diag = &diag,
         .comp_dir = cwd,
         .stack_size = inc.stack_size,
+        .strip = inc.strip,
         .local_symbols = converted.symbols,
         .input_sections = converted.sections,
         .aliases = aliases,
