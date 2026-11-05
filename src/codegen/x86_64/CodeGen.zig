@@ -1219,6 +1219,14 @@ fn copyTo(cg: *CodeGen, dst: Mem, ref: Ref) Error!void {
             return cg.e.mov(errFieldSize(layout), .{ .mem = offsetMem(dst, layout.err_offset) }, .{ .reg = .rax });
         }
     };
+    // A constant array of one scalar over `copy_inline_max` bytes (a
+    // comptime `@splat`): filled rather than copied from its constant.
+    if (size > copy_inline_max) if (ref.toInterned()) |v| if (cg.ip.keyTag(v) == .aggregate) {
+        const agg = cg.ip.keyPayload(.aggregate, v);
+        if (agg.storage == .repeated_elem) if (cg.ip.keyAs(.array_type, ty)) |at| if (at.sentinel == .none) {
+            if (try cg.fillSplat(dst, .fromInterned(agg.storage.repeated_elem), at.len)) return;
+        };
+    };
     const loc = try cg.locOf(ref);
     switch (loc) {
         .xmm => unreachable, // `locOf` gives memory
@@ -1312,6 +1320,39 @@ fn fillMem(cg: *CodeGen, dst: Mem, size: u64, byte: u8) Error!void {
         try cg.e.mov(sizeOf(chunk), .{ .mem = offsetMem(dst, off) }, .{ .reg = .rax });
         off += chunk;
     }
+}
+
+/// Fills `count` elements at `dst` with scalar `elem` of 1, 2, 4, or 8
+/// bytes with one `rep stos`, of bytes when a constant's are all equal;
+/// false for other elements. Uses rax, rcx, and rdi.
+fn fillSplat(cg: *CodeGen, dst: Mem, elem: Ref, count: u64) Error!bool {
+    const ip = cg.ip;
+    const ty = cg.typeOf(elem);
+    const size = Type.abiSize(ip, ty);
+    switch (size) {
+        1, 2, 4, 8 => {},
+        else => return false,
+    }
+    switch (Type.class(ip, ty)) {
+        .int, .bool, .@"enum", .float, .error_set => {},
+        .pointer => if (Type.isSlice(ip, ty)) return false,
+        else => return false,
+    }
+    const mask = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - 8 * size);
+    const bits: ?u64 = switch (try cg.locOf(elem)) {
+        .imm => |v| @as(u64, @bitCast(v)) & mask,
+        else => null,
+    };
+    const byte: u8 = if (bits) |b| @truncate(b) else 0;
+    if (bits != null and bits.? == (@as(u64, byte) *% 0x0101_0101_0101_0101) & mask) {
+        try cg.fillMem(dst, count * size, byte);
+        return true;
+    }
+    try cg.load(.rax, elem);
+    try cg.e.lea(.qword, .rdi, dst);
+    try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(count) });
+    try cg.e.repStos(sizeOf(size));
+    return true;
 }
 
 /// The memory holding value `ref`, materializing a register-only constant
@@ -5075,7 +5116,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                     if (elem != elems[0]) break i;
                 } else elems.len;
                 const total = run * elem_size;
-                if (total > 128) {
+                if (total > 128 and try cg.fillSplat(dst, elems[0], run)) {
+                    first = run;
+                } else if (total > 128) {
                     var span: u64 = 0;
                     while (span < 64) : (span += elem_size) try cg.copyTo(offsetMem(dst, span), elems[0]);
                     while (span < 512 and span < total) {
