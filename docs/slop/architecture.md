@@ -8233,7 +8233,12 @@ libraries as inputs. To be agreed with that thread.
 bs compiles no C++ either: `.C`, `.cc`, `.cpp`, `.cxx`, `.c++` and
 `.stub` sources (upstream's `FileExt.cpp`) go to upstream `zig clang`
 like C sources (`CSource.Lang`), with the same records, cache inputs and
-diagnostics.
+diagnostics. Objective-C (`.m`) and Objective-C++ (`.mm`, `.M`; added
+2026-11-05 for fizzy's macOS platform code) go the same way and take C's
+arguments: as upstream, clang picks the language from the extension (no
+`-x`), and only C++ proper adds `-nostdinc++`. The Objective-C runtime
+and frameworks come from the step's own `-lobjc` and `-framework`
+options, as upstream's.
 
 - **Arguments** (`CSource.appendArgs`, one function for C, C++ and
   libunwind's assembly, in upstream's `addCCArgs` order): C++ adds

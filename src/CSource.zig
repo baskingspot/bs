@@ -38,6 +38,11 @@ lang: Lang = .c,
 pub const Lang = enum {
     c,
     cpp,
+    /// `.m`: Objective-C, which takes C's arguments, as upstream's.
+    objc,
+    /// `.mm` and `.M`: Objective-C++, which takes C's arguments too
+    /// (upstream adds `-nostdinc++` only for C++ proper).
+    objcpp,
     /// `.S`: assembly through the C preprocessor.
     asm_cpp,
     /// `.s`: assembly as is, without include directories, defines or a
@@ -50,6 +55,8 @@ pub const Lang = enum {
         const ext = std.fs.path.extension(path);
         if (std.mem.eql(u8, ext, ".c")) return .c;
         for ([_][]const u8{ ".C", ".cc", ".cpp", ".cxx", ".stub", ".c++" }) |e| if (std.mem.eql(u8, ext, e)) return .cpp;
+        if (std.mem.eql(u8, ext, ".m")) return .objc;
+        if (std.mem.eql(u8, ext, ".mm") or std.mem.eql(u8, ext, ".M")) return .objcpp;
         if (std.mem.eql(u8, ext, ".S")) return .asm_cpp;
         if (std.mem.eql(u8, ext, ".s")) return .assembly;
         return null;
@@ -1291,7 +1298,7 @@ fn runtimeJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Ru
             switch (lang) {
                 .c => try argv.appendSlice(arena, &.{ "-std=c99", "-fexceptions" }),
                 .cpp => try argv.appendSlice(arena, &.{ "-fno-exceptions", "-fno-rtti" }),
-                .asm_cpp, .assembly => {},
+                .objc, .objcpp, .asm_cpp, .assembly => {},
             }
             try argv.appendSlice(arena, &.{ "-w", "-I", try join(arena, &.{ lib, "libunwind", "include" }), "-D_LIBUNWIND_HIDE_SYMBOLS", "-Wa,--noexecstack", "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-fvisibility-global-new-delete=force-hidden", "-D_LIBUNWIND_IS_NATIVE_ONLY" });
             // The compilation's own mode, which is Debug.

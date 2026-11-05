@@ -186,6 +186,21 @@ pub fn build(b: *std.Build) void {
         c_run.addCheck(.{ .expect_stdout_exact = "argc=2 q=478165905515354922\n" });
         c_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
         test_step.dependOn(&c_run.step);
+        // Objective-C sources: one without the runtime, and a class that
+        // sends messages through libobjc and Foundation, whose sections
+        // the Mach-O linker places for the runtime.
+        for ([_][]const u8{ "objc.m", "objc_class.m" }) |src| {
+            const objc_exe = b.addRunArtifact(exe);
+            objc_exe.setName(b.fmt("bs build-exe -lc with {s} on aarch64-macos", .{src}));
+            objc_exe.addArgs(&.{ "build-exe", "-lc", "-lobjc", "-framework", "Foundation" });
+            objc_exe.addFileArg(b.path("test/link_input/objc_main.zig"));
+            objc_exe.addFileArg(b.path(b.fmt("test/link_input/{s}", .{src})));
+            objc_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+            const objc_run = std.Build.Step.Run.create(b, b.fmt("run bs -lc build of {s} on aarch64-macos", .{src}));
+            objc_run.addFileArg(objc_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            objc_run.addCheck(.{ .expect_term = .{ .exited = 3 } });
+            test_step.dependOn(&objc_run.step);
+        }
     }
 }
 
@@ -1781,6 +1796,18 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     src_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&src_run.step);
+    // An Objective-C source, which goes to upstream's Clang like C (as
+    // upstream, it builds on Linux when it needs no runtime).
+    const objc_exe = b.addRunArtifact(bs);
+    objc_exe.setName("bs build-exe -lc with an Objective-C source");
+    objc_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+    objc_exe.addFileArg(b.path("test/link_input/objc_main.zig"));
+    objc_exe.addFileArg(b.path("test/link_input/objc.m"));
+    objc_exe.setEnvironmentVariable("BS_ZIG", zig);
+    const objc_run = std.Build.Step.Run.create(b, "run bs -lc build of an Objective-C source");
+    objc_run.addFileArg(objc_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    objc_run.addCheck(.{ .expect_term = .{ .exited = 3 } });
+    test_step.dependOn(&objc_run.step);
     // A C source's strong definition replaces a weak export of the Zig
     // code, for the Zig code's references too, as in ld.
     const wdef_exe = b.addRunArtifact(bs);
