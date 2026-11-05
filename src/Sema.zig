@@ -7545,11 +7545,12 @@ fn zirFieldParentPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileEr
     // As upstream, the result type may be an optional pointer.
     const result_ty = try sema.castDestType(block, src, extra.parent_ptr_type, false);
     const dest_ty = if (Type.class(ip, result_ty) == .optional and Type.class(ip, Type.childType(ip, result_ty)) == .pointer) Type.childType(ip, result_ty) else result_ty;
-    if (dest_ty != result_ty) return sema.coerce(block, result_ty, try sema.fieldParentPtr(block, src, extra, dest_ty), src);
-    return sema.fieldParentPtr(block, src, extra, dest_ty);
+    const flags: Zir.Inst.FullPtrCastFlags = @bitCast(@as(u5, @truncate(ext.small)));
+    if (dest_ty != result_ty) return sema.coerce(block, result_ty, try sema.fieldParentPtr(block, src, extra, dest_ty, flags.align_cast), src);
+    return sema.fieldParentPtr(block, src, extra, dest_ty, flags.align_cast);
 }
 
-fn fieldParentPtr(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.FieldParentPtr, dest_ty: Index) CompileError!Ref {
+fn fieldParentPtr(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.FieldParentPtr, dest_ty: Index, align_cast: bool) CompileError!Ref {
     const ip = sema.ip;
     if (Type.class(ip, dest_ty) != .pointer or Type.ptrInfo(ip, dest_ty).flags.size != .one)
         return sema.fail(block, src, "expected single pointer type, found '{f}'", .{sema.fmtType(dest_ty)});
@@ -7568,6 +7569,22 @@ fn fieldParentPtr(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.FieldPar
         else => false,
     };
     if (is_comptime_field) return sema.fail(block, sema.callArgSrc(src, false, 0), "cannot get @fieldParentPtr of a comptime field", .{});
+    // As upstream: a field less aligned than the parent pointer needs an
+    // `@alignCast`. A packed struct's or union's field pointers keep the
+    // parent's alignment.
+    if (!align_cast and !Type.isPacked(ip, parent_ty)) {
+        const dest_align = Type.ptrInfo(ip, dest_ty).flags.alignment;
+        const parent_align: u64 = if (dest_align != 0) @as(u64, 1) << (dest_align - 1) else Type.abiAlignment(ip, parent_ty);
+        const field_flag = try sema.fieldPtrAlignment(block, src, dest_align, parent_ty, field_index);
+        const field_align: u64 = if (field_flag != 0) @as(u64, 1) << (field_flag - 1) else Type.abiAlignment(ip, Type.fieldType(ip, parent_ty, field_index));
+        if (field_align < parent_align) {
+            const err = sema.fail(block, src, "{s} increases pointer alignment", .{"@fieldParentPtr"});
+            const span = src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+            try sema.zcu.addNote(sema.file, span, "parent pointer type '{f}' has alignment '{d}'; field '{s}' limits it to '{d}'", .{ sema.fmtType(dest_ty), parent_align, name, field_align });
+            try sema.zcu.addNote(sema.file, span, "use @alignCast to assert pointer alignment", .{});
+            return err;
+        }
+    }
     const field_ptr = sema.resolveInst(extra.field_ptr);
     if (Type.class(ip, sema.typeOf(field_ptr)) != .pointer) return sema.fail(block, sema.callArgSrc(src, false, 1), "expected pointer type, found '{f}'", .{sema.fmtType(sema.typeOf(field_ptr))});
     if (sema.resolveValue(field_ptr)) |v| if (!sema.isUndef(v)) {
