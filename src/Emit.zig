@@ -346,6 +346,8 @@ const Fate = union(enum) {
     yes: struct {
         size: u32,
         hash: cache.Hash,
+        /// No `loop` (`Zcu.InlineResult.straight`).
+        straight: bool,
         /// Index into `inline_bodies`, or `no_body` for a function loaded
         /// from the cache whose body no caller generated now needed yet.
         body: u32,
@@ -755,6 +757,7 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     defer bodies.deinit(gpa);
     var callee_hash: cache.Hash = 0;
     var size = s.size;
+    var straight = s.straight;
     var all = s.inlinable;
     // The callees of calls that stay calls that return a slice of an
     // argument's length, for prove.
@@ -772,7 +775,7 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
                 try emit.keepRetLen(&ret_lens, site.callee);
                 continue;
             },
-            .yes => |y| if (y.size <= emit.inline_budget * @as(u32, if (site.in_loop) inline_ir.loop_factor else 1)) y else {
+            .yes => |y| if (y.size <= emit.inline_budget * inline_ir.factor(site.loops, y.straight)) y else {
                 all = false;
                 try emit.keepRetLen(&ret_lens, site.callee);
                 continue;
@@ -788,12 +791,13 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
             continue;
         };
         size += yes.size;
+        straight = straight and yes.straight;
         callee_hash = cache.hash(@truncate(callee_hash), std.mem.asBytes(&yes.hash)) ^ callee_hash;
         try bodies.append(gpa, body);
         try splices.append(gpa, .{ .site = site, .body = undefined });
     }
     // Up to the loop budget: a caller decides per site.
-    const inlinable = all and size <= emit.inline_budget * inline_ir.loop_factor;
+    const inlinable = all and size <= emit.inline_budget * inline_ir.nested_loop_factor;
     // Of its own body, before the splices.
     const loaded = emit.inline_fates.contains(func);
     const own_hash: cache.Hash = if (inlinable and !loaded) try inline_ir.hashBody(gpa, &zcu.ip, &ir) else 0;
@@ -815,7 +819,7 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     }
     const ret_len1: u32 = if (ret_len) |k| k + 1 else 0;
     if (inlinable) {
-        const hash = cache.hash(size, std.mem.asBytes(&[2]cache.Hash{ own_hash, callee_hash })) ^ emit.inlineSalt() ^ Zcu.InlineResult.retLenHash(ret_len1);
+        const hash = cache.hash(size | if (straight) Zcu.InlineResult.straight_bit else 0, std.mem.asBytes(&[2]cache.Hash{ own_hash, callee_hash })) ^ emit.inlineSalt() ^ Zcu.InlineResult.retLenHash(ret_len1);
         var copy = ir.instructions.toMultiArrayList();
         try emit.inline_bodies.append(gpa, .{
             .instructions = (try copy.clone(gpa)).slice(),
@@ -825,8 +829,8 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
             .rbrace_line = ir.rbrace_line,
             .rbrace_column = ir.rbrace_column,
         });
-        try emit.inline_fates.put(gpa, func, .{ .yes = .{ .size = size, .hash = hash, .body = @intCast(emit.inline_bodies.items.len - 1) } });
-        try zcu.inline_results.put(gpa, func, .{ .size = size, .hash = hash, .ret_len = ret_len1 });
+        try emit.inline_fates.put(gpa, func, .{ .yes = .{ .size = size, .hash = hash, .straight = straight, .body = @intCast(emit.inline_bodies.items.len - 1) } });
+        try zcu.inline_results.put(gpa, func, .{ .size = size, .hash = hash, .ret_len = ret_len1, .straight = straight });
     } else {
         try emit.inline_fates.put(gpa, func, .no);
         // Its callers' calls read its `ret_len` (`func_inline`).
@@ -876,7 +880,7 @@ pub fn inlineFate(emit: *Emit, func: Index) Allocator.Error!FateResult {
         .done => {
             const res = emit.zcu.inline_results.get(func);
             try emit.inline_fates.put(emit.gpa, func, if (res) |r| if (r.size != Zcu.InlineResult.not_inlinable)
-                .{ .yes = .{ .size = r.size, .hash = r.hash, .body = no_body } }
+                .{ .yes = .{ .size = r.size, .hash = r.hash, .straight = r.straight, .body = no_body } }
             else
                 .no else .no);
             if (res) |r| if (r.ret_len != 0) try emit.ret_lens.put(emit.gpa, func, r.ret_len - 1);

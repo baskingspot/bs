@@ -1537,13 +1537,29 @@ pub const InlineResult = struct {
     /// One more than the argument that is the length of every slice the
     /// function returns (`inline.retLen`); 0 for none.
     ret_len: u32 = 0,
+    /// No `loop` in it or its inlined callees (`inline.nested_loop_factor`).
+    straight: bool = false,
 
     pub const not_inlinable = std.math.maxInt(u32);
+    /// In its `func_inline` node's first result word, above the size (but
+    /// for `not_inlinable`); a record without it reads as having a loop.
+    pub const straight_bit: u32 = 1 << 31;
 
     /// Mixed into the `func_inline` result, so callers that read
     /// `ret_len` change with it.
     pub fn retLenHash(ret_len: u32) cache.Hash {
         return if (ret_len == 0) 0 else cache.hash(ret_len, "ret_len");
+    }
+
+    /// Its first result word.
+    pub fn sizeWord(res: InlineResult) u32 {
+        return if (res.straight) res.size | straight_bit else res.size;
+    }
+
+    /// From its first result word, `size` and `straight`.
+    pub fn fromWord(word: u32) struct { u32, bool } {
+        if (word == not_inlinable) return .{ word, false };
+        return .{ word & ~straight_bit, word & straight_bit != 0 };
     }
 };
 

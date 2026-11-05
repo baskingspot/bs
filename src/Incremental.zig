@@ -3886,7 +3886,7 @@ fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.
         // is not inlinable and has none.
         if (d == .func_inline) if (zcu.inline_results.get(d.func_inline)) |res| {
             range.result = .{ @intCast(words.items.len), if (res.ret_len != 0) 2 else 1 };
-            try words.append(gpa, res.size);
+            try words.append(gpa, res.sizeWord());
             if (res.ret_len != 0) try words.append(gpa, res.ret_len);
         };
     }

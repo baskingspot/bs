@@ -1850,7 +1850,12 @@ build, the passes, and the debug info treat them as Sema's inline calls
   sroa), plus the sizes of the
   callees inlined into it (mid-stack inlining); the budget is 24, and
   twice that for a call inside a loop of the caller (`loop_factor`: its
-  cost is paid each iteration, its code once). A function whose callees are
+  cost is paid each iteration, its code once), and three times for a
+  callee with no loop (`straight`, recorded in its `func_inline` result
+  word) at a call inside a loop inside a loop (`nested_loop_factor`):
+  tls's `ct_protected.mulWide` (63) in the Montgomery inner loop, −5.8%
+  of tls-test's instructions. A callee with a loop of its own stays at
+  twice: sort's `blockSwap` inlined into `block` was +0.9%. A function whose callees are
   not all inlined is not inlinable itself, so only leaves and functions
   that become leaves inline, but for calls of `std.lang.returnError` (an
   error return trace's push): the address it records is in the inlined

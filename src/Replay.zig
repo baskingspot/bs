@@ -643,11 +643,15 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
     var inline_result: ?Zcu.InlineResult = null;
     if (zcu.inline_salt != 0) if (m.find(try r.keyer.keyOf(.func_inline, &.{try r.keyer.unitKeyString(unit)}))) |n| {
         const words = m.result(n);
-        if (words.len == 1 or words.len == 2) inline_result = .{
-            .size = words[0],
-            .hash = m.node(n).result_hash,
-            .ret_len = if (words.len == 2) words[1] else 0,
-        };
+        if (words.len == 1 or words.len == 2) {
+            const size, const straight = Zcu.InlineResult.fromWord(words[0]);
+            inline_result = .{
+                .size = size,
+                .hash = m.node(n).result_hash,
+                .ret_len = if (words.len == 2) words[1] else 0,
+                .straight = straight,
+            };
+        }
     };
     if (r.lazy) {
         if (ies) |got| {
@@ -1259,7 +1263,7 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
             // callee's unit).
             const in_changed = switch (dtag) {
                 .func_body => r.inChangedInput(d),
-                .func_inline => try r.inlineMoved(d, inline_ir.budget * inline_ir.loop_factor),
+                .func_inline => try r.inlineMoved(d, inline_ir.budget * inline_ir.nested_loop_factor),
                 else => continue,
             };
             if (!in_changed) continue;

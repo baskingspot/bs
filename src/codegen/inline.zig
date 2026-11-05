@@ -19,6 +19,22 @@ pub const budget = 24;
 /// A call inside a loop inlines callees up to this many times the budget:
 /// its cost is paid once per iteration, the code once.
 pub const loop_factor = 2;
+/// A callee without loops, at a call inside a loop inside a loop, which
+/// runs the most often: tls's Montgomery multiplication calls
+/// `ct_protected.mulWide` (size 63, whose checks prove then removes) in
+/// its inner loop. A callee's own loop would add its registers to the
+/// caller's hottest code (sort's `blockSwap` in `block`: +0.9%).
+pub const nested_loop_factor = 3;
+
+/// How many times the budget a callee of a call `loops` loops deep may
+/// have; `straight` is whether the callee has no loop.
+pub fn factor(loops: u32, straight: bool) u32 {
+    return switch (loops) {
+        0 => 1,
+        1 => loop_factor,
+        else => if (straight) nested_loop_factor else loop_factor,
+    };
+}
 /// Elements an `aggregate_init` may have and still count as one
 /// instruction: a struct literal sroa splits into registers, or a short
 /// array.
@@ -29,8 +45,8 @@ const small_aggregate = 8;
 /// position.
 pub const Site = struct {
     call: Inst.Index,
-    /// Inside a `loop` of the caller (`loop_factor`).
-    in_loop: bool,
+    /// How many `loop`s of the caller it is inside (`factor`).
+    loops: u32,
     callee: Index,
     line: u32,
     column: u32,
@@ -51,6 +67,8 @@ pub const Scan = struct {
     /// traps. A panic in inlined code loses its callers' frames from the
     /// stack trace.
     panics: bool = false,
+    /// Whether the function has no `loop` (`nested_loop_factor`).
+    straight: bool = true,
 };
 
 /// Finds the candidate calls of `ir` (into `sites`, in IR order) and
@@ -131,6 +149,7 @@ const Scanner = struct {
                     const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
                     const loop = tag == .loop;
                     s.loops += @intFromBool(loop);
+                    if (loop) s.out.straight = false;
                     try s.body(ir.bodySlice(extra.end, extra.data.body_len), cold);
                     s.loops -= @intFromBool(loop);
                 },
@@ -230,7 +249,7 @@ const Scanner = struct {
             s.out.inlinable = false;
             return;
         }
-        try s.sites.append(s.gpa, .{ .call = inst, .in_loop = s.loops != 0, .callee = callee, .line = s.line, .column = s.column });
+        try s.sites.append(s.gpa, .{ .call = inst, .loops = s.loops, .callee = callee, .line = s.line, .column = s.column });
     }
 };
 
