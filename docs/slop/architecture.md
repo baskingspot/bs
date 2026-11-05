@@ -7074,7 +7074,28 @@ Options:
      is) and `-D__GLIBC_MINOR__=N`, as upstream's bundled glibc. System
      headers of other libraries still come from the native include and
      library paths (`std.zig.system.NativePaths.detect`, as upstream does
-     when a step links system libraries).
+     when a step links system libraries). *As built* (native-libc): for
+     the native ABI (no `-target`, or `native`), libc's headers are the
+     system's, as upstream's `LibCDirs.detect` takes them from
+     `LibCInstallation.findNative`: `CSource.libcIncludeDirs` runs `$CC`
+     (else `cc`) with `-E -Wp,-v -xc /dev/null` and, from the last search
+     directory back, takes the first with `stdlib.h` and the first with
+     `sys/errno.h` (on the orb `/usr/include` and
+     `/usr/include/x86_64-linux-gnu`). It asks `-print-file-name` for
+     `crt1.o` and `crtbeginS.o` too and fails as upstream does
+     ("failed to find libc installation") without them, though bs links
+     neither. A compiler that cannot run or lists no directories falls
+     back to the lib directory's headers, as upstream's. The answer is
+     kept in `<global>/bs/libc/<key>`, keyed by the compiler's argv and
+     its file's stat and by `PATH`, `CPATH`, `C_INCLUDE_PATH`,
+     `GCC_EXEC_PREFIX`, `COMPILER_PATH`, `NIX_CFLAGS_COMPILE` and
+     `NIX_CC`, so that a build runs no compiler (a 0.1 ms read); the
+     directories go into the arguments, hence into every C record's and
+     translation record's key, and the headers read under them into
+     their file lists, as before. `-target x86_64-linux-gnu[.version]`
+     keeps the lib directory's headers, as upstream's. Linking does not
+     change: crt code, libc_nonshared.a and the glibc imports stay this
+     option's.
    - **glibc version**: `-target x86_64-linux-gnu.2.28` says it; for the
      native target, upstream's detection (`std.zig.system`, which reads
      the system's `libc.so.6`). It is part of the compilation key.
@@ -7357,8 +7378,9 @@ libraries as inputs. To be agreed with that thread.
   one without `-target` (glibc's
   ABI and detected version, with or without `-lc`, as upstream's native
   target), `x86_64-linux-none` for `-target x86_64-linux`. `-lc` adds
-  `-fPIC`, `-D__GLIBC_MINOR__` and glibc's headers from the zig lib
-  directory (`LibCDirs.detectFromBuilding`); the binary itself still adds
+  `-fPIC`, `-D__GLIBC_MINOR__` and libc's headers: the system's for the
+  native ABI, else glibc's from the zig lib directory (decision 1,
+  `CSource.libcIncludeDirs`); the binary itself still adds
   the native include paths (`/usr/include`) after all of these, as
   upstream's does. A native `-l<name>` other than libc's and libc++'s
   also puts them right after libc's headers, ahead of the user's flags
@@ -7531,8 +7553,8 @@ libraries as inputs. To be agreed with that thread.
   bs's target and the baseline CPU, in Debug: the triple from the glibc
   version (native: detected, with or without `-lc`, as upstream's native
   target; `x86_64-linux`: no libc), `-fPIC` with `-lc`
-  (`requiresPic`), glibc's headers from the zig lib directory (decision
-  1, as translate-c), `-fno-stack-protector` (upstream's Debug
+  (`requiresPic`), libc's headers as translate-c's (decision 1: the
+  system's for the native ABI), `-fno-stack-protector` (upstream's Debug
   backend for Zig has none, which turns it off for the compilation's C
   too; step 4 has the exceptions), the sanitizer flags of `sanitize_c`, every CPU feature, then
   `global_cc_argv`, the module's `cc_argv` and the file's `-cflags`.
@@ -7540,8 +7562,9 @@ libraries as inputs. To be agreed with that thread.
   errors instead (`-fno-caret-diagnostics`: `path:line:col: error:`,
   with notes), which become ordinary diagnostics. The objects are byte
   for byte upstream's for `-target x86_64-linux-gnu.2.36 -lc
-  -mcpu=baseline` and for the native target without `-lc`; upstream's
-  native `-lc` reads the system's `/usr/include` instead (decision 1).
+  -mcpu=baseline` and for the native target with and without `-lc`
+  (with `-mcpu=baseline`, since bs's default CPU is the baseline and
+  upstream's native).
 - **Running**: upstream zig is `BS_ZIG`, else `zig` on PATH, else
   `~/.cache/bs/zig-0.17.1/zig` or `zig-<host>-0.17.1/zig`; its
   version is checked (`zig version`, 5 ms) only when something must

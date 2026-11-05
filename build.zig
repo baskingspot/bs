@@ -1874,6 +1874,22 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     tc_native.addCheck(.{ .expect_stdout_match = "pub extern fn tcn_native() c_int;" });
     takes(b, &tc_native.step, 13);
     test_step.dependOn(&tc_native.step);
+    // With -lc and the native target, libc's headers are the system's,
+    // which the C compiler's search path names, as upstream's
+    // `LibCInstallation.findNative`; an explicit target takes the lib
+    // directory's glibc headers.
+    for ([_][]const []const u8{ &.{}, &.{ "-target", "x86_64-linux-gnu" } }, [_][]const u8{ "tcl_system", "tcl_bundled" }) |target, name| {
+        const tc_libc = b.addRunArtifact(bs);
+        tc_libc.setName(b.fmt("bs translate-c -lc {s} takes libc's headers from {s}", .{ if (target.len == 0) "native" else target[1], if (target.len == 0) "the system" else "the lib directory" }));
+        tc_libc.addArgs(&.{ "translate-c", "-lc" });
+        tc_libc.addArgs(target);
+        tc_libc.addFileArg(b.path("test/link_input/tc_libc/s.h"));
+        tc_libc.setCwd(b.path("."));
+        tc_libc.setEnvironmentVariable("CC", "sh test/link_input/tc_libc/cc.sh");
+        tc_libc.addCheck(.{ .expect_stdout_match = b.fmt("pub extern fn {s}() c_int;", .{name}) });
+        takes(b, &tc_libc.step, 13);
+        test_step.dependOn(&tc_libc.step);
+    }
     // SysV aggregates between Zig and C both ways: INTEGER, SSE and mixed
     // eightbytes, odd sizes, MEMORY, registers running out, a function
     // pointer, and variadic aggregates. Upstream prints the same except

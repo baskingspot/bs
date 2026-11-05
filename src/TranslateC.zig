@@ -6,8 +6,9 @@
 //!
 //! The arguments that reach Aro are upstream's (`Compilation.translateC`
 //! with `addCommonCCArgs(.aro)`) for bs's target: Debug, the baseline
-//! CPU, and with `-lc` glibc's headers from the zig lib directory, as
-//! bs's `-lc` links (docs/slop/architecture.md, "C interop").
+//! CPU, and with `-lc` libc's headers: the system's for the native ABI,
+//! as upstream's, else glibc's from the zig lib directory
+//! (`CSource.libcIncludeDirs`; docs/slop/architecture.md, "C interop").
 //!
 //! A translation record, `<local cache>/bs/tc/<key>`, lists every file
 //! Aro read (from its `-MD` depfile) with its stat and content hash, and
@@ -25,6 +26,7 @@ const Frontend = @import("Frontend.zig");
 const Incremental = @import("Incremental.zig");
 const BuildRunner = @import("BuildRunner.zig");
 const ToolRecord = @import("ToolRecord.zig");
+const CSource = @import("CSource.zig");
 const InternPool = @import("InternPool.zig");
 
 const Request = struct {
@@ -44,6 +46,9 @@ const Request = struct {
     /// upstream's `native_system_include_paths`, which a native target
     /// gets when the command names system libraries.
     native_includes: []const []const u8 = &.{},
+    /// The native ABI (no `-target`): libc's headers are the system's
+    /// (`CSource.libcIncludeDirs`), as upstream's.
+    native_abi: bool = false,
     listen: bool,
     zig_lib_dir: []const u8,
     cache_dirs: Frontend.CacheDirs,
@@ -169,6 +174,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         .cpu = opts.cpu,
         .cc_args = cc_args.items,
         .native_includes = native_includes,
+        .native_abi = std.mem.eql(u8, target, "native"),
         .listen = opts.listen,
         .zig_lib_dir = opts.zig_lib_dir orelse init.environ_map.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir,
         .cache_dirs = Frontend.resolveCacheDirs(arena, io, init.environ_map, .{ .local = opts.cache_dir, .global = opts.global_cache_dir }),
@@ -299,8 +305,8 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     if (req.link_libc and !macos) try argv.append(arena, try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{req.glibc_version.?.minor}));
     try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ lib, "include" }) });
     if (req.link_libc) {
-        const dirs = try std.zig.LibCDirs.detectFromBuilding(arena, .{ .root_dir = .cwd(), .sub_path = lib }, &target);
-        for (dirs.libc_include_dir_list) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
+        const dirs = try CSource.libcIncludeDirs(arena, io, init.environ_map, global, lib, &target, req.native_abi and !macos);
+        for (dirs) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
     }
     for (req.native_includes) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
     try argv.appendSlice(arena, &.{ "-O0", "-target", try target.zigTriple(arena), try mcpuArg(arena, &target) });

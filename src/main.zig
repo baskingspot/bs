@@ -1003,6 +1003,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .unwind_tables = opts.unwind_tables,
         .global_cc_argv = opts.c_global_cc_argv,
         .native_includes = opts.c_native_includes,
+        .native_abi = opts.target == null or std.mem.eql(u8, opts.target.?, "native"),
         .verbose = opts.verbose_cc,
     });
 }

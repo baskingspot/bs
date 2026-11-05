@@ -156,6 +156,9 @@ pub const Options = struct {
     global_cc_argv: []const []const u8,
     /// `-isystem` directories after libc's (`main.Options.c_native_includes`).
     native_includes: []const []const u8 = &.{},
+    /// The native ABI (no `-target`): libc's headers are the system's
+    /// (`libcIncludeDirs`).
+    native_abi: bool = false,
     /// `--verbose-cc`.
     verbose: bool = false,
     /// aarch64-macos (apple_m1 and libSystem's headers, which every
@@ -567,6 +570,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     const b = try gpa.create(Batch);
     errdefer gpa.destroy(b);
     b.* = .{ .gpa = gpa, .io = io, .jobs = &.{}, .zig = undefined, .paths = undefined, .verbose = o.verbose, .result_arena = .init(gpa) };
+    errdefer b.result_arena.deinit();
     errdefer {
         for (b.tool_locks.items) |f| f.close(io);
         b.tool_locks.deinit(gpa);
@@ -589,7 +593,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         break :id try std.fmt.allocPrint(s, "{s}\x00{d}\x00{d}\x00{d}", .{ p, st.inode, st.size, st.mtime.toNanoseconds() });
     } else "";
     const target = if (o.macos) try macosTarget(io) else try cTarget(io, o.glibc_version, o.cpu);
-    const common = try commonArgs(ra, &target, lib, o);
+    const common = try commonArgs(ra, io, environ, &target, lib, o);
 
     // The runtime libraries first, to know how many of their sources to
     // compile.
@@ -786,11 +790,11 @@ const Common = struct {
     asm_features: []const []const u8,
 };
 
-fn commonArgs(arena: std.mem.Allocator, target: *const std.Target, lib: []const u8, o: Options) !Common {
+fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, target: *const std.Target, lib: []const u8, o: Options) !Common {
     var libc_includes: std.ArrayList([]const u8) = .empty;
     if (o.link_libc) {
-        const dirs = try std.zig.LibCDirs.detectFromBuilding(arena, .{ .root_dir = .cwd(), .sub_path = lib }, target);
-        for (dirs.libc_include_dir_list) |d| try libc_includes.appendSlice(arena, &.{ "-isystem", d });
+        const dirs = try libcIncludeDirs(arena, io, environ, o.global_cache, lib, target, o.native_abi and !o.macos);
+        for (dirs) |d| try libc_includes.appendSlice(arena, &.{ "-isystem", d });
     }
     var native_includes: std.ArrayList([]const u8) = .empty;
     for (o.native_includes) |d| try native_includes.appendSlice(arena, &.{ "-isystem", d });
@@ -1206,6 +1210,145 @@ fn runtimeJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Ru
 }
 
 const Found = struct { found: ?[]const u8, looked: []const u8 };
+
+/// libc's include directories for `target`, in order, as upstream's
+/// `std.zig.LibCDirs.detect`: with the native ABI, the system libc
+/// installation's (`nativeLibcIncludes`), else, or when there is no
+/// system C compiler, the zig lib directory's glibc headers.
+pub fn libcIncludeDirs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8, lib: []const u8, target: *const std.Target, native_abi: bool) ![]const []const u8 {
+    if (native_abi) if (nativeLibcIncludes(arena, io, environ, global_cache) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => @import("main.zig").fatal("failed to find libc installation: {t}", .{err}),
+    }) |dirs| return dirs;
+    return (try std.zig.LibCDirs.detectFromBuilding(arena, .{ .root_dir = .cwd(), .sub_path = lib }, target)).libc_include_dir_list;
+}
+
+// The detection below follows upstream's `std.zig.LibCInstallation`
+// (`findNativeIncludeDirPosix`, `appendCcExe`) and `std.zig.LibCDirs`
+// (`detectFromInstallation`), Copyright (c) Zig contributors, MIT license.
+
+/// The system libc installation's include directories, as upstream finds
+/// them for a native target: the C compiler (`$CC`, split on spaces, else
+/// `cc`) lists its search path (`-E -Wp,-v -xc /dev/null`); from the last
+/// entry back, the first directory with `stdlib.h` and the first with
+/// `sys/errno.h`. Null when the compiler cannot run or lists nothing,
+/// where upstream falls back to its own headers. The answer is kept in
+/// `<global>/bs/libc/<key>`, keyed by the compiler's identity and the
+/// environment it searches with, so that a build does not run it again.
+fn nativeLibcIncludes(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8) !?[]const []const u8 {
+    const inf_loop_env_key = "ZIG_IS_DETECTING_LIBC_PATHS";
+    const skip_cc_env_var = if (environ.get(inf_loop_env_key)) |phase|
+        (if (std.mem.eql(u8, phase, "1")) true else return error.ZigIsTheCCompiler)
+    else
+        false;
+    var argv: std.ArrayList([]const u8) = .empty;
+    if (skip_cc_env_var) try argv.append(arena, "cc") else if (environ.get("CC")) |cc| {
+        var it = std.mem.tokenizeScalar(u8, cc, ' ');
+        while (it.next()) |arg| try argv.append(arena, arg);
+    }
+    if (argv.items.len == 0) try argv.append(arena, "cc");
+
+    // The key: the compiler's file and what changes where it looks.
+    var key: std.ArrayList(u8) = .empty;
+    try key.print(arena, "bs native libc 1\x00{d}\x00", .{@intFromBool(skip_cc_env_var)});
+    for (argv.items) |a| try key.print(arena, "{s}\x00", .{a});
+    const exe = argv.items[0];
+    const exe_path: ?[]const u8 = if (std.mem.indexOfScalar(u8, exe, '/') != null) exe else p: {
+        var it = std.mem.tokenizeScalar(u8, environ.get("PATH") orelse "", ':');
+        while (it.next()) |dir| {
+            const p = try std.fs.path.join(arena, &.{ dir, exe });
+            if (Io.Dir.cwd().access(io, p, .{ .execute = true })) |_| break :p p else |_| {}
+        }
+        break :p null;
+    };
+    const exe_stat = if (exe_path) |p| Io.Dir.cwd().statFile(io, p, .{}) catch null else null;
+    if (exe_stat) |st| try key.print(arena, "{s}\x00{d}\x00{d}\x00{d}\x00", .{ exe_path.?, st.inode, st.size, st.mtime.toNanoseconds() });
+    for ([_][]const u8{ "PATH", "CPATH", "C_INCLUDE_PATH", "GCC_EXEC_PREFIX", "COMPILER_PATH", "NIX_CFLAGS_COMPILE", "NIX_CC" }) |name|
+        try key.print(arena, "{s}={s}\x00", .{ name, environ.get(name) orelse "" });
+    const hex = std.fmt.bytesToHex(@as([16]u8, @bitCast(cache.hash(2, key.items))), .lower);
+    const record = try std.fs.path.join(arena, &.{ global_cache, "bs", "libc", &hex });
+    if (exe_stat != null) if (Io.Dir.cwd().readFileAlloc(io, record, arena, .limited(64 * 1024))) |bytes| {
+        var dirs: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.tokenizeScalar(u8, bytes, 0);
+        while (it.next()) |d| try dirs.append(arena, d);
+        // A record whose headers went away is the compiler's to answer.
+        if (dirs.items.len != 0) if (Io.Dir.cwd().access(io, try std.fs.path.join(arena, &.{ dirs.items[0], "stdlib.h" }), .{})) |_| return dirs.items else |_| {};
+    } else |_| {};
+
+    var env = try environ.clone(arena);
+    try env.put(inf_loop_env_key, if (skip_cc_env_var) "2" else "1");
+    const cc_argv = try arena.dupe([]const u8, argv.items);
+    try argv.appendSlice(arena, &.{ "-E", "-Wp,-v", "-xc", "/dev/null" });
+    const res = runCc(arena, io, argv.items, &env) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.CCompilerFailed => return null,
+    };
+    var search_paths: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.tokenizeAny(u8, res.stderr, "\n\r");
+    while (lines.next()) |line| if (line.len != 0 and line[0] == ' ') try search_paths.append(arena, std.mem.trimStart(u8, line, " "));
+    if (search_paths.items.len == 0) return null;
+    var include_dir: ?[]const u8 = null;
+    var sys_include_dir: ?[]const u8 = null;
+    var i = search_paths.items.len;
+    while (i > 0) {
+        i -= 1;
+        const dir = search_paths.items[i];
+        if (include_dir == null) if (Io.Dir.cwd().access(io, try std.fs.path.join(arena, &.{ dir, "stdlib.h" }), .{})) |_| {
+            include_dir = dir;
+        } else |_| {};
+        if (sys_include_dir == null) if (Io.Dir.cwd().access(io, try std.fs.path.join(arena, &.{ dir, "sys", "errno.h" }), .{})) |_| {
+            sys_include_dir = dir;
+        } else |_| {};
+        if (include_dir != null and sys_include_dir != null) break;
+    }
+    if (include_dir == null or sys_include_dir == null) return error.LibCStdLibHeaderNotFound;
+    // Upstream's detection also asks for the C runtime and GCC's objects,
+    // and fails without them (`findNativeCrtDirPosix`,
+    // `findNativeGccDirPosix`), though bs links its own.
+    for ([_][]const u8{ "crt1.o", "crtbeginS.o" }) |basename| {
+        const print = try std.mem.concat(arena, []const u8, &.{ cc_argv, &.{try std.fmt.allocPrint(arena, "-print-file-name={s}", .{basename})} });
+        const out = runCc(arena, io, print, &env) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.CCompilerFailed => return null,
+        };
+        var it = std.mem.tokenizeAny(u8, out.stdout, "\n\r");
+        const line = it.next() orelse return error.LibCRuntimeNotFound;
+        if (std.mem.eql(u8, line, basename) or std.fs.path.dirname(line) == null) return error.LibCRuntimeNotFound;
+    }
+    const dirs: []const []const u8 = if (std.mem.eql(u8, include_dir.?, sys_include_dir.?))
+        try arena.dupe([]const u8, &.{include_dir.?})
+    else
+        try arena.dupe([]const u8, &.{ include_dir.?, sys_include_dir.? });
+    // Best effort: without the record, the next build asks again.
+    if (exe_stat != null) {
+        if (std.fs.path.dirname(record)) |d| Io.Dir.cwd().createDirPath(io, d) catch {};
+        var parts: [4][]const u8 = undefined;
+        for (dirs, 0..) |d, k| {
+            parts[2 * k] = d;
+            parts[2 * k + 1] = "\x00";
+        }
+        cache.writeReplace(io, Io.Dir.cwd(), record, parts[0 .. 2 * dirs.len]) catch {};
+    }
+    return dirs;
+}
+
+/// Runs the C compiler for `nativeLibcIncludes`: `CCompilerFailed` when
+/// it cannot start or does not exit with 0, where upstream falls back to
+/// its own headers.
+fn runCc(arena: std.mem.Allocator, io: Io, argv: []const []const u8, env: *const std.process.Environ.Map) !std.process.RunResult {
+    const res = std.process.run(arena, io, .{
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+        .argv = argv,
+        .environ_map = env,
+        .expand_arg0 = .expand,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => return error.CCompilerFailed,
+    };
+    if (!res.term.success()) return error.CCompilerFailed;
+    return res;
+}
 
 /// Upstream zig: `BS_ZIG`, else `zig` on PATH, else where `.agents/setup`
 /// installs it.
