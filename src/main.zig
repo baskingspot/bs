@@ -123,7 +123,13 @@ pub const Options = struct {
     /// link glibc dynamically, with `glibc_version` resolved from the
     /// target (see "C interop" in docs/slop/architecture.md).
     link_libc: bool = false,
+    /// The glibc of a gnu target, linked or not (`checkTarget`).
     glibc_version: ?std.SemanticVersion = null,
+    /// A Linux target, resolved as upstream's (`checkTarget`), for
+    /// builtin; `native_os` when the target names no OS, whose kernel,
+    /// glibc and dynamic linker this system decides.
+    linux: ?std.Target = null,
+    native_os: bool = false,
     /// `-lc++` (or `-lstdc++`, `-lc++abi`, `-lsupc++`, as upstream): libc++'s
     /// headers for the C and C++ sources, and in an executable libc++,
     /// libc++abi and libunwind, built from the lib directory (CSource.zig).
@@ -470,6 +476,7 @@ pub const Job = struct {
             .pie = opts.pie,
             .dynamic = opts.dynamic,
             .glibc = if (opts.link_libc) opts.glibc_version else null,
+            .linux = opts.linux,
             .link_libcpp = opts.link_libcpp,
             .cpu = opts.cpu,
             .target = opts.bs_target,
@@ -504,6 +511,7 @@ pub const Job = struct {
                 .error_tracing = false,
                 .valgrind = false,
                 .cpu = opts.cpu,
+                .linux = opts.linux,
                 .target = opts.bs_target,
             })
         else
@@ -517,6 +525,11 @@ pub const Job = struct {
         // The glibc version a -lc build links, which the arguments do not
         // spell for the native target. Keys only: `full_args` stay as given.
         if (opts.link_libc) try compile_args.append(arena, try std.fmt.allocPrint(arena, "--bs-glibc={f}", .{opts.glibc_version.?}));
+        // What this system decides of a native OS, which builtin states.
+        if (opts.native_os) if (opts.linux) |t| {
+            const v = t.os.version_range.linux;
+            try compile_args.append(arena, try std.fmt.allocPrint(arena, "--bs-native={t},{f},{f},{f},{s}", .{ t.abi, v.range.min, v.range.max, v.glibc, t.dynamic_linker.get() orelse "" }));
+        };
         // The files the object and library arguments name, which `-l`
         // finds in the `-L` directories: the cache's link-only inputs,
         // objects and archives, then shared libraries.
@@ -958,20 +971,16 @@ fn libcNonshared(opts: *const Options) bool {
 /// Starts compiling the job's C sources (CSource.zig).
 fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
     const opts = &job.opts;
-    // The target's glibc names the ABI: without -lc too for the native
-    // target, as upstream's.
-    const glibc_version = opts.glibc_version orelse if (opts.target == null)
-        if (std.zig.system.resolveTargetQuery(init.io, .{})) |native| (if (native.abi.isGnu()) native.os.version_range.linux.glibc else null) else |_| null
-    else
-        null;
-    // On aarch64-macos every compile links libc (libSystem) and is
-    // position-independent, and upstream's Zig code goes through LLVM,
-    // so its C gets the stack protector, as upstream's `Module.create`.
+    // A gnu target's glibc names the C sources' ABI, without -lc too,
+    // as upstream's. On aarch64-macos every compile links libc
+    // (libSystem) and is position-independent, and upstream's Zig code
+    // goes through LLVM, so its C gets the stack protector, as upstream's
+    // `Module.create`.
     const macos = opts.bs_target == .aarch64_macos;
     return CSource.start(init.gpa, init.io, init.environ_map, opts.c_sources, .{
         .zig_lib_dir = job.zig_lib_dir,
         .local_cache = job.cache_dirs.local,
-        .glibc_version = if (macos) null else glibc_version,
+        .glibc_version = if (macos) null else opts.glibc_version,
         .cpu = opts.cpu,
         .macos = macos,
         .link_libc = opts.link_libc or macos,
@@ -2209,7 +2218,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             fatal("unexpected extra parameter: {s}", .{arg});
         }
     }
-    checkTarget(&opts, arena, opts.target orelse "native");
+    checkTarget(&opts, arena, io, opts.target orelse "native");
     // The aarch64-macos backend builds executables and tests, linked
     // against libSystem, which is macOS's libc (`-lc` asks for nothing
     // more), with C sources, Mach-O objects and archives.
@@ -2262,7 +2271,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // position-independent, as their builtin says. bs links executables
     // itself, non-PIE.
     if (opts.link_libc and (command == .build_obj or command == .build_lib)) opts.pic = true;
-    if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena, io);
+    if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena);
     // C sources without any module: a library or executable of C only, as
     // upstream's; so are object inputs alone in a library or object.
     if (root == null and !rootless_root and command != .@"test" and
@@ -2454,40 +2463,47 @@ fn inheritFlags(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []con
 }
 
 /// Resolves `-target` (`opts.bs_target`), or refuses a target bs does
-/// not support.
-pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8) void {
-    if (std.mem.eql(u8, target, "native")) {
-        if (builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux) {
-            opts.bs_target = .x86_64_linux;
-        } else if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
-            opts.bs_target = .aarch64_macos;
-        } else if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .linux) {
-            opts.bs_target = .aarch64_linux;
-        } else setUnsupported(opts, arena, "bs does not support the native target; pass -target x86_64-linux, -target aarch64-linux, or -target aarch64-macos", .{});
-    } else if (std.mem.eql(u8, target, "x86_64-linux") or std.mem.eql(u8, target, "x86_64-linux-none")) {
-        opts.bs_target = .x86_64_linux;
-    } else if (std.mem.startsWith(u8, target, "x86_64-linux-gnu")) {
-        // `x86_64-linux-gnu[.version]`: glibc, of that version or upstream's
-        // default for the target.
-        const rest = target["x86_64-linux-gnu".len..];
-        if (rest.len == 0) {
-            opts.glibc_version = default_glibc;
-        } else if (rest[0] == '.') {
-            opts.glibc_version = std.SemanticVersion.parse(rest[1..]) catch parse: {
-                const v = std.SemanticVersion.parse(std.fmt.allocPrint(arena, "{s}.0", .{rest[1..]}) catch fatal("out of memory", .{})) catch {
-                    setUnsupported(opts, arena, "invalid glibc version in target '{s}'", .{target});
-                    return;
-                };
-                break :parse v;
-            };
-        } else setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", .{target});
-        if (opts.glibc_version != null and !opts.link_libc)
-            setUnsupported(opts, arena, "bs supports '{s}' only with -lc; drop the ABI or add -lc", .{target});
-    } else if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none")) {
+/// not support. A Linux target resolves as upstream's
+/// (`std.zig.system.resolveTargetQuery`) into `opts.linux`: no ABI is musl
+/// (`-target x86_64-linux`), and a native OS (`native`,
+/// `x86_64-native-gnu`) takes the kernel version, and without an ABI the
+/// ABI, glibc and dynamic linker, of this system.
+pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []const u8) void {
+    if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none") or
+        (std.mem.eql(u8, target, "native") and builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos))
+    {
         opts.bs_target = .aarch64_macos;
-    } else if (std.mem.eql(u8, target, "aarch64-linux") or std.mem.eql(u8, target, "aarch64-linux-none")) {
-        opts.bs_target = .aarch64_linux;
-    } else setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", .{target});
+        return;
+    }
+    var query = std.Target.Query.parse(.{ .arch_os_abi = target }) catch {
+        setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", .{target});
+        return;
+    };
+    const arch = query.cpu_arch orelse builtin.cpu.arch;
+    if ((arch != .x86_64 and arch != .aarch64) or (query.os_tag orelse builtin.os.tag) != .linux) {
+        if (std.mem.eql(u8, target, "native"))
+            setUnsupported(opts, arena, "bs does not support the native target; pass -target x86_64-linux, -target aarch64-linux, or -target aarch64-macos", .{})
+        else
+            setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", .{target});
+        return;
+    }
+    // bs's CPU is `-mcpu`'s (`cpu.resolve`), not the detected one.
+    query.cpu_model = .baseline;
+    const resolved = std.zig.system.resolveTargetQuery(io, query) catch |err| {
+        setUnsupported(opts, arena, "unable to detect the native target '{s}': {t}", .{ target, err });
+        return;
+    };
+    switch (resolved.abi) {
+        .gnu => opts.glibc_version = resolved.os.version_range.linux.glibc,
+        .musl, .none => {},
+        else => {
+            setUnsupported(opts, arena, "bs does not support the ABI {t} ('-target {s}'); it supports gnu, musl and none", .{ resolved.abi, target });
+            return;
+        },
+    }
+    opts.bs_target = if (arch == .aarch64) .aarch64_linux else .x86_64_linux;
+    opts.linux = resolved;
+    opts.native_os = query.os_tag == null;
 }
 
 /// glibc's symbols at the build's version, from the zig lib directory.
@@ -2579,28 +2595,18 @@ pub fn isGlibcLib(name: []const u8) bool {
     return glibc_libs.has(name);
 }
 
-/// Upstream's glibc version for `x86_64-linux-gnu` without one.
-const default_glibc: std.SemanticVersion = .{ .major = 2, .minor = 31, .patch = 0 };
-
-/// Settles the glibc a `-lc` build links: the target's version, or for the
-/// native target the system's, which upstream detects the same way. Other
-/// libcs are not supported.
-pub fn resolveGlibc(opts: *Options, arena: std.mem.Allocator, io: Io) void {
+/// Refuses a `-lc` build without glibc: bs links no other libc. The
+/// target (`checkTarget`) gives the glibc version, which for the native
+/// target is the system's, as upstream detects it.
+pub fn resolveGlibc(opts: *Options, arena: std.mem.Allocator) void {
     if (opts.glibc_version != null) return;
     const target = opts.target orelse "native";
     if (!std.mem.eql(u8, target, "native")) {
         setUnsupported(opts, arena, "bs links only glibc ('-lc' with target '{s}', whose libc is musl or none); pass -target x86_64-linux-gnu or no target", .{target});
-        return;
+    } else {
+        const abi: std.Target.Abi = if (opts.linux) |t| t.abi else .none;
+        setUnsupported(opts, arena, "bs links only glibc ('-lc'), and this system's libc is not glibc ({t}); pass -target x86_64-linux-gnu", .{abi});
     }
-    const native = std.zig.system.resolveTargetQuery(io, .{}) catch |err| {
-        setUnsupported(opts, arena, "unable to detect the native libc for -lc: {t}", .{err});
-        return;
-    };
-    if (native.os.tag != .linux or !native.abi.isGnu()) {
-        setUnsupported(opts, arena, "bs links only glibc ('-lc'), and this system's libc is not glibc ({t}); pass -target x86_64-linux-gnu", .{native.abi});
-        return;
-    }
-    opts.glibc_version = native.os.version_range.linux.glibc;
 }
 
 fn nextTestArg(command: Command, args: []const []const u8, i: *usize, flag: []const u8) []const u8 {

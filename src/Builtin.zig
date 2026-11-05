@@ -42,6 +42,10 @@ pub const Options = struct {
     /// code, which glibc's crt1.o would provide, comes with it
     /// (`glibc_start`).
     glibc: ?std.SemanticVersion = null,
+    /// Linux: the target as upstream resolves it (`main.checkTarget`),
+    /// whose ABI, kernel and glibc versions and dynamic linker builtin
+    /// states; without one, x86_64-linux-none.
+    linux: ?std.Target = null,
     /// `-lc++`.
     link_libcpp: bool = false,
     /// `-mcpu` (`cpu.resolve`).
@@ -274,7 +278,18 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     // Objects and static libraries with -lc stay static and take no start
     // code, as upstream's (`--show-builtin`).
     const exe_libc = libc and opts.output_mode == .Exe;
-    const glibc = opts.glibc orelse std.SemanticVersion{ .major = 2, .minor = 31, .patch = 0 };
+    const abi: std.Target.Abi = if (opts.linux) |t| t.abi else .none;
+    const versions: std.Target.Os.LinuxVersionRange = if (opts.linux) |t| t.os.version_range.linux else .{
+        .range = .{ .min = .{ .major = 5, .minor = 10, .patch = 0 }, .max = .{ .major = 7, .minor = 2, .patch = 0 } },
+        .glibc = .{ .major = 2, .minor = 31, .patch = 0 },
+        .android = 29,
+    };
+    const glibc = opts.glibc orelse versions.glibc;
+    var ld_buf: [255 * 4 + 16]u8 = undefined;
+    const dynamic_linker = if (opts.linux) |t| if (t.dynamic_linker.get()) |ld|
+        std.fmt.bufPrint(&ld_buf, ".init(\"{f}\")", .{std.zig.fmtString(ld)}) catch unreachable
+    else
+        ".none" else ".none";
     const cpu_ns = switch (opts.cpu.arch) {
         .x86_64 => "x86",
         else => @tagName(opts.cpu.arch),
@@ -311,14 +326,14 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\    .version_range = .{{ .linux = .{{
         \\        .range = .{{
         \\            .min = .{{
-        \\                .major = 5,
-        \\                .minor = 10,
-        \\                .patch = 0,
+        \\                .major = {d},
+        \\                .minor = {d},
+        \\                .patch = {d},
         \\            }},
         \\            .max = .{{
-        \\                .major = 7,
-        \\                .minor = 2,
-        \\                .patch = 0,
+        \\                .major = {d},
+        \\                .minor = {d},
+        \\                .patch = {d},
         \\            }},
         \\        }},
         \\        .glibc = .{{
@@ -326,7 +341,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\            .minor = {d},
         \\            .patch = {d},
         \\        }},
-        \\        .android = 29,
+        \\        .android = {d},
         \\    }}}},
         \\}};
         \\pub const target: std.Target = .{{
@@ -363,16 +378,23 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         @tagName(opts.unwind_tables),
         if (opts.is_test) "true" else "false",
         if (opts.single_threaded) "true" else "false",
-        if (libc) "gnu" else "none",
+        @tagName(abi),
         @tagName(opts.cpu.arch),
         cpu_ns,
         std.zig.fmtIdPU(opts.cpu.model.name),
         cpu_ns,
         features.items,
+        versions.range.min.major,
+        versions.range.min.minor,
+        versions.range.min.patch,
+        versions.range.max.major,
+        versions.range.max.minor,
+        versions.range.max.patch,
         glibc.major,
         glibc.minor,
         glibc.patch,
-        if (libc) ".init(\"/lib64/ld-linux-x86-64.so.2\")" else ".none",
+        versions.android,
+        dynamic_linker,
         @tagName(opts.optimize),
         if (libc) "true" else "false",
         if (opts.link_libcpp) "true" else "false",

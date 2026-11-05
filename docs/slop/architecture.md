@@ -7196,7 +7196,13 @@ libraries as inputs. To be agreed with that thread.
   ("glibc_start.zig"); }`, which is not a declaration, so
   `@typeInfo(builtin)` stays upstream's. The start file sits next to
   builtin.zig in its content-addressed directory, whose hash covers both.
-  Builds without `-lc` get the same builtin.zig bytes as before.
+  With or without `-lc`, a Linux target (x86_64 or aarch64) resolves as upstream's
+  (`main.checkTarget` calls `std.zig.system.resolveTargetQuery`), and
+  builtin states its ABI (the system's for the native target, musl for
+  `x86_64-linux`, none for `x86_64-linux-none`), kernel and glibc
+  versions and dynamic linker. A native OS's resolved values go into the
+  compilation's key (`--bs-native=`), since the arguments do not spell
+  them.
 - **Start code** (`Builtin.glibc_start`): a naked `_start` (CFI
   undefined rip) passes the stack pointer and rdx to `startMain`, which
   calls `__libc_start_main(main, argc, argv, null, null, rtld_fini,

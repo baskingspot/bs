@@ -143,15 +143,10 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
                 native_includes = paths.include_dirs.items;
             } else |_| {};
         } else |_| {}
-        if (opts.link_libc and opts.unsupported == null) main.resolveGlibc(&opts, arena, io);
+        if (opts.link_libc and opts.unsupported == null) main.resolveGlibc(&opts, arena);
     } else {
-        // `checkTarget` takes `x86_64-linux-gnu` only with -lc; headers
-        // translate for it without.
-        const libc = opts.link_libc;
-        opts.link_libc = true;
-        main.checkTarget(&opts, arena, target);
-        opts.link_libc = libc;
-        if (opts.link_libc and opts.unsupported == null and opts.bs_target == .x86_64_linux) main.resolveGlibc(&opts, arena, io);
+        main.checkTarget(&opts, arena, io, target);
+        if (opts.link_libc and opts.unsupported == null and opts.bs_target == .x86_64_linux) main.resolveGlibc(&opts, arena);
     }
     // As the code bs compiles the headers into: apple_m1, whatever the
     // host (`-mcpu native` included).
