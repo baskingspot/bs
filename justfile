@@ -20,6 +20,12 @@ test *ARGS:
 conformance *ARGS:
     tools/conformance/run.py {{ ARGS }}
 
+[doc("Order checks: behavior built four ways on one thread, std built with the comptime evaluator off, eager, and off; each checked node by node against the build before (BS_CACHE_VERIFY=full) and required to give the same binary. Pass --bs <path> to skip building bs")]
+[group("test")]
+sched-check *ARGS:
+    BS_CACHE_CHECK=1 tools/conformance/run.py --default-runner --edit-verify --sched-check {{ ARGS }}
+    BS_CACHE_CHECK=1 tools/conformance/run.py --std --sched-check {{ ARGS }}
+
 [doc("Lint Zig, Python, shell, Nix, Markdown, the workflows, and this justfile: zig fmt, ruff, shellcheck, nix fmt, oxfmt, actionlint, zizmor, and just --fmt")]
 [group("lint")]
 lint:

@@ -717,8 +717,10 @@ through a reinterpreting pointer). Before, std's `featureSet(&.{})`
 (`var x = Set.empty; ...; return x;`) gave memo entries the evaluator
 made a plain `type_layout` of `Cpu.Feature.Set` that the walker's lacked,
 so `cpu.generic`'s edges followed analysis order
-(test/run/edit_eval_tier.zig; on std, a `BS_COMPTIME_EVAL=0` build then
-a `BS_COMPTIME_EVAL=1 BS_CACHE_VERIFY=full` one shows any such read).
+(test/run/edit_eval_tier.zig; `run.py --std --sched-check`, or `just
+sched-check`, builds std with `BS_COMPTIME_EVAL=0`, then `=1`, then `=0`,
+each checked with `BS_CACHE_VERIFY=full` against the one before, which
+shows such a read whichever tier lacks it).
 A unit's edges therefore cover what
 the walker would have read (plain) plus the lowering's other reads
 (conditional), whichever tier ran its calls; since call counts differ
@@ -6522,11 +6524,17 @@ state. Built for step 1:
   (the last export of a name wins; `comptime` blocks' effects are
   ordered). Without a seed the order is the one before. `--sched-check`
   builds every unit a third way with it (seed `--sched-seed` plus the
-  unit name's CRC-32). Each of its three builds is a full build on one
-  thread checked node by node against the unit's last build
-  (`BS_CACHE_VERIFY=full`), so the cache's dependencies, references and
-  atom records must not depend on the order either, and the three
-  binaries must be identical. The check needs the cache on: error codes
+  unit name's CRC-32), and a fourth with `BS_COMPTIME_EVAL=1`, where the
+  evaluator runs every comptime call the walker ran in the other three.
+  Each of its four builds is a full build on one thread checked node by
+  node against the unit's last build (`BS_CACHE_VERIFY=full`), so the
+  cache's dependencies, references and atom records must not depend on
+  the order or the tier either, and the four binaries must be identical.
+  With `--std` or `--c-abi`, `--sched-check` builds the suite again with
+  `BS_COMPTIME_EVAL=0`, `=1` and `=0` instead (the tier swap), checked
+  the same way; since `BS_CACHE_VERIFY` only flags what the previous
+  build's manifest lacks, the swap runs both ways. `just sched-check`
+  runs both. The check needs the cache on: error codes
   are numbered as names are first used (rule 5's global order is not
   built), so with the cache off a shuffled build numbers them
   differently (behavior's fn_delegation.zig: two entries of the error
