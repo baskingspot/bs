@@ -753,8 +753,12 @@ fn argScratch(cg: *CodeGen, n: usize) Error!struct { []Index, []AutoArg } {
     return .{ cg.arg_tys.items, cg.arg_locs.items };
 }
 
-/// Loads the `n` bytes (1 to 8) at `m` into `reg`, zero-extended. Uses r11
-/// for sizes that take more than one load.
+/// Loads the `n` bytes (1 to 8) at `m` into `reg`, zero-extended. An odd
+/// size is assembled from the top down: the highest byte or word
+/// zero-extended, then each lower word written into the low half after a
+/// shift, which keeps the rest. No scratch register, so `m` may be
+/// addressed through any register but `reg` (r11 for a deferred load
+/// whose pointer is in memory, `deferredMem`).
 fn loadBytes(cg: *CodeGen, reg: Reg, m: Mem, n: u64) Error!void {
     const e = &cg.e;
     switch (n) {
@@ -762,34 +766,36 @@ fn loadBytes(cg: *CodeGen, reg: Reg, m: Mem, n: u64) Error!void {
         4 => return e.movzx(.qword, reg, .dword, .{ .mem = m }),
         2 => return e.movzx(.qword, reg, .word, .{ .mem = m }),
         1 => return e.movzx(.qword, reg, .byte, .{ .mem = m }),
-        3 => try e.movzx(.qword, reg, .word, .{ .mem = m }),
-        else => try e.movzx(.qword, reg, .dword, .{ .mem = m }),
+        else => {},
     }
-    var off: u64 = if (n == 3) 2 else 4;
-    while (off < n) {
-        const chunk: u64 = if (n - off >= 2) 2 else 1;
-        try e.movzx(.qword, .r11, if (chunk == 2) .word else .byte, .{ .mem = offsetMem(m, off) });
-        try e.shift(.shl, .qword, .{ .reg = .r11 }, @intCast(off * 8));
-        try e.alu(.@"or", .qword, .{ .reg = reg }, .{ .reg = .r11 });
-        off += chunk;
+    var off: u64 = n - 2 + n % 2;
+    try e.movzx(.qword, reg, if (n % 2 == 1) .byte else .word, .{ .mem = offsetMem(m, off) });
+    while (off > 0) {
+        off -= 2;
+        try e.shift(.shl, .qword, .{ .reg = reg }, 16);
+        try e.mov(.word, .{ .reg = reg }, .{ .mem = offsetMem(m, off) });
     }
 }
 
-/// Stores the low `n` bytes (1 to 8) of `reg` to `m`. Uses r11.
+/// Stores the low `n` bytes (1 to 8) of `reg` to `m`. An odd size is
+/// stored from the bottom up, rotating `reg` to bring each higher part
+/// down, and back at the end. No scratch register, so `m` may be
+/// addressed through any register but `reg`. Writes the flags.
 fn storeBytes(cg: *CodeGen, m: Mem, reg: Reg, n: u64) Error!void {
     switch (n) {
         1, 2, 4, 8 => return cg.storeReg(m, reg, n),
         else => {},
     }
     const e = &cg.e;
-    try e.mov(.qword, .{ .reg = .r11 }, .{ .reg = reg });
     var off: u64 = 0;
-    while (off < n) {
+    while (true) {
         const chunk: u64 = if (n - off >= 4) 4 else if (n - off >= 2) 2 else 1;
-        try e.mov(sizeOf(chunk), .{ .mem = offsetMem(m, off) }, .{ .reg = .r11 });
+        try e.mov(sizeOf(chunk), .{ .mem = offsetMem(m, off) }, .{ .reg = reg });
+        if (off + chunk == n) break;
+        try e.shift(.ror, .qword, .{ .reg = reg }, @intCast(chunk * 8));
         off += chunk;
-        if (off < n) try e.shift(.shr, .qword, .{ .reg = .r11 }, @intCast(chunk * 8));
     }
+    try e.shift(.rol, .qword, .{ .reg = reg }, @intCast(off * 8));
 }
 
 /// Loads `.auto` value `ref` of class `gpr` into `reg`.
