@@ -200,6 +200,9 @@ pub const Options = struct {
     builtin_dir: []const u8,
     /// `bs test` only: root source file of the module under test.
     main_src_path: ?[]const u8 = null,
+    /// `bs test` with `--test-runner`: as upstream's, the custom test
+    /// runner imports the modules the module under test does.
+    custom_test_runner: bool = false,
     /// Whether `loadAll` loads std, which upstream always analyzes. Off only
     /// in tests that have no lib directory.
     load_std: bool = true,
@@ -303,6 +306,7 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         }
     }.f;
     fe.modules.items[@backingInt(fe.main_module)].deps = try resolve(&fe, options.root_name, options.root_deps);
+    if (options.custom_test_runner) fe.modules.items[@backingInt(Module.Index.root)].deps = try gpa.dupe(Dep, fe.modules.items[@backingInt(fe.main_module)].deps);
     for (options.modules, first_extra..) |m, k| fe.modules.items[k].deps = try resolve(&fe, options.root_name, m.deps);
     // `-ffuzz` per module: the main module's flag for it, std, builtin
     // and the test runner; each other module's resolved by `main`.

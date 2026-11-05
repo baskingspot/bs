@@ -1037,6 +1037,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .root_dir = opts.root_dir,
         .builtin_dir = job.builtin_dir,
         .main_src_path = if (is_test) opts.root_src_path else null,
+        .custom_test_runner = is_test and opts.test_runner != null,
         .root_name = opts.root_name,
         .root_deps = opts.root_deps,
         .modules = opts.modules,

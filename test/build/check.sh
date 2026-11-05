@@ -127,6 +127,14 @@ tar tf zig-out/docs/sources.tar | grep -qx test/main.zig || fail "sources.tar ho
 printf 'fn f() void {\n    const y = 1;\n}\n' | "$bs" ast-check --color off 2>"$work/log" && fail "bs ast-check fails on an unused constant"
 expect "<stdin>:2:11: error: unused local constant"
 
+# A custom test runner imports the modules the tested module does, as
+# upstream's.
+mkdir "$work/runner"
+printf 'pub const n = 7;\n' >"$work/runner/m.zig"
+printf 'test {}\n' >"$work/runner/t.zig"
+printf 'const m = @import("m");\npub fn main() u8 {\n    return if (m.n == 7) 0 else 1;\n}\n' >"$work/runner/r.zig"
+(cd "$work/runner" && "$bs" test --dep m -Mroot=t.zig -Mm=m.zig --test-runner r.zig) >"$work/log" 2>&1 || fail "bs test with a custom runner importing the tested module's import"
+
 # An edit: the output changes in place.
 sed -i 's/"hello"/"howdy"/' src/greet.zig
 "$bs" build >"$work/log" 2>&1 || fail "bs build (edit)"
