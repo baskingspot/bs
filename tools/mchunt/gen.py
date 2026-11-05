@@ -446,6 +446,17 @@ EXTRA_DECL = {
         "    return x -% y;",
         "}",
     ],
+    # Switch shapes (s_swx).
+    "swx": [
+        "var gSwCnt: u64 = 0;",
+        "noinline fn swSide(v: u64) bool {",
+        "    gSwCnt = gSwCnt *% 31 +% v +% 1;",
+        "    return v & 1 == 1;",
+        "}",
+        "const SwN = enum(i8) { lo = -128, m1 = -1, z = 0, f = 5, hi = 127, _ };",
+        "const SwX = enum(i16) { a = -300, b = -2, c = 7, d = 1000 };",
+        "const SwU = enum(u3) { a, b, c, d, e, f, g, h };",
+    ],
     # 4. Calls through @extern and extern pointers whose result goes back
     # into the variable the argument came from.
     "xcall": [
@@ -1376,6 +1387,7 @@ class Gen:
             (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
             (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
+            (2, "swx"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -2999,6 +3011,271 @@ class Gen:
             self.sink(ctx, f"{sl}[{j}]" if not near else f"{sl}[{j} + 1]", U32)
             ctx["indent"] -= 1
             e("}")
+
+    def _sw_int(self):
+        """An integer type for a switch operand: u8..u64, i8..i64, odd
+        widths, and wider than 64 bits."""
+        return self.pick([Int(False, 8), Int(False, 16), Int(False, 32), U64, Int(True, 8), Int(True, 16), Int(True, 32),
+                          Int(True, 64), Int(False, 3), Int(True, 5), Int(False, 65), Int(False, 128), Int(True, 100),
+                          Int(False, 12), Int(True, 33)])
+
+    def s_swx(self, ctx):
+        """Switches as jump tables, binary searches and compares: dense,
+        sparse and mixed items, range prongs (signed, at the type ends,
+        wide), enums with negative and non-exhaustive tags, labeled switch
+        continues, and and/or/! conditions guarding slice indexing."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        self.extra.add("swx")
+        k = self.r.randrange(5)
+        if k <= 1:
+            self._sw_items(ctx)
+        elif k == 2:
+            self._sw_enum(ctx)
+        elif k == 3:
+            self._sw_labeled(ctx)
+        else:
+            self._sw_cond(ctx)
+        self.sink(ctx, "gSwCnt", U64)
+
+    def _sw_items(self, ctx):
+        e = lambda s_: self.emit(ctx, s_)
+        t = self._sw_int()
+        sg, b = t.signed, t.bits
+        lo, hi = (-(1 << (b - 1)), (1 << (b - 1)) - 1) if sg else (0, (1 << b) - 1)
+        lit = lambda v: f"@as({t.name()}, {v})"
+        shape = self.r.randrange(3)
+        n = self.r.randint(2, 14)
+        vals = set()
+        if shape == 0:  # dense from a base (maybe at a type end)
+            base = self.pick([lo, max(lo, hi - n), 0 if lo <= 0 else lo, self.r.randint(lo, max(lo, hi - n))])
+            vals = {v for v in range(base, base + n) if lo <= v <= hi}
+        else:
+            for _ in range(n):
+                vals.add(self.pick([lo, lo + 1, hi, hi - 1, 0 if lo <= 0 <= hi else lo, self.r.randint(lo, hi),
+                                    self.r.randint(max(lo, -40), min(hi, 40))]))
+            if shape == 2:  # mixed: a dense run plus sparse
+                base = self.r.randint(max(lo, -20), max(lo, min(hi - 8, 20)))
+                vals |= {v for v in range(base, base + 6) if lo <= v <= hi}
+        vals = sorted(vals)
+        # Range prongs over gaps, disjoint from the items.
+        ranges = []
+        used = set(vals)
+        for _ in range(self.r.randint(0, 3)):
+            a = self.pick([lo, self.r.randint(lo, hi), max(lo, hi - self.r.randint(0, 1000))])
+            w = self.pick([1, 3, 50, (hi - lo) // 4])
+            z = min(hi, a + w)
+            if any(a <= v <= z for v in used) or any(not (z < r0 or a > r1) for r0, r1 in ranges):
+                continue
+            ranges.append((a, z))
+        full = len(vals) == (hi - lo + 1)
+        prongs = []
+        groups = list(vals)
+        self.r.shuffle(groups)
+        i = 0
+        while i < len(groups):
+            g = groups[i:i + self.r.choice([1, 1, 1, 2, 3])]
+            i += len(g)
+            prongs.append(("items", g))
+        for r0, r1 in ranges:
+            prongs.append(("range", (r0, r1)))
+        self.r.shuffle(prongs)
+        # A runtime selector over interesting values: items, range ends +-1, type ends.
+        cands = set(vals) | {lo, hi} | {x for r0, r1 in ranges for x in (r0 - 1, r0, r1, r1 + 1)}
+        cands = sorted(c for c in cands if lo <= c <= hi)
+        sel = self.fresh("sw")
+        e(f"var {sel}: [{len(cands)}]{t.name()} = .{{ {', '.join(lit(c) for c in cands)} }};")
+        e(f"{sel}[{self.r.randrange(len(cands))}] {'+%' if self.chance(0.5) else '-%'}= {lit(self.r.randint(0, 1))};")
+        idx = f"@as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % {len(cands)}"
+        v = self.fresh("sv")
+        e(f"const {v}: {t.name()} = {sel}[{idx}];")
+        r = self.fresh("sr")
+        e(f"const {r}: u64 = switch ({v}) {{")
+        ctx["indent"] += 1
+        for kind, pv in prongs:
+            body = self.pick([f"{self.r.randint(0, 999)}", "|c| " + self.to_u64("c", t) + f" +% {self.r.randint(1, 9)}"])
+            cap = ""
+            if body.startswith("|c| "):
+                cap, body = "|c| ", body[4:]
+            if kind == "items":
+                e(f"{', '.join(lit(x) for x in pv)} => {cap}{body},")
+            else:
+                e(f"{lit(pv[0])}...{lit(pv[1])} => {cap}{body},")
+        if not full:
+            e(f"else => {self.pick(['77', '|c| ' + self.to_u64('c', t) + ' ^ 0x55'])},")
+        ctx["indent"] -= 1
+        e("};")
+        self.sink(ctx, r, U64)
+
+    def _sw_enum(self, ctx):
+        e = lambda s_: self.emit(ctx, s_)
+        k = self.r.randrange(3)
+        r = self.fresh("sr")
+        if k == 0:
+            # Non-exhaustive with negative tags: any i8 is a valid value.
+            v = self.fresh("se")
+            e(f"const {v}: SwN = @enumFromInt(@as(i8, @truncate(@as(i64, @bitCast({self.int_expr(ctx, U64, 1)})))));")
+            items = self.r.sample(["lo", "m1", "z", "f", "hi"], self.r.randint(1, 5))
+            e(f"const {r}: u64 = switch ({v}) {{")
+            ctx["indent"] += 1
+            for it in items:
+                e(f".{it} => {self.r.randint(0, 99)},")
+            if len(items) == 5 and self.chance(0.5):
+                e(f"_ => |c| @as(u64, @as(u8, @bitCast(@intFromEnum(c)))),")
+            else:
+                e(f"else => |c| @as(u64, @as(u8, @bitCast(@intFromEnum(c)))) +% 1000,")
+            ctx["indent"] -= 1
+            e("};")
+        elif k == 1:
+            sel = self.fresh("sw")
+            e(f"var {sel} = [_]SwX{{ .a, .b, .c, .d, .{self.pick(['a', 'b', 'c', 'd'])} }};")
+            e(f"_ = &{sel};")
+            e(f"const {r}: u64 = switch ({sel}[@as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % 5]) {{")
+            ctx["indent"] += 1
+            e(f".a, .d => {self.r.randint(0, 99)},")
+            if self.chance(0.5):
+                e(f".b => |c| @as(u64, @as(u16, @bitCast(@intFromEnum(c)))),")
+                e(f".c => {self.r.randint(0, 99)},")
+            else:
+                e("else => |c| @as(u64, @as(u16, @bitCast(@intFromEnum(c)))) ^ 3,")
+            ctx["indent"] -= 1
+            e("};")
+        else:
+            v = self.fresh("se")
+            e(f"const {v}: SwU = @enumFromInt(@as(u3, @truncate({self.int_expr(ctx, U64, 1)})));")
+            tags = ["a", "b", "c", "d", "e", "f", "g", "h"]
+            self.r.shuffle(tags)
+            cut = self.r.randint(1, 7)
+            e(f"const {r}: u64 = switch ({v}) {{")
+            ctx["indent"] += 1
+            e(f"{', '.join('.' + x for x in tags[:cut])} => |c| @as(u64, @intFromEnum(c)) *% 3,")
+            e(f"{', '.join('.' + x for x in tags[cut:])} => {self.r.randint(0, 99)},")
+            ctx["indent"] -= 1
+            e("};")
+        self.sink(ctx, r, U64)
+
+    def _sw_labeled(self, ctx):
+        """`continue :s <const>` into items, ranges and else, with and
+        without captures, and bounded runtime continues."""
+        e = lambda s_: self.emit(ctx, s_)
+        t = self.pick([Int(False, 8), Int(True, 8), Int(False, 32), Int(True, 16), U64, Int(False, 3)])
+        sg, b = t.signed, t.bits
+        lo, hi = (-(1 << (b - 1)), (1 << (b - 1)) - 1) if sg else (0, (1 << b) - 1)
+        lit = lambda v: f"@as({t.name()}, {v})"
+        # States: items 0..5 (clamped into range), a range prong, else.
+        st = sorted({max(lo, min(hi, v)) for v in [0, 1, 2, 3, 5, hi]})
+        rlo, rhi = (max(lo, 10), min(hi, 20)) if hi >= 20 else (None, None)
+        acc, cnt, lab = self.fresh("la"), self.fresh("lc"), self.fresh("ls")
+        e(f"var {acc}: u64 = {self.int_expr(ctx, U64, 1)};")
+        e(f"var {cnt}: u32 = 0;")
+        start = self.pick(st + ([rlo] if rlo is not None else []) + ([lo] if lo not in st else []))
+        startx = lit(start) if self.chance(0.5) else f"{lit(start)} +% @as({t.name()}, @intFromBool({self.bool_expr(ctx, 1)}))"
+        e(f"{lab}: switch ({startx}) {{")
+        ctx["indent"] += 1
+        targets = st + ([rlo, rhi] if rlo is not None else []) + [hi]
+        later = lambda x: [y for y in st if y > x]
+        for x in st:
+            nxt = later(x)
+            if x == st[-1] or not nxt:
+                e(f"{lit(x)} => break :{lab},")
+                continue
+            cap = self.chance(0.4)
+            e(f"{lit(x)} => {'|c| ' if cap else ''}{{")
+            ctx["indent"] += 1
+            e(f"{acc} = ({acc} ^ {('@as(u64, @bitCast(@as(i64, c)))' if sg else '@as(u64, c)') if cap else str(x)}) *% 0x9E3779B97F4A7C15;")
+            j = self.r.randrange(4)
+            if j == 0:
+                e(f"continue :{lab} {lit(self.pick(nxt))};")
+            elif j == 1 and rlo is not None:
+                e(f"continue :{lab} {lit(self.r.randint(rlo, rhi))};")
+            elif j == 2:
+                # Into else (a value no prong names).
+                ev = next((y for y in range(lo, hi + 1) if y not in targets and not (rlo is not None and rlo <= y <= rhi)), None)
+                e(f"continue :{lab} {lit(ev) if ev is not None else lit(self.pick(nxt))};")
+            else:
+                # Runtime continue, bounded by the counter.
+                e(f"{cnt} += 1;")
+                e(f"if ({cnt} < 4 and {self.bool_expr(ctx, 1)}) continue :{lab} {lit(self.pick(nxt))};")
+                e(f"continue :{lab} {lit(st[-1])};")
+            ctx["indent"] -= 1
+            e("},")
+        if rlo is not None:
+            e(f"{lit(rlo)}...{lit(rhi)} => |c| {{")
+            ctx["indent"] += 1
+            e(f"{acc} +%= {'@as(u64, @bitCast(@as(i64, c)))' if sg else '@as(u64, c)'};")
+            e(f"continue :{lab} {lit(st[-1])};")
+            ctx["indent"] -= 1
+            e("},")
+        if len(st) + (rhi - rlo + 1 if rlo is not None else 0) < hi - lo + 1:
+            e("else => |c| {")
+            ctx["indent"] += 1
+            e(f"{acc} ^= {'@as(u64, @bitCast(@as(i64, c)))' if sg else '@as(u64, c)'};")
+            e(f"{cnt} += 1;")
+            e(f"if ({cnt} < 6) continue :{lab} {lit(st[0])};")
+            e(f"break :{lab};")
+            ctx["indent"] -= 1
+            e("},")
+        ctx["indent"] -= 1
+        e("}")
+        self.sink(ctx, acc, U64)
+        self.sink(ctx, cnt, U32)
+
+    def _sw_cond(self, ctx):
+        """and/or/! as values and as branches, with side effects on the
+        right, guarding slice indexing; near misses keep the bounds check."""
+        e = lambda s_: self.emit(ctx, s_)
+        n = self.r.randint(1, 6)
+        a = self.fresh("ca")
+        e(f"var {a}: [{n}]u8 = @splat({self.int_expr(ctx, Int(False, 8), 1)});")
+        e(f"{a}[{self.r.randrange(n)}] +%= 1;")
+        sl = self.fresh("cs")
+        e(f"const {sl}: []u8 = {a}[{self.r.randint(0, n - 1)}..];")
+        i = self.fresh("ci")
+        e(f"const {i}: usize = @as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % {n + 2};")
+        near = self.chance(0.3)
+        side = lambda: f"swSide({self.int_expr(ctx, U64, 1)})"
+        guard = self.pick([f"{i} < {sl}.len", f"!({i} >= {sl}.len)", f"{sl}.len > {i}"])
+        if near:
+            guard = self.pick([f"{i} <= {sl}.len", f"!({i} > {sl}.len)"])
+        use = f"{sl}[{i}] {self.pick(['>', '==', '!=', '<'])} {self.r.randint(0, 255)}"
+        k = self.r.randrange(5)
+        c = self.fresh("cc")
+        if k == 0:
+            e(f"const {c} = ({guard} and {use}) or {side()};")
+            self.sink(ctx, f"@as(u8, @intFromBool({c}))", Int(False, 8))
+        elif k == 1:
+            e(f"if ({guard} and ({use} or {side()})) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"{sl}[{i}]", Int(False, 8))
+            ctx["indent"] -= 1
+            e("}")
+        elif k == 2:
+            e(f"if (!({guard}) or {side()}) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"@as(u8, {self.r.randint(0, 9)})", Int(False, 8))
+            ctx["indent"] -= 1
+            e("} else {")
+            ctx["indent"] += 1
+            self.sink(ctx, f"{sl}[{i}]", Int(False, 8))
+            ctx["indent"] -= 1
+            e("}")
+        elif k == 3:
+            e(f"const {c} = !({side()} and !({guard}));")
+            e(f"if ({c} and {guard}) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"{sl}[{i}]", Int(False, 8))
+            ctx["indent"] -= 1
+            e("}")
+        else:
+            j = self.fresh("cj")
+            e(f"_ = {i};")
+            e(f"var {j}: usize = 0;")
+            e(f"while ({j} < {n + 1} and ({j} < {sl}.len{' + 1' if near else ''} or {side()})) : ({j} += 1) {{")
+            ctx["indent"] += 1
+            e(f"if ({j} < {sl}.len{' + 1' if near else ''}) {sl}[{j}] +%= 1;")
+            ctx["indent"] -= 1
+            e("}")
+            self.sink(ctx, j, USIZE)
 
     def s_rvoglob(self, ctx):
         """Aggregates over 16 bytes returned early straight from a global;
