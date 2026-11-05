@@ -127,8 +127,22 @@ dbg_inline_names: std.ArrayList(u8) = .empty,
 dbg_inline_callees: std.ArrayList(SymbolKey) = .empty,
 dbg_files: std.ArrayList(u32) = .empty,
 dbg_open: std.ArrayList(OpenInline) = .empty,
+/// Panic calls in code the backend inlined, which call a chain of stubs
+/// emitted after the blocks instead of the handler (`panicThroughStubs`),
+/// with the inlined calls open at each (`stub_open`), and the stubs'
+/// bytes so far (as in the x86_64 backend).
+stub_chains: std.ArrayList(StubChain) = .empty,
+stub_open: std.ArrayList(OpenInline) = .empty,
+stub_bytes: u32 = 0,
 
-const OpenInline = struct { index: u32, line: u32, column: u32 };
+/// An inlined call whose end is not reached yet, and the caller's row to
+/// resume after it.
+const OpenInline = struct { index: u32, line: u32, column: u32, backend: bool = false };
+
+/// A panic call through stubs: the stubs' first label, the handler, the
+/// inlined calls open at the call (`stub_open[open_start..][0..open_len]`),
+/// and the row of the check, relative to the innermost.
+const StubChain = struct { label: Encoder.Label, target: SymbolKey, open_start: u32, open_len: u32, line: u32, column: u32 };
 
 const Pending = struct { inst: Inst.Index, mem: Mem };
 
@@ -232,6 +246,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.tmp_slots.deinit(gpa);
         cg.tmp16_slots.deinit(gpa);
         cg.pending.deinit(gpa);
+        cg.stub_chains.deinit(gpa);
+        cg.stub_open.deinit(gpa);
     }
     @memset(cg.homes, .none);
     const naked = cg.fn_ty.cc == .naked;
@@ -274,11 +290,20 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         try cg.setupParams();
     }
     try cg.emitBlocks();
-    if (!naked) try cg.allocFrame(frame_at, body);
+    const stubs_at: u32 = @intCast(cg.e.code.items.len);
+    try cg.emitStubs();
+    const probes_at = if (!naked) try cg.allocFrame(frame_at, body) else null;
     cg.e.finish() catch |err| switch (err) {
         error.BranchOutOfRange => return cg.fail("function too large for its branches", .{}),
         else => |x| return x,
     };
+    // The stubs, then the probes, end the code (`Atom.Unwind.epilogue`).
+    var unwind: Atom.Unwind = .{ .kind = .frame_pointer, .saved = cg.saved };
+    if (cg.stub_chains.items.len != 0) {
+        const size = cg.e.code.items.len;
+        unwind.epilogue = @intCast(size - cg.e.finalOffset(stubs_at));
+        if (probes_at) |at| unwind.probes = @intCast(size - cg.e.finalOffset(at));
+    }
     for (cg.dbg_inlines.items) |*in| {
         in.low = cg.e.finalOffset(in.low);
         in.high = cg.e.finalOffset(in.high);
@@ -319,7 +344,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .bytes = try arena.dupe(u8, cg.e.code.items),
         .targets = try arena.dupe(Atom.SymbolKey, cg.e.refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
-        .unwind = if (cg.outermost_frame) .outermost else if (naked) .none else .{ .kind = .frame_pointer, .saved = cg.saved },
+        .unwind = if (cg.outermost_frame) .outermost else if (naked) .none else unwind,
     }, debug);
 }
 
@@ -328,8 +353,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
 /// the prologue branches to `mov x9, #size; blr ___chkstk_darwin; sub sp`
 /// after the body, which branches back to `body`. A frame of 2^24 bytes or
 /// more takes the same out-of-line path, since its `sub sp` needs the size
-/// in x17.
-fn allocFrame(cg: *CodeGen, frame_at: u32, body: Encoder.Label) Error!void {
+/// in x17. Returns where that code starts, if there is any.
+fn allocFrame(cg: *CodeGen, frame_at: u32, body: Encoder.Label) Error!?u32 {
     const frame = std.mem.alignForward(u32, cg.out_args_size + cg.slots_size, 16);
     // Upstream's LLVM backend probes the stack only on x86 off Darwin
     // (`supportsStackProbing`), so aarch64-linux frames are not probed.
@@ -339,8 +364,9 @@ fn allocFrame(cg: *CodeGen, frame_at: u32, body: Encoder.Label) Error!void {
         defer tmp.deinit();
         try subSp(&tmp, frame);
         @memcpy(cg.e.code.items[frame_at..][0..tmp.code.items.len], tmp.code.items);
-        return;
+        return null;
     }
+    const at: u32 = @intCast(cg.e.code.items.len);
     const stub = try cg.e.newLabel();
     cg.e.bind(stub);
     try cg.e.line(0, 0);
@@ -351,6 +377,7 @@ fn allocFrame(cg: *CodeGen, frame_at: u32, body: Encoder.Label) Error!void {
     try subSp(&cg.e, frame);
     try cg.e.b(.{ .label = body });
     try cg.e.branchFrom(frame_at, stub);
+    return at;
 }
 
 /// `sub sp, sp, #size`: at most two immediate instructions below 2^24, else
@@ -399,7 +426,7 @@ fn beginInline(cg: *CodeGen, func: Index, site: Ir.DbgInline) Error!void {
         .high = @intCast(cg.e.code.items.len),
         .parent = if (cg.dbg_open.getLastOrNull()) |o| o.index else Atom.Debug.Inline.none,
     });
-    try cg.dbg_open.append(cg.gpa, .{ .index = index, .line = cg.dbg_line, .column = cg.dbg_column });
+    try cg.dbg_open.append(cg.gpa, .{ .index = index, .line = cg.dbg_line, .column = cg.dbg_column, .backend = site.flags.backend });
     try cg.e.switchLines(file, index + 1);
 }
 
@@ -1836,7 +1863,7 @@ fn emitBlocks(cg: *CodeGen) Error!void {
             copy.high = pc;
             copy.parent = if (cg.dbg_open.getLastOrNull()) |p| p.index else Atom.Debug.Inline.none;
             try cg.dbg_inline_callees.append(cg.gpa, cg.dbg_inline_callees.items[o.index]);
-            try cg.dbg_open.append(cg.gpa, .{ .index = @intCast(cg.dbg_inlines.items.len), .line = o.line, .column = o.column });
+            try cg.dbg_open.append(cg.gpa, .{ .index = @intCast(cg.dbg_inlines.items.len), .line = o.line, .column = o.column, .backend = o.backend });
             try cg.dbg_inlines.append(cg.gpa, copy);
         }
         if (cg.dbg_open.getLastOrNull()) |o| {
@@ -3437,6 +3464,106 @@ fn cRet(cg: *CodeGen, operand: Ref) Error!void {
     }
 }
 
+/// Calls panic handler `target` from cold code through a chain of stubs,
+/// one per call the backend inlined that is open here, so that the stack
+/// trace shows the frames those calls would have had (docs/slop/architecture.md,
+/// "Synthetic panic frames"), as the x86_64 backend does: the `bl` itself
+/// is at the outermost such call's site, in its caller, and the stubs
+/// after the blocks (`emitStubs`) are at each next site inward, the last
+/// at the check. Without such calls open, or past the stubs' room, calls
+/// `target`.
+fn panicThroughStubs(cg: *CodeGen, target: SymbolKey) Error!void {
+    const open = cg.dbg_open.items;
+    var first: ?usize = null;
+    var depth: u32 = 0;
+    for (open, 0..) |o, i| if (o.backend) {
+        if (first == null) first = i;
+        depth += 1;
+    };
+    // `Atom.Unwind.epilogue` counts the stubs and probes in 16 bits.
+    if (first == null or cg.stub_bytes + stub_size * depth > 0xfe00) return cg.e.bl(.{ .sym = target });
+    cg.stub_bytes += stub_size * depth;
+    const b = first.?;
+    const label = try cg.e.newLabel();
+    try cg.stub_chains.append(cg.gpa, .{ .label = label, .target = target, .open_start = @intCast(cg.stub_open.items.len), .open_len = @intCast(open.len), .line = cg.dbg_line, .column = cg.dbg_column });
+    try cg.stub_open.appendSlice(cg.gpa, open);
+    // The call is the outermost inlined call's caller's: the inlined calls
+    // from there in end before it. No code that runs follows it.
+    const pc: u32 = @intCast(cg.e.code.items.len);
+    for (open[b..]) |o| cg.dbg_inlines.items[o.index].high = pc;
+    const site = cg.dbg_inlines.items[open[b].index];
+    if (b != 0) {
+        try cg.e.switchLines(cg.dbg_inlines.items[open[b - 1].index].file, open[b - 1].index + 1);
+    } else try cg.e.switchLines(0, 0);
+    cg.dbg_open.shrinkRetainingCapacity(b);
+    cg.dbg_line = site.call_line;
+    cg.dbg_column = site.call_column;
+    try cg.e.line(site.call_line, site.call_column);
+    try cg.e.bl(.{ .label = label });
+}
+
+/// The bytes of a stub: `stp x29, x30, [sp, #-16]!; mov x29, sp; bl`.
+const stub_size = 12;
+
+/// The stubs of the panic calls `panicThroughStubs` made, after the
+/// blocks. Each makes a frame record, as a prologue does, so the frame
+/// pointer chain and the stubs' unwind info (the frame record's rule with
+/// no saved registers, `Atom.Unwind.epilogue`) step through it. Stub k is
+/// in entries copying the inlined calls open from the k-th backend-inlined
+/// call to the next one (from the function's own for the first), at the
+/// next one's site, and calls stub k + 1, which follows; the last is at
+/// the check and calls the handler.
+fn emitStubs(cg: *CodeGen) Error!void {
+    for (cg.stub_chains.items) |ch| {
+        cg.e.bind(ch.label);
+        const open = cg.stub_open.items[ch.open_start..][0..ch.open_len];
+        const clones_start = cg.dbg_inlines.items.len;
+        var parent: u32 = Atom.Debug.Inline.none;
+        var i: usize = 0;
+        while (i < open.len) {
+            // The entries up to the next backend-inlined call after `i`.
+            var end = i + 1;
+            while (end < open.len and !open[end].backend) end += 1;
+            if (i == 0) {
+                // The first stub's: those up to the second backend call.
+                end = 0;
+                var seen: u32 = 0;
+                while (end < open.len) : (end += 1) {
+                    if (open[end].backend) {
+                        seen += 1;
+                        if (seen == 2) break;
+                    }
+                }
+            }
+            const pc: u32 = @intCast(cg.e.code.items.len);
+            for (open[i..end]) |o| {
+                var copy = cg.dbg_inlines.items[o.index];
+                copy.low = pc;
+                copy.parent = parent;
+                parent = @intCast(cg.dbg_inlines.items.len);
+                try cg.dbg_inline_callees.append(cg.gpa, cg.dbg_inline_callees.items[o.index]);
+                try cg.dbg_inlines.append(cg.gpa, copy);
+            }
+            try cg.e.switchLines(cg.dbg_inlines.items[parent].file, parent + 1);
+            if (end < open.len) {
+                const site = cg.dbg_inlines.items[open[end].index];
+                try cg.e.line(site.call_line, site.call_column);
+            } else try cg.e.line(ch.line, ch.column);
+            try cg.e.stp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .pre = -16 } });
+            try cg.e.mov(.x, .fp, .sp);
+            if (end < open.len) {
+                const next = try cg.e.newLabel();
+                try cg.e.bl(.{ .label = next });
+                cg.e.bind(next);
+            } else try cg.e.bl(.{ .sym = ch.target });
+            i = end;
+        }
+        const end_pc: u32 = @intCast(cg.e.code.items.len);
+        for (cg.dbg_inlines.items[clones_start..]) |*in| in.high = end_pc;
+    }
+    if (cg.stub_chains.items.len != 0) try cg.e.switchLines(0, 0);
+}
+
 /// The epilogue: `popFrame`, then `ret`.
 fn epilogue(cg: *CodeGen) Error!void {
     // The epilogue belongs to the closing brace, as in upstream's line tables.
@@ -3555,6 +3682,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const in_reg = !tail and (cg.homes[@backingInt(inst)] == .reg or (cg.homes[@backingInt(inst)] == .vreg and !cg.inVec(ret_ty)));
     const dst = if (tail or in_reg) null else try cg.resultMem(inst, ret_ty);
     var pn_save: ?Mem = null;
+    var stack_args = false;
 
     const vals = try cg.gpa.alloc(Val, args.len);
     defer cg.gpa.free(vals);
@@ -3578,6 +3706,10 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         defer cg.gpa.free(locs);
         for (vals, tys) |v, *t| t.* = v.ty;
         _ = cg.autoArgs(tys, locs);
+        for (locs) |l| switch (l) {
+            .stack, .stack_indirect => stack_args = true,
+            else => {},
+        };
         try cg.placeArgs(vals, locs, tail);
         if (cg.autoClass(ret_ty) == .memory) try cg.resultPtrTo(dst, tail);
         try cg.loadTrace(.x15);
@@ -3588,7 +3720,13 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         if (callee_val) |f| try cg.e.b(.{ .sym = try cg.emit.funcKey(f) }) else try cg.e.br(.x16);
         return;
     }
-    if (callee_val) |f| try cg.e.bl(.{ .sym = try cg.emit.funcKey(f) }) else try cg.e.blr(.x16);
+    if (callee_val) |f| {
+        // A panic in code the backend inlined, with its arguments in
+        // registers, gets the frames of the calls it was inlined from.
+        if (ret_ty == .noreturn_type and cg.in_cold and !is_c and !stack_args and !cg.outermost_frame) {
+            try cg.panicThroughStubs(try cg.emit.funcKey(f));
+        } else try cg.e.bl(.{ .sym = try cg.emit.funcKey(f) });
+    } else try cg.e.blr(.x16);
     if (pn_save) |save| for (0..10) |k| try cg.loadMem(@fromBackingInt(@intCast(19 + k)), save.plus(@intCast(8 * k)), .usize_type);
     if (in_reg) {
         // f32 and f64 results come back in v0 in every convention.

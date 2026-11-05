@@ -982,22 +982,41 @@ pub fn cieOf(arch: Atom.Unwind.Arch) *const [cie.len]u8 {
 pub const fde_size = 32;
 pub const max_short_fde_size = 48;
 pub const max_fde_size = 72;
+/// aarch64's largest: every pair saved, and stubs (`fdeSize`).
+pub const max_fde_size_aarch64 = 104;
+
+/// The largest FDE of `arch`.
+pub fn maxFdeSize(arch: Atom.Unwind.Arch) u32 {
+    return if (arch == .aarch64) max_fde_size_aarch64 else max_fde_size;
+}
 
 /// The size of the FDE of a `size`-byte function whose `unwind` is not
 /// `none`: the frame-pointer program, 3 bytes per saved register, and the
 /// epilogue's rows, padded to 8. On aarch64: the frame record's program,
 /// then an advance, 4 bytes per saved pair of x19-x28 and 6 per pair of
-/// d8-d15 (`writeFde`).
+/// d8-d15, and with stubs another advance and 2 and 4 bytes per pair
+/// (`writeFde`).
 pub fn fdeSize(arch: Atom.Unwind.Arch, u: Atom.Unwind, size: u64) u32 {
     if (u.kind != .frame_pointer) return fde_size;
     if (arch == .aarch64) {
         const pairs: u32 = @popCount(u.saved & 0x1f);
         const fpairs: u32 = @popCount(u.saved & 0xf00);
-        return std.mem.alignForward(u32, @as(u32, frame_pointer_program_aarch64.len) + if (pairs + fpairs == 0) 0 else 1 + 4 * pairs + 6 * fpairs, 8);
+        const stubs: u32 = if (stubsAdvance(u, size)) |adv| advanceSize(adv) + 2 * pairs + 4 * fpairs else 0;
+        return std.mem.alignForward(u32, @as(u32, frame_pointer_program_aarch64.len) + if (pairs + fpairs == 0) 0 else 1 + 4 * pairs + 6 * fpairs + stubs, 8);
     }
     const n: u32 = @popCount(u.saved & Atom.Unwind.savedBits(.x86_64));
     const rows: u32 = if (epilogueRows(u, size)) |e| e.size(n) else 0;
     return std.mem.alignForward(u32, @as(u32, frame_pointer_program.len) + 3 * n + rows, 8);
+}
+
+/// On aarch64, with saved pairs: from the end of their pushes to the stubs
+/// at `size - u.epilogue` (`Atom.Unwind.epilogue`), which make frame
+/// records of their own and save no registers, so the pairs' rules revert
+/// to the CIE's there; null without stubs or saved pairs.
+fn stubsAdvance(u: Atom.Unwind, size: u64) ?u32 {
+    const pairs: u32 = @popCount(u.saved & 0xf1f);
+    if (u.epilogue == 0 or pairs == 0) return null;
+    return @intCast(size - u.epilogue - 8 - 4 * pairs);
 }
 
 /// Where the rows after the prologue's go in a frame-pointer FDE.
@@ -1141,6 +1160,7 @@ comptime {
     // four of d registers, the largest.
     std.debug.assert(fdeSize(.aarch64, .{ .kind = .frame_pointer, .saved = 0x1f }, std.math.maxInt(u32)) == max_short_fde_size);
     std.debug.assert(fdeSize(.aarch64, .{ .kind = .frame_pointer, .saved = 0xf1f }, std.math.maxInt(u32)) == max_fde_size);
+    std.debug.assert(fdeSize(.aarch64, .{ .kind = .frame_pointer, .epilogue = 12, .saved = 0xf1f }, std.math.maxInt(u32)) == max_fde_size_aarch64);
 }
 
 /// Writes the FDE at offset `fde_off` of .eh_frame, `fdeSize(u, size)`
@@ -1149,7 +1169,8 @@ comptime {
 ///
 /// On aarch64 the FDE describes the frame record and the saved pairs of
 /// x19-x28 and d8-d15 (`Atom.Unwind.saved`), padded to the size `fdeSize`
-/// gives; it records no epilogue yet. The prologue pushes the pairs right
+/// gives, and the stubs after the blocks, where the pairs' rules revert
+/// (`stubsAdvance`); it records no epilogue. The prologue pushes the pairs right
 /// after the frame record, x19 at CFA - 24 and x20 at CFA - 32, each
 /// further pair 16 bytes below, the d pairs after the x pairs, and their
 /// rules start after the last push (a push does not change the registers
@@ -1176,6 +1197,19 @@ pub fn writeFde(arch: Atom.Unwind.Arch, out: []u8, u: Atom.Unwind, fde_off: u32,
                 at += 6;
                 k += 1;
             };
+            if (stubsAdvance(u, size)) |adv| {
+                at += writeAdvance(out[at..], adv);
+                for (0..5) |bit| if (u.saved >> @intCast(bit) & 1 != 0) {
+                    const r: u8 = @intCast(19 + 2 * bit);
+                    out[at..][0..2].* = .{ DW.CFA.restore + r, DW.CFA.restore + r + 1 };
+                    at += 2;
+                };
+                for (0..4) |bit| if (u.saved >> @intCast(8 + bit) & 1 != 0) {
+                    const r: u8 = @intCast(72 + 2 * bit);
+                    out[at..][0..4].* = .{ DW.CFA.restore_extended, r, DW.CFA.restore_extended, r + 1 };
+                    at += 4;
+                };
+            }
         }
         std.mem.writeInt(u32, out[0..4], @intCast(out.len - 4), .little);
     } else switch (u.kind) {

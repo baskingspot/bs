@@ -1828,8 +1828,6 @@ build, the passes, and the debug info treat them as Sema's inline calls
   function with `@trap` never inlines. `BS_INLINE=<budget>` sets the
   budget (`0` turns inlining off) and `BS_INLINE_SAFE=1` selects safe; a
   non-default setting gets its own cache target (`main.cacheTarget`).
-  aarch64-macos always inlines the safe variant until its synthetic
-  panic frames (below) land.
 - **When.** On the Sema thread, as Sema hands a function to the sink
   (`Emit.functionOwned`), before CodeGen gets it: `inline.scan` finds the
   candidate sites and the size, and `Emit.inlineFate` decides each
@@ -2010,9 +2008,20 @@ build, the passes, and the debug info treat them as Sema's inline calls
   fault (a segfault from a bad pointer, a division trap) in inlined code
   has no stub, so the signal handler's trace shows the callee's line
   under the caller's name and loses the inlined callers. aarch64's
-  variant (for its own lowering): stubs save the link register,
-  `str x30, [sp, #-16]!; bl next`, with the row `CFA = sp+16` and x30 at
-  `CFA-16`.
+  variant: the stubs follow the blocks (aarch64 has an epilogue at each
+  return) and each makes a frame record, `stp x29, x30, [sp, #-16]!;
+  mov x29, sp; bl next` (12 bytes), so the frame-pointer chain and the
+  frame record's unwind rule (CFA = x29 + 16) step through them, and the
+  stack stays 16-byte aligned. `Atom.Unwind.epilogue` is the distance
+  from the stubs to the end (the probes after them, on macOS, are
+  `probes`). The FDE (aarch64-linux) restores the saved pairs' rules at
+  the stubs (`Dwarf.stubsAdvance`; up to 104 bytes,
+  `max_fde_size_aarch64`), and Mach-O gives the stubs a compact unwind
+  entry of their own, frame mode without saved pairs, and the probes the
+  function's again (`MachO.unwindParts`, in `__unwind_info` and objects'
+  `__compact_unwind`). `zig build test` compares the traces with
+  `BS_INLINE=0`'s for aarch64-linux (under qemu) and, on a Mac,
+  aarch64-macos.
 
 #### Unrolling
 

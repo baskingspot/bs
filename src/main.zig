@@ -1305,9 +1305,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     const bench_runs: u32 = if (env.get("BS_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
     if (bench_runs != 0) emit.bench_irs = .empty;
     const inl = inlining(job.environ_map);
-    // The aarch64 backend has no synthetic panic frames yet, so it inlines
-    // only callees that cannot panic, which keeps panic traces complete.
-    if (inl.budget != 0) emit.enableInlining(inl.budget, inl.safe or opts.bs_target.arch() == .aarch64);
+    if (inl.budget != 0) emit.enableInlining(inl.budget, inl.safe);
     // `BS_THREADS=n`: analysis and CodeGen on n threads, Sema on one and
     // CodeGen on the others; 1 generates on the Sema thread. The output
     // is the same for every n.
