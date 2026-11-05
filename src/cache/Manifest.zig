@@ -1529,7 +1529,8 @@ pub const Delta = struct {
 
     /// Replaces a node's state after it was analyzed again. Its key stays.
     pub fn update(d: *Delta, index: u32, n: NodeInit) !void {
-        std.debug.assert(index < d.base.nodeCount() and d.base.node(index).key == n.key);
+        std.debug.assert(index < d.base.nodeCount());
+        std.debug.assert(d.base.node(index).key == n.key);
         try d.appendNode(index, n);
     }
 

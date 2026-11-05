@@ -197,7 +197,8 @@ pub const Cond = enum(u4) {
     nv,
 
     pub fn negate(c: Cond) Cond {
-        assert(c != .al and c != .nv);
+        assert(c != .al);
+        assert(c != .nv);
         return @fromBackingInt(@backingInt(c) ^ 1);
     }
 };
@@ -476,7 +477,8 @@ pub fn ldr(e: *Encoder, size: Size, dst: Reg, mem: Mem) !void {
 /// Loads `size` bytes into `dst` sign-extended to `width`: ldrsb, ldrsh
 /// (to w or x), and ldrsw (to x only).
 pub fn ldrs(e: *Encoder, size: Size, width: Width, dst: Reg, mem: Mem) !void {
-    assert(size != .dword and !(size == .word and width == .w));
+    assert(size != .dword);
+    assert(!(size == .word and width == .w));
     try e.loadStore(size, false, if (width == .x) 0b10 else 0b11, dst.zrEnc(), mem);
 }
 
@@ -636,7 +638,8 @@ pub fn ldaxr(e: *Encoder, size: Size, dst: Reg, base: Reg) !void {
 /// `stlxr{b,h}`: a store-release exclusive of the low `size` bytes of
 /// `src` to `[base]`; `status` gets 0 if it stored, 1 if not.
 pub fn stlxr(e: *Encoder, size: Size, status: Reg, src: Reg, base: Reg) !void {
-    assert(status != src and status != base);
+    assert(status != src);
+    assert(status != base);
     try e.reserve();
     e.word(0x0800fc00 | (@as(u32, @backingInt(size)) << 30) | (status.zrEnc() << 16) | (base.spEnc() << 5) | src.zrEnc());
 }
@@ -651,7 +654,9 @@ pub fn ldaxp(e: *Encoder, lo: Reg, hi: Reg, base: Reg) !void {
 /// `stlxp`: a store-release exclusive of the x register pair `lo`, `hi`
 /// to `[base]`; `status` gets 0 if it stored, 1 if not.
 pub fn stlxp(e: *Encoder, status: Reg, lo: Reg, hi: Reg, base: Reg) !void {
-    assert(status != lo and status != hi and status != base);
+    assert(status != lo);
+    assert(status != hi);
+    assert(status != base);
     try e.reserve();
     e.word(0xc8208000 | (status.zrEnc() << 16) | (hi.zrEnc() << 10) | (base.spEnc() << 5) | lo.zrEnc());
 }
@@ -670,7 +675,8 @@ pub fn cas(e: *Encoder, size: Size, order: Ordering, expected: Reg, new: Reg, ba
 /// must be even.
 pub fn casp(e: *Encoder, size: Size, order: Ordering, expected: Reg, new: Reg, base: Reg) !void {
     assert(size == .word or size == .dword);
-    assert(expected.zrEnc() & 1 == 0 and new.zrEnc() & 1 == 0);
+    assert(expected.zrEnc() & 1 == 0);
+    assert(new.zrEnc() & 1 == 0);
     try e.reserve();
     e.word(0x08207c00 | (@as(u32, @intFromBool(size == .dword)) << 30) | (order.aBit() << 22) | (expected.zrEnc() << 16) |
         (order.rBit() << 15) | (base.spEnc() << 5) | new.zrEnc());
@@ -835,7 +841,8 @@ pub const MovWideOp = enum(u2) { movn = 0b00, movz = 0b10, movk = 0b11 };
 /// movz, movn, or movk of `imm` shifted left by `shift` (0, 16, 32, or 48;
 /// 0 or 16 for w registers).
 pub fn movWide(e: *Encoder, op: MovWideOp, width: Width, dst: Reg, imm: u16, shift: u6) !void {
-    assert(shift % 16 == 0 and shift < width.bits());
+    assert(shift % 16 == 0);
+    assert(shift < width.bits());
     try e.reserve();
     e.word(0x12800000 | width.sf() | (@as(u32, @backingInt(op)) << 29) | (@as(u32, shift / 16) << 21) | (@as(u32, imm) << 5) | dst.zrEnc());
 }
@@ -1098,7 +1105,8 @@ pub const BitfieldOp = enum(u2) { sbfm = 0b00, bfm = 0b01, ubfm = 0b10 };
 /// sbfm, bfm, ubfm, from which the shifts, extensions, and bitfield
 /// extracts and inserts are built.
 pub fn bitfield(e: *Encoder, op: BitfieldOp, width: Width, dst: Reg, src: Reg, immr: u6, imms: u6) !void {
-    assert(immr < width.bits() and imms < width.bits());
+    assert(immr < width.bits());
+    assert(imms < width.bits());
     try e.reserve();
     const n: u32 = @backingInt(width);
     e.word(0x13000000 | width.sf() | (@as(u32, @backingInt(op)) << 29) | (n << 22) | (@as(u32, immr) << 16) | (@as(u32, imms) << 10) | (src.zrEnc() << 5) | dst.zrEnc());

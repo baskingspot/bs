@@ -171,7 +171,8 @@ pub const Mem = struct {
 
     /// The offset from sp of a slot.
     fn baseOff(m: Mem) i32 {
-        assert(m.base == .reg and m.base.reg == .sp);
+        assert(m.base == .reg);
+        assert(m.base.reg == .sp);
         return m.off;
     }
 
@@ -3598,7 +3599,10 @@ fn atomicCas(cg: *CodeGen, size: Size, expected: Reg, new: Reg, base: Reg) Error
 fn atomicOp(cg: *CodeGen, op: Encoder.AtomicOp, size: Size, src: Reg, dst: Reg, base: Reg) Error!void {
     const e = &cg.e;
     if (cg.hasLse()) return e.atomic(op, size, .acq_rel, src, dst, base);
-    assert(dst != .x11 and dst != .x13 and src != .x11 and src != .x13);
+    assert(dst != .x11);
+    assert(dst != .x13);
+    assert(src != .x11);
+    assert(src != .x13);
     const width: Encoder.Width = if (size == .dword) .x else .w;
     const top = try e.newLabel();
     e.bind(top);

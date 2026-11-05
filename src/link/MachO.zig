@@ -3462,7 +3462,8 @@ fn testUnwindEncoding(bytes: []const u8, addr: u64) ?u32 {
     const start = indices[left].secondLevelPagesSectionOffset;
     if (start == 0) return null;
     const page = std.mem.bytesToValue(macho.unwind_info_regular_second_level_page_header, info[start..][0..@sizeOf(macho.unwind_info_regular_second_level_page_header)]);
-    std.debug.assert(page.kind == .REGULAR and page.entryCount > 0);
+    std.debug.assert(page.kind == .REGULAR);
+    std.debug.assert(page.entryCount > 0);
     const entries = std.mem.bytesAsSlice(macho.unwind_info_regular_second_level_entry, info[start + page.entryPageOffset ..][0 .. page.entryCount * @sizeOf(macho.unwind_info_regular_second_level_entry)]);
     left = 0;
     len = entries.len;
