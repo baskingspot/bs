@@ -5323,8 +5323,9 @@ fn ret(cg: *CodeGen, operand: Ref, next: Ssa.Block.Index) Error!void {
             // A load of the result's own alloc is not emitted (`planCopies`).
             const rvo = if (operand.toIndex()) |l| switch (cg.homes[@backingInt(l)]) {
                 .dead => true,
-                // Read in place from the result's own alloc (`planCopies`).
-                .deferred => cg.ir.instructions.items(.data)[@backingInt(l)].ty_op.operand.toIndex() == cg.rvo_alloc,
+                // Read in place from the result's own alloc (`planCopies`),
+                // not from a constant address when there is none.
+                .deferred => cg.rvo_alloc != null and cg.ir.instructions.items(.data)[@backingInt(l)].ty_op.operand.toIndex() == cg.rvo_alloc,
                 else => false,
             } else false;
             if (!rvo) {
