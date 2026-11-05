@@ -912,7 +912,16 @@ comptime arguments are run-time values in the lowered code (uucode's
   x19-x28; f32 and f64 (`inFloat`, `want_float`) one of d8-d15, or of
   v20-v29 when they cross no call; vectors of at most 16 bytes
   (`inVec`, `want_vec`, which takes only allocate's floats outside
-  `survives`) one of v20-v29; promoted variables likewise; the rest live
+  `survives`) one of v20-v29, and so does a struct whose one runtime
+  field is such a vector, as `crypto.aes` wraps its blocks
+  (`vector.wrappedField`): its `struct_field_val` and `aggregate_init`
+  are moves (`vector.copy`), and `.auto` passes it as the vector
+  (`autoVec`). Sema reads such a field of a parameter or `const` as a
+  load through `struct_field_ptr`, which takes the local's address;
+  `vector.foldWrappedLoads`, on the workers after `forward.run` and
+  only for aarch64, turns a field pointer read once right away into a
+  `struct_field_val` of a whole load, through a pointer cast that only
+  adds `const`, so the local is promoted. Promoted variables likewise; the rest live
   in stack slots shared by lifetime. Floats and vectors share one home,
   `.vreg`. No lowering uses an allocated register as scratch. Calls
   preserve x19-x28 and d8-d15 (only their low 64 bits, all an f64
@@ -935,9 +944,11 @@ comptime arguments are run-time values in the lowered code (uucode's
   slice in registers takes none of its own but reads the slice's
   (`lengthenIntervals`, as x86_64's `pairFoldable`). Block results
   stay in slots. A value that meets an inline assembly statement (an operand,
-  its result, or a value live across it) takes none of the x19-x28 and
-  v8-v15 an assembly statement in the function names in its template,
-  pins or clobbers (`asmRegs`, an `Ssa.allocate` restriction); the
+  its result, or a value live across it) takes none of the x19-x28,
+  v8-v15 and v20-v29 an assembly statement in the function names in its
+  template, pins or clobbers, nor v20-v29 when its SIMD operands
+  outnumber the scratch registers left (`asmRegs`, an `Ssa.allocate`
+  restriction); the
   statement saves those it names around itself, for its caller's
   values (a context switch names them only as clobbers), except in a
   naked function. The prologue saves the used pairs right below the frame record (x19 at fp
@@ -1005,13 +1016,14 @@ comptime arguments are run-time values in the lowered code (uucode's
   std's AES, GHASH/POLYVAL and SHA-256 code (`aese`/`aesmc`, `pmull`,
   `sha256h`, `ext`, `tbl`, `movi`, ...), in both `v0.16b` and Apple's
   `sha256h.4s` suffix spelling. `w` and `x` operands (v0-v31, v0-v15)
-  take v16-v31 first, then v0-v7, then v8-v15, whose low halves are
+  take the scratch registers no value is allocated first (v0-v7,
+  v16-v19, v30, v31), then v20-v29, then v8-v15, whose low halves are
   callee-saved and so are saved whole around the template, as are the
   callee-saved registers the template names; `%q[x]` and `%[x].4s`
   pick the register's form. A digit constraint ties an input to an
   output's register.
-  Vector-typed asm operands load and store through memory, since
-  vector values themselves stay scalarized.
+  A vector operand moves from its register, and a vector result into
+  its home register unless the statement restores that register.
 - aarch64-linux (started 2026-11-05) runs the same CodeGen and links
   static, non-PIE executables with the ELF linker (`Elf.Options.arch`),
   and position-independent objects and shared objects ("Position-
@@ -1572,8 +1584,9 @@ layout order of pass 4:
   plus rsi, rdi, r8, r9 and r11, which its `r` operands and output
   addresses may get. An asm statement is also an x86_64 clobber point.
   aarch64 restricts the registers an asm statement names; an asm
-  statement is a clobber point there too (`callFree`), so the values
-  that meet it keep out of v20-v29, which its SIMD operands get first.
+  statement is a clobber point there only when its template calls (`bl`,
+  `blr`; `asmCalls`), so vectors live across one keep v20-v29, which
+  its SIMD operands get only after the scratch registers.
   Sema records every register the clobbers name, by any of its names,
   as two masks by register number (`Ir.Asm.gpr_clobbers` and
   `vec_clobbers`, `Ir.Asm.clobberReg`); an asm statement's `r`, `w` and

@@ -38,6 +38,7 @@ const MachO = @import("link/MachO.zig");
 const MachOObject = @import("link/MachOObject.zig");
 const Ssa = @import("codegen/Ssa.zig");
 const inline_ir = @import("codegen/inline.zig");
+const shared_vector = @import("codegen/vector.zig");
 const rewrite = @import("codegen/rewrite.zig");
 const prove = @import("codegen/prove.zig");
 const sroa = @import("codegen/sroa.zig");
@@ -1217,6 +1218,9 @@ fn generateFunction(emit: *Emit, ir: *const Ir) Allocator.Error!void {
     defer emit.codegen_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
     // The IR is this job's own.
     if (emit.forward_on) emit.codegen_stats.forwarded += try forward.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.forward_scratch);
+    // Only where the backend keeps a struct that wraps a vector in a
+    // vector register (aarch64's `inVec`; x86_64's `inFloat` does not yet).
+    if (emit.zcu.ip.target != .x86_64_linux) try shared_vector.foldWrappedLoads(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.forward_scratch);
     const t1 = std.Io.Timestamp.now(io, .awake);
     emit.codegen_stats.forward_ns += @intCast(t0.durationTo(t1).nanoseconds);
     const st: prove.Stats = if (!emit.prove_on) .{} else try prove.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.prove_scratch, emit.fuzz);
