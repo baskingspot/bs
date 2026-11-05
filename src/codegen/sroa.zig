@@ -81,7 +81,7 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
     } else return 0;
 
     const n = ir.instructions.len;
-    try scratch.words.resize(gpa, 8 * n);
+    try scratch.words.resize(gpa, 9 * n);
     var s: Scan = .{
         .ir = ir,
         .ip = ip,
@@ -91,6 +91,7 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
         .esc = scratch.words.items[5 * n .. 6 * n],
         .alias = scratch.words.items[6 * n .. 7 * n],
         .same = scratch.words.items[7 * n .. 8 * n],
+        .arg_copy = scratch.words.items[8 * n .. 9 * n],
         .events = &scratch.events,
         .escapes = &scratch.escapes,
         .gpa = gpa,
@@ -100,6 +101,7 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
     @memset(s.esc, 0);
     @memset(s.alias, none);
     @memset(s.same, 0);
+    @memset(s.arg_copy, 0);
     scratch.events.clearRetainingCapacity();
     scratch.escapes.clearRetainingCapacity();
     scratch.syncs.clearRetainingCapacity();
@@ -380,6 +382,11 @@ const Scan = struct {
     /// For a load of such a local: 1; it is the candidate's address, and
     /// its `root` the candidate.
     same: []u32,
+    /// For a `*const` candidate stored from a parameter: 1. A by-value
+    /// call argument of its whole value is then the parameter's memory,
+    /// passed without a copy when the backend passes it by reference;
+    /// split, it would be rebuilt and copied for the call.
+    arg_copy: []u32,
     events: *std.ArrayList(Inst.Index),
     escapes: *std.ArrayList([2]u32),
     /// The candidates the instruction being scanned, a call, passes.
@@ -475,9 +482,18 @@ const Scan = struct {
             s.passed_len = 0;
             Ssa.forEachOperandPtr(ir, inst, s);
             switch (tag) {
-                .call => for (s.passed[0..s.passed_len]) |r| {
-                    s.esc[r] = 1;
-                    try s.escapes.append(s.gpa, .{ r, ii });
+                .call => {
+                    for (s.passed[0..s.passed_len]) |r| {
+                        s.esc[r] = 1;
+                        try s.escapes.append(s.gpa, .{ r, ii });
+                    }
+                    const x = ir.extraData(Ir.Call, data.pl_op.payload);
+                    for (ir.refSlice(x.end, x.data.args_len)) |arg| {
+                        const l = @backingInt(arg.toIndex() orelse continue);
+                        if (tags[l] != .load or !isRoot(s, datas[l].ty_op.operand)) continue;
+                        const r = s.rootOf(@backingInt(datas[l].ty_op.operand.toIndex().?));
+                        if (s.arg_copy[r] != 0) s.fields[r] = 0;
+                    }
                 },
                 .aggregate_init => if (s.passed_len != 0) {
                     s.alias[i] = s.passed[0];
@@ -530,6 +546,9 @@ const Scan = struct {
                         if (s.root[l] == l | load_bit) s.fields[l] = 0;
                     };
                     try s.events.append(s.gpa, inst);
+                    if (data.bin_op.rhs.toIndex()) |v| if (tags[@backingInt(v)] == .arg and Type.ptrInfo(s.ip, datas[r].ty).flags.is_const) {
+                        s.arg_copy[r] = 1;
+                    };
                 } else if (data.bin_op.rhs.toIndex()) |v| switch (tags[@backingInt(v)]) {
                     .block, .load => try stores.append(s.gpa, inst),
                     else => {},

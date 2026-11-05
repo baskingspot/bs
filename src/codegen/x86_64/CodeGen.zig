@@ -745,6 +745,21 @@ fn argRef(cg: *CodeGen, ref: Ref) Error!?ArgRef {
     if (ref.toIndex()) |v| return switch (cg.homes[@backingInt(v)]) {
         .ind => |r| .{ .reg = r },
         .slot => |off| .{ .addr = Mem.at(.rbp, off) },
+        // A load, read in place, of a copy of a by-reference argument or
+        // of a constant (`ref_alias`, `const_alias`): that memory, which
+        // does not change either (`self.method()` on a by-value `self`).
+        .deferred => {
+            const p = cg.ir.instructions.items(.data)[@backingInt(v)].ty_op.operand.toIndex() orelse return null;
+            const alias = (cg.ref_alias.count() != 0 and cg.ref_alias.contains(@backingInt(p))) or
+                (cg.const_alias.count() != 0 and cg.const_alias.contains(@backingInt(p)));
+            if (!alias) return null;
+            // The alloc's address in a register (in a slot, it is the
+            // pointer's memory, not the value's).
+            return switch (cg.homes[@backingInt(p)]) {
+                .reg_addr => |a| if (a.off == 0) .{ .reg = a.base } else .{ .addr = Mem.at(a.base, a.off) },
+                else => null,
+            };
+        },
         else => null,
     };
     return switch (try cg.constLoc(ref.toInterned().?)) {
@@ -3041,12 +3056,22 @@ pub fn deferLoad(cg: *CodeGen, arg: Ref, before: []const Inst.Index, prev: []con
     if (!found) return;
     const ptr = datas[li].ty_op.operand;
     if (ptr.toIndex()) |p0| {
-        // A folded address keeps its base, not itself, alive.
-        if (cg.addr_base[@backingInt(p0)] != no_base) return;
         var p = @backingInt(p0);
-        // A variable `Ssa.plan` may keep in a register (a 16-byte vector)
-        // has no memory to read.
-        if (tags[p] == .alloc and Ssa.wants(live.items(.reg)[p])) return;
+        // A copy of a by-reference argument or of a constant is that
+        // memory, which does not change (`ref_alias`, `const_alias`):
+        // read in place, through the argument's register when the copy's
+        // address is folded into it.
+        const ref_copy = cg.ref_alias.count() != 0 and cg.ref_alias.contains(p);
+        const const_copy = cg.const_alias.count() != 0 and cg.const_alias.contains(p);
+        if (cg.addr_base[p] != no_base) {
+            // A folded address keeps its base, not itself, alive.
+            if (!ref_copy) return;
+            p = cg.addr_base[p];
+        } else if (tags[p] == .alloc and Ssa.wants(live.items(.reg)[p]) and !ref_copy and !const_copy) {
+            // A variable `Ssa.plan` may keep in a register (a 16-byte
+            // vector) has no memory to read.
+            return;
+        }
         if (fwd[p] != Ssa.no_tie) p = fwd[p];
         if (share[p] != Ssa.no_tie or fate[p] != .normal) return;
         end[p] = @max(end[p], at);
