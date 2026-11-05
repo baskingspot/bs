@@ -20009,9 +20009,14 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const src = block.nodeSrc(data.src_node);
     const fn_info = sema.code.getFnInfo(inst);
     // The return type and calling convention bodies may contain function
-    // types with parameters of their own.
-    const params = sema.params.items;
+    // types with parameters of their own. In a function type expression
+    // they come after the outer parameters in the same block, so this
+    // function takes only its own, the last ones appended; the outer
+    // function's stay pending.
+    const pending = sema.params.items;
+    const params = pending[pending.len - fn_info.total_params_len ..];
     sema.params = .empty;
+    try sema.params.appendSlice(sema.arena, pending[0 .. pending.len - fn_info.total_params_len]);
 
     var parsed_cc: Callconv = .{ .tag = .auto };
     var explicit_cc = false;
