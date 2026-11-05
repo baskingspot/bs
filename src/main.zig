@@ -545,6 +545,7 @@ pub const Job = struct {
             if (m.optimize.? == opts.optimize and m.error_tracing.? == opts.error_tracing and m.valgrind.? == opts.valgrind) continue;
             var o = builtin_opts;
             o.optimize, o.error_tracing, o.valgrind = .{ m.optimize.?, m.error_tracing.?, m.valgrind.? };
+            o.start_code = false;
             m.builtin_dir = try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }), o);
         }
         var job_opts = opts;

@@ -53,6 +53,10 @@ pub const Options = struct {
     /// statically, which bring the start code; code stays as it is
     /// without libc (no PIC).
     musl: bool = false,
+    /// Whether this builtin brings the start code with `glibc`: the root
+    /// module's does; the builtin of a module whose options differ (see
+    /// `main`) does not, or the program would export `_start` twice.
+    start_code: bool = true,
     /// Linux: the target as upstream resolves it (`main.checkTarget`),
     /// whose ABI, kernel and glibc versions and dynamic linker builtin
     /// states; without one, x86_64-linux-none.
@@ -501,7 +505,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         if (opts.pic or opts.glibc != null) "true" else "false",
         if (opts.pie) "true" else "false",
         if (opts.strip) "true" else "false",
-        if (exe_libc) "comptime {\n    _ = @import(\"glibc_start.zig\");\n}\n" else "",
+        if (exe_libc and opts.start_code) "comptime {\n    _ = @import(\"glibc_start.zig\");\n}\n" else "",
     });
     return out.toOwnedSlice(gpa);
 }
@@ -514,7 +518,8 @@ pub fn writeToCache(gpa: Allocator, io: Io, cache_dir: []const u8, opts: Options
     var hash: [16]u8 = undefined;
     var hasher: std.crypto.hash.Blake3 = .init(.{});
     hasher.update(source);
-    if (opts.glibc != null) hasher.update(glibcStart(opts.cpu.arch));
+    const start = opts.glibc != null and opts.start_code;
+    if (start) hasher.update(glibcStart(opts.cpu.arch));
     hasher.final(&hash);
     const dir = try std.fmt.allocPrint(gpa, "{s}/builtin/{x}", .{ cache_dir, &hash });
     errdefer gpa.free(dir);
@@ -524,7 +529,7 @@ pub fn writeToCache(gpa: Allocator, io: Io, cache_dir: []const u8, opts: Options
     if (cwd.access(io, path, .{})) |_| return dir else |_| {}
     // The start file first: builtin.zig's presence says the directory is
     // complete.
-    if (opts.glibc != null) {
+    if (start) {
         const start_path = try std.fs.path.join(gpa, &.{ dir, "glibc_start.zig" });
         defer gpa.free(start_path);
         var atomic = try cwd.createFileAtomic(io, start_path, .{ .make_path = true, .replace = true });
