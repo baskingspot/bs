@@ -213,21 +213,24 @@ fn addFlags(b: *std.Build, r: *std.Build.Step.Run, flags: []const []const u8, sr
     if (!modules) r.addFileArg(b.path(src_path));
 }
 
+/// How this host runs aarch64-linux executables: natively (no prefix),
+/// under qemu, or not at all (null). qemu emulates a Cortex-A53, an
+/// ARMv8.0 core like the target's generic baseline, so newer instructions
+/// (LSE atomics, FEAT_FP16) trap.
+fn aarch64LinuxRunner(b: *std.Build) ?[]const []const u8 {
+    const host = b.graph.host.result;
+    if (host.cpu.arch == .aarch64 and host.os.tag == .linux) return &.{};
+    if (host.os.tag != .linux) return null;
+    const qemu = b.findProgram(.{ .names = &.{ "qemu-aarch64-static", "qemu-aarch64" } }) orelse return null;
+    return b.allocator.dupe([]const u8, &.{ qemu, "-cpu", "cortex-a53" }) catch @panic("OOM");
+}
+
 fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     const io = b.graph.io;
     const host = b.graph.host.result;
     const host_runs_bs_output = host.cpu.arch == .x86_64 and host.os.tag == .linux;
     const host_runs_macos_output = host.cpu.arch == .aarch64 and host.os.tag == .macos;
-    // How this host runs aarch64-linux executables: natively, under qemu,
-    // or not at all. qemu emulates a Cortex-A53, an ARMv8.0 core like the
-    // target's generic baseline, so newer instructions (LSE atomics,
-    // FEAT_FP16) trap.
-    const aarch64_linux_runner: ?[]const []const u8 = if (host.cpu.arch == .aarch64 and host.os.tag == .linux)
-        &.{}
-    else if (host.os.tag == .linux) if (b.findProgram(.{ .names = &.{ "qemu-aarch64-static", "qemu-aarch64" } })) |qemu|
-        b.allocator.dupe([]const u8, &.{ qemu, "-cpu", "cortex-a53" }) catch @panic("OOM")
-    else
-        null else null;
+    const aarch64_linux_runner = aarch64LinuxRunner(b);
     // The headers are read here, while configuring.
     b.dependOnDirectoryContents(b.path("test/run"));
     var dir = b.root.openDir(io, "test/run", .{ .iterate = true }) catch |err|
@@ -1406,6 +1409,49 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&src_run.step);
     }
+
+    // The same inputs for aarch64-linux, from `zig cc` non-PIC and -fPIC
+    // and as sources: the link converts aarch64 relocations and relaxes
+    // the TLS descriptor and initial-exec sequences to local-exec.
+    if (aarch64LinuxRunner(b)) |runner| for ([_][]const u8{ "", "-fPIC", "sources" }) |v| {
+        const what = if (v.len == 0) "objects" else if (v[0] == '-') "-fPIC objects" else "C sources";
+        const exe = b.addRunArtifact(bs);
+        exe.setName(b.fmt("bs build-exe -target aarch64-linux with {s}", .{what}));
+        exe.addArgs(&.{ "build-exe", "-target", "aarch64-linux" });
+        exe.addFileArg(b.path("test/link_input/main.zig"));
+        exe.setEnvironmentVariable("BS_CACHE", "off");
+        exe.setEnvironmentVariable("BS_ZIG", zig);
+        const objects = [_][]const u8{ "lib.c", "tls.c", "tlsie.c", "a1.c", "a2.c" };
+        for (objects) |src| {
+            const flags: []const []const u8 = if (std.mem.eql(u8, src, "lib.c")) &.{"-fcommon"} else if (std.mem.startsWith(u8, src, "tls")) &.{"-fPIC"} else &.{};
+            if (std.mem.eql(u8, v, "sources")) {
+                exe.addArg("-cflags");
+                exe.addArgs(flags);
+                exe.addArg("--");
+                exe.addFileArg(b.path(b.fmt("test/link_input/{s}", .{src})));
+                continue;
+            }
+            const c = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux", "-c" });
+            if (v.len != 0) c.addArg(v);
+            c.addArgs(flags);
+            c.addFileArg(b.path(b.fmt("test/link_input/{s}", .{src})));
+            const o = c.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{src}));
+            if (src[0] != 'a') {
+                exe.addFileArg(o);
+                continue;
+            }
+            const ar = b.addSystemCommand(&.{ zig, "ar", "rcs" });
+            const a = ar.addOutputFileArg(b.fmt("lib{s}.a", .{src[0..2]}));
+            ar.addFileArg(o);
+            exe.addFileArg(a);
+        }
+        const run = std.Build.Step.Run.create(b, b.fmt("run bs aarch64-linux link of {s}", .{what}));
+        run.addArgs(runner);
+        run.addFileArg(exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        run.addCheck(.{ .expect_stderr_exact = expect });
+        run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&run.step);
+    };
 
     // A static library and an object of objects alone, as libvaxis's C API
     // step makes one: no Zig root and no C sources. The library holds the

@@ -774,7 +774,7 @@ fn linkWithInputs(
 ) !?Linked {
     const gpa = inc.gpa;
     const io = inc.io;
-    var objects: ElfInput = .{ .arena = arena, .dynamic = glibc != null, .shared_libs = shared, .lld = inc.lld };
+    var objects: ElfInput = .{ .arena = arena, .dynamic = glibc != null, .shared_libs = shared, .lld = inc.lld, .arch = inc.arch };
     for (inc.link_objects, 0..) |path, n| {
         const bytes = try inc.mapInput(arena, maps, path) orelse return null;
         const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");
@@ -1085,7 +1085,7 @@ fn reboundSlots(
         }
         var b = a;
         b.targets = try arena.dupe(Atom.SymbolKey, &.{t.key});
-        b.relocs = try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, addend)});
+        b.relocs = try arena.dupe(Atom.Reloc, &.{.init(0, if (objects.arch == .aarch64) .aarch64_abs64 else .x86_64_abs64, 0, addend)});
         try overrides.put(arena, i, b);
     }
     return overrides;

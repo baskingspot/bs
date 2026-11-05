@@ -949,7 +949,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   aarch64's relocation kinds and unwind records. A no-change build of
   std's tests relinks in 0.2 s against 9 s cold. The inline assembly
   std's Linux code needs adds `msr tpidr_el0`, the shifts, and the
-  extension aliases.
+  extension aliases. C sources, objects and archives link without libc
+  ("Object, archive and shared-library inputs"), and thread-local
+  externs that a C object defines are local-exec too.
 - Panics are calls, as upstream: `@panic` and each failed safety check
   call the matching function of `std.lang.panic` (`integerOverflow`,
   `outOfBounds(index, len)`, `call(msg, null)`, ...), then `unreach`.
@@ -3865,6 +3867,25 @@ differs from the design above:
    2026-11-04.
 3. C: `.so` inputs (`-l<name>` against a library upstream built), and
    copy relocations if an input needs them. Built 2026-11-04.
+
+**aarch64-linux** (built 2026-11-05): objects, archives and C sources
+link into static executables without libc (`ElfInput.arch`; C sources
+compile for `aarch64-linux-none` and the generic CPU, as translate-c
+translates for them). `relocA64` maps R_AARCH64_ABS64, ABS32, PREL32,
+CALL26/JUMP26, ADR_PREL_PG_HI21, the ADD and LDST ABS_LO12_NC forms, the
+TLSLE adds and movs, and ADR_GOT_PAGE/LD64_GOT_LO12_NC, which keep their
+GOT kinds for the linker to relax to the target's address, as the Zig
+code's. -fPIC code reaches thread-locals through TLS descriptors and
+initial-exec GOT loads, which a static executable relaxes to local-exec
+as lld does: the descriptor's `adrp` and `ldr` become nops, its `add`
+and `blr` `movz x0, #g1, lsl #16; movk x0, #g0_nc`
+(`aarch64_tprel_g1`/`g0_nc`), and the initial-exec `adrp` and `ldr` the
+same pair into their register. `.eh_frame`'s FDEs are PREL32, and the
+debug sections' ABS32/ABS64 map onto the input-section kinds. Shared
+libraries, `-lc`, and objects with other relocations are refused or
+reported by name. Checked by `addLinkInputTests` under qemu: upstream
+`zig cc` objects, non-PIC and -fPIC, and the same files as sources
+print what the x86_64 link prints.
 
 ### Comptime pointers to extern data (built 2026-11-04)
 
@@ -7314,8 +7335,10 @@ libraries as inputs. To be agreed with that thread.
   `-iquote`/`-idirafter`/`-D`/`-U` and the like (passed to Aro in order),
   the cache and lib directories; `-O` is ignored (headers see Debug's
   macros, as the code they go into), `-cflags ... --` too, as upstream.
-  Targets: x86_64-linux only, since bs builds the translate-c binary
-  with its x86_64 backend.
+  Targets: an x86_64-linux host only, since bs builds the translate-c
+  binary with its x86_64 backend; it translates for x86_64-linux and,
+  without `-lc`, for aarch64-linux (`aarch64-linux-none`, the generic
+  CPU), whose output matches upstream's.
 - **Aro's arguments** are upstream's (`Compilation.translateC`, read from
   the argv upstream's zig passes its translate-c binary) for bs's
   target: `-mcpu` is bs's CPU (the baseline unless `-mcpu` says

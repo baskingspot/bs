@@ -1194,6 +1194,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     link_inputs.dynamic = glibc != null or emit.shared;
     link_inputs.shared_libs = shared_libs;
     link_inputs.lld = opts.c_root;
+    link_inputs.arch = if (opts.bs_target.arch() == .aarch64) .aarch64 else .x86_64;
     var macho_inputs: MachOInput = .{ .arena = arena };
     const target_inputs: Emit.Inputs = if (opts.bs_target == .aarch64_macos) .{ .macho = &macho_inputs } else .{ .elf = &link_inputs };
     if (c_batch) |b| if (!emit.obj or emit.shared) {
@@ -2246,11 +2247,14 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
         opts.link_libc = false;
     } else if (opts.bs_target == .aarch64_linux) {
-        // Static executables and tests of Zig only, so far.
+        // Static executables and tests, with C sources, objects, and
+        // archives but no libc, so far.
         if (command == .build_obj or command == .build_lib)
             setUnsupported(&opts, arena, "bs builds only executables and tests for aarch64-linux so far; build this step with upstream zig", .{})
-        else if (c_files.items.len != 0 or link_inputs.items.len != 0 or opts.link_libc or opts.link_libcpp)
-            setUnsupported(&opts, arena, "bs does not link C sources, objects, or libraries for aarch64-linux yet; build this step with upstream zig", .{})
+        else if (opts.link_libc or opts.link_libcpp)
+            setUnsupported(&opts, arena, "bs does not link libc or libc++ for aarch64-linux yet; build this step with upstream zig", .{})
+        else if (for (link_inputs.items) |p| (if (isSharedLib(p)) break true) else false)
+            setUnsupported(&opts, arena, "bs does not link shared libraries for aarch64-linux yet; build this step with upstream zig", .{})
         else if (opts.fuzz)
             setUnsupported(&opts, arena, "bs does not instrument code for fuzzing on aarch64-linux yet ('-ffuzz'); build this step with upstream zig", .{})
         else if (opts.pic or opts.pie or link_mode == .dynamic)

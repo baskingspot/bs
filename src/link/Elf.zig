@@ -2585,6 +2585,17 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
                 const f = try relocField(a, dst, r.offset, 4, diag);
                 std.mem.writeInt(u32, f, std.math.cast(u32, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
             },
+            .aarch64_prel32 => {
+                const f = try relocField(a, dst, r.offset, 4, diag);
+                const v = @as(i64, @bitCast(s -% (p_base + r.offset))) +% r.addend;
+                std.mem.writeInt(i32, f, std.math.cast(i32, v) orelse return overflow(a, r, diag), .little);
+            },
+            .aarch64_abs32 => {
+                const f = try relocField(a, dst, r.offset, 4, diag);
+                const v = @as(i128, s) + r.addend;
+                if (v < std.math.minInt(i32) or v > std.math.maxInt(u32)) return overflow(a, r, diag);
+                std.mem.writeInt(u32, f, @truncate(@as(u128, @bitCast(v))), .little);
+            },
             .x86_64_abs32s => {
                 const f = try relocField(a, dst, r.offset, 4, diag);
                 std.mem.writeInt(i32, f, std.math.cast(i32, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
@@ -2617,7 +2628,7 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
                 const f = try relocField(a, dst, r.offset, 1, diag);
                 f[0] = std.math.cast(u8, @as(i128, s) + r.addend) orelse return overflow(a, r, diag);
             },
-            .aarch64_branch26, .aarch64_page21, .aarch64_pageoff12, .aarch64_got_load_page21, .aarch64_got_load_pageoff12, .aarch64_movw_value16, .aarch64_tprel_hi12, .aarch64_tprel_lo12_nc => try aarch64Reloc(a, r, dst, p_base, s, tls, diag),
+            .aarch64_branch26, .aarch64_page21, .aarch64_pageoff12, .aarch64_got_load_page21, .aarch64_got_load_pageoff12, .aarch64_movw_value16, .aarch64_tprel_hi12, .aarch64_tprel_lo12_nc, .aarch64_tprel_g1, .aarch64_tprel_g0_nc => try aarch64Reloc(a, r, dst, p_base, s, tls, diag),
             else => return invalidReloc(a, diag),
         }
     }
@@ -2692,6 +2703,14 @@ noinline fn aarch64Reloc(a: *const Atom, r: Atom.Reloc, dst: []u8, p_base: u64, 
             if (r.info.kind == .aarch64_tprel_lo12_nc) break :v a64.patchImm12(insn, @truncate(off & 0xfff));
             if (off >= 1 << 24) return overflow(a, r, diag);
             break :v a64.patchImm12(insn, @truncate(off >> 12));
+        },
+        .aarch64_tprel_g1, .aarch64_tprel_g0_nc => v: {
+            // movz or movk, x
+            if (insn & 0xdf800000 != 0xd2800000 or s < tls.start or s >= tls.end) return invalidReloc(a, diag);
+            const off = target -% tls.tp;
+            if (r.info.kind == .aarch64_tprel_g0_nc) break :v (insn & ~@as(u32, 0xffff << 5)) | @as(u32, @truncate(off & 0xffff)) << 5;
+            if (off >= 1 << 32) return overflow(a, r, diag);
+            break :v (insn & ~@as(u32, 0xffff << 5)) | @as(u32, @truncate(off >> 16)) << 5;
         },
         else => unreachable,
     };

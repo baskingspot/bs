@@ -744,11 +744,12 @@ pub fn destroy(b: *Batch) void {
     gpa.destroy(b);
 }
 
-/// The target C compiles for: glibc's version names the ABI, as the
-/// native target does upstream, and `cpu` is the compilation's (`-mcpu`).
+/// The target C compiles for: `cpu`'s architecture, glibc's version names
+/// the ABI, as the native target does upstream, and `cpu` is the
+/// compilation's (`-mcpu`).
 pub fn cTarget(io: Io, glibc_version: ?std.SemanticVersion, cpu: std.Target.Cpu) !std.Target {
     var buf: [64]u8 = undefined;
-    const text = if (glibc_version) |v| try std.fmt.bufPrint(&buf, "x86_64-linux-gnu.{f}", .{v}) else "x86_64-linux-none";
+    const text = if (glibc_version) |v| try std.fmt.bufPrint(&buf, "{t}-linux-gnu.{f}", .{ cpu.arch, v }) else try std.fmt.bufPrint(&buf, "{t}-linux-none", .{cpu.arch});
     const query = try std.Target.Query.parse(.{ .arch_os_abi = text, .cpu_features = "baseline" });
     var target = try std.zig.system.resolveTargetQuery(io, query);
     target.cpu = cpu;

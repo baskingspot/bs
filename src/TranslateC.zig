@@ -33,7 +33,7 @@ const Request = struct {
     link_libc: bool,
     /// The target's glibc, which the target triple names: the native
     /// system's without `-target`, as upstream's native target, with or
-    /// without `-lc`; null for `x86_64-linux(-none)`.
+    /// without `-lc`; null for `x86_64-linux(-none)` and `aarch64-linux`.
     glibc_version: ?std.SemanticVersion,
     /// `-mcpu`, as for a compilation (`cpu.resolve`): it sets the macros
     /// the headers see (`__SSE4_1__`).
@@ -146,6 +146,11 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         if (opts.link_libc and opts.unsupported == null) main.resolveGlibc(&opts, arena);
     } else {
         main.checkTarget(&opts, arena, io, target);
+        if (opts.bs_target == .aarch64_linux and opts.link_libc)
+            main.setUnsupported(&opts, arena, "bs does not translate C against libc for aarch64-linux yet ('-lc'); build this step with upstream zig", .{});
+        // The target's baseline CPU, as its compilations' (`-mcpu` there
+        // takes only the baseline).
+        if (opts.bs_target == .aarch64_linux) opts.cpu = std.Target.aarch64.cpu.generic.toCpu(.aarch64);
         if (opts.link_libc and opts.unsupported == null and opts.bs_target == .x86_64_linux) main.resolveGlibc(&opts, arena);
     }
     // As the code bs compiles the headers into: apple_m1, whatever the
@@ -287,7 +292,7 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
         "-fno-lto",                         "-fhosted",
         "-nostdinc",
     });
-    const query_text = if (macos) "aarch64-macos" else if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "x86_64-linux-gnu.{f}", .{v}) else "x86_64-linux-none";
+    const query_text = if (macos) "aarch64-macos" else if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "{t}-linux-gnu.{f}", .{ req.cpu.arch, v }) else try std.fmt.allocPrint(arena, "{t}-linux-none", .{req.cpu.arch});
     const query = try std.Target.Query.parse(.{ .arch_os_abi = query_text, .cpu_features = "baseline" });
     var target = try std.zig.system.resolveTargetQuery(io, query);
     target.cpu = req.cpu;

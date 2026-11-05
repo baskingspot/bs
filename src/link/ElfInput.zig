@@ -1,5 +1,6 @@
-//! ELF relocatable objects and archives as link inputs (x86_64-linux;
-//! "Object, archive and shared-library inputs" in docs/slop/architecture.md).
+//! ELF relocatable objects and archives as link inputs (x86_64-linux, and
+//! static executables on aarch64-linux; "Object, archive and
+//! shared-library inputs" in docs/slop/architecture.md).
 //! Objects are read in place. Each allocated section becomes one Atom, or
 //! one per entry for mergeable sections, so the link stays one pass over
 //! atoms and nothing downstream knows an atom came from C.
@@ -59,6 +60,8 @@ shared_libs: []const ElfShared = &.{},
 /// (`Elf.LocalSymbol.bind`), as lld lists them, rather than local, as
 /// upstream's own linker lists them in programs with Zig code.
 lld: bool = false,
+/// The architecture of the objects the link takes.
+arch: Atom.Unwind.Arch = .x86_64,
 
 pub const Def = struct { object: u32, sym: u32, weak: bool };
 pub const Common = struct { size: u64, alignment: u64 };
@@ -116,10 +119,18 @@ pub const Object = struct {
 
 /// Parses an ELF64 x86_64 ET_REL in place.
 pub fn parseObject(arena: Allocator, path: []const u8, bytes: []const u8) Error!Object {
+    return parseObjectFor(arena, path, bytes, .x86_64);
+}
+
+/// Parses an ELF64 ET_REL of `arch` in place.
+fn parseObjectFor(arena: Allocator, path: []const u8, bytes: []const u8, arch: Atom.Unwind.Arch) Error!Object {
     if (bytes.len < @sizeOf(elf.Elf64_Ehdr) or !std.mem.eql(u8, bytes[0..4], elf.MAGIC)) return error.InvalidObject;
     const eh = std.mem.bytesToValue(elf.Elf64_Ehdr, bytes[0..@sizeOf(elf.Elf64_Ehdr)]);
     if (eh.e_ident[elf.EI.CLASS] != elf.ELFCLASS64 or eh.e_ident[elf.EI.DATA] != elf.ELFDATA2LSB) return error.InvalidObject;
-    if (eh.e_type != .REL or eh.e_machine != .X86_64) return error.InvalidObject;
+    if (eh.e_type != .REL or eh.e_machine != @as(elf.EM, switch (arch) {
+        .x86_64 => .X86_64,
+        .aarch64 => .AARCH64,
+    })) return error.InvalidObject;
     if (eh.e_shentsize != @sizeOf(elf.Elf64_Shdr)) return error.InvalidObject;
     const sh_end = std.math.add(u64, eh.e_shoff, @as(u64, eh.e_shnum) * @sizeOf(elf.Elf64_Shdr)) catch return error.InvalidObject;
     if (sh_end > bytes.len) return error.InvalidObject;
@@ -183,7 +194,7 @@ pub fn parseObject(arena: Allocator, path: []const u8, bytes: []const u8) Error!
 
 /// Adds an object given on the command line.
 pub fn addObject(in: *Inputs, path: []const u8, bytes: []const u8) Error!void {
-    try in.load(try parseObject(in.arena, path, bytes));
+    try in.load(try parseObjectFor(in.arena, path, bytes, in.arch));
 }
 
 /// Adds an archive, whose members load when they define a name the
@@ -266,9 +277,9 @@ pub fn pull(in: *Inputs, wanted: []const []const u8, ctx: anytype) !usize {
             if ((try ar.pulled.getOrPut(in.arena, sym.member)).found_existing) continue;
             const m = try ar.reader.member(sym.member);
             const path = try std.fmt.allocPrint(in.arena, "{s}({s})", .{ ar.path, m.name });
-            try in.load(parseObject(in.arena, path, m.bytes) catch |err| switch (err) {
+            try in.load(parseObjectFor(in.arena, path, m.bytes, in.arch) catch |err| switch (err) {
                 error.InvalidObject => {
-                    try in.errors.append(in.arena, try std.fmt.allocPrint(in.arena, "{s}: not an x86_64 ELF relocatable object", .{path}));
+                    try in.errors.append(in.arena, try std.fmt.allocPrint(in.arena, "{s}: not an {t} ELF relocatable object", .{ path, in.arch }));
                     continue;
                 },
                 else => |e| return e,
@@ -815,7 +826,14 @@ fn Converter(comptime Ctx: type) type {
         /// lld's.
         fn inputReloc(c: *C, index: u32, relocs: *std.ArrayList(Elf.InputReloc), r: elf.Elf64_Rela, new_offset: u64, tombstone: u64) !void {
             const R = elf.R_X86_64;
-            const ty = std.enums.fromInt(R, r.r_type()) orelse return c.unsupported(index, r.r_type());
+            // aarch64's data relocations, as x86_64's of the same width.
+            const ty: R = if (c.in.arch == .aarch64) switch (std.enums.fromInt(elf.R_AARCH64, r.r_type()) orelse return c.unsupported(index, r.r_type())) {
+                .NONE => .NONE,
+                .ABS32 => .@"32",
+                .ABS64 => .@"64",
+                .PREL32 => .PC32,
+                else => return c.unsupported(index, r.r_type()),
+            } else std.enums.fromInt(R, r.r_type()) orelse return c.unsupported(index, r.r_type());
             const wide = switch (ty) {
                 .NONE => return,
                 .@"32", .PC32, .DTPOFF32 => false,
@@ -887,7 +905,8 @@ fn Converter(comptime Ctx: type) type {
                 var drop = false;
                 if (std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little) != 0) {
                     while (ri < relas.len and relas[ri].r_offset < off + 8) ri += 1;
-                    if (ri == relas.len or relas[ri].r_offset != off + 8 or relas[ri].r_type() != @backingInt(elf.R_X86_64.PC32))
+                    const pc32: u32 = if (c.in.arch == .aarch64) @backingInt(elf.R_AARCH64.PREL32) else @backingInt(elf.R_X86_64.PC32);
+                    if (ri == relas.len or relas[ri].r_offset != off + 8 or relas[ri].r_type() != pc32)
                         return c.fail("{s}: the FDE at offset {d} of .eh_frame is not PC-relative, which bs does not link yet", .{ o.path, off });
                     drop = switch (try c.inputTarget(relas[ri].r_sym(), relas[ri].r_addend)) {
                         .atom => false,
@@ -1020,6 +1039,10 @@ fn Converter(comptime Ctx: type) type {
         /// relaxes an instruction sequence. Returns how many relocations
         /// after `k` the rewrite consumed.
         fn reloc(c: *C, index: u32, relas: []align(1) const elf.Elf64_Rela, k: usize, bytes: []const u8, copy: *?[]u8) !usize {
+            if (c.in.arch == .aarch64) {
+                try c.relocA64(index, relas[k], bytes, copy);
+                return 0;
+            }
             const o = c.o;
             const r = relas[k];
             const off = r.r_offset;
@@ -1385,8 +1408,64 @@ fn Converter(comptime Ctx: type) type {
         }
 
         fn unsupported(c: *C, index: u32, ty: u32) Allocator.Error!void {
-            const name = if (std.enums.fromInt(elf.R_X86_64, ty)) |t| @tagName(t) else "unknown";
-            try c.fail("{s}: bs does not link relocation R_X86_64_{s} ({d}) in section '{s}' yet", .{ c.o.path, name, ty, c.o.sectionName(index) });
+            const prefix, const name = switch (c.in.arch) {
+                .x86_64 => .{ "R_X86_64_", if (std.enums.fromInt(elf.R_X86_64, ty)) |t| @tagName(t) else "unknown" },
+                .aarch64 => .{ "R_AARCH64_", if (std.enums.fromInt(elf.R_AARCH64, ty)) |t| @tagName(t) else "unknown" },
+            };
+            try c.fail("{s}: bs does not link relocation {s}{s} ({d}) in section '{s}' yet", .{ c.o.path, prefix, name, ty, c.o.sectionName(index) });
+        }
+
+        /// Converts aarch64 relocation `r` of section `index`, in a static
+        /// executable, where every target is the image's own: GOT loads
+        /// keep their kinds, which the linker relaxes to the target's
+        /// address (`Elf.aarch64Reloc`), and thread-locals reached through
+        /// TLS descriptors or the GOT (initial-exec) become local-exec,
+        /// rewriting the code in `copy` as lld relaxes it: the
+        /// descriptor's `adrp` and `ldr` become nops, its `add` and `blr`
+        /// `movz x0, #tprel_g1, lsl #16; movk x0, #tprel_g0_nc`, and the
+        /// initial-exec `adrp` and `ldr` the same pair into their own
+        /// register.
+        fn relocA64(c: *C, index: u32, r: elf.Elf64_Rela, bytes: []const u8, copy: *?[]u8) !void {
+            const o = c.o;
+            if (r.r_offset + 4 > bytes.len) return c.fail("{s}: relocation at offset {d} past the end of section '{s}'", .{ o.path, r.r_offset, o.sectionName(index) });
+            const R = elf.R_AARCH64;
+            const ty = std.enums.fromInt(R, r.r_type()) orelse return c.unsupported(index, r.r_type());
+            const at: usize = @intCast(r.r_offset);
+            const insn = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            // The relaxed instruction, if this one changes.
+            const relaxed: ?u32 = switch (ty) {
+                .TLSDESC_ADR_PAGE21, .TLSDESC_LD64_LO12 => {
+                    std.mem.writeInt(u32, (try c.writable(bytes, copy))[at..][0..4], 0xd503201f, .little); // nop
+                    return;
+                },
+                .TLSDESC_ADD_LO12 => 0xd2a00000, // movz x0, #0, lsl #16
+                .TLSDESC_CALL => 0xf2800000, // movk x0, #0
+                .TLSIE_ADR_GOTTPREL_PAGE21 => if (insn & 0x9f000000 == 0x90000000) 0xd2a00000 | (insn & 0x1f) else return c.unsupported(index, r.r_type()),
+                .TLSIE_LD64_GOTTPREL_LO12_NC => if (insn & 0xffc00000 == 0xf9400000) 0xf2800000 | (insn & 0x1f) else return c.unsupported(index, r.r_type()),
+                else => null,
+            };
+            const kind: Atom.Reloc.Kind = switch (ty) {
+                .TLSDESC_ADD_LO12, .TLSIE_ADR_GOTTPREL_PAGE21, .TLSLE_MOVW_TPREL_G1 => .aarch64_tprel_g1,
+                .TLSDESC_CALL, .TLSIE_LD64_GOTTPREL_LO12_NC, .TLSLE_MOVW_TPREL_G0_NC => .aarch64_tprel_g0_nc,
+                .NONE => return,
+                .ABS64 => .aarch64_abs64,
+                .ABS32 => .aarch64_abs32,
+                .PREL32 => .aarch64_prel32,
+                .CALL26, .JUMP26 => .aarch64_branch26,
+                .ADR_PREL_PG_HI21, .ADR_PREL_PG_HI21_NC => .aarch64_page21,
+                .ADD_ABS_LO12_NC, .LDST8_ABS_LO12_NC, .LDST16_ABS_LO12_NC, .LDST32_ABS_LO12_NC, .LDST64_ABS_LO12_NC, .LDST128_ABS_LO12_NC => .aarch64_pageoff12,
+                .ADR_GOT_PAGE => .aarch64_got_load_page21,
+                .LD64_GOT_LO12_NC => .aarch64_got_load_pageoff12,
+                .TLSLE_ADD_TPREL_HI12 => .aarch64_tprel_hi12,
+                .TLSLE_ADD_TPREL_LO12, .TLSLE_ADD_TPREL_LO12_NC => .aarch64_tprel_lo12_nc,
+                else => return c.unsupported(index, r.r_type()),
+            };
+            if ((kind == .aarch64_got_load_page21 or kind == .aarch64_got_load_pageoff12) and r.r_addend != 0)
+                return c.fail("{s}: GOT relocation with addend {d} in section '{s}'", .{ o.path, r.r_addend, o.sectionName(index) });
+            const t = try c.target(r.r_sym(), r.r_addend) orelse return;
+            if (t.import) return c.fail("{s}: bs does not link aarch64 objects against shared libraries yet ('{s}')", .{ o.path, o.symName(o.syms[r.r_sym()]) });
+            if (relaxed) |v| std.mem.writeInt(u32, (try c.writable(bytes, copy))[at..][0..4], v, .little);
+            try c.add(r.r_offset, kind, t, r.r_addend);
         }
 
         fn writable(c: *C, bytes: []const u8, copy: *?[]u8) Allocator.Error![]u8 {

@@ -286,6 +286,19 @@ pub const Reloc = extern struct {
         /// `.tdata` or `.tbss`.
         aarch64_tprel_hi12,
         aarch64_tprel_lo12_nc,
+        /// aarch64 data from C objects: S + A - P as an i32 (ELF
+        /// R_AARCH64_PREL32), and S + A as 32 bits, checked to fit an i32
+        /// or a u32 (R_AARCH64_ABS32). ELF only.
+        aarch64_prel32,
+        aarch64_abs32,
+        /// aarch64 ELF local-exec TLS in `movz xd, #g1, lsl #16; movk xd,
+        /// #g0_nc`: bits 16-31 of thread-local S's offset from the thread
+        /// pointer (as `aarch64_tprel_hi12`), checked to fit 32 bits (ELF
+        /// R_AARCH64_TLSLE_MOVW_TPREL_G1), and bits 0-15, unchecked
+        /// (R_AARCH64_TLSLE_MOVW_TPREL_G0_NC). The relaxed form of C
+        /// objects' TLS descriptor and initial-exec sequences.
+        aarch64_tprel_g1,
+        aarch64_tprel_g0_nc,
     };
 };
 

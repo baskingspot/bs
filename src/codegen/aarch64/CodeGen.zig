@@ -1578,7 +1578,15 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.setResult(inst, data.ty_pl.ty, .x9);
         },
         .extern_pcrel => return cg.fail("@extern with '.relocation = .pcrel' on aarch64-macos", .{}),
-        .extern_tls => return cg.fail("thread-local externs on aarch64-macos", .{}),
+        .extern_tls => {
+            if (cg.ip.target != .aarch64_linux) return cg.fail("thread-local externs on aarch64-macos", .{});
+            // A static executable's: a C object defines it, in the
+            // executable's own TLS block, so local-exec reaches it.
+            const t = try cg.emit.tlsTarget(ip.stringSlice(@fromBackingInt(data.ty_pl.payload)));
+            if (t.slot or !t.local) return cg.fail("thread-local externs from shared libraries on aarch64-linux", .{});
+            try cg.e.threadLocalOffset(.x9, t.key);
+            try cg.setResult(inst, data.ty_pl.ty, .x9);
+        },
         .c_va_start => {
             // Apple's `va_list` is the address of the next variadic
             // argument, all of which are on the stack.
