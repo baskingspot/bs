@@ -324,6 +324,12 @@ def test_runner(args, cfg):
     return HERE / ("bs_runner.zig" if bs_runner else "test_runner.zig")
 
 
+def mcpu_args(args):
+    """`--mcpu`'s CPU for both compilers, else none: an explicit target's
+    baseline, which the committed baselines were recorded with."""
+    return [f"-mcpu={args.mcpu}"] if args.mcpu else []
+
+
 def compile_unit(compiler, unit, cfg, args, workdir, env=None, run_env=None, generated=False):
     """Builds the unit's test binary. `env` is an edit build's environment:
     the unit's generated root, and a failure is edit_verify_failed. Else
@@ -342,7 +348,7 @@ def compile_unit(compiler, unit, cfg, args, workdir, env=None, run_env=None, gen
     ]
     if not args.default_runner:
         argv += ["--test-runner", str(test_runner(args, cfg))]
-    argv += ["-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}"]
+    argv += ["-target", cfg["zig_target"], *mcpu_args(args), "--test-no-exec", f"-femit-bin={bin_path}"]
     for f in unit_filters(unit):
         argv += ["--test-filter", f]
     code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout, env if env is not None else run_env)
@@ -914,6 +920,7 @@ def full_run(zig, cfg, args, workdir):
         str(test_runner(args, cfg)),
         "-target",
         cfg["zig_target"],
+        *mcpu_args(args),
         "--test-no-exec",
         f"-femit-bin={bin_path}",
     ]
@@ -1128,6 +1135,7 @@ def std_target(compiler, cfg, args, workdir):
             str(UPSTREAM_LIB),
             "-target",
             cfg["zig_target"],
+            *mcpu_args(args),
             "--test-no-exec",
             f"-femit-bin={bin_path}",
         ]
@@ -2321,6 +2329,11 @@ def main():
         "--incremental",
         action="store_true",
         help="bs only: run upstream's test/incremental cases, each update an edit build checked against the case",
+    )
+    p.add_argument(
+        "--mcpu",
+        help="behavior and std: build for this CPU (such as native, as bs's native target defaults to), "
+        "still compared with the baseline CPU's committed results",
     )
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
