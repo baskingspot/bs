@@ -396,13 +396,29 @@ pub fn abiAlignment(ip: *const InternPool, ty: Index) u64 {
         .@"fn" => if (ip.target == .aarch64_macos) 4 else 1,
         .bool => 1,
         .int, .error_set, .@"enum" => intAbiAlignment(intInfo(ip, ty).bits),
-        .float => @min(abiSize(ip, ty), 16),
+        // f80 and f128 are soft floats on aarch64-macos, 8-byte aligned
+        // there, as LLVM lays them out.
+        .float => if (ip.target == .aarch64_macos) @min(abiSize(ip, ty), 8) else @min(abiSize(ip, ty), 16),
         .pointer, .@"anyframe" => 8,
         .array => abiAlignment(ip, childType(ip, ty)),
         .vector => blk: {
-            // Upstream's stage2_x86_64 rule for a CPU without AVX.
             const v = ip.keyPayload(.vector_type, ty);
             if (v.len == 0) break :blk 1;
+            if (ip.target == .aarch64_macos) {
+                // LLVM's, as upstream's aarch64-macos build: the vector's
+                // bits in bytes, rounded up to a power of two and capped at
+                // the stack alignment; a vector of soft floats (f80, f128)
+                // is aligned as its elements.
+                if (v.child == .f80_type or v.child == .f128_type) break :blk abiAlignment(ip, v.child);
+                const elem_bits: u64 = switch (class(ip, v.child)) {
+                    .bool => 1,
+                    .int, .@"enum" => intInfo(ip, v.child).bits,
+                    else => abiSize(ip, v.child) * 8,
+                };
+                if (elem_bits == 0) break :blk 1;
+                break :blk std.math.ceilPowerOfTwoAssert(u64, @min((elem_bits * v.len + 7) / 8, 16));
+            }
+            // Upstream's stage2_x86_64 rule for a CPU without AVX.
             if (v.child == .bool_type) break :blk if (v.len > 64) 16 else std.math.ceilPowerOfTwoAssert(u64, (v.len + 7) / 8);
             break :blk if (abiSize(ip, v.child) == 0) 1 else 16;
         },
