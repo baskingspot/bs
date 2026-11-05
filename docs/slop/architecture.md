@@ -1268,12 +1268,15 @@ upstream ReleaseSafe's (`bench/runtime.py`, below).
   each through a recorded cache edge). Nothing reads a callee's register
   usage or frame size. That keeps each Atom a function of its unit's
   inputs, which the cache and parallel CodeGen both require.
-- **No code motion of memory operations.** Loads, stores, calls, atomics,
-  and inline assembly stay in IR order within their block. Pure values may
-  be folded into their user (an immediate, an address, a compare into a
-  branch) or removed when dead, but are not hoisted or sunk across
-  blocks. There is no memory SSA, no alias analysis, no GVN, and no LICM.
-  Line tables stay in source order, which is what a debugger stepping a
+- **Little code motion of memory operations.** Stores, calls, atomics,
+  and inline assembly stay in IR order within their block, and so do
+  loads, with one exception: a scalar load no write in its loop may change
+  moves to just before the loop, under the alias rules of Forwarding
+  (forward.zig), which also lets a load read a dominating store's or
+  load's value. Pure values may be folded into their user (an immediate,
+  an address, a compare into a branch) or removed when dead, but are not
+  hoisted or sunk across blocks. There is no memory SSA, no general alias
+  analysis, no GVN, and no LICM beyond those loads. Line tables stay in source order, which is what a debugger stepping a
   Debug build expects. This is a rule of the default mode's pass list,
   not of the SSA form or the allocator: nothing below assumes memory
   operations stay put, so a later mode can relax it.
@@ -2235,19 +2238,21 @@ rewrites use it:
   previous rule did not forward moves to just before its innermost loop
   (which becomes `block { loads; loop }` in its place) when three things
   hold. Its address, or the base of its field pointer, is computed before
-  the loop. No write anywhere in the loop's body, before or after the
-  load, may overlap its memory by the rules above, and no returning call
-  is in the loop unless the memory is a non-escaping local's; a write
-  (or call) after which the path leaves the loop without repeating it
-  counts only for loads later on that path (a tokenizer's keyword lookup
-  as it returns a token). And a load or store through the same base runs
-  on every path to the loop, at most 64 positions before it with no
-  returning call between, or first in the loop body before anything that
-  may leave it, so the moved load cannot fault where the loop body might
-  not have run. Two loads of the same memory in a loop move as one. The
-  moved loads take the line of the statement before the loop; safety checks do not move. This keeps
-  `self.buf.ptr` and `self.buf.len` in registers across a tokenizer's
-  loop, and lets prove see the bound of every `buf[i]` as the same value.
+  the loop or is a load that moves too (`self.in.buf.len`). No write
+  anywhere in the loop's body, before or after the load, may overlap its
+  memory by the rules above, and no returning call is in the loop unless
+  the memory is a non-escaping local's; a write (or call) after which the
+  path leaves the loop without repeating it counts only for loads later
+  on that path (a tokenizer's keyword lookup as it returns a token). And
+  a load or store through the same base runs on every path to the loop,
+  at most 64 positions before it with no returning call or inline
+  assembly between, or in the loop body before its first branch, call or
+  assembly, so the moved load cannot fault where the loop body might not
+  have run. Two loads of the same memory in a loop move as one. The moved
+  loads take the line of the statement before the loop; safety checks do
+  not move. This keeps `self.buf.ptr` and `self.buf.len` in registers
+  across a tokenizer's loop, and lets prove see the bound of every
+  `buf[i]` as the same value.
 
 `BS_FORWARD=off` turns the pass off (its own cache entries, as
 `+noforward`), to compare a program's behavior with and without it;

@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "1\n1\n1\n1\n1\n1\n1\n1\n1\n"
+//! stdout: "1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n"
 //! Loop-invariant loads (docs/slop/architecture.md, "Forwarding"): a load
 //! whose memory no write in the loop may reach moves before the loop and
 //! reads the same value; one that a write, a call, or an aliasing store
@@ -97,6 +97,19 @@ noinline fn throughParam(p: **u32) u32 {
     return x;
 }
 
+const Outer = struct { in: *Tok, n: usize };
+
+/// `o.in` and `o.in.buf.len`, loaded through it, move before the inner
+/// loop.
+noinline fn nested(o: *Outer) usize {
+    var sum: usize = o.in.index;
+    for (0..o.n) |_| {
+        var i: usize = 0;
+        while (i < o.in.buf.len) : (i += 1) sum += 1;
+    }
+    return sum;
+}
+
 /// The loop's body never runs: nothing reads through `p` before it, so its
 /// load stays in the loop and does not fault.
 noinline fn neverRuns(p: *const Tok, n: usize) usize {
@@ -129,6 +142,10 @@ fn main() callconv(.c) noreturn {
 
     var pp: *u32 = &dummy;
     rt.printInt(@intFromBool(throughParam(&pp) == 5));
+
+    var n: Tok = .{ .buf = "abc", .index = 1, .count = 0 };
+    var o: Outer = .{ .in = &n, .n = 3 };
+    rt.printInt(@intFromBool(nested(&o) == 1 + 9));
 
     const bad: *const Tok = @ptrFromInt(0x10);
     rt.printInt(@intFromBool(neverRuns(bad, 0) == 0));

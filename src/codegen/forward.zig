@@ -115,6 +115,7 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
                 const Self = @This();
                 pub fn use(s: Self, ref: *Inst.Ref) void {
                     const i = ref.toIndex() orelse return;
+                    if (@backingInt(i) >= s.subst.len) return;
                     var to = s.subst[@backingInt(i)];
                     if (to == none) return;
                     // A load forwarded to one that was hoisted, or to one
@@ -127,6 +128,9 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
                 }
             };
             for (w.order[0..w.next]) |i| Ssa.forEachOperandPtr(ir, @fromBackingInt(i), Subst{ .subst = w.subst });
+            // The moved loads' addresses: an inner loop's may be an outer
+            // loop's load that moved too.
+            for (n..ir.instructions.len) |i| Ssa.forEachOperandPtr(ir, @fromBackingInt(@as(u32, @intCast(i))), Subst{ .subst = w.subst });
         }
         count += loads_forwarded + hoisted;
     }
@@ -422,7 +426,7 @@ const Walk = struct {
     /// Loop-invariant loads (`cands`: loads in loops that `forwardLoads`
     /// did not forward, in position order): a load of a scalar whose
     /// address is computed before its innermost loop, or is a field of a
-    /// pointer that is, moves to before the loop when no write in the
+    /// pointer that is, or of a load that moves too, moves to before the loop when no write in the
     /// loop may reach its memory (`loopWrites`), and when that memory was
     /// already read or written through the same base before the loop, or
     /// is first in the loop, with no call between that might free it
@@ -446,11 +450,19 @@ const Walk = struct {
             const lp = w.loop_of[l];
             const ptr = w.resolve(datas[l].ty_op.operand);
             const key = w.keyOf(ptr) orelse continue;
-            // The address, computed before the loop.
+            // The address, computed before the loop or by a load that
+            // moves before it first (`self.in.buf.len`).
+            const Moved = struct {
+                fn in(hs: []const Hoist, ref: Inst.Ref, loop: u32) bool {
+                    const i = ref.toIndex() orelse return false;
+                    for (hs) |h| if (h.load == @backingInt(i) and h.loop == loop) return true;
+                    return false;
+                }
+            };
             var addr = ptr;
             var field: u32 = 0;
-            if (!w.dominatesLoop(ptr, lp)) {
-                if (key.field == 0 or !w.dominatesLoop(key.base, lp)) continue;
+            if (!w.dominatesLoop(ptr, lp) and !Moved.in(hoists[0..nh], ptr, lp)) {
+                if (key.field == 0 or !(w.dominatesLoop(key.base, lp) or Moved.in(hoists[0..nh], key.base, lp))) continue;
                 addr = key.base;
                 field = key.field;
             }
@@ -532,8 +544,8 @@ const Walk = struct {
     }
 
     /// Whether a load or store through `base` runs on every path to loop
-    /// `lp`, shortly before it, with no call between that might free its
-    /// memory.
+    /// `lp`, shortly before it, with no call or inline assembly between
+    /// that might free its memory.
     fn accessedBefore(w: *Walk, base: Inst.Ref, lp: u32) bool {
         const ir = w.ir;
         const tags = ir.instructions.items(.tag);
@@ -547,29 +559,30 @@ const Walk = struct {
                 .load => datas[i].ty_op.operand,
                 .store => datas[i].bin_op.lhs,
                 .call => if (ir.extraData(Ir.Call, datas[i].pl_op.payload).data.ret_ty != .noreturn_type) return false else continue,
+                // Inline assembly may unmap memory as a call may free it.
+                .assembly => return false,
                 else => continue,
             };
             if (!(w.pos[lp] <= w.scope_end[i])) continue;
             const key = w.keyOf(w.resolve(ptr)) orelse continue;
             if (key.base == base) return true;
         }
-        // Or first in the loop, which always runs its body once: on every
-        // path through the body, before anything that might leave it or
-        // free the memory.
+        // Or first in the loop, which always runs its body once: in
+        // position order before the first branch, or anything else that
+        // might leave the body or free the memory (entering a block, as a
+        // `while` condition's, is not a branch).
         const insts = blockBody(ir, @fromBackingInt(lp));
         if (insts.len == 0) return false;
-        const body_end = w.scope_end[@backingInt(insts[0])];
         p = w.pos[lp] + 1;
-        const end = @min(body_end + 1, p + 64);
+        const end = @min(w.scope_end[@backingInt(insts[0])] + 1, p + 64);
         while (p < end) : (p += 1) {
             const i = w.order[p];
             const ptr = switch (tags[i]) {
                 .load => datas[i].ty_op.operand,
                 .store => datas[i].bin_op.lhs,
-                .call, .br, .repeat, .ret, .unreach, .trap, .assembly => return false,
+                .cond_br, .switch_br, .call, .br, .repeat, .ret, .unreach, .trap, .assembly => return false,
                 else => continue,
             };
-            if (w.scope_end[i] < body_end) continue;
             const key = w.keyOf(w.resolve(ptr)) orelse continue;
             if (key.base == base) return true;
         }
