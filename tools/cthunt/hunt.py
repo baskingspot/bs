@@ -224,6 +224,27 @@ def same_value(got, want):
     return len(g) == len(w) and all(a == b or a in UNDEF for a, b in zip(g, w))
 
 
+def value_diff(got, want):
+    """A name for how bs's line differs from upstream's, for the finding's
+    signature: "sign" when each differing number is a negative one read
+    without its sign extension, else ""."""
+    g, w = TOKEN.findall(got or ""), TOKEN.findall(want or "")
+    if len(g) != len(w):
+        return ""
+    seen = False
+    for a, b in zip(g, w):
+        if a == b or a in UNDEF:
+            continue
+        try:
+            ia, ib = int(a), int(b)
+        except ValueError:
+            return ""
+        if not (ib < 0 < ia and (ia - ib) & (ia - ib - 1) == 0):
+            return ""
+        seen = True
+    return "sign" if seen else ""
+
+
 def new_scratch():
     base = os.path.join(WORK, "tmp")
     os.makedirs(base, exist_ok=True)
@@ -358,7 +379,20 @@ def check(seed, tools, size=1.0, text=None, save_findings=True):
             ]
             if bad:
                 rec["findings"].append(
-                    save(seed, src_text, tools, up, res, "wrong-value", tid, bad, "", size, only, text is not None)
+                    save(
+                        seed,
+                        src_text,
+                        tools,
+                        up,
+                        res,
+                        "wrong-value",
+                        tid,
+                        bad,
+                        value_diff(res[bad[0]].lines.get(tid), want),
+                        size,
+                        only,
+                        text is not None,
+                    )
                 )
         for c, b in res.items():
             if b.status == "run-fail":
