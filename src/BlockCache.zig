@@ -148,14 +148,18 @@ test "reuses large blocks within its cap" {
     const again = try a.alloc(u8, 65 << 10);
     try std.testing.expectEqual(p, again.ptr);
     try std.testing.expectEqual(0, c.cached);
-    // Growing past the class moves it to another, contents and all.
+    // Growing past the class moves it to another, contents and all. Where
+    // the child cannot remap pages (macOS has no mremap), the block is
+    // copied and the old one cached.
     again[100] = 7;
     const grown = try a.realloc(again, 200 << 10);
     try std.testing.expectEqual(7, grown[100]);
-    // A 224 KiB and a 256 KiB block exceed the cap: the second goes to the
-    // child.
+    const kept = c.cached;
+    try std.testing.expect(kept == 0 or kept == 80 << 10);
+    // The 224 KiB block fits under the cap; the 256 KiB one does not and
+    // goes to the child.
     const other = try a.alloc(u8, 256 << 10);
     a.free(grown);
     a.free(other);
-    try std.testing.expectEqual(224 << 10, c.cached);
+    try std.testing.expectEqual(kept + (224 << 10), c.cached);
 }

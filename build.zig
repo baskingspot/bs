@@ -418,8 +418,14 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                         \\{[libc]s} --global-cache-dir "$4.d/g2" --cache-dir "$4.d/l3" "$4.d/a/{[file]s}" -femit-bin="$4.d/c2" 2>"$4.d/log" || fail
                         \\BS_CACHE_TIMING=1 BS_CACHE_CHECK=1 {[static]s} --global-cache-dir "$4.d/g2" --cache-dir "$4.d/l4" "$4.d/a/{[file]s}" -femit-bin="$4.d/s2" 2>"$4.d/log" || fail
                         \\nodonor
-                        \\"$4.d/s2" 2>"$4.d/log" || fail
-                    , .{ .file = file, .static = static, .libc = libc }),
+                        \\{[run]s}
+                    , .{
+                        .file = file,
+                        .static = static,
+                        .libc = libc,
+                        // The static build runs where bs's output does.
+                        .run = if (host_runs_bs_output) "\"$4.d/s2\" 2>\"$4.d/log\" || fail" else "",
+                    }),
                     "sh",
                 });
                 r.addFileArg(b.path(src_path));
@@ -478,10 +484,18 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                             \\(cd "$4.d/c" && BS_CACHE_TIMING=1 {[bs]s} --cache-dir "$4.d/lc" {[file]s} -femit-bin="$4.d/moved") 2>"$4.d/log" || fail
                             \\grep -q "no input changed" "$4.d/log" || {{ echo "the build after the moved program's first build found changes" >&2; fail; }}
                             \\(cd "$4.d/c" && BS_CACHE_VERIFY=full BS_CACHE_CHECK=1 {[bs]s} --cache-dir "$4.d/lc" {[file]s} -femit-bin="$4.d/moved2") 2>"$4.d/log" || fail
-                            \\"$4.d/moved" >"$4.d/moved.out" 2>&1 || true
-                            \\"$4.d/moved2" >"$4.d/moved2.out" 2>&1 || true
-                            \\cmp "$4.d/moved.out" "$4.d/moved2.out" >&2
-                        , .{ .file = file, .bs = bs_cmd }),
+                            \\{[compare]s}
+                        , .{
+                            .file = file,
+                            .bs = bs_cmd,
+                            // The programs run where bs's output does.
+                            .compare = if (host_runs_bs_output)
+                                \\"$4.d/moved" >"$4.d/moved.out" 2>&1 || true
+                                \\"$4.d/moved2" >"$4.d/moved2.out" 2>&1 || true
+                                \\cmp "$4.d/moved.out" "$4.d/moved2.out" >&2
+                            else
+                                "",
+                        }),
                     }),
                     "sh",
                 });
