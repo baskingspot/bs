@@ -9654,9 +9654,9 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             const v = val orelse return sema.failNeededComptime(block, src, "clobber must be comptime-known");
             if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
             const info = ip.structInfo(src_ty);
-            var mask: u32 = 0;
+            var mask: u64 = 0;
             for (info.field_names, 0..) |name, k| {
-                if (try sema.fieldValue(v, @intCast(k)) == .bool_true) mask |= clobberBit(ip.stringSlice(name));
+                if (try sema.fieldValue(v, @intCast(k)) == .bool_true) mask |= clobberBit(ip.target.arch(), ip.stringSlice(name));
             }
             return .fromInterned(try sema.clobbersValue(mask));
         } else if (dest_ty == .calling_convention_type and sc == .@"union" and
@@ -19819,31 +19819,21 @@ fn checkClobberName(sema: *Sema, block: *Block, src: Src, name: []const u8) Comp
 }
 
 /// A value of `std.lang.Clobbers` (`clobbers_type`), which bs gives no
-/// fields of its own: it keeps only what CodeGen reads, the callee-saved
-/// registers clobbered, as one bool per `Ir.Asm.callee_saved_names`
-/// entry. std's `std.lang.assembly.Clobbers` coerces to it
-/// (`coerceInner`), a literal through that type (`zirStructInit`).
-fn clobbersValue(sema: *Sema, mask: u32) !Index {
-    var elems: [Ir.Asm.callee_saved_names.len]Index = undefined;
+/// fields of its own: it keeps only what CodeGen reads, the registers
+/// clobbered, as 64 bools: general-purpose registers 0-31, then vector
+/// registers 0-31, by number (`Ir.Asm.clobberReg`). std's
+/// `std.lang.assembly.Clobbers` coerces to it (`coerceInner`), a literal
+/// through that type (`zirStructInit`).
+fn clobbersValue(sema: *Sema, mask: u64) !Index {
+    var elems: [64]Index = undefined;
     for (&elems, 0..) |*e, bit| e.* = if (mask >> @intCast(bit) & 1 != 0) .bool_true else .bool_false;
     return sema.intern(.{ .aggregate = .{ .ty = .clobbers_type, .storage = .{ .elems = &elems } } });
 }
 
-/// The `Ir.Asm.callee_saved_clobbers` bit of clobber `name`, if any.
-/// aarch64's `w19` is `x19`, and `z8`, `d8`, `s8`, `h8` and `b8` are
-/// `v8`, as LLVM aliases them.
-fn clobberBit(name: []const u8) u32 {
-    var buf: [4]u8 = undefined;
-    var canonical = name;
-    if (name.len >= 2 and name.len <= buf.len and std.mem.indexOfScalar(u8, "wzdshb", name[0]) != null) {
-        buf[0] = if (name[0] == 'w') 'x' else 'v';
-        @memcpy(buf[1..name.len], name[1..]);
-        canonical = buf[0..name.len];
-    }
-    for (Ir.Asm.callee_saved_names, 0..) |n, bit| {
-        if (std.mem.eql(u8, n, canonical)) return @as(u32, 1) << @intCast(bit);
-    }
-    return 0;
+/// The `clobbersValue` bit of clobber `name`, if it names a register.
+fn clobberBit(arch: std.Target.Cpu.Arch, name: []const u8) u64 {
+    const c = Ir.Asm.clobberReg(arch, name) orelse return 0;
+    return @as(u64, 1) << (@as(u6, c.num) + @as(u6, if (c.vec) 32 else 0));
 }
 
 fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
@@ -19908,10 +19898,10 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             .operand = operand,
         });
     }
-    // CodeGen keeps no values in registers across instructions, but a
-    // clobbered callee-saved register is the caller's to keep. As
-    // upstream, the clobbers must be a defined value.
-    var clobbered: u32 = 0;
+    // Operands take no clobbered register, and a clobbered callee-saved
+    // register is the caller's to keep. As upstream, the clobbers must be
+    // a defined value.
+    var clobbered: u64 = 0;
     if (extra.data.clobbers != .none) {
         const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
         const node = tree.fullAsm(src.loc.node.toAbsolute(src.base)).?.ast.clobbers.unwrap().?;
@@ -19928,13 +19918,13 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         const v = try sema.resolveConstValue(block, clobbers_src, c, "clobber must be comptime-known");
         if (sema.isUndef(v)) return sema.fail(block, clobbers_src, "use of undefined value here causes illegal behavior", .{});
         const a = sema.ip.keyPayload(.aggregate, v);
-        for (0..Ir.Asm.callee_saved_names.len) |bit| {
+        for (0..64) |bit| {
             const e = switch (a.storage) {
                 .elems => |elems| elems[bit],
                 .repeated_elem => |e| e,
                 .bytes => unreachable, // bools
             };
-            if (e == .bool_true) clobbered |= @as(u32, 1) << @intCast(bit);
+            if (e == .bool_true) clobbered |= @as(u64, 1) << @intCast(bit);
         }
     }
     const payload = try sema.addExtra(Ir.Asm{
@@ -19945,7 +19935,8 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         .outputs_len = small.outputs_len,
         .inputs_len = small.inputs_len,
         .is_volatile = @intFromBool(small.is_volatile),
-        .callee_saved_clobbers = clobbered,
+        .gpr_clobbers = @truncate(clobbered),
+        .vec_clobbers = @intCast(clobbered >> 32),
     });
     for (operands.items) |op| _ = try sema.addExtra(op);
     return sema.addInst(block, .{ .tag = .assembly, .data = .{ .ty_pl = .{ .ty = result_ty, .payload = payload } } });

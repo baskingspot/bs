@@ -1496,6 +1496,11 @@ layout order of pass 4:
   aarch64 restricts the registers an asm statement names; an asm
   statement is a clobber point there too (`callFree`), so the values
   that meet it keep out of v20-v29, which its SIMD operands get first.
+  Sema records every register the clobbers name, by any of its names,
+  as two masks by register number (`Ir.Asm.gpr_clobbers` and
+  `vec_clobbers`, `Ir.Asm.clobberReg`); an asm statement's `r`, `w` and
+  `x` operands take none of them, and the function saves the
+  callee-saved ones.
 
 **The `.auto` calling convention** follows from this, and stays private
 to bs (nothing outside bs calls an `.auto` function, so it changes

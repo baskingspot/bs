@@ -1769,21 +1769,32 @@ fn planRegisters(cg: *CodeGen) Error!void {
     // none of those, nor the registers its operands may get.
     var asm_regs: u32 = 0;
     if (cg.has_asm) {
-        comptime for (Ir.Asm.callee_saved_names[0..@popCount(callee_saved)], alloc_regs[0..@popCount(callee_saved)]) |name, r| {
-            std.debug.assert(std.mem.eql(u8, name, @tagName(r)));
-        };
         for (f.values.items(.inst)) |inst| {
             if (ir.instructions.items(.tag)[@backingInt(inst)] != .assembly) continue;
             const extra = ir.extraData(Ir.Asm, ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload);
-            asm_regs |= extra.data.callee_saved_clobbers & callee_saved;
+            var used: u16 = @truncate(extra.data.gpr_clobbers);
+            var n_r: u32 = 0;
             var i = extra.end;
-            for (0..extra.data.outputs_len + extra.data.inputs_len) |_| {
+            for (0..extra.data.outputs_len + extra.data.inputs_len) |k| {
                 const op = ir.extraData(Ir.Asm.Operand, i).data;
                 i += 3;
                 const c = asmAlternative(std.mem.trimStart(u8, cg.ip.stringSlice(op.constraint), "=+"));
+                if (std.mem.eql(u8, c, "r") or (k >= extra.data.outputs_len and std.mem.eql(u8, c, "rm") and cg.passInRegs(cg.typeOf(op.operand)))) n_r += 1;
                 const r = parseReg(regConstraint(c) orelse continue) orelse continue;
-                const k = allocIndex(r.reg);
-                if (k != Ssa.no_reg) asm_regs |= @as(u32, 1) << @intCast(k);
+                used |= @as(u16, 1) << @backingInt(r.reg);
+            }
+            // The `r` operands past rax-r11 take `asm_fallback`'s first
+            // free ones.
+            var avail: u32 = 0;
+            for (asm_pool) |r| avail += @intFromBool(used >> @backingInt(r) & 1 == 0);
+            for (asm_fallback) |r| {
+                if (n_r <= avail) break;
+                if (used >> @backingInt(r) & 1 != 0) continue;
+                used |= @as(u16, 1) << @backingInt(r);
+                avail += 1;
+            }
+            for (alloc_regs, 0..) |r, k| {
+                if (used >> @backingInt(r) & 1 != 0) asm_regs |= @as(u32, 1) << @intCast(k);
             }
         }
         // `assembly`'s `r` operands and its outputs' addresses get
@@ -6014,6 +6025,14 @@ fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
 
 const AsmArg = union(enum) { sym: struct { key: SymbolKey, off: i32 }, imm: i64, reg: ParsedReg };
 
+/// The registers `assembly` gives `r` operands: rax-r11, which no value
+/// lives in across an assembly statement, then, once those are taken,
+/// the callee-saved `asm_fallback`, which the function saves and values
+/// that meet the statement avoid (`planRegisters`). rbx comes last, as
+/// templates often name it.
+const asm_pool = [_]Reg{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9, .r10, .r11 };
+const asm_fallback = [_]Reg{ .r12, .r13, .r14, .r15, .rbx };
+
 fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const ip = cg.ip;
     const ir = cg.ir;
@@ -6032,8 +6051,9 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
 
     var names: std.StringHashMapUnmanaged(AsmArg) = .empty;
     defer names.deinit(cg.gpa);
-    // `r` inputs get registers that no `{reg}` constraint names.
-    var used: u16 = 0;
+    // `r` operands get registers that no `{reg}` constraint and no
+    // clobber names.
+    var used: u16 = @truncate(extra.data.gpr_clobbers);
     for (ops) |op| {
         const c = asmAlternative(std.mem.trimStart(u8, ip.stringSlice(op.constraint), "=+"));
         if (regConstraint(c)) |rn| if (parseReg(rn)) |r| {
@@ -6051,7 +6071,7 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         const constraint = asmAlternative(full[1..]);
         const ty = if (out.operand == .none) data.ty_pl.ty else Type.ptrInfo(ip, cg.typeOf(out.operand)).child;
         if (std.mem.eql(u8, constraint, "r")) {
-            const reg = for ([_]Reg{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9, .r10, .r11 }) |r| {
+            const reg = for (asm_pool ++ asm_fallback) |r| {
                 if (used & (@as(u16, 1) << @backingInt(r)) == 0) break r;
             } else return cg.fail("asm with too many register operands", .{});
             used |= @as(u16, 1) << @backingInt(reg);
@@ -6076,7 +6096,7 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         const is_r = std.mem.eql(u8, constraint, "r") or (std.mem.eql(u8, constraint, "rm") and cg.passInRegs(cg.typeOf(in.operand)));
         if (is_r) {
             const in_size = Type.abiSize(ip, cg.typeOf(in.operand));
-            const reg = for ([_]Reg{ .r8, .r9, .r10, .r11, .rsi, .rdi, .rcx, .rdx, .rax }) |r| {
+            const reg = for ([_]Reg{ .r8, .r9, .r10, .r11, .rsi, .rdi, .rcx, .rdx, .rax } ++ asm_fallback) |r| {
                 if (used & (@as(u16, 1) << @backingInt(r)) == 0) break r;
             } else return cg.fail("asm with too many register operands", .{});
             used |= @as(u16, 1) << @backingInt(reg);
