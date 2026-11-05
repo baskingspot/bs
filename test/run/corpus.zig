@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -334,6 +334,16 @@ fn cPipe(fds: *[2]c_int) *[2]i32 {
     return fds;
 }
 
+// dvui (Data.zig): @ptrCast(@alignCast()) of an optional slice into an
+// optional pointer keeps null.
+var data_buf: [8]u8 align(4) = .{ 1, 0, 0, 0, 2, 0, 0, 0 };
+noinline fn dataGet(some: bool) ?[]u8 {
+    return if (some) &data_buf else null;
+}
+fn dataPtr(some: bool) ?*u32 {
+    return @ptrCast(@alignCast(dataGet(some)));
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -439,5 +449,6 @@ fn main() callconv(.c) noreturn {
     rt.printInt(@intFromBool(fits == null));
     var fds: [2]i32 = .{ 0, 0 };
     rt.printInt(@intCast(cPipe(&fds)[1] + fds[1]));
+    rt.printInt(dataPtr(true).?.* + @intFromBool(dataPtr(false) == null));
     rt.exit(0);
 }

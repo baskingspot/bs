@@ -18794,10 +18794,19 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
     // An optional slice into a plain pointer gives the slice's pointer,
     // whose address is zero for null.
     const op_ty = sema.typeOf(operand);
-    if (Type.class(ip, op_ty) == .optional and Type.class(ip, Type.childType(ip, op_ty)) == .pointer and
-        Type.ptrInfo(ip, Type.childType(ip, op_ty)).flags.size == .slice and
-        Type.class(ip, dest_ty) == .pointer and Type.ptrInfo(ip, dest_ty).flags.size != .slice)
-    {
+    const opt_slice = Type.class(ip, op_ty) == .optional and Type.class(ip, Type.childType(ip, op_ty)) == .pointer and
+        Type.ptrInfo(ip, Type.childType(ip, op_ty)).flags.size == .slice;
+    // An optional slice into an optional pointer or slice: null stays null.
+    // A null slice's pointer is zero, so the cast payload, bitcast back to
+    // an optional, is null too.
+    if (opt_slice and Type.class(ip, dest_ty) == .optional and Type.class(ip, Type.childType(ip, dest_ty)) == .pointer) {
+        if (sema.resolveValue(operand)) |v| if (!sema.isUndef(v) and ip.keyPayload(.opt, v).val == .none)
+            return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = .none } }));
+        const child = try sema.ptrCastInner(block, src, flags, Type.childType(ip, dest_ty), try sema.optionalPayload(block, src, operand, false));
+        if (sema.resolveValue(child)) |cv| return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = cv } }));
+        return sema.addTyOp(block, .bitcast, dest_ty, child);
+    }
+    if (opt_slice and Type.class(ip, dest_ty) == .pointer and Type.ptrInfo(ip, dest_ty).flags.size != .slice) {
         const az = Type.ptrInfo(ip, dest_ty).flags.is_allowzero;
         if (sema.resolveValue(operand)) |v| {
             if (!sema.isUndef(v) and ip.keyPayload(.opt, v).val == .none) {
