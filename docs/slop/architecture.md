@@ -1926,10 +1926,11 @@ Go's `prove` and `loopbce`: one forward walk per function on its CodeGen
 worker (`Emit.generateFunction`, before `CodeGen.generate`) keeps the
 integer comparisons known to hold at each point and removes a safety
 check whose condition they prove, by making its `cond_br`'s condition a
-constant (`Ssa.build` then builds only the passing side). Only Sema's
-own branches with a failing side (`unreach` or `trap`) are decided, and
-only toward the passing side; nothing moves, and user branches, which
-are `-ffuzz` coverage points, are only learned from.
+constant (`Ssa.build` then builds only the passing side). Only branches
+with a failing side (`unreach` or `trap`) are decided, and only toward
+the passing side; nothing moves. Those include the user's own (`if
+(!ok) unreachable`, `std.debug.assert`), except under `-ffuzz`, where
+user branches are coverage points and are only learned from.
 
 - **Values.** Facts relate values, not instructions. A load of a
   variable (an alloc only loaded from and stored to, found by one scan
@@ -1948,12 +1949,38 @@ are `-ffuzz` coverage points, are only learned from.
   its compare's type, which bounds an operand only the fact bounds. An
   undefined value is no term: a store of one forgets the variable, and a
   compare with one gives no fact.
+- **Value numbering.** An instruction that writes no memory and computes
+  the operation of an earlier one on equal terms (same result type, or
+  for a compare the operands' type) is that one's term, so a fact on
+  `s.len - i` or on `(a + b) & mask` holds where the same expression is
+  computed again. `(a + b) - a` is `b` and `(x - c) + c` is `x` in one
+  type, wrapping or not. Loads of other memory (`load`, `ptr_elem_val`,
+  `slice_elem_val`, never volatile) are numbered by address term, type,
+  and memory version: it changes at every instruction that may write
+  memory or publish another thread's writes (all but a list of pure
+  tags; calls, atomics, `memcpy`, `memset`, stores through pointers other
+  than variables), at each loop entry and exit, and after a merge of
+  paths one of which changed it. A check's failing side (only a call of
+  its `noreturn` handler) does not change it, since nothing after it
+  runs. Loading `self.len` twice with no write between is one value.
 - **Facts.** A branch's condition (a compare, `not`, the `and` of two
   in its true side, the `or` of two in its false side) holds in the
   side it leads to, negated in the other. What held at every `br` that
   leaves a block holds after it, so a check passed holds for the rest of
   its block (`s[i]` twice checks once) and an early return's negation
-  holds after it (`if (n < 2) return n;`). The 64 most recent facts are
+  holds after it (`if (n < 2) return n;`). The facts of a block's exits
+  live in a list that only grows within the function, so a `br` to any
+  enclosing block (a loop's `break`) carries them, and a failed loop
+  walk restores the exits alone. A block left by a single `br` with a
+  body that ends in `noreturn` (a loop's exit block) also keeps what the
+  variables held at that `br` (at most 32 stored in it), as a new
+  version naming the same values, and the memory version there, instead
+  of forgetting them. A `bool` block (`a and b`, an inlined call
+  returning `bool`) keeps what held at its exits per value: assuming it
+  true adds what held at every `br` that may exit it true. Other `bool`
+  values give the fact `b == 1` or `b == 0`. Deciding a `bool`
+  condition handles `not`, `bool` blocks, and `a & b` / `a | b` by
+  assuming one side and deciding the other. The 64 most recent facts are
   searched, which keeps functions with thousands of checks linear.
 - **Proofs.** A compare follows from a fact on the same operands, from
   constant bounds the facts give each operand (with `x < y` bounding
@@ -1970,7 +1997,16 @@ are `-ffuzz` coverage points, are only learned from.
   unsigned multiplication goes when its operands' bounds exclude
   overflow, or for `a - b` when `b <= a` holds (`i + 1` after `i < len`,
   `n - 1` after `n >= 2`); the operation's value read then becomes the
-  wrapping operation, so the overflow bit is not computed.
+  wrapping operation, so the overflow bit is not computed. An overflow
+  check whose overflow bit (by value number) was checked before goes
+  too. `x - b <= y` follows from `x <= y` and `x - b < y` from `x < y`,
+  or from `x <= y` when `b >= 1`, for an exact subtraction; `a <= a + b`
+  for an exact unsigned addition; and `(x - k) + k` after an exact `x -
+  k` cannot overflow. Constant bounds come from exact additions and
+  subtractions, `%`, `@mod`, `&`, `>>` of unsigned values, `@intCast`,
+  `@truncate`, `@min`, `@max`, from facts whose other side has bounds
+  (transitively, depth-limited), and `t != k` at an end of `t`'s range
+  moves that end.
 - **Offsets.** An unsigned value that is a chain of constant additions
   is `x + c`. From `x + c < y` (or `<=`), when no addition in `x + c`
   can have wrapped (each an overflow operation whose check passed, or
@@ -1990,16 +2026,25 @@ are `-ffuzz` coverage points, are only learned from.
   them hold at every iteration's start. If one does not, every decision
   of that walk is undone and the body walked again without them, so a
   loop is walked at most twice, and loops nested in a walk with
-  candidates take none.
+  candidates take none. An unsigned variable stored before the loop
+  whose stores in it are each a constant within its bound, a difference
+  that did not wrap, a remainder, a mask, or a minimum
+  (`index -= 2`, `i = (i + 1) & mask`) is a candidate `v <= hi` for its
+  largest value before the loop; `repeat` also accepts a value whose
+  own bounds keep it within. Variables changed in a failed walk are
+  restored from an undo log of their versions, which also restores them
+  between a `cond_br`'s or `switch_br`'s sides.
 - **Turning it off.** `BS_PROVE=off` keeps every check (its own cache
   target, `+noprove`). A program whose output or panic differs between
   on and off has found a bug in a proof, with no oracle needed. The
   soundness argument for each rule is next to it in `prove.zig`; the run
   tests `prove_wrap`, `prove_load`, `prove_width`, and `prove_exit`
   each hold a program whose check a rule once removed unproven, and
-  `prove_offset_wrap`, `prove_offset_store`, `prove_offset_loop`, and
-  `prove_offset_retry` one that a wrong offset or loop rule would
-  remove.
+  `prove_offset_wrap`, `prove_offset_store`, `prove_offset_loop`,
+  `prove_offset_retry`, `prove_mem`, `prove_mem_merge`,
+  `prove_mem_loop`, `prove_wrap_end`, `prove_sub`, `prove_bool`,
+  `prove_assert`, and `prove_rem` one that a wrong offset, loop,
+  memory, range, or `bool` rule would remove.
 
 #### Compile-time budget and how it is measured
 
