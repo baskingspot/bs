@@ -144,7 +144,21 @@ const Scanner = struct {
                 .save_err_return_trace_index => if (data.ty_pl.ty == .none) continue else {
                     s.out.inlinable = false;
                 },
-                .ret_addr, .frame_addr, .err_return_trace, .set_err_return_trace, .assembly, .c_va_start, .c_va_arg, .c_va_copy => s.out.inlinable = false,
+                .ret_addr, .frame_addr, .err_return_trace, .set_err_return_trace, .c_va_start, .c_va_arg, .c_va_copy => s.out.inlinable = false,
+                // A local over a page stays in its own frame, which grows the
+                // stack when the function is called, as upstream's: inlined,
+                // the caller's prologue would grow it (and probe it) before
+                // the caller's own code ran, such as `Thread.callFn`'s
+                // setting up the signal stack a stack overflow reports on.
+                .alloc => if (data.ty != .none and Type.abiSize(s.ip, Type.ptrInfo(s.ip, data.ty).child) > 4096) {
+                    s.out.inlinable = false;
+                },
+                // As many instructions as the template has lines.
+                .assembly => {
+                    const source = s.ip.stringSlice(ir.extraData(Ir.Asm, data.ty_pl.payload).data.source);
+                    if (!asmCopyable(source)) s.out.inlinable = false;
+                    if (!cold) s.out.size +|= asmLines(source) -| 1;
+                },
                 .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect, .comptime_exit => unreachable,
                 .block, .loop => {
                     const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
@@ -253,6 +267,33 @@ const Scanner = struct {
         try s.sites.append(s.gpa, .{ .call = inst, .loops = s.loops, .callee = callee, .line = s.line, .column = s.column });
     }
 };
+
+/// The statements of an inline assembly template: its lines and the
+/// statements `;` separates.
+fn asmLines(source: []const u8) u32 {
+    var n: u32 = 0;
+    var it = std.mem.tokenizeAny(u8, source, "\n;");
+    while (it.next()) |line| n += @intFromBool(std.mem.trim(u8, line, " \t").len != 0);
+    return n;
+}
+
+/// Whether an inline assembly template means the same when a function
+/// holds several copies of it: it defines no named label and has no
+/// directive (`.globl`, `.section`), which would define a symbol or
+/// switch sections twice. GNU as's numeric labels (`1:`, `1b`) repeat.
+fn asmCopyable(source: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, source, "\n;");
+    while (it.next()) |line_in| {
+        const line = std.mem.trim(u8, line_in, " \t");
+        if (line.len == 0) continue;
+        if (line[0] == '.') return false;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        const name = line[0..colon];
+        if (name.len == 0 or std.mem.findAny(u8, name, " \t,%(\"") != null) continue;
+        for (name) |ch| if (!std.ascii.isDigit(ch)) return false;
+    }
+    return true;
+}
 
 /// Whether a body is cold code: a safety check's failure or `unreachable`.
 fn isCold(ir: *const Ir, body: []const Inst.Index) bool {
@@ -405,8 +446,17 @@ pub const Copier = struct {
         switch (tag) {
             .arg => return,
             .alloc, .dbg_stmt, .dbg_inline_end, .extern_ptr, .extern_pcrel, .extern_tls, .tls_ptr, .save_err_return_trace_index, .unreach, .trap, .breakpoint => {},
-            .ret_addr, .frame_addr, .err_return_trace, .set_err_return_trace, .assembly, .c_va_start, .c_va_arg, .c_va_copy => unreachable,
+            .ret_addr, .frame_addr, .err_return_trace, .set_err_return_trace, .c_va_start, .c_va_arg, .c_va_copy => unreachable,
             .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect, .comptime_exit => unreachable,
+            .assembly => {
+                const extra = from.extraData(Ir.Asm, data.ty_pl.payload);
+                data.ty_pl.payload = try c.payload(Ir.Asm, data.ty_pl.payload);
+                var at: u32 = @intCast(extra.end);
+                for (0..extra.data.outputs_len + extra.data.inputs_len) |_| {
+                    _ = try c.payload(Ir.Asm.Operand, at);
+                    at += @typeInfo(Ir.Asm.Operand).@"struct".field_names.len;
+                }
+            },
             .dbg_inline_begin => data.dbg_inline.payload = try c.payload(Ir.DbgInline, data.dbg_inline.payload),
             .ret => if (c.block) |b| {
                 tag = .br;
@@ -786,7 +836,21 @@ const Hasher = struct {
                 }
                 try h.body(it.elseBody());
             },
-            .assembly, .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect, .comptime_exit => unreachable,
+            .assembly => {
+                const extra = ir.extraData(Ir.Asm, data.ty_pl.payload);
+                try h.index(data.ty_pl.ty);
+                try h.string(extra.data.source);
+                for ([_]u32{ extra.data.outputs_len, extra.data.inputs_len, extra.data.is_volatile, extra.data.gpr_clobbers, extra.data.vec_clobbers }) |w| try h.word(w);
+                var at: u32 = @intCast(extra.end);
+                for (0..extra.data.outputs_len + extra.data.inputs_len) |_| {
+                    const op = ir.extraData(Ir.Asm.Operand, at).data;
+                    try h.string(op.name);
+                    try h.string(op.constraint);
+                    try h.ref(op.operand);
+                    at += @typeInfo(Ir.Asm.Operand).@"struct".field_names.len;
+                }
+            },
+            .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect, .comptime_exit => unreachable,
         }
     }
 };

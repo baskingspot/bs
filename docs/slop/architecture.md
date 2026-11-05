@@ -1943,7 +1943,18 @@ build, the passes, and the debug info treat them as Sema's inline calls
   `trap`: safety checks, `unreachable`), of a callee that is not
   recursive, not `noinline`, not variadic, has no inferred error set, and
   uses only instructions the splice maps (no `@returnAddress`,
-  `@frameAddress`, inline assembly, error return trace access). Its size is its instructions with code
+  `@frameAddress`, error return trace access, or inline assembly that
+  defines a named label or has a directive, which two copies in one
+  function would define twice; GNU as's numeric labels repeat). An
+  inlined asm statement brings its clobbers and register restrictions
+  into the caller, and an error in it is reported at the statement once,
+  however many callers it was copied into (`Zcu.diagnostics` drops
+  repeats), while the backend goes on to report the caller's other
+  statements (`asm_failed`). Nor a callee with a local over a page,
+  whose frame grows (and probes) the stack when it is called, as
+  upstream's, not in its caller's prologue before the caller's own code
+  (`Thread.callFn` attaches the signal stack that reports a stack
+  overflow before it calls). Its size is its instructions with code
   outside cold bodies, less `block`s, their `br`s, `ret`s (a `br` once
   inlined), the fields of an overflow operation's result, pointer
   `bitcast`s, and the `alloc`s of `const` locals and parameters with the
@@ -1952,7 +1963,7 @@ build, the passes, and the debug info treat them as Sema's inline calls
   `aggregate_init` with more than 8 (`@splat` of a runtime value has an
   operand per element: `std.mem.zeroes` of a 1 MiB array counted as one
   instruction, and its inlined copies cost 22 ms each in rewrite and
-  sroa), plus the sizes of the
+  sroa), plus each asm template's lines past the first, plus the sizes of the
   callees inlined into it (mid-stack inlining); the budget is 24, and
   twice that for a call inside a loop of the caller (`loop_factor`: its
   cost is paid each iteration, its code once), and three times for a
@@ -2711,7 +2722,9 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    widths compare against the truncation. Pass 2 leaves out values
    without uses whose computation has no effect, in one backward sweep
    after liveness. The encoder shortens `jmp`/`jcc` to rel8 when in reach
-   (not in functions with inline assembly), re-encoding once and moving
+   (also in functions with inline assembly since 2026-11-05: its jumps
+   and `leaq 1f(%rip)` go through the encoder's labels, and the inliner
+   copies asm into callers), re-encoding once and moving
    relocations, labels, line rows, inline ranges, and the frame patch.
    Error unions get their error code written through the padding before
    the payload (up to 8 bytes), so whole-word reads forward from the
