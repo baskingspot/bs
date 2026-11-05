@@ -15,6 +15,7 @@ Changes a user of bs notices, newest first, in the
 - Container-level assembly (`comptime { asm (...); }`) is assembled into the program on all targets, so its `.global` labels satisfy `extern fn` declarations and C references, as with upstream's LLVM backend (upstream's self-hosted backends drop it). What bs cannot assemble is a compile error at the `asm`.
 - On aarch64-linux and aarch64-macos, C calls pass homogeneous float aggregates, vectors, and bool vectors as Clang does, and `callconv(.{ .aarch64_preserve_none = .{} })` works; upstream's C ABI tests pass.
 - On aarch64-macos, `-framework X`, `-needed_framework X` and `-F<dir>` link frameworks, and `-l` finds the macOS SDK's text-based stubs (`-lz`, `-lobjc`), as upstream does.
+- On aarch64-macos, `-lc++` links libc++ and libc++abi, built from the zig lib directory's sources as upstream builds them (libSystem provides libunwind), so C++ sources with exceptions, iostream and the rest of the standard library link and run as with upstream.
 - On aarch64-macos, C objects compiled as Objective-C link: classes, protocols, selector references and constant CFStrings work as with upstream (raylib-zig's GLFW backend), and libraries that linked frameworks re-export, such as libobjc and CoreFoundation, are linked in their own right, as upstream does.
 
 ### Changed
@@ -28,6 +29,7 @@ Changes a user of bs notices, newest first, in the
 
 - In `bs build`, the first build after a cold one no longer compiles shared libraries and `-fPIC` objects again when they link other steps' outputs, nor reruns every step that depends on them.
 - In an ELF object (`bs build-obj`), a constant table of extern function pointers that code copies, such as `const libs = [_]Lib{ .{ .open = c.luaopen_base }, ... }` read in a `for` loop, keeps its relocations to those functions, instead of leaving null pointers that crash when called.
+- On aarch64-macos, static libraries index their members' hidden (private external) definitions, as upstream's do, so another member or a program linking the library can pull them.
 - On aarch64-macos, C and Objective-C objects whose functions catch exceptions (`@try`/`@catch`, C++ `try`) link: their `__eh_frame` is kept and their compact unwind entries reach `__unwind_info`, and the POINTER_TO_GOT relocations of their personality pointers are resolved, so a throw finds its handler as with upstream, instead of the link refusing the relocations.
 - On aarch64-macos, `__unwind_info`'s second-level pages are at most 4 KiB, as ld64 writes them, so `objdump --unwind-info` and lldb read them without "attempt to read past end of buffer" warnings.
 - On ELF targets, a global absolute symbol an object defines (`.globl sym; .set sym, 0x1234`) binds from other objects and from Zig `extern` declarations, as upstream's, instead of being an undefined symbol.

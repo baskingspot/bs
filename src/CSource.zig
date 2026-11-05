@@ -2,7 +2,8 @@
 //! the arguments upstream's `Compilation.addCCArgs` gives them for bs's
 //! target and the baseline CPU, in Debug (docs/slop/architecture.md, "C
 //! interop"). bs never compiles C or C++ itself. With `-lc++`, an
-//! executable also links libc++, libc++abi and libunwind, which this file
+//! executable also links libc++, libc++abi and (except on macOS, whose
+//! libSystem has it) libunwind, which this file
 //! builds from the zig lib directory's sources as upstream's
 //! `libs/libcxx.zig` and `libs/libunwind.zig` do, once per configuration,
 //! into the global cache.
@@ -196,6 +197,8 @@ pub const Batch = struct {
     jobs: []Job,
     /// The C++ runtime libraries an executable links (`Options.cxx_runtime`).
     archives: []Archive = &.{},
+    /// Whether they are Mach-O's, archived with a `__.SYMDEF` index.
+    macos: bool = false,
     /// The tool directories of the runtime libraries found in the global
     /// cache, held until `destroy` so that maintenance keeps them
     /// (`cache.useTool`).
@@ -466,7 +469,7 @@ pub const Batch = struct {
                 return err;
             };
         } else |_| {}
-        try ar.write(b.gpa, io, Io.Dir.cwd(), a.path, members);
+        try if (b.macos) ar.writeDarwin(b.gpa, io, Io.Dir.cwd(), a.path, members) else ar.write(b.gpa, io, Io.Dir.cwd(), a.path, members);
     }
 };
 
@@ -647,6 +650,8 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         const is_nonshared = std.mem.eql(u8, rl.name, nonshared_lib.name);
         const is_musl = rl.musl;
         if (!(if (is_nonshared) o.libc_nonshared and zig.found != null else if (is_musl) o.musl_libc else o.cxx_runtime)) continue;
+        // macOS's libunwind is libSystem's (`libCxxNeedsLibUnwind`).
+        if (o.macos and std.mem.eql(u8, rl.name, "unwind")) continue;
         const first = runtime.items.len;
         if (is_nonshared)
             try nonsharedJobs(ra, &runtime, common, lib, o)
@@ -690,6 +695,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         }
     }
     b.archives = archives.items;
+    b.macos = o.macos;
     b.jobs = try gpa.alloc(Batch.Job, sources.len + runtime.items.len);
     for (b.jobs) |*j| j.arena = .init(gpa);
 
@@ -724,7 +730,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .link_libc = o.link_libc,
             .native = true,
             .libcpp = o.link_libcpp,
-            .libunwind = o.link_libcpp,
+            .libunwind = o.link_libcpp and !o.macos,
         });
         try argv.appendSlice(arena, o.global_cc_argv);
         try argv.appendSlice(arena, src.cc_argv);
@@ -900,11 +906,12 @@ fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Envi
         "-D_LIBCPP_HAS_UNICODE",
         "-D_LIBCPP_HAS_WIDE_CHARACTERS",
         "-D_LIBCPP_HAS_NO_STD_MODULES",
-        "-D_LIBCPP_HAS_TIME_ZONE_DATABASE",
         "-D_LIBCPP_PSTL_BACKEND_SERIAL",
         "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE",
         "-D_LIBCPP_ASSERTION_SEMANTIC_DEFAULT=_LIBCPP_ASSERTION_SEMANTIC_IGNORE",
     });
+    // Linux only, as upstream's `addCxxArgs`.
+    if (!o.macos) try cxx.append(arena, "-D_LIBCPP_HAS_TIME_ZONE_DATABASE");
     // glibc 2.16 introduced aligned_alloc.
     if (o.glibc_version) |v| if (v.order(.{ .major = 2, .minor = 16, .patch = 0 }) == .lt) try cxx.append(arena, "-D_LIBCPP_HAS_LIBRARY_ALIGNED_ALLOCATION=0");
     const os_args: []const []const u8 = if (o.macos) os: {
@@ -949,7 +956,8 @@ const Mode = struct {
     native: bool = false,
     /// libc++'s include directories and configuration (`-lc++`).
     libcpp: bool,
-    /// libunwind's include directory, which `-lc++` links on Linux.
+    /// libunwind's include directory, which `-lc++` links on Linux (macOS
+    /// uses libSystem's).
     libunwind: bool,
 };
 
@@ -1021,7 +1029,8 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
 }
 
 // The C++ runtime libraries, as upstream's `src/libs/libcxx.zig` and
-// `src/libs/libunwind.zig` build them for x86_64-linux-gnu.
+// `src/libs/libunwind.zig` build them for Linux and (without libunwind)
+// macOS.
 // Copyright (c) Zig contributors. MIT licensed (see LICENSE-ZIG).
 
 const RuntimeLib = struct {

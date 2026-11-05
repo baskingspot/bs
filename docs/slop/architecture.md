@@ -4745,7 +4745,8 @@ The other direction, bs's own relocatable output, is new:
   DWARF yet, so Zig frames in a library linked from them have symbols
   but no lines.
 - `Archive.writeDarwin` writes the static library as upstream's
-  `build-lib` does: a `__.SYMDEF` index and `#1/<n>` member names padded
+  `build-lib` does: a `__.SYMDEF` index (every external symbol that is
+  defined or COMMON, private externals too) and `#1/<n>` member names padded
   so that every member's contents start 8-aligned, which ld64 requires.
 - ld64 (through clang), upstream zig and bs itself link both and run
   the result on the Mac; libvaxis's `bs build test` runs all 48 steps
@@ -8416,6 +8417,22 @@ options, as upstream's.
   Upstream links them as `libunwind libc++ <objects> libc++abi`; bs's
   archives resolve as one group (`ElfInput.pull` loops until nothing more
   is pulled), so the order does not change which members load.
+- **aarch64-macos** (2026-11-05, for fizzy): `-lc++` builds libc++ and
+  libc++abi the same way, without libunwind, which is libSystem's
+  (upstream's `libCxxNeedsLibUnwind`), and without
+  `_LIBCPP_HAS_TIME_ZONE_DATABASE` (Linux only in `addCxxArgs`); a
+  user source gets no libunwind include directory. The archives are
+  Darwin's (`Archive.writeDarwin`), and MachOInput pulls their members.
+  libc++ is built with `-fvisibility=hidden`, so its definitions are
+  private externals: `writeDarwin` indexes them, as upstream's
+  `Object.updateArSymtab` and ranlib do (it indexed only plain externals
+  before, so a hidden definition could not be pulled). The throws need
+  `__unwind_info`'s personalities and LSDAs (see "Unwind (stage A2)").
+  Checked on the Mac against upstream: a Zig program calling C++ that
+  throws through four frames with destructors, catches by type, catches
+  `vector::at`'s `out_of_range` with `catch (...)` and rethrows it, and
+  prints with iostream and stringstream gives the same output and exit
+  status, and so does a C++-only `main`.
 - **libc_nonshared.a** (`CSource.nonshared_lib`, from upstream's
   `src/libs/glibc.zig`): `atexit`, `at_quick_exit`, `pthread_atfork`,
   `__stack_chk_fail_local`, and for older glibc the stat and mknod

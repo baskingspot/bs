@@ -89,8 +89,10 @@ pub fn write(gpa: Allocator, io: Io, dir: Io.Dir, ar_path: []const u8, members: 
 /// Writes a Darwin archive of arm64 Mach-O `members`, in order, to
 /// `ar_path`, as upstream's `zig build-lib` writes one for aarch64-macos
 /// (`src/link/MachO/relocatable.zig`): a `__.SYMDEF` index of 32-bit
-/// (name offset, member offset) pairs over the members' defined external
-/// symbols, sorted by name offset, then the members, each named with BSD
+/// (name offset, member offset) pairs over the members' external
+/// symbols that are defined (private externals too, which an executable
+/// or library linking the archive resolves as other members' references)
+/// or COMMON, sorted by name offset, then the members, each named with BSD
 /// `#1/<n>` and its name padded so that its contents start 8-aligned.
 pub fn writeDarwin(gpa: Allocator, io: Io, dir: Io.Dir, ar_path: []const u8, members: []const Input) !void {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -180,8 +182,10 @@ const MachODefined = struct {
             if (at + 16 > it.obj.len) return error.InvalidObject;
             const strx = std.mem.readInt(u32, it.obj[at..][0..4], .little);
             const n_type = it.obj[at + 4];
-            // N_EXT, not N_PEXT or a stab, and N_SECT.
-            if (n_type & 0xe0 != 0 or n_type & 0x01 == 0 or n_type & 0x10 != 0 or n_type & 0x0e != 0x0e) continue;
+            // N_EXT (N_PEXT or not), not a stab, and not N_UNDF unless
+            // COMMON (a value), as upstream's `Object.updateArSymtab`.
+            if (n_type & 0xe0 != 0 or n_type & 0x01 == 0) continue;
+            if (n_type & 0x0e == 0 and std.mem.readInt(u64, it.obj[at + 8 ..][0..8], .little) == 0) continue;
             if (strx >= it.strsize or it.strs + it.strsize > it.obj.len) return error.InvalidObject;
             return std.mem.sliceTo(it.obj[it.strs + strx .. it.strs + it.strsize], 0);
         }

@@ -560,7 +560,14 @@ test "an object and a Darwin archive of it read back with MachOInput" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try Archive.writeDarwin(gpa, io, tmp.dir, "lib.a", &.{.{ .name = "an_object_with_a_long_name.o", .bytes = obj }});
+    // A second member's hidden (private external) function, which the
+    // index names too, as upstream's and ranlib's do.
+    const hidden: SymbolKey = .fromName("hidden");
+    const hidden_obj = try emit(gpa, &.{.{ .key = hidden, .name = "hidden", .section = .text, .alignment = .@"4", .bytes = &.{ 0xc0, 0x03, 0x5f, 0xd6 } }}, .{
+        .exports = &.{.{ .key = hidden, .name = "hidden", .visibility = .hidden }},
+    });
+    defer gpa.free(hidden_obj);
+    try Archive.writeDarwin(gpa, io, tmp.dir, "lib.a", &.{ .{ .name = "an_object_with_a_long_name.o", .bytes = obj }, .{ .name = "hidden.o", .bytes = hidden_obj } });
     const lib = try tmp.dir.readFileAlloc(io, "lib.a", gpa, .unlimited);
     defer gpa.free(lib);
 
@@ -583,6 +590,9 @@ test "an object and a Darwin archive of it read back with MachOInput" {
     // The index names the member's three definitions, not the import.
     try std.testing.expectEqual(0, try in.pull(&.{"entry"}, Ctx{}));
     try std.testing.expectEqualStrings("lib.a(an_object_with_a_long_name.o)", in.objects.items[0].path);
+    _ = try in.pull(&.{"hidden"}, Ctx{});
+    try std.testing.expectEqual(2, in.objects.items.len);
+    try std.testing.expectEqualStrings("lib.a(hidden.o)", in.objects.items[1].path);
     const c = try in.convert(Ctx{});
     try std.testing.expectEqual(0, in.errors.items.len);
     const text = (try in.lookup("entry")).?;

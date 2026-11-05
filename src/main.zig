@@ -1658,7 +1658,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
         .link_mode = if (opts.dynamic or (opts.link_libc and !opts.musl and !opts.command.isObj() and opts.command != .build_lib)) .dynamic else .static,
         .link_libc = opts.link_libc,
         .link_libcpp = opts.link_libcpp,
-        .link_libunwind = opts.link_libcpp,
+        .link_libunwind = opts.link_libcpp and opts.bs_target != .aarch64_macos,
         .pie = false,
     } });
 
@@ -2452,8 +2452,6 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     if (opts.bs_target == .aarch64_macos) {
         if (command.isObj() and (c_files.items.len != 0 or link_inputs.items.len != 0))
             setUnsupported(&opts, "bs does not merge C sources or objects into aarch64-macos objects yet; build this step with upstream zig", arena, .{})
-        else if (opts.link_libcpp)
-            setUnsupported(&opts, "bs does not link libc++ for aarch64-macos yet; build this step with upstream zig", arena, .{})
         else if (opts.fuzz)
             setUnsupported(&opts, "bs does not instrument code for fuzzing on aarch64-macos yet ('-ffuzz'); build this step with upstream zig", arena, .{});
         // Code is generated for Apple's M1 (`-target aarch64-macos`), the
