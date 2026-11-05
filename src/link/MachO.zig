@@ -683,7 +683,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
 
     // __LINKEDIT contents.
     const fixups_seg = [3]bool{ false, n_fixups[got] + n_fixups[mod_init_func] + n_fixups[data_const] > 0, n_fixups[data] + n_fixups[thread_vars] + n_fixups[thread_data] > 0 };
-    const cf = ChainedFixupsLayout.init(n_segs, @intFromBool(dylib == null), seg_present, fixups_seg, seg_start, seg_mem_end, bind_imports);
+    // Page starts cover only the file-backed pages: under page-in linking
+    // the kernel maps every page the starts list from the file, so a
+    // listed zero-fill page (__bss, __thread_bss) would read the bytes
+    // that follow __DATA in the file instead of zeros.
+    const cf = ChainedFixupsLayout.init(n_segs, @intFromBool(dylib == null), seg_present, fixups_seg, seg_start, seg_file_end, bind_imports);
     const fixups_off = linkedit_off;
     const trie_off = fixups_off + cf.size;
     // A dylib's exports trie, from where its atoms went.
@@ -2209,7 +2213,7 @@ const ChainedFixupsLayout = struct {
 
     /// `first_ordinal` is __TEXT's segment index: 1 after an executable's
     /// __PAGEZERO, 0 in a dylib.
-    fn init(n_segs: u32, first_ordinal: u32, present: [3]bool, has_fixups: [3]bool, seg_start: [3]u64, seg_mem_end: [3]u64, imports: []const Import) ChainedFixupsLayout {
+    fn init(n_segs: u32, first_ordinal: u32, present: [3]bool, has_fixups: [3]bool, seg_start: [3]u64, seg_file_end: [3]u64, imports: []const Import) ChainedFixupsLayout {
         var cf: ChainedFixupsLayout = .{
             .n_segs = n_segs,
             .seg_info = @splat(0),
@@ -2229,7 +2233,7 @@ const ChainedFixupsLayout = struct {
         for (has_fixups, 0..) |f, seg| if (f) {
             at = std.mem.alignForward(u32, at, 8);
             cf.seg_info[seg] = at;
-            cf.page_count[seg] = @intCast((seg_mem_end[seg] - seg_start[seg]) / page_size);
+            cf.page_count[seg] = @intCast((seg_file_end[seg] - seg_start[seg]) / page_size);
             at += 22 + 2 * @as(u32, cf.page_count[seg]);
         };
         cf.imports_off = std.mem.alignForward(u32, starts_off + at, 4);
@@ -2711,6 +2715,44 @@ test "gives each thread its own thread-locals from __thread_data and __thread_bs
     bad[0].targets = &.{target};
     bad[0].relocs = &.{.init(0, .aarch64_tlvp_page21, 0, 0)};
     try std.testing.expectError(error.InvalidRelocation, emit(gpa, io, &bad, .{ .entry = main, .imports = options.imports, .diag = &diag }));
+}
+
+test "chained fixups list no zero-fill page of __DATA" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // A rebase in __data, then 64 KiB of __bss: four zero-fill pages that
+    // the starts must not list, or page-in linking maps them from the file.
+    const main: SymbolKey = .fromName("main");
+    const ptr: SymbolKey = .fromName("ptr");
+    const zeros: SymbolKey = .fromName("zeros");
+    const ret = [_]u8{ 0xc0, 0x03, 0x5f, 0xd6 };
+    const atoms = [_]Atom{
+        .{ .key = main, .name = "main", .section = .text, .alignment = .@"4", .bytes = &ret },
+        .{ .key = ptr, .name = "ptr", .section = .data, .alignment = .@"8", .bytes = &@as([8]u8, @splat(0)), .targets = &.{zeros}, .relocs = &.{.init(0, .aarch64_abs64, 0, 0)} },
+        .{ .key = zeros, .name = "zeros", .section = .bss, .alignment = .@"8", .zero_fill = 64 << 10 },
+    };
+    const out = try emit(gpa, io, &atoms, .{ .entry = main });
+    defer gpa.free(out);
+
+    var data_seg: ?macho.segment_command_64 = null;
+    var fixups: ?macho.linkedit_data_command = null;
+    var it: macho.LoadCommandIterator = try .init(@ptrCast(@alignCast(out.ptr)), out[@sizeOf(macho.mach_header_64)..]);
+    while (try it.next()) |lc| switch (lc.hdr.cmd) {
+        .SEGMENT_64 => if (std.mem.eql(u8, lc.cast(macho.segment_command_64).?.segName(), "__DATA")) {
+            data_seg = lc.cast(macho.segment_command_64).?;
+        },
+        .DYLD_CHAINED_FIXUPS => fixups = lc.cast(macho.linkedit_data_command).?,
+        else => {},
+    };
+    try std.testing.expect(data_seg.?.vmsize >= data_seg.?.filesize + (64 << 10));
+    // __DATA's dyld_chained_starts_in_segment, by its segment offset.
+    const blob = out[fixups.?.dataoff..][0..fixups.?.datasize];
+    const image = blob[std.mem.readInt(u32, blob[4..8], .little)..];
+    const starts = for (0..std.mem.readInt(u32, image[0..4], .little)) |s| {
+        const info = std.mem.readInt(u32, image[4 + 4 * s ..][0..4], .little);
+        if (info != 0 and std.mem.readInt(u64, image[info + 8 ..][0..8], .little) == data_seg.?.fileoff) break image[info..];
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(try std.math.divCeil(u64, data_seg.?.filesize, page_size), @as(u64, std.mem.readInt(u16, starts[20..22], .little)));
 }
 
 test "links many chunks of atoms and pages of fixups the same way on any number of threads" {
