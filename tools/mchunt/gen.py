@@ -572,6 +572,21 @@ EXTRA_DECL["sharefwd"] = [
     "inline fn sfIn(a: u64, b: u64) u64 { return (a ^ b) +% (a >> 3); }",
 ]
 
+# Stores through pointers, then loads of the same address (s_storefwd).
+EXTRA_DECL["storefwd"] = [
+    "const SfL = struct { items: []u32, cap: usize, tag: u8 };",
+    "var gSfBuf: [64]u32 = @splat(0x5a5a);",
+    "var gSfL: SfL = .{ .items = gSfBuf[0..8], .cap = 64, .tag = 1 };",
+    "var gSfIdx: usize = 0;",
+    "noinline fn sfPut(p: *usize, v: usize) void { p.* = v; }",
+    "noinline fn sfPutG(v: usize) void { gSfIdx = v; gSfL.items.len = @min(v, 64); }",
+    "noinline fn sfPutLen(sp: *[]u32, n: usize) void { sp.len = n; }",
+    "noinline fn sfSet(l: *SfL, n: usize) void { l.items.len = n; }",
+    "noinline fn sfRead(p: *const usize) usize { return p.*; }",
+    "inline fn sfGrow(l: *SfL, k: usize) []u32 { const old = l.items.len; l.items.len = old + k; return l.items[old..][0..k]; }",
+    "noinline fn sfGrowN(l: *SfL, k: usize) []u32 { const old = l.items.len; l.items.len = old + k; return l.items[old..][0..k]; }",
+]
+
 # Loads and copies around writes that may alias them (s_fwdalias).
 EXTRA_DECL["fwdalias"] = [
     "const AQ = struct { a: u32, b: u32, c: u64 };",
@@ -1544,7 +1559,7 @@ class Gen:
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
             (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
             (2, "swx"), (2, "scopenum"), (2, "argbase"), (2, "mulbound"), (2, "retlen"),
-            (2, "sharefwd"), (2, "fwdalias"),
+            (2, "sharefwd"), (2, "fwdalias"), (2, "storefwd"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -3396,6 +3411,208 @@ class Gen:
                 sk(f"@as(u64, {x1}) *% 1000 +% {x2}")
                 ctx["indent"] -= 1
                 e("} else |_| {}")
+
+    def s_storefwd(self, ctx):
+        """A store through a pointer, then a load of the same address used
+        as an index or a slice length, with writes in between that must
+        invalidate it (an aliasing pointer, a byte pointer, a call, inline
+        asm, a volatile store, a whole-struct or whole-slice store), stores
+        in one branch or case only, stores in loops, `undefined` stores, and
+        slice lengths stored through `*[]T`, struct fields and globals."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        ctx["fn"].risky = True
+        self.extra.add("storefwd")
+        e = lambda s_: self.emit(ctx, s_)
+        sk = lambda x: self.sink(ctx, x, U32)
+        sel = self.fresh("fs")
+        vals = [0, 1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 40]
+        e(f"var {sel} = [_]usize{{ {', '.join(map(str, vals))} }};")
+        e(f"_ = &{sel};")
+        pv = lambda: f"{sel}[@as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % {len(vals)}]"
+        k = self.r.randrange(13)
+        if k <= 5 or k == 12:
+            # A usize index held in a local, an array element, a struct
+            # field or a global, stored and loaded through p.
+            arr = self.fresh("fa")
+            e(f"var {arr}: [16]u32 = @splat({self.int_expr(ctx, U32, 1)});")
+            e(f"_ = &{arr};")
+            h = self.r.randrange(4)
+            hv = self.fresh("fh")
+            if h == 0:
+                e(f"var {hv}: usize = {pv()};")
+                addr = f"&{hv}"
+            elif h == 1:
+                e(f"var {hv}: [4]usize = .{{ {pv()}, {pv()}, 1, 2 }};")
+                addr = f"&{hv}[{self.r.randint(0, 3)}]"
+            elif h == 2:
+                e(f"var {hv}: struct {{ a: usize, b: u8 }} = .{{ .a = {pv()}, .b = 3 }};")
+                addr = f"&{hv}.a"
+            else:
+                addr = "&gSfIdx"
+            e(f"_ = &{hv};" if h < 3 else "_ = &gSfIdx;")
+            p = self.fresh("fp")
+            e(f"const {p}: *usize = {addr};")
+            small = self.pick([f"{pv()} & 7", str(self.r.randint(0, 15)), f"@min({pv()}, 15)"])
+            big = pv
+            idx = lambda: f"{p}.*"
+            if k <= 3:
+                e(f"{p}.* = {small};")
+                w = self.r.randrange(9)
+                if w == 0:
+                    q = self.fresh("fq")
+                    if h == 1:
+                        e(f"const {q}: *usize = &{hv}[{pv()} & 3];")
+                    else:
+                        e(f"const {q}: *usize = {addr};")
+                    e(f"{q}.* = {big()};")
+                elif w == 1:
+                    bp = self.fresh("fb")
+                    e(f"const {bp}: *u8 = @ptrCast({p});")
+                    e(f"{bp}.* = @truncate({big()});")
+                elif w == 2:
+                    if h == 2:
+                        e(f"{hv} = .{{ .a = {big()}, .b = 4 }};")
+                    elif h == 1:
+                        e(f"{hv} = .{{ {big()}, {big()}, {big()}, {big()} }};")
+                    else:
+                        e(f"sfPut({p}, {big()});")
+                elif w == 3:
+                    e(f"sfPut({p}, {big()});")
+                elif w == 4:
+                    e(f"sfPutG({big()});")
+                elif w == 5:
+                    e(f'asm volatile ("movq %[v], (%%rdi)" : : [p] "{{rdi}}" ({p}), [v] "r" ({big()}) : .{{ .memory = true }});')
+                elif w == 6:
+                    vp = self.fresh("fv")
+                    e(f"const {vp}: *volatile usize = {p};")
+                    e(f"{vp}.* = {big()};")
+                elif w == 7:
+                    e(f"_ = sfRead({p});")
+                # w == 8: nothing in between, the load is forwarded.
+            elif k == 4:
+                # A store on one side only; the old value may be big.
+                if self.chance(0.5):
+                    e(f"if ({self.bool_expr(ctx, 1)}) {p}.* = {small};")
+                else:
+                    e(f"switch ({pv()} % 3) {{")
+                    e(f"    0 => {p}.* = {small},")
+                    e("    1 => {},")
+                    e(f"    else => {p}.* = {self.r.randint(0, 15)},")
+                    e("}")
+            elif k == 5:
+                # Stores in a loop, loaded in the next iteration and after.
+                i = self.fresh("fi")
+                e(f"{p}.* = {small};")
+                e(f"for (0..{self.r.randint(1, 5)}) |{i}| {{")
+                ctx["indent"] += 1
+                sk(f"{arr}[{p}.*]")
+                e(f"{p}.* = {sel}[({i} + {self.r.randint(0, 11)}) % {len(vals)}]{' & 15' if self.chance(0.6) else ''};")
+                ctx["indent"] -= 1
+                e("}")
+            else:
+                e(f"{p}.* = undefined;")
+                e(f"if ({self.bool_expr(ctx, 1)}) {p}.* = {small};")
+            if self.chance(0.4):
+                e(f"if ({idx()} < {arr}.len) {{")
+                e(f"    {arr}[{idx()}] +%= 1;")
+                e("}")
+            sk(f"{arr}[{idx()}]")
+            if self.chance(0.3):
+                sk(f"{arr}[{idx()}..][0..1][0]")
+            return
+        # Slice lengths.
+        n = self.fresh("fn")
+        e(f"const {n}: usize = {pv()};")
+        if k <= 9:
+            buf = self.fresh("fbuf")
+            e(f"var {buf}: [64]u32 = @splat({self.int_expr(ctx, U32, 1)});")
+            off = self.r.randint(0, 8)
+            l0 = self.r.randint(0, 64 - off)
+            if self.chance(0.5):
+                sv = self.fresh("fsl")
+                e(f"var {sv}: []u32 = {buf}[{off}..][0..{l0}];")
+                e(f"_ = &{sv};")
+                sp = self.fresh("fsp")
+                e(f"const {sp}: *[]u32 = &{sv};")
+                sl, lenp, holder = f"{sp}.*", f"{sp}.len", None
+            else:
+                lv = self.fresh("fl")
+                e(f"var {lv}: SfL = .{{ .items = {buf}[{off}..][0..{l0}], .cap = {64 - off}, .tag = 0 }};")
+                e(f"_ = &{lv};")
+                lp = self.fresh("flp")
+                e(f"const {lp}: *SfL = &{lv};")
+                sl, lenp, holder = f"{lp}.items", f"{lp}.items.len", lp
+        else:
+            buf = "gSfBuf"
+            if self.chance(0.5):
+                sl, lenp, holder = "gSfL.items", "gSfL.items.len", "&gSfL"
+            else:
+                gp = self.fresh("fgp")
+                e(f"const {gp}: *[]u32 = &gSfL.items;")
+                sl, lenp, holder = f"{gp}.*", f"{gp}.len", "&gSfL"
+        if k == 9 or k == 11:
+            # Append-style: grow by kk and fill the new tail.
+            kk = self.fresh("fk")
+            e(f"{lenp} = {n} & 31;")
+            e(f"const {kk}: usize = {pv()} & 15;")
+            if holder is not None and self.chance(0.6):
+                g = self.fresh("fg")
+                e(f"const {g} = {self.pick(['sfGrow', 'sfGrowN'])}({holder}, {kk});")
+            else:
+                g = self.fresh("fg")
+                old = self.fresh("fo")
+                e(f"const {old} = {lenp};")
+                e(f"{lenp} = {old} + {kk};")
+                e(f"const {g} = {sl}[{old}..][0..{kk}{' + 1' if self.chance(0.1) else ''}];")
+            e(f"for ({g}, 0..) |*x, xi| x.* +%= @intCast(xi);")
+            e(f"if ({kk} > 0) {{")
+            ctx["indent"] += 1
+            sk(f"{g}[{kk} - 1]")
+            ctx["indent"] -= 1
+            e("}")
+            sk(f"@as(u32, @truncate({sl}.len))")
+            return
+        e(f"{lenp} = {n};")
+        w = self.r.randrange(8)
+        if w == 0:
+            lnp = self.fresh("fln")
+            e(f"const {lnp}: *usize = &{lenp};")
+            e(f"{lnp}.* = {n} -| 1;")
+        elif w == 1:
+            if holder is None or self.chance(0.5):
+                e(f"sfPutLen(&{sl}, {n} -| {self.r.randint(0, 2)});")
+            else:
+                e(f"sfSet({holder}, {n} -| 1);")
+        elif w == 2:
+            e(f"{sl} = {buf}[0..{pv()}];")
+        elif w == 3 and k == 10:
+            e(f"sfPutG({pv()});")
+        elif w == 4:
+            e(f"if ({self.bool_expr(ctx, 1)}) {lenp} = {n} -| 1;")
+        # otherwise nothing in between
+        u = self.r.randrange(4)
+        if u == 0:
+            e(f"if ({n} > 0) {{")
+            ctx["indent"] += 1
+            sk(f"{sl}[{n} - 1]")
+            ctx["indent"] -= 1
+            e("}")
+        elif u == 1:
+            sk(f"{sl}[{self.pick([n, n + ' -| 1', n + ' + 1', n + ' / 2'])}]")
+        elif u == 2:
+            a, kk = self.fresh("fa"), self.fresh("fk")
+            e(f"const {a}: usize = {n} / {self.r.randint(1, 3)};")
+            e(f"const {kk}: usize = {n} - {a}{self.pick(['', '', ' + 1', ' -| 1'])};")
+            e(f"for ({sl}[{a}..][0..{kk}]) |x| {{")
+            ctx["indent"] += 1
+            sk("x")
+            ctx["indent"] -= 1
+            e("}")
+        else:
+            i = self.fresh("fi")
+            e(f"for (0..{n}) |{i}| {sl}[{i}] +%= 1;")
+            sk(f"@as(u32, @truncate({sl}.len))")
 
     def s_retlen(self, ctx):
         """Slices from noinline callees whose returned length is one argument
