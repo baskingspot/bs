@@ -1439,6 +1439,16 @@ fn select(cg: *CodeGen, inst: Inst.Index, ty: Index, pred: Ref, a: Ref, b: Ref) 
     const s = shape(cg.ip, ty).?;
     const e = &cg.e;
     const dst = try Dst.of(cg, inst, ty);
+    // Both arms the same value: it is the result. (The masking below
+    // writes r before reading b, and r can be their shared home.)
+    if (a == b) {
+        for (0..s.chunks()) |k| {
+            const r = dst.home orelse .xmm0;
+            try loadChunk(cg, r, a, @intCast(k));
+            try dst.put(cg, r, @intCast(k));
+        }
+        return;
+    }
     const bits = try laneConst(cg, s.lane.bytes(), bitConst(s.lane.bytes()));
     try cg.load(.rdx, pred);
     const n = s.perChunk();
@@ -1493,7 +1503,9 @@ fn shuffle(cg: *CodeGen, inst: Inst.Index, ty: Index, a: Ref, b: Ref, mask: Inde
         undef[i] = ip.keyTag(m) == .undef;
         if (undef[i]) continue;
         sel[i] = ip.intValue(i32, m).?;
-        if (sel[i] >= 0) from_b = false else from_a = false;
+        // With a and b the same value, every lane is one of a's: the
+        // paths below then never read b after writing a's home.
+        if (sel[i] >= 0 or a == b) from_b = false else from_a = false;
     }
     const src_ty = cg.typeOf(if (from_b and !from_a) b else a);
     const src_s = shape(ip, src_ty).?;
@@ -1519,7 +1531,7 @@ fn shuffle(cg: *CodeGen, inst: Inst.Index, ty: Index, a: Ref, b: Ref, mask: Inde
         var used: [2]bool = .{ false, false };
         for (0..s.len) |i| {
             if (undef[i]) continue;
-            const which: usize = if (sel[i] >= 0) 0 else 1;
+            const which: usize = if (sel[i] >= 0 or a == b) 0 else 1;
             const lane: u32 = @intCast(if (sel[i] >= 0) sel[i] else ~sel[i]);
             used[which] = true;
             for (0..lb) |q| masks[which][i * lb + q] = @intCast(lane * lb + q);
