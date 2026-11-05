@@ -1,12 +1,14 @@
 //! exit: 0
-//! stdout: "68 1 null 5 20 13 99 507 394 8589934593 120\n"
+//! stdout: "68 1 null 5 20 13 99 507 394 8589934593 120 231 345612 987 7\n"
 
 // Tiny constant-trip `for` loops are unrolled (`codegen/unroll.zig`):
 // each copy of the body has the counter as a constant. `continue`,
 // `break`, `return` and labeled breaks out of a copy, nested loops, and a
 // start other than 0 keep their meaning; a loop of more than 8 iterations
 // stays a loop. A slice's constant length (`@ptrCast` of a `*T`, as in
-// `std.mem.swap`) counts as a constant trip count.
+// `std.mem.swap`) counts as a constant trip count, and `std.mem.swap`'s
+// byte loop moves words instead: overlapping, coinciding and
+// multi-word swaps keep the byte loop's meaning.
 const std = @import("std");
 
 const weights = [_]u32{ 3, 5, 7, 11 };
@@ -67,6 +69,36 @@ noinline fn swapped(a: u32, b: u32) u64 {
     return @as(u64, x) << 32 | y;
 }
 
+noinline fn overlapped(base: u32) u32 {
+    var arr: [3]u32 = .{ base, base + 1, base + 2 };
+    std.mem.swap([2]u32, arr[0..2], arr[1..3]);
+    return arr[0] * 100 + arr[1] * 10 + arr[2];
+}
+
+noinline fn overlappedWords(base: u64) u64 {
+    var arr: [6]u64 = undefined;
+    for (&arr, 0..) |*e, i| e.* = base + i;
+    std.mem.swap([4]u64, arr[0..4], arr[2..6]);
+    var n: u64 = 0;
+    for (arr) |e| n = n * 10 + e;
+    return n;
+}
+
+const S12 = struct { a: u32, b: u32, c: u32 };
+
+noinline fn swapped12(x: u32) u32 {
+    var s: S12 = .{ .a = x, .b = x + 1, .c = x + 2 };
+    var t: S12 = .{ .a = 9, .b = 8, .c = 7 };
+    std.mem.swap(S12, &s, &t);
+    return s.a * 100 + s.b * 10 + s.c + t.a - x;
+}
+
+noinline fn swappedSelf(x: u16) u16 {
+    var v = x;
+    std.mem.swap(u16, &v, &v);
+    return v;
+}
+
 noinline fn byteSum(v: *const u64) u32 {
     const bytes: []const u8 = @ptrCast(v);
     var s: u32 = 0;
@@ -79,7 +111,7 @@ pub fn main() void {
     var w: std.Io.Writer = .fixed(&buf);
     const x = [_]u32{ 1, 2, 3, 4 };
     const v: u64 = 0x0102030405060708;
-    w.print("{} {any} {any} {} {} {} {} {} {} {} {}\n", .{
+    w.print("{} {any} {any} {} {} {} {} {} {} {} {} {} {} {} {}\n", .{
         weighted(&x),
         firstLong(2),
         firstLong(4),
@@ -91,6 +123,10 @@ pub fn main() void {
         indexes("abcd"),
         swapped(1, 2),
         byteSum(&v),
+        overlapped(1),
+        overlappedWords(1),
+        swapped12(1),
+        swappedSelf(7),
     }) catch unreachable;
     std.Io.File.stdout().writeStreamingAll(std.Options.debug_io, w.buffered()) catch {};
 }

@@ -2161,6 +2161,19 @@ like every other check and fold only where the constant proves them.
 case that matters: zig fmt −2.9%, the zls tests −4.1% outside std's
 unwinder.
 
+When the body is `std.mem.swap`'s byte swap (two `slice_elem_ptr`s at the
+counter, load both bytes, store each into the other) over two slices of
+constant length `n` from `[*]align(K) u8` pointers, the loop becomes
+`n / c` swaps of `c`-byte words instead, `c` the largest of 2, 4 and 8
+dividing both `K` and `n`, at most 8 of them, in order, each with the
+body's `dbg_stmt`s (`std.mem.swap` of a `u32` is two `u32` loads and
+two stores, as in ReleaseSafe). Both pointers are `c`-aligned, so the
+bytes of one word are in distinct residues mod `c` and the loop's byte
+swaps that touch them commute: swapping a word at once is the same as
+swapping its bytes in turn, whether `*a` and `*b` coincide, are disjoint,
+or overlap. Sort −19.3%, the zls tests −0.34% outside the unwinder,
+.text −0.14% on the zig workload.
+
 #### Forwarding
 
 Built on the IR, on the CodeGen workers before proving checks
