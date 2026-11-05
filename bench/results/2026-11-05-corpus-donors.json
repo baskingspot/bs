@@ -1,0 +1,7634 @@
+{
+ "date": "2026-11-05",
+ "bs": {
+  "1c792147": "all targets but the rerun ones",
+  "1a859c51": "zine, json-zig, zmath, flow, flow-musl, verse, marionette, knoedel, zigdown, sandopolis, zlob, zigcli, zeit, zig-blind-rsa-signatures, zio"
+ },
+ "zig": "0.17.1",
+ "command": "python3 tools/corpus/run.py --bs <bs> --no-edit --donors",
+ "rows": [
+  {
+   "project": "zls",
+   "target": "zls",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.813471579007455,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.021769917992060073
+   },
+   "bs": {
+    "cold_local": 3.0921531219937606,
+    "cold_local_donor": 1.9335988600068958,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.005642735995934345
+   }
+  },
+  {
+   "project": "zls",
+   "target": "lsp-codegen",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.9970566439878894,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.16608728900610004
+   },
+   "bs": {
+    "cold_local": 0.6055237229884369,
+    "cold_local_donor": 0.7571453159907833,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.0794912290002685
+   }
+  },
+  {
+   "project": "zls",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.623732760999701,
+    "compile_exit": 0,
+    "run": "exit 0, 487 passed; 11 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 1.5599685850029346
+   },
+   "bs": {
+    "cold_local": 1.6715365609998116,
+    "cold_local_donor": 2.4877593200071715,
+    "compile_exit": 0,
+    "run": "exit 0, 487 passed; 11 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 1.0647562840022147
+   }
+  },
+  {
+   "project": "zls",
+   "target": "src test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.3464087169995764,
+    "compile_exit": 0,
+    "run": "exit 0, All 94 tests passed.",
+    "run_exit": 0,
+    "run_secs": 4.088622665003641
+   },
+   "bs": {
+    "cold_local": 0.7683607880026102,
+    "cold_local_donor": 0.5380860200093593,
+    "compile_exit": 0,
+    "run": "exit 0, All 94 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.3787604509998346
+   }
+  },
+  {
+   "project": "ghostty",
+   "target": "ghostty-vt-test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 25.128927585014026,
+    "compile_exit": 0,
+    "run": "exit 1, 3004 passed; 102 skipped; 1 failed.",
+    "run_exit": 1,
+    "run_secs": 1402.2757574409916
+   },
+   "bs": {
+    "cold_local": 14.9938525359903,
+    "cold_local_donor": 12.9033552769979,
+    "compile_exit": 0,
+    "run": "exit 1, 3004 passed; 102 skipped; 1 failed.",
+    "run_exit": 1,
+    "run_secs": 482.02355605200864
+   }
+  },
+  {
+   "project": "ghostty",
+   "target": "props-unigen",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.030930136985262,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.4712948459928157
+   },
+   "bs": {
+    "cold_local": 0.590493604002404,
+    "cold_local_donor": 0.7819871620013146,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.29759403999196365
+   }
+  },
+  {
+   "project": "ghostty",
+   "target": "symbols-unigen",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.0018915089895017,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.12023104300897103
+   },
+   "bs": {
+    "cold_local": 0.40936025099654216,
+    "cold_local_donor": 0.1323446799942758,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.05686610899283551
+   }
+  },
+  {
+   "project": "ghostty",
+   "target": "uucode_generate",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1315483269863762,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 2.2273289220029255
+   },
+   "bs": {
+    "cold_local": 0.519039047008846,
+    "cold_local_donor": 0.4368327410047641,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.9068842309934553
+   }
+  },
+  {
+   "project": "superhtml",
+   "target": "superhtml",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.951371969014872,
+    "compile_exit": 0,
+    "run": "exit 1",
+    "run_exit": 1,
+    "run_secs": 0.012591621009050868
+   },
+   "bs": {
+    "cold_local": 1.6797391309955856,
+    "cold_local_donor": 1.596418850007467,
+    "compile_exit": 0,
+    "run": "exit 1",
+    "run_exit": 1,
+    "run_secs": 0.0032021099905250594
+   }
+  },
+  {
+   "project": "superhtml",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.7890382729965495,
+    "compile_exit": 0,
+    "run": "exit 0, All 85 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.030824600995401852
+   },
+   "bs": {
+    "cold_local": 1.3995642410154687,
+    "cold_local_donor": 1.272206306020962,
+    "compile_exit": 0,
+    "run": "exit 0, All 85 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.017597080004634336
+   }
+  },
+  {
+   "project": "superhtml",
+   "target": "language-tag-parser",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.514581031005946,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.3344680199952563,
+    "cold_local_donor": 0.23366884001006838,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "ziggy",
+   "target": "ziggy",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.3499884649936575,
+    "compile_exit": 0,
+    "run": "exit 1",
+    "run_exit": 1,
+    "run_secs": 0.013453249994199723
+   },
+   "bs": {
+    "cold_local": 0.8751244799932465,
+    "cold_local_donor": 0.7731992350018118,
+    "compile_exit": 0,
+    "run": "exit 1",
+    "run_exit": 1,
+    "run_secs": 0.004328643000917509
+   }
+  },
+  {
+   "project": "ziggy",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.9473178790067323,
+    "compile_exit": 0,
+    "run": "exit 0, All 99 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.03323676199943293
+   },
+   "bs": {
+    "cold_local": 0.6438327810028568,
+    "cold_local_donor": 0.4190167330089025,
+    "compile_exit": 0,
+    "run": "exit 0, All 99 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.021048062000772916
+   }
+  },
+  {
+   "project": "z2d",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.4260624920134433,
+    "compile_exit": 0,
+    "run": "exit 0, All 199 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.17073700099717826
+   },
+   "bs": {
+    "cold_local": 0.9228887540084543,
+    "cold_local_donor": 0.7680800369998906,
+    "compile_exit": 0,
+    "run": "exit 0, All 199 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.06212957100069616
+   }
+  },
+  {
+   "project": "zf",
+   "target": "zf",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.2463266260165256,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.006892238990985788
+   },
+   "bs": {
+    "cold_local": 0.6362778049951885,
+    "cold_local_donor": 0.4381755130016245,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.0022077059984439984
+   }
+  },
+  {
+   "project": "zf",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5230542959907325,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00516664500173647
+   },
+   "bs": {
+    "cold_local": 0.3177443259919528,
+    "cold_local_donor": 0.13667471600638237,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002107565989717841
+   }
+  },
+  {
+   "project": "zig-clap",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6189812329830602,
+    "compile_exit": 0,
+    "run": "exit 0, All 27 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00738448700576555
+   },
+   "bs": {
+    "cold_local": 0.37648833899584133,
+    "cold_local_donor": 0.21132917299109977,
+    "compile_exit": 0,
+    "run": "exit 0, All 27 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0036435219954000786
+   }
+  },
+  {
+   "project": "zig-clap",
+   "target": "simple",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.4831403819989646,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.004624175009666942
+   },
+   "bs": {
+    "cold_local": 0.2835466200049268,
+    "cold_local_donor": 0.26942217101168353,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.002581690001534298
+   }
+  },
+  {
+   "project": "zig-clap",
+   "target": "subcommands",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.49816063400066923,
+    "compile_exit": 0,
+    "run": "exit 1",
+    "run_exit": 1,
+    "run_secs": 0.05108695199305657
+   },
+   "bs": {
+    "cold_local": 0.3313281049922807,
+    "cold_local_donor": 0.11568465699383523,
+    "compile_exit": 0,
+    "run": "exit 1",
+    "run_exit": 1,
+    "run_secs": 0.01065008899604436
+   }
+  },
+  {
+   "project": "zig-clap",
+   "target": "usage",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.4955613509955583,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.005300264005200006
+   },
+   "bs": {
+    "cold_local": 0.29198207800800446,
+    "cold_local_donor": 0.11839073699957225,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.002315859994268976
+   }
+  },
+  {
+   "project": "anyzig",
+   "target": "zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.0830837470275583,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 1.9345401690079598,
+    "cold_local_donor": 1.7800984540081117,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "anyzig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6923541279975325,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.4486203360138461,
+    "cold_local_donor": 0.18745263101300225,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zine",
+   "target": "translate-c",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 2.83914202300366,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.013063072998193093
+   },
+   "bs": {
+    "cold_local": 2.0188804310164414,
+    "cold_local_donor": 1.8176669430104084,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.004789700993569568
+   }
+  },
+  {
+   "project": "zine",
+   "target": "camera",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5152639310108498,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.2779563490039436,
+    "cold_local_donor": 0.15022158999636304,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "protoc-gen-zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.0214518170105293,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.6241727460146649,
+    "cold_local_donor": 0.5139158440142637,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7578552790073445,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006155276991194114
+   },
+   "bs": {
+    "cold_local": 0.5233252560137771,
+    "cold_local_donor": 0.2567968869989272,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0024702289956621826
+   }
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "protobuf",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6847147030057386,
+    "compile_exit": 0,
+    "run": "exit 0, All 26 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010200600998359732
+   },
+   "bs": {
+    "cold_local": 0.3776177620020462,
+    "cold_local_donor": 0.21779266401426867,
+    "compile_exit": 0,
+    "run": "exit 0, All 26 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0037053490086691454
+   }
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "json",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.127134324007784,
+    "compile_exit": 0,
+    "run": "exit 0, All 153 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.027890495999599807
+   },
+   "bs": {
+    "cold_local": 0.75077393000538,
+    "cold_local_donor": 0.5089719899988268,
+    "compile_exit": 0,
+    "run": "exit 0, All 153 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.017420277989003807
+   }
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "alltypes",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.3050628540077014,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.009024165003211237
+   },
+   "bs": {
+    "cold_local": 0.6575758750113891,
+    "cold_local_donor": 0.474312454010942,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0034792360092978925
+   }
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "varints",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6311741440003971,
+    "compile_exit": 0,
+    "run": "exit 0, All 36 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010898747001192532
+   },
+   "bs": {
+    "cold_local": 0.5180857949890196,
+    "cold_local_donor": 0.2323657739907503,
+    "compile_exit": 0,
+    "run": "exit 0, All 36 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004762120996019803
+   }
+  },
+  {
+   "project": "vulkan-zig",
+   "target": "vulkan-zig-generator",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7868353339872556,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.9418430039950181
+   },
+   "bs": {
+    "cold_local": 0.5301734179811319,
+    "cold_local_donor": 0.37542075899546035,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.345800060997135
+   }
+  },
+  {
+   "project": "vulkan-zig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.536799647990847,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006387018001987599
+   },
+   "bs": {
+    "cold_local": 0.3206775180005934,
+    "cold_local_donor": 0.1466453009925317,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.003143162000924349
+   }
+  },
+  {
+   "project": "tls.zig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.3117838299949653,
+    "compile_exit": 0,
+    "run": "exit 0, 88 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 2.8382222470099805
+   },
+   "bs": {
+    "cold_local": 1.2843375820084475,
+    "cold_local_donor": 1.082314897008473,
+    "compile_exit": 0,
+    "run": "exit 0, 88 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.8635287710058037
+   }
+  },
+  {
+   "project": "tls.zig",
+   "target": "http_get",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.7231588730064686,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.9423325230163755,
+    "cold_local_donor": 0.9740363750170218,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "tls.zig",
+   "target": "server",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.6553440690040588,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.9301040420104982,
+    "cold_local_donor": 0.16787934499734547,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zlinter",
+   "target": "no_unused_unit_test_coverage",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7436343489971478,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01750232299673371
+   },
+   "bs": {
+    "cold_local": 0.5801760970061878,
+    "cold_local_donor": 0.35199029100476764,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.009819844999583438
+   }
+  },
+  {
+   "project": "zlinter",
+   "target": "require_fmt_unit_test_coverage",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8578952029929496,
+    "compile_exit": 0,
+    "run": "exit 0, All 7 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01035500100988429
+   },
+   "bs": {
+    "cold_local": 0.4667561030073557,
+    "cold_local_donor": 0.2157881150051253,
+    "compile_exit": 0,
+    "run": "exit 0, All 7 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004992185989976861
+   }
+  },
+  {
+   "project": "zlinter",
+   "target": "build_lint_builtin",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.4772432079917053,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.25946171300893184,
+    "cold_local_donor": 0.16420016299525741,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zig-ecs",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6383583869901486,
+    "compile_exit": 0,
+    "run": "exit 0, All 52 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.14450504099659156
+   },
+   "bs": {
+    "cold_local": 0.5116001699934714,
+    "cold_local_donor": 0.23115785200207029,
+    "compile_exit": 0,
+    "run": "exit 0, All 52 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.10108655001386069
+   }
+  },
+  {
+   "project": "zig-minisign",
+   "target": "minizign",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6237841160036623,
+    "compile_exit": 0,
+    "run": "exit 1",
+    "run_exit": 1,
+    "run_secs": 0.005190563999349251
+   },
+   "bs": {
+    "cold_local": 0.3913753899978474,
+    "cold_local_donor": 0.23468400099955034,
+    "compile_exit": 0,
+    "run": "exit 1",
+    "run_exit": 1,
+    "run_secs": 0.002154144996893592
+   }
+  },
+  {
+   "project": "zig-minisign",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6143494149873732,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.042610683987732045
+   },
+   "bs": {
+    "cold_local": 0.3267132280016085,
+    "cold_local_donor": 0.16917594100232236,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.012062099005561322
+   }
+  },
+  {
+   "project": "zalgebra",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6165155700000469,
+    "compile_exit": 0,
+    "run": "exit 0, All 70 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00617235699610319
+   },
+   "bs": {
+    "cold_local": 0.43032754899468273,
+    "cold_local_donor": 0.16368980400147848,
+    "compile_exit": 0,
+    "run": "exit 0, All 70 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002448970000841655
+   }
+  },
+  {
+   "project": "zig-args",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6243343660025857,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006717847994877957
+   },
+   "bs": {
+    "cold_local": 0.3868801659991732,
+    "cold_local_donor": 0.32754055500845425,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0059592719917418435
+   }
+  },
+  {
+   "project": "zig-args",
+   "target": "demo",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5724377320002532,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.004742513003293425
+   },
+   "bs": {
+    "cold_local": 0.3200692109967349,
+    "cold_local_donor": 0.46614096900157165,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.002312660013558343
+   }
+  },
+  {
+   "project": "zig-args",
+   "target": "demo_verb",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.46566606700071134,
+    "compile_exit": 0,
+    "run": "exit 1",
+    "run_exit": 1,
+    "run_secs": 0.004567379000945948
+   },
+   "bs": {
+    "cold_local": 0.287241030993755,
+    "cold_local_donor": 0.12310534699645359,
+    "compile_exit": 0,
+    "run": "exit 1",
+    "run_exit": 1,
+    "run_secs": 0.0022928329999558628
+   }
+  },
+  {
+   "project": "zBench",
+   "target": "runner",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5119449649937451,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005110080004669726
+   },
+   "bs": {
+    "cold_local": 0.28370655101025477,
+    "cold_local_donor": 0.15541747701354325,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0023052939941408113
+   }
+  },
+  {
+   "project": "zBench",
+   "target": "statistics",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5152308230026392,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005343357988749631
+   },
+   "bs": {
+    "cold_local": 0.2770622740063118,
+    "cold_local_donor": 0.13371461701171938,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0027666150126606226
+   }
+  },
+  {
+   "project": "zBench",
+   "target": "platform",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.503890252992278,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005093389001558535
+   },
+   "bs": {
+    "cold_local": 0.26753939301124774,
+    "cold_local_donor": 0.11744446000375319,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0021990249952068552
+   }
+  },
+  {
+   "project": "zBench",
+   "target": "partial",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.46879163599805906,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00555162200180348
+   },
+   "bs": {
+    "cold_local": 0.2726136580022285,
+    "cold_local_donor": 0.1282407139951829,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0020011789893032983
+   }
+  },
+  {
+   "project": "linuxwave",
+   "target": "linuxwave",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5506793030072004,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.1519234269944718
+   },
+   "bs": {
+    "cold_local": 0.30220774801273365,
+    "cold_local_donor": 0.17475256600300781,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.11721056900569238
+   }
+  },
+  {
+   "project": "linuxwave",
+   "target": "wav-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.4885465919942362,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00483375700423494
+   },
+   "bs": {
+    "cold_local": 0.3029851199971745,
+    "cold_local_donor": 0.11913356701552402,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0020672760001616552
+   }
+  },
+  {
+   "project": "linuxwave",
+   "target": "gen-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.48772714799270034,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0076772379979956895
+   },
+   "bs": {
+    "cold_local": 0.27312684401113074,
+    "cold_local_donor": 0.1277210669941269,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004025878995889798
+   }
+  },
+  {
+   "project": "linuxwave",
+   "target": "file-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.4817990100127645,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00484533999406267
+   },
+   "bs": {
+    "cold_local": 0.29527490500186104,
+    "cold_local_donor": 0.12030920399411116,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0021283280075294897
+   }
+  },
+  {
+   "project": "linuxwave",
+   "target": "main-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5450690100115025,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.13940255899797194
+   },
+   "bs": {
+    "cold_local": 0.33834628500335384,
+    "cold_local_donor": 0.17060039698844776,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.13540129399916623
+   }
+  },
+  {
+   "project": "zli",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5485251000063727,
+    "compile_exit": 0,
+    "run": "exit 0, All 32 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.024866010004188865
+   },
+   "bs": {
+    "cold_local": 0.34275685300235637,
+    "cold_local_donor": 0.16620781399251428,
+    "compile_exit": 0,
+    "run": "exit 0, All 32 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014228379994165152
+   }
+  },
+  {
+   "project": "zig-compiler",
+   "target": "translate-c",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.880305437996867,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 4.008122967003146
+   },
+   "bs": {
+    "cold_local": 1.771252254009596,
+    "cold_local_donor": 1.5740921230026288,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 2.387794345006114
+   }
+  },
+  {
+   "project": "zig-compiler",
+   "target": "resinator",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.7283779079880333,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.029048354990663938
+   },
+   "bs": {
+    "cold_local": 1.4231259740045061,
+    "cold_local_donor": 0.7872844069934217,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.10119018401019275
+   }
+  },
+  {
+   "project": "zig-compiler",
+   "target": "resinator-test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.2939318949938752,
+    "compile_exit": 0,
+    "run": "exit 0, 73 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.020641551993321627
+   },
+   "bs": {
+    "cold_local": 0.6921858770074323,
+    "cold_local_donor": 0.5763512830017135,
+    "compile_exit": 0,
+    "run": "exit 0, 73 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.022970890000578947
+   }
+  },
+  {
+   "project": "zig-compiler",
+   "target": "aro-test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.096772962002433,
+    "compile_exit": 0,
+    "run": "exit 0, All 42 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.22983209499216173
+   },
+   "bs": {
+    "cold_local": 1.266073963008239,
+    "cold_local_donor": 1.1786992750130594,
+    "compile_exit": 0,
+    "run": "exit 0, All 42 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.1140194129984593
+   }
+  },
+  {
+   "project": "zig-compiler",
+   "target": "objcopy",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5958609160006745,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.008505438003339805
+   },
+   "bs": {
+    "cold_local": 0.3217966349911876,
+    "cold_local_donor": 0.22594879199459683,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.012941996988956816
+   }
+  },
+  {
+   "project": "zig-compiler",
+   "target": "objdump",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7084396929858485,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.007030216002021916
+   },
+   "bs": {
+    "cold_local": 0.41704811599629465,
+    "cold_local_donor": 0.27928413001063745,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.0026110089966095984
+   }
+  },
+  {
+   "project": "zig-compiler",
+   "target": "reduce",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1635446759901242,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.011774312995839864
+   },
+   "bs": {
+    "cold_local": 0.74649674599641,
+    "cold_local_donor": 0.6030833889963105,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.0031960850028553978
+   }
+  },
+  {
+   "project": "zig-compiler",
+   "target": "std-docs",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.105075454004691,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.005964177005807869
+   },
+   "bs": {
+    "cold_local": 0.7040883369918447,
+    "cold_local_donor": 0.4628860209923005,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.007735313993180171
+   }
+  },
+  {
+   "project": "zigimg",
+   "target": "zigimgtest",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.452793672986445,
+    "compile_exit": 0,
+    "run": "exit 0, 347 passed; 170 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 1.7547383839992108
+   },
+   "bs": {
+    "cold_local": 1.0541927500016754,
+    "cold_local_donor": 0.7474560269911308,
+    "compile_exit": 0,
+    "run": "exit 0, 347 passed; 170 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.4918598249932984
+   }
+  },
+  {
+   "project": "zeit",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.7195339259924367,
+    "compile_exit": 0,
+    "run": "exit 0, All 33 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.23475260700797662
+   },
+   "bs": {
+    "cold_local": 0.4283432009979151,
+    "cold_local_donor": 0.39522507700894494,
+    "compile_exit": 0,
+    "run": "exit 0, All 33 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.26485219100140966
+   }
+  },
+  {
+   "project": "zbor",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.2902538670023205,
+    "compile_exit": 0,
+    "run": "exit 1, 97 passed; 0 skipped; 1 failed.",
+    "run_exit": 1,
+    "run_secs": 0.6486148330004653
+   },
+   "bs": {
+    "cold_local": 0.8999218469980406,
+    "cold_local_donor": 0.4727161180053372,
+    "compile_exit": 0,
+    "run": "exit 1, 97 passed; 0 skipped; 1 failed.",
+    "run_exit": 1,
+    "run_secs": 0.18603052600519732
+   }
+  },
+  {
+   "project": "libvaxis",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.2662845839950023,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005470122006954625
+   },
+   "bs": {
+    "cold_local": 0.5503036859881831,
+    "cold_local_donor": 0.4108799069945235,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0021608079987345263
+   }
+  },
+  {
+   "project": "libvaxis",
+   "target": "example-text_input",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.2440186360036023,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.42024672000843566,
+    "cold_local_donor": 0.39541949500562623,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "libvaxis",
+   "target": "example-c-tty",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.18841580700245686,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.2666843750048429
+   },
+   "bs": {
+    "cold_local": 0.39060755701211747,
+    "cold_local_donor": 0.29972279400681145,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.26622978900559247
+   }
+  },
+  {
+   "project": "cache.zig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.621223314999952,
+    "compile_exit": 0,
+    "run": "exit 0, 20 of 20 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.009407959994859993
+   },
+   "bs": {
+    "cold_local": 0.37842869899759535,
+    "cold_local_donor": 0.37928518699482083,
+    "compile_exit": 0,
+    "run": "exit 0, 20 of 20 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.005263344995910302
+   }
+  },
+  {
+   "project": "zul",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.4034958289848873,
+    "compile_exit": 0,
+    "run": "exit 0, 86 of 86 tests passed",
+    "run_exit": 0,
+    "run_secs": 7.263559259008616
+   },
+   "bs": {
+    "cold_local": 1.2843139320029877,
+    "cold_local_donor": 1.183431516008568,
+    "compile_exit": 0,
+    "run": "exit 0, 86 of 86 tests passed",
+    "run_exit": 0,
+    "run_secs": 7.337529965006979
+   }
+  },
+  {
+   "project": "metrics.zig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7479744009906426,
+    "compile_exit": 0,
+    "run": "exit 0, 41 of 41 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.08791015199676622
+   },
+   "bs": {
+    "cold_local": 0.4613156770064961,
+    "cold_local_donor": 0.36183178100327495,
+    "compile_exit": 0,
+    "run": "exit 0, 41 of 41 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.06688979700265918
+   }
+  },
+  {
+   "project": "zig-hpke",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.5090362490009284,
+    "compile_exit": 0,
+    "run": "exit 1, 30 passed; 0 skipped; 1 failed.",
+    "run_exit": 1,
+    "run_secs": 1.2373168890044326
+   },
+   "bs": {
+    "cold_local": 0.8599784069956513,
+    "cold_local_donor": 0.6967237799981376,
+    "compile_exit": 0,
+    "run": "exit 1, 30 passed; 0 skipped; 1 failed.",
+    "run_exit": 1,
+    "run_secs": 0.2436264419957297
+   }
+  },
+  {
+   "project": "libxev",
+   "target": "xev-test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7078858439926989,
+    "compile_exit": 0,
+    "run": "exit 0, 142 passed; 4 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.26624090800760314
+   },
+   "bs": {
+    "cold_local": 0.46597332901728805,
+    "cold_local_donor": 0.3876985000242712,
+    "compile_exit": 0,
+    "run": "exit 0, 142 passed; 4 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.1651563079940388
+   }
+  },
+  {
+   "project": "libxev",
+   "target": "xev",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5373480580019532,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.2774815589946229,
+    "cold_local_donor": 0.21065953800280113,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zio",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 2.3777681129868142,
+    "compile_exit": 0,
+    "run": "exit 0, 817 of 817 tests passed",
+    "run_exit": 0,
+    "run_secs": 11.676123945988365
+   },
+   "bs": {
+    "cold_local": 1.355611814011354,
+    "cold_local_donor": 1.3129537709901342,
+    "compile_exit": 0,
+    "run": "exit 0, 817 of 817 tests passed",
+    "run_exit": 0,
+    "run_secs": 12.810606023995206
+   }
+  },
+  {
+   "project": "zio",
+   "target": "hello-world",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.8284111079992726,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.014359335997141898
+   },
+   "bs": {
+    "cold_local": 0.5849228790029883,
+    "cold_local_donor": 0.47721048300445545,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.007450454999343492
+   }
+  },
+  {
+   "project": "zio",
+   "target": "coro-demo",
+   "verdict": "upstream run fails (exit signal 6)",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5684735830145655,
+    "compile_exit": 0,
+    "run": "exit signal 6",
+    "run_exit": "signal 6",
+    "run_secs": 0.0024630179977975786
+   },
+   "bs": {
+    "cold_local": 0.28493948899267707,
+    "cold_local_donor": 0.298036375985248,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.0020845240069320425
+   }
+  },
+  {
+   "project": "zio",
+   "target": "mutex-demo",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.8816154969972558,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.016026324999984354
+   },
+   "bs": {
+    "cold_local": 0.5263047220068984,
+    "cold_local_donor": 0.43047219699656125,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.009109078993787989
+   }
+  },
+  {
+   "project": "zio",
+   "target": "ev-demo",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6864901570079383,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 5.00313176898635
+   },
+   "bs": {
+    "cold_local": 0.35800261300755665,
+    "cold_local_donor": 0.32218816901149694,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 5.004719589007436
+   }
+  },
+  {
+   "project": "zio",
+   "target": "producer-consumer",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.8617445339914411,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.7655238309962442
+   },
+   "bs": {
+    "cold_local": 0.5238142809830606,
+    "cold_local_donor": 0.3750536339794053,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.7621790279954439
+   }
+  },
+  {
+   "project": "zedis",
+   "target": "test-unit",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.140096306000487,
+    "compile_exit": 0,
+    "run": "exit 0, All 384 tests passed.",
+    "run_exit": 0,
+    "run_secs": 3.4209106900088955
+   },
+   "bs": {
+    "cold_local": 0.7922659729956649,
+    "cold_local_donor": 0.787006084996392,
+    "compile_exit": 0,
+    "run": "exit 0, All 384 tests passed.",
+    "run_exit": 0,
+    "run_secs": 3.1181184189917985
+   }
+  },
+  {
+   "project": "zedis",
+   "target": "zedis",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1349709950009128,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.6434334999939892,
+    "cold_local_donor": 0.6743035129911732,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "tokamak",
+   "target": "test",
+   "verdict": "bs: run differs (exit signal 6, no summary, died in dom.document.test_0 vs exit 1, 88 passed; 0 skipped; 1 failed.)",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.7546259950031526,
+    "compile_exit": 0,
+    "run": "exit 1, 88 passed; 0 skipped; 1 failed.",
+    "run_exit": 1,
+    "run_secs": 2.3131689419969916
+   },
+   "bs": {
+    "cold_local": 1.5484941450122278,
+    "cold_local_donor": 1.4271773420041427,
+    "compile_exit": 0,
+    "run": "exit signal 6, no summary, died in dom.document.test_0",
+    "run_exit": "signal 6",
+    "run_secs": 1.5689288100111298
+   }
+  },
+  {
+   "project": "zig-sqlite",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 7.623654141003499,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02384549299313221
+   },
+   "bs": {
+    "cold_local": 7.317993403004948,
+    "cold_local_donor": 7.591583200002788,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01686781400348991
+   }
+  },
+  {
+   "project": "raylib-zig",
+   "target": "raylib",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 12.470818873000098,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 5.098582942984649,
+    "cold_local_donor": 5.261557756995899,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "raylib-zig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8085549029929098,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010422946987091564
+   },
+   "bs": {
+    "cold_local": 0.6055914989992743,
+    "cold_local_donor": 0.2709599520021584,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01669424699502997
+   }
+  },
+  {
+   "project": "raylib-zig",
+   "target": "basic_window",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6284845170157496,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.3543837059987709,
+    "cold_local_donor": 0.3517122890043538,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "raylib-zig",
+   "target": "bunnymark",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5694295319990488,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.4759311790112406,
+    "cold_local_donor": 0.22016779400291853,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "raylib-zig",
+   "target": "models_heightmap",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5880727969924919,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.34751406899886206,
+    "cold_local_donor": 0.19717103498987854,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "raylib-zig",
+   "target": "gui_message_box",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5720151210116455,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.3470316889870446,
+    "cold_local_donor": 0.21745785299572162,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "raylib-zig",
+   "target": "raymarching",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6238201160012977,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.3521987209969666,
+    "cold_local_donor": 0.20796246599638835,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "json-zig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.7879512289946433,
+    "compile_exit": 0,
+    "run": "exit 0, All 348 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.5710836469952483
+   },
+   "bs": {
+    "cold_local": 1.1649088300036965,
+    "cold_local_donor": 1.0122507229971234,
+    "compile_exit": 0,
+    "run": "exit 0, All 348 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.8518445299996529
+   }
+  },
+  {
+   "project": "json-zig",
+   "target": "json-fuzz",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6479973210080061,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.4652025399846025,
+    "cold_local_donor": 0.28369412099709734,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "ziglua",
+   "target": "lua",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.266630244004773,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.4951293680060189,
+    "cold_local_donor": 0.46247809199849144,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "ziglua",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7376959750108654,
+    "compile_exit": 0,
+    "run": "exit 0, All 99 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.16449743100383785
+   },
+   "bs": {
+    "cold_local": 0.5268848039995646,
+    "cold_local_donor": 0.28102676398702897,
+    "compile_exit": 0,
+    "run": "exit 0, All 99 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.08123282999440562
+   }
+  },
+  {
+   "project": "zqlite.zig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6994508060015505,
+    "compile_exit": 0,
+    "run": "exit 0, 20 of 20 tests passed",
+    "run_exit": 0,
+    "run_secs": 1.0547759309993125
+   },
+   "bs": {
+    "cold_local": 0.61804278800264,
+    "cold_local_donor": 0.431140401007724,
+    "compile_exit": 0,
+    "run": "exit 0, 20 of 20 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.9609511470043799
+   }
+  },
+  {
+   "project": "http.zig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.0100718539906666,
+    "compile_exit": 0,
+    "run": "exit 0, 131 of 131 tests passed",
+    "run_exit": 0,
+    "run_secs": 30.564348239000537
+   },
+   "bs": {
+    "cold_local": 1.1391711809847038,
+    "cold_local_donor": 0.9489808519865619,
+    "compile_exit": 0,
+    "run": "exit 0, 131 of 131 tests passed",
+    "run_exit": 0,
+    "run_secs": 29.155711123996298
+   }
+  },
+  {
+   "project": "http.zig",
+   "target": "example_1",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6798299520014552,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.45917336200363934,
+    "cold_local_donor": 0.4138369580032304,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zigmod",
+   "target": "zigmod",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.5909607960056746,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 2.535178014994017,
+    "cold_local_donor": 1.336102015004144,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "buzz",
+   "target": "test",
+   "verdict": "upstream fails to compile",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.3135822949989233,
+    "compile_exit": 1,
+    "error": "src/vm.zig:904:9: error: unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags"
+   },
+   "bs": {
+    "cold_local": 2.327853828013758,
+    "compile_exit": 1,
+    "error": "src/vm.zig:904:9: error[unsupported]: unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags"
+   }
+  },
+  {
+   "project": "buzz",
+   "target": "buzz_behavior",
+   "verdict": "upstream fails to compile",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.3788515719934367,
+    "compile_exit": 1,
+    "error": "src/vm.zig:904:9: error: unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags"
+   },
+   "bs": {
+    "cold_local": 1.83707900698937,
+    "compile_exit": 1,
+    "error": "src/vm.zig:904:9: error[unsupported]: unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags"
+   }
+  },
+  {
+   "project": "buzz",
+   "target": "buzz_lsp",
+   "verdict": "upstream fails to compile",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.9186845859949244,
+    "compile_exit": 1,
+    "error": "src/vm.zig:904:9: error: unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags"
+   },
+   "bs": {
+    "cold_local": 1.9453795939916745,
+    "compile_exit": 1,
+    "error": "src/vm.zig:904:9: error[unsupported]: unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags"
+   }
+  },
+  {
+   "project": "supermd",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.298679091996746,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.012480642995797098
+   },
+   "bs": {
+    "cold_local": 1.4701491779997014,
+    "cold_local_donor": 1.0319001139869215,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00566339900251478
+   }
+  },
+  {
+   "project": "supermd",
+   "target": "docgen",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5237511330051348,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.3195336099888664,
+    "cold_local_donor": 0.32834275599452667,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zflecs",
+   "target": "zflecs-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6872173340088921,
+    "compile_exit": 0,
+    "run": "exit 0, All 12 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.3170492759963963
+   },
+   "bs": {
+    "cold_local": 0.46424383200064767,
+    "cold_local_donor": 0.22512681999069173,
+    "compile_exit": 0,
+    "run": "exit 0, All 12 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.7475496260012733
+   }
+  },
+  {
+   "project": "zmath",
+   "target": "zmath-tests",
+   "verdict": "upstream fails to compile",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5457008609955665,
+    "compile_exit": 1,
+    "error": "src/root.zig:885:5: error: genSetReg called with a value larger than dst_reg"
+   },
+   "bs": {
+    "cold_local": 0.46526508597889915,
+    "cold_local_donor": 0.18615200399653986,
+    "compile_exit": 0,
+    "run": "exit 0, All 78 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0034326460008742288
+   }
+  },
+  {
+   "project": "zmath",
+   "target": "zmath-benchmarks",
+   "verdict": "upstream fails to compile",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.49071591399842873,
+    "compile_exit": 1,
+    "error": "src/root.zig:885:5: error: genSetReg called with a value larger than dst_reg"
+   },
+   "bs": {
+    "cold_local": 0.3080292630038457,
+    "cold_local_donor": 0.1559667069959687,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zig-msgpack",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.4185192190052476,
+    "compile_exit": 0,
+    "run": "exit 0, All 171 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.8116340340056922
+   },
+   "bs": {
+    "cold_local": 0.5465456940000877,
+    "cold_local_donor": 0.4161525920062559,
+    "compile_exit": 0,
+    "run": "exit 0, All 171 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.500588296999922
+   }
+  },
+  {
+   "project": "zig-toml",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6986236960074166,
+    "compile_exit": 0,
+    "run": "exit 0, All 80 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.013696019988856278
+   },
+   "bs": {
+    "cold_local": 0.7029121390078217,
+    "cold_local_donor": 0.5250090409972472,
+    "compile_exit": 0,
+    "run": "exit 0, All 80 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007856523006921634
+   }
+  },
+  {
+   "project": "zig-toml",
+   "target": "example1",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.4942995560122654,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.2856480769987684,
+    "cold_local_donor": 0.1656236849958077,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zig-regex",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8871630180074135,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.061035926002659835
+   },
+   "bs": {
+    "cold_local": 0.5028791969962185,
+    "cold_local_donor": 0.3275056050042622,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.03471168299438432
+   }
+  },
+  {
+   "project": "zig-regex",
+   "target": "regex",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8772316999966279,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.46059946199238766,
+    "cold_local_donor": 0.38937746900774073,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "xml",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7316700179944746,
+    "compile_exit": 0,
+    "run": "exit 0, 86 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.9553515690058703
+   },
+   "bs": {
+    "cold_local": 0.5712550269963685,
+    "cold_local_donor": 0.29699238399916794,
+    "compile_exit": 0,
+    "run": "exit 0, 86 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.31918557299650274
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "yaml",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.818426272002398,
+    "compile_exit": 0,
+    "run": "exit 0, 77 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 3.314235939003993
+   },
+   "bs": {
+    "cold_local": 0.6667101840139367,
+    "cold_local_donor": 0.3310121230169898,
+    "compile_exit": 0,
+    "run": "exit 0, 77 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 1.3046075680031208
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "regex",
+   "verdict": "upstream run fails (exit signal 6, no summary, died in root.test.deep nesting compiles (or is refused) on a 512 KiB thread stack)",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 28.50203210399195,
+    "compile_exit": 0,
+    "run": "exit signal 6, no summary, died in root.test.deep nesting compiles (or is refused) on a 512 KiB thread stack",
+    "run_exit": "signal 6",
+    "run_secs": 28.820344810999813
+   },
+   "bs": {
+    "cold_local": 2.630491412986885,
+    "cold_local_donor": 2.1707656609942205,
+    "compile_exit": 0,
+    "run": "exit 0, 54 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 13.621002329004114
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "jinja",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.027829571001348,
+    "compile_exit": 0,
+    "run": "exit 0, 84 passed; 7 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 4.559259828005452
+   },
+   "bs": {
+    "cold_local": 0.6602043220045744,
+    "cold_local_donor": 0.5049323850107612,
+    "compile_exit": 0,
+    "run": "exit 0, 84 passed; 7 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 2.6307323410001118
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "protobuf",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.0958356030023424,
+    "compile_exit": 0,
+    "run": "exit 0, 98 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.5709369969990803
+   },
+   "bs": {
+    "cold_local": 0.6777711170143448,
+    "cold_local_donor": 0.5148815870197723,
+    "compile_exit": 0,
+    "run": "exit 0, 98 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.24267734499881044
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "json5",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8765698910137871,
+    "compile_exit": 0,
+    "run": "exit 0, 99 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 1.6257911309949122
+   },
+   "bs": {
+    "cold_local": 0.6440712799958419,
+    "cold_local_donor": 0.4827135039959103,
+    "compile_exit": 0,
+    "run": "exit 0, 99 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.973132073006127
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "raft",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.774915381000028,
+    "compile_exit": 0,
+    "run": "exit 0, 88 passed; 6 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 57.80992566300847
+   },
+   "bs": {
+    "cold_local": 0.5379923959990265,
+    "cold_local_donor": 0.31959395499143284,
+    "compile_exit": 0,
+    "run": "exit 0, 88 passed; 6 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 31.970825042997603
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "cbor",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.9377742540236795,
+    "compile_exit": 0,
+    "run": "exit 0, 91 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.11976128700189292
+   },
+   "bs": {
+    "cold_local": 0.5010415119904792,
+    "cold_local_donor": 0.2869903829850955,
+    "compile_exit": 0,
+    "run": "exit 0, 91 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.06615156300540548
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "ini",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8609828529879451,
+    "compile_exit": 0,
+    "run": "exit 0, 85 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 6.691552155010868
+   },
+   "bs": {
+    "cold_local": 0.5590550180058926,
+    "cold_local_donor": 0.3387939020030899,
+    "compile_exit": 0,
+    "run": "exit 0, 85 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 3.2301938309974503
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "tar",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8750560420012334,
+    "compile_exit": 0,
+    "run": "exit 0, 153 passed; 3 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 2.8793192970042583
+   },
+   "bs": {
+    "cold_local": 0.5850860670034308,
+    "cold_local_donor": 0.31616163201397285,
+    "compile_exit": 0,
+    "run": "exit 0, 153 passed; 3 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 1.454699552996317
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "trie",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7180071659968235,
+    "compile_exit": 0,
+    "run": "exit 0, All 82 tests passed.",
+    "run_exit": 0,
+    "run_secs": 20.59027303601033
+   },
+   "bs": {
+    "cold_local": 0.5524509050010238,
+    "cold_local_donor": 0.25774566498876084,
+    "compile_exit": 0,
+    "run": "exit 0, All 82 tests passed.",
+    "run_exit": 0,
+    "run_secs": 9.082188246000442
+   }
+  },
+  {
+   "project": "zig-libs",
+   "target": "qr",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7876052370120306,
+    "compile_exit": 0,
+    "run": "exit 0, 45 passed; 4 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 12.429155431003892
+   },
+   "bs": {
+    "cold_local": 0.566261861982639,
+    "cold_local_donor": 0.27722769798128866,
+    "compile_exit": 0,
+    "run": "exit 0, 45 passed; 4 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 4.286256749997847
+   }
+  },
+  {
+   "project": "zwasm",
+   "target": "zwasm",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 4.201515058011864,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.024623541001346894
+   },
+   "bs": {
+    "cold_local": 2.6604717320005875,
+    "cold_local_donor": 2.153455028994358,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.008336440994753502
+   }
+  },
+  {
+   "project": "zwasm",
+   "target": "test:src/zwasm.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 6.83233946900873,
+    "compile_exit": 0,
+    "run": "exit 0, 3464 passed; 12 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 53.808324368990725
+   },
+   "bs": {
+    "cold_local": 4.04009432400926,
+    "cold_local_donor": 4.003434593018028,
+    "compile_exit": 0,
+    "run": "exit 0, 3464 passed; 12 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 24.841501202987274
+   }
+  },
+  {
+   "project": "zwasm",
+   "target": "test:src/cli/main.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.584957017999841,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.026828982008737512
+   },
+   "bs": {
+    "cold_local": 1.4200346830039052,
+    "cold_local_donor": 1.2776532679854427,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007536953999078833
+   }
+  },
+  {
+   "project": "zwasm",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5579737179941731,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005386774006183259
+   },
+   "bs": {
+    "cold_local": 0.3561408259993186,
+    "cold_local_donor": 0.5580585879943101,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002460029994836077
+   }
+  },
+  {
+   "project": "astroz",
+   "target": "astroz",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.2605005809891736,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.6296197500050766,
+    "cold_local_donor": 0.241742582002189,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "astroz",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.1171581060043536,
+    "compile_exit": 0,
+    "run": "exit 0, All 139 tests passed.",
+    "run_exit": 0,
+    "run_secs": 5.049557966995053
+   },
+   "bs": {
+    "cold_local": 1.295309218010516,
+    "cold_local_donor": 1.0139368540112628,
+    "compile_exit": 0,
+    "run": "exit 0, All 139 tests passed.",
+    "run_exit": 0,
+    "run_secs": 2.792185664002318
+   }
+  },
+  {
+   "project": "zigcli",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.741541795010562,
+    "compile_exit": 0,
+    "run": "exit 0, All 68 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014247790997615084
+   },
+   "bs": {
+    "cold_local": 0.4175241199991433,
+    "cold_local_donor": 0.2557537120010238,
+    "compile_exit": 0,
+    "run": "exit 0, All 68 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00849134499731008
+   }
+  },
+  {
+   "project": "zigcli",
+   "target": "loc",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5922830940107815,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.17583433000254445
+   },
+   "bs": {
+    "cold_local": 0.346480401000008,
+    "cold_local_donor": 0.2570347220025724,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.05791309000051115
+   }
+  },
+  {
+   "project": "zigcli",
+   "target": "hexdump",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5463794719835278,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.03690226600156166
+   },
+   "bs": {
+    "cold_local": 0.3243873340106802,
+    "cold_local_donor": 0.21395238500554115,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.01823511598922778
+   }
+  },
+  {
+   "project": "zigcli",
+   "target": "pretty-csv",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5860466849990189,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.33437950399820693,
+    "cold_local_donor": 0.15932295100355987,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zigcli",
+   "target": "tree",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5473607140011154,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.3236989010038087,
+    "cold_local_donor": 0.15045738499611616,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zigcli",
+   "target": "cowsay",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5541139209963148,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.29819531699467916,
+    "cold_local_donor": 0.13320919699617662,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zigcli",
+   "target": "zfetch",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.605072790000122,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.37815955199766904,
+    "cold_local_donor": 0.2502160570002161,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zig-interface",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5377375020034378,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006276771004195325
+   },
+   "bs": {
+    "cold_local": 0.3647768979863031,
+    "cold_local_donor": 0.3200831269932678,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.003790572998696007
+   }
+  },
+  {
+   "project": "nanoui",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.2789570029999595,
+    "compile_exit": 0,
+    "run": "exit 0, 252 passed; 10 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 14.303217254011543
+   },
+   "bs": {
+    "cold_local": 1.8923695040139137,
+    "cold_local_donor": 1.643573520006612,
+    "compile_exit": 0,
+    "run": "exit 0, 252 passed; 10 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 13.948066066004685
+   }
+  },
+  {
+   "project": "nanoui",
+   "target": "nui",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5814021070109447,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.31059047700546216,
+    "cold_local_donor": 0.1876201600098284,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "nanoui",
+   "target": "hello",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1561508379963925,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.6537431600008858,
+    "cold_local_donor": 0.7537538850010606,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "nanoui",
+   "target": "todo",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1711269350053044,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.6779639769956702,
+    "cold_local_donor": 0.29742441601410974,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "nanoui",
+   "target": "browser",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1187576329975855,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.7888370029832004,
+    "cold_local_donor": 0.2857614209933672,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "dhi",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5123212839971529,
+    "compile_exit": 0,
+    "run": "exit 0, All 16 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005912990993238054
+   },
+   "bs": {
+    "cold_local": 0.2981087869993644,
+    "cold_local_donor": 0.13950867200037464,
+    "compile_exit": 0,
+    "run": "exit 0, All 16 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0027656050078803673
+   }
+  },
+  {
+   "project": "dhi",
+   "target": "dhi",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.4522156050079502,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.23331701300048735,
+    "cold_local_donor": 0.23219414200866595,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "dhi",
+   "target": "dhi-zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.04246110099484213,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.017658669996308163,
+    "cold_local_donor": 0.007185960988863371,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "merjs",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.49388421699404716,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005826687003718689
+   },
+   "bs": {
+    "cold_local": 0.26801728100690525,
+    "cold_local_donor": 0.12978597699839156,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.003142311004921794
+   }
+  },
+  {
+   "project": "merjs",
+   "target": "merjs",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.6380799660109915,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 1.5367890739871655,
+    "cold_local_donor": 1.3937517550075427,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "merjs",
+   "target": "codegen",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.47750192100647837,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.299673003013595,
+    "cold_local_donor": 0.3027842309966218,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "ziex",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 13.432121981997625,
+    "compile_exit": 0,
+    "run": "exit 1, no summary",
+    "run_exit": 1,
+    "run_secs": 6.433885937993182
+   },
+   "bs": {
+    "cold_local": 7.362084437991143,
+    "cold_local_donor": 7.3637663169938605,
+    "compile_exit": 0,
+    "run": "exit 1, no summary",
+    "run_exit": 1,
+    "run_secs": 6.093173913002829
+   }
+  },
+  {
+   "project": "ziex",
+   "target": "zx",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 5.462052164992201,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.035608193997177295
+   },
+   "bs": {
+    "cold_local": 3.5410552569956053,
+    "cold_local_donor": 2.9515678510069847,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.009239761013304815
+   }
+  },
+  {
+   "project": "ziex",
+   "target": "zls_gen",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6892671260138741,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.4171726329950616,
+    "cold_local_donor": 0.42340704100206494,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 17.242888035994838,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 9.775255342014134,
+    "cold_local_donor": 9.107597601003363,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fake-fizzy",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5122071989899268,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.2934864389972063,
+    "cold_local_donor": 0.3540243070019642,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "text",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 5.292138235003222,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 2.282201380992774,
+    "cold_local_donor": 1.8470624210021924,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-textcore-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6922135019995039,
+    "compile_exit": 0,
+    "run": "exit 0, All 94 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.34390665899263695
+   },
+   "bs": {
+    "cold_local": 0.41676230999291874,
+    "cold_local_donor": 0.3978659179992974,
+    "compile_exit": 0,
+    "run": "exit 0, All 94 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.22950713700265624
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-fuzzy-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5871751480008243,
+    "compile_exit": 0,
+    "run": "exit 0, All 12 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.008484714999212883
+   },
+   "bs": {
+    "cold_local": 0.4293031840061303,
+    "cold_local_donor": 0.1741135610063793,
+    "compile_exit": 0,
+    "run": "exit 0, All 12 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0024225689994636923
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-diff-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5497787659987807,
+    "compile_exit": 0,
+    "run": "exit 0, All 21 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.09227563500462566
+   },
+   "bs": {
+    "cold_local": 0.44993754499591887,
+    "cold_local_donor": 0.1779950460040709,
+    "compile_exit": 0,
+    "run": "exit 0, All 21 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.05757893399277236
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-lsp-protocol-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6117338379990542,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.009180908993585035
+   },
+   "bs": {
+    "cold_local": 0.4054274210066069,
+    "cold_local_donor": 0.20565054299368057,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.003451247001066804
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-keymap-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.809252999999444,
+    "compile_exit": 0,
+    "run": "exit 0, All 31 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.015307600988307968
+   },
+   "bs": {
+    "cold_local": 0.5013577179925051,
+    "cold_local_donor": 0.3481740830029594,
+    "compile_exit": 0,
+    "run": "exit 0, All 31 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0077024049969622865
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-glass-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.5884940060059307,
+    "compile_exit": 0,
+    "run": "exit 0, All 30 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.022527124994667247
+   },
+   "bs": {
+    "cold_local": 1.5494270369963488,
+    "cold_local_donor": 1.6500625159969786,
+    "compile_exit": 0,
+    "run": "exit 0, All 30 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.013107602993841283
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "backend-gpu-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.531898626984912,
+    "compile_exit": 0,
+    "run": "exit 0, All 7 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005333870998583734
+   },
+   "bs": {
+    "cold_local": 0.3394052770017879,
+    "cold_local_donor": 0.1379127590043936,
+    "compile_exit": 0,
+    "run": "exit 0, All 7 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002288101997692138
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-control-json-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7878053339954931,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.008810679995804094
+   },
+   "bs": {
+    "cold_local": 0.4522268360015005,
+    "cold_local_donor": 0.3380608550069155,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0035320970055181533
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-md-supermd-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5695081449957797,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007110518999979831
+   },
+   "bs": {
+    "cold_local": 0.3529217330069514,
+    "cold_local_donor": 0.1689545240078587,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0032271740055875853
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-remote-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7944543669873383,
+    "compile_exit": 0,
+    "run": "exit 0, All 36 tests passed.",
+    "run_exit": 0,
+    "run_secs": 34.49224892300845
+   },
+   "bs": {
+    "cold_local": 0.4588320690090768,
+    "cold_local_donor": 0.46831691000261344,
+    "compile_exit": 0,
+    "run": "exit 0, All 36 tests passed.",
+    "run_exit": 0,
+    "run_secs": 34.444565867001074
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-tape-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1822189840022475,
+    "compile_exit": 0,
+    "run": "exit 0, All 80 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.9909989250008948
+   },
+   "bs": {
+    "cold_local": 0.7396010129887145,
+    "cold_local_donor": 0.473891523986822,
+    "compile_exit": 0,
+    "run": "exit 0, All 80 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.5415519410016714
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-plugin-loader-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 4.116735994000919,
+    "compile_exit": 0,
+    "run": "exit 0, 2 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.011440709989983588
+   },
+   "bs": {
+    "cold_local": 1.2833020279940683,
+    "cold_local_donor": 1.2449685129977297,
+    "compile_exit": 0,
+    "run": "exit 0, 2 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.004627927002729848
+   }
+  },
+  {
+   "project": "fizzy",
+   "target": "fizzy-liquid-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5257874569942942,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007310750006581657
+   },
+   "bs": {
+    "cold_local": 0.2929084939969471,
+    "cold_local_donor": 0.11960463199648075,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0028149659920018166
+   }
+  },
+  {
+   "project": "revo",
+   "target": "revo",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 4.706591359994491,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.06479352799942717
+   },
+   "bs": {
+    "cold_local": 2.392434002002119,
+    "cold_local_donor": 2.274219147002441,
+    "compile_exit": 0,
+    "run": "exit 0",
+    "run_exit": 0,
+    "run_secs": 0.05455546599114314
+   }
+  },
+  {
+   "project": "revo",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5148441600176739,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0047720040020067245
+   },
+   "bs": {
+    "cold_local": 0.29031332000158727,
+    "cold_local_donor": 0.13082499700249173,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002049372997134924
+   }
+  },
+  {
+   "project": "revo",
+   "target": "test:src/vm/root.zig",
+   "verdict": "bs: run differs (exit signal 6, no summary, died in tests.test.vm channel buffered send then recv vs exit signal 6, no summary, died in tests.test.vm gc keeps rooted closures and captured tables alive)",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.3847595560073387,
+    "compile_exit": 0,
+    "run": "exit signal 6, no summary, died in tests.test.vm gc keeps rooted closures and captured tables alive",
+    "run_exit": "signal 6",
+    "run_secs": 2.2209840399882523
+   },
+   "bs": {
+    "cold_local": 2.1085080960037885,
+    "cold_local_donor": 1.8159937449963763,
+    "compile_exit": 0,
+    "run": "exit signal 6, no summary, died in tests.test.vm channel buffered send then recv",
+    "run_exit": "signal 6",
+    "run_secs": 0.881248436999158
+   }
+  },
+  {
+   "project": "revo",
+   "target": "test:src/lang/tests/root.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.4276638989831554,
+    "compile_exit": 0,
+    "run": "exit 0, 336 passed; 3 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 7.21722846099874
+   },
+   "bs": {
+    "cold_local": 1.7237515209999401,
+    "cold_local_donor": 0.8083323960163398,
+    "compile_exit": 0,
+    "run": "exit 0, 336 passed; 3 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 4.095778022005106
+   }
+  },
+  {
+   "project": "revo",
+   "target": "test:src/root.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.548842407995835,
+    "compile_exit": 0,
+    "run": "exit 0, All 310 tests passed.",
+    "run_exit": 0,
+    "run_secs": 3.9056474289973266
+   },
+   "bs": {
+    "cold_local": 1.9139343740098411,
+    "cold_local_donor": 1.0306538209988503,
+    "compile_exit": 0,
+    "run": "exit 0, All 310 tests passed.",
+    "run_exit": 0,
+    "run_secs": 2.5233005180052714
+   }
+  },
+  {
+   "project": "revo",
+   "target": "test:src/cli.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.0483137580013135,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005843746999744326
+   },
+   "bs": {
+    "cold_local": 0.6668967250006972,
+    "cold_local_donor": 0.6590598059992772,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0032243269961327314
+   }
+  },
+  {
+   "project": "revo",
+   "target": "test:src/capi/root.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5918209280062001,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007497985003283247
+   },
+   "bs": {
+    "cold_local": 0.31311830700724386,
+    "cold_local_donor": 0.2708450690115569,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0034744519944069907
+   }
+  },
+  {
+   "project": "zig-extras",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.0223567840148462,
+    "compile_exit": 0,
+    "run": "exit 0, All 1228 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.023556305997772142
+   },
+   "bs": {
+    "cold_local": 0.5975916739989771,
+    "cold_local_donor": 0.4818925040017348,
+    "compile_exit": 0,
+    "run": "exit 0, All 1228 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.012128873990150169
+   }
+  },
+  {
+   "project": "StaticHttpFileServer",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.0017483649862697,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.008648816001368687
+   },
+   "bs": {
+    "cold_local": 1.0149620730080642,
+    "cold_local_donor": 0.9279042900016066,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0054732369899284095
+   }
+  },
+  {
+   "project": "flash",
+   "target": "flash",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6415517770074075,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.43441283800348174,
+    "cold_local_donor": 0.23888897901633754,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "flash",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5063669219962321,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00487176000024192
+   },
+   "bs": {
+    "cold_local": 0.2749468099937076,
+    "cold_local_donor": 0.11244621699734125,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002081276004901156
+   }
+  },
+  {
+   "project": "flash",
+   "target": "test:src/root.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.062562331004301,
+    "compile_exit": 0,
+    "run": "exit 0, 237 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.042116244992939755
+   },
+   "bs": {
+    "cold_local": 0.6507609690161189,
+    "cold_local_donor": 0.47683287800464313,
+    "compile_exit": 0,
+    "run": "exit 0, 237 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.03910662099951878
+   }
+  },
+  {
+   "project": "flow",
+   "target": "flow",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 12.806938130990602,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 5.526504151013796,
+    "cold_local_donor": 5.067011402003118,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-terminal_icons",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.49480405100621283,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005009378990507685
+   },
+   "bs": {
+    "cold_local": 0.30927973399229813,
+    "cold_local_donor": 0.14373247500043362,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0022033410059520975
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-syntax_validator",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6237480580020929,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014215081013389863
+   },
+   "bs": {
+    "cold_local": 0.6619029539870098,
+    "cold_local_donor": 0.6946216889773495,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014359870998305269
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-stdio_capture",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5074479290196905,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005763637003838085
+   },
+   "bs": {
+    "cold_local": 0.3891402139852289,
+    "cold_local_donor": 0.4164174719771836,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0034717669914243743
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-dbus",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.0595488740073051,
+    "compile_exit": 0,
+    "run": "exit 0, 9 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.016325469012372196
+   },
+   "bs": {
+    "cold_local": 0.49306014701141976,
+    "cold_local_donor": 0.3886933570029214,
+    "compile_exit": 0,
+    "run": "exit 0, 9 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.007854153998778202
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-gitignore",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5407239320047665,
+    "compile_exit": 0,
+    "run": "exit 0, All 55 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.026398323985631578
+   },
+   "bs": {
+    "cold_local": 0.317450861010002,
+    "cold_local_donor": 0.15514816100767348,
+    "compile_exit": 0,
+    "run": "exit 0, All 55 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.017994068999541923
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-terminal_wt_profiles",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5454541390063241,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010359447987866588
+   },
+   "bs": {
+    "cold_local": 0.31080483699042816,
+    "cold_local_donor": 0.18025206800666638,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004531188998953439
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-rc",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.0772696819913108,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.026512808006373234
+   },
+   "bs": {
+    "cold_local": 0.5407612090202747,
+    "cold_local_donor": 0.3493642070097849,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.017408200990757905
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-terminal_key",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5935303639998892,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005241293998551555
+   },
+   "bs": {
+    "cold_local": 0.29542815800232347,
+    "cold_local_donor": 0.14093895399128087,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0022838459990452975
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-flow",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.6328938380029285,
+    "compile_exit": 0,
+    "run": "exit 0, All 284 tests passed.",
+    "run_exit": 0,
+    "run_secs": 7.360149885003921
+   },
+   "bs": {
+    "cold_local": 0.9475459670065902,
+    "cold_local_donor": 0.9104558480030391,
+    "compile_exit": 0,
+    "run": "exit 0, All 284 tests passed.",
+    "run_exit": 0,
+    "run_secs": 4.6510365169961005
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-richdoc",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 6.26714312499098,
+    "compile_exit": 0,
+    "run": "exit 0, All 63 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.09556101199996192
+   },
+   "bs": {
+    "cold_local": 1.128075632994296,
+    "cold_local_donor": 0.944913807004923,
+    "compile_exit": 0,
+    "run": "exit 0, All 63 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.06205895499442704
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-match",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5686458090058295,
+    "compile_exit": 0,
+    "run": "exit 0, All 19 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007681614006287418
+   },
+   "bs": {
+    "cold_local": 0.3116978039906826,
+    "cold_local_donor": 0.1341876029910054,
+    "compile_exit": 0,
+    "run": "exit 0, All 19 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002298040999448858
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-FileStore",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.2142676310031675,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.6274674020096427
+   },
+   "bs": {
+    "cold_local": 0.730958305997774,
+    "cold_local_donor": 0.4559470509993844,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.6207217739865882
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-fetch",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.558829383997363,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006523410003865138
+   },
+   "bs": {
+    "cold_local": 0.2954152019956382,
+    "cold_local_donor": 0.35430433200963307,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0020733220007969067
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-chord_key",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.537409064010717,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005185468005947769
+   },
+   "bs": {
+    "cold_local": 0.3136805389949586,
+    "cold_local_donor": 0.14828998000302818,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002474620006978512
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-command_line",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.550814332003938,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006991810994804837
+   },
+   "bs": {
+    "cold_local": 0.2904760899982648,
+    "cold_local_donor": 0.14586045099713374,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004972784998244606
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-glyph_constraint",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.633400406994042,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006462096003815532
+   },
+   "bs": {
+    "cold_local": 0.29997213401657064,
+    "cold_local_donor": 0.13831821801431943,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.003020646996446885
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-edit_set",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.624247607003781,
+    "compile_exit": 0,
+    "run": "exit 0, All 32 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.13176322300569154
+   },
+   "bs": {
+    "cold_local": 0.4342363930045394,
+    "cold_local_donor": 0.22929211500741076,
+    "compile_exit": 0,
+    "run": "exit 0, All 32 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.05804015499597881
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-double_mapped_ring_buffer",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5340477229910903,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005263280007056892
+   },
+   "bs": {
+    "cold_local": 0.34548924799310043,
+    "cold_local_donor": 0.4158729259943357,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0023150190099840984
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-mouse_event",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5719256000011228,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005000559001928195
+   },
+   "bs": {
+    "cold_local": 0.2927816460141912,
+    "cold_local_donor": 0.13767484400887042,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002222697003162466
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-terminal_line_store",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5235828439908801,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.043663557997206226
+   },
+   "bs": {
+    "cold_local": 0.30514130198571365,
+    "cold_local_donor": 0.1505665469885571,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.025393269010237418
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-terminal_screen",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6374980160035193,
+    "compile_exit": 0,
+    "run": "exit 0, All 25 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.04978199600009248
+   },
+   "bs": {
+    "cold_local": 0.3310722840105882,
+    "cold_local_donor": 0.17312975401000585,
+    "compile_exit": 0,
+    "run": "exit 0, All 25 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.03539012500550598
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-glyph_atlas",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.495351187986671,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02706877700984478
+   },
+   "bs": {
+    "cold_local": 0.28635253199900035,
+    "cold_local_donor": 0.12954283799626864,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02376363199437037
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-keybind",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.2664535929943668,
+    "compile_exit": 0,
+    "run": "exit 0, All 24 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.1568798299995251
+   },
+   "bs": {
+    "cold_local": 0.8577679409936536,
+    "cold_local_donor": 0.7174417679925682,
+    "compile_exit": 0,
+    "run": "exit 0, All 24 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.07923375099198893
+   }
+  },
+  {
+   "project": "flow",
+   "target": "test-gitignore-differential",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5825079110072693,
+    "compile_exit": 0,
+    "run": "exit 0, All 59 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.21707390999654308
+   },
+   "bs": {
+    "cold_local": 0.3442405350069748,
+    "cold_local_donor": 0.16415880898421165,
+    "compile_exit": 0,
+    "run": "exit 0, All 59 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.1928405390062835
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "flow",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 13.811012057005428,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 39.01275200402597,
+    "cold_local_donor": 6.062069223014987,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-terminal_icons",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.508287601012853,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00648021898814477
+   },
+   "bs": {
+    "cold_local": 0.38598669799102936,
+    "cold_local_donor": 0.6354934819974005,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0025698209938127548
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-syntax_validator",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.7484829219902167,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010157912009162828
+   },
+   "bs": {
+    "cold_local": 0.8934683200059226,
+    "cold_local_donor": 0.8266913670086069,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0053214590006973594
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-stdio_capture",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6063925999915227,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005344624994904734
+   },
+   "bs": {
+    "cold_local": 0.479453673993703,
+    "cold_local_donor": 0.46206175300176255,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002394316004938446
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-dbus",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.141038119996665,
+    "compile_exit": 0,
+    "run": "exit 0, 9 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.019032351003261283
+   },
+   "bs": {
+    "cold_local": 0.6715190090035321,
+    "cold_local_donor": 0.6825368119898485,
+    "compile_exit": 0,
+    "run": "exit 0, 9 passed; 2 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.0069455459888558835
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-gitignore",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5765275089943316,
+    "compile_exit": 0,
+    "run": "exit 0, All 55 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.027441929007181898
+   },
+   "bs": {
+    "cold_local": 0.839187021003454,
+    "cold_local_donor": 0.23015427400241606,
+    "compile_exit": 0,
+    "run": "exit 0, All 55 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.017991440996411256
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-terminal_wt_profiles",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6566497239982709,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01163574199017603
+   },
+   "bs": {
+    "cold_local": 0.3559463560086442,
+    "cold_local_donor": 0.18003140500513837,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00895887600199785
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-rc",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.161291587006417,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02944559200841468
+   },
+   "bs": {
+    "cold_local": 0.6556865479942644,
+    "cold_local_donor": 0.6929401899978984,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01683184200373944
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-terminal_key",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5751828480133554,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00513794700964354
+   },
+   "bs": {
+    "cold_local": 0.323847558000125,
+    "cold_local_donor": 0.29995819099713117,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0022658509988104925
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-flow",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.8908955419901758,
+    "compile_exit": 0,
+    "run": "exit 0, All 284 tests passed.",
+    "run_exit": 0,
+    "run_secs": 7.817341248999583
+   },
+   "bs": {
+    "cold_local": 1.1331231229851255,
+    "cold_local_donor": 1.3038926539884415,
+    "compile_exit": 0,
+    "run": "exit 0, All 284 tests passed.",
+    "run_exit": 0,
+    "run_secs": 4.60305164399324
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-richdoc",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 6.117750707999221,
+    "compile_exit": 0,
+    "run": "exit 0, All 63 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.09354167499986943
+   },
+   "bs": {
+    "cold_local": 1.3885176199983107,
+    "cold_local_donor": 1.2781137220008532,
+    "compile_exit": 0,
+    "run": "exit 0, All 63 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.07737685399479233
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-match",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5511918880074518,
+    "compile_exit": 0,
+    "run": "exit 0, All 19 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005543902996578254
+   },
+   "bs": {
+    "cold_local": 0.30340209398127627,
+    "cold_local_donor": 0.518627335986821,
+    "compile_exit": 0,
+    "run": "exit 0, All 19 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0036873500066576526
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-FileStore",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.3377202699921327,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.6427201280021109
+   },
+   "bs": {
+    "cold_local": 0.7739090560062323,
+    "cold_local_donor": 0.7579779229999986,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.6186577469925396
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-fetch",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5562440979992971,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0049393490044167265
+   },
+   "bs": {
+    "cold_local": 0.30793672300933395,
+    "cold_local_donor": 0.15733269701013342,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0023708809894742444
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-chord_key",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5072445580008207,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005008108011679724
+   },
+   "bs": {
+    "cold_local": 0.2863340610056184,
+    "cold_local_donor": 0.12846710700250696,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0023493199987569824
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-command_line",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5342172300152015,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007286120002390817
+   },
+   "bs": {
+    "cold_local": 0.298427517991513,
+    "cold_local_donor": 0.1297800899919821,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0034988859988516197
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-glyph_constraint",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5090499709913274,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0055146230006357655
+   },
+   "bs": {
+    "cold_local": 0.3056765200017253,
+    "cold_local_donor": 0.5180001339904265,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002261576009914279
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-edit_set",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6805397559946869,
+    "compile_exit": 0,
+    "run": "exit 0, All 32 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.1479988140054047
+   },
+   "bs": {
+    "cold_local": 0.3967004559963243,
+    "cold_local_donor": 0.2680106659827288,
+    "compile_exit": 0,
+    "run": "exit 0, All 32 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.06443030400259886
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-double_mapped_ring_buffer",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5126983899972402,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0059533099993132055
+   },
+   "bs": {
+    "cold_local": 0.2936248220066773,
+    "cold_local_donor": 0.12199165100173559,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002077675992040895
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-mouse_event",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5911280189902755,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005008918000385165
+   },
+   "bs": {
+    "cold_local": 0.29881126998225227,
+    "cold_local_donor": 0.1811752339854138,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0024979520094348118
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-terminal_line_store",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5318136300047627,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.04386213199177291
+   },
+   "bs": {
+    "cold_local": 0.31402592798986007,
+    "cold_local_donor": 0.16312168698641472,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.024660911003593355
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-terminal_screen",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.7738310639979318,
+    "compile_exit": 0,
+    "run": "exit 0, All 25 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.05276503899949603
+   },
+   "bs": {
+    "cold_local": 0.5340464530017925,
+    "cold_local_donor": 0.1905160240130499,
+    "compile_exit": 0,
+    "run": "exit 0, All 25 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0482901689974824
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-glyph_atlas",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5537200499966275,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.030222829009289853
+   },
+   "bs": {
+    "cold_local": 0.34731850000389386,
+    "cold_local_donor": 0.14160356899083126,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02552330499747768
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-keybind",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.3029345219838433,
+    "compile_exit": 0,
+    "run": "exit 0, All 24 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.20034094799484592
+   },
+   "bs": {
+    "cold_local": 1.0531008319812827,
+    "cold_local_donor": 0.9354925009974977,
+    "compile_exit": 0,
+    "run": "exit 0, All 24 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.07920400699367747
+   }
+  },
+  {
+   "project": "flow-musl",
+   "target": "test-gitignore-differential",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5745097549952334,
+    "compile_exit": 0,
+    "run": "exit 0, All 59 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.22117771800549235
+   },
+   "bs": {
+    "cold_local": 0.34508390800328925,
+    "cold_local_donor": 0.1675427600130206,
+    "compile_exit": 0,
+    "run": "exit 0, All 59 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.1825760260107927
+   }
+  },
+  {
+   "project": "lztime",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.593474649998825,
+    "compile_exit": 0,
+    "run": "exit 0, All 18 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006346109003061429
+   },
+   "bs": {
+    "cold_local": 0.42931318799674045,
+    "cold_local_donor": 0.19279055499646347,
+    "compile_exit": 0,
+    "run": "exit 0, All 18 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.003411077006603591
+   }
+  },
+  {
+   "project": "nats.zig",
+   "target": "example-simple",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.993650960008381,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 1.0688707170047564,
+    "cold_local_donor": 0.9433840539859375,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "nats.zig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.0746996209927602,
+    "compile_exit": 0,
+    "run": "exit 0, All 556 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.2299632000067504
+   },
+   "bs": {
+    "cold_local": 0.632287903004908,
+    "cold_local_donor": 0.42560653999680653,
+    "compile_exit": 0,
+    "run": "exit 0, All 556 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.21858541600522585
+   }
+  },
+  {
+   "project": "nats.zig",
+   "target": "test:src/io_backend.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.4963086609932361,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0071676329971523955
+   },
+   "bs": {
+    "cold_local": 0.2948112040030537,
+    "cold_local_donor": 0.13160751700343098,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002022619009949267
+   }
+  },
+  {
+   "project": "teru",
+   "target": "teru",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.514993089993368,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.666404760981095,
+    "cold_local_donor": 0.6840086049924139,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "teru",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1799890020047314,
+    "compile_exit": 0,
+    "run": "exit 0, All 629 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.21470575498824473
+   },
+   "bs": {
+    "cold_local": 0.6630732439807616,
+    "cold_local_donor": 0.48251266998704523,
+    "compile_exit": 0,
+    "run": "exit 0, All 629 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.14310759298678022
+   }
+  },
+  {
+   "project": "zarrow",
+   "target": "zarrow_c",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6796120060025714,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.3077959270158317,
+    "cold_local_donor": 0.2679121870169183,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zarrow",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 9.929479873011587,
+    "compile_exit": 0,
+    "run": "exit 0, All 341 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.16071561198623385
+   },
+   "bs": {
+    "cold_local": 7.69797007899615,
+    "cold_local_donor": 7.362882130997605,
+    "compile_exit": 0,
+    "run": "exit 0, All 341 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.12780138300149702
+   }
+  },
+  {
+   "project": "zig-blind-rsa-signatures",
+   "target": "blind-rsa-signatures",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.467548992994125,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.5954759660089621,
+    "cold_local_donor": 0.4855939289991511,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zig-blind-rsa-signatures",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.7921818869945128,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 14.98219385300763
+   },
+   "bs": {
+    "cold_local": 0.8785614109947346,
+    "cold_local_donor": 1.138918267984991,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 9.744822477005073
+   }
+  },
+  {
+   "project": "zig-cbc",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6242148809978971,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006091023999033496
+   },
+   "bs": {
+    "cold_local": 0.4864815640030429,
+    "cold_local_donor": 0.29007838599500246,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01579807698726654
+   }
+  },
+  {
+   "project": "zig-cli",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5512338020052994,
+    "compile_exit": 0,
+    "run": "exit 0, All 12 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010515782996662892
+   },
+   "bs": {
+    "cold_local": 0.4382883700018283,
+    "cold_local_donor": 0.44150119299592916,
+    "compile_exit": 0,
+    "run": "exit 0, All 12 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0050035250023938715
+   }
+  },
+  {
+   "project": "zig-gobject",
+   "target": "translate-gir",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.002604267996503,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.6823142450011801,
+    "cold_local_donor": 0.5330225710058585,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zig-gobject",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6933111279940931,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010442928993143141
+   },
+   "bs": {
+    "cold_local": 0.4207475040166173,
+    "cold_local_donor": 0.27876052902138326,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004760736002936028
+   }
+  },
+  {
+   "project": "zignal",
+   "target": "zignal:src/main.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.9295196440216387,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 1.244346172985388,
+    "cold_local_donor": 1.0157816859864397,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zignal",
+   "target": "zignal:src/root.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 3.0507585339946672,
+    "compile_exit": 0,
+    "run": "exit 1, 851 passed; 3 skipped; 1 failed.",
+    "run_exit": 1,
+    "run_secs": 26.722145579988137
+   },
+   "bs": {
+    "cold_local": 1.7602006230008556,
+    "cold_local_donor": 1.6397542120103026,
+    "compile_exit": 0,
+    "run": "exit 1, 851 passed; 3 skipped; 1 failed.",
+    "run_exit": 1,
+    "run_secs": 12.410820717996103
+   }
+  },
+  {
+   "project": "zlaya",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8221809789974941,
+    "compile_exit": 0,
+    "run": "exit 0, All 25 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.09659959499549586
+   },
+   "bs": {
+    "cold_local": 0.8545377090049442,
+    "cold_local_donor": 0.4056635700108018,
+    "compile_exit": 0,
+    "run": "exit 0, All 25 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.07890128500002902
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "zlob:src/main.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.0258626480062958,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.6755018109979574,
+    "cold_local_donor": 0.500615678014583,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5795136180095142,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.012933799007441849
+   },
+   "bs": {
+    "cold_local": 0.42822495999280363,
+    "cold_local_donor": 0.18739946800633334,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01004010799806565
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_fnmatch.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.7713600330171175,
+    "compile_exit": 0,
+    "run": "exit 0, All 76 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.011072082997998223
+   },
+   "bs": {
+    "cold_local": 0.33673754798655864,
+    "cold_local_donor": 0.355833335997886,
+    "compile_exit": 0,
+    "run": "exit 0, All 76 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006043241999577731
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_dlopen_tls.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5293224619963439,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005930868996074423
+   },
+   "bs": {
+    "cold_local": 0.32068119999894407,
+    "cold_local_donor": 0.11101237099501304,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014669472991954535
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_glibc.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.0810294739931123,
+    "compile_exit": 0,
+    "run": "exit 0, All 23 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02147619800234679
+   },
+   "bs": {
+    "cold_local": 0.5327240510086995,
+    "cold_local_donor": 0.4895285000093281,
+    "compile_exit": 0,
+    "run": "exit 0, All 23 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.011874523988808505
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_static_tls_budget.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5065364829933969,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.049633347007329576
+   },
+   "bs": {
+    "cold_local": 0.3011247190006543,
+    "cold_local_donor": 0.12692202998732682,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.04588382400106639
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_basic.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.0164703540067421,
+    "compile_exit": 0,
+    "run": "exit 0, All 19 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.03466385099454783
+   },
+   "bs": {
+    "cold_local": 0.5075032820022898,
+    "cold_local_donor": 0.35645827700500377,
+    "compile_exit": 0,
+    "run": "exit 0, All 19 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014044836003449745
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_match_basename.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.096693545987364,
+    "compile_exit": 0,
+    "run": "exit 0, All 20 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02985041300416924
+   },
+   "bs": {
+    "cold_local": 0.5616607700067107,
+    "cold_local_donor": 0.22136966799735092,
+    "compile_exit": 0,
+    "run": "exit 0, All 20 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.018781820006552152
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:src/gitignore.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6035931859951233,
+    "compile_exit": 0,
+    "run": "exit 0, All 21 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02027927798917517
+   },
+   "bs": {
+    "cold_local": 0.3350269930087961,
+    "cold_local_donor": 0.17235986300511286,
+    "compile_exit": 0,
+    "run": "exit 0, All 21 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006638336999458261
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_walker_paths.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6711796169984154,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.017046717999619432
+   },
+   "bs": {
+    "cold_local": 0.4757018169912044,
+    "cold_local_donor": 0.1795887570042396,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.009975957989809103
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:src/walker.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5909320919890888,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010684654000215232
+   },
+   "bs": {
+    "cold_local": 0.3209209429915063,
+    "cold_local_donor": 0.1519687379914103,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004967339991708286
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:src/sorting.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5681828629894881,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005793349992018193
+   },
+   "bs": {
+    "cold_local": 0.3260230890009552,
+    "cold_local_donor": 0.169432146998588,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.003345795994391665
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:src/brace_optimizer.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6237409239984117,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02001564200327266
+   },
+   "bs": {
+    "cold_local": 0.298788781001349,
+    "cold_local_donor": 0.19047735900676344,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010353110992582515
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_brace.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.0940478940174216,
+    "compile_exit": 0,
+    "run": "exit 0, All 57 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.08642102999147028
+   },
+   "bs": {
+    "cold_local": 0.5728889720048755,
+    "cold_local_donor": 0.7919260710186791,
+    "compile_exit": 0,
+    "run": "exit 0, All 57 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.07328107100329362
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_path_matcher.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.129677356002503,
+    "compile_exit": 0,
+    "run": "exit 0, All 76 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02052749200083781
+   },
+   "bs": {
+    "cold_local": 0.8756623790104641,
+    "cold_local_donor": 1.0121156120003434,
+    "compile_exit": 0,
+    "run": "exit 0, All 76 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01143000200681854
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_gitignore_e2e.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.897464918991318,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.017185358999995515
+   },
+   "bs": {
+    "cold_local": 0.5034673059999477,
+    "cold_local_donor": 0.5225171299971407,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.012414865006576292
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_utils.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5294808080070652,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005720336004742421
+   },
+   "bs": {
+    "cold_local": 0.2858029350027209,
+    "cold_local_donor": 0.14886220298649278,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.003013637993717566
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_extglob.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.107703715999378,
+    "compile_exit": 0,
+    "run": "exit 0, All 23 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02742580499034375
+   },
+   "bs": {
+    "cold_local": 0.4896904990018811,
+    "cold_local_donor": 0.5926610769965919,
+    "compile_exit": 0,
+    "run": "exit 0, All 23 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.024679791007656604
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_gitignore.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6103190199937671,
+    "compile_exit": 0,
+    "run": "exit 0, All 21 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014799840006162412
+   },
+   "bs": {
+    "cold_local": 0.33632864299579524,
+    "cold_local_donor": 0.2312581050064182,
+    "compile_exit": 0,
+    "run": "exit 0, All 21 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007747094001388177
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:src/pattern_context.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6006404420040781,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014992996992077678
+   },
+   "bs": {
+    "cold_local": 0.3263658030045917,
+    "cold_local_donor": 0.19962354899325874,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005125498995766975
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_walk.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.3257950869883643,
+    "compile_exit": 0,
+    "run": "exit 0, All 40 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.8774312640016433
+   },
+   "bs": {
+    "cold_local": 0.6294281779992161,
+    "cold_local_donor": 0.8470772979926551,
+    "compile_exit": 0,
+    "run": "exit 0, All 40 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.7558004249876831
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:src/fnmatch.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6628021069918759,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.015126697995583527
+   },
+   "bs": {
+    "cold_local": 0.3424813890014775,
+    "cold_local_donor": 0.24500994000118226,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004645929002435878
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_append.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.268758621008601,
+    "compile_exit": 0,
+    "run": "exit 0, All 9 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.02077074999397155
+   },
+   "bs": {
+    "cold_local": 0.5690062700014096,
+    "cold_local_donor": 0.7896553470054641,
+    "compile_exit": 0,
+    "run": "exit 0, All 9 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014606751006795093
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_posix.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.1730830399901606,
+    "compile_exit": 0,
+    "run": "exit 0, All 40 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.0155068790045334
+   },
+   "bs": {
+    "cold_local": 0.5704756750055822,
+    "cold_local_donor": 0.7312626220082166,
+    "compile_exit": 0,
+    "run": "exit 0, All 40 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.522620691001066
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_rust_glob.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.9724125569919124,
+    "compile_exit": 0,
+    "run": "exit 0, All 30 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.020918577996781096
+   },
+   "bs": {
+    "cold_local": 0.5988425709947478,
+    "cold_local_donor": 0.5955490880005527,
+    "compile_exit": 0,
+    "run": "exit 0, All 30 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01611144900380168
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_absolute_paths.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.0593771520070732,
+    "compile_exit": 0,
+    "run": "exit 0, All 37 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.054366059994208626
+   },
+   "bs": {
+    "cold_local": 0.5214356640062761,
+    "cold_local_donor": 0.5857503650040599,
+    "compile_exit": 0,
+    "run": "exit 0, All 37 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.026240475999657065
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_errfunc.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.2506608340045204,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.012839121991419233
+   },
+   "bs": {
+    "cold_local": 0.6240607939980691,
+    "cold_local_donor": 0.6857540000055451,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006336064005154185
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_edge_cases.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.2750391300069168,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.015877351994276978
+   },
+   "bs": {
+    "cold_local": 0.5745389099902241,
+    "cold_local_donor": 0.665460197997163,
+    "compile_exit": 0,
+    "run": "exit 0, All 15 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0065508010011399165
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_match_basename_fuzz.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.8051888460031478,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 9.773156188995927
+   },
+   "bs": {
+    "cold_local": 0.5351526379818097,
+    "cold_local_donor": 0.3550029999896651,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 6.132092681000358
+   }
+  },
+  {
+   "project": "zlob",
+   "target": "test:test/test_internal.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.7252516760054277,
+    "compile_exit": 0,
+    "run": "exit 0, All 26 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.011486874005640857
+   },
+   "bs": {
+    "cold_local": 0.3837155979999807,
+    "cold_local_donor": 0.3112965039908886,
+    "compile_exit": 0,
+    "run": "exit 0, All 26 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005634988003293984
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "server",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.9743588459969033,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.6449388619948877,
+    "cold_local_donor": 0.5543919369956711,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "client",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.0054392839956563,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.588666183015448,
+    "cold_local_donor": 0.18089317201520316,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.9683618110138923,
+    "compile_exit": 0,
+    "run": "exit 0, All 116 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.0084340489993338
+   },
+   "bs": {
+    "cold_local": 0.6195144910016097,
+    "cold_local_donor": 0.4838206970016472,
+    "compile_exit": 0,
+    "run": "exit 0, All 116 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.20350992699968629
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/transport_params.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5255089399870485,
+    "compile_exit": 0,
+    "run": "exit 0, All 44 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005647641999530606
+   },
+   "bs": {
+    "cold_local": 0.29100635001668707,
+    "cold_local_donor": 0.12948415501159616,
+    "compile_exit": 0,
+    "run": "exit 0, All 44 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002372091999859549
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/stream.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5188229890045477,
+    "compile_exit": 0,
+    "run": "exit 0, All 62 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014836618007393554
+   },
+   "bs": {
+    "cold_local": 0.2933803160121897,
+    "cold_local_donor": 0.1391731979965698,
+    "compile_exit": 0,
+    "run": "exit 0, All 62 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01181199899292551
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/connection_test_handshakecorruption.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1336788300104672,
+    "compile_exit": 0,
+    "run": "exit 0, All 327 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.2832287040073425
+   },
+   "bs": {
+    "cold_local": 0.6673794780217577,
+    "cold_local_donor": 0.2733626220142469,
+    "compile_exit": 0,
+    "run": "exit 0, All 327 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.3037279190029949
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/connection_id.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5520710389973829,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005122367001604289
+   },
+   "bs": {
+    "cold_local": 0.29270810598973185,
+    "cold_local_donor": 0.115043538986356,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0020947960001649335
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/connection_test_pmtud.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.4929847819876159,
+    "compile_exit": 0,
+    "run": "exit 0, All 346 tests passed.",
+    "run_exit": 0,
+    "run_secs": 2.4762417339952663
+   },
+   "bs": {
+    "cold_local": 0.8399920979863964,
+    "cold_local_donor": 0.4057086909888312,
+    "compile_exit": 0,
+    "run": "exit 0, All 346 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.5851616049912991
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/fuzz.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1232372450031107,
+    "compile_exit": 0,
+    "run": "exit 0, All 327 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.1467215169977862
+   },
+   "bs": {
+    "cold_local": 0.7863230030052364,
+    "cold_local_donor": 0.2322050799994031,
+    "compile_exit": 0,
+    "run": "exit 0, All 327 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.24008750499342568
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/congestion/bbr.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5043535579898162,
+    "compile_exit": 0,
+    "run": "exit 0, All 36 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00517421099357307
+   },
+   "bs": {
+    "cold_local": 0.2956078319984954,
+    "cold_local_donor": 0.15791753499070182,
+    "compile_exit": 0,
+    "run": "exit 0, All 36 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0023529969912488014
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/netsim.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.49225293898780365,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0049481640016892925
+   },
+   "bs": {
+    "cold_local": 0.28028822198393755,
+    "cold_local_donor": 0.151900412995019,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0020482199906837195
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/congestion/cubic.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.4988332279899623,
+    "compile_exit": 0,
+    "run": "exit 0, All 19 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004950057991663925
+   },
+   "bs": {
+    "cold_local": 0.3081253489945084,
+    "cold_local_donor": 0.18588562199147418,
+    "compile_exit": 0,
+    "run": "exit 0, All 19 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0021166310034459457
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/integration_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1579234880045988,
+    "compile_exit": 0,
+    "run": "exit 0, All 376 tests passed.",
+    "run_exit": 0,
+    "run_secs": 4.988115191998077
+   },
+   "bs": {
+    "cold_local": 0.749397298990516,
+    "cold_local_donor": 1.0992217579914723,
+    "compile_exit": 0,
+    "run": "exit 0, All 376 tests passed.",
+    "run_exit": 0,
+    "run_secs": 2.441965084988624
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/connection_test_basic.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.1671719290025067,
+    "compile_exit": 0,
+    "run": "exit 0, All 375 tests passed.",
+    "run_exit": 0,
+    "run_secs": 3.0774173899990274
+   },
+   "bs": {
+    "cold_local": 0.8280017509969184,
+    "cold_local_donor": 1.038176519999979,
+    "compile_exit": 0,
+    "run": "exit 0, All 375 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.7368853840016527
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:tools/server.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5958477649983251,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005430108998552896
+   },
+   "bs": {
+    "cold_local": 0.3348590159876039,
+    "cold_local_donor": 0.12940834698383696,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0021025969908805564
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/flow_control.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5210799789783778,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005074879998574033
+   },
+   "bs": {
+    "cold_local": 0.28337760000431444,
+    "cold_local_donor": 0.14901567599736154,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002119559998391196
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/loss_recovery.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5835504209971987,
+    "compile_exit": 0,
+    "run": "exit 0, All 44 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.012527313010650687
+   },
+   "bs": {
+    "cold_local": 0.3717461930064019,
+    "cold_local_donor": 0.1861156080121873,
+    "compile_exit": 0,
+    "run": "exit 0, All 44 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0055824050068622455
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/packet.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6667587839910993,
+    "compile_exit": 0,
+    "run": "exit 0, All 37 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.009435384999960661
+   },
+   "bs": {
+    "cold_local": 0.44109893999120686,
+    "cold_local_donor": 0.3702670490019955,
+    "compile_exit": 0,
+    "run": "exit 0, All 37 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0030079549906076863
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:tools/pem.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6485566969931824,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.008548673999030143
+   },
+   "bs": {
+    "cold_local": 0.3683921359915985,
+    "cold_local_donor": 0.17126009101048112,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002640453996718861
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/connection_test_frames.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.15674860800209,
+    "compile_exit": 0,
+    "run": "exit 0, All 390 tests passed.",
+    "run_exit": 0,
+    "run_secs": 3.5906505249877227
+   },
+   "bs": {
+    "cold_local": 0.8038188320206245,
+    "cold_local_donor": 1.1151246790104778,
+    "compile_exit": 0,
+    "run": "exit 0, All 390 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.9896191529987846
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/connection_test_resumption.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.120004632990458,
+    "compile_exit": 0,
+    "run": "exit 0, All 333 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.4472373999888077
+   },
+   "bs": {
+    "cold_local": 0.718130661000032,
+    "cold_local_donor": 0.9966622649953933,
+    "compile_exit": 0,
+    "run": "exit 0, All 333 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.32933951399172656
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/crypto.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5819888209953206,
+    "compile_exit": 0,
+    "run": "exit 0, All 56 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006354141005431302
+   },
+   "bs": {
+    "cold_local": 0.4154623719950905,
+    "cold_local_donor": 0.3844046710000839,
+    "compile_exit": 0,
+    "run": "exit 0, All 56 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0041086999990511686
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/congestion/common.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5446413130121073,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004823707989999093
+   },
+   "bs": {
+    "cold_local": 0.27320108900312334,
+    "cold_local_donor": 0.11995315199601464,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002475343004334718
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/tls.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.9210097940085689,
+    "compile_exit": 0,
+    "run": "exit 0, All 113 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.9920990099926712
+   },
+   "bs": {
+    "cold_local": 0.5906574219989125,
+    "cold_local_donor": 0.8004745240032207,
+    "compile_exit": 0,
+    "run": "exit 0, All 113 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.20630378399800975
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/test_harness.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.518436518003,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004872988996794447
+   },
+   "bs": {
+    "cold_local": 0.28946456899575423,
+    "cold_local_donor": 0.04760653599805664,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.001974448998225853
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/congestion/cc_test_harness.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.556993798003532,
+    "compile_exit": 0,
+    "run": "exit 0, All 61 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005774486999143846
+   },
+   "bs": {
+    "cold_local": 0.3262459909892641,
+    "cold_local_donor": 0.24424772599013522,
+    "compile_exit": 0,
+    "run": "exit 0, All 61 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0024956609995570034
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/pool.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5509988609992433,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006104325002525002
+   },
+   "bs": {
+    "cold_local": 0.37629419499717187,
+    "cold_local_donor": 0.1847925369947916,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004670595997595228
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/varint.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5311811790015781,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.017666624000412412
+   },
+   "bs": {
+    "cold_local": 0.30886254299548455,
+    "cold_local_donor": 0.1914325510006165,
+    "compile_exit": 0,
+    "run": "exit 0, All 10 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0026314389979233965
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/connection_test_corruption.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.3112765470141312,
+    "compile_exit": 0,
+    "run": "exit 0, All 327 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.5997914920008043
+   },
+   "bs": {
+    "cold_local": 0.8578972550021717,
+    "cold_local_donor": 1.1763683480094187,
+    "compile_exit": 0,
+    "run": "exit 0, All 327 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.3796808260085527
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/connection.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6472641970030963,
+    "compile_exit": 0,
+    "run": "exit 0, All 44 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.015508372991462238
+   },
+   "bs": {
+    "cold_local": 0.3303324739972595,
+    "cold_local_donor": 0.16531694801233243,
+    "compile_exit": 0,
+    "run": "exit 0, All 44 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005465224996441975
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/connection_test_crypto.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.2043076760019176,
+    "compile_exit": 0,
+    "run": "exit 0, All 404 tests passed.",
+    "run_exit": 0,
+    "run_secs": 3.632900141994469
+   },
+   "bs": {
+    "cold_local": 0.7521398859971669,
+    "cold_local_donor": 1.1139238430041587,
+    "compile_exit": 0,
+    "run": "exit 0, All 404 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.8500624900043476
+   }
+  },
+  {
+   "project": "zquic",
+   "target": "test:src/quic/frame.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5320265749905957,
+    "compile_exit": 0,
+    "run": "exit 0, All 52 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.008838566995109431
+   },
+   "bs": {
+    "cold_local": 0.3103310180013068,
+    "cold_local_donor": 0.20290054600627627,
+    "compile_exit": 0,
+    "run": "exit 0, All 52 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0035648790071718395
+   }
+  },
+  {
+   "project": "XirAsm",
+   "target": "xirasm",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.8575159699976211,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 1.316302621984505,
+    "cold_local_donor": 0.928708054983872,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "XirAsm",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.101080574997468,
+    "compile_exit": 0,
+    "run": "exit 0, All 358 tests passed.",
+    "run_exit": 0,
+    "run_secs": 21.617449541998212
+   },
+   "bs": {
+    "cold_local": 1.2579866870073602,
+    "cold_local_donor": 1.197444080011337,
+    "compile_exit": 0,
+    "run": "exit 0, All 358 tests passed.",
+    "run_exit": 0,
+    "run_secs": 13.806166921000113
+   }
+  },
+  {
+   "project": "zprof",
+   "target": "zprof",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.04714023499400355,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.021407127991551533,
+    "cold_local_donor": 0.007028660998912528,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zprof",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5477063020080095,
+    "compile_exit": 0,
+    "run": "exit 0, All 12 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007659050010261126
+   },
+   "bs": {
+    "cold_local": 0.32943398600036744,
+    "cold_local_donor": 0.17073495298973285,
+    "compile_exit": 0,
+    "run": "exit 0, All 12 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006263602001126856
+   }
+  },
+  {
+   "project": "csv-zero",
+   "target": "csvzero",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.42635468501248397,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.2642639850091655,
+    "cold_local_donor": 0.24523809101083316,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "csv-zero",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6406657440093113,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006055598991224542
+   },
+   "bs": {
+    "cold_local": 0.4338379810069455,
+    "cold_local_donor": 0.13833676000649575,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0025775620015338063
+   }
+  },
+  {
+   "project": "ChipZ",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6454230789968278,
+    "compile_exit": 0,
+    "run": "exit 0, All 7 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005584410988376476
+   },
+   "bs": {
+    "cold_local": 0.31747670099139214,
+    "cold_local_donor": 0.16999639201094396,
+    "compile_exit": 0,
+    "run": "exit 0, All 7 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.003614415996707976
+   }
+  },
+  {
+   "project": "verse",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5590673000115203,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00620712099771481
+   },
+   "bs": {
+    "cold_local": 0.3284094420087058,
+    "cold_local_donor": 0.28041384399693925,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0025718199904076755
+   }
+  },
+  {
+   "project": "verse",
+   "target": "test:src/verse.zig",
+   "verdict": "bs: compile error",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 3.0807773629931035,
+    "compile_exit": 0,
+    "run": "exit 0, 105 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.12764797400450334
+   },
+   "bs": {
+    "cold_local": 1.6743201869830955,
+    "compile_exit": 1,
+    "error": "src/ContentType.zig:88:25: error[bad-switch]: cannot enumerate values of type 'ContentType.Application' for 'inline else'"
+   }
+  },
+  {
+   "project": "verse",
+   "target": "basic",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6446241000230657,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.4088604369899258,
+    "cold_local_donor": 0.31913150899345055,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "verse",
+   "target": "template",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.8773431959998561,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.4714595710102003,
+    "cold_local_donor": 0.30459515401162207,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "verse",
+   "target": "template-enum",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.7134038730000611,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.42145542800426483,
+    "cold_local_donor": 0.18899740400956944,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "verse",
+   "target": "template-extra",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.7272596469993005,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.5110351539915428,
+    "cold_local_donor": 0.19886361599492375,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "verse",
+   "target": "websocket",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.6713645019917749,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.3914556459931191,
+    "cold_local_donor": 0.1710445499920752,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "marionette",
+   "target": "marionette-run",
+   "verdict": "bs: compile error",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.1159718419949058,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.7769691139983479,
+    "compile_exit": 1,
+    "error": "src/fiber.zig:692:66: error[no-member]: union 'lang.CallingConvention' has no member named 'withStackAlign'"
+   }
+  },
+  {
+   "project": "marionette",
+   "target": "marionette-tidy",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.5832810459978646,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.35353613999905065,
+    "cold_local_donor": 0.1919153130002087,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "marionette",
+   "target": "test",
+   "verdict": "bs: compile error",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.8745590689941309,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.035618809997686185
+   },
+   "bs": {
+    "cold_local": 0.4165247549972264,
+    "compile_exit": 1,
+    "error": "src/fiber.zig:692:66: error[no-member]: union 'lang.CallingConvention' has no member named 'withStackAlign'"
+   }
+  },
+  {
+   "project": "marionette",
+   "target": "test:examples/root.zig",
+   "verdict": "bs: compile error",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.326888568000868,
+    "compile_exit": 0,
+    "run": "exit 0, All 28 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.1483659270015778
+   },
+   "bs": {
+    "cold_local": 0.6716960920020938,
+    "compile_exit": 1,
+    "error": "src/fiber.zig:692:66: error[no-member]: union 'lang.CallingConvention' has no member named 'withStackAlign'"
+   }
+  },
+  {
+   "project": "marionette",
+   "target": "test:src/root.zig",
+   "verdict": "bs: compile error",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 3.4325301189965103,
+    "compile_exit": 0,
+    "run": "exit 0, All 424 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.3195995829883032
+   },
+   "bs": {
+    "cold_local": 1.7639995889912825,
+    "compile_exit": 1,
+    "error": "src/fiber.zig:692:66: error[no-member]: union 'lang.CallingConvention' has no member named 'withStackAlign'"
+   }
+  },
+  {
+   "project": "marionette",
+   "target": "test:tests/root.zig",
+   "verdict": "bs: compile error",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.6741845079959603,
+    "compile_exit": 0,
+    "run": "exit 0, All 106 tests passed.",
+    "run_exit": 0,
+    "run_secs": 4.982219622004777
+   },
+   "bs": {
+    "cold_local": 0.8630452989891637,
+    "compile_exit": 1,
+    "error": "src/fiber.zig:692:66: error[no-member]: union 'lang.CallingConvention' has no member named 'withStackAlign'"
+   }
+  },
+  {
+   "project": "marionette",
+   "target": "test:validation/bounded_queue_concurrency.zig",
+   "verdict": "bs: compile error",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.9939337719988544,
+    "compile_exit": 0,
+    "run": "exit 0, All 5 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.1115239940118045
+   },
+   "bs": {
+    "cold_local": 0.4921230520121753,
+    "compile_exit": 1,
+    "error": "src/fiber.zig:692:66: error[no-member]: union 'lang.CallingConvention' has no member named 'withStackAlign'"
+   }
+  },
+  {
+   "project": "marionette",
+   "target": "test:validation/kv_compat.zig",
+   "verdict": "bs: compile error",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.0273364050081,
+    "compile_exit": 0,
+    "run": "exit 0, All 8 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.5037232589966152
+   },
+   "bs": {
+    "cold_local": 0.48148944100830704,
+    "compile_exit": 1,
+    "error": "src/fiber.zig:692:66: error[no-member]: union 'lang.CallingConvention' has no member named 'withStackAlign'"
+   }
+  },
+  {
+   "project": "polyrole",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6676707409933442,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007886006002081558
+   },
+   "bs": {
+    "cold_local": 0.35736696000094526,
+    "cold_local_donor": 0.1681180250016041,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0019303050066810101
+   }
+  },
+  {
+   "project": "wild",
+   "target": "wild",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6098571149923373,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.36934135100455023,
+    "cold_local_donor": 0.2662754920165753,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "wild",
+   "target": "benchmark",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6690485329891089,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.34082468099950347,
+    "cold_local_donor": 0.21819725801469758,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "wild",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5916630790015915,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004910080009722151
+   },
+   "bs": {
+    "cold_local": 0.368471055990085,
+    "cold_local_donor": 0.19729105799342506,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.002225577991339378
+   }
+  },
+  {
+   "project": "wild",
+   "target": "test:tests/test_batch_read.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5762655820144573,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.117996941000456
+   },
+   "bs": {
+    "cold_local": 0.37464292999356985,
+    "cold_local_donor": 0.28068509900185745,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.0434743350051576
+   }
+  },
+  {
+   "project": "wild",
+   "target": "test:tests/test_wild_storage.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5223619629978202,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.021985500992741436
+   },
+   "bs": {
+    "cold_local": 0.3181585549900774,
+    "cold_local_donor": 0.1485709269909421,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.025686303997645155
+   }
+  },
+  {
+   "project": "wild",
+   "target": "test:src/root.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5899421270005405,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007376614012173377
+   },
+   "bs": {
+    "cold_local": 0.2839491630002158,
+    "cold_local_donor": 0.14471706999756861,
+    "compile_exit": 0,
+    "run": "exit 0, All 1 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0031675889913458377
+   }
+  },
+  {
+   "project": "wild",
+   "target": "test:src/test_slab_allocator.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6306424939975841,
+    "compile_exit": 0,
+    "run": "exit 0, All 7 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.036754992994247004
+   },
+   "bs": {
+    "cold_local": 0.34122522397956345,
+    "cold_local_donor": 0.15234880898788106,
+    "compile_exit": 0,
+    "run": "exit 0, All 7 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.026000270998338237
+   }
+  },
+  {
+   "project": "wild",
+   "target": "test:src/client.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5483500440022908,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004722287994809449
+   },
+   "bs": {
+    "cold_local": 0.34559217099740636,
+    "cold_local_donor": 0.14422335401468445,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0023521560069639236
+   }
+  },
+  {
+   "project": "zeptun",
+   "target": "zeptun:src/cli/main.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.9954032420064323,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 0.5740516259975266,
+    "cold_local_donor": 0.5080589899880579,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zeptun",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.0800261059921468,
+    "compile_exit": 0,
+    "run": "exit 0, 101 passed; 8 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 2.7652190160006285
+   },
+   "bs": {
+    "cold_local": 0.7810414580162615,
+    "cold_local_donor": 0.5022001730103511,
+    "compile_exit": 0,
+    "run": "exit 0, 101 passed; 8 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 2.5141401649889303
+   }
+  },
+  {
+   "project": "zeptun",
+   "target": "test:src/bench/main.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5784091339883162,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.03409645399369765
+   },
+   "bs": {
+    "cold_local": 0.32808559700788464,
+    "cold_local_donor": 0.18864716500684153,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.04012312099803239
+   }
+  },
+  {
+   "project": "zeptun",
+   "target": "test:src/ffi/ffi.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8620489790046122,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007786899004713632
+   },
+   "bs": {
+    "cold_local": 0.49765466898679733,
+    "cold_local_donor": 0.35760307498276234,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.003624342003604397
+   }
+  },
+  {
+   "project": "zeptun",
+   "target": "test:src/cli/main.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5295315930125071,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0066662600002018735
+   },
+   "bs": {
+    "cold_local": 0.27972952101845294,
+    "cold_local_donor": 0.23686866700882092,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0020409520075190812
+   }
+  },
+  {
+   "project": "s2s",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6244486939976923,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.011576078002690338
+   },
+   "bs": {
+    "cold_local": 0.462258090992691,
+    "cold_local_donor": 0.5804144760040799,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.003205440007150173
+   }
+  },
+  {
+   "project": "knoedel",
+   "target": "test",
+   "verdict": "bs: compile error",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 0.8340144700050587,
+    "compile_exit": 0,
+    "run": "exit 0, All 20 tests passed.",
+    "run_exit": 0,
+    "run_secs": 1.2559708320040954
+   },
+   "bs": {
+    "cold_local": 0.4474551429884741,
+    "compile_exit": 1,
+    "error": "src/ecs.zig:528:61: error[comptime-required]: unable to resolve comptime value"
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8124522709986195,
+    "compile_exit": 0,
+    "run": "exit 0, All 9 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.022412559992517345
+   },
+   "bs": {
+    "cold_local": 0.49142945698986296,
+    "cold_local_donor": 0.32805177199770696,
+    "compile_exit": 0,
+    "run": "exit 0, All 9 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.013495908002369106
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/toon_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.683954920998076,
+    "compile_exit": 0,
+    "run": "exit 0, All 17 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.013483786999131553
+   },
+   "bs": {
+    "cold_local": 0.41508231399348006,
+    "cold_local_donor": 0.24296873499406502,
+    "compile_exit": 0,
+    "run": "exit 0, All 17 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.009242108993930742
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/serde_options_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.9303704500052845,
+    "compile_exit": 0,
+    "run": "exit 0, All 63 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.01820294999924954
+   },
+   "bs": {
+    "cold_local": 0.4938178049924318,
+    "cold_local_donor": 0.3429637789959088,
+    "compile_exit": 0,
+    "run": "exit 0, All 63 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006835847001639195
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/tokens_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6774502589832991,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.006476529000792652
+   },
+   "bs": {
+    "cold_local": 0.3701840639987495,
+    "cold_local_donor": 0.21775324799818918,
+    "compile_exit": 0,
+    "run": "exit 0, All 6 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004454681999050081
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/etf_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7336692389944801,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.013165091993869282
+   },
+   "bs": {
+    "cold_local": 0.48507598700234666,
+    "cold_local_donor": 0.31133423300343566,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.007165503004216589
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:src/root.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.488831977985683,
+    "compile_exit": 0,
+    "run": "exit 0, All 838 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.086852798005566
+   },
+   "bs": {
+    "cold_local": 1.6285300720046507,
+    "cold_local_donor": 1.5001319100119872,
+    "compile_exit": 0,
+    "run": "exit 0, All 838 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0565705750050256
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/json_diagnostics_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.9039185470028315,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.05469056800939143
+   },
+   "bs": {
+    "cold_local": 0.3918335989874322,
+    "cold_local_donor": 0.2746583089901833,
+    "compile_exit": 0,
+    "run": "exit 0, All 11 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.031806761006009765
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:bench/main.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5596073779888684,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005238359997747466
+   },
+   "bs": {
+    "cold_local": 0.39899794399389066,
+    "cold_local_donor": 0.17224689199065324,
+    "compile_exit": 0,
+    "run": "exit 0, All 3 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0023511260078521445
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/contracts_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8661890390067128,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00748090299020987
+   },
+   "bs": {
+    "cold_local": 0.5088234819995705,
+    "cold_local_donor": 0.42351904402312357,
+    "compile_exit": 0,
+    "run": "exit 0, All 4 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0028289530018810183
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/roundtrip_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8289318359893514,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.014262287993915379
+   },
+   "bs": {
+    "cold_local": 0.4955288799974369,
+    "cold_local_donor": 0.29697029398812447,
+    "compile_exit": 0,
+    "run": "exit 0, All 13 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005955704007647
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/core_regressions_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.440087353999843,
+    "compile_exit": 0,
+    "run": "exit 0, All 22 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.09438840800430626
+   },
+   "bs": {
+    "cold_local": 0.7941378420073306,
+    "cold_local_donor": 0.6956050340086222,
+    "compile_exit": 0,
+    "run": "exit 0, All 22 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.05534482999064494
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/edge_cases_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6758769060106715,
+    "compile_exit": 0,
+    "run": "exit 0, All 36 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.010051176999695599
+   },
+   "bs": {
+    "cold_local": 0.3965604999975767,
+    "cold_local_donor": 0.20840772699739318,
+    "compile_exit": 0,
+    "run": "exit 0, All 36 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004567811003653333
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/reader_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7658841700031189,
+    "compile_exit": 0,
+    "run": "exit 0, All 16 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.03610624199791346
+   },
+   "bs": {
+    "cold_local": 0.4528697180066956,
+    "cold_local_donor": 0.28385698700731155,
+    "compile_exit": 0,
+    "run": "exit 0, All 16 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.03145585599122569
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/stress_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 1.432942476007156,
+    "compile_exit": 0,
+    "run": "exit 0, All 20 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.015281439991667867
+   },
+   "bs": {
+    "cold_local": 1.001183870001114,
+    "cold_local_donor": 0.7773085230001016,
+    "compile_exit": 0,
+    "run": "exit 0, All 20 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.00518976099556312
+   }
+  },
+  {
+   "project": "serde.zig",
+   "target": "test:test/adversarial_test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.6585342540056445,
+    "compile_exit": 0,
+    "run": "exit 0, All 52 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.011468444994534366
+   },
+   "bs": {
+    "cold_local": 0.3972398549958598,
+    "cold_local_donor": 0.19984088400087785,
+    "compile_exit": 0,
+    "run": "exit 0, All 52 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0034894550044555217
+   }
+  },
+  {
+   "project": "oma",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.4954952779953601,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.005195011006435379
+   },
+   "bs": {
+    "cold_local": 0.3171603790106019,
+    "cold_local_donor": 0.15438889400684275,
+    "compile_exit": 0,
+    "run": "exit 0, All 2 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0020537359960144386
+   }
+  },
+  {
+   "project": "comptime-serde",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8955872650112724,
+    "compile_exit": 0,
+    "run": "exit 0, All 139 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.015043837003759108
+   },
+   "bs": {
+    "cold_local": 0.5337583500077017,
+    "cold_local_donor": 0.6062739360058913,
+    "compile_exit": 0,
+    "run": "exit 0, All 139 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.009268333000363782
+   }
+  },
+  {
+   "project": "zitrus",
+   "target": "zitrus",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 2.29301012698852,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 1.5174948670173762,
+    "cold_local_donor": 1.5603504980099387,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "zitrus",
+   "target": "zitrus-mod-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.9141790449939435,
+    "compile_exit": 0,
+    "run": "exit 0, 40 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.012569508005981334
+   },
+   "bs": {
+    "cold_local": 0.47566189400095027,
+    "cold_local_donor": 0.3348845950094983,
+    "compile_exit": 0,
+    "run": "exit 0, 40 passed; 1 skipped; 0 failed.",
+    "run_exit": 0,
+    "run_secs": 0.008156067997333594
+   }
+  },
+  {
+   "project": "zitrus",
+   "target": "zitrus-exe-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5670143999886932,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.004725478996988386
+   },
+   "bs": {
+    "cold_local": 0.3077389740210492,
+    "cold_local_donor": 0.143940226000268,
+    "compile_exit": 0,
+    "run": "exit 0, All 0 tests passed.",
+    "run_exit": 0,
+    "run_secs": 0.0020729219977511093
+   }
+  },
+  {
+   "project": "zigdown",
+   "target": "zigdown",
+   "verdict": "bs: compile error",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 12.440700043996912,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 4.285585676989285,
+    "compile_exit": 1,
+    "error": "zig-pkg/plutosvg-0.0.6-3-LyMxgXMyAAD6k7ItjCRXOfbv3dDsF-oPiTWZZgLdEiIB/lib/plutosvg.zig:91:63: error[type-mismatch]: expected type '?*const fn (?*anyopaque, ?*anyopaque, c_int) callconv(.c) void', found 'fn (?*anyopaque, ?*anyopaque, i32) callconv(.c) void'"
+   }
+  },
+  {
+   "project": "zigdown",
+   "target": "test",
+   "verdict": "bs: compile error",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 12.48035620500741,
+    "compile_exit": 0,
+    "run": "exit 0, no summary",
+    "run_exit": 0,
+    "run_secs": 0.06852883799001575
+   },
+   "bs": {
+    "cold_local": 4.012665899994317,
+    "compile_exit": 1,
+    "error": "zig-pkg/plutosvg-0.0.6-3-LyMxgXMyAAD6k7ItjCRXOfbv3dDsF-oPiTWZZgLdEiIB/lib/plutosvg.zig:91:63: error[type-mismatch]: expected type '?*const fn (?*anyopaque, ?*anyopaque, c_int) callconv(.c) void', found 'fn (?*anyopaque, ?*anyopaque, i32) callconv(.c) void'"
+   }
+  },
+  {
+   "project": "sandopolis",
+   "target": "sandopolis",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 4.607847606996074,
+    "compile_exit": 0,
+    "run": "not run"
+   },
+   "bs": {
+    "cold_local": 2.7069873610016657,
+    "cold_local_donor": 1.645174395001959,
+    "compile_exit": 0,
+    "run": "not run"
+   }
+  },
+  {
+   "project": "sandopolis",
+   "target": "test",
+   "verdict": "bs: run differs (exit signal 6, no summary, died in system_machine.test.facade boots a sega cd from bios bytes and an in-memory iso vs exit 0, All 602 tests passed.)",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 3.9609382760099834,
+    "compile_exit": 0,
+    "run": "exit 0, All 602 tests passed.",
+    "run_exit": 0,
+    "run_secs": 124.79201959200145
+   },
+   "bs": {
+    "cold_local": 1.4854118619841756,
+    "cold_local_donor": 1.311548348981887,
+    "compile_exit": 0,
+    "run": "exit signal 6, no summary, died in system_machine.test.facade boots a sega cd from bios bytes and an in-memory iso",
+    "run_exit": "signal 6",
+    "run_secs": 74.1924547660019
+   }
+  },
+  {
+   "project": "sandopolis",
+   "target": "test:tests/property_tests.zig",
+   "verdict": "ok",
+   "bs_commit": "1a859c51",
+   "zig": {
+    "cold_local": 1.5698156430007657,
+    "compile_exit": 0,
+    "run": "exit 0, All 25 tests passed.",
+    "run_exit": 0,
+    "run_secs": 16.014853583998047
+   },
+   "bs": {
+    "cold_local": 0.73563352500787,
+    "cold_local_donor": 0.5404778789816191,
+    "compile_exit": 0,
+    "run": "exit 0, All 25 tests passed.",
+    "run_exit": 0,
+    "run_secs": 8.136756432999391
+   }
+  },
+  {
+   "project": "evm.zig",
+   "target": "evmz:tools/main.zig",
+   "verdict": "upstream fails to compile",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.03916327899787575,
+    "compile_exit": -11,
+    "error": ""
+   },
+   "bs": {
+    "cold_local": 11.40997971300385,
+    "compile_exit": 1,
+    "error": "src/interpreter/tail_dispatch.zig:283:28: error[unsupported]: unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags"
+   }
+  },
+  {
+   "project": "evm.zig",
+   "target": "test",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5758284320036182,
+    "compile_exit": 0,
+    "run": "exit 0, 7 of 7 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.006046161986887455
+   },
+   "bs": {
+    "cold_local": 0.416670962003991,
+    "cold_local_donor": 0.38589740300085396,
+    "compile_exit": 0,
+    "run": "exit 0, 7 of 7 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.002794579995679669
+   }
+  },
+  {
+   "project": "evm.zig",
+   "target": "mpt-key-tests",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.5578984719904838,
+    "compile_exit": 0,
+    "run": "exit 0, 2 of 2 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.009343931000330485
+   },
+   "bs": {
+    "cold_local": 0.33460917900083587,
+    "cold_local_donor": 0.17510152200702578,
+    "compile_exit": 0,
+    "run": "exit 0, 2 of 2 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.0054700300097465515
+   }
+  },
+  {
+   "project": "evm.zig",
+   "target": "test:pkg/mpt/test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.7909407020051731,
+    "compile_exit": 0,
+    "run": "exit 0, 55 of 55 tests passed",
+    "run_exit": 0,
+    "run_secs": 1.259152755010291
+   },
+   "bs": {
+    "cold_local": 0.5289945799886482,
+    "cold_local_donor": 0.33015237998915836,
+    "compile_exit": 0,
+    "run": "exit 0, 55 of 55 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.5126380160072586
+   }
+  },
+  {
+   "project": "evm.zig",
+   "target": "test:pkg/rlp/src/test.zig",
+   "verdict": "ok",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.8077798239974072,
+    "compile_exit": 0,
+    "run": "exit 0, 37 of 37 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.022008102998370305
+   },
+   "bs": {
+    "cold_local": 0.4568678289942909,
+    "cold_local_donor": 0.2841239069966832,
+    "compile_exit": 0,
+    "run": "exit 0, 37 of 37 tests passed",
+    "run_exit": 0,
+    "run_secs": 0.013543503009714186
+   }
+  },
+  {
+   "project": "evm.zig",
+   "target": "evmz-native-tests",
+   "verdict": "upstream fails to compile",
+   "bs_commit": "1c792147",
+   "zig": {
+    "cold_local": 0.03687764299684204,
+    "compile_exit": -11,
+    "error": ""
+   },
+   "bs": {
+    "cold_local": 11.985557322012028,
+    "compile_exit": 1,
+    "error": "src/interpreter/tail_dispatch.zig:283:28: error[unsupported]: unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags"
+   }
+  }
+ ]
+}
