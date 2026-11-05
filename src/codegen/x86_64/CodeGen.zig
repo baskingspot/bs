@@ -150,8 +150,11 @@ cold_starts: std.ArrayList(ColdStart) = .empty,
 cover_key: SymbolKey = undefined,
 cover_pcs: std.ArrayList(u32) = .empty,
 cold_open: std.ArrayList(OpenInline) = .empty,
-/// The function contains inline assembly, so no value gets a register.
+/// The function contains inline assembly (`planRegisters`).
 has_asm: bool = false,
+/// From `planRegisters`: per position (as `Ssa.clobbers`), how many
+/// inline assembly statements come at or before it.
+asm_counts: std.ArrayList(u32) = .empty,
 /// Per value in two registers that code read from memory, or in a
 /// register saved around clobber points (`split_vals`): its slot.
 pair_spills: std.AutoHashMapUnmanaged(u32, i32) = .empty,
@@ -343,6 +346,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.stub_open.deinit(gpa);
         cg.cover_pcs.deinit(gpa);
         cg.r11_clobbers.deinit(gpa);
+        cg.asm_counts.deinit(gpa);
     }
     if (cover) cg.cover_key = Emit.coverageKeys(try emit.funcKey(ir.func))[0];
     @memset(cg.homes, .none);
@@ -1769,7 +1773,7 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         // moves. (`Ssa.plan` promotes variables.)
         .block => {
             const ty = data.ty_pl.ty;
-            const class: RegClass = if (cg.has_asm) .none else if (cg.inGpr(ty) or cg.inGprBytes(ty)) .gpr else if (cg.inPair(ty)) .pair else if (cg.inFloat(ty)) .float else .none;
+            const class: RegClass = if (cg.inGpr(ty) or cg.inGprBytes(ty)) .gpr else if (cg.inPair(ty)) .pair else if (cg.inFloat(ty)) .float else .none;
             if (class != .none) {
                 const live = cg.emit.ssa.live.slice();
                 live.items(.reg)[@backingInt(inst)] = class.want();
@@ -1780,12 +1784,12 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         // A copy of a by-reference argument is its pointer, folded into
         // its users' addressing when the argument has a register.
         .alloc => {
-            if (!cg.has_asm and cg.const_alias.count() != 0 and cg.const_alias.contains(@backingInt(inst))) {
+            if (cg.const_alias.count() != 0 and cg.const_alias.contains(@backingInt(inst))) {
                 const live = cg.emit.ssa.live.slice();
                 live.items(.reg)[@backingInt(inst)] = RegClass.gpr.want();
                 live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
             }
-            if (!cg.has_asm and cg.ref_alias.count() != 0 and cg.ref_alias.contains(@backingInt(inst))) {
+            if (cg.ref_alias.count() != 0 and cg.ref_alias.contains(@backingInt(inst))) {
                 const live = cg.emit.ssa.live.slice();
                 live.items(.reg)[@backingInt(inst)] = RegClass.gpr.want();
                 live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
@@ -1801,7 +1805,7 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         .slice_ptr, .slice_len => if (cg.pairFoldable(inst)) return false,
         else => {},
     }
-    const class: RegClass = if (cg.has_asm) .none else cg.wantsReg(inst);
+    const class: RegClass = cg.wantsReg(inst);
     const want = class != .none;
     if (want) {
         const live = cg.emit.ssa.live.slice();
@@ -1826,7 +1830,9 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         },
         // A value in memory is copied to its slot (`copyMem`).
         .load => !want and Type.abiSize(cg.ip, data.ty_op.ty) > copy_inline_max,
-        .call, .atomic_rmw => true,
+        // Inline assembly writes the registers it names and takes its
+        // operands' from rax-r11.
+        .call, .atomic_rmw, .assembly => true,
         // Its fields are copied through rax.
         .aggregate_init => switch (cg.ip.keyTag(data.ty_pl.ty)) {
             .struct_type, .tuple_type => Type.abiSize(cg.ip, data.ty_pl.ty) > 128,
@@ -1861,40 +1867,46 @@ fn planRegisters(cg: *CodeGen) Error!void {
     const live = f.live.slice();
     const reg = live.items(.reg);
     @memset(reg, Ssa.no_reg);
-    cg.has_asm = f.has_asm;
+    cg.has_asm = for (f.values.items(.inst)) |inst| {
+        if (ir.instructions.items(.tag)[@backingInt(inst)] == .assembly) break true;
+    } else false;
     // `clobbers` marks the values that want a register.
     try f.liveness(cg.gpa, ir, cg);
     cg.live = true;
-    if (!cg.has_asm) try cg.exemptArgs();
+    try cg.exemptArgs();
     try f.plan(cg.gpa, ir, cg.ip, cg);
     f.bypassUnread(ir);
     const fate = live.items(.fate);
+    // A `{reg}` operand that names a callee-saved register (cpuid's
+    // `={ebx}`) or a clobber of one (zio's context switch) writes it, so
+    // the prologue saves it. A value that meets an inline assembly
+    // statement (an operand, its result, or one live across it) takes
+    // none of those, nor the registers its operands may get.
+    var asm_regs: u32 = 0;
     if (cg.has_asm) {
-        for (f.values.items(.inst)) |inst| {
-            if (fate[@backingInt(inst)] == .dead) cg.homes[@backingInt(inst)] = .dead;
-        }
-        // No value gets a register, but a `{reg}` operand that names a
-        // callee-saved register (cpuid's `={ebx}`) or a clobber of one
-        // (zio's context switch) writes it, so the prologue saves it.
         comptime for (Ir.Asm.callee_saved_names[0..@popCount(callee_saved)], alloc_regs[0..@popCount(callee_saved)]) |name, r| {
             assert(std.mem.eql(u8, name, @tagName(r)));
         };
         for (f.values.items(.inst)) |inst| {
             if (ir.instructions.items(.tag)[@backingInt(inst)] != .assembly) continue;
             const extra = ir.extraData(Ir.Asm, ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload);
-            cg.saved |= extra.data.callee_saved_clobbers;
+            asm_regs |= extra.data.callee_saved_clobbers & callee_saved;
             var i = extra.end;
             for (0..extra.data.outputs_len + extra.data.inputs_len) |_| {
                 const op = ir.extraData(Ir.Asm.Operand, i).data;
                 i += 3;
                 const c = asmAlternative(std.mem.trimStart(u8, cg.ip.stringSlice(op.constraint), "=+"));
                 const r = parseReg(regConstraint(c) orelse continue) orelse continue;
-                for (alloc_regs[0..@popCount(callee_saved)], 0..) |saved, bit| {
-                    if (saved == r.reg) cg.saved |= @as(u32, 1) << @intCast(bit);
-                }
+                const k = allocIndex(r.reg);
+                if (k != Ssa.no_reg) asm_regs |= @as(u32, 1) << @intCast(k);
             }
         }
-        return;
+        // `assembly`'s `r` operands and its outputs' addresses get
+        // registers of rax-r11.
+        for (alloc_regs, 0..) |r, k| switch (r) {
+            .rsi, .rdi, .r8, .r9, .r11 => asm_regs |= @as(u32, 1) << @intCast(k),
+            else => {},
+        };
     }
     try cg.planDeferred();
     try cg.planRotates();
@@ -1974,7 +1986,13 @@ fn planRegisters(cg: *CodeGen) Error!void {
     while (consts.next()) |a| cg.split.unset(a.*);
     try cg.planRetCalls();
     try cg.planR11();
-    cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split, r11_only, cg.r11_clobbers.items) & callee_saved;
+    var restrictions: [2]Ssa.Restriction = .{ .{ .regs = r11_only, .counts = cg.r11_clobbers.items }, undefined };
+    var n_restrictions: usize = 1;
+    if (try f.asmCounts(cg.gpa, ir, &cg.asm_counts)) |c| {
+        restrictions[1] = .{ .regs = asm_regs, .counts = c };
+        n_restrictions = 2;
+    }
+    cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split, restrictions[0..n_restrictions]) & callee_saved | asm_regs & callee_saved;
     const reg2 = live.items(.reg2);
     for (f.values.items(.inst)) |inst| {
         const i = @backingInt(inst);
@@ -2451,7 +2469,6 @@ fn planCopies(cg: *CodeGen) Error!void {
             if (cg.homes[@backingInt(l)] != .deferred) cg.homes[@backingInt(l)] = if (last == l) .dead else .deferred;
         }
     }
-    if (f.has_asm) return;
     const gpa = cg.gpa;
     for (f.values.items(.inst)) |inst| {
         if (tags[@backingInt(inst)] != .store) continue;
@@ -3544,7 +3561,6 @@ fn addrOperand(cg: *CodeGen, inst: Inst.Index) Ref {
 /// in layout order, where the base's register class is already known. If
 /// the base gets no register after all, the pointer is computed as usual.
 fn addrFoldable(cg: *CodeGen, inst: Inst.Index) bool {
-    if (cg.has_asm) return false;
     const ir = cg.ir;
     const ip = cg.ip;
     const data = ir.instructions.items(.data)[@backingInt(inst)];
@@ -3572,7 +3588,6 @@ fn addrFoldable(cg: *CodeGen, inst: Inst.Index) bool {
 /// registers is folded into that slice's register: it takes none, and its
 /// users read the slice's (`lengthenIntervals`, as for `addrFoldable`).
 fn pairFoldable(cg: *CodeGen, inst: Inst.Index) bool {
-    if (cg.has_asm) return false;
     const b = cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op.operand.toIndex() orelse return false;
     if (cg.emit.ssa.live.items(.reg)[@backingInt(b)] != Ssa.want_pair) return false;
     cg.addr_base[@backingInt(inst)] = @backingInt(b);
