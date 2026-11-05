@@ -2318,7 +2318,12 @@ Before the rules, scalar replacement (`src/codegen/sroa.zig`, Go's
 fields (integers and enums up to 64 bits, `f32`, `f64`, `bool`,
 pointers, slices) whose address is used only for field pointers, whole
 loads, and whole stores into one local per field, which CodeGen then
-keeps in a register. A field pointer becomes its field's local (as a
+keeps in a register. So does a local array of at most 16 such scalars
+or 16-byte vectors indexed only at constant indices (`ptr_elem_ptr`
+with a constant, which `inline for` makes; BLAKE3's `v: [16]Vec` once
+`roundFnVec` inlines), its elements as fields: promotion keeps what
+fits in registers and spills the rest, no worse than the array's
+memory. A field pointer becomes its field's local (as a
 substitution the rule walk applies); a whole store becomes a store of
 each field; a whole load becomes the fields' loads and an
 `aggregate_init`, whose field reads a rule folds. Two neighbors make the

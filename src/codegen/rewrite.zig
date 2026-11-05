@@ -315,7 +315,7 @@ const Walker = struct {
             .unwrap_errunion_err => return w.wrapPart(tag, data.ty_op.operand),
             .is_null, .is_non_null, .is_err, .is_non_err => return w.constPart(tag, data.un_op) orelse w.wrapPart(tag, data.un_op),
             .bitcast => return w.constAlias(data.ty_op),
-            .array_elem_val => return w.constElem(data.bin_op.lhs, data.bin_op.rhs),
+            .array_elem_val => return try w.constElem(data.bin_op.lhs, data.bin_op.rhs) orelse w.initElem(data.bin_op.lhs, data.bin_op.rhs),
             .load => return w.loadConst(data.ty_op.operand),
             .add_with_overflow, .sub_with_overflow, .mul_with_overflow => return w.overflowConst(inst, tag, data),
             .not => if (w.invertCmp(inst, data)) return null,
@@ -477,6 +477,22 @@ const Walker = struct {
         const x = ir.extraData(Ir.Aggregate, agg.payload);
         if (x.data.len != Type.fieldCount(w.ip, agg.ty)) return null;
         return ir.refSlice(x.end, x.data.len)[sf.index];
+    }
+
+    /// An element, at a constant index, of an array an `aggregate_init`
+    /// makes (a split array's whole load, `sroa`).
+    fn initElem(w: *Walker, array: Inst.Ref, index: Inst.Ref) ?Inst.Ref {
+        const ir = w.ir;
+        const i = @backingInt(array.toIndex() orelse return null);
+        if (ir.instructions.items(.tag)[i] != .aggregate_init) return null;
+        const k = index.toInterned() orelse return null;
+        if (w.ip.keyTag(k) != .int) return null;
+        const agg = ir.instructions.items(.data)[i].ty_pl;
+        if (w.ip.keyTag(agg.ty) != .array_type) return null;
+        const x = ir.extraData(Ir.Aggregate, agg.payload);
+        const n = w.ip.intValue(u64, k) orelse return null;
+        if (n >= x.data.len or x.data.len != w.ip.keyPayload(.array_type, agg.ty).len) return null;
+        return ir.refSlice(x.end, x.data.len)[@intCast(n)];
     }
 
     /// A field of a constant struct or tuple.
