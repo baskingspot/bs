@@ -602,7 +602,8 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             return inc.noLink("export '{s}' has no symbol number", .{x.name});
     }
 
-    const aliases = try externAliases(arena, m, WithInputs{ .pack = &input, .extra = &.{}, .overrides = &.empty }, in.numbered);
+    const aliases = try externAliases(arena, m, WithInputs{ .pack = &input, .extra = &.{}, .overrides = &.empty }, in.numbered) orelse
+        return inc.noLink("an extern slot's atom record is damaged", .{});
     const numbered_aliases = try arena.alloc(Elf.NumberedAlias, aliases.len);
     for (numbered_aliases, aliases) |*n, a| n.* = .{
         .symbol = m.symbol(@backingInt(a.key)).?,
@@ -717,7 +718,9 @@ fn loadShared(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io
 /// manifest's references hold is a candidate; a manifest with no such
 /// key costs one lookup per name. A key only unlinked atoms still use
 /// may have no linked slot, and gets no alias.
-fn externAliases(arena: Allocator, m: *const Manifest, pack_atoms: WithInputs, numbered: []const Elf.NumberedAtom) ![]const Emit.Alias {
+/// Null if a slot's record is damaged (`Pack.LinkAtoms.check`), which the
+/// link would report.
+fn externAliases(arena: Allocator, m: *const Manifest, pack_atoms: WithInputs, numbered: []const Elf.NumberedAtom) !?[]const Emit.Alias {
     var slots: std.AutoArrayHashMapUnmanaged(u32, Atom.SymbolKey) = .empty;
     for (0..m.refNameCount()) |i| {
         const name = m.refName(@intCast(i));
@@ -729,6 +732,7 @@ fn externAliases(arena: Allocator, m: *const Manifest, pack_atoms: WithInputs, n
     var aliases: std.ArrayList(Emit.Alias) = try .initCapacity(arena, slots.count());
     for (numbered, 0..) |na, i| {
         const key = slots.get(na.symbol) orelse continue;
+        if (!pack_atoms.check(i)) return null;
         const a = pack_atoms.atom(i);
         // An undefined weak symbol's slot has no relocation; nothing
         // strong refers to it through `extaddr`.
@@ -898,6 +902,8 @@ fn linkWithInputs(
         };
         dynamic.runpath = inc.runpath;
     }
+    const aliases = try externAliases(arena, m, WithInputs{ .pack = pack_atoms, .extra = &.{}, .overrides = &overrides }, numbered) orelse
+        return inc.noLink("an extern slot's atom record is damaged", .{});
     var diag: Elf.Diagnostic = .{};
     const options: Elf.Options = .{
         .entry = @fromBackingInt(m.entry),
@@ -907,7 +913,7 @@ fn linkWithInputs(
         .stack_size = inc.stack_size,
         .local_symbols = converted.symbols,
         .input_sections = converted.sections,
-        .aliases = try externAliases(arena, m, WithInputs{ .pack = pack_atoms, .extra = &.{}, .overrides = &overrides }, numbered),
+        .aliases = aliases,
         .dynamic = if (glibc != null) &dynamic else null,
     };
     Elf.linkInput(gpa, io, out_dir, sub_path, WithInputs{ .pack = pack_atoms, .extra = extra.items, .overrides = &overrides }, options) catch |err| switch (err) {
