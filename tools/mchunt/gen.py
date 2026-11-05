@@ -1651,7 +1651,7 @@ class Gen:
             (2, "sroaesc"), (2, "retbig"), (2, "erragg"), (2, "packstore"),
             (2, "rvoglob"), (2, "boolret"), (1, "asmpin"), (2, "xcall"), (2, "prove3"),
             (2, "swx"), (2, "scopenum"), (2, "argbase"), (2, "mulbound"), (2, "retlen"),
-            (2, "sharefwd"), (2, "fwdalias"), (2, "storefwd"), (2, "unrollswap"), (1, "storelen"), (2, "inlnest"),
+            (2, "sharefwd"), (2, "fwdalias"), (2, "storefwd"), (2, "unrollswap"), (1, "storelen"), (2, "inlnest"), (2, "divnarrow"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -3713,6 +3713,82 @@ class Gen:
         self.sink(ctx, f"{st}.a ^ @as(u32, @as(u16, @bitCast({st}.b))) ^ {st}.c", U32)
         self.sink(ctx, f"@as(u64, @truncate({w} ^ ({w} >> 64)))", U64)
         self.sink(ctx, f"{buf}[0] ^ {buf}[5]", U32)
+
+    def s_divnarrow(self, ctx):
+        """Integer division of every kind on wide (65..128-bit) and narrow
+        types: operands near the 64-bit boundaries and the type's limits in
+        every sign combination, chosen at run time, and comptime-known
+        divisors (powers of two, small odd numbers, 2^63, 2^64, maxInt(u64),
+        negative ones). Division by zero, minInt / -1 and nonpositive
+        @rem/@mod divisors are guarded except for rare near misses, which
+        must panic as upstream does."""
+        if ctx["fn"].pure:
+            return self.s_sroa(ctx)
+        ctx["fn"].risky = True
+        e = lambda s_: self.emit(ctx, s_)
+        wide = self.chance(0.6)
+        if wide:
+            sg, bits = self.pick([(True, 128), (False, 128), (True, 128), (False, 128), (True, 65), (False, 65),
+                                  (False, 100), (True, 127), (True, 100), (False, 127)])
+        else:
+            sg, bits = self.pick([(True, 8), (True, 16), (True, 32), (True, 64), (False, 64), (True, 7), (True, 33),
+                                  (False, 63), (False, 32), (False, 8)])
+        T = f"{'i' if sg else 'u'}{bits}"
+        lo, hi = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if sg else (0, (1 << bits) - 1)
+        P63, P64 = 1 << 63, 1 << 64
+        base = [0, 1, 2, 3, 7, 60, 1000, 86400, 10**9, 1 << 32, 1 << 62, P63 - 1, P63, P63 + 1, P64 - 1, P64, P64 + 1,
+                (1 << 100) + 5, lo, hi, lo + 1, hi - 1, hi // 3]
+        cand = set(base) | {-v for v in base}
+        vals = sorted(v for v in cand if lo <= v <= hi)
+        for _ in range(4):
+            vals.append(self.r.randint(lo, hi))
+        lit = lambda v: f"@as({T}, {'-' if v < 0 else ''}0x{abs(v):x})"
+        sel = self.fresh("dv")
+        e(f"var {sel} = [_]{T}{{ {', '.join(lit(v) for v in vals)} }};")
+        e(f"_ = &{sel};")
+        a, b = self.fresh("da"), self.fresh("db")
+        pick = lambda: f"{sel}[@as(usize, @truncate({self.int_expr(ctx, U64, 1)})) % {len(vals)}]"
+        e(f"var {a}: {T} = {pick()};")
+        e(f"var {b}: {T} = {pick()};")
+        e(f"_ = &{a};")
+        e(f"_ = &{b};")
+        consts = [1, 2, 4, 1 << 32, 1 << 62, P63, P64, -1, -2, -P63, 3, 7, 60, 1000, 86400, 10**9, P63 - 1, P64 - 1,
+                  P63 + 12345, 5, 9, 100]
+        consts = [c for c in consts if lo <= c <= hi and c != 0]
+        W = f"{'i' if sg else 'u'}128"
+        def sink(x):
+            r = self.fresh("dr")
+            e(f"const {r}: {W} = {x};")
+            self.sink(ctx, f"@as(u64, @truncate(@as(u128, @bitCast({r}))))", U64)
+            if bits > 64:
+                self.sink(ctx, f"@as(u64, @truncate(@as(u128, @bitCast({r})) >> 64))", U64)
+        ops = ["@divTrunc", "@divFloor", "@divCeil", "@rem", "@mod"] + (["/", "%"] if not sg else [])
+        for _ in range(self.r.randint(2, 5)):
+            op = self.pick(ops)
+            const = self.chance(0.5)
+            if const:
+                c = self.pick(consts)
+                if op in ("@rem", "@mod", "%") and c < 0:
+                    c = -c if lo <= -c <= hi else 3
+                d = lit(c)
+                guard = f"{a} != std.math.minInt({T})" if sg and c == -1 else None
+            else:
+                d = b
+                if op in ("@rem", "@mod", "%"):
+                    guard = f"{b} > 0"
+                elif sg:
+                    guard = f"{b} != 0 and !({b} == -1 and {a} == std.math.minInt({T}))"
+                else:
+                    guard = f"{b} != 0"
+            expr = f"({a} {op} {d})" if op in ("/", "%") else f"{op}({a}, {d})"
+            if guard and not self.chance(0.04):
+                e(f"if ({guard}) {{")
+                ctx["indent"] += 1
+                sink(expr)
+                ctx["indent"] -= 1
+                e("}")
+            else:
+                sink(expr)
 
     def s_storelen(self, ctx):
         """s_storefwd's slice-length cases only."""
