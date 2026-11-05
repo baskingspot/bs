@@ -1961,6 +1961,55 @@ build, the passes, and the debug info treat them as Sema's inline calls
   36), indirect
   calls through stubs (the stub calls r11) if vtable-heavy code shows a
   win, or an unwinder whose cost does not grow with distinct pcs.
+- **Constant arguments (counted 2026-11-05 on main fd4c29b, parked).**
+  The question was whether a callee over the budget fits once a call's
+  constant arguments are folded into it, as ReleaseSafe inlines and
+  specializes `mem.eql(u8, s, "return")`. A temporary probe in
+  `inlineProcess` measured this for every call that stays a call and has
+  a constant argument. It copied the callee with the constants in place,
+  ran `rewrite`, and counted the live code reachable through constant
+  `cond_br`s and `switch_br`s, with the callee's own calls counted only
+  if they would inline as well. Also letting prove decide every branch
+  its facts prove, and taking a `slice(ptr, K)` argument's length as
+  constant, changed almost nothing:
+
+  | Program | Constant-argument calls | Fit at the budget | Fit at 2× |
+  |---|---:|---:|---:|
+  | hash | 864 | 18 | 26 |
+  | unwinder (100k 5-deep traces) | 841 | 13 | 21 |
+  | zfmt (parse and render lib/std) | 1,782 | 16 | 37 |
+  | vaxis render | 1,384 | 13 | 32 |
+  | zls tests | 11,095 | 128 | 258 |
+  | zig workload | 123,840 | 1,120 | 6,535 |
+
+  What fits at the budget is cold: `alignForward` and `isAligned` with a
+  constant alignment, `init`s, zls's `wantKind`. The hot callees the
+  survey ranked do not fit:
+  - `mem.eql` with a constant string measures 193 with `eqlBytes`, and
+    141 folded. ReleaseSafe's two loads need the length substituted as
+    a value, not only branches decided, the 4-iteration loop unrolled
+    in the IR, and the duplicate loads merged.
+  - `Wyhash.hash` for an 8-byte key measures 518, and stays a call even
+    at budget 128. Its cost is the 128-bit arithmetic through memory.
+  - `regNative` with a constant register, with `dwarfRegisterBytes`,
+    folds to 39–43. It fits only at 2× the budget, which is the
+    unwinder's −10.7%.
+  - zfmt's `getIndex` and `findPosLinear`, and vaxis's
+    `utf8.Iterator.next` and `appendSliceAssumeCapacity`, take runtime
+    arguments at their hot calls, so they are a matter of size, not of
+    constants.
+
+  A uniform budget, for comparison (Ir, with text in parentheses): 32
+  gives hash 0 (+2%), the unwinder −6.9% (+2%), zfmt −0.6% (+3%); 48
+  gives −8.1% (+6%), −10.7% (+6%), −4.5% (+7%), at +23.5% IR and +19.6%
+  text on the zig workload; 64 adds nothing more. Building it would
+  take a per-callee summary to pick the calls worth evaluating, since
+  evaluating every one took the zig workload from 9.8 s to 33.8 s. It
+  would also need a memo per (callee, constants), the callee's body hash
+  in `func_inline`, constant `switch_br` folding, and up to +1.3% IR on
+  the zig workload at 2×, all for one program. Cloning callees per
+  constant tuple costs more: the whole backend per clone, and new cache
+  units and symbols.
 - **Synthetic panic frames.** Only cold code changes. A panic call in
   cold code inside calls the backend inlined (`DbgInline.flags.backend`;
   Sema's inline calls lose their frame as upstream's do) calls a chain of
