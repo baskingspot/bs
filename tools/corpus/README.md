@@ -149,9 +149,24 @@ of packed registers (ChipZ, sandopolis, zitrus), fibers and event loops
 (polyrole) and a Markdown renderer (zigdown); they are MIT (evm.zig
 MIT or Apache-2.0). ChipZ records only its test (its exe needs SDL2);
 sandopolis records `test-unit` and `test-property` (its full `test`
-needs ROMs). Each run is timed once
-(`run_secs`, the scoreboard's "run zig / bs" column), so run-time ratios
-to upstream come from the same run as the verdicts.
+needs ROMs).
+
+The 17 after monstar (eth.zig through ssz.zig) were added on 2026-11-05
+toward 128-bit arithmetic and crypto (eth.zig, ssz.zig, ulid.zig), inline
+assembly (wamr, a WebAssembly runtime and AOT compiler; forklift, a JIT),
+heavy comptime (zig-graph-compiler, which compiles a tensor graph at
+comptime), C and C++ interop (zbullet's C++ Bullet, zstbi, zig-lmdb,
+zstd.zig, element-0) and programs with real run time; they are MIT,
+Apache-2.0 (element-0, zoto, wamr), ISC (maxminddb.zig) or the Unlicense
+(ssz.zig). maxminddb.zig's test data comes from a git submodule. forklift
+records `test_user`, and wamr `test-minimal-wasi` and
+`test-execution-context`: forklift's full `test` does not compile under
+upstream, and wamr's needs an aarch64 objdump. ulid.zig's `bench` prints
+timings, so its stdout is not compared (`"compare_stdout": false`).
+
+Each run is timed once (`run_secs`, the scoreboard's "run zig / bs"
+column), so run-time ratios to upstream come from the same run as the
+verdicts.
 
 ## Scoreboard
 

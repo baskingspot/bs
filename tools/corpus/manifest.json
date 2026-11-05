@@ -3080,6 +3080,470 @@
      "note": "Not run: the terminal needs a Wayland compositor. Under weston (x11 backend) the window bs's build draws for `-e sh -c 'printf ...; ls'` matched upstream's pixel for pixel apart from the pointer (2026-11-05)."
     }
    ]
+  },
+  {
+   "name": "eth.zig",
+   "url": "https://github.com/StrobeLabs/eth.zig",
+   "commit": "052749c860009b89000503902c2d212d608d5528",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "zbullet",
+   "url": "https://github.com/zig-gamedev/zbullet",
+   "commit": "6c3acca3cd4bb4dd4f6dfbe6e1679a679c2ba3ec",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zbullet-tests"
+    }
+   ]
+  },
+  {
+   "name": "zstbi",
+   "url": "https://github.com/zig-gamedev/zstbi",
+   "commit": "6b9bea1fd13eb7c8299f23605b4c6b04fccd9aa7",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zstbi-tests"
+    }
+   ]
+  },
+  {
+   "name": "zig-lmdb",
+   "url": "https://github.com/nDimensional/zig-lmdb",
+   "commit": "df93065928c73ff8dc1ceb45791190a2828f496d",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "hocdb",
+   "url": "https://github.com/o1dstaRs/hocdb",
+   "commit": "4361aada24bc0f03bc837ee2189dbc0926b6c7d2",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "hocdb",
+     "run": []
+    },
+    {
+     "name": "test"
+    },
+    {
+     "name": "test:src/root.zig"
+    }
+   ]
+  },
+  {
+   "name": "zig-graph-compiler",
+   "url": "https://github.com/krypticlogan/zig-graph-compiler",
+   "commit": "98e94b5f918b031c48528210d881171e58286cee",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zgc"
+    },
+    {
+     "name": "zgc-executable-runner-test",
+     "note": "bs refuses `--force_undefined`, which build.zig's `forceUndefinedSymbol(\"zgc_runtime_run\")` passes (bs, CLI and linker; open)."
+    },
+    {
+     "name": "test",
+     "note": "Not a bs bug: upstream with `-mcpu=x86_64_v2` fails the same way (tests/network.zig:36, access of union field 'kernel' while field 'direct' is active). The comptime cost model sizes memory transfers with `std.simd.suggestVectorLength(f32)`: 8 lanes with the host's AVX2 under upstream, 4 under bs, which clamps the native CPU to x86_64_v2 (docs/slop/architecture.md). The test hard-codes the fusion plan that AVX2 costs choose."
+    }
+   ]
+  },
+  {
+   "name": "maxminddb.zig",
+   "url": "https://github.com/marselester/maxminddb.zig",
+   "commit": "58d8d14f2aefe470e5fba6418fd844c3d04d3d59",
+   "ref": "master",
+   "license": "ISC",
+   "submodules": true,
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "zig-rbtree",
+   "url": "https://github.com/alexbishop/zig-rbtree",
+   "commit": "571542e325e4598fabd45addd6889184b1c68847",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "example",
+     "run": []
+    },
+    {
+     "name": "src.meta"
+    },
+    {
+     "name": "src.rbtree"
+    },
+    {
+     "name": "test.cached-nodes"
+    },
+    {
+     "name": "example.augmented_example"
+    },
+    {
+     "name": "src.rb_node"
+    },
+    {
+     "name": "test.from_sorted"
+    },
+    {
+     "name": "test.test"
+    },
+    {
+     "name": "src.rb_unmanaged"
+    },
+    {
+     "name": "src.rb_managed"
+    },
+    {
+     "name": "src.index_functions"
+    },
+    {
+     "name": "src.rb_implementation"
+    },
+    {
+     "name": "example.release-example"
+    }
+   ]
+  },
+  {
+   "name": "archive.zig",
+   "url": "https://github.com/muhammad-fiaz/archive.zig",
+   "commit": "37c4ef6696b2a9ac48a4f6baffada0315c3c7366",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "archive"
+    },
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "lanes.zig",
+   "url": "https://github.com/axelmagn/lanes.zig",
+   "commit": "3e02a5b4f85ddacf8c789d73f8c80156c90a2248",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "element-0",
+   "url": "https://github.com/Element0Lang/element-0",
+   "commit": "7a6014b4a7d3c2930cc5c1f304a0a5de9f06cec8",
+   "ref": "main",
+   "license": "Apache-2.0",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "elz-repl"
+    },
+    {
+     "name": "e1_ffi_pow",
+     "run": []
+    },
+    {
+     "name": "e2_ffi_list_increment",
+     "run": []
+    },
+    {
+     "name": "e3_ffi_sum_of_squares",
+     "run": []
+    },
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "zstd.zig",
+   "url": "https://github.com/muhammad-fiaz/zstd.zig",
+   "commit": "aeec26c273fa59bede70421408a98716ddcdb90e",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zstd"
+    },
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "forklift",
+   "url": "https://github.com/bfredl/forklift",
+   "commit": "e7334488e840e66dfad81d77335afbb4c1537db8",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test_user"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "run"
+    },
+    {
+     "name": "test",
+     "note": "Records `test_user` (test/all_user.zig): forklift's full `test` does not compile under upstream. Both compilers' runs panic in flir.test.int2float (integer overflow at src/liveness.zig:222, forklift's bug); the tests both ran before it pass under both."
+    }
+   ]
+  },
+  {
+   "name": "ulid.zig",
+   "url": "https://github.com/hendriknielaender/ulid.zig",
+   "commit": "debff99b8693a9bcf59a2387f0fc683ef0a69c6b",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "bench",
+     "run": [],
+     "compare_stdout": false
+    },
+    {
+     "name": "basic",
+     "run": []
+    },
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "zoto",
+   "url": "https://github.com/braheezy/zoto",
+   "commit": "84f43bed1a657f48433152a7c1da0408d5533d56",
+   "ref": "main",
+   "license": "Apache-2.0",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "wamr",
+   "url": "https://github.com/cataggar/wamr",
+   "commit": "63825e30154186accac4ae012650c206ee1a877c",
+   "ref": "main",
+   "license": "Apache-2.0",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test-minimal-wasi"
+    ],
+    [
+     "test-execution-context"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "wamrc"
+    },
+    {
+     "name": "wamr-exe",
+     "note": "bs's x86_64 inline assembler refuses `mfence` (src/platform/platform.zig:501), then `incl %%eax` in the naked longjmp (src/runtime/aot/trap_jmp.zig:110) (bs, backend; open). With both replaced in a work copy, the target matches upstream."
+    },
+    {
+     "name": "spec-test-runner",
+     "note": "bs's x86_64 inline assembler refuses `mfence` (src/platform/platform.zig:501), then `incl %%eax` in the naked longjmp (src/runtime/aot/trap_jmp.zig:110) (bs, backend; open). With both replaced in a work copy, the target matches upstream."
+    },
+    {
+     "name": "simd-bench-runner",
+     "note": "bs's x86_64 inline assembler refuses `mfence` (src/platform/platform.zig:501), then `incl %%eax` in the naked longjmp (src/runtime/aot/trap_jmp.zig:110) (bs, backend; open). With both replaced in a work copy, the target matches upstream."
+    },
+    {
+     "name": "test"
+    },
+    {
+     "name": "test:src/wasi/minimal.zig"
+    },
+    {
+     "name": "test:tests/minimal_wasi.zig"
+    },
+    {
+     "name": "test:src/runtime/common/execution_context.zig"
+    },
+    {
+     "name": "test:src/root.zig",
+     "note": "bs's x86_64 inline assembler refuses `mfence` (src/platform/platform.zig:501), then `incl %%eax` in the naked longjmp (src/runtime/aot/trap_jmp.zig:110) (bs, backend; open). With both replaced in a work copy, the target matches upstream."
+    }
+   ]
+  },
+  {
+   "name": "ssz.zig",
+   "url": "https://github.com/blockblaz/ssz.zig",
+   "commit": "395121c9037974d24afce13e5bdb16717ace9bf3",
+   "ref": "master",
+   "license": "Unlicense",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "ssz"
+    },
+    {
+     "name": "test"
+    },
+    {
+     "name": "test:src/lib.zig"
+    }
+   ]
   }
  ],
  "excluded": [
