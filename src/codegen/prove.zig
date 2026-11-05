@@ -342,6 +342,9 @@ const Walker = struct {
     stats: Stats = .{},
     /// The overflow operation of the overflow check `decide` decided.
     checked_op: ?Inst.Index = null,
+    /// `step`'s count, and how deep in `assume` and `decide` it is.
+    steps: u32 = 0,
+    nest: u32 = 0,
     /// The loop being walked with candidate facts at its start
     /// (`Scratch.cands`), and whether they held at each `repeat` so far.
     spec: ?struct { loop: Inst.Index, ok: bool } = null,
@@ -1361,6 +1364,26 @@ const Walker = struct {
     /// and b` true is both true, `a or b` false is both false, and a
     /// compare of integers is its fact, or the negation.
     fn assume(w: *Walker, cond: Inst.Ref, truth: bool) Allocator.Error!void {
+        if (!w.step()) return;
+        defer w.nest -= 1;
+        return w.assumeStep(cond, truth);
+    }
+
+    /// Counts one step of `assume` or `decide`, which walk conditions as
+    /// trees: one shared by many `and`s and `or`s would take exponential
+    /// time. A top-level call gets `max_steps`; past them, nothing more is
+    /// assumed or decided.
+    fn step(w: *Walker) bool {
+        if (w.nest == 0) w.steps = max_steps;
+        if (w.steps == 0) return false;
+        w.steps -= 1;
+        w.nest += 1;
+        return true;
+    }
+
+    const max_steps = 256;
+
+    fn assumeStep(w: *Walker, cond: Inst.Ref, truth: bool) Allocator.Error!void {
         if (cond.toIndex() == null) return;
         const ir = w.ir;
         // The instruction that computed the value first (`number`) has
@@ -1444,6 +1467,15 @@ const Walker = struct {
 
     /// Whether the facts decide condition `cond`.
     fn decide(w: *Walker, cond: Inst.Ref) ?bool {
+        if (!w.step()) {
+            w.checked_op = null;
+            return null;
+        }
+        defer w.nest -= 1;
+        return w.decideStep(cond);
+    }
+
+    fn decideStep(w: *Walker, cond: Inst.Ref) ?bool {
         w.checked_op = null;
         const i = cond.toIndex() orelse return null;
         const ir = w.ir;

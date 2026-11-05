@@ -2101,6 +2101,12 @@ user branches are coverage points and are only learned from.
   condition handles `not`, `bool` blocks, and `a & b` / `a | b` by
   assuming one side and deciding the other. The 64 most recent facts are
   searched, which keeps functions with thousands of checks linear.
+- **Step budget.** Assuming a condition and deciding one walk it as a
+  tree (`not`, `and`, `or`, and through value numbering to the first
+  equal instruction), so a condition reached along many paths is walked
+  once per path: the zig workload spent 2.9 s of CPU in prove. Each
+  top-level assume or decide takes at most 256 steps and then assumes or
+  decides nothing more; it proves the same checks in 1.3 s.
 - **Proofs.** A compare follows from a fact on the same operands, from
   constant bounds the facts give each operand (with `x < y` bounding
   `x` by the maximum of the fact's type less one), from `x < y` for
