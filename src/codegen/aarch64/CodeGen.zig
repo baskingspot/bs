@@ -6,8 +6,9 @@
 //! branch computes, and which overflow results write their fields
 //! directly. Scalars in general-purpose registers (`inGpr`), including
 //! promoted variables, get one of the callee-saved x19-x28 from linear
-//! scan (`Ssa.allocate`), and slices, optional slices, and error unions
-//! with an 8-byte payload (`inPair`) two of them; f32 and f64 (`inFloat`)
+//! scan (`Ssa.allocate`), and slices, optional slices, error unions with
+//! an 8-byte payload, and 128-bit integers (`inPair`, `int128.zig`) two of
+//! them; f32 and f64 (`inFloat`)
 //! one of d8-d15, whose low halves calls preserve, or of v20-v29; and
 //! vectors of up to 16 bytes (`inVec`) one of v20-v29. Calls clobber v20-v29, so a value lives
 //! in one only when no instruction that may call (`callFree`) lies in its
@@ -56,6 +57,7 @@ const asm_src = @import("../asm_src.zig");
 const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
 const vector = @import("vector.zig");
+const int128 = @import("int128.zig");
 const Ssa = @import("../Ssa.zig");
 const switch_br = @import("../switch_br.zig");
 const print = @import("../../Ir/print.zig");
@@ -216,7 +218,7 @@ const Home = union(enum) {
     regs: Regs,
 };
 
-const Regs = struct { lo: Reg, hi: Reg };
+pub const Regs = struct { lo: Reg, hi: Reg };
 
 /// Where an operand's value can be read.
 pub const Loc = union(enum) {
@@ -611,6 +613,7 @@ fn allocateRegs(cg: *CodeGen) Error!void {
     var counts: std.ArrayList(u32) = .empty;
     defer counts.deinit(cg.gpa);
     const restrictions: []const Ssa.Restriction = if (try f.asmCounts(cg.gpa, cg.ir, &counts)) |c| &.{.{ .regs = cg.asmRegs(), .counts = c }} else &.{};
+    try int128.plan(cg);
     const used = f.allocate(alloc_regs.len, float_regs.len + vreg_count, (1 << survive) - 1, cg.pair_base, &split, restrictions);
     for (0..5) |k| if (used >> @intCast(2 * k) & 3 != 0) {
         cg.saved |= @as(u16, 1) << @intCast(k);
@@ -714,8 +717,9 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
 
 /// Whether value `inst`, of a type `inPair`, is computed by code that can
 /// leave it in two registers: a load or a copy of 16 bytes, a `slice`, an
-/// optional's or error union's wrapping or unwrapping, an argument, or an
-/// `.auto` call's result (x0 and x1). Other values of those types stay in
+/// optional's or error union's wrapping or unwrapping, an argument, an
+/// `.auto` call's result (x0 and x1), or an operation on 128-bit integers
+/// that `int128.gen` computes. Other values of those types stay in
 /// memory, where their lowerings write them.
 fn pairResult(cg: *CodeGen, inst: Inst.Index) bool {
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
@@ -724,7 +728,7 @@ fn pairResult(cg: *CodeGen, inst: Inst.Index) bool {
         .optional_payload, .wrap_optional, .unwrap_errunion_payload, .wrap_errunion_payload, .wrap_errunion_err => true,
         .arg => !isC(cg.fn_ty.cc),
         .call => !isC(cg.calleeType(data.pl_op.operand).cc),
-        else => false,
+        else => int128.lowers(cg, inst) == .pair,
     };
 }
 
@@ -735,6 +739,7 @@ fn callFree(cg: *CodeGen, inst: Inst.Index) bool {
     const ir = cg.ir;
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     if (vector.lowers(cg, inst)) return true;
+    if (int128.lowers(cg, inst) != null or int128.isOverflow(cg, inst)) return true;
     return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
         .arg, .alloc, .block, .loop, .repeat, .br, .cond_br, .switch_br, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => true,
         .load, .store, .struct_field_ptr, .struct_field_val, .ptr_elem_ptr, .slice_elem_ptr, .ptr_add => true,
@@ -803,9 +808,10 @@ pub fn termClobbers(_: *CodeGen, _: Ssa.Block.Index) bool {
 
 /// Whether `ty`'s values live in two general-purpose registers when they
 /// get registers, and variables of it are promoted to two (`Ssa.plan`):
-/// slices, optional slices, and error unions with an 8-byte aligned
-/// payload of 8 bytes (the error code in the low eightbyte, the payload
-/// in the high one); all 16 bytes, the low eightbyte at offset 0.
+/// slices, optional slices, error unions with an 8-byte aligned payload
+/// of 8 bytes (the error code in the low eightbyte, the payload in the
+/// high one), and 128-bit integers (`int128.zig`); all 16 bytes, the low
+/// eightbyte at offset 0.
 pub fn inPair(cg: *CodeGen, ty: Index) bool {
     const ip = cg.ip;
     return switch (Type.class(ip, ty)) {
@@ -819,6 +825,7 @@ pub fn inPair(cg: *CodeGen, ty: Index) bool {
             const payload = ip.keyPayload(.error_union_type, ty).payload_type;
             break :blk Type.abiAlignment(ip, payload) == 8 and Type.abiSize(ip, payload) == 8;
         },
+        .int => int128.is128(ip, ty),
         else => false,
     };
 }
@@ -881,7 +888,7 @@ pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
     return switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => blk: {
             const ty = cg.typeOf(data.bin_op.lhs);
-            break :blk !cg.isFloat(ty) and !cg.isWideInt(ty) and cg.passInRegs(ty);
+            break :blk !cg.isFloat(ty) and ((!cg.isWideInt(ty) and cg.passInRegs(ty)) or int128.is128(cg.ip, ty));
         },
         .is_err, .is_non_err, .is_null, .is_non_null, .cmp_lt_errors_len => true,
         .reduce => vector.fusable(cg, inst),
@@ -1662,7 +1669,7 @@ pub fn intBits(ip: *const InternPool, val: Index) u64 {
     unreachable; // wider than 64 bits; rejected before codegen
 }
 
-fn signed(cg: *CodeGen, ty: Index) bool {
+pub fn signed(cg: *CodeGen, ty: Index) bool {
     return switch (Type.class(cg.ip, ty)) {
         .int, .@"enum" => Type.intInfo(cg.ip, ty).signedness == .signed,
         else => false,
@@ -1736,7 +1743,7 @@ pub fn load(cg: *CodeGen, reg: Reg, ref: Ref) Error!void {
 }
 
 /// The register holding scalar `ref`: its own, or `scratch` loaded with it.
-fn use(cg: *CodeGen, ref: Ref, scratch: Reg) Error!Reg {
+pub fn use(cg: *CodeGen, ref: Ref, scratch: Reg) Error!Reg {
     const v = try cg.valOf(ref);
     if (v.loc == .reg) return v.loc.reg;
     try cg.loadVal(scratch, v);
@@ -1745,7 +1752,7 @@ fn use(cg: *CodeGen, ref: Ref, scratch: Reg) Error!Reg {
 
 /// The register value `inst` is computed in: its own, or `scratch` for
 /// `setResult` to store.
-fn resultReg(cg: *CodeGen, inst: Inst.Index, scratch: Reg) Reg {
+pub fn resultReg(cg: *CodeGen, inst: Inst.Index, scratch: Reg) Reg {
     return switch (cg.homes[@backingInt(inst)]) {
         .reg => |r| r,
         else => scratch,
@@ -1869,12 +1876,12 @@ fn loadRegsMem(cg: *CodeGen, d: Regs, m: Mem) Error!void {
 }
 
 /// Stores the 16 bytes in `p` to `m`. Uses x16.
-fn storeRegsMem(cg: *CodeGen, m: Mem, p: Regs) Error!void {
+pub fn storeRegsMem(cg: *CodeGen, m: Mem, p: Regs) Error!void {
     try cg.e.stp(.dword, p.lo, p.hi, try cg.pairAccess(m, .x16));
 }
 
 /// The registers holding `ref` if it is a value in two (`Home.regs`).
-fn pairOf(cg: *CodeGen, ref: Ref) ?Regs {
+pub fn pairOf(cg: *CodeGen, ref: Ref) ?Regs {
     const inst = ref.toIndex() orelse return null;
     return switch (cg.homes[@backingInt(inst)]) {
         .regs => |p| p,
@@ -1885,6 +1892,7 @@ fn pairOf(cg: *CodeGen, ref: Ref) ?Regs {
 /// Loads 16-byte value `ref` (`inPair`) into `d`: a parallel move from
 /// the registers holding it, or a pair load. Uses x9 for a swap.
 fn loadRegs(cg: *CodeGen, d: Regs, ref: Ref) Error!void {
+    if (ref.toInterned()) |c| if (int128.is128(cg.ip, cg.ip.typeOf(c))) return int128.loadConst(cg, d, c);
     const v = try cg.valOf(ref);
     if (v.loc != .regs) return cg.loadRegsMem(d, try cg.valMem(v));
     const p = v.loc.regs;
@@ -2754,6 +2762,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             // Its operand's memory (`Home.result`).
             if (cg.homes[@backingInt(inst)] == .result) return;
             if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(src_ty)) and Type.isInt(ip, ty)) {
+                if (int128.lowers(cg, inst) != null) return int128.gen(cg, inst, tag, data);
                 // A wide integer truncated to a register: its low limb.
                 if (tag != .bitcast and cg.passInRegs(ty) and Type.isInt(ip, src_ty)) {
                     const d = cg.resultReg(inst, .x9);
@@ -3310,7 +3319,7 @@ fn bitOp(cg: *CodeGen, tag: Inst.Tag, bits: u16, operand: Ref) Error!void {
 }
 
 /// A condition as a bool.
-fn genCond(cg: *CodeGen, inst: Inst.Index) Error!void {
+pub fn genCond(cg: *CodeGen, inst: Inst.Index) Error!void {
     if (cg.fate(inst) == .fused) return;
     const cond = try cg.condFlags(inst);
     const d = cg.resultReg(inst, .x9);
@@ -3332,6 +3341,7 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Cond {
                 // An overflow bit left in the flags.
                 return if (Ssa.ovfBitCmp(cg.ir, ip, inst, @backingInt(bit)).?) cg.ovf_cc else cg.ovf_cc.negate();
             };
+            if (int128.is128(ip, cg.typeOf(data.bin_op.lhs))) return int128.cmpFlags(cg, tag, data.bin_op.lhs, data.bin_op.rhs);
             const s = cg.signed(cg.typeOf(data.bin_op.lhs));
             try cg.cmpOperand(try cg.use(data.bin_op.lhs, .x9), data.bin_op.rhs);
             return switch (tag) {
@@ -3557,7 +3567,12 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     const bin = cg.ir.extraData(Ir.Bin, data.ty_pl.payload).data;
     const tuple_ty = data.ty_pl.ty;
     const ty = cg.typeOf(bin.lhs);
-    if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
+    if (int128.isOverflow(cg, inst)) return int128.overflow(cg, inst, tag, data);
+    if (cg.isWideInt(ty)) {
+        try cg.genWide(inst, tag, data);
+        if (cg.fate(inst) == .pair) try cg.wideFields(inst, ty, tuple_ty);
+        return;
+    }
     const pair = cg.fate(inst) == .pair;
     const dst = if (pair) undefined else try cg.resultMem(inst, tuple_ty) orelse return;
     const fields = if (pair) cg.ssa.pairs.get(@backingInt(inst)).? else .{ Ssa.no_tie, Ssa.no_tie };
@@ -3613,6 +3628,22 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     }
     try cg.storeReg(dst, .x9, Type.abiSize(ip, ty));
     try cg.storeReg(dst.plus(Type.fieldOffset(ip, tuple_ty, 1)), .x11, 1);
+}
+
+/// Writes the fields of overflow result `inst` (`pair`), which `genWide`
+/// computed into its slot, to their homes: a 128-bit `@mulWithOverflow`,
+/// whose bit is never left in the flags (`ovfFlagsOnly`).
+fn wideFields(cg: *CodeGen, inst: Inst.Index, ty: Index, tuple_ty: Index) Error!void {
+    const m = cg.homes[@backingInt(inst)].slot;
+    const fields = cg.ssa.pairs.get(@backingInt(inst)).?;
+    if (fields[0] != Ssa.no_tie) {
+        const v: Inst.Index = @fromBackingInt(fields[0]);
+        if (cg.pairOf(v.toRef())) |d| try cg.loadRegsMem(d, m) else if (try cg.resultMem(v, ty)) |dst| try cg.copyMem(dst, m, Type.abiSize(cg.ip, ty));
+    }
+    if (fields[1] != Ssa.no_tie) {
+        try cg.loadMem(.x9, m.plus(Type.fieldOffset(cg.ip, tuple_ty, 1)), .u1_type);
+        try cg.setResult(@fromBackingInt(fields[1]), .u1_type, .x9);
+    }
 }
 
 /// Normalizes x9 to `ty` and compares it with its value before: `ne` if
@@ -5688,7 +5719,7 @@ fn loadLimb(cg: *CodeGen, reg: Reg, v: Val, i: u32) Error!void {
 }
 
 /// Loads limb `i` of the wide integer at `m`. Changes no flags.
-fn ldrLimb(cg: *CodeGen, reg: Reg, m: Mem, i: u32) Error!void {
+pub fn ldrLimb(cg: *CodeGen, reg: Reg, m: Mem, i: u32) Error!void {
     try cg.e.ldr(.dword, reg, try cg.access(limb(m, i), 8, reg));
 }
 
@@ -5908,11 +5939,11 @@ fn mulLimbs(cg: *CodeGen, dst: Mem, lhs: Mem, rhs: Mem, n: u32) Error!void {
 /// How a factor of a two-limb product extends its low limb into the high
 /// one: with zeros, with its sign, or both, when the low limb's top bit is
 /// clear. `imm` is the low limb of a constant.
-const Ext = struct { zero: bool, sign: bool, imm: ?u64 = null };
+pub const Ext = struct { zero: bool, sign: bool, imm: ?u64 = null };
 
 /// The extension of product factor `ref`, when it is a constant or a
 /// widened integer of at most 64 bits.
-fn factorExt(cg: *CodeGen, ref: Ref) ?Ext {
+pub fn factorExt(cg: *CodeGen, ref: Ref) ?Ext {
     const ip = cg.ip;
     const ir = cg.ir;
     if (ref.toInterned()) |v| {
@@ -5946,20 +5977,30 @@ fn mulWide(cg: *CodeGen, dst: Mem, lhs: Ref, rhs: Ref) Error!bool {
     for ([_]Reg{ .x9, .x10 }, [_]Ref{ lhs, rhs }, [_]Ext{ a, b }) |reg, ref, x| {
         if (x.imm) |imm| try e.movImm(.x, reg, imm) else try cg.loadLimb(reg, try cg.wideVal(ref), 0);
     }
+    try cg.mulExt(.x11, .x12, .x9, .x10, a, b);
+    try cg.strLimb(dst, 0, .x11);
+    try cg.strLimb(dst, 1, .x12);
+    return true;
+}
+
+/// `hi:lo = x * y` for factors `x` and `y`, the low limbs of values
+/// extended as `a` and `b` say (`factorExt`): one `mul` and one `umulh`
+/// or `smulh`, plus a correction of the high half when one factor is a
+/// zero-extended value with its top bit set and the other a sign-extended
+/// one. Writes `hi` first, then `lo`; uses x13 (none of the others).
+pub fn mulExt(cg: *CodeGen, lo: Reg, hi: Reg, x: Reg, y: Reg, a: Ext, b: Ext) Error!void {
+    const e = &cg.e;
     const unsigned = a.zero and b.zero;
-    try e.mul(.x, .x11, .x9, .x10);
-    try e.mulHigh(!unsigned and a.sign and b.sign, .x12, .x9, .x10);
+    try e.mulHigh(!unsigned and a.sign and b.sign, hi, x, y);
     if (!unsigned and !(a.sign and b.sign)) {
         // One factor is u (zero-extended, its top bit set or not), the
         // other s (sign-extended): u * s is umulh(u, s) less u << 64 when
         // s is negative.
-        const u: Reg, const s: Reg = if (a.zero) .{ .x9, .x10 } else .{ .x10, .x9 };
+        const u: Reg, const s: Reg = if (a.zero) .{ x, y } else .{ y, x };
         try e.logic(.@"and", .x, .x13, u, .{ .reg = .{ .reg = s, .shift = .asr, .amount = 63 } });
-        try e.addSub(.sub, .x, .x12, .x12, .r(.x13));
+        try e.addSub(.sub, .x, hi, hi, .r(.x13));
     }
-    try cg.strLimb(dst, 0, .x11);
-    try cg.strLimb(dst, 1, .x12);
-    return true;
+    try e.mul(.x, lo, x, y);
 }
 
 /// Shifts the wide integer `v` of type `ty` by the constant `k`, less
@@ -6122,6 +6163,7 @@ fn divEi4(cg: *CodeGen, file: []const u8, name: []const u8, dst: Mem, u: Mem, v:
 
 /// Instructions on wide integers.
 fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error!void {
+    if (int128.lowers(cg, inst) != null) return int128.gen(cg, inst, tag, data);
     const ip = cg.ip;
     const e = &cg.e;
     switch (tag) {

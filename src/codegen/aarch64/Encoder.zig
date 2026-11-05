@@ -1091,13 +1091,17 @@ pub fn shiftImm(e: *Encoder, op: Shift, width: Width, dst: Reg, src: Reg, amount
         .lsl => try e.bitfield(.ubfm, width, dst, src, @intCast((bits - amount) % bits), top - amount),
         .lsr => try e.bitfield(.ubfm, width, dst, src, amount, top),
         .asr => try e.bitfield(.sbfm, width, dst, src, amount, top),
-        .ror => {
-            try e.reserve();
-            // extr dst, src, src, #amount
-            const n: u32 = @backingInt(width);
-            e.word(0x13800000 | width.sf() | (n << 22) | (src.zrEnc() << 16) | (@as(u32, amount) << 10) | (src.zrEnc() << 5) | dst.zrEnc());
-        },
+        .ror => try e.extr(width, dst, src, src, amount),
     }
+}
+
+/// extr: the register-width bits of `hi:lo` starting at bit `lsb`, as a
+/// double shift right.
+pub fn extr(e: *Encoder, width: Width, dst: Reg, hi: Reg, lo: Reg, lsb: u6) !void {
+    assert(lsb < width.bits());
+    try e.reserve();
+    const n: u32 = @backingInt(width);
+    e.word(0x13800000 | width.sf() | (n << 22) | (lo.zrEnc() << 16) | (@as(u32, lsb) << 10) | (hi.zrEnc() << 5) | dst.zrEnc());
 }
 
 pub const BitfieldOp = enum(u2) { sbfm = 0b00, bfm = 0b01, ubfm = 0b10 };

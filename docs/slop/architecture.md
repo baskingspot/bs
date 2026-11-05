@@ -881,12 +881,12 @@ comptime arguments are run-time values in the lowered code (uucode's
   call compiler_rt (see below). Integers wider than 64 bits live in memory
   as 64-bit limbs, normalized like narrow integers (the bits above the width
   are sign or zero copies); CodeGen operates on them limb by limb, inline
-  except for 128-bit division (`__udivti3` and friends). On x86_64,
-  exactly 128-bit integers are register-allocated as pairs instead
-  (`want_pair`, low half in `reg`, high half in `reg2`; `int128.zig`
-  lowers addition, subtraction, bitwise operations, multiplication,
-  constant shifts, casts, comparisons and their overflow forms there),
-  and the rest reads them from memory.
+  except for 128-bit division (`__udivti3` and friends). On x86_64 and
+  aarch64, exactly 128-bit integers are register-allocated as pairs
+  instead (`want_pair`, low half in `reg`, high half in `reg2`; each
+  backend's `int128.zig` lowers addition, subtraction, bitwise
+  operations, multiplication, constant shifts, casts, comparisons and
+  their overflow forms there), and the rest reads them from memory.
 - Vector operations that the backend lowers in SIMD registers stay whole
   vectors in the IR; Sema scalarizes the rest (see "Vectors" below). In
   memory, vectors are laid out as upstream's x86_64 backend lays them
@@ -933,8 +933,13 @@ comptime arguments are run-time values in the lowered code (uucode's
   result (`pairResult`), or a promoted variable; their users that read
   memory get a copy (`valMem`), and a `slice_ptr` or `slice_len` of a
   slice in registers takes none of its own but reads the slice's
-  (`lengthenIntervals`, as x86_64's `pairFoldable`). Block results
-  stay in slots. A value that meets an inline assembly statement (an operand,
+  (`lengthenIntervals`, as x86_64's `pairFoldable`). 128-bit integers
+  take two when `int128.zig` computes them; before allocation
+  (`int128.plan`), a widening of a 64-bit or narrower integer that only
+  those operations read gets one register or none (folded into its
+  operand's, `want_fold`), a truncation to 64 bits takes none but reads
+  its pair's half, and a right shift by 64 or more that only a
+  truncation reads is not emitted. Block results stay in slots. A value that meets an inline assembly statement (an operand,
   its result, or a value live across it) takes none of the x19-x28 and
   v8-v15 an assembly statement in the function names in its template,
   pins or clobbers (`asmRegs`, an `Ssa.allocate` restriction); the
