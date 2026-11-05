@@ -1548,9 +1548,20 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     if (emit.zcu.ip.target == .aarch64_macos) {
         const imports = try emit.gpa.alloc(MachO.Import, emit.imports.count());
         defer emit.gpa.free(imports);
-        for (imports, emit.imports.keys()) |*imp, name| imp.* = .{ .key = importKey(name), .name = name, .lib = for (emit.macho_libs, 1..) |lib, i| {
-            if (lib.exports.contains(name)) break @intCast(i);
-        } else 0 };
+        // A library's own definition wins over another's re-export of it
+        // (AppKit re-exports CoreFoundation; `-framework CoreFoundation`
+        // binds CF names there), as upstream binds them.
+        for (imports, emit.imports.keys()) |*imp, name| {
+            var lib: u16 = 0;
+            for (emit.macho_libs, 1..) |l, i| if (l.exports.get(name)) |e| {
+                if (!e.reexport) {
+                    lib = @intCast(i);
+                    break;
+                }
+                if (lib == 0) lib = @intCast(i);
+            };
+            imp.* = .{ .key = importKey(name), .name = name, .lib = lib };
+        }
         const libs = try emit.gpa.alloc(MachO.Lib, emit.macho_libs.len);
         defer emit.gpa.free(libs);
         for (libs, emit.macho_libs) |*l, lib| l.* = .{ .install_name = lib.install_name, .current_version = lib.current_version, .compatibility_version = lib.compatibility_version };

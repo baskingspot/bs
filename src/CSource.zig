@@ -1254,7 +1254,7 @@ pub fn libcIncludeDirs(arena: std.mem.Allocator, io: Io, environ: *const std.pro
 /// as `nativeLibcIncludes`'s answer, keyed by what selects the developer
 /// directory (`xcode-select -s`'s link, `DEVELOPER_DIR`) and the SDK
 /// (`SDKROOT`) and by `PATH`.
-fn darwinSdk(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8) !?[]const u8 {
+pub fn darwinSdk(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8) !?[]const u8 {
     var key: std.ArrayList(u8) = .empty;
     try key.appendSlice(arena, "bs darwin sdk 1\x00");
     for ([_][]const u8{ "/var/db/xcode_select_link", "/usr/share/xcode-select/xcode_dir_path" }) |link| {

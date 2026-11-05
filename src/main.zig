@@ -1252,10 +1252,13 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         for (libs, opts.shared_libs) |*lib, path| {
             const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
                 fatal("unable to read '{s}': {t}", .{ path, err });
-            lib.* = MachODylib.parse(arena, path, bytes) catch |err| switch (err) {
-                error.OutOfMemory => |e| return e,
-                error.InvalidDylib => fatal("'{s}' is not an arm64 Mach-O dynamic library", .{path}),
-            };
+            lib.* = if (std.mem.startsWith(u8, bytes, "--- !tapi-tbd"))
+                try readTbd(arena, init.io, path, bytes)
+            else
+                MachODylib.parse(arena, path, bytes) catch |err| switch (err) {
+                    error.OutOfMemory => |e| return e,
+                    error.InvalidDylib => fatal("'{s}' is not an arm64 Mach-O dynamic library", .{path}),
+                };
         }
         emit.macho_libs = libs;
     }
@@ -1979,9 +1982,6 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-mcmodel", "bs only supports the default code model ('-mcmodel')" },
     .{ "--script", "bs does not support linker scripts ('--script'); build this step with upstream zig" },
     .{ "--version-script", "bs does not support version scripts ('--version-script')" },
-    .{ "-framework", "bs does not link frameworks yet ('-framework')" },
-    .{ "-needed_framework", "bs does not link frameworks yet ('-needed_framework')" },
-    .{ "-weak_framework", "bs does not link frameworks yet ('-weak_framework')" },
     .{ "--subsystem", "bs does not target Windows ('--subsystem')" },
     .{ "-municode", "bs does not target Windows ('-municode')" },
 });
@@ -2002,6 +2002,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // `-l` names, resolved against `lib_dirs` once all arguments are read.
     var libs: std.ArrayList(LibQuery) = .empty;
     var lib_dirs: std.ArrayList([]const u8) = .empty;
+    // `-F` directories and `-framework` names, each at its place in
+    // `link_inputs`, as `libs`.
+    var framework_dirs: std.ArrayList([]const u8) = .empty;
+    var frameworks: std.ArrayList(LibQuery) = .empty;
     // `-static` and `-dynamic`, the last one given (upstream's `link_mode`).
     var link_mode: ?std.lang.LinkMode = null;
     // `-mcpu`, resolved for the target (`cpu.resolve` on x86_64).
@@ -2215,6 +2219,15 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (LibQuery.searches.get(arg)) |search| {
             lib_search = search;
             if (std.mem.eql(u8, arg, "-static")) link_mode = .static;
+        } else if (std.mem.eql(u8, arg, "-F")) {
+            try framework_dirs.append(arena, nextArg(args, &i, arg));
+        } else if (std.mem.startsWith(u8, arg, "-F")) {
+            try framework_dirs.append(arena, arg[2..]);
+        } else if (std.mem.eql(u8, arg, "-framework") or std.mem.eql(u8, arg, "-needed_framework")) {
+            try frameworks.append(arena, .{ .name = nextArg(args, &i, arg), .at = link_inputs.items.len, .search = .{} });
+            try link_inputs.append(arena, "");
+        } else if (std.mem.eql(u8, arg, "-weak_framework")) {
+            setUnsupported(&opts, arena, "bs does not link weak frameworks yet ('-weak_framework {s}')", .{nextArg(args, &i, arg)});
         } else if (std.mem.eql(u8, arg, "-L")) {
             try lib_dirs.append(arena, nextArg(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "-L")) {
@@ -2399,7 +2412,26 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     for (lib_dirs.items) |dir| if (Io.Dir.cwd().access(io, dir, .{})) |_| try search_dirs.append(arena, dir) else |_| {};
     const native = opts.target == null or std.mem.eql(u8, opts.target.?, "native");
     const n_explicit_dirs = search_dirs.items.len;
-    if (libs.items.len != 0 and native and !sysroot) {
+    var search_frameworks: std.ArrayList([]const u8) = .empty;
+    for (framework_dirs.items) |dir| if (Io.Dir.cwd().access(io, dir, .{})) |_| try search_frameworks.append(arena, dir) else |_| {};
+    if ((libs.items.len != 0 or frameworks.items.len != 0) and native and !sysroot and builtin.os.tag == .macos) {
+        // As upstream's `NativePaths.detect` on macOS: the SDK's libraries,
+        // frameworks and headers, then Homebrew's; the SDK as the C
+        // sources find it (`CSource.darwinSdk`, kept in the global cache).
+        const global_cache = Frontend.resolveCacheDirs(arena, io, environ_map, .{ .global = opts.global_cache_dir }).global;
+        var includes: std.ArrayList([]const u8) = .empty;
+        if (try CSource.darwinSdk(arena, io, environ_map, global_cache)) |sdk| {
+            try search_dirs.append(arena, try std.fs.path.join(arena, &.{ sdk, "usr", "lib" }));
+            try search_frameworks.append(arena, try std.fs.path.join(arena, &.{ sdk, "System", "Library", "Frameworks" }));
+            try includes.append(arena, try std.fs.path.join(arena, &.{ sdk, "usr", "include" }));
+        }
+        if (environ_map.get("HOMEBREW_PREFIX")) |prefix| {
+            const dir = try std.fs.path.join(arena, &.{ prefix, "lib" });
+            if (Io.Dir.cwd().access(io, dir, .{})) |_| try search_dirs.append(arena, dir) else |_| {}
+            try includes.append(arena, try std.fs.path.join(arena, &.{ prefix, "include" }));
+        }
+        opts.c_native_includes = includes.items;
+    } else if (libs.items.len != 0 and native and !sysroot) {
         if (std.zig.system.resolveTargetQuery(io, .{})) |target| {
             if (std.zig.system.NativePaths.detect(arena, io, &target, environ_map)) |paths| {
                 for (paths.lib_dirs.items) |dir| if (Io.Dir.cwd().access(io, dir, .{})) |_| try search_dirs.append(arena, dir) else |_| {};
@@ -2408,10 +2440,16 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else |_| {}
     }
     var found: std.StringHashMapUnmanaged(void) = .empty;
+    const macos = opts.bs_target == .aarch64_macos;
     for (libs.items) |q| {
-        link_inputs.items[q.at] = try q.find(arena, io, search_dirs.items) orelse
+        link_inputs.items[q.at] = try q.find(arena, io, search_dirs.items, macos) orelse
             fatal("unable to find library '-l{s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_dirs.items) });
         try found.put(arena, link_inputs.items[q.at], {});
+    }
+    for (frameworks.items) |q| {
+        if (!macos) fatal("frameworks are for macOS targets ('-framework {s}')", .{q.name});
+        link_inputs.items[q.at] = try findFramework(arena, io, search_frameworks.items, q.name) orelse
+            fatal("unable to find framework '-framework {s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_frameworks.items) });
     }
     // As upstream, an object or a static library links nothing: it leaves
     // archive and shared library inputs out (`-l` names are still found).
@@ -2634,11 +2672,14 @@ fn loadGlibc(init: std.process.Init, job: *const Job) !Glibc {
     return g;
 }
 
-/// Whether `path` names a shared library: `.so`, a versioned `.so.1`, or
-/// a Mach-O `.dylib`.
+/// Whether `path` names a shared library: `.so`, a versioned `.so.1`, a
+/// Mach-O `.dylib`, a macOS SDK stub (`.tbd`), or a framework's library.
 fn isSharedLib(path: []const u8) bool {
     const base = std.fs.path.basename(path);
-    return std.mem.endsWith(u8, base, ".so") or std.mem.indexOf(u8, base, ".so.") != null or std.mem.endsWith(u8, base, ".dylib");
+    if (std.mem.endsWith(u8, base, ".so") or std.mem.indexOf(u8, base, ".so.") != null or std.mem.endsWith(u8, base, ".dylib") or std.mem.endsWith(u8, base, ".tbd")) return true;
+    // A framework's library, `<name>.framework/<name>`.
+    const dir = std.fs.path.basename(std.fs.path.dirname(path) orelse return false);
+    return std.mem.endsWith(u8, dir, ".framework") and std.mem.eql(u8, dir[0 .. dir.len - ".framework".len], base);
 }
 
 /// A `-l` library, found as upstream's `link.resolveLibInput` finds one
@@ -2666,10 +2707,14 @@ const LibQuery = struct {
     });
 
     /// The library's path, `lib<name>.so` or `lib<name>.a` in one of
-    /// `dirs`, or null if there is none.
-    fn find(q: LibQuery, arena: std.mem.Allocator, io: Io, dirs: []const []const u8) !?[]const u8 {
-        const preferred: []const u8 = if (q.search.static) ".a" else ".so";
-        const other: []const u8 = if (q.search.static) ".so" else ".a";
+    /// `dirs`, or null if there is none. For macOS, a shared library is
+    /// an SDK stub, `lib<name>.tbd`, before `lib<name>.dylib` and
+    /// `lib<name>.so`, as upstream's.
+    fn find(q: LibQuery, arena: std.mem.Allocator, io: Io, dirs: []const []const u8, macos: bool) !?[]const u8 {
+        const shared: []const []const u8 = if (macos) &.{ ".tbd", ".dylib", ".so" } else &.{".so"};
+        const static: []const []const u8 = &.{".a"};
+        const preferred = if (q.search.static) static else shared;
+        const other = if (q.search.static) shared else static;
         switch (q.search.strategy) {
             .paths_first => for (dirs) |dir| {
                 if (try exists(arena, io, dir, q.name, preferred)) |p| return p;
@@ -2685,11 +2730,68 @@ const LibQuery = struct {
         return null;
     }
 
-    fn exists(arena: std.mem.Allocator, io: Io, dir: []const u8, name: []const u8, ext: []const u8) !?[]const u8 {
-        const path = try std.fmt.allocPrint(arena, "{s}{s}lib{s}{s}", .{ dir, if (dir.len == 0 or dir[dir.len - 1] == '/') "" else "/", name, ext });
-        return if (Io.Dir.cwd().access(io, path, .{})) |_| path else |_| null;
+    fn exists(arena: std.mem.Allocator, io: Io, dir: []const u8, name: []const u8, exts: []const []const u8) !?[]const u8 {
+        for (exts) |ext| {
+            const path = try std.fmt.allocPrint(arena, "{s}{s}lib{s}{s}", .{ dir, if (dir.len == 0 or dir[dir.len - 1] == '/') "" else "/", name, ext });
+            if (Io.Dir.cwd().access(io, path, .{})) |_| return path else |_| {}
+        }
+        return null;
     }
 };
+
+/// A macOS SDK stub (`-lz`'s `libz.tbd`, `-framework Cocoa`'s
+/// `Cocoa.tbd`) as the library it describes. The libraries it re-exports
+/// in other stubs, as Cocoa does AppKit, export through it, as dyld
+/// follows the re-exports: they are read from the SDK the stub is in, the
+/// part of `path` before its `/usr/lib/` or `/System/Library/`, as ld64
+/// finds them under `-syslibroot`.
+fn readTbd(arena: std.mem.Allocator, io: Io, path: []const u8, bytes: []const u8) !MachODylib {
+    var lib, var pending = Tbd.dylib(arena, path, bytes) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.InvalidTbd => fatal("'{s}': a text-based stub without an install name", .{path}),
+    };
+    const root = for ([_][]const u8{ "/usr/lib/", "/System/Library/" }) |dir| {
+        if (std.mem.indexOf(u8, path, dir)) |at| break path[0..at];
+    } else "";
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    try seen.put(arena, lib.install_name, {});
+    var queue: std.ArrayList([]const u8) = .empty;
+    try queue.appendSlice(arena, pending);
+    while (queue.pop()) |install_name| {
+        if ((try seen.getOrPut(arena, install_name)).found_existing) continue;
+        // `/usr/lib/libobjc.A.dylib`'s is `libobjc.A.tbd`; a framework's
+        // library has no extension.
+        const stem = if (std.mem.endsWith(u8, install_name, ".dylib")) install_name[0 .. install_name.len - ".dylib".len] else install_name;
+        const stub = try std.fmt.allocPrint(arena, "{s}{s}.tbd", .{ root, stem });
+        const text = Io.Dir.cwd().readFileAlloc(io, stub, arena, .unlimited) catch |err|
+            fatal("'{s}' re-exports '{s}', whose stub '{s}' cannot be read: {t}", .{ path, install_name, stub, err });
+        const reexported, pending = Tbd.dylib(arena, stub, text) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.InvalidTbd => fatal("'{s}': a text-based stub without an install name", .{stub}),
+        };
+        var it = reexported.exports.iterator();
+        while (it.next()) |e| {
+            const gop = try lib.exports.getOrPut(arena, e.key_ptr.*);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = e.value_ptr.*;
+                gop.value_ptr.reexport = true;
+            }
+        }
+        try queue.appendSlice(arena, pending);
+    }
+    return lib;
+}
+
+/// Framework `name`'s library in one of `dirs`, as upstream's
+/// `resolveFrameworkInput`: `<name>.framework/<name>.tbd` (the SDK's
+/// stubs), `.dylib`, or the bare `<name>`, which may be either.
+fn findFramework(arena: std.mem.Allocator, io: Io, dirs: []const []const u8, name: []const u8) !?[]const u8 {
+    for (dirs) |dir| for ([_][]const u8{ ".tbd", ".dylib", "" }) |ext| {
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}.framework/{s}{s}", .{ std.mem.trimEnd(u8, dir, "/"), name, name, ext });
+        if (Io.Dir.cwd().access(io, path, .{})) |_| return path else |_| {}
+    };
+    return null;
+}
 
 /// glibc's libraries, which `-l` links as part of libc (upstream's
 /// `std.zig.target.isLibCLibName` for glibc).

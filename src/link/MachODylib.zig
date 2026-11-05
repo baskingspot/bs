@@ -18,7 +18,10 @@ compatibility_version: u32,
 /// Exported names without Darwin's leading underscore.
 exports: std.StringHashMapUnmanaged(Export) = .empty,
 
-pub const Export = packed struct(u8) { weak: bool, tls: bool, _: u6 = 0 };
+/// `reexport` marks a name a stub takes from a library it re-exports
+/// (`Tbd`): a link prefers a library that defines the name itself, as
+/// upstream binds to the defining library when that one is linked too.
+pub const Export = packed struct(u8) { weak: bool, tls: bool, reexport: bool = false, _: u5 = 0 };
 
 pub const Error = error{ OutOfMemory, InvalidDylib };
 

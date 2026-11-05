@@ -4503,9 +4503,28 @@ The other direction, bs's own relocatable output, is new:
   trie; each gets an LC_LOAD_DYLIB after libSystem's, an import binds to
   the first one exporting its name (two-level ordinal), else to
   libSystem, and `-rpath` directories become LC_RPATHs.
-Still refused on aarch64-macos: `.tbd` stubs and `-l` search for
-dylibs, `build-obj` that would merge C sources or objects into its
-output, and `-lc++`.
+- Frameworks and SDK libraries (decided 2026-11-05). On a macOS host
+  with a native target, the library and framework search paths are the
+  SDK's (`CSource.darwinSdk`, the C thread's cached `xcrun` answer):
+  `<sdk>/usr/lib` and `<sdk>/System/Library/Frameworks`, plus
+  Homebrew's prefix, as upstream's. `-l` there prefers `.tbd`, `.dylib`
+  and `.so` over `.a`; `-framework X` (and `-needed_framework`) finds
+  `<dir>/X.framework/X.tbd`, `.dylib` or bare `X` in the `-F`
+  directories and then the SDK's, as upstream's `resolveFrameworkInput`.
+  A text-based stub becomes a `MachODylib` through `Tbd.dylib` (install
+  name, versions, arm64 exports including the ObjC class, metaclass,
+  ehtype and ivar symbols). Its re-exported libraries are read from
+  their own stubs under the same SDK root and their names merged,
+  marked `reexport`: an import binds to a linked library that defines
+  the name itself before one that only re-exports it, so with AppKit
+  and CoreFoundation both linked, CF names bind to CoreFoundation, as
+  upstream's do. Differences from upstream: LC_LOAD_DYLIB order is the
+  command line's (upstream sorts), and libSystem's current version stays
+  1.0.0. `-weak_framework` is refused. Objective-C sections in C inputs
+  (`__DATA,__cfstring`, `__objc_*`) are refused, which keeps raylib's
+  rglfw out.
+Still refused on aarch64-macos: `build-obj` that would merge C sources
+or objects into its output, and `-lc++`.
 
 ### compiler_rt (decided 2026-11-02)
 
