@@ -1552,6 +1552,17 @@ fn runCc(arena: std.mem.Allocator, io: Io, argv: []const []const u8, env: *const
     return res;
 }
 
+/// Execs upstream zig with `args`, `bs ar ...` as `zig ar ...`
+/// (main.zig's `forwarded_commands`).
+pub fn forward(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, args: []const []const u8) !void {
+    const zig = toolchain.findZig(arena, io, environ);
+    const path = zig.found orelse main.fatal("'{s}' runs upstream zig 0.17.1; bs looked for it in BS_ZIG, as 'zig' on PATH, and in {s}", .{ args[0], zig.looked });
+    if (try checkZig(arena, io, path)) |msg| main.fatal("{s}", .{msg});
+    const argv = try std.mem.concat(arena, []const u8, &.{ &.{path}, args });
+    const err = std.process.replace(io, .{ .argv = argv });
+    main.fatal("unable to run '{s}': {t}", .{ path, err });
+}
+
 /// Null when `zig` is upstream's 0.17.1, else why not.
 fn checkZig(arena: std.mem.Allocator, io: Io, zig: []const u8) !?[]const u8 {
     const res = std.process.run(arena, io, .{ .argv = &.{ zig, "version" } }) catch |err| {

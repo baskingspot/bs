@@ -1159,6 +1159,19 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     pie_panic.addCheck(.{ .expect_stderr_match = " in bs_overflow (lib.zig)\n    return x + 250;\n" });
     pie_panic.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
     test_step.dependOn(&pie_panic.step);
+    // `bs ar` is upstream's `zig ar`, as build scripts run it through
+    // `b.graph.zig_exe` (ghostty's combine_archives: `ar -M`).
+    const ar = b.addRunArtifact(bs);
+    ar.setName("bs ar rcs (upstream's ar)");
+    ar.addArgs(&.{ "ar", "rcs" });
+    const ar_out = ar.addOutputFileArg("libbsar.a");
+    ar.addFileArg(pic_o);
+    const ar_t = b.addRunArtifact(bs);
+    ar_t.setName("bs ar t");
+    ar_t.addArgs(&.{ "ar", "t" });
+    ar_t.addFileArg(ar_out);
+    ar_t.addCheck(.{ .expect_stdout_exact = "lib.o\n" });
+    test_step.dependOn(&ar_t.step);
     const so = b.addSystemCommand(&.{ upstreamZig(b), "build-lib", "-dynamic", "--name", "bspic" });
     so.addFileArg(pic_o);
     const so_file = so.addPrefixedOutputFileArg("-femit-bin=", "libbspic.so");

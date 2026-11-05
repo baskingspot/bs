@@ -269,10 +269,13 @@ pub const Options = struct {
 /// implement, so that they fail with a diagnostic, over the compiler
 /// protocol when asked to.
 const unsupported_commands: std.StaticStringMap([]const u8) = .initComptime(.{
-    .{ "cc", "bs does not compile C ('cc'); build this step with upstream zig" },
-    .{ "c++", "bs does not compile C++ ('c++'); build this step with upstream zig" },
     .{ "objcopy", "bs does not implement 'objcopy'; run this step with upstream zig" },
 });
+
+/// Upstream's Clang and LLVM tools, which build scripts run as
+/// `b.graph.zig_exe` (bs under `bs build`), such as ghostty's `zig ar -M`:
+/// bs execs upstream zig with the same arguments (`CSource.forward`).
+const forwarded_commands: std.StaticStringMap(void) = .initComptime(.{ .{"cc"}, .{"c++"}, .{"ar"}, .{"ranlib"} });
 
 /// A segfault handler runs on the signal stack, which every thread keeps
 /// in its thread-local storage, zeroed when the thread starts (std's
@@ -333,6 +336,7 @@ pub fn main(init_std: std.process.Init) !void {
     const cmd = raw_args[1];
     if (std.mem.eql(u8, cmd, "build")) return BuildRunner.run(init, raw_args[2..]);
     if (std.mem.eql(u8, cmd, "translate-c")) return TranslateC.run(init, raw_args[2..]);
+    if (forwarded_commands.has(cmd)) return CSource.forward(arena, init.io, init.environ_map, raw_args[1..]);
     const args = raw_args;
     const command: Command = if (std.mem.eql(u8, cmd, "build-exe"))
         .build_exe
