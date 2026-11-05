@@ -19795,9 +19795,18 @@ fn clobbersValue(sema: *Sema, mask: u32) !Index {
 }
 
 /// The `Ir.Asm.callee_saved_clobbers` bit of clobber `name`, if any.
+/// aarch64's `w19` is `x19`, and `z8`, `d8`, `s8`, `h8` and `b8` are
+/// `v8`, as LLVM aliases them.
 fn clobberBit(name: []const u8) u32 {
+    var buf: [4]u8 = undefined;
+    var canonical = name;
+    if (name.len >= 2 and name.len <= buf.len and std.mem.indexOfScalar(u8, "wzdshb", name[0]) != null) {
+        buf[0] = if (name[0] == 'w') 'x' else 'v';
+        @memcpy(buf[1..name.len], name[1..]);
+        canonical = buf[0..name.len];
+    }
     for (Ir.Asm.callee_saved_names, 0..) |n, bit| {
-        if (std.mem.eql(u8, n, name)) return @as(u32, 1) << @intCast(bit);
+        if (std.mem.eql(u8, n, canonical)) return @as(u32, 1) << @intCast(bit);
     }
     return 0;
 }

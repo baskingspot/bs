@@ -3638,18 +3638,27 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         if (mentionsVReg(source, @intCast(r))) vused |= @as(u32, 1) << @intCast(r);
     }
     const free_regs = [_]Reg{ .x9, .x10, .x11, .x12, .x13, .x14, .x15, .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7, .x8 };
-    // Callee-saved registers the template mentions, saved to slots first.
+    // Callee-saved registers the template mentions or the clobbers name,
+    // saved to slots first. A context switch (zio's) names them only as
+    // clobbers, and its caller's values live in them. A naked function
+    // has no frame to save them in, and saves nothing, as upstream.
+    const clobbered = extra.data.callee_saved_clobbers;
+    const naked = cg.fn_ty.cc == .naked;
     var saved: [10]?Mem = @splat(null);
-    for (19..29) |r| {
-        if (mentionsReg(source, @intCast(r)) or used & (@as(u64, 1) << @intCast(r)) != 0) {
+    if (!naked) for (19..29) |r| {
+        if (mentionsReg(source, @intCast(r)) or used & (@as(u64, 1) << @intCast(r)) != 0 or clobbered >> @intCast(Ir.Asm.aarch64_x19_bit + r - 19) & 1 != 0) {
             const m = try cg.allocSlot(8, 8);
             try cg.storeReg(m, @fromBackingInt(@intCast(r)), 8);
             saved[r - 19] = m;
         }
-    }
-    // v8-v15, whose low halves are callee-saved: saved whole when the
-    // template names them or an operand gets one.
+    };
+    // v8-v15, whose low halves are callee-saved (and hold f32 and f64
+    // values): saved whole when the template names them, the clobbers do,
+    // or an operand gets one.
     var vsaved: [8]?Mem = @splat(null);
+    for (8..16) |r| {
+        if (vused >> @intCast(r) & 1 != 0 or clobbered >> @intCast(Ir.Asm.aarch64_v8_bit + r - 8) & 1 != 0) try cg.saveVReg(&vsaved, @intCast(r));
+    }
     const out_regs = try cg.gpa.alloc(AsmOut, outputs.len);
     defer cg.gpa.free(out_regs);
     for (outputs, out_regs) |out, *out_reg| {
@@ -3779,9 +3788,10 @@ fn asmVReg(cg: *CodeGen, used: *u32, vsaved: *[8]?Mem, low: bool) Error!VReg {
     return cg.fail("asm with too many SIMD register operands", .{});
 }
 
-/// Saves v`r`, one of v8-v15, to a slot in `vsaved` unless it is saved.
+/// Saves v`r`, one of v8-v15, to a slot in `vsaved` unless it is saved
+/// or the function is naked.
 fn saveVReg(cg: *CodeGen, vsaved: *[8]?Mem, r: u5) Error!void {
-    if (vsaved[r - 8] != null) return;
+    if (vsaved[r - 8] != null or cg.fn_ty.cc == .naked) return;
     const m = try cg.allocSlot(16, 16);
     try cg.e.strQ(@fromBackingInt(r), try cg.access(m, 16, .x16));
     vsaved[r - 8] = m;

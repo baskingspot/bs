@@ -647,7 +647,18 @@ pub const Asm = struct {
     /// of `callee_saved_names`, which the function must save.
     callee_saved_clobbers: u32,
 
-    pub const callee_saved_names = [_][]const u8{ "rbx", "r12", "r13", "r14", "r15" };
+    /// x86_64's, then aarch64's: x19-x28 (bits 5-14) and v8-v15 (bits
+    /// 15-22), which aarch64's other names of them (`w19`, `d8`, `z8`, ...)
+    /// also set (`Sema.clobberBit`).
+    pub const callee_saved_names = [_][]const u8{
+        "rbx", "r12", "r13", "r14", "r15",
+        "x19", "x20", "x21", "x22", "x23",
+        "x24", "x25", "x26", "x27", "x28",
+        "v8",  "v9",  "v10", "v11", "v12",
+        "v13", "v14", "v15",
+    };
+    pub const aarch64_x19_bit = 5;
+    pub const aarch64_v8_bit = 15;
 
     pub const Operand = struct {
         name: InternPool.String,
