@@ -150,7 +150,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, arch: Atom
             if (out.type != sh.sh_type and !is_eh) {
                 // .bss pieces in a PROGBITS section are zeros.
                 if (out.type == elf.SHT_NOBITS and sh.sh_type == elf.SHT_PROGBITS) out.type = elf.SHT_PROGBITS else if (!(out.type == elf.SHT_PROGBITS and sh.sh_type == elf.SHT_NOBITS))
-                    return unsupported(arena, diag, "{s}: section '{s}' has type {d}, another input's {d}", .{ o.path, name, sh.sh_type, out.type });
+                    return unsupported("{s}: section '{s}' has type {d}, another input's {d}", arena, diag, .{ o.path, name, sh.sh_type, out.type });
             }
             const flags = sh.sh_flags & ~@as(u64, elf.SHF_GROUP);
             // Merged entries of another size are only concatenated.
@@ -263,7 +263,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, arch: Atom
     // Relocations, renumbered and moved.
     for (objects, 0..) |*o, oi| {
         for (o.shdrs, 0..) |sh, ri| {
-            if (sh.sh_type == elf.SHT_REL) return unsupported(arena, diag, "{s}: SHT_REL relocations", .{o.path});
+            if (sh.sh_type == elf.SHT_REL) return unsupported("{s}: SHT_REL relocations", arena, diag, .{o.path});
             if (sh.sh_type != elf.SHT_RELA) continue;
             const target = sh.sh_info;
             if (target >= o.shdrs.len or place[oi][target] == unmapped) continue;
@@ -292,7 +292,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, arch: Atom
                         // A dropped section's: nothing.
                         addend = 0;
                     } else {
-                        return unsupported(arena, diag, "{s}: section '{s}' refers to dropped section '{s}'", .{ o.path, o.sectionName(target), if (isym.st_shndx < o.shdrs.len) o.sectionName(isym.st_shndx) else "?" });
+                        return unsupported("{s}: section '{s}' refers to dropped section '{s}'", arena, diag, .{ o.path, o.sectionName(target), if (isym.st_shndx < o.shdrs.len) o.sectionName(isym.st_shndx) else "?" });
                     }
                 }
                 out.relas.appendAssumeCapacity(.{
@@ -631,7 +631,7 @@ fn invalid(arena: Allocator, diag: *[]const u8, o: *const Object, what: []const 
     return error.InvalidObject;
 }
 
-fn unsupported(arena: Allocator, diag: *[]const u8, comptime fmt: []const u8, args: anytype) Error {
+fn unsupported(comptime fmt: []const u8, arena: Allocator, diag: *[]const u8, args: anytype) Error {
     diag.* = try arena.print("bs does not merge this object yet: " ++ fmt, args);
     return error.UnsupportedObject;
 }

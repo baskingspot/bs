@@ -507,16 +507,16 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
 
     @memset(failures, null);
     if (numbered == null) {
-        try parallel(io, n_threads, n_chunks, &l, Link.gatherKeys);
-        try parallel(io, n_threads, n_partitions, &l, Link.dedup);
-        try parallel(io, n_threads, n_chunks, &l, Link.layOutKeyed);
+        try parallel(&l, Link.gatherKeys, io, n_threads, n_chunks);
+        try parallel(&l, Link.dedup, io, n_threads, n_partitions);
+        try parallel(&l, Link.layOutKeyed, io, n_threads, n_chunks);
     } else {
-        try parallel(io, n_threads, n_chunks, &l, Link.layOutNumbered);
+        try parallel(&l, Link.layOutNumbered, io, n_threads, n_chunks);
     }
     try l.check(diag);
     // Size the debug chunks, which needs only where atoms went.
     if (n_debug > 0) {
-        try parallel(io, n_threads, n_debug_chunks, &l, Link.layOutDebug);
+        try parallel(&l, Link.layOutDebug, io, n_threads, n_debug_chunks);
         try l.check(diag);
     }
 
@@ -817,9 +817,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // Numbered symbols keep addresses as 31-bit offsets from the base.
     if (numbered != null and linkedit_vm >= value_tag) return error.OutOfMemory;
     if (numbered != null) {
-        try parallel(io, n_threads, n_chunks, &l, Link.resolveAddrsNumbered);
+        try parallel(&l, Link.resolveAddrsNumbered, io, n_threads, n_chunks);
     } else {
-        try parallel(io, n_threads, n_partitions, &l, Link.resolveAddrsKeyed);
+        try parallel(&l, Link.resolveAddrsKeyed, io, n_threads, n_partitions);
     }
     try l.check(diag);
     try l.resolveAliases(options.aliases, &values, &imports, diag);
@@ -905,11 +905,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     l.tlv_bootstrap = @intCast(n_imports);
     l.unwind_off = starts[unwind_info];
     if (n_debug > 0) {
-        try parallel(io, n_threads, n_chunks + n_debug_chunks, &l, Link.copyAll);
+        try parallel(&l, Link.copyAll, io, n_threads, n_chunks + n_debug_chunks);
     } else if (numbered == null) {
-        try parallel(io, n_threads, n_chunks, &l, Link.copyKeyed);
+        try parallel(&l, Link.copyKeyed, io, n_threads, n_chunks);
     } else {
-        try parallel(io, n_threads, n_chunks, &l, Link.copyNumbered);
+        try parallel(&l, Link.copyNumbered, io, n_threads, n_chunks);
     }
     try l.check(diag);
     if (n_debug > 0) writeUnwindIndex(buf[starts[unwind_info]..][0..sizes[unwind_info]], unwind_pages, @intCast(starts[text]), @intCast(starts[text] + sizes[text]));
@@ -2489,7 +2489,7 @@ fn sign(io: std.Io, n_threads: usize, buf: []u8, sig_off: u32, uuid_at: usize, i
         }
     };
     const h: Hasher = .{ .buf = buf, .hashes = hashes, .limit = sig_off };
-    try parallel(io, n_threads, std.math.divCeil(usize, n_slots, Hasher.pages_per_task) catch unreachable, &h, Hasher.task);
+    try parallel(&h, Hasher.task, io, n_threads, std.math.divCeil(usize, n_slots, Hasher.pages_per_task) catch unreachable);
     // UUID: from all page hashes, with page 0 hashed while the UUID is
     // zero; then page 0 again with the UUID in it.
     h.hashPage(0);

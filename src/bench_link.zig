@@ -72,11 +72,11 @@ pub fn main(init: std.process.Init) !void {
     };
     defer lock.close(io);
     switch (format) {
-        inline else => |f| try bench(f, gpa, io, arena),
+        inline else => |f| try bench(f, gpa, arena, io),
     }
 }
 
-fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator) !void {
+fn bench(comptime format: Format, gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io) !void {
     const L = switch (format) {
         .elf => Elf,
         .macho => MachO,
@@ -181,8 +181,8 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
         });
         if (format == .elf) try linkToFile(gpa, io, atoms, single, parallel, out_n, cpus);
         switch (format) {
-            .elf => try benchNumbered(gpa, io, arena, atoms, debug, single, out_n, stripped, cpus),
-            .macho => try benchNumberedMachO(gpa, io, arena, atoms, single_strip, cpus),
+            .elf => try benchNumbered(gpa, arena, io, atoms, debug, single, out_n, stripped, cpus),
+            .macho => try benchNumberedMachO(gpa, arena, io, atoms, single_strip, cpus),
         }
     }
     std.debug.print("(best of {d} runs each)\n", .{runs});
@@ -225,7 +225,7 @@ fn floor(gpa: std.mem.Allocator, io: std.Io, atoms: []const Atom, threads: usize
 
 /// Times the numbered-symbol link of the atoms the key-based link keeps,
 /// scattered as generated and packed in link order.
-fn benchNumbered(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, all: []const Atom, all_debug: []const Atom.Debug, options: Elf.Options, expected: []const u8, expected_stripped: []const u8, cpus: usize) !void {
+fn benchNumbered(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, all: []const Atom, all_debug: []const Atom.Debug, options: Elf.Options, expected: []const u8, expected_stripped: []const u8, cpus: usize) !void {
     // Number the kept atoms in link order, as a first build's manifest would.
     var numbers: std.AutoHashMapUnmanaged(Atom.SymbolKey, u32) = .empty;
     var kept: std.ArrayList(Atom) = .empty;
@@ -338,7 +338,7 @@ fn linkToFile(gpa: std.mem.Allocator, io: std.Io, atoms: []const Atom, single: E
 
 /// `benchNumbered` for Mach-O, which numbers its imports too and has no
 /// debug info. Compares against the key-based link of the kept atoms.
-fn benchNumberedMachO(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, all: []const Atom, options: MachO.Options, cpus: usize) !void {
+fn benchNumberedMachO(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, all: []const Atom, options: MachO.Options, cpus: usize) !void {
     var numbers: std.AutoHashMapUnmanaged(Atom.SymbolKey, u32) = .empty;
     var kept: std.ArrayList(Atom) = .empty;
     for (all) |a| {

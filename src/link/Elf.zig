@@ -840,14 +840,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
 
     @memset(failures, null);
     if (numbered == null) {
-        try parallel(io, n_threads, n_chunks, &l, Link.gatherKeys);
+        try parallel(&l, Link.gatherKeys, io, n_threads, n_chunks);
         try l.check(diag);
-        try parallel(io, n_threads, n_partitions, &l, Link.dedup);
+        try parallel(&l, Link.dedup, io, n_threads, n_partitions);
     }
     if (numbered == null) {
-        try parallel(io, n_threads, n_chunks, &l, Link.layOutKeyed);
+        try parallel(&l, Link.layOutKeyed, io, n_threads, n_chunks);
     } else {
-        try parallel(io, n_threads, n_chunks, &l, Link.layOutNumbered);
+        try parallel(&l, Link.layOutNumbered, io, n_threads, n_chunks);
     }
     try l.check(diag);
 
@@ -1143,7 +1143,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             values.getOrPut(ElfDynamic.dynamic_key).* = .{ .key = ElfDynamic.dynamic_key, .value = base + dynamic_off, .used = true };
         }
     }
-    try parallel(io, n_threads, l.n_resolve_tasks + n_debug_chunks, &l, Link.resolveAddrsAndLayOutDebug);
+    try parallel(&l, Link.resolveAddrsAndLayOutDebug, io, n_threads, l.n_resolve_tasks + n_debug_chunks);
     try l.check(diag);
     try l.resolveAliases(options.aliases, &values, diag);
     const entry_addr = if (options.entry == null) 0 else if (numbered) |s| l.numberedAddr(addrs[s.entry]) else symbols.get(options.entry.?) orelse values.get(options.entry.?).?;
@@ -1218,7 +1218,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     switch (l.target) {
         .memory => |buf| {
             adviseHugePages(buf);
-            try parallel(io, n_threads, std.math.divCeil(usize, buf.len, populate_len) catch unreachable, &l, Link.populateOutput);
+            try parallel(&l, Link.populateOutput, io, n_threads, std.math.divCeil(usize, buf.len, populate_len) catch unreachable);
         },
         .file => {
             // Room for the largest task's parts of the output.
@@ -1403,7 +1403,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     l.max_targets = max_targets;
     l.eh_off = eh_off;
     l.hdr_off = hdr_off;
-    try parallel(io, n_threads, n_chunks + n_debug_chunks + inputs.len, &l, Link.copyAll);
+    try parallel(&l, Link.copyAll, io, n_threads, n_chunks + n_debug_chunks + inputs.len);
     try l.check(diag);
     if (n_input_fdes > 0) {
         const hdr_addr = base + hdr_off;
@@ -2426,7 +2426,7 @@ fn LinkOf(comptime Input: type) type {
 
 /// Runs `task(ctx, i, thread)` for every i < n_tasks on up to `n_threads`
 /// threads, the calling thread included.
-pub fn parallel(io: std.Io, n_threads: usize, n_tasks: usize, ctx: anytype, comptime task: fn (@TypeOf(ctx), usize, usize) void) std.Io.Cancelable!void {
+pub fn parallel(ctx: anytype, comptime task: fn (@TypeOf(ctx), usize, usize) void, io: std.Io, n_threads: usize, n_tasks: usize) std.Io.Cancelable!void {
     const Ctx = @TypeOf(ctx);
     const Worker = struct {
         fn work(c: Ctx, next: *std.atomic.Value(usize), total: usize, thread: usize) void {

@@ -747,7 +747,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .out_path = try Io.Dir.path.join(arena, &.{ local, "o", &hex, try arena.print("{s}.o", .{Io.Dir.path.stem(src.path)}) }),
             .start_ns = start_ns,
         };
-        if (try ToolRecord.check(arena, io, j.record_path, j.out_path, start_ns, s, &stats)) |c| switch (c) {
+        if (try ToolRecord.check(arena, s, io, j.record_path, j.out_path, start_ns, &stats)) |c| switch (c) {
             .hit => |inputs| {
                 j.inputs = inputs;
                 j.state = .done;

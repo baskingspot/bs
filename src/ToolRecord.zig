@@ -83,7 +83,7 @@ pub const Stats = std.StringHashMapUnmanaged(Io.File.Stat);
 /// file stats as recorded or, rehashed, has the recorded contents (the
 /// record then takes the new stats). Null without a usable record.
 /// `stats` keeps what it stats for later checks, in `stats_gpa`.
-pub fn check(arena: std.mem.Allocator, io: Io, record_path: []const u8, out_path: []const u8, start_ns: i96, stats_gpa: std.mem.Allocator, stats: ?*Stats) !?Check {
+pub fn check(arena: std.mem.Allocator, stats_gpa: std.mem.Allocator, io: Io, record_path: []const u8, out_path: []const u8, start_ns: i96, stats: ?*Stats) !?Check {
     const cwd = Io.Dir.cwd();
     const rec = cwd.readFileAlloc(io, record_path, arena, .limited(64 << 20)) catch return null;
     if (rec.len < @sizeOf(Header)) return null;

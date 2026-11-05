@@ -318,7 +318,7 @@ pub fn main(init: std.process.Init) !void {
     print("relink after compaction, numbered and packed: {d:.2} / {d:.2} ms (map {d:.3}, gather {d:.2}, Elf.emitInput {d:.2})\n", .{
         ms(relink_packed.median(3)), ms(relink_packed.best(3)), ms(relink_packed.median(0)), ms(relink_packed.median(1)), ms(relink_packed.median(2)),
     });
-    try benchStores(gpa, io, arena, rand, work, atoms, debug, keys[0]);
+    try benchStores(gpa, arena, io, rand, work, atoms, debug, keys[0]);
 }
 
 /// A relink as `Incremental` does it: map the manifest and pack, and
@@ -384,7 +384,7 @@ fn dedupe(arena: std.mem.Allocator, all: []const Atom, all_debug: []const Atom.D
 
 /// The global store: a first build's 30k puts and commit, lookups with 1,
 /// 8, and 64 packs, maintenance, and concurrent builds writing at once.
-fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: std.Random, work: Io.Dir, atoms: []const Atom, debug: []const Atom.Debug, entry: Atom.SymbolKey) !void {
+fn benchStores(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, rand: std.Random, work: Io.Dir, atoms: []const Atom, debug: []const Atom.Debug, entry: Atom.SymbolKey) !void {
     const print = std.debug.print;
     const n_threads = std.Thread.getCpuCount() catch 1;
     const dep_list = try arena.alloc(Store.Dep, deps_per_unit);

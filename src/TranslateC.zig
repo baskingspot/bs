@@ -99,7 +99,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
             const r = cpu_mod.resolve(arena, io, if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else next(args, &i));
             opts.cpu = r.cpu;
             mcpu = true;
-            if (r.refused) |msg| main.setUnsupported(&opts, arena, "{s}", .{msg});
+            if (r.refused) |msg| main.setUnsupported(&opts, "{s}", arena, .{msg});
         } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {
             opts.zig_lib_dir = next(args, &i);
         } else if (std.mem.eql(u8, arg, "--cache-dir")) {
@@ -139,7 +139,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         } else if (ignored_flags_with_arg.has(arg)) {
             _ = next(args, &i);
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            main.setUnsupported(&opts, arena, "bs does not support the option '{s}' for translate-c", .{arg});
+            main.setUnsupported(&opts, "bs does not support the option '{s}' for translate-c", arena, .{arg});
         } else if (source == null) {
             source = arg;
         } else {
@@ -153,7 +153,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         main.checkTarget(&opts, arena, io, target);
     } else if (std.mem.eql(u8, target, "native")) {
         if (!(host.cpu.arch == .x86_64 and host.os.tag == .linux))
-            main.setUnsupported(&opts, arena, "bs translates C only for x86_64-linux and aarch64-macos so far ('native'); pass -target x86_64-linux", .{})
+            main.setUnsupported(&opts, "bs translates C only for x86_64-linux and aarch64-macos so far ('native'); pass -target x86_64-linux", arena, .{})
         else if (std.zig.system.resolveTargetQuery(io, .{})) |native| {
             // The host's CPU, clamped, as a compilation's without -mcpu.
             if (!mcpu) opts.cpu = cpu_mod.resolve(arena, io, "native").cpu;
@@ -340,7 +340,7 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     const out_path = try Io.Dir.path.join(arena, &.{ out_dir, try arena.print("{s}.zig", .{Io.Dir.path.stem(source)}) });
 
     var old_output: ?cache.Hash = null;
-    if (try ToolRecord.check(arena, io, record_path, out_path, start_ns, arena, null)) |c| switch (c) {
+    if (try ToolRecord.check(arena, arena, io, record_path, out_path, start_ns, null)) |c| switch (c) {
         .hit => |inputs| return .{ .digest = digest, .cache_hit = true, .out_path = out_path, .inputs = inputs },
         .miss => |h| old_output = h,
     };

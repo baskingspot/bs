@@ -16,7 +16,7 @@ const MachODylib = @import("MachODylib.zig");
 /// Adds the names `text` exports, without Darwin's leading underscore, to
 /// `out`. The names point into `text`.
 pub fn exports(gpa: Allocator, text: []const u8, out: *std.StringHashMapUnmanaged(void)) Allocator.Error!void {
-    _ = try scan(gpa, text, void, out);
+    _ = try scan(void, gpa, text, out);
 }
 
 pub const Error = error{ OutOfMemory, InvalidTbd };
@@ -27,7 +27,7 @@ pub const Error = error{ OutOfMemory, InvalidTbd };
 /// stubs. Names point into `text` or `arena`.
 pub fn dylib(arena: Allocator, path: []const u8, text: []const u8) Error!struct { MachODylib, []const []const u8 } {
     var d: MachODylib = .{ .path = path, .install_name = "", .current_version = 0x10000, .compatibility_version = 0x10000 };
-    const info = try scan(arena, text, MachODylib.Export, &d.exports);
+    const info = try scan(MachODylib.Export, arena, text, &d.exports);
     d.install_name = info.install_name orelse return error.InvalidTbd;
     d.current_version = info.current_version;
     d.compatibility_version = info.compatibility_version;
@@ -51,7 +51,7 @@ const Info = struct {
 
 /// What `text` says about arm64 macOS; its exported names go to `out`,
 /// with their `MachODylib.Export` flags when `V` is that.
-fn scan(gpa: Allocator, text: []const u8, comptime V: type, out: *std.StringHashMapUnmanaged(V)) Allocator.Error!Info {
+fn scan(comptime V: type, gpa: Allocator, text: []const u8, out: *std.StringHashMapUnmanaged(V)) Allocator.Error!Info {
     var info: Info = .{};
     // What the bracketed list being read holds, across lines.
     var list: enum { none, targets, symbols, weak, tls, objc_classes, objc_eh_types, objc_ivars, libraries, skip } = .none;
@@ -122,16 +122,16 @@ fn scan(gpa: Allocator, text: []const u8, comptime V: type, out: *std.StringHash
                     arm64 = true;
                 },
                 .symbols, .weak, .tls => if (name.len > 1 and name[0] == '_') {
-                    try put(gpa, V, out, name[1..], .{ .weak = list == .weak, .tls = list == .tls });
+                    try put(V, gpa, out, name[1..], .{ .weak = list == .weak, .tls = list == .tls });
                 },
                 // Their symbols, without the leading underscore, as ld64
                 // makes them for an objc2 stub.
                 .objc_classes => {
-                    try put(gpa, V, out, try gpa.print("OBJC_CLASS_$_{s}", .{name}), .{ .weak = false, .tls = false });
-                    try put(gpa, V, out, try gpa.print("OBJC_METACLASS_$_{s}", .{name}), .{ .weak = false, .tls = false });
+                    try put(V, gpa, out, try gpa.print("OBJC_CLASS_$_{s}", .{name}), .{ .weak = false, .tls = false });
+                    try put(V, gpa, out, try gpa.print("OBJC_METACLASS_$_{s}", .{name}), .{ .weak = false, .tls = false });
                 },
-                .objc_eh_types => try put(gpa, V, out, try gpa.print("OBJC_EHTYPE_$_{s}", .{name}), .{ .weak = false, .tls = false }),
-                .objc_ivars => try put(gpa, V, out, try gpa.print("OBJC_IVAR_$_{s}", .{name}), .{ .weak = false, .tls = false }),
+                .objc_eh_types => try put(V, gpa, out, try gpa.print("OBJC_EHTYPE_$_{s}", .{name}), .{ .weak = false, .tls = false }),
+                .objc_ivars => try put(V, gpa, out, try gpa.print("OBJC_IVAR_$_{s}", .{name}), .{ .weak = false, .tls = false }),
                 .libraries => try info.reexports.append(gpa, name),
                 .skip, .none => {},
             }
@@ -141,7 +141,7 @@ fn scan(gpa: Allocator, text: []const u8, comptime V: type, out: *std.StringHash
     return info;
 }
 
-fn put(gpa: Allocator, comptime V: type, out: *std.StringHashMapUnmanaged(V), name: []const u8, flags: MachODylib.Export) Allocator.Error!void {
+fn put(comptime V: type, gpa: Allocator, out: *std.StringHashMapUnmanaged(V), name: []const u8, flags: MachODylib.Export) Allocator.Error!void {
     try out.put(gpa, name, if (V == void) {} else flags);
 }
 

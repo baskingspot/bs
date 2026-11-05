@@ -2051,7 +2051,7 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-municode", "bs does not target Windows ('-municode')" },
 });
 
-pub fn setUnsupported(opts: *Options, arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+pub fn setUnsupported(opts: *Options, comptime fmt: []const u8, arena: std.mem.Allocator, args: anytype) void {
     if (opts.unsupported == null) opts.unsupported = arena.print(fmt, args) catch fatal("out of memory", .{});
 }
 
@@ -2190,7 +2190,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (std.mem.eql(u8, arg, "-ffuzz")) {
             // Objects would need the coverage sections and their symbols.
             if (command.isObj() or command == .build_lib)
-                setUnsupported(&opts, arena, "bs does not instrument objects or libraries for fuzzing yet ('-ffuzz'); fuzz an executable or a test", .{});
+                setUnsupported(&opts, "bs does not instrument objects or libraries for fuzzing yet ('-ffuzz'); fuzz an executable or a test", arena, .{});
             fuzz = true;
         } else if (std.mem.eql(u8, arg, "-fno-fuzz")) {
             fuzz = false;
@@ -2296,7 +2296,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             try frameworks.append(arena, .{ .name = nextArg(args, &i, arg), .at = link_inputs.items.len, .search = .{} });
             try link_inputs.append(arena, "");
         } else if (std.mem.eql(u8, arg, "-weak_framework")) {
-            setUnsupported(&opts, arena, "bs does not link weak frameworks yet ('-weak_framework {s}')", .{nextArg(args, &i, arg)});
+            setUnsupported(&opts, "bs does not link weak frameworks yet ('-weak_framework {s}')", arena, .{nextArg(args, &i, arg)});
         } else if (std.mem.eql(u8, arg, "-L")) {
             try lib_dirs.append(arena, nextArg(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "-L")) {
@@ -2350,7 +2350,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (std.mem.eql(u8, arg, "-fdata-sections")) {
             opts.data_sections = true;
         } else if (std.mem.startsWith(u8, arg, "-ofmt=")) {
-            if (!std.mem.eql(u8, arg, "-ofmt=elf")) setUnsupported(&opts, arena, "bs emits ELF on Linux only ('{s}')", .{arg});
+            if (!std.mem.eql(u8, arg, "-ofmt=elf")) setUnsupported(&opts, "bs emits ELF on Linux only ('{s}')", arena, .{arg});
         } else if (std.mem.startsWith(u8, arg, "-l") and glibc_libs.has(arg[2..])) {
             opts.link_libc = true;
         } else if (std.mem.startsWith(u8, arg, "-l") and libcpp_names.has(arg[2..])) {
@@ -2368,9 +2368,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
                 try link_inputs.append(arena, "");
             }
         } else if (std.mem.startsWith(u8, arg, "-needed-l") or std.mem.startsWith(u8, arg, "-weak-l")) {
-            setUnsupported(&opts, arena, "bs does not link libc or system libraries ('{s}'); build this step with upstream zig", .{arg});
+            setUnsupported(&opts, "bs does not link libc or system libraries ('{s}'); build this step with upstream zig", arena, .{arg});
         } else if (unsupported_flags.get(arg)) |msg| {
-            setUnsupported(&opts, arena, "{s}", .{msg});
+            setUnsupported(&opts, "{s}", arena, .{msg});
             // Their parameters: the C flags up to `--`, the language.
             if (std.mem.eql(u8, arg, "-rcflags")) {
                 while (i + 1 < args.len and !std.mem.eql(u8, args[i + 1], "--")) i += 1;
@@ -2385,9 +2385,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             std.mem.startsWith(u8, arg, "-fpatchable-function-entry=") or
             std.mem.startsWith(u8, arg, "--compress-debug-sections="))
         {
-            setUnsupported(&opts, arena, "bs does not support '{s}' yet", .{arg});
+            setUnsupported(&opts, "bs does not support '{s}' yet", arena, .{arg});
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            setUnsupported(&opts, arena, "bs does not support the option '{s}'", .{arg});
+            setUnsupported(&opts, "bs does not support the option '{s}'", arena, .{arg});
         } else if (!std.mem.endsWith(u8, arg, ".zig")) {
             const ext = Io.Dir.path.extension(arg);
             if (CSource.Lang.ofPath(arg)) |lang| {
@@ -2395,9 +2395,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or (isSharedLib(arg) and !command.isObj())) {
                 try link_inputs.append(arena, arg);
             } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.find(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib") or std.mem.eql(u8, ext, ".dylib") or std.mem.eql(u8, ext, ".tbd"))
-                setUnsupported(&opts, arena, "bs does not link object files or libraries ('{s}'); build this step with upstream zig", .{arg})
+                setUnsupported(&opts, "bs does not link object files or libraries ('{s}'); build this step with upstream zig", arena, .{arg})
             else
-                setUnsupported(&opts, arena, "bs does not compile C, C++, or assembly sources ('{s}'); build this step with upstream zig", .{arg});
+                setUnsupported(&opts, "bs does not compile C, C++, or assembly sources ('{s}'); build this step with upstream zig", arena, .{arg});
         } else if (root == null) {
             root = arg;
             positional_root = true;
@@ -2412,30 +2412,30 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // more), with C sources, Mach-O objects and archives.
     if (opts.bs_target == .aarch64_macos) {
         if (command.isObj() and (c_files.items.len != 0 or link_inputs.items.len != 0))
-            setUnsupported(&opts, arena, "bs does not merge C sources or objects into aarch64-macos objects yet; build this step with upstream zig", .{})
+            setUnsupported(&opts, "bs does not merge C sources or objects into aarch64-macos objects yet; build this step with upstream zig", arena, .{})
         else if (opts.link_libcpp)
-            setUnsupported(&opts, arena, "bs does not link libc++ for aarch64-macos yet; build this step with upstream zig", .{})
+            setUnsupported(&opts, "bs does not link libc++ for aarch64-macos yet; build this step with upstream zig", arena, .{})
         else if (opts.fuzz)
-            setUnsupported(&opts, arena, "bs does not instrument code for fuzzing on aarch64-macos yet ('-ffuzz'); build this step with upstream zig", .{});
+            setUnsupported(&opts, "bs does not instrument code for fuzzing on aarch64-macos yet ('-ffuzz'); build this step with upstream zig", arena, .{});
         // Code is generated for Apple's M1 (`-target aarch64-macos`), the
         // target's baseline. `zig build` passes `-mcpu baseline` with an
         // explicit target and `-mcpu native` for `-Dcpu=native`.
         if (mcpu) |text| if (!std.mem.eql(u8, text, "baseline") and !std.mem.eql(u8, text, "native") and !std.mem.eql(u8, text, "apple_m1"))
-            setUnsupported(&opts, arena, "bs generates code only for apple_m1 on aarch64-macos ('-mcpu {s}'); drop -mcpu or build this step with upstream zig", .{text});
+            setUnsupported(&opts, "bs generates code only for apple_m1 on aarch64-macos ('-mcpu {s}'); drop -mcpu or build this step with upstream zig", arena, .{text});
         opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
         opts.link_libc = false;
     } else if (opts.bs_target == .aarch64_linux) {
         if (opts.fuzz)
-            setUnsupported(&opts, arena, "bs does not instrument code for fuzzing on aarch64-linux yet ('-ffuzz'); build this step with upstream zig", .{});
+            setUnsupported(&opts, "bs does not instrument code for fuzzing on aarch64-linux yet ('-ffuzz'); build this step with upstream zig", arena, .{});
         // Code is generated for the generic ARMv8-A CPU, the target's
         // baseline, as `-target aarch64-linux` gives upstream.
         if (mcpu) |text| if (!std.mem.eql(u8, text, "baseline") and !std.mem.eql(u8, text, "native") and !std.mem.eql(u8, text, "generic"))
-            setUnsupported(&opts, arena, "bs generates code only for the generic CPU on aarch64-linux ('-mcpu {s}'); drop -mcpu or build this step with upstream zig", .{text});
+            setUnsupported(&opts, "bs generates code only for the generic CPU on aarch64-linux ('-mcpu {s}'); drop -mcpu or build this step with upstream zig", arena, .{text});
         opts.cpu = std.Target.aarch64.cpu.generic.toCpu(.aarch64);
     } else if (mcpu) |text| {
         const r = cpu_mod.resolve(arena, io, text);
         opts.cpu = r.cpu;
-        if (r.refused) |msg| setUnsupported(&opts, arena, "{s}", .{msg});
+        if (r.refused) |msg| setUnsupported(&opts, "{s}", arena, .{msg});
     } else if (opts.target == null or std.mem.eql(u8, opts.target.?, "native")) {
         // As upstream, the native target's CPU is the host's (as
         // `-mcpu=native`, clamped); an explicit target's is its baseline.
@@ -2451,10 +2451,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else opts.exe_dynamic = true;
     }
     if (opts.exe_dynamic and !opts.link_libc and command != .build_lib)
-        setUnsupported(&opts, arena, "bs links executables statically unless they link libc ('-dynamic'); add -lc or build this step with upstream zig", .{});
+        setUnsupported(&opts, "bs links executables statically unless they link libc ('-dynamic'); add -lc or build this step with upstream zig", arena, .{});
     // ld64, which upstream's Mach-O links follow, has no version scripts.
     if (opts.version_script != null and opts.dynamic and opts.bs_target == .aarch64_macos)
-        setUnsupported(&opts, arena, "bs does not support version scripts ('--version-script') on aarch64-macos, whose linkers have none; use symbol visibility instead", .{});
+        setUnsupported(&opts, "bs does not support version scripts ('--version-script') on aarch64-macos, whose linkers have none; use symbol visibility instead", arena, .{});
     if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena);
     // As upstream (`requiresPIC`): glibc makes objects and libraries
     // position-independent, as their builtin says; musl does not. bs
@@ -2476,9 +2476,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             opts.c_root = true;
             opts.objects_only = true;
         } else if (command != .build_lib and !command.isObj())
-            setUnsupported(&opts, arena, "bs builds modules without a Zig root source file only into libraries and objects of C and executables of C that link glibc ('-M{s}'); build this step with upstream zig", .{opts.root_name})
+            setUnsupported(&opts, "bs builds modules without a Zig root source file only into libraries and objects of C and executables of C that link glibc ('-M{s}'); build this step with upstream zig", arena, .{opts.root_name})
         else if (c_files.items.len == 0 and link_inputs.items.len == 0)
-            setUnsupported(&opts, arena, "bs builds a library or object without a Zig root source file only from C sources and objects ('-M{s}')", .{opts.root_name})
+            setUnsupported(&opts, "bs builds a library or object without a Zig root source file only from C sources and objects ('-M{s}')", arena, .{opts.root_name})
         else if (opts.dynamic)
             opts.c_root = true
         else
@@ -2566,7 +2566,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     opts.shared_libs = shared.items;
     opts.shared_names = shared_names.items;
     if (shared.items.len != 0 and !opts.link_libc and opts.bs_target != .aarch64_macos)
-        setUnsupported(&opts, arena, "bs links shared libraries only into executables and shared libraries that link libc ('{s}'); add -lc or build this step with upstream zig", .{shared.items[0]});
+        setUnsupported(&opts, "bs links shared libraries only into executables and shared libraries that link libc ('{s}'); add -lc or build this step with upstream zig", arena, .{shared.items[0]});
     // DT_RUNPATH: as upstream's `rpath_list`, deduplicated.
     if (native) try rpaths.appendSlice(arena, search_dirs.items[0..n_explicit_dirs]);
     var unique_rpaths: std.array_hash_map.String(void) = .empty;
@@ -2613,7 +2613,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     opts.root_fuzz = root_fuzz orelse false;
     if (command == .test_obj and !opts.test_no_exec and !opts.listen) fatal("test-obj requires --test-no-exec", .{});
     if (unsafe_mode) |a| if (!opts.listen)
-        setUnsupported(&opts, arena, "bs builds only Debug and ReleaseSafe on the command line ('{s}'); use -OReleaseSafe, or upstream zig for an optimized build", .{a});
+        setUnsupported(&opts, "bs builds only Debug and ReleaseSafe on the command line ('{s}'); use -OReleaseSafe, or upstream zig for an optimized build", arena, .{a});
     // As upstream's `Config.resolve` and `Module.create`: error tracing and
     // Valgrind client requests are on in Debug and off in ReleaseSafe
     // unless asked for.
@@ -2691,7 +2691,7 @@ fn inheritFlags(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []con
 /// passes `-fno-entry`).
 fn unsupportedTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8) void {
     opts.unsupported = null;
-    setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", .{target});
+    setUnsupported(opts, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", arena, .{target});
 }
 
 pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []const u8) void {
@@ -2699,7 +2699,7 @@ pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []c
         // As upstream's native target: this system's macOS version, as
         // both minimum and maximum.
         const native = std.zig.system.resolveTargetQuery(io, .{}) catch |err| {
-            setUnsupported(opts, arena, "unable to detect the native target '{s}': {t}", .{ target, err });
+            setUnsupported(opts, "unable to detect the native target '{s}': {t}", arena, .{ target, err });
             return;
         };
         opts.macos_version = native.os.version_range.semver;
@@ -2726,7 +2726,7 @@ pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []c
     }
     if ((arch != .x86_64 and arch != .aarch64) or (query.os_tag orelse builtin.os.tag) != .linux) {
         if (std.mem.eql(u8, target, "native"))
-            setUnsupported(opts, arena, "bs does not support the native target; pass -target x86_64-linux, -target aarch64-linux, or -target aarch64-macos", .{})
+            setUnsupported(opts, "bs does not support the native target; pass -target x86_64-linux, -target aarch64-linux, or -target aarch64-macos", arena, .{})
         else
             unsupportedTarget(opts, arena, target);
         return;
@@ -2734,14 +2734,14 @@ pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []c
     // bs's CPU is `-mcpu`'s (`cpu.resolve`), not the detected one.
     query.cpu_model = .baseline;
     const resolved = std.zig.system.resolveTargetQuery(io, query) catch |err| {
-        setUnsupported(opts, arena, "unable to detect the native target '{s}': {t}", .{ target, err });
+        setUnsupported(opts, "unable to detect the native target '{s}': {t}", arena, .{ target, err });
         return;
     };
     switch (resolved.abi) {
         .gnu => opts.glibc_version = resolved.os.version_range.linux.glibc,
         .musl, .none => {},
         else => {
-            setUnsupported(opts, arena, "bs does not support the ABI {t} ('-target {s}'); it supports gnu, musl and none", .{ resolved.abi, target });
+            setUnsupported(opts, "bs does not support the ABI {t} ('-target {s}'); it supports gnu, musl and none", arena, .{ resolved.abi, target });
             return;
         },
     }
@@ -2938,14 +2938,14 @@ pub fn resolveGlibc(opts: *Options, arena: std.mem.Allocator) void {
     if (opts.linux != null and opts.linux.?.abi == .musl) {
         opts.musl = true;
         if (opts.dynamic or opts.exe_dynamic)
-            setUnsupported(opts, arena, "bs links musl only statically ('-dynamic' with target '{s}'); build this step with upstream zig", .{target});
+            setUnsupported(opts, "bs links musl only statically ('-dynamic' with target '{s}'); build this step with upstream zig", arena, .{target});
         return;
     }
     if (!std.mem.eql(u8, target, "native")) {
-        setUnsupported(opts, arena, "bs links only glibc and musl ('-lc' with target '{s}', whose libc is none); pass -target {s}-linux-gnu or -target {s}-linux-musl", .{ target, if (std.mem.startsWith(u8, target, "aarch64")) "aarch64" else "x86_64", if (std.mem.startsWith(u8, target, "aarch64")) "aarch64" else "x86_64" });
+        setUnsupported(opts, "bs links only glibc and musl ('-lc' with target '{s}', whose libc is none); pass -target {s}-linux-gnu or -target {s}-linux-musl", arena, .{ target, if (std.mem.startsWith(u8, target, "aarch64")) "aarch64" else "x86_64", if (std.mem.startsWith(u8, target, "aarch64")) "aarch64" else "x86_64" });
     } else {
         const abi: std.Target.Abi = if (opts.linux) |t| t.abi else .none;
-        setUnsupported(opts, arena, "bs links only glibc ('-lc'), and this system's libc is not glibc ({t}); pass -target {t}-linux-gnu", .{ abi, builtin.cpu.arch });
+        setUnsupported(opts, "bs links only glibc ('-lc'), and this system's libc is not glibc ({t}); pass -target {t}-linux-gnu", arena, .{ abi, builtin.cpu.arch });
     }
 }
 
@@ -3026,7 +3026,7 @@ test "checkTarget reads the macOS versions an aarch64-macos target names" {
     try std.testing.expect(opts.unsupported != null);
     // An unsupported target's message replaces an unsupported option's.
     var wasm: Options = .{ .command = .build_exe, .root_src_path = "a.zig" };
-    setUnsupported(&wasm, arena.allocator(), "{s}", .{unsupported_flags.get("-fno-entry").?});
+    setUnsupported(&wasm, "{s}", arena.allocator(), .{unsupported_flags.get("-fno-entry").?});
     checkTarget(&wasm, arena.allocator(), std.testing.io, "wasm32-freestanding");
     try std.testing.expectStringStartsWith(wasm.unsupported.?, "bs does not support the target 'wasm32-freestanding'");
     // The native target on a Mac: this system's version, both minimum and
