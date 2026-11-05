@@ -3,7 +3,8 @@
 //! flags: -ffuzz
 //! A non-test executable built with -ffuzz links and runs, as upstream's
 //! default build does: bs instruments it but links no fuzzer, whose
-//! `runner_*` callbacks only the test runner defines.
+//! `runner_*` callbacks it does not define (upstream links the fuzzer as
+//! a library, which this program draws nothing from).
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 

@@ -505,13 +505,12 @@ pub const Job = struct {
             } else false;
             job_opts.root_src_path = try Builtin.writeCMain(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }), !ubsan);
         }
-        // A test that fuzzes links the fuzzer, whose module family has a
-        // builtin of its own, as upstream's separate compilation of it (a
-        // static library) does. Only the test runner references the
-        // fuzzer and provides the `runner_*` functions it calls back, so
-        // a non-test executable links without it, as upstream's default
-        // backend links one (its linker leaves libfuzzer.a out).
-        const fuzzer_builtin_dir: ?[]const u8 = if (opts.fuzz and is_test)
+        // An executable or test that fuzzes links the fuzzer, whose
+        // module family has a builtin of its own, as upstream's separate
+        // compilation of it (a static library) does. A program other
+        // than the test runner provides the `runner_*` functions the
+        // fuzzer calls back itself (upstream's test/standalone/libfuzzer).
+        const fuzzer_builtin_dir: ?[]const u8 = if (opts.fuzz and (is_test or command == .build_exe or command == .run))
             try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }), .{
                 .output_mode = .Lib,
                 .is_test = false,

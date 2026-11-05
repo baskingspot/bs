@@ -1592,7 +1592,7 @@ pub fn compilerRtExport(name: []const u8) ?RtExport {
 /// `-ffuzz` the fuzzer's root (for its exports) and its std, and with C
 /// objects ubsan_rt and compiler_rt's stack protector (for theirs).
 pub fn rootFiles(zcu: *Zcu) [7]?u32 {
-    const fuzzer = zcu.fe.fuzzer_root;
+    const fuzzer = if (zcu.linksFuzzer()) zcu.fe.fuzzer_root else null;
     const ubsan_rt = zcu.fe.ubsan_rt;
     return .{
         0,
@@ -1603,6 +1603,26 @@ pub fn rootFiles(zcu: *Zcu) [7]?u32 {
         if (ubsan_rt) |r| zcu.moduleRootFile(r) else null,
         if (ubsan_rt != null) zcu.moduleFile(.compiler_rt, @import("Frontend.zig").ssp_sub_path) else null,
     };
+}
+
+/// Whether the fuzzer, with `-ffuzz`, joins the analysis: in a test, or in
+/// an executable whose root file declares the callbacks it makes
+/// (`runner_test_run`), as a program that drives it does. Upstream links
+/// the fuzzer as a library, which only such a program draws members
+/// from.
+fn linksFuzzer(zcu: *Zcu) bool {
+    if (zcu.fe.fuzzer_root == null) return false;
+    if (zcu.is_test) return true;
+    const f = zcu.moduleRootFile(zcu.fe.main_module) orelse return false;
+    const zir = &zcu.file(f).zir;
+    for (zir.getStructDecl(.main_struct_inst).decls) |inst| {
+        const d = zir.getDeclaration(inst);
+        switch (d.kind) {
+            .@"const", .@"var" => if (std.mem.eql(u8, zir.nullTerminatedString(d.name), "runner_test_run")) return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
