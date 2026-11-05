@@ -287,8 +287,10 @@ const Walker = struct {
         const ip = w.ip;
         switch (tag) {
             .struct_field_val => return try w.overflowField(data) orelse w.constField(data) orelse w.initField(data),
-            .slice_ptr, .slice_len, .optional_payload, .unwrap_errunion_payload => return w.constPart(tag, data.ty_op.operand),
-            .is_null, .is_non_null, .is_err, .is_non_err => return w.constPart(tag, data.un_op),
+            .slice_ptr, .slice_len, .optional_payload, .unwrap_errunion_payload => return w.constPart(tag, data.ty_op.operand) orelse w.wrapPart(tag, data.ty_op.operand),
+            .unwrap_errunion_err => return w.wrapPart(tag, data.ty_op.operand),
+            .is_null, .is_non_null, .is_err, .is_non_err => return w.constPart(tag, data.un_op) orelse w.wrapPart(tag, data.un_op),
+            .bitcast => return w.constAlias(data.ty_op),
             .array_elem_val => return w.constElem(data.bin_op.lhs, data.bin_op.rhs),
             .load => return w.loadConst(data.ty_op.operand),
             .add_with_overflow, .sub_with_overflow, .mul_with_overflow => return w.overflowConst(inst, tag, data),
@@ -520,6 +522,64 @@ const Walker = struct {
             },
             else => return null,
         }
+    }
+
+    /// What `tag` reads of an optional or error union `operand` wraps:
+    /// `return x` in a function that traces errors tests the error union
+    /// it just made.
+    fn wrapPart(w: *Walker, tag: Tag, operand: Inst.Ref) ?Inst.Ref {
+        const i = @backingInt(operand.toIndex() orelse return null);
+        const b = struct {
+            fn f(x: bool) Inst.Ref {
+                return .fromInterned(if (x) .bool_true else .bool_false);
+            }
+        }.f;
+        const wrap = w.ir.instructions.items(.tag)[i];
+        switch (wrap) {
+            .wrap_optional, .wrap_errunion_payload, .wrap_errunion_err => {},
+            else => return null,
+        }
+        const inner = w.ir.instructions.items(.data)[i].ty_op.operand;
+        return switch (wrap) {
+            .wrap_optional => switch (tag) {
+                .is_null => b(false),
+                .is_non_null => b(true),
+                .optional_payload => inner,
+                else => null,
+            },
+            .wrap_errunion_payload => switch (tag) {
+                .is_err => b(false),
+                .is_non_err => b(true),
+                .unwrap_errunion_payload => inner,
+                else => null,
+            },
+            .wrap_errunion_err => switch (tag) {
+                .is_err => b(true),
+                .is_non_err => b(false),
+                .unwrap_errunion_err => inner,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// A pointer to a local that only adds `const`, which is the local's
+    /// own pointer: Sema makes a destructured `const` local that way, and
+    /// its loads then read the alloc, which the SSA can promote. No
+    /// lowering reads a pointer type's constness.
+    fn constAlias(w: *Walker, op: @FieldType(Inst.Data, "ty_op")) ?Inst.Ref {
+        const p = op.operand.toIndex() orelse return null;
+        if (w.ir.instructions.items(.tag)[@backingInt(p)] != .alloc) return null;
+        const from_ty = w.ir.instructions.items(.data)[@backingInt(p)].ty;
+        if (from_ty == .none or w.ip.keyTag(op.ty) != .ptr_type) return null;
+        var from = Type.ptrInfo(w.ip, from_ty);
+        const to = Type.ptrInfo(w.ip, op.ty);
+        // Not `@constCast`: a store through the cast would then reach a
+        // `const` alloc, which `planConstAliases` may place in rodata.
+        if (!to.flags.is_const) return null;
+        from.flags.is_const = true;
+        if (!std.meta.eql(from, to)) return null;
+        return op.operand;
     }
 
     fn resultInfo(w: *const Walker, ty: Index) Type.IntInfo {

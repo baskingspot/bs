@@ -523,7 +523,9 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                     var n: u32 = 0;
                     for (values[k + 1 ..]) |next| {
                         const j = @backingInt(next);
-                        if (tags[j] == .dbg_stmt or fate[j] == .dead) continue;
+                        // A destructuring `const r, const o = @addWithOverflow(..)`
+                        // stores each field before reading the next.
+                        if (tags[j] == .dbg_stmt or tags[j] == .store or fate[j] == .dead) continue;
                         if (tags[j] != .struct_field_val) break;
                         const sf = ir.extraData(Ir.StructField, datas[j].ty_pl.payload).data;
                         if (sf.operand != inst.toRef() or fields[sf.index] != no_tie) break;
@@ -533,6 +535,10 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                     if (n == 0 or n != uses[i]) continue;
                     fate[i] = .pair;
                     for (fields) |j| if (j != no_tie) {
+                        // A store between the operation and the field's read
+                        // may be a clobber point the field now lives across.
+                        const cl = f.clobbers.items;
+                        if (cl[def[j]][0] != cl[def[i]][0] or cl[def[j]][1] != cl[def[i]][1]) live.items(.crosses)[j] = true;
                         def[j] = def[i];
                     };
                     try f.pairs.put(gpa, i, fields);

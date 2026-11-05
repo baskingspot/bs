@@ -1905,7 +1905,16 @@ code. Rules are matched per tag (a comptime index of the table):
   constant array at a constant index, a constant slice's `ptr` and
   `len`, a constant optional's or error union's state and payload, and
   the fields of an overflow operation on constants (so a check of `n - 1`
-  for a constant `n` folds).
+  for a constant `n` folds);
+- reads through a wrapper: an optional's or error union's state, payload
+  or error code read from the `wrap_optional`/`wrap_errunion_*` that made
+  it (`return x` in a function that traces errors tests the error union
+  it just built);
+- a `bitcast` that only adds `const` to a local's pointer is the local's
+  pointer: Sema makes a destructured `const` local that way, and its loads
+  then read the alloc directly, which `Ssa.plan` can promote (with the
+  bitcast in between, `const r, const o = @addWithOverflow(a, b)` kept
+  both in memory).
 
 A `cond_br` whose condition became constant keeps only the taken body
 (`Ssa.build`), in a block of its own, so a panic that now always runs
