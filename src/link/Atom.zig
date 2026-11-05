@@ -275,6 +275,17 @@ pub const Reloc = extern struct {
         /// address of an export with default visibility. In data, GOT
         /// slots, and the slots PLT stubs jump through.
         x86_64_abs64_sym,
+        /// aarch64 ELF local-exec TLS, in `mrs xd, tpidr_el0; add xd, xd,
+        /// #hi12, lsl #12; add xd, xd, #lo12`: thread-local S's offset
+        /// from the thread pointer, S + A - TP, where TP is below the start
+        /// of the TLS segment by 16 rounded up to the segment's alignment
+        /// (TLS variant 1, a 16-byte TCB at TP). `hi12` writes bits 12-23
+        /// into the add's imm12, checked to fit 24 bits (ELF
+        /// R_AARCH64_TLSLE_ADD_TPREL_HI12); `lo12_nc` writes bits 0-11,
+        /// unchecked (R_AARCH64_TLSLE_ADD_TPREL_LO12_NC). S must be in
+        /// `.tdata` or `.tbss`.
+        aarch64_tprel_hi12,
+        aarch64_tprel_lo12_nc,
     };
 };
 

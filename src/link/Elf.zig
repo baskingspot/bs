@@ -59,6 +59,7 @@ const Allocator = std.mem.Allocator;
 const Atom = @import("Atom.zig");
 const Dwarf = @import("Dwarf.zig");
 const ElfDynamic = @import("ElfDynamic.zig");
+const a64 = @import("aarch64.zig");
 /// DW_AT_language of the compile units: Zig, as upstream's self-hosted
 /// backend (its Linux Debug default) writes it, which gdb reads.
 const dwarf_language = std.dwarf.LANG.Zig;
@@ -100,6 +101,9 @@ pub const Options = struct {
     symbols: ?Symbols = null,
     /// How `link` writes the file; for tests and benchmarks.
     file_writes: FileWrites = .auto,
+    /// The machine: x86_64, or aarch64 for static executables (relocation
+    /// kinds, TLS variant 1, 64 KiB segment alignment, CFI registers).
+    arch: Atom.Unwind.Arch = .x86_64,
     /// The image is position-independent code: .rodata atoms holding
     /// absolute addresses go to .data.rel.ro, which a loader may write, and
     /// local-dynamic TLS relocations are allowed. Executables are not.
@@ -798,6 +802,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .n_partitions = n_partitions,
         .n_resolve_tasks = if (numbered == null) n_partitions else n_chunks,
         .numbered = numbered,
+        .arch = options.arch,
         .pic = options.pic or (options.dynamic != null and !exe_dyn),
         .dynamic = options.dynamic != null,
         .exe_imports = exe_imports,
@@ -994,11 +999,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const hdr_off = eh_off + eh_room;
     const hdr_room = if (has_cfi) Dwarf.eh_frame_hdr_size + (n_debug + n_input_fdes) * Dwarf.eh_frame_hdr_entry_size else 0;
     const r_end = if (has_cfi) hdr_off + hdr_room else pcs_end;
-    const rx_start = if (has_rx) std.mem.alignForward(u64, r_end, page_size) else r_end;
+    // aarch64 Linux kernels may use pages of up to 64 KiB, which segments
+    // must start on, as upstream's (lld's) aarch64 output does.
+    const seg_align: u64 = if (options.arch == .aarch64) 0x10000 else page_size;
+    const rx_start = if (has_rx) std.mem.alignForward(u64, r_end, seg_align) else r_end;
     const plt_off = if (has_dyn) std.mem.alignForward(u64, rx_start, 16) else rx_start;
     starts[text] = aligns[text].forward(plt_off + plt_size);
     const text_end = starts[text] + sizes[text];
-    const rw_start = if (has_rw) std.mem.alignForward(u64, text_end, page_size) else text_end;
+    const rw_start = if (has_rw) std.mem.alignForward(u64, text_end, seg_align) else text_end;
     // The TLS segment: its start and every thread's copy are aligned to
     // its alignment, so offsets within it keep theirs.
     const tls_align = aligns[tdata].max(aligns[tbss]);
@@ -1058,12 +1066,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             values.getOrPut(key).* = .{ .key = key, .value = base + at, .used = true };
         }
     }
-    // Variant 2: the thread pointer is the end of the thread's TLS block,
-    // whose size is the segment's rounded up to its alignment.
+    // Variant 2 (x86_64): the thread pointer is the end of the thread's
+    // TLS block, whose size is the segment's rounded up to its alignment.
+    // Variant 1 (aarch64): the block follows a 16-byte TCB at the thread
+    // pointer, at the TCB's end rounded up to the block's alignment.
     l.tls = .{
         .start = base + tls_start,
         .end = base + tls_end,
-        .tp = base + tls_start + tls_align.forward(tls_end - tls_start),
+        .tp = if (options.arch == .aarch64) base + tls_start -% tls_align.forward(16) else base + tls_start + tls_align.forward(tls_end - tls_start),
         .ld_got = if (has_dyn and !exe_dyn) base + got_off else if (options.pic) base + tls_start else null,
         .object = options.object,
     };
@@ -1217,7 +1227,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const hdr_size = Dwarf.eh_frame_hdr_size + @as(u64, n_frames) * Dwarf.eh_frame_hdr_entry_size;
     if (has_cfi) {
         // The FDEs and the search table are written with the debug chunks.
-        try l.put(eh_off, &Dwarf.cie);
+        try l.put(eh_off, Dwarf.cieOf(options.arch));
         try l.fill(eh_off + eh_size - 4, hdr_off - (eh_off + eh_size - 4)); // terminator, unused room
         const eh_frame_rel: i32 = @intCast(@as(i64, @intCast(eh_off)) - @as(i64, @intCast(hdr_off + 4)));
         try l.put(hdr_off, &Dwarf.ehFrameHdr(eh_frame_rel, n_frames));
@@ -1392,7 +1402,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     writeStruct(&head, elf.Elf64.Ehdr{
         .ident = .{ .class = .@"64", .data = .@"2LSB", .version = 1, .osabi = .NONE, .abiversion = 0 },
         .type = if (has_dyn and !exe_dyn) .DYN else .EXEC,
-        .machine = .X86_64,
+        .machine = if (options.arch == .aarch64) .AARCH64 else .X86_64,
         .version = 1,
         .entry = entry_addr.?,
         .phoff = @sizeOf(elf.Elf64.Ehdr),
@@ -1412,9 +1422,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const phdrs = [ph_present.len]struct { elf.PT, elf.PF, u64, u64, u64, u64, u64 }{
         .{ .PHDR, .{ .R = true }, @sizeOf(elf.Elf64.Ehdr), base + @sizeOf(elf.Elf64.Ehdr), ph_size, ph_size, 8 },
         .{ .INTERP, .{ .R = true }, interp_off, base + interp_off, interp_size, interp_size, 1 },
-        .{ .LOAD, .{ .R = true }, 0, base, r_end, r_end, page_size },
-        .{ .LOAD, .{ .R = true, .X = true }, rx_start, base + rx_start, text_end - rx_start, text_end - rx_start, page_size },
-        .{ .LOAD, .{ .R = true, .W = true }, rw_start, base + rw_start, file_end - rw_start, mem_end - rw_start, page_size },
+        .{ .LOAD, .{ .R = true }, 0, base, r_end, r_end, seg_align },
+        .{ .LOAD, .{ .R = true, .X = true }, rx_start, base + rx_start, text_end - rx_start, text_end - rx_start, seg_align },
+        .{ .LOAD, .{ .R = true, .W = true }, rw_start, base + rw_start, file_end - rw_start, mem_end - rw_start, seg_align },
         // (Absent ones may wrap.)
         .{ .DYNAMIC, .{ .R = true, .W = true }, dynamic_off, base + dynamic_off, got_off -% dynamic_off, got_off -% dynamic_off, 8 },
         .{ .TLS, .{ .R = true }, tls_start, base + tls_start, sizes[tdata], tls_end - tls_start, tls_align.toByteUnits() },
@@ -1590,6 +1600,8 @@ fn LinkOf(comptime Input: type) type {
         /// symbols, chunks.
         n_resolve_tasks: usize,
         numbered: ?Symbols,
+        /// `Options.arch`.
+        arch: Atom.Unwind.Arch,
         /// `Options.pic`.
         pic: bool,
         /// Whether `Options.dynamic` is set.
@@ -2107,7 +2119,7 @@ fn LinkOf(comptime Input: type) type {
                     const fn_addr: i64 = @intCast(addr);
                     const k = fde - c.frame_base;
                     const fde_len = Dwarf.fdeSize(unwind, size);
-                    Dwarf.writeFde(out[0][fde_at..][0..fde_len], unwind, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
+                    Dwarf.writeFde(l.arch, out[0][fde_at..][0..fde_len], unwind, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
                     fde_at += fde_len;
                     const entry = out[1][@as(usize, k) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
                     std.mem.writeInt(i32, entry[0..4], @intCast(fn_addr - hdr_addr), .little);
@@ -2285,7 +2297,7 @@ fn LinkOf(comptime Input: type) type {
                 if (!zero_fill[place.section]) {
                     const section_out = out[place.section];
                     const start = addr - l.base - offsets[place.section];
-                    @memset(section_out[start - place.gap .. start], fills[place.section]);
+                    @memset(section_out[start - place.gap .. start], if (l.arch == .aarch64) 0 else fills[place.section]);
                     const dst = section_out[start..][0..a.bytes.len];
                     @memcpy(dst, a.bytes);
                     const res = resolved[0..a.targets.len];
@@ -2565,7 +2577,7 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
             },
             // The resolver's address until the loader calls it, as
             // upstream writes it.
-            .x86_64_abs64, .x86_64_irelative => {
+            .x86_64_abs64, .x86_64_irelative, .aarch64_abs64 => {
                 const f = try relocField(a, dst, r.offset, 8, diag);
                 std.mem.writeInt(u64, f, s +% @as(u64, @bitCast(@as(i64, r.addend))), .little);
             },
@@ -2605,6 +2617,7 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
                 const f = try relocField(a, dst, r.offset, 1, diag);
                 f[0] = std.math.cast(u8, @as(i128, s) + r.addend) orelse return overflow(a, r, diag);
             },
+            .aarch64_branch26, .aarch64_page21, .aarch64_pageoff12, .aarch64_got_load_page21, .aarch64_got_load_pageoff12, .aarch64_movw_value16, .aarch64_tprel_hi12, .aarch64_tprel_lo12_nc => try aarch64Reloc(a, r, dst, p_base, s, tls, diag),
             else => return invalidReloc(a, diag),
         }
     }
@@ -2636,6 +2649,53 @@ noinline fn tpoff64(a: *const Atom, r: Atom.Reloc, dst: []u8, s: u64, tls: *cons
         diag.* = .{ .atom = a.name, .target = a.targets[r.info.target] };
         return error.InvalidRelocation;
     }
+}
+
+/// An aarch64 instruction's relocation, in a static executable, where
+/// every target is defined: GOT loads become the target's address.
+noinline fn aarch64Reloc(a: *const Atom, r: Atom.Reloc, dst: []u8, p_base: u64, s: u64, tls: *const Tls, diag: *Diagnostic) Error!void {
+    const f = try relocField(a, dst, r.offset, 4, diag);
+    const insn = std.mem.readInt(u32, f, .little);
+    const p = p_base + r.offset;
+    const target = s +% @as(u64, @bitCast(@as(i64, r.addend)));
+    const v: u32 = switch (r.info.kind) {
+        .aarch64_branch26 => v: {
+            const delta: i64 = @bitCast(target -% p);
+            if (delta & 3 != 0 or delta < -(1 << 27) or delta >= 1 << 27) return overflow(a, r, diag);
+            break :v (insn & 0xfc000000) | @as(u32, @truncate(@as(u64, @bitCast(delta >> 2)) & 0x3ffffff));
+        },
+        .aarch64_page21, .aarch64_got_load_page21 => v: {
+            const pages = a64.pageDelta(target, p);
+            if (pages < -(1 << 20) or pages >= 1 << 20) return overflow(a, r, diag);
+            break :v a64.patchAdrp(insn, pages);
+        },
+        .aarch64_pageoff12 => v: {
+            const off: u32 = @truncate(target & 0xfff);
+            const scale = a64.pageOffScale(insn) orelse return invalidReloc(a, diag);
+            if (off & ((@as(u32, 1) << scale) - 1) != 0) return overflow(a, r, diag);
+            break :v a64.patchImm12(insn, off >> scale);
+        },
+        // ldr xt, [xn, #got_lo12] becomes add xt, xn, #lo12.
+        .aarch64_got_load_pageoff12 => if (insn & 0xffc00000 != 0xf9400000)
+            return invalidReloc(a, diag)
+        else
+            0x91000000 | (insn & 0x3ff) | @as(u32, @truncate(target & 0xfff)) << 10,
+        // movz or movk, w or x.
+        .aarch64_movw_value16 => if (insn & 0x5f800000 != 0x52800000)
+            return invalidReloc(a, diag)
+        else
+            (insn & ~@as(u32, 0xffff << 5)) | @as(u32, std.math.cast(u16, @as(i128, s) + r.addend) orelse return overflow(a, r, diag)) << 5,
+        .aarch64_tprel_hi12, .aarch64_tprel_lo12_nc => v: {
+            // add xd, xn, #imm
+            if (insn & 0xff800000 != 0x91000000 or s < tls.start or s >= tls.end) return invalidReloc(a, diag);
+            const off = target -% tls.tp;
+            if (r.info.kind == .aarch64_tprel_lo12_nc) break :v a64.patchImm12(insn, @truncate(off & 0xfff));
+            if (off >= 1 << 24) return overflow(a, r, diag);
+            break :v a64.patchImm12(insn, @truncate(off >> 12));
+        },
+        else => unreachable,
+    };
+    std.mem.writeInt(u32, f, v, .little);
 }
 
 /// Whether `a` holds an absolute address, which a position-independent

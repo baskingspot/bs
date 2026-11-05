@@ -64,6 +64,10 @@ const Dwarf = @import("Dwarf.zig");
 /// and shows no functions or inlined frames for DW_LANG_Zig units.
 const dwarf_language = std.dwarf.LANG.C99;
 const Elf = @import("Elf.zig");
+const a64 = @import("aarch64.zig");
+const pageDelta = a64.pageDelta;
+const patchAdrp = a64.patchAdrp;
+const pageOffScale = a64.pageOffScale;
 const SymbolKey = Atom.SymbolKey;
 const SymbolTable = Elf.SymbolTable;
 const parallel = Elf.parallel;
@@ -1873,38 +1877,12 @@ fn LinkOf(comptime Input: type) type {
                             std.mem.writeInt(u32, field[0..4], insn | @as(u32, @intCast(t.v & 0xfff)) << 10, .little);
                         }
                     },
+                    .aarch64_tprel_hi12, .aarch64_tprel_lo12_nc => return invalid,
                     .x86_64_abs64, .x86_64_pc32, .x86_64_tpoff32, .x86_64_tlsld, .x86_64_dtpoff32, .x86_64_gottpoff, .x86_64_tlsgd, .x86_64_abs32, .x86_64_abs32s, .x86_64_tpoff64, .x86_64_dtpmod64, .x86_64_tlsdesc, .x86_64_irelative, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym, .x86_64_tlsdesc_sym, .x86_64_abs64_sym => return invalid,
                 }
             }
         }
     };
-}
-
-/// Page(target) - Page(p), in 4 KiB pages, as adrp computes it.
-fn pageDelta(target: u64, p: u64) i64 {
-    return @as(i64, @bitCast(target >> 12)) - @as(i64, @bitCast(p >> 12));
-}
-
-/// Sets adrp's immhi:immlo to `pages`.
-fn patchAdrp(insn: u32, pages: i64) u32 {
-    const imm: u32 = @truncate(@as(u64, @bitCast(pages)) & 0x1fffff);
-    return (insn & 0x9f00001f) | ((imm & 3) << 29) | ((imm >> 2) << 5);
-}
-
-/// log2 of the unit of an instruction's unsigned 12-bit offset: 0 for
-/// `add (immediate)`, the access size for loads and stores, or null for an
-/// instruction a pageoff12 relocation cannot patch.
-fn pageOffScale(insn: u32) ?u5 {
-    // add wd|xd, wn|sp, #imm (no shift)
-    if (insn & 0x7fc00000 == 0x11000000) return 0;
-    // Loads and stores, unsigned offset: size 111 V 01 opc imm12 Rn Rt.
-    if (insn & 0x3b000000 == 0x39000000) {
-        const size: u5 = @intCast(insn >> 30);
-        // V=1 with opc<1>=1 and size 00 is a q register.
-        if (insn & 0x04800000 == 0x04800000 and size == 0) return 4;
-        return size;
-    }
-    return null;
 }
 
 /// A chained bind (`dyld_chained_ptr_64_bind`) with `next` 0.
