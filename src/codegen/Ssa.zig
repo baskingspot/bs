@@ -2044,7 +2044,8 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// a value that crosses none prefers the others. When none is free, the
 /// value whose interval ends last among those holding a register it could
 /// use is kept in memory for its whole life. A pair gets two free
-/// registers or stays in memory, and is never evicted. Values stay in
+/// registers or stays in memory; it evicts none, and when it is evicted
+/// both its registers are freed. Values stay in
 /// their registers through their last use, so a result shares a register
 /// only with its tied operand or, for a load of a promoted variable, with
 /// the variable (`Live.share`). A free register the value's `hint` names
@@ -2152,7 +2153,7 @@ pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, s
                 continue;
             }
             if (reg[inst] == want_pair) {
-                // Two registers or none; a pair neither evicts nor is evicted.
+                // Two registers or none; a pair evicts none.
                 const avail = free & usable;
                 if (@popCount(avail) < 2) {
                     reg[inst] = no_reg;
@@ -2197,10 +2198,11 @@ pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, s
                 continue;
             }
             // Out of registers: a value used a loop level less often than the
-            // others goes to memory, else the one that ends last.
+            // others goes to memory, else the one that ends last. A pair that
+            // goes frees both its registers.
             var last: ?u8 = null;
             for (active[0..active_len], 0..) |a, k| {
-                if (usable >> @intCast(reg[a]) & 1 == 0 or held[reg[a]] >= def[inst] or reg2[a] != no_reg or hint[a][1] == hint_pinned) continue;
+                if (usable & (regBit(reg[a]) | regBit(reg2[a])) == 0 or held[reg[a]] >= def[inst] or hint[a][1] == hint_pinned) continue;
                 if (last == null or spillsBefore(weight, end, a, active[last.?])) last = @intCast(k);
             }
             const victim = if (last) |l| active[l] else {
@@ -2208,8 +2210,11 @@ pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, s
                 continue;
             };
             if (spillsBefore(weight, end, victim, inst)) {
-                reg[inst] = reg[victim];
+                const lo = usable >> @intCast(reg[victim]) & 1 != 0;
+                reg[inst] = if (lo) reg[victim] else reg2[victim];
+                if (reg2[victim] != no_reg) free |= regBit(if (lo) reg2[victim] else reg[victim]);
                 reg[victim] = no_reg;
+                reg2[victim] = no_reg;
                 active[last.?] = inst;
             } else reg[inst] = no_reg;
         }
