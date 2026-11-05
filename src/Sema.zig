@@ -10314,8 +10314,9 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
         if (a == b or a == .generic_poison_type or b == .generic_poison_type) continue;
         if (sema.paramPtrCoercible(b, a)) continue;
         if (sema.cPtrOptCoercibleInMemory(b, a) or sema.cPtrOptCoercibleInMemory(a, b)) continue;
-        // A parameter may take more errors than `dst`'s passes.
-        if (sema.errorCoercibleInMemory(b, a)) continue;
+        // A parameter may take more errors than `dst`'s passes, or be an
+        // integer of the same signedness and bits (`i32` for `c_int`).
+        if (sema.errorCoercibleInMemory(b, a) or sema.childCoercibleInMemory(b, a)) continue;
         return false;
     }
     if (s.return_type == d.return_type or s.return_type == .noreturn_type or s.return_type == .generic_poison_type) return true;
