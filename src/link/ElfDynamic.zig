@@ -60,6 +60,9 @@ pub const Import = struct {
     /// A thread-local (STT_TLS): in an executable, reached through slots
     /// the loader writes with TPOFF64 relocations.
     tls: bool = false,
+    /// A function in the library that defines it (STT_FUNC); otherwise
+    /// STT_NOTYPE, as for a weak name nothing defines.
+    func: bool = false,
     /// With glibc: the symbol version the import binds to
     /// (`GLIBC_2.2.5`), or null for none, and the index in
     /// `Options.needed` of the library that defines it.
@@ -318,7 +321,7 @@ pub fn writeSymbols(out: []u8, t: *const Tables, o: Options, defined: []const De
     syms[0] = std.mem.zeroes(elf.Elf64.Sym);
     for (o.imports, 1.., t.names[0..t.n_imports]) |imp, k, name| syms[k] = .{
         .name = name,
-        .info = .{ .type = if (imp.tls) .TLS else .NOTYPE, .bind = if (imp.weak) .WEAK else .GLOBAL },
+        .info = .{ .type = if (imp.tls) .TLS else if (imp.func) .FUNC else .NOTYPE, .bind = if (imp.weak) .WEAK else .GLOBAL },
         .other = .{ .visibility = .DEFAULT },
         .shndx = elf.SHN_UNDEF,
         .value = 0,

@@ -263,20 +263,21 @@ fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copie
             try needed.append(arena, lib.soname);
         };
     }
-    const Place = struct { version: ?[]const u8, library: u32 };
+    const Place = struct { version: ?[]const u8, library: u32, func: bool = false };
     const place = struct {
         fn f(gl: *const Glibc, a: Allocator, sh: []const ElfShared, live: []const bool, si: []const u32, li: *const [libs.len]u32, name: []const u8) !?Place {
             // A weak import of a library nothing keeps alive stays
             // unversioned, as it binds to no needed library.
-            if (sharedSymbol(sh, name)) |s| return if (live[s.lib]) .{ .version = s.sym.version, .library = si[s.lib] } else .{ .version = null, .library = 0 };
+            if (sharedSymbol(sh, name)) |s| return if (live[s.lib]) .{ .version = s.sym.version, .library = si[s.lib], .func = s.sym.func } else .{ .version = null, .library = 0, .func = s.sym.func };
             const sym = gl.get(name) orelse return null;
-            return .{ .version = try gl.versionName(a, sym.version), .library = li[sym.lib] };
+            return .{ .version = try gl.versionName(a, sym.version), .library = li[sym.lib], .func = !sym.object };
         }
     }.f;
     for (imports) |*imp| {
         const p = try place(g, arena, shared, alive, shared_index, &lib_index, imp.name) orelse continue;
         imp.version = p.version;
         imp.library = p.library;
+        imp.func = p.func and !imp.tls;
     }
     // Each copy, then the other names its library gives the same object,
     // which the library's own code may use instead.
@@ -431,4 +432,7 @@ test load {
     for (own.needed, [_][]const u8{ "libm.so.6", "libc.so.6", "ld-linux-x86-64.so.2", "liba.so" }) |got, want| try std.testing.expectEqualStrings(want, got);
     try std.testing.expectEqual(3, own.imports[0].library);
     try std.testing.expectEqual(1, own.imports[1].library);
+    // An import is a function (STT_FUNC) where its library's symbol is:
+    // glibc's puts is; liba.so's `a` is neither a function nor data.
+    try std.testing.expect(!own.imports[0].func and own.imports[1].func);
 }

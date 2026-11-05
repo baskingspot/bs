@@ -32,6 +32,9 @@ pub const Symbol = struct {
     /// A thread-local (STT_TLS), which an executable reaches through a
     /// slot the loader writes its thread-pointer offset into (TPOFF64).
     tls: bool = false,
+    /// A function (STT_FUNC or STT_GNU_IFUNC), which an import of it is
+    /// as well (STT_FUNC, as lld and upstream's linker write it).
+    func: bool = false,
     size: u64,
     value: u64,
 };
@@ -130,7 +133,7 @@ pub fn parse(arena: Allocator, path: []const u8, needed_name: []const u8, bytes:
         if (name.len == 0) continue;
         const gop = try lib.symbols.getOrPut(arena, name);
         if (gop.found_existing) continue;
-        gop.value_ptr.* = .{ .version = version, .object = sym.st_type() == elf.STT_OBJECT, .tls = sym.st_type() == elf.STT_TLS, .size = sym.st_size, .value = sym.st_value };
+        gop.value_ptr.* = .{ .version = version, .object = sym.st_type() == elf.STT_OBJECT, .tls = sym.st_type() == elf.STT_TLS, .func = sym.st_type() == elf.STT_FUNC or sym.st_type() == elf.STT_GNU_IFUNC, .size = sym.st_size, .value = sym.st_value };
     }
     lib.undefs = undefs.items;
     return lib;
