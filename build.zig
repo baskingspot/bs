@@ -290,7 +290,7 @@ fn addFlags(b: *std.Build, r: *std.Build.Step.Run, flags: []const []const u8, sr
         r.addArg(f);
         if (!std.mem.startsWith(u8, f, "-M")) continue;
         modules = true;
-        r.addFileInput(b.path(f[std.mem.indexOfScalar(u8, f, '=').? + 1 ..]));
+        r.addFileInput(b.path(f[std.mem.findScalar(u8, f, '=').? + 1 ..]));
     }
     if (!modules) r.addFileArg(b.path(src_path));
 }
@@ -380,7 +380,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
             if (!std.mem.startsWith(u8, line, "//! ")) break;
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue;
             const key = line[4..colon];
             const value = std.mem.trim(u8, line[colon + 1 ..], " ");
             if (std.mem.eql(u8, key, "exit")) {
@@ -407,7 +407,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 expect.rebuild_without.append(b.allocator, .{ text, "" }) catch @panic("OOM");
             } else if (std.mem.eql(u8, key, "rebuild-replace") or std.mem.eql(u8, key, "rebuild-lib-without")) {
                 // Two strings.
-                const end = 1 + (std.mem.indexOfPos(u8, value, 1, "\" \"") orelse std.debug.panic("{s}: bad {s}", .{ src_path, key }));
+                const end = 1 + (std.mem.findPos(u8, value, 1, "\" \"") orelse std.debug.panic("{s}: bad {s}", .{ src_path, key }));
                 const first = std.zig.string_literal.parseAlloc(b.allocator, value[0..end]) catch std.debug.panic("{s}: bad string", .{src_path});
                 const second = std.zig.string_literal.parseAlloc(b.allocator, std.mem.trim(u8, value[end..], " ")) catch std.debug.panic("{s}: bad string", .{src_path});
                 if (key[8] == 'r') {
@@ -435,7 +435,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
         // `-target native` and `<arch>-native-<abi>` name the host's OS, as
         // upstream resolves them, so these tests need an x86_64-linux host.
         if (!host_runs_bs_output and for (expect.flags.items, 0..) |f, i| {
-            if (i > 0 and std.mem.eql(u8, expect.flags.items[i - 1], "-target") and std.mem.indexOf(u8, f, "native") != null) break true;
+            if (i > 0 and std.mem.eql(u8, expect.flags.items[i - 1], "-target") and std.mem.find(u8, f, "native") != null) break true;
         } else false) continue;
 
         for ([_]bool{ false, true }) |upstream| {
@@ -462,7 +462,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                     const lib_dir = defaultZigLibDir(b);
                     const lib_src = std.Io.Dir.cwd().readFileAlloc(io, b.pathJoin(&.{ lib_dir, e.path }), b.allocator, .limited(16 << 20)) catch |err|
                         std.debug.panic("{s}: unable to read {s}: {t}", .{ src_path, e.path, err });
-                    const at = std.mem.indexOf(u8, lib_src, e.text) orelse std.debug.panic("{s}: rebuild-lib-without text not found", .{src_path});
+                    const at = std.mem.find(u8, lib_src, e.text) orelse std.debug.panic("{s}: rebuild-lib-without text not found", .{src_path});
                     _ = files.add("lib_before", b.fmt("{s}{s}", .{ lib_src[0..at], lib_src[at + e.text.len ..] }));
                     lib_setup = b.fmt("chmod -R u+w \"$4.d/lib\" 2>/dev/null || :; rm -rf \"$4.d/lib\"; cp -rs {s} \"$4.d/lib\"; chmod -R u+w \"$4.d/lib\"; rm \"$4.d/lib/{s}\"\n", .{ lib_dir, e.path });
                     lib_flag = b.fmt(" --zig-lib-dir \"$4.d/lib\"", .{});
@@ -547,7 +547,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 r.addFileArg(b.path("test/run/rt.zig"));
                 break :blk r;
             } else if (expect.donor_without) |text| blk: {
-                const at = std.mem.indexOf(u8, source, text) orelse std.debug.panic("{s}: donor-without text not found", .{src_path});
+                const at = std.mem.find(u8, source, text) orelse std.debug.panic("{s}: donor-without text not found", .{src_path});
                 const files = b.addWriteFiles();
                 const donor = files.add(file, b.fmt("{s}{s}", .{ source[0..at], source[at + text.len ..] }));
                 const bs_cmd = b.fmt("\"$5\" build-exe -target x86_64-linux --global-cache-dir \"$4.d/g\"", .{});
@@ -625,7 +625,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             };
             compile.addFileInput(b.path("test/run/rt.zig"));
             if (!upstream) {
-                const uses_std = std.mem.indexOf(u8, source, "@import(\"std\")") != null;
+                const uses_std = std.mem.find(u8, source, "@import(\"std\")") != null;
                 const edits = expect.rebuild_without.items.len != 0 or expect.lib_edit != null;
                 takes(b, &compile.step, if (edits) (if (uses_std) 10 else 1) else if (expect.donor_libc) 12 else if (expect.donor_without != null) (if (uses_std) 8 else 2) else if (uses_std) 2 else 1);
             }
@@ -723,7 +723,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 r.addFileArg(before);
                 r.addFileArg(b.path(src_path));
                 r.addFileArg(b.path("test/run/rt.zig"));
-                takes(b, &r.step, if (std.mem.indexOf(u8, source, "@import(\"std\")") != null) 4 else 1);
+                takes(b, &r.step, if (std.mem.find(u8, source, "@import(\"std\")") != null) 4 else 1);
                 break :blk r;
             } else if (upstream) b.addSystemCommand(&.{upstreamZig(b)}) else b.addRunArtifact(bs);
             const bin = if (rebuild) blk: {
@@ -764,9 +764,9 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
 fn earlierVersion(b: *std.Build, source: []const u8, edits: []const [2][]const u8, src_path: []const u8) []const u8 {
     var earlier = source;
     var body_start: usize = 0;
-    while (std.mem.startsWith(u8, earlier[body_start..], "//! ")) body_start = std.mem.indexOfScalarPos(u8, earlier, body_start, '\n').? + 1;
+    while (std.mem.startsWith(u8, earlier[body_start..], "//! ")) body_start = std.mem.findScalarPos(u8, earlier, body_start, '\n').? + 1;
     for (edits) |edit| {
-        const at = std.mem.indexOfPos(u8, earlier, body_start, edit[0]) orelse std.debug.panic("{s}: rebuild-without text not found", .{src_path});
+        const at = std.mem.findPos(u8, earlier, body_start, edit[0]) orelse std.debug.panic("{s}: rebuild-without text not found", .{src_path});
         earlier = b.fmt("{s}{s}{s}", .{ earlier[0..at], edit[1], earlier[at + edit[0].len ..] });
     }
     return earlier;
@@ -848,7 +848,7 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         b.dependOnFileContents(b.path(src_path));
         const source = dir.readFileAlloc(io, file, b.allocator, .limited(1 << 20)) catch |err|
             std.debug.panic("unable to read {s}: {t}", .{ src_path, err });
-        const block = std.mem.lastIndexOf(u8, source, "\n// error\n") orelse
+        const block = std.mem.findLast(u8, source, "\n// error\n") orelse
             std.debug.panic("{s}: missing '// error' block", .{src_path});
         var args: []const u8 = "";
         // `bs-only: why`: an error only bs gives, which upstream accepts.
@@ -872,11 +872,11 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
             }
             if (expected.items.len == 0 and std.mem.startsWith(u8, text, "edit-from: ")) {
                 const value = text["edit-from: ".len..];
-                const end = 1 + (std.mem.indexOfPos(u8, value, 1, "\" \"") orelse std.debug.panic("{s}: bad edit-from", .{src_path}));
+                const end = 1 + (std.mem.findPos(u8, value, 1, "\" \"") orelse std.debug.panic("{s}: bad edit-from", .{src_path}));
                 const now = std.zig.string_literal.parseAlloc(b.allocator, value[0..end]) catch std.debug.panic("{s}: bad string", .{src_path});
                 const then = std.zig.string_literal.parseAlloc(b.allocator, value[end + 1 ..]) catch std.debug.panic("{s}: bad string", .{src_path});
                 const code = earlier orelse source[0..block];
-                const at = std.mem.indexOf(u8, code, now) orelse std.debug.panic("{s}: edit-from text not found", .{src_path});
+                const at = std.mem.find(u8, code, now) orelse std.debug.panic("{s}: edit-from text not found", .{src_path});
                 earlier = b.fmt("{s}{s}{s}", .{ code[0..at], then, code[at + now.len ..] });
                 continue;
             }
@@ -892,7 +892,7 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         run.addArgs(&.{ "build-exe", "-target", "x86_64-linux", "-fno-emit-bin" });
         // Arguments that give the root module (`--dep a -Mroot=<file>`)
         // name the file themselves.
-        if (std.mem.indexOf(u8, args, "-Mroot=") == null) run.addArg(file);
+        if (std.mem.find(u8, args, "-Mroot=") == null) run.addArg(file);
         var arg_it = std.mem.tokenizeScalar(u8, args, ' ');
         while (arg_it.next()) |a| run.addArg(a);
         run.addFileInput(b.path(src_path));
@@ -1032,7 +1032,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     // upstream links the programs.
     for ([_][]const u8{ "test/obj/lib.zig", "test/link_input/so_libc.zig", "test/link_input/so_libc.c" }, [_][]const u8{ "test/obj/main.zig", "test/link_input/so_libc_main.zig", "test/link_input/so_c_main.zig" }, [_][]const u8{ "bslc", "so_libc", "so_c" }, [_][]const u8{ "", "z[c7:1]\nz[c42:2]\nc bye\n", "c3:1\nc4:2\nc bye\n" }) |lib_src, main_src, name, stderr| {
         const lc_so = b.addRunArtifact(bs);
-        lc_so.setName(b.fmt("bs build-lib -dynamic -lc {s}", .{std.fs.path.basename(lib_src)}));
+        lc_so.setName(b.fmt("bs build-lib -dynamic -lc {s}", .{std.Io.Dir.path.basename(lib_src)}));
         lc_so.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", "x86_64-linux-gnu", "--name", name });
         lc_so.addFileArg(b.path(lib_src));
         if (std.mem.eql(u8, name, "so_libc")) lc_so.addFileArg(b.path("test/link_input/so_libc.c"));
@@ -1042,7 +1042,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         lc_so_host.addFileArg(b.path(main_src));
         lc_so_host.addFileArg(lc_so_file);
         const lc_so_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
-        lc_so_run.setName(b.fmt("run {s} (bs shared library linking glibc)", .{std.fs.path.basename(main_src)}));
+        lc_so_run.setName(b.fmt("run {s} (bs shared library linking glibc)", .{std.Io.Dir.path.basename(main_src)}));
         lc_so_run.addFileArg(lc_so_file);
         lc_so_run.addFileArg(lc_so_host.addPrefixedOutputFileArg("-femit-bin=", "main"));
         if (stderr.len != 0) lc_so_run.addCheck(.{ .expect_stderr_exact = stderr }) else lc_so_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
@@ -1541,14 +1541,14 @@ fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roo
         g.* = &gate.step;
         load.* = 0;
     }
-    var seen: std.AutoArrayHashMapUnmanaged(*Step, void) = .empty;
+    var seen: std.array_hash_map.Auto(*Step, void) = .empty;
     var users: std.ArrayList(*Step) = .empty;
     for (roots) |r| seen.put(b.allocator, r, {}) catch @panic("OOM");
     var i: usize = 0;
     while (i < seen.count()) : (i += 1) {
         const s = seen.keys()[i];
         for (s.dependencies.items) |d| seen.put(b.allocator, d, {}) catch @panic("OOM");
-        if (s != first and std.mem.indexOfScalar(*Step, s.dependencies.items, bs) != null) users.append(b.allocator, s) catch @panic("OOM");
+        if (s != first and std.mem.findScalar(*Step, s.dependencies.items, bs) != null) users.append(b.allocator, s) catch @panic("OOM");
     }
     std.mem.sort(*Step, users.items, {}, struct {
         fn heavier(_: void, x: *Step, y: *Step) bool {
@@ -1556,7 +1556,7 @@ fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roo
         }
     }.heavier);
     for (users.items) |s| {
-        const least = std.mem.indexOfMin(usize, loads);
+        const least = std.mem.findMin(usize, loads);
         for (s.dependencies.items) |*d| {
             if (d.* == bs or d.* == first) d.* = gates[least];
         }
@@ -1608,7 +1608,7 @@ fn defaultZigLibDir(b: *std.Build) []const u8 {
     const zig = upstreamZig(b);
     const zig_exe = std.Io.Dir.cwd().realPathFileAlloc(io, zig, b.allocator) catch |err|
         std.debug.panic("unable to resolve zig executable path '{s}': {t}", .{ zig, err });
-    return b.pathJoin(&.{ std.fs.path.dirname(zig_exe).?, "lib" });
+    return b.pathJoin(&.{ std.Io.Dir.path.dirname(zig_exe).?, "lib" });
 }
 
 /// lib/docs/wasm of `zig_lib_dir` compiled as upstream's compiler compiles
@@ -2872,7 +2872,7 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
     // calls glibc through versioned imports, and of C only.
     for ([_][]const []const u8{ &.{ "test/link_input/so_libc.zig", "test/link_input/so_libc.c" }, &.{"test/link_input/so_libc.c"} }, [_][]const u8{ "test/link_input/so_libc_main.zig", "test/link_input/so_c_main.zig" }, [_][]const u8{ "so_libc", "so_c" }, [_][]const u8{ "z[c7:1]\nz[c42:2]\nc bye\n", "c3:1\nc4:2\nc bye\n" }) |srcs, main_src, name, stderr| {
         const so = b.addRunArtifact(bs);
-        so.setName(b.fmt("bs build-lib -dynamic -lc -target aarch64-linux-gnu {s}", .{std.fs.path.basename(srcs[0])}));
+        so.setName(b.fmt("bs build-lib -dynamic -lc -target aarch64-linux-gnu {s}", .{std.Io.Dir.path.basename(srcs[0])}));
         so.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", gnu, "--name", name });
         for (srcs) |src| so.addFileArg(b.path(src));
         so.setEnvironmentVariable("BS_ZIG", zig);
@@ -2880,7 +2880,7 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         const host = b.addSystemCommand(&.{ zig, "build-exe", "-lc", "-rdynamic", "-target", gnu });
         host.addFileArg(b.path(main_src));
         host.addFileArg(so_file);
-        const r = Run.withLib(b, b.fmt("run {s} (bs aarch64-linux shared library linking glibc)", .{std.fs.path.basename(main_src)}), runner, so_file, host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        const r = Run.withLib(b, b.fmt("run {s} (bs aarch64-linux shared library linking glibc)", .{std.Io.Dir.path.basename(main_src)}), runner, so_file, host.addPrefixedOutputFileArg("-femit-bin=", "main"));
         r.addCheck(.{ .expect_stderr_exact = stderr });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -2949,6 +2949,6 @@ fn upstreamZig(b: *std.Build) []const u8 {
     const io = b.graph.io;
     const zig_exe = b.graph.zig_exe;
     const real = std.Io.Dir.cwd().realPathFileAlloc(io, zig_exe, b.allocator) catch zig_exe;
-    if (std.Io.Dir.cwd().access(io, b.pathJoin(&.{ std.fs.path.dirname(real) orelse ".", "lib", "std", "std.zig" }), .{})) |_| return zig_exe else |_| {}
+    if (std.Io.Dir.cwd().access(io, b.pathJoin(&.{ std.Io.Dir.path.dirname(real) orelse ".", "lib", "std", "std.zig" }), .{})) |_| return zig_exe else |_| {}
     return b.findProgram(.{ .names = &.{"zig"} }) orelse std.debug.panic("'{s}' is not upstream zig, and no zig is on PATH", .{zig_exe});
 }

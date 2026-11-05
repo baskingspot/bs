@@ -399,7 +399,7 @@ const Walk = struct {
             known[len] = k;
             return len + 1;
         }
-        std.mem.copyForwards(Known, known[0 .. max_known - 1], known[1..]);
+        @memmove(known[0 .. max_known - 1], known[1..]);
         known[max_known - 1] = k;
         return len;
     }

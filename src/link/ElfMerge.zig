@@ -79,7 +79,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, arch: Atom
     for (objects, inputs) |*o, in| o.* = ElfInput.parseObjectFor(arena, in.path, in.bytes, arch) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => {
-            diag.* = try std.fmt.allocPrint(arena, "{s}: not an {t} ELF relocatable object", .{ in.path, arch });
+            diag.* = try arena.print("{s}: not an {t} ELF relocatable object", .{ in.path, arch });
             return error.InvalidObject;
         },
     };
@@ -134,7 +134,7 @@ pub fn merge(gpa: Allocator, arena: Allocator, inputs: []const Input, arch: Atom
                 em.*[si] = m;
             }
             const group = group_of[oi][si];
-            const key = if (group == no_group) name else try std.fmt.allocPrint(arena, "{s}\x00{d}", .{ name, group });
+            const key = if (group == no_group) name else try arena.print("{s}\x00{d}", .{ name, group });
             const gop = try out_index.getOrPut(arena, key);
             if (!gop.found_existing) {
                 gop.value_ptr.* = @intCast(outs.items.len);
@@ -405,7 +405,7 @@ fn write(
     for (outs, 0..) |o, i| {
         if (rela_index[i] == 0) continue;
         off = std.mem.alignForward(u64, off, 8);
-        const name = try std.fmt.allocPrint(arena, ".rela{s}", .{o.name});
+        const name = try arena.print(".rela{s}", .{o.name});
         shdrs[rela_index[i]] = .{
             .sh_name = try addString(arena, &shstrtab, name),
             .sh_type = elf.SHT_RELA,
@@ -627,16 +627,16 @@ fn addString(arena: Allocator, table: *std.ArrayList(u8), s: []const u8) Allocat
 }
 
 fn invalid(arena: Allocator, diag: *[]const u8, o: *const Object, what: []const u8) Error {
-    diag.* = try std.fmt.allocPrint(arena, "{s}: {s}", .{ o.path, what });
+    diag.* = try arena.print("{s}: {s}", .{ o.path, what });
     return error.InvalidObject;
 }
 
 fn unsupported(arena: Allocator, diag: *[]const u8, comptime fmt: []const u8, args: anytype) Error {
-    diag.* = try std.fmt.allocPrint(arena, "bs does not merge this object yet: " ++ fmt, args);
+    diag.* = try arena.print("bs does not merge this object yet: " ++ fmt, args);
     return error.UnsupportedObject;
 }
 
 fn dup(arena: Allocator, diag: *[]const u8, name: []const u8, a: []const u8, b: []const u8) Error {
-    diag.* = try std.fmt.allocPrint(arena, "duplicate symbol: {s}, defined in {s} and {s}", .{ name, a, b });
+    diag.* = try arena.print("duplicate symbol: {s}, defined in {s} and {s}", .{ name, a, b });
     return error.DuplicateSymbol;
 }

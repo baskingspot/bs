@@ -390,7 +390,7 @@ pub const ContainerInfo = struct {
         // beats comparing bytes (`@hasField` on a 1500-tag enum).
         if (info.field_names.len > 8) {
             const s = ip.findString(name) orelse return null;
-            const i = std.mem.indexOfScalar(u32, @ptrCast(info.field_names), @backingInt(s)) orelse return null;
+            const i = std.mem.findScalar(u32, @ptrCast(info.field_names), @backingInt(s)) orelse return null;
             return @intCast(i);
         }
         for (info.field_names, 0..) |n, i| {

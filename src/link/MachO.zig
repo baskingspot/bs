@@ -230,19 +230,19 @@ pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, a
 /// `Elf.AtomSlice`'s declarations; `options.debug` is not used.
 pub fn linkInput(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, input: anytype, options: Options) !void {
     var o = options;
-    if (o.identifier == null) o.identifier = std.fs.path.basename(sub_path);
+    if (o.identifier == null) o.identifier = std.Io.Dir.path.basename(sub_path);
     var out: Elf.MemoryOutput = .{ .gpa = gpa };
     defer gpa.free(out.buf);
     if (input.debugLen() == 0) {
         try build(gpa, io, input, o, &out, {});
     } else {
-        const dsym_dir = try std.fmt.allocPrint(gpa, "{s}.dSYM/Contents/Resources/DWARF", .{sub_path});
+        const dsym_dir = try gpa.print("{s}.dSYM/Contents/Resources/DWARF", .{sub_path});
         defer gpa.free(dsym_dir);
         var dsym_parent = try dir.createDirPathOpen(io, dsym_dir, .{});
         defer dsym_parent.close(io);
         // A debugger may have the old file mapped, so it is replaced, not
         // overwritten.
-        const dsym_name = std.fs.path.basename(sub_path);
+        const dsym_name = std.Io.Dir.path.basename(sub_path);
         dsym_parent.deleteFile(io, dsym_name) catch |err| switch (err) {
             error.FileNotFound => {},
             else => |e| return e,
@@ -929,7 +929,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // fixups linked into a chain, imports, and their names, without the
     // slots of pointers to absolute symbols.
     var live_fixups: []u64 = fixups;
-    if (std.mem.indexOfScalar(u64, fixups, no_fixup)) |first| {
+    if (std.mem.findScalar(u64, fixups, no_fixup)) |first| {
         var n = first;
         for (fixups[first..]) |f| if (f != no_fixup) {
             fixups[n] = f;
@@ -2526,7 +2526,7 @@ fn sign(io: std.Io, n_threads: usize, buf: []u8, sig_off: u32, uuid_at: usize, i
         .execSegLimit = text_end,
         .execSegFlags = if (main_binary) macho.CS_EXECSEG_MAIN_BINARY else 0,
     };
-    std.mem.byteSwapAllFields(macho.CodeDirectory, &cd);
+    std.mem.byteSwap(macho.CodeDirectory, &cd);
     writeStruct(buf[cd_off..], cd);
     @memcpy(buf[cd_off + ident_off ..][0..identifier.len], identifier);
     buf[cd_off + ident_off + identifier.len] = 0;
@@ -2645,7 +2645,7 @@ test "links and runs a program that writes from __TEXT,__const and exits with 42
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try link(gpa, io, tmp.dir, "hello", &atoms, options);
-    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/hello", .{tmp.sub_path});
+    const path = try gpa.print(".zig-cache/tmp/{s}/hello", .{tmp.sub_path});
     defer gpa.free(path);
     // `link` names the signature after the file, as `emit` was told to.
     const file = try tmp.dir.readFileAlloc(io, "hello", gpa, .unlimited);
@@ -2724,7 +2724,7 @@ test "an alias links as a reference to its target, with numbered symbols too" {
     defer targets.deinit(gpa);
     for (atoms[0], &numbered_atoms, 0..) |a, *n, i| {
         n.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
-        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.indexOfScalar(SymbolKey, &numbering, t).?));
+        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.findScalar(SymbolKey, &numbering, t).?));
     }
     const numbered = try emit(gpa, io, &atoms[0], .{ .entry = main, .imports = &imports, .aliases = &aliases, .symbols = .{
         .atoms = &numbered_atoms,
@@ -2881,7 +2881,7 @@ test "gives each thread its own thread-locals from __thread_data and __thread_bs
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try link(gpa, io, tmp.dir, "tlv", &atoms, options);
-    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/tlv", .{tmp.sub_path});
+    const path = try gpa.print(".zig-cache/tmp/{s}/tlv", .{tmp.sub_path});
     defer gpa.free(path);
     const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
     defer gpa.free(result.stdout);
@@ -2997,7 +2997,7 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
     const key = struct {
         fn f(prefix: []const u8, i: usize) SymbolKey {
             var buf: [32]u8 = undefined;
-            return .fromName(std.fmt.bufPrint(&buf, "{s}{d}", .{ prefix, i }) catch unreachable);
+            return .fromName(std.mem.print(&buf, "{s}{d}", .{ prefix, i }) catch unreachable);
         }
     }.f;
 
@@ -3028,7 +3028,7 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
         try e.finish();
         expected +%= @intCast(i % 50 + 1);
         const alignments = [_]std.mem.Alignment{ .@"4", .@"16", .@"64" };
-        try atoms.append(arena, .{ .key = key("f", i), .name = try std.fmt.allocPrint(arena, "f{d}", .{i}), .section = .text, .alignment = alignments[i % 3], .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items });
+        try atoms.append(arena, .{ .key = key("f", i), .name = try arena.print("f{d}", .{i}), .section = .text, .alignment = alignments[i % 3], .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items });
         try atoms.append(arena, constants[i % 50]);
         if (i % 7 == 0) try atoms.append(arena, .{ .key = key("pad", i), .name = "pad", .section = .bss, .alignment = .@"8", .zero_fill = i % 13 });
     }
@@ -3175,7 +3175,7 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try link(gpa, io, tmp.dir, "chunks", atoms.items, .{ .entry = main, .imports = imports, .threads = 3 });
-    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/chunks", .{tmp.sub_path});
+    const path = try gpa.print(".zig-cache/tmp/{s}/chunks", .{tmp.sub_path});
     defer gpa.free(path);
     const file = try tmp.dir.readFileAlloc(io, "chunks", gpa, .unlimited);
     defer gpa.free(file);
@@ -3205,7 +3205,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     const fkey = struct {
         fn f(prefix: []const u8, i: usize) SymbolKey {
             var buf: [32]u8 = undefined;
-            return .fromName(std.fmt.bufPrint(&buf, "{s}{d}", .{ prefix, i }) catch unreachable);
+            return .fromName(std.mem.print(&buf, "{s}{d}", .{ prefix, i }) catch unreachable);
         }
     }.f;
     const files = [_][]const u8{ "a.zig", "dir/b.zig", "/abs/c.zig" };
@@ -3245,7 +3245,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
             try e.ret();
         }
         try e.finish();
-        const name = try std.fmt.allocPrint(arena, "f{d}", .{i});
+        const name = try arena.print("f{d}", .{i});
         const atom: Atom = .{ .key = fkey("f", i), .name = name, .section = .text, .alignment = if (i % 3 == 0) .@"16" else .@"4", .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items, .unwind = if (naked(i)) .none else .frame_pointer };
         const entry: Atom.Debug = .{ .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = lines.bytes.items, .unit = units[i / 300 % units.len] };
         try debug.append(arena, d: {
@@ -3302,7 +3302,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     const written_dsym = try tmp.dir.readFileAlloc(io, "prog.dSYM/Contents/Resources/DWARF/prog", gpa, .unlimited);
     defer gpa.free(written_dsym);
     try std.testing.expectEqualSlices(u8, one.dsym, written_dsym);
-    const path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/prog", .{tmp.sub_path});
+    const path = try arena.print(".zig-cache/tmp/{s}/prog", .{tmp.sub_path});
     if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
         const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
         defer gpa.free(result.stdout);
@@ -3317,7 +3317,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     var mf = try std.debug.MachOFile.load(di_gpa, io, path, .aarch64);
     defer mf.deinit(di_gpa);
     for ([_]usize{ 0, 9, 997, 2047, 2048, 3001, dup, n - 1 }) |index| {
-        const name = try std.fmt.allocPrint(arena, "f{d}", .{index});
+        const name = try arena.print("f{d}", .{index});
         const addr = testMachOSymbol(one.exe, name).?;
         const body = addr + if (naked(index)) 0 else @as(u64, 8);
         const dwarf, const vaddr = try mf.getDwarfForAddress(di_gpa, io, body);
@@ -3326,11 +3326,11 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
         try dwarf.getSymbols(arena, arena, .little, vaddr, false, &symbols);
         const loc = symbols.items[0].source_location.?;
         try std.testing.expectEqualStrings(name, symbols.items[0].name.?);
-        try std.testing.expectEqualStrings(std.fs.path.basenamePosix(units[index / 300 % units.len]), symbols.items[0].compile_unit_name.?);
+        try std.testing.expectEqualStrings(std.Io.Dir.path.basenamePosix(units[index / 300 % units.len]), symbols.items[0].compile_unit_name.?);
         try std.testing.expectEqual(index + 2, loc.line);
         try std.testing.expectEqual(5, loc.column);
         const file = files[index / 1000 % files.len];
-        try std.testing.expectEqualStrings(if (file[0] == '/') file else try std.fmt.allocPrint(arena, "/w/{s}", .{file}), loc.file_name);
+        try std.testing.expectEqualStrings(if (file[0] == '/') file else try arena.print("/w/{s}", .{file}), loc.file_name);
     }
 
     // lldb finds a dSYM's units only through .debug_aranges: a set per
@@ -3341,7 +3341,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     const aranges_sect = testMachOSection(one.dsym, "__debug_aranges").?;
     const aranges = one.dsym[aranges_sect.offset..][0..aranges_sect.size];
     for ([_]usize{ 0, 9, 997, 2047, 2048, 3001, dup, n - 1 }) |index| {
-        const name = try std.fmt.allocPrint(arena, "f{d}", .{index});
+        const name = try arena.print("f{d}", .{index});
         const addr = testMachOSymbol(one.exe, name).?;
         var at: usize = 0;
         const unit_name = while (at < aranges.len) {
@@ -3357,7 +3357,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
             // language.
             if (found) break std.mem.sliceTo(one.dsym[info.offset + std.mem.readInt(u32, set[6..10], .little) + 12 + 1 + 4 + 2 ..], 0);
         } else return error.TestExpectedEqual;
-        try std.testing.expectEqualStrings(std.fs.path.basenamePosix(units[index / 300 % units.len]), unit_name);
+        try std.testing.expectEqualStrings(std.Io.Dir.path.basenamePosix(units[index / 300 % units.len]), unit_name);
     }
 
     // Each function's code has its frame's encoding, and code without
@@ -3366,7 +3366,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     const main_addr = testMachOSymbol(one.exe, "main").?;
     try std.testing.expectEqual(0, testUnwindEncoding(one.exe, main_addr + 4).?);
     for (0..n) |index| {
-        const name = try std.fmt.allocPrint(arena, "f{d}", .{index});
+        const name = try arena.print("f{d}", .{index});
         const addr = testMachOSymbol(one.exe, name).?;
         const expected: u32 = if (naked(index)) 0 else frame;
         try std.testing.expectEqual(expected, testUnwindEncoding(one.exe, addr).?);
@@ -3528,7 +3528,7 @@ test "exports trie lookups follow dyld's walk" {
     var entries: [300]TrieEntry = undefined;
     var name_buf: [300][8]u8 = undefined;
     for (&entries, &name_buf, 0..) |*e, *nb, i| {
-        const name = std.fmt.bufPrint(nb, "f{d}", .{i * 7}) catch unreachable;
+        const name = std.mem.print(nb, "f{d}", .{i * 7}) catch unreachable;
         e.* = .{ .name = name, .flags = @intCast(i % 2 * macho.EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION), .offset = 0x4000 + i * 0x123 };
     }
     std.mem.sortUnstable(TrieEntry, &entries, {}, struct {
@@ -3541,7 +3541,7 @@ test "exports trie lookups follow dyld's walk" {
     try std.testing.expectEqual(0, trie.len % 8);
     for (entries) |e| {
         var buf: [9]u8 = undefined;
-        const found = trieLookup(trie, std.fmt.bufPrint(&buf, "_{s}", .{e.name}) catch unreachable) orelse return error.TestUnexpectedResult;
+        const found = trieLookup(trie, std.mem.print(&buf, "_{s}", .{e.name}) catch unreachable) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual([2]u64{ e.flags, e.offset }, found);
     }
     // Prefixes of names and names past them are not exported.
@@ -3608,7 +3608,7 @@ test "a dylib has its install name, exports and fixups, and no __PAGEZERO or ent
     // The trie: f (weak) and ptr at their offsets from the header, which
     // are their file offsets.
     try std.testing.expectEqual(0, trie.len % 8);
-    const f_off = std.mem.indexOf(u8, out, &.{ 0xc0, 0x03, 0x5f, 0xd6 }) orelse return error.TestUnexpectedResult;
+    const f_off = std.mem.find(u8, out, &.{ 0xc0, 0x03, 0x5f, 0xd6 }) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual([2]u64{ macho.EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, f_off }, trieLookup(trie, "_f").?);
     try std.testing.expectEqual(0, trieLookup(trie, "_ptr").?[0]);
     try std.testing.expectEqual(null, trieLookup(trie, "_g"));

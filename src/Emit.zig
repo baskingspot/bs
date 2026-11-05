@@ -58,24 +58,24 @@ debug: std.ArrayList(Atom.Debug) = .empty,
 /// Content-addressed atoms already emitted.
 content_keys: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty,
 /// Declarations whose data the code refers to; lowered by `finish`.
-navs: std.AutoArrayHashMapUnmanaged(InternPool.NavIndex, void) = .empty,
+navs: std.array_hash_map.Auto(InternPool.NavIndex, void) = .empty,
 /// How many of `navs` were lowered (`lowerNavs`).
 navs_done: usize = 0,
 /// A lazy edit build (`Replay.lazy`): `finish` lowers only this build's
 /// data, and the link's own atoms come from the cache.
 lazy: bool = false,
 /// Error names referenced by `value*` relocations.
-errors: std.AutoArrayHashMapUnmanaged(InternPool.String, void) = .empty,
+errors: std.array_hash_map.Auto(InternPool.String, void) = .empty,
 /// External symbols the code reads the address of (`@extern`), by name,
 /// and whether every reference is weak. `finish` writes each one's slot.
-externs: std.StringArrayHashMapUnmanaged(bool) = .empty,
+externs: std.array_hash_map.String(bool) = .empty,
 /// For each bound slot at offset 0, its `externAddrKey` and where the
 /// slot binds the symbol, for `link` (`lowerExternSlots`).
 aliases: std.ArrayList(Alias) = .empty,
 /// The global symbols container-level assembly defines, by the name Zig
 /// code and C objects know them by, at offsets in its atoms
 /// (codegen/global_asm.zig).
-asm_symbols: std.StringArrayHashMapUnmanaged(ExternTarget) = .empty,
+asm_symbols: std.array_hash_map.String(ExternTarget) = .empty,
 /// Whether code reads `error_name_table`.
 uses_error_names: bool = false,
 /// Compile errors that codegen reports (unsupported constructs), rendered
@@ -168,10 +168,10 @@ has_inputs: bool = false,
 c_batch: ?*CSource.Batch = null,
 /// In an object, the symbols other objects define, by name. On
 /// aarch64-macos, the symbols libSystem defines.
-imports: std.StringArrayHashMapUnmanaged(ImportFlags) = .empty,
+imports: std.array_hash_map.String(ImportFlags) = .empty,
 /// The imports the executable copies (R_X86_64_COPY) and their sizes, a
 /// subset of `imports`, for data C objects reach without the GOT.
-copies: std.StringArrayHashMapUnmanaged(u64) = .empty,
+copies: std.array_hash_map.String(u64) = .empty,
 /// In an object, its exports, once `finish` found them; in an executable
 /// with link inputs or shared libraries, its Zig exports.
 exports: std.ArrayList(ElfObject.Export) = .empty,
@@ -250,7 +250,7 @@ inputs_requested: usize = 0,
 /// hands to the Zcu once its function queue is empty, in request order.
 /// So the point where Sema learns of them does not depend on when CodeGen
 /// ran.
-rt_pending: std.StringArrayHashMapUnmanaged(void) = .empty,
+rt_pending: std.array_hash_map.String(void) = .empty,
 /// The exports snapshot last handed to a worker (`exportsSnapshot`), and
 /// how many of its declarations were not resolved yet.
 export_snap: ExportsView = .{ .list = &.{}, .resolved = &.{} },
@@ -880,7 +880,7 @@ pub fn enableInlining(emit: *Emit, budget: u32, safe: bool) void {
 /// analysis first if needed.
 pub fn inlineFate(emit: *Emit, func: Index) Allocator.Error!FateResult {
     if (emit.inline_fates.get(func)) |f| return .{ .fate = f };
-    if (std.mem.indexOfScalar(Index, emit.inline_active.items, func) != null) return .cycle;
+    if (std.mem.findScalar(Index, emit.inline_active.items, func) != null) return .cycle;
     switch (try emit.zcu.takeFuncBody(func)) {
         .busy => return .busy,
         .failed => try emit.inline_fates.put(emit.gpa, func, .no),
@@ -1005,11 +1005,11 @@ pub fn sync(emit: *Emit, zcu: *Zcu) !void {
         for ([2][]const CSource.Object{ result.objects, result.runtime_objects }) |list| for (list) |o| in.addObject(o.path, o.bytes) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             // As `convertInputs` reports the inputs' problems.
-            else => try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{try std.fmt.allocPrint(emit.allocator(), "unable to link '{s}': {t}", .{ o.path, err })}),
+            else => try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{try emit.allocator().print("unable to link '{s}': {t}", .{ o.path, err })}),
         };
         for ((try b.wait()).archives) |a| in.addArchive(a.path, a.bytes, true) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
-            else => try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{try std.fmt.allocPrint(emit.allocator(), "unable to link '{s}': {t}", .{ a.path, err })}),
+            else => try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{try emit.allocator().print("unable to link '{s}': {t}", .{ a.path, err })}),
         };
     }
     if (emit.inputs) |in| switch (in) {
@@ -1396,7 +1396,7 @@ pub fn addError(emit: *Emit, file_index: u32, span: std.zig.Ast.Span, comptime f
     try emit.codegen_errors.append(emit.gpa, .{
         .file = file_index,
         .span = span,
-        .msg = try std.fmt.allocPrint(emit.allocator(), fmt, args),
+        .msg = try emit.allocator().print(fmt, args),
         .code = comptime Diag.formatCode(fmt),
     });
 }
@@ -1570,9 +1570,9 @@ fn nameAtoms(emit: *Emit) !void {
         }
         info.* = .{ .parent = nav.parent, .prefix_len = @intCast(gop.value_ptr.len) };
         atom.name = if (generic)
-            try std.fmt.allocPrint(arena, "{s}.{s}__func_{x:0>8}", .{ gop.value_ptr.*, ip.stringSlice(nav.name), @as(u32, @truncate(ip.stableHash(func_index))) })
+            try arena.print("{s}.{s}__func_{x:0>8}", .{ gop.value_ptr.*, ip.stringSlice(nav.name), @as(u32, @truncate(ip.stableHash(func_index))) })
         else
-            try std.fmt.allocPrint(arena, "{s}.{s}", .{ gop.value_ptr.*, ip.stringSlice(nav.name) });
+            try arena.print("{s}.{s}", .{ gop.value_ptr.*, ip.stringSlice(nav.name) });
     }
 }
 
@@ -1683,7 +1683,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         dynamic.exports = exports;
         if (emit.version_script) |vs| {
             const names = try vs.names(arena_state.allocator());
-            if (names.len != 0) dynamic.versions = .{ .base = emit.soname orelse std.fs.path.basename(sub_path), .names = names };
+            if (names.len != 0) dynamic.versions = .{ .base = emit.soname orelse std.Io.Dir.path.basename(sub_path), .names = names };
         }
         dynamic.soname = emit.soname;
         dynamic.runpath = emit.runpath;
@@ -1718,11 +1718,11 @@ fn applyVersionScript(emit: *Emit, arena: Allocator, vs: *const VersionScript, s
             for (n.globals) |p| if (p.offset == pat.offset) break :find n.name;
             for (n.locals) |p| if (p.offset == pat.offset) break :find "local";
         } else "";
-        const more = if (unmatched.len > 1) try std.fmt.allocPrint(arena, " (and {d} more names)", .{unmatched.len - 1}) else "";
+        const more = if (unmatched.len > 1) try arena.print(" (and {d} more names)", .{unmatched.len - 1}) else "";
         emit.link_diagnostic = .{
             .code = .@"version-script",
             .loc = versionScriptLoc(vs.path, vs.source, pat.offset),
-            .msg = try std.fmt.allocPrint(emit.allocator(), "version script assignment of '{s}' to symbol '{s}' failed: '{s}' defines no such symbol{s}", .{ if (node.len == 0) "global" else node, pat.text, std.fs.path.basename(sub_path), more }),
+            .msg = try emit.allocator().print("version script assignment of '{s}' to symbol '{s}' failed: '{s}' defines no such symbol{s}", .{ if (node.len == 0) "global" else node, pat.text, std.Io.Dir.path.basename(sub_path), more }),
             .hint = "export it, remove it from the script, or allow it with --undefined-version (`linker_allow_undefined_version = true`)",
         };
         return null;
@@ -1738,8 +1738,8 @@ fn applyVersionScript(emit: *Emit, arena: Allocator, vs: *const VersionScript, s
 /// is `src`, for messages.
 pub fn versionScriptLoc(path: []const u8, src: []const u8, offset: u32) Diag.Loc {
     const at = @min(offset, src.len);
-    const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..at], '\n')) |nl| nl + 1 else 0;
-    const line_end = std.mem.indexOfScalarPos(u8, src, at, '\n') orelse src.len;
+    const line_start = if (std.mem.findScalarLast(u8, src[0..at], '\n')) |nl| nl + 1 else 0;
+    const line_end = std.mem.findScalarPos(u8, src, at, '\n') orelse src.len;
     var end = at;
     while (end < line_end and !std.ascii.isWhitespace(src[end]) and src[end] != ';') end += 1;
     return .{
@@ -1770,7 +1770,7 @@ fn branchRangeDiagnostic(arena: Allocator, caller: []const u8, target: []const u
     return .{
         .code = .@"branch-range",
         .loc = null,
-        .msg = try std.fmt.allocPrint(arena, "'{s}' calls '{s}', which is out of range: .text exceeds aarch64's \u{b1}128 MiB branch range, and bs adds no range-extension thunks", .{ caller, target }),
+        .msg = try arena.print("'{s}' calls '{s}', which is out of range: .text exceeds aarch64's \u{b1}128 MiB branch range, and bs adds no range-extension thunks", .{ caller, target }),
         .hint = "upstream zig links it: its linker adds the thunks",
     };
 }
@@ -1782,7 +1782,7 @@ fn symbolName(emit: *Emit, key: SymbolKey, offset: i64) []const u8 {
     for (emit.input_symbols) |s| if (s.atom == key and s.offset == offset and !std.mem.startsWith(u8, s.name, "$")) return s.name;
     for (emit.atoms.items) |a| if (a.key == key and a.name.len > 0) return a.name;
     for (emit.imports.keys()) |name| if (importKey(name) == key) return name;
-    return std.fmt.allocPrint(emit.allocator(), "{x:0>32}", .{@backingInt(key)}) catch "?";
+    return emit.allocator().print("{x:0>32}", .{@backingInt(key)}) catch "?";
 }
 
 /// The key of the 8-byte slot holding the address of external symbol
@@ -1862,7 +1862,7 @@ pub fn useErrorNames(emit: *Emit) !void {
 
 pub fn externSlotKey(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
-    return .fromName(std.fmt.bufPrint(&buf, "extern.{s}", .{name}) catch name);
+    return .fromName(std.mem.print(&buf, "extern.{s}", .{name}) catch name);
 }
 
 /// The key a constant that a function reads relocates the address of
@@ -1871,7 +1871,7 @@ pub fn externSlotKey(name: []const u8) SymbolKey {
 /// content then does not depend on where the symbol is defined.
 pub fn externAddrKey(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
-    return .fromName(std.fmt.bufPrint(&buf, "extaddr.{s}", .{name}) catch name);
+    return .fromName(std.mem.print(&buf, "extaddr.{s}", .{name}) catch name);
 }
 
 /// An `externAddrKey` and its slot's binding.
@@ -1881,19 +1881,19 @@ pub const Alias = Elf.Alias;
 /// symbol `name`.
 pub fn externSlotName(emit: *Emit, name: []const u8, off: i64) Allocator.Error![]const u8 {
     if (off == 0) return name;
-    return std.fmt.allocPrint(emit.allocator(), "{s}\x00{d}", .{ name, off });
+    return emit.allocator().print("{s}\x00{d}", .{ name, off });
 }
 
 /// The symbol and offset of a `useExtern` name (`externSlotName`).
 fn parseExternSlot(slot: []const u8) struct { []const u8, i64 } {
-    const nul = std.mem.indexOfScalar(u8, slot, 0) orelse return .{ slot, 0 };
+    const nul = std.mem.findScalar(u8, slot, 0) orelse return .{ slot, 0 };
     return .{ slot[0..nul], std.fmt.parseInt(i64, slot[nul + 1 ..], 10) catch unreachable };
 }
 
 /// The key relocations name an imported symbol by (see `useImport`).
 pub fn importKey(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
-    return .fromName(std.fmt.bufPrint(&buf, "import.{s}", .{name}) catch name);
+    return .fromName(std.mem.print(&buf, "import.{s}", .{name}) catch name);
 }
 
 /// In position-independent code, the key of `__tls_get_addr`, which the
@@ -2040,7 +2040,7 @@ fn lowerExternSlots(emit: *Emit) !bool {
         const relocs: []const Atom.Reloc = if (target) |t| try arena.dupe(Atom.Reloc, &.{.init(0, emit.abs64Kind(), 0, std.math.cast(i32, t.addend + off) orelse return error.Overflow)}) else &.{};
         try emit.addAtom(.{
             .key = externSlotKey(slot),
-            .name = if (off == 0) try std.fmt.allocPrint(arena, "extern.{s}", .{name}) else try std.fmt.allocPrint(arena, "extern.{s}+{d}", .{ name, off }),
+            .name = if (off == 0) try arena.print("extern.{s}", .{name}) else try arena.print("extern.{s}+{d}", .{ name, off }),
             .section = .rodata,
             .alignment = .@"8",
             .bytes = bytes,
@@ -2258,7 +2258,7 @@ pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.Ar
     // Each atom's group.
     const group_of = try gpa.alloc(u32, n);
     defer gpa.free(group_of);
-    var groups: std.AutoArrayHashMapUnmanaged(Group, void) = .empty;
+    var groups: std.array_hash_map.Auto(Group, void) = .empty;
     defer groups.deinit(gpa);
     for (atoms.items, owners.items, group_of) |a, o, *g| {
         const gop = try groups.getOrPut(gpa, switch (o) {
@@ -2375,8 +2375,8 @@ pub fn coverageKeys(func: SymbolKey) [2]SymbolKey {
     var buf: [40]u8 = undefined;
     const k = std.mem.asBytes(&func);
     return .{
-        .fromName(std.fmt.bufPrint(&buf, "cntrs.{x}", .{k}) catch unreachable),
-        .fromName(std.fmt.bufPrint(&buf, "pcs.{x}", .{k}) catch unreachable),
+        .fromName(std.mem.print(&buf, "cntrs.{x}", .{k}) catch unreachable),
+        .fromName(std.mem.print(&buf, "pcs.{x}", .{k}) catch unreachable),
     };
 }
 
@@ -2418,7 +2418,7 @@ pub fn contentAtom(emit: *Emit, alignment: u64, bytes: []const u8, targets: []co
     const arena = emit.allocator();
     try emit.addAtom(.{
         .key = key,
-        .name = try std.fmt.allocPrint(arena, "__anon_{x}", .{@backingInt(key)}),
+        .name = try arena.print("__anon_{x}", .{@backingInt(key)}),
         .section = .rodata,
         .alignment = a,
         .bytes = try arena.dupe(u8, bytes),
@@ -2457,7 +2457,7 @@ pub fn errorKey(ip: *const InternPool, name: InternPool.String) SymbolKey {
 
 pub fn errorKeyFromName(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "error.{s}", .{name}) catch unreachable;
+    const s = std.mem.print(&buf, "error.{s}", .{name}) catch unreachable;
     return .fromName(s);
 }
 
@@ -2659,7 +2659,7 @@ test "a relink in the manifest's order reproduces the fresh link, with mixed ali
     const n = 3000;
     for (0..n) |i| {
         const unit: Zcu.AnalUnit = .{ .func = @fromBackingInt(@intCast(100_000 + i)) };
-        const name = try std.fmt.allocPrint(arena, "f{d}", .{i});
+        const name = try arena.print("f{d}", .{i});
         const bytes = try arena.alloc(u8, 5 + i % 37);
         @memset(bytes, 0x90);
         const target = constants[i % constants.len].key;
@@ -2672,7 +2672,7 @@ test "a relink in the manifest's order reproduces the fresh link, with mixed ali
         }
         // A unit's second atom, after other units' atoms.
         if (i % 11 == 10) {
-            const extra = try std.fmt.allocPrint(arena, "data{d}", .{i});
+            const extra = try arena.print("data{d}", .{i});
             try atoms.append(gpa, .{ .key = .fromName(extra), .name = extra, .section = .data, .alignment = alignments[i % 4], .bytes = try arena.dupe(u8, "abcdefgh") });
             try owners.append(gpa, .{ .unit = .{ .func = @fromBackingInt(@intCast(100_000 + i - 5)) } });
         }

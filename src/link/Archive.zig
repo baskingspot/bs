@@ -69,7 +69,7 @@ pub fn write(gpa: Allocator, io: Io, dir: Io.Dir, ar_path: []const u8, members: 
     for (members, long_at, counts) |m, at, c| {
         const member_offset = out.items.len;
         var name_buf: [17]u8 = undefined;
-        const name = if (at) |o| try std.fmt.bufPrint(&name_buf, "/{d}", .{o}) else try std.fmt.bufPrint(&name_buf, "{s}/", .{m.name});
+        const name = if (at) |o| try std.mem.print(&name_buf, "/{d}", .{o}) else try std.mem.print(&name_buf, "{s}/", .{m.name});
         try header(gpa, &out, name, m.bytes.len);
         try out.appendSlice(gpa, m.bytes);
         if (out.items.len % 2 != 0) try out.append(gpa, 0);
@@ -151,7 +151,7 @@ fn darwinHeader(gpa: Allocator, out: *std.ArrayList(u8), name: []const u8, size:
     const name_start = out.items.len + 60;
     const name_len = std.mem.alignForward(u64, name_start + name.len + 1, 8) - name_start;
     var buf: [16]u8 = undefined;
-    const field = try std.fmt.bufPrint(&buf, "#1/{d}", .{name_len});
+    const field = try std.mem.print(&buf, "#1/{d}", .{name_len});
     try out.print(gpa, "{s: <16}{s: <12}{s: <6}{s: <6}{s: <8}{d: <10}`\n", .{ field, "0", "0", "0", "0", size + name_len });
     try out.appendSlice(gpa, name);
     try out.appendNTimes(gpa, 0, name_len - name.len);
@@ -286,7 +286,7 @@ pub const Reader = struct {
                 try symbols.ensureUnusedCapacity(arena, @intCast(n));
                 for (0..@intCast(n)) |i| {
                     const at = if (wide) std.mem.readInt(u64, data[w + 8 * i ..][0..8], .big) else std.mem.readInt(u32, data[w + 4 * i ..][0..4], .big);
-                    const end = std.mem.indexOfScalarPos(u8, data, names_at, 0) orelse return error.InvalidArchive;
+                    const end = std.mem.findScalarPos(u8, data, names_at, 0) orelse return error.InvalidArchive;
                     symbols.appendAssumeCapacity(.{ .name = data[names_at..end], .member = at });
                     names_at = end + 1;
                 }
@@ -334,7 +334,7 @@ pub const Reader = struct {
         if (name.len > 1 and name[0] == '/' and std.ascii.isDigit(name[1])) {
             const at = std.fmt.parseInt(usize, name[1..], 10) catch return error.InvalidArchive;
             if (at >= r.long_names.len) return error.InvalidArchive;
-            const end = std.mem.indexOfScalarPos(u8, r.long_names, at, '\n') orelse r.long_names.len;
+            const end = std.mem.findScalarPos(u8, r.long_names, at, '\n') orelse r.long_names.len;
             name = r.long_names[at..end];
         }
         if (name.len > 0 and name[name.len - 1] == '/') name = name[0 .. name.len - 1];

@@ -19,14 +19,14 @@ pub fn sources(arena: std.mem.Allocator, arch: std.Target.Cpu.Arch) ![]const []c
     for (src_files) |f| try table.put(arena, f, {});
     var out: std.ArrayList([]const u8) = .empty;
     for (src_files) |f| {
-        const dir = std.fs.path.dirname(f).?;
-        const base = std.fs.path.basename(f);
-        const stem = base[0 .. base.len - std.fs.path.extension(base).len];
-        if (isArchName(std.fs.path.basename(dir))) {
-            if (!std.mem.eql(u8, std.fs.path.basename(dir), arch_name)) continue;
+        const dir = std.Io.Dir.path.dirname(f).?;
+        const base = std.Io.Dir.path.basename(f);
+        const stem = base[0 .. base.len - std.Io.Dir.path.extension(base).len];
+        if (isArchName(std.Io.Dir.path.basename(dir))) {
+            if (!std.mem.eql(u8, std.Io.Dir.path.basename(dir), arch_name)) continue;
         } else {
             const overridden = for ([_][]const u8{ ".s", ".S", ".c" }) |ext| {
-                if (table.contains(try std.fmt.allocPrint(arena, "{s}/{s}/{s}{s}", .{ dir, arch_name, stem, ext }))) break true;
+                if (table.contains(try arena.print("{s}/{s}/{s}{s}", .{ dir, arch_name, stem, ext }))) break true;
             } else false;
             if (overridden) continue;
         }
@@ -39,7 +39,7 @@ pub fn sources(arena: std.mem.Allocator, arch: std.Target.Cpu.Arch) ![]const []c
 /// libc.a or crt1.o: `-O3` for the string and internal C sources
 /// (`wantsO3`), `-Os` for the others.
 pub fn ccArgs(arena: std.mem.Allocator, lib: []const u8, arch: std.Target.Cpu.Arch, o3: bool) ![]const []const u8 {
-    const join = std.fs.path.join;
+    const join = std.Io.Dir.path.join;
     const arch_name = archName(arch);
     return arena.dupe([]const u8, &.{
         "-std=c99",

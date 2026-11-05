@@ -78,7 +78,7 @@ pub const SymbolKey = enum(u128) {
     /// coverage sections and the init and fini arrays have them.
     pub fn sectionBound(section: Section, bound: enum { start, stop }) SymbolKey {
         var buf: [64]u8 = undefined;
-        return .fromName(std.fmt.bufPrint(&buf, "section.{t}.{t}", .{ section, bound }) catch unreachable);
+        return .fromName(std.mem.print(&buf, "section.{t}.{t}", .{ section, bound }) catch unreachable);
     }
 
     const Hasher = std.crypto.auth.siphash.SipHash128(1, 3);
@@ -353,7 +353,7 @@ pub const Reloc = extern struct {
 /// the encoder and by data lowering.
 pub const RelocList = struct {
     /// `targets.keys()` is the atom's `targets`, in first-use order.
-    targets: std.ArrayHashMapUnmanaged(SymbolKey, void, KeyContext, false) = .empty,
+    targets: std.array_hash_map.Custom(SymbolKey, void, KeyContext, false) = .empty,
     relocs: std.ArrayList(Reloc) = .empty,
 
     pub fn deinit(l: *RelocList, gpa: std.mem.Allocator) void {
@@ -470,8 +470,8 @@ pub const Debug = struct {
     pub fn localFile(d: *const Debug, local: u32) []const u8 {
         if (local == 0) return d.file;
         var start: usize = 0;
-        for (1..local) |_| start = std.mem.indexOfScalarPos(u8, d.files, start, 0).? + 1;
-        return d.files[start..std.mem.indexOfScalarPos(u8, d.files, start, 0).?];
+        for (1..local) |_| start = std.mem.findScalarPos(u8, d.files, start, 0).? + 1;
+        return d.files[start..std.mem.findScalarPos(u8, d.files, start, 0).?];
     }
 
     pub fn inlineName(d: *const Debug, inl: Inline) []const u8 {

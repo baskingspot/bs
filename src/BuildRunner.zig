@@ -32,17 +32,17 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     }
     const cwd = try std.process.currentPathAlloc(io, arena);
     const dirs = Frontend.resolveCacheDirs(arena, io, env, .{ .local_is_global = true });
-    const global = try std.fs.path.resolve(arena, &.{ cwd, dirs.global });
+    const global = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, dirs.global });
     const lib = try toolchain.libDir(arena, io, env, global, lib_override);
-    const zig_lib_dir = try std.fs.path.resolve(arena, &.{ cwd, lib.path });
+    const zig_lib_dir = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, lib.path });
 
     // One runner per bs binary, zig lib directory and mode.
     const mode = "-OReleaseSafe";
     const seed, _ = try Incremental.compilationKey(arena, io, &.{}, zig_lib_dir, "x86_64-linux");
     const runner_hash = cache.hash(2, try std.mem.concat(arena, u8, &.{ std.mem.asBytes(&seed), zig_lib_dir, mode }));
-    const runner_dir = try std.fmt.allocPrint(arena, "{s}/bs/o/{x:0>32}", .{ global, runner_hash });
+    const runner_dir = try arena.print("{s}/bs/o/{x:0>32}", .{ global, runner_hash });
     try Io.Dir.cwd().createDirPath(io, runner_dir);
-    const runner_path = try std.fs.path.join(arena, &.{ runner_dir, "maker" });
+    const runner_path = try Io.Dir.path.join(arena, &.{ runner_dir, "maker" });
     // Held until the runner replaces this process (the file closes on
     // exec), so that maintenance keeps the runner it finds.
     _ = cache.useTool(io, runner_dir) catch {};
@@ -52,16 +52,16 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     // (about 3 ms of a 38 ms no-change build). Another lib directory, given
     // with `--zig-lib=` or ZIG_LIB_DIR, may be a source tree under edit,
     // so it is always checked.
-    const stamp_path = try std.fs.path.join(arena, &.{ runner_dir, "maker.stat" });
+    const stamp_path = try Io.Dir.path.join(arena, &.{ runner_dir, "maker.stat" });
     if (!(lib.trusted and toolUnchanged(io, runner_path, stamp_path))) {
         try compileTool(init, runner_dir, &.{
             "bs",                 "build-exe",
-            mode,                 try std.fmt.allocPrint(arena, "-Mroot={s}/compiler/Maker.zig", .{zig_lib_dir}),
+            mode,                 try arena.print("-Mroot={s}/compiler/Maker.zig", .{zig_lib_dir}),
             "--name",             "maker",
             "--zig-lib-dir",      zig_lib_dir,
             "--cache-dir",        global,
             "--global-cache-dir", global,
-        }, "Compiling build runner", "build runner", try std.fmt.allocPrint(arena, "{s}/compiler/Maker.zig", .{zig_lib_dir}), null);
+        }, "Compiling build runner", "build runner", try arena.print("{s}/compiler/Maker.zig", .{zig_lib_dir}), null);
         noteTool(io, runner_path, stamp_path);
     }
 
@@ -72,10 +72,10 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     try argv.appendSlice(arena, &.{
         runner_path,
         "build",
-        try std.fmt.allocPrint(arena, "--zig-lib={s}", .{zig_lib_dir}),
-        try std.fmt.allocPrint(arena, "--zig={s}", .{self_exe}),
-        try std.fmt.allocPrint(arena, "--global-cache={s}", .{global}),
-        try std.fmt.allocPrint(arena, "--seed=0x{x}", .{std.mem.readInt(u32, &seed_bytes, .little)}),
+        try arena.print("--zig-lib={s}", .{zig_lib_dir}),
+        try arena.print("--zig={s}", .{self_exe}),
+        try arena.print("--global-cache={s}", .{global}),
+        try arena.print("--seed=0x{x}", .{std.mem.readInt(u32, &seed_bytes, .little)}),
     });
     try argv.appendSlice(arena, user_args);
     if (env.get("ZIG_VERBOSE_CMD") != null) std.log.info("{f}", .{std.zig.SubprocessCommand{ .argv = argv.items }});

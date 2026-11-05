@@ -84,13 +84,13 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
     const keys = try arena.alloc(Atom.SymbolKey, n_text + n_rodata + n_data + n_bss);
     const names = try arena.alloc([]const u8, keys.len);
     for (keys, names, 0..) |*k, *n, i| {
-        n.* = try std.fmt.allocPrint(arena, "bench:file{d}.zig:decl{d}", .{ i % 500, i });
+        n.* = try arena.print("bench:file{d}.zig:decl{d}", .{ i % 500, i });
         k.* = .fromName(n.*);
     }
 
     var imports: [n_imports]MachO.Import = undefined;
     for (&imports, 0..) |*imp, i| {
-        imp.name = try std.fmt.allocPrint(arena, "imp{d}", .{i});
+        imp.name = try arena.print("imp{d}", .{i});
         imp.key = .fromName(imp.name);
     }
 
@@ -114,7 +114,7 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
             .macho => {
                 single.imports = &imports;
                 // As `link` names it, so the file and `emit` match.
-                single.identifier = std.fs.path.basename(out_path);
+                single.identifier = std.Io.Dir.path.basename(out_path);
             },
         }
         var parallel = single;
@@ -416,7 +416,7 @@ fn put(comptime T: type, pack: []align(16) u8, at: *usize, items: []const T) []c
 fn checkFile(gpa: std.mem.Allocator, io: std.Io, expected: []const u8) !void {
     const file = try std.Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .unlimited);
     defer gpa.free(file);
-    const first = std.mem.indexOfDiff(u8, file, expected) orelse return;
+    const first = std.mem.findDiff(u8, file, expected) orelse return;
     std.debug.panic("link wrote different bytes than emit returned: {d} bytes, expected {d}, first difference at 0x{x}", .{ file.len, expected.len, first });
 }
 
@@ -444,12 +444,12 @@ fn generate(arena: std.mem.Allocator, rand: std.Random, keys: []const Atom.Symbo
     var atoms: std.ArrayList(Atom) = .empty;
     // Each function's debug info, by its index in `atoms` before shuffling.
     var debug: std.ArrayList(Atom.Debug) = .empty;
-    var targets: std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
+    var targets: std.array_hash_map.Auto(Atom.SymbolKey, void) = .empty;
     // Each atom's name, bytes, relocations, and targets are allocated
     // together, as CodeGen's arena or a cache entry would hold them, and the
     // copy floor reads the same real memory.
     var files: [500][]const u8 = undefined;
-    for (&files, 0..) |*f, j| f.* = try std.fmt.allocPrint(arena, "src/dir{d}/file{d}.zig", .{ j % 20, j });
+    for (&files, 0..) |*f, j| f.* = try arena.print("src/dir{d}/file{d}.zig", .{ j % 20, j });
     // Functions: 32..512 bytes, one call or constant reference per 32 bytes.
     for (0..n_text) |i| {
         const name = try arena.dupe(u8, names[i]);
@@ -502,7 +502,7 @@ fn generate(arena: std.mem.Allocator, rand: std.Random, keys: []const Atom.Symbo
             try lines.addRow(arena, offset, line, rand.intRangeAtMost(u32, 4, 40));
             line += rand.intRangeAtMost(u32, 1, 3);
         }
-        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i % files.len], .name = name[std.mem.lastIndexOfScalar(u8, name, ':').? + 1 ..], .base_line = rand.uintLessThan(u32, 5000), .lines = lines.bytes.items });
+        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i % files.len], .name = name[std.mem.findScalarLast(u8, name, ':').? + 1 ..], .base_line = rand.uintLessThan(u32, 5000), .lines = lines.bytes.items });
         try atoms.append(arena, .{ .key = keys[i], .name = name, .section = .text, .alignment = .@"16", .bytes = bytes, .targets = try arena.dupe(Atom.SymbolKey, targets.keys()), .relocs = relocs.items, .unwind = .{ .kind = .frame_pointer, .epilogue = 1 } });
     }
     // Constants: 8..128 bytes; every fourth one is emitted twice, as two

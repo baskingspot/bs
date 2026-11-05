@@ -550,7 +550,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     input.names = in.names;
     const checked: [2]Hash = .{ m.id, m.pack_id };
     if (inc.baseChecked(checked)) {
-        var trusted: std.DynamicBitSetUnmanaged = try .initFull(gpa, in.refs.len);
+        var trusted: std.bit_set.Dynamic = try .initFull(gpa, in.refs.len);
         for (in.fresh) |r| trusted.setRangeValue(.{ .start = r[0], .end = r[1] }, false);
         input.trusted = trusted;
     }
@@ -599,7 +599,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     var dynamic_exports: []u32 = &.{};
     const exe_dyn = inc.output == .exe and inc.glibc_version != null;
     const glibc: ?*const Glibc = if (!exe_dyn) null else inc.glibc orelse g: {
-        const path = try std.fs.path.join(arena, &.{ inc.glibc_lib_dir, Glibc.abilists_path });
+        const path = try Io.Dir.path.join(arena, &.{ inc.glibc_lib_dir, Glibc.abilists_path });
         const contents = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err|
             return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
         glibc_loaded = Glibc.load(gpa, contents, inc.glibc_version.?, inc.arch) catch |err|
@@ -682,9 +682,9 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             // The Zig object, then the object inputs and the C objects
             // as they are, as `compileReplaying` writes them.
             const members = try arena.alloc(Archive.Input, 1 + inc.link_objects.len);
-            members[0] = .{ .name = try std.fmt.allocPrint(arena, "{s}.o", .{inc.archive_stem}), .bytes = obj };
+            members[0] = .{ .name = try arena.print("{s}.o", .{inc.archive_stem}), .bytes = obj };
             for (members[1..], inc.link_objects) |*member, path| member.* = .{
-                .name = std.fs.path.basename(path),
+                .name = Io.Dir.path.basename(path),
                 .bytes = try inc.mapInput(arena, &maps, path) orelse return null,
             };
             break :lib Archive.write(gpa, io, out_dir, sub_path, members);
@@ -748,7 +748,7 @@ fn loadShared(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io
 /// Null if a slot's record is damaged (`Pack.LinkAtoms.check`), which the
 /// link would report.
 fn externAliases(arena: Allocator, m: *const Manifest, pack_atoms: WithInputs, numbered: []const Elf.NumberedAtom) !?[]const Emit.Alias {
-    var slots: std.AutoArrayHashMapUnmanaged(u32, Atom.SymbolKey) = .empty;
+    var slots: std.array_hash_map.Auto(u32, Atom.SymbolKey) = .empty;
     for (0..m.refNameCount()) |i| {
         const name = m.refName(@intCast(i));
         if (m.symbol(@backingInt(Emit.externAddrKey(name))) == null) continue;
@@ -810,11 +810,11 @@ fn linkWithInputs(
         exports: *const std.StringHashMapUnmanaged(Atom.SymbolKey),
         glibc: ?*const Glibc,
         shared: []const ElfShared,
-        copies: *std.StringArrayHashMapUnmanaged(u64),
+        copies: *std.array_hash_map.String(u64),
         arena: Allocator,
         /// The imports the objects ask for, as a full build's link
         /// requests them (`Emit.InputResolver.importSym`).
-        requested_imports: *std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void),
+        requested_imports: *std.array_hash_map.Auto(Atom.SymbolKey, void),
         /// `Incremental.lld`, for `weakImport`.
         lld: bool,
 
@@ -857,10 +857,10 @@ fn linkWithInputs(
     };
     var export_keys: std.StringHashMapUnmanaged(Atom.SymbolKey) = .empty;
     for (exports) |x| _ = try export_keys.getOrPutValue(arena, x.name, x.key);
-    var copies: std.StringArrayHashMapUnmanaged(u64) = .empty;
-    var live = try std.DynamicBitSetUnmanaged.initEmpty(arena, m.symbolLen());
+    var copies: std.array_hash_map.String(u64) = .empty;
+    var live = try std.bit_set.Dynamic.initEmpty(arena, m.symbolLen());
     for (numbered) |na| live.set(na.symbol);
-    var requested_imports: std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
+    var requested_imports: std.array_hash_map.Auto(Atom.SymbolKey, void) = .empty;
     const resolver: Resolver = .{
         .exports = &export_keys,
         .glibc = glibc,
@@ -872,7 +872,7 @@ fn linkWithInputs(
     };
     // The archive members the Zig code's externs pull: those of the
     // linked nodes and the link's own atoms.
-    var externs: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var externs: std.array_hash_map.String(void) = .empty;
     for (0..m.nodeCount()) |i_usize| {
         const i: u32 = @intCast(i_usize);
         if (m.node(i).tag != @backingInt(Tag.link) and (m.atoms(i).len == 0 or m.flags(i).unlinked)) continue;
@@ -979,13 +979,13 @@ fn sameObjectRequests(
     arena: Allocator,
     m: *const Manifest,
     pack_atoms: *const Pack.LinkAtoms,
-    live: *const std.DynamicBitSetUnmanaged,
+    live: *const std.bit_set.Dynamic,
     objects: *const ElfInput,
-    requested_imports: *const std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void),
+    requested_imports: *const std.array_hash_map.Auto(Atom.SymbolKey, void),
 ) !bool {
     // What the last build's objects asked for: the imports and the live
     // compiler_rt functions, less those the Zig code needs (struck below).
-    var old: std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
+    var old: std.array_hash_map.Auto(Atom.SymbolKey, void) = .empty;
     for (m.link_symbols) |ls| if (ls.kind == .import) try old.put(arena, @fromBackingInt(ls.key), {});
     for (@import("compiler_rt_exports.zig").exports) |e| {
         var buf: [128]u8 = undefined;
@@ -994,7 +994,7 @@ fn sameObjectRequests(
         if (live.isSet(n)) try old.put(arena, key, {});
     }
     // What the new objects ask for.
-    var new: std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
+    var new: std.array_hash_map.Auto(Atom.SymbolKey, void) = .empty;
     for (requested_imports.keys()) |key| try new.put(arena, key, {});
     var names: std.ArrayList([]const u8) = .empty;
     try objects.undefinedSince(0, &names, arena);
@@ -1022,7 +1022,7 @@ fn sameObjectRequests(
                 .rt => .fromName(m.refName(ref.value)),
                 .import => k: {
                     const name = m.refName(ref.value);
-                    break :k Emit.importKey(name[0 .. std.mem.indexOfScalar(u8, name, 0) orelse name.len]);
+                    break :k Emit.importKey(name[0 .. std.mem.findScalar(u8, name, 0) orelse name.len]);
                 },
                 else => continue,
             };
@@ -1051,7 +1051,7 @@ fn reboundSlots(
     m: *const Manifest,
     pack_atoms: *const Pack.LinkAtoms,
     numbered: []const Elf.NumberedAtom,
-    live: *const std.DynamicBitSetUnmanaged,
+    live: *const std.bit_set.Dynamic,
     objects: *ElfInput,
     export_keys: *const std.StringHashMapUnmanaged(Atom.SymbolKey),
     imports: []const ElfObject.Import,
@@ -1074,7 +1074,7 @@ fn reboundSlots(
         const slot = slots.get(na.symbol) orelse continue;
         if (!pack_atoms.check(i)) return error.InvalidInput;
         const a = pack_atoms.atom(i);
-        const nul = std.mem.indexOfScalar(u8, slot, 0);
+        const nul = std.mem.findScalar(u8, slot, 0);
         const name = slot[0 .. nul orelse slot.len];
         const off: i64 = if (nul) |z| std.fmt.parseInt(i64, slot[z + 1 ..], 10) catch return null else 0;
         const in_object = try objects.lookup(name);
@@ -1458,7 +1458,7 @@ pub fn donorPathsKnown(gpa: Allocator, m: *const Manifest, fe: *const Frontend) 
     }
     const add = struct {
         fn add(g: Allocator, set: *std.StringHashMapUnmanaged(void), parts: []const []const u8) !void {
-            const p = try std.fs.path.join(g, parts);
+            const p = try Io.Dir.path.join(g, parts);
             const gop = set.getOrPut(g, p) catch |err| {
                 g.free(p);
                 return err;
@@ -1470,7 +1470,7 @@ pub fn donorPathsKnown(gpa: Allocator, m: *const Manifest, fe: *const Frontend) 
     for (0..m.inputCount()) |i| {
         const key = m.inputKey(@intCast(i));
         if (isLinkInput(key)) continue;
-        const colon = std.mem.indexOfScalar(u8, key, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, key, ':') orelse continue;
         const mod = fe.module(keyModule(fe, key[0..colon]) orelse continue);
         const sub = key[colon + 1 ..];
         try add(gpa, &paths, &.{ mod.root_dir, if (sub.len == 0) mod.root_file else sub });
@@ -1486,7 +1486,7 @@ pub fn donorPathsKnown(gpa: Allocator, m: *const Manifest, fe: *const Frontend) 
 fn installDonorBase(inc: *Incremental) !void {
     const io = inc.io;
     var buf: [donors_path.len + 1 + donor_name_len]u8 = undefined;
-    const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ donors_path, &inc.donor.? }) catch unreachable;
+    const path = std.mem.print(&buf, "{s}/{s}", .{ donors_path, &inc.donor.? }) catch unreachable;
     var d = try inc.global.openDir(io, path, .{});
     defer d.close(io);
     inc.dir.deleteFile(io, "manifest.log") catch {};
@@ -1518,9 +1518,9 @@ fn publishDonor(inc: *Incremental, base_names: []const []const u8) !void {
     var rand: [16]u8 = undefined;
     io.random(&rand);
     var name: [donor_name_len]u8 = undefined;
-    _ = std.fmt.bufPrint(&name, "{s}-{s}{s}", .{ &std.fmt.hex(inc.donor_key), &inc.donor_tag, &std.fmt.bytesToHex(rand[0..8].*, .lower) }) catch unreachable;
+    _ = std.mem.print(&name, "{s}-{s}{s}", .{ &std.fmt.hex(inc.donor_key), &inc.donor_tag, &std.fmt.bytesToHex(rand[0..8].*, .lower) }) catch unreachable;
     var tmp_name: [Store.donor_tmp_prefix.len + 32]u8 = undefined;
-    _ = std.fmt.bufPrint(&tmp_name, "{s}{s}", .{ Store.donor_tmp_prefix, &std.fmt.bytesToHex(rand, .lower) }) catch unreachable;
+    _ = std.mem.print(&tmp_name, "{s}{s}", .{ Store.donor_tmp_prefix, &std.fmt.bytesToHex(rand, .lower) }) catch unreachable;
     {
         var tmp = try donors.createDirPathOpen(io, &tmp_name, .{});
         defer tmp.close(io);
@@ -1545,7 +1545,7 @@ fn publishDonor(inc: *Incremental, base_names: []const []const u8) !void {
     while (it.next(io) catch null) |e| {
         if (e.kind != .directory or e.name.len != donor_name_len or !std.mem.startsWith(u8, e.name, name[0..32])) continue;
         var path: [donor_name_len + "/manifest".len]u8 = undefined;
-        _ = std.fmt.bufPrint(&path, "{s}/manifest", .{e.name}) catch unreachable;
+        _ = std.mem.print(&path, "{s}/manifest", .{e.name}) catch unreachable;
         if (std.mem.eql(u8, e.name, &name)) continue;
         if (std.mem.eql(u8, e.name[33..49], &inc.donor_tag)) {
             try superseded.append(gpa, e.name[0..donor_name_len].*);
@@ -2327,7 +2327,7 @@ fn sameInput(inc: *const Incremental, m: *const Manifest, in: u32, fe: *const Fr
 /// Sets the flags of node `i`, which the lazy build did not write, as
 /// they are now, if they changed: linked if `live`, `reached`, and stale
 /// if an edit reached it and the build left it undecided.
-fn setFlags(rp: *const Replay, d: *Manifest.Delta, i: u32, live: *const std.DynamicBitSetUnmanaged, reached: *const std.DynamicBitSetUnmanaged, in_graph: *const std.DynamicBitSetUnmanaged) !void {
+fn setFlags(rp: *const Replay, d: *Manifest.Delta, i: u32, live: *const std.bit_set.Dynamic, reached: *const std.bit_set.Dynamic, in_graph: *const std.bit_set.Dynamic) !void {
     const m = rp.m;
     const old = m.flags(i);
     var flags = old;
@@ -2513,7 +2513,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     const file_inputs = try gpa.alloc(u32, fe.files.items.len);
     defer gpa.free(file_inputs);
     var n_inputs = m.inputCount();
-    var changed_input = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_inputs);
+    var changed_input = try std.bit_set.Dynamic.initEmpty(gpa, n_inputs);
     defer changed_input.deinit(gpa);
     for (rp.changed.items) |c| changed_input.set(c.input);
     for (fe.files.items, file_inputs, 0..) |*f, *fi, i| {
@@ -2606,7 +2606,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     defer reached.deinit(gpa);
     // Which nodes are live now: those the walk reached, and those written
     // with what they depend on.
-    var live = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev + n_new);
+    var live = try std.bit_set.Dynamic.initEmpty(gpa, n_prev + n_new);
     defer live.deinit(gpa);
     {
         var it = rp.visited.iterator(.{});
@@ -2617,7 +2617,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         for (n.deps) |e| live.set(final[Manifest.Edge.nodeOf(e)]);
     };
     // The nodes this build's graph has: decided, written or not.
-    var in_graph = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    var in_graph = try std.bit_set.Dynamic.initEmpty(gpa, n_prev);
     defer in_graph.deinit(gpa);
     for (final) |f| if (f < n_prev) in_graph.set(f);
 
@@ -2627,19 +2627,19 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     // atoms, which `BS_CACHE_CHECK` checks), so only the others, the
     // assumed ones no longer reached, and those an edit reached or the
     // build decided can change.
-    var check = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    var check = try std.bit_set.Dynamic.initEmpty(gpa, n_prev);
     defer check.deinit(gpa);
     if (rp.assumed.bit_length == 0) {
         check.setRangeValue(.{ .start = 0, .end = n_prev }, true);
     } else {
-        const word_bits = @bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt);
+        const word_bits = @bitSizeOf(std.bit_set.Dynamic.MaskInt);
         for (0..(n_prev + word_bits - 1) / word_bits) |w| {
             const a = rp.assumed.masks[w];
             check.masks[w] = rp.cone.masks[w] | rp.outdated.masks[w] | in_graph.masks[w] |
                 ((live.masks[w] | reached.masks[w]) & ~a) | (a & ~reached.masks[w]);
         }
         // Bits past `n_prev` in `live` and `reached` are new nodes'.
-        if (n_prev % word_bits != 0) check.masks[n_prev / word_bits] &= (@as(std.DynamicBitSetUnmanaged.MaskInt, 1) << @intCast(n_prev % word_bits)) - 1;
+        if (n_prev % word_bits != 0) check.masks[n_prev / word_bits] &= (@as(std.bit_set.Dynamic.MaskInt, 1) << @intCast(n_prev % word_bits)) - 1;
         for (rp.state, 0..) |st, i| if (st != .unknown) check.set(i);
     }
     // The link's inputs must not change: the symbols it resolves outside
@@ -2705,7 +2705,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         if (f < n_prev) try d.update(f, init) else _ = try d.addNode(init);
         n_written += 1;
     }
-    var written = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    var written = try std.bit_set.Dynamic.initEmpty(gpa, n_prev);
     defer written.deinit(gpa);
     for (final, write) |f, w| if (w and f < n_prev) written.set(f);
     // The others' flags, and the sources and lines in changed inputs.
@@ -2724,7 +2724,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     // winning offers changed, so that a node that comes back to life
     // later has them right too.
     {
-        var rewrite = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+        var rewrite = try std.bit_set.Dynamic.initEmpty(gpa, n_prev);
         defer rewrite.deinit(gpa);
         var it = rp.refresh.iterator(.{});
         while (it.next()) |i| if (i < n_prev and !written.isSet(i) and live.isSet(i) and m.atoms(@intCast(i)).len != 0) rewrite.set(i);
@@ -2829,7 +2829,7 @@ fn externalRef(kind: Manifest.Ref.Kind) bool {
 /// (`Manifest.Ref.value`), so that a change in flags alone is a changed
 /// reference.
 fn addImportRefName(gpa: Allocator, namer: anytype, name: []const u8, flags: Emit.ImportFlags) !u32 {
-    const ref_name = try std.fmt.allocPrint(gpa, "{s}\x00{d}", .{ name, flags.bits() });
+    const ref_name = try gpa.print("{s}\x00{d}", .{ name, flags.bits() });
     defer gpa.free(ref_name);
     return namer.addRefName(ref_name);
 }
@@ -2858,12 +2858,12 @@ fn embedInput(m: *const Manifest, rp: *const Replay, path: []const u8, key: []co
 /// the symbols it resolves outside the build (`ext`, `ext_weak`), an
 /// object's imports (`import`, with their flags; the manifest lists them),
 /// whether it writes the error name table, and if so, the error names.
-fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSetUnmanaged, check: *const std.DynamicBitSetUnmanaged, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, d: *Manifest.Delta) !void {
+fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.bit_set.Dynamic, check: *const std.bit_set.Dynamic, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, d: *Manifest.Delta) !void {
     const gpa = inc.gpa;
     const m = rp.m;
     const n_prev = m.nodeCount();
     const Set = struct {
-        names: std.StringArrayHashMapUnmanaged(void) = .empty,
+        names: std.array_hash_map.String(void) = .empty,
         error_names: bool = false,
 
         fn add(s: *@This(), a: Allocator, kind: Manifest.Ref.Kind, name: []const u8) !void {
@@ -2871,10 +2871,10 @@ fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSe
                 .ext => try s.names.put(a, name, {}),
                 // Weak and strong references to one name resolve alike
                 // unless every one is weak.
-                .ext_weak => try s.names.put(a, try std.fmt.allocPrint(a, "{s}\x00weak", .{name}), {}),
+                .ext_weak => try s.names.put(a, try a.print("{s}\x00weak", .{name}), {}),
                 // Any change of an import's flags falls back, even one
                 // that merges to the same flags.
-                .import => try s.names.put(a, try std.fmt.allocPrint(a, "\x00import\x00{s}", .{name}), {}),
+                .import => try s.names.put(a, try a.print("\x00import\x00{s}", .{name}), {}),
                 .error_names => s.error_names = true,
                 else => {},
             }
@@ -2885,7 +2885,7 @@ fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSe
     const arena = arena_state.allocator();
     var old: Set = .{};
     var new: Set = .{};
-    var written = try std.DynamicBitSetUnmanaged.initEmpty(arena, n_prev);
+    var written = try std.bit_set.Dynamic.initEmpty(arena, n_prev);
     for (final, write) |f, w| if (w and f < n_prev) written.set(f);
     // Only the nodes written or whose flags may change (`check`) can
     // change the sets: without an external reference among them, and
@@ -3111,7 +3111,7 @@ fn sameSubject(m: *const Manifest, enc: *const results.Encoder, old: []const u32
 /// Rewrites the manifest's result items that name instructions of changed
 /// inputs to name them in the new ZIR (or none, if they are gone), so that
 /// the inputs' new contents describe them.
-fn remapItems(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, changed: *const std.DynamicBitSetUnmanaged) !void {
+fn remapItems(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, changed: *const std.bit_set.Dynamic) !void {
     if (changed.count() == 0) return;
     const gpa = inc.gpa;
     const m = rp.m;
@@ -3124,7 +3124,7 @@ fn remapItems(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, changed: *cons
     defer out.deinit(gpa);
     const Ctx = struct {
         rp: *Replay,
-        changed: *const std.DynamicBitSetUnmanaged,
+        changed: *const std.bit_set.Dynamic,
         pub fn map(c: @This(), input: u32, inst: u32) ?u32 {
             if (input >= c.changed.bit_length or !c.changed.isSet(input)) return null;
             const x = c.rp.mapInst(input, @fromBackingInt(inst)) orelse return Manifest.Source.no_inst;
@@ -3847,7 +3847,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         out.* = try gpa.dupe(u8, name);
         n_names += 1;
     }
-    const report = try std.fmt.allocPrint(gpa, "cache: recorded {d} nodes, {d} atoms, {d} references, {d} inputs in {d:.2} ms alongside the link (graph {d:.2}: items {d:.2}, keys {d:.2}; store lookups {d:.2}: {d} reused, {d} put, beside results {d:.2}: {d} units, {d} not encodable, {d} items, {d} KB; manifest {d:.2} while the store writes: nodes and symbols {d:.2}, inputs {d:.2}, write {d:.2}; store's remainder {d:.2})", .{
+    const report = try gpa.print("cache: recorded {d} nodes, {d} atoms, {d} references, {d} inputs in {d:.2} ms alongside the link (graph {d:.2}: items {d:.2}, keys {d:.2}; store lookups {d:.2}: {d} reused, {d} put, beside results {d:.2}: {d} units, {d} not encodable, {d} items, {d} KB; manifest {d:.2} while the store writes: nodes and symbols {d:.2}, inputs {d:.2}, write {d:.2}; store's remainder {d:.2})", .{
         r.nodes.items.len,                                         emit.atoms.items.len, b.refs.items.len,      fe.files.items.len,  ms(t0, t6),
         ms(t0, t1),                                                ms(t0, t_collect),    ms(t_collect, t_keys), ms(t1, t2),          reused,
         n_put,                                                     encoded.ms,           encoded.units,         encoded.unencodable, enc.starts.items.len,
@@ -4191,7 +4191,7 @@ const Putter = struct {
 pub fn inputPath(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, module: Frontend.Module.Index, sub_path: []const u8) !void {
     const mod = fe.module(module);
     buf.clearRetainingCapacity();
-    try buf.print(gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse mod.root_dir, std.fs.path.sep, sub_path });
+    try buf.print(gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse mod.root_dir, Io.Dir.path.sep, sub_path });
 }
 
 /// `Manifest.Input.key` of a file: `Zcu.fileKey`, with the module's
@@ -4251,7 +4251,7 @@ fn depsTag(fe: *const Frontend, mod: *const Frontend.Module) [17]u8 {
 /// the files of another project, or a module this build lacks.
 pub fn inputKeyHolds(gpa: Allocator, buf: *std.ArrayList(u8), m: *const Manifest, i: u32, fe: *const Frontend) !bool {
     const key = m.inputKey(i);
-    const colon = std.mem.indexOfScalar(u8, key, ':') orelse return false;
+    const colon = std.mem.findScalar(u8, key, ':') orelse return false;
     const mod = keyModule(fe, key[0..colon]) orelse return false;
     // The same `--dep`s too.
     const tag = depsTag(fe, fe.module(mod));
@@ -4265,7 +4265,7 @@ pub fn inputKeyHolds(gpa: Allocator, buf: *std.ArrayList(u8), m: *const Manifest
 /// `--dep`s: `inputKeyHolds` without the deps tag.
 pub fn inputKeyRebound(gpa: Allocator, buf: *std.ArrayList(u8), m: *const Manifest, i: u32, fe: *const Frontend) !bool {
     const key = m.inputKey(i);
-    const colon = std.mem.indexOfScalar(u8, key, ':') orelse return false;
+    const colon = std.mem.findScalar(u8, key, ':') orelse return false;
     const mod = keyModule(fe, key[0..colon]) orelse return false;
     const sub_path = key[colon + 1 ..];
     try inputPath(gpa, buf, fe, mod, if (sub_path.len == 0) fe.module(mod).root_file else sub_path);
@@ -4338,7 +4338,7 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
     var seed_list: std.ArrayList(u32) = .empty;
     defer seed_list.deinit(gpa);
     const t0 = now(io);
-    var changed_set = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m.inputCount());
+    var changed_set = try std.bit_set.Dynamic.initEmpty(gpa, m.inputCount());
     defer changed_set.deinit(gpa);
     for (changed.items) |c| changed_set.set(c.input);
     var changed_nodes: std.ArrayList(u32) = .empty;
@@ -4347,7 +4347,7 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
     const stats = try seeds.compute(gpa, m, fe, changed.items, changed_nodes.items, &seed_list, null);
     const seeds_ms = ms(t0, now(io));
 
-    var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    var seen = try std.bit_set.Dynamic.initEmpty(gpa, n_prev);
     defer seen.deinit(gpa);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
@@ -4489,16 +4489,16 @@ const NewGraph = struct {
 /// now or another assumed node that stays reaches it. Falls back if one
 /// that goes offered type names, or named a node the walk visited (it may
 /// have been visited for it).
-fn reachedNow(inc: *Incremental, rp: *Replay, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, n_new: u32) !std.DynamicBitSetUnmanaged {
+fn reachedNow(inc: *Incremental, rp: *Replay, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, n_new: u32) !std.bit_set.Dynamic {
     const gpa = inc.gpa;
     const m = rp.m;
     const n_prev = m.nodeCount();
     const n_all = n_prev + n_new;
     var g: NewGraph = try .init(gpa, rp, nodes, final, write, node_refs, ref_starts, n_all);
     defer g.deinit(gpa);
-    var reached = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_all);
+    var reached = try std.bit_set.Dynamic.initEmpty(gpa, n_all);
     errdefer reached.deinit(gpa);
-    const word_bits = @bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt);
+    const word_bits = @bitSizeOf(std.bit_set.Dynamic.MaskInt);
     for (0..(n_prev + word_bits - 1) / word_bits) |w| reached.masks[w] = rp.visited.masks[w] & ~rp.dead.masks[w];
     for (final, write) |f, w| if (w and f < n_prev and rp.visited.isSet(f)) reached.set(f);
     var stack: std.ArrayList(u32) = .empty;
@@ -4525,15 +4525,15 @@ fn reachedNow(inc: *Incremental, rp: *Replay, nodes: []const Node, final: []cons
     // only from an assumed node that goes.
     const n_words = (n_all + word_bits - 1) / word_bits;
     const n_prev_words = (n_prev + word_bits - 1) / word_bits;
-    var excluded = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_all);
+    var excluded = try std.bit_set.Dynamic.initEmpty(gpa, n_all);
     defer excluded.deinit(gpa);
-    var entered = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    var entered = try std.bit_set.Dynamic.initEmpty(gpa, n_prev);
     defer entered.deinit(gpa);
-    var walked = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_all);
+    var walked = try std.bit_set.Dynamic.initEmpty(gpa, n_all);
     defer walked.deinit(gpa);
-    var cand = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    var cand = try std.bit_set.Dynamic.initEmpty(gpa, n_prev);
     defer cand.deinit(gpa);
-    var solid = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_all);
+    var solid = try std.bit_set.Dynamic.initEmpty(gpa, n_all);
     defer solid.deinit(gpa);
     var lost: std.ArrayList(u32) = .empty;
     defer lost.deinit(gpa);
@@ -4552,7 +4552,7 @@ fn reachedNow(inc: *Incremental, rp: *Replay, nodes: []const Node, final: []cons
             for (next.items) |t| if (t < n_prev and assumed.isSet(t)) entered.set(t);
         }
         lost.clearRetainingCapacity();
-        for ([_]*const std.DynamicBitSetUnmanaged{ &rp.cone, &excluded }) |set| {
+        for ([_]*const std.bit_set.Dynamic{ &rp.cone, &excluded }) |set| {
             var it = set.iterator(.{});
             while (it.next()) |x| if (x < n_prev) {
                 next.clearRetainingCapacity();
@@ -4641,20 +4641,20 @@ fn reachedNow(inc: *Incremental, rp: *Replay, nodes: []const Node, final: []cons
 
 /// Whether an assumed node outside `cand` names `x` among the references
 /// reach follows (reverse edges are a superset: each is checked).
-fn namedByAssumed(gpa: Allocator, m: *const Manifest, assumed: *const std.DynamicBitSetUnmanaged, cand: *const std.DynamicBitSetUnmanaged, x: u32, next: *std.ArrayList(u32)) !bool {
+fn namedByAssumed(gpa: Allocator, m: *const Manifest, assumed: *const std.bit_set.Dynamic, cand: *const std.bit_set.Dynamic, x: u32, next: *std.ArrayList(u32)) !bool {
     for ([_][2][]const u32{ m.rdeps(x), m.rrefs(x) }) |parts| for (parts) |part| for (part) |p| {
         if (!assumed.isSet(p) or cand.isSet(p)) continue;
         next.clearRetainingCapacity();
         try reachNext(m.deps(p), m.nodeRefs(p), next, gpa);
-        if (std.mem.indexOfScalar(u32, next.items, x) != null) return true;
+        if (std.mem.findScalar(u32, next.items, x) != null) return true;
     };
     return false;
 }
 
 /// The nodes a walk from the roots reaches in the graph a lazy build
 /// leaves (`NewGraph`).
-fn fullReach(gpa: Allocator, rp: *const Replay, g: *const NewGraph) !std.DynamicBitSetUnmanaged {
-    var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, g.written_at.len);
+fn fullReach(gpa: Allocator, rp: *const Replay, g: *const NewGraph) !std.bit_set.Dynamic {
+    var seen = try std.bit_set.Dynamic.initEmpty(gpa, g.written_at.len);
     errdefer seen.deinit(gpa);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
@@ -4677,7 +4677,7 @@ fn fullReach(gpa: Allocator, rp: *const Replay, g: *const NewGraph) !std.Dynamic
 /// `BS_CACHE_CHECK` for a lazy build: the `reached` flags it records,
 /// and the nodes with atoms it links (`live`), against a full walk of the
 /// graph it leaves (`NewGraph`) from the roots.
-fn checkLiveReach(inc: *Incremental, rp: *const Replay, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, live: *const std.DynamicBitSetUnmanaged, reached: *const std.DynamicBitSetUnmanaged) !void {
+fn checkLiveReach(inc: *Incremental, rp: *const Replay, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, live: *const std.bit_set.Dynamic, reached: *const std.bit_set.Dynamic) !void {
     const gpa = inc.gpa;
     const m = rp.m;
     const n_all = live.bit_length;
@@ -4715,7 +4715,7 @@ fn checkLiveReach(inc: *Incremental, rp: *const Replay, nodes: []const Node, fin
 /// returns whether every node with atoms is reached.
 fn markReached(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *Manifest.Builder, check: bool) !bool {
     const nodes = r.nodes.items;
-    var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, nodes.len);
+    var seen = try std.bit_set.Dynamic.initEmpty(gpa, nodes.len);
     defer seen.deinit(gpa);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
@@ -4911,7 +4911,7 @@ fn loadMakes(zcu: *Zcu, use: Zcu.EffectUse) bool {
     const conditional = zcu.conditional_deps.get(use.unit) orelse &.{};
     const ns = ip.structInfo(use.ty).namespace;
     for (deps, 0..) |d, i| {
-        if (std.mem.indexOfScalar(u32, conditional, @intCast(i)) != null) continue;
+        if (std.mem.findScalar(u32, conditional, @intCast(i)) != null) continue;
         switch (d) {
             .type_layout, .struct_defaults => |ty| if (ty == use.ty) return true,
             .namespace => |n| if (n == ns) return true,
@@ -4975,7 +4975,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
     var pack: Pack = try .open(inc.io, inc.dir);
     defer pack.close(gpa, inc.io);
     for (0..m.bases.len) |i| _ = try pack.addBase(gpa, inc.io, inc.dir, m.basePack(i));
-    var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m.nodeCount());
+    var seen = try std.bit_set.Dynamic.initEmpty(gpa, m.nodeCount());
     defer seen.deinit(gpa);
     var differ: usize = 0;
     var mine: std.ArrayList([2]Hash) = .empty;

@@ -247,9 +247,9 @@ pub const Options = struct {
 /// upstream, testing `<lib>/std/std.zig` makes std the module under test
 /// rather than loading a second copy of it.
 pub fn testsStd(gpa: Allocator, zig_lib_dir: []const u8, main_src_path: []const u8) !bool {
-    const resolved = try std.fs.path.resolve(gpa, &.{main_src_path});
+    const resolved = try Io.Dir.path.resolveAlloc(gpa, &.{main_src_path});
     defer gpa.free(resolved);
-    const std_root = try std.fs.path.resolve(gpa, &.{ zig_lib_dir, "std", "std.zig" });
+    const std_root = try Io.Dir.path.resolveAlloc(gpa, &.{ zig_lib_dir, "std", "std.zig" });
     defer gpa.free(std_root);
     return std.mem.eql(u8, resolved, std_root);
 }
@@ -271,7 +271,7 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     }) else try fe.addModule("=root", options.root_src_path, .local);
     try fe.modules.append(gpa, .{
         .name = "std",
-        .root_dir = try std.fs.path.join(gpa, &.{ zig_lib_dir, "std" }),
+        .root_dir = try Io.Dir.path.join(gpa, &.{ zig_lib_dir, "std" }),
         .root_file = try gpa.dupe(u8, "std.zig"),
         .cache = .global,
     });
@@ -303,7 +303,7 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         fn f(f_fe: *Frontend, root_name: []const u8, specs: []const []const u8) ![]const Dep {
             const deps = try f_fe.gpa.alloc(Dep, specs.len);
             for (deps, specs) |*d, spec| {
-                const eq = std.mem.indexOfScalar(u8, spec, '=');
+                const eq = std.mem.findScalar(u8, spec, '=');
                 const name = if (eq) |e| spec[0..e] else spec;
                 const target = if (eq) |e| spec[e + 1 ..] else spec;
                 // By `-M` name: under `bs test` no `--dep` names the test
@@ -347,7 +347,7 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         const b = existing orelse b: {
             const bk = fe.modules.items.len;
             try fe.modules.append(gpa, .{
-                .name = try std.fmt.allocPrint(gpa, "=builtin@{s}", .{std.fs.path.basename(dir)}),
+                .name = try gpa.print("=builtin@{s}", .{Io.Dir.path.basename(dir)}),
                 .root_dir = try gpa.dupe(u8, dir),
                 .root_file = try gpa.dupe(u8, "builtin.zig"),
                 .cache = .global,
@@ -362,7 +362,7 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         const family: [3]Module.Index = .{ @fromBackingInt(@backingInt(root) + 1), root, @fromBackingInt(@backingInt(root) + 2) };
         try fe.modules.appendSlice(gpa, &.{
             .{ .name = "=root@fuzzer", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "fuzzer.zig"), .cache = .global },
-            .{ .name = "=std@fuzzer", .root_dir = try std.fs.path.join(gpa, &.{ zig_lib_dir, "std" }), .root_file = try gpa.dupe(u8, "std.zig"), .cache = .global },
+            .{ .name = "=std@fuzzer", .root_dir = try Io.Dir.path.join(gpa, &.{ zig_lib_dir, "std" }), .root_file = try gpa.dupe(u8, "std.zig"), .cache = .global },
             .{ .name = "=builtin@fuzzer", .root_dir = try gpa.dupe(u8, dir), .root_file = try gpa.dupe(u8, "builtin.zig"), .cache = .global },
         });
         for (fe.modules.items[@backingInt(root)..]) |*m| {
@@ -390,8 +390,8 @@ pub const ssp_sub_path = "compiler_rt/ssp.zig";
 fn addModule(fe: *Frontend, name: []const u8, root_src_path: []const u8, cache: CacheKind) !void {
     try fe.modules.append(fe.gpa, .{
         .name = name,
-        .root_dir = try fe.gpa.dupe(u8, std.fs.path.dirname(root_src_path) orelse "."),
-        .root_file = try fe.gpa.dupe(u8, std.fs.path.basename(root_src_path)),
+        .root_dir = try fe.gpa.dupe(u8, Io.Dir.path.dirname(root_src_path) orelse "."),
+        .root_file = try fe.gpa.dupe(u8, Io.Dir.path.basename(root_src_path)),
         .cache = cache,
     });
 }
@@ -494,7 +494,7 @@ pub fn displayName(fe: *const Frontend, index: Module.Index) []const u8 {
     const name = fe.module(index).name;
     // The fuzzer's family (`=std@fuzzer`), named as in upstream's
     // separate compilation of it.
-    if (std.mem.startsWith(u8, name, "=")) return name[1..std.mem.indexOfScalar(u8, name, '@').?];
+    if (std.mem.startsWith(u8, name, "=")) return name[1..std.mem.findScalar(u8, name, '@').?];
     return name;
 }
 
@@ -669,12 +669,12 @@ const CacheDir = struct {
     /// its mtime renewed when it is mapped.
     renew_before_ns: i96,
 
-    const sub_path = "bs" ++ std.fs.path.sep_str ++ "zir";
+    const sub_path = "bs" ++ Io.Dir.path.sep_str ++ "zir";
 
     /// Opens the cache in `path`, or warns and returns null if it cannot
     /// (a full disk, for one): the build goes on without it.
     fn openOrWarn(gpa: Allocator, io: Io, path: []const u8, global: bool) Allocator.Error!?CacheDir {
-        const full = try std.fs.path.join(gpa, &.{ path, sub_path });
+        const full = try Io.Dir.path.join(gpa, &.{ path, sub_path });
         defer gpa.free(full);
         const dir = Io.Dir.cwd().openDir(io, full, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => Io.Dir.cwd().createDirPathOpen(io, full, .{ .open_options = .{ .iterate = true } }) catch |e| {
@@ -1232,7 +1232,7 @@ const Loader = struct {
     fn getJob(l: *Loader, mod_index: Module.Index, sub_path: []const u8) !*Job {
         const fe = l.fe;
         const gpa = fe.gpa;
-        const key = try std.fmt.allocPrint(gpa, "{d}:{s}", .{ @backingInt(mod_index), sub_path });
+        const key = try gpa.print("{d}:{s}", .{ @backingInt(mod_index), sub_path });
         const gop = l.jobs.getOrPut(gpa, key) catch |err| {
             gpa.free(key);
             return err;
@@ -1257,7 +1257,7 @@ const Loader = struct {
         job.* = .{ .file = .{
             .module = mod_index,
             .sub_path = owned_sub_path,
-            .display_path = try std.fs.path.join(gpa, &.{ fe.module(mod_index).root_dir, sub_path }),
+            .display_path = try Io.Dir.path.join(gpa, &.{ fe.module(mod_index).root_dir, sub_path }),
             .zir = undefined,
             .content_hash = undefined,
             .mapping = null,
@@ -1462,7 +1462,7 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
 /// are invalid afterwards.
 pub fn loadFile(fe: *Frontend, mod: Module.Index, sub_path: []const u8) !?File.Index {
     var buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "{d}:{s}", .{ @backingInt(mod), sub_path }) catch return error.NameTooLong;
+    const key = std.mem.print(&buf, "{d}:{s}", .{ @backingInt(mod), sub_path }) catch return error.NameTooLong;
     if (fe.file_map.get(key)) |index| return index;
     var errors: std.zig.ErrorBundle.Wip = try .init(fe.gpa);
     defer errors.deinit();
@@ -1535,14 +1535,14 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
             // As upstream, an imported file that cannot be read is an
             // error at that file, with a note at the import.
             const importer = for (order.items[0..i]) |o| {
-                if (std.mem.indexOfScalar(*Job, o.imports, job) != null) break o;
+                if (std.mem.findScalar(*Job, o.imports, job) != null) break o;
             } else fatalFile(job.file.display_path, err);
             try fe.addMissingFile(errors, importer, job, err);
             any_missing = true;
             continue;
         }
         for (job.zon_imports) |sub_path| {
-            const path = try std.fs.path.join(gpa, &.{ fe.module(job.file.module).root_dir, sub_path });
+            const path = try Io.Dir.path.join(gpa, &.{ fe.module(job.file.module).root_dir, sub_path });
             defer gpa.free(path);
             _ = Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
                 try fe.addMissingZon(errors, job, sub_path, err);
@@ -1803,7 +1803,7 @@ fn collectZonImports(fe: *const Frontend, f: *const File, names: []const u8) ![]
 /// ZON file inside the module (a path outside it is Sema's error).
 fn resolveZonImport(fe: *const Frontend, f: *const File, name: []const u8) !?[]const u8 {
     if (!std.mem.endsWith(u8, name, ".zon") or fe.depModule(f.module, name) != null) return null;
-    const sub_path = try std.fs.path.resolvePosix(fe.gpa, &.{ std.fs.path.dirname(f.sub_path) orelse "", name });
+    const sub_path = try Io.Dir.path.resolveAllocPosix(fe.gpa, &.{ Io.Dir.path.dirname(f.sub_path) orelse "", name });
     if (std.mem.eql(u8, sub_path, "..") or std.mem.startsWith(u8, sub_path, "../")) {
         fe.gpa.free(sub_path);
         return null;
@@ -1821,7 +1821,7 @@ fn resolveImport(fe: *const Frontend, f: *const File, name: []const u8) !?Import
         return .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) };
     }
     if (std.mem.endsWith(u8, name, ".zig")) {
-        const sub_path = try std.fs.path.resolvePosix(gpa, &.{ std.fs.path.dirname(f.sub_path) orelse "", name });
+        const sub_path = try Io.Dir.path.resolveAllocPosix(gpa, &.{ Io.Dir.path.dirname(f.sub_path) orelse "", name });
         // A path outside the module is Sema's error, at the import.
         if (std.mem.eql(u8, sub_path, "..") or std.mem.startsWith(u8, sub_path, "../")) {
             gpa.free(sub_path);
@@ -1848,7 +1848,7 @@ fn checkModuleOverlap(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, root_jobs
         if (job.missing != null) continue;
         const m = fe.module(job.file.module);
         if (m.std_mod != .std) continue;
-        const path = try std.fs.path.resolve(arena, &.{ m.abs_root_dir orelse m.root_dir, job.file.sub_path });
+        const path = try Io.Dir.path.resolveAlloc(arena, &.{ m.abs_root_dir orelse m.root_dir, job.file.sub_path });
         const gop = try seen.getOrPut(arena, path);
         if (!gop.found_existing) {
             gop.value_ptr.* = job;
@@ -1902,7 +1902,7 @@ fn checkModuleOverlap(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, root_jobs
 /// Whether `job` is the root file of its module, or one of the files a
 /// load starts from.
 fn isModuleRoot(fe: *const Frontend, job: *const Job, root_jobs: []const *Job) bool {
-    return std.mem.indexOfScalar(*const Job, root_jobs, job) != null or
+    return std.mem.findScalar(*const Job, root_jobs, job) != null or
         std.mem.eql(u8, job.file.sub_path, fe.module(job.file.module).root_file);
 }
 
@@ -1923,7 +1923,7 @@ fn addMissingFile(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, importer: *co
 /// could not be read, as `addMissingFile`.
 fn addMissingZon(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, importer: *const Job, sub_path: []const u8, err: anyerror) !void {
     const token = try fe.importToken(importer, importer.file.module, sub_path, true);
-    const path = try std.fs.path.join(fe.gpa, &.{ fe.module(importer.file.module).root_dir, sub_path });
+    const path = try Io.Dir.path.join(fe.gpa, &.{ fe.module(importer.file.module).root_dir, sub_path });
     defer fe.gpa.free(path);
     try fe.addUnreadable(errors, importer, token, path, err);
 }
@@ -1932,7 +1932,7 @@ fn addUnreadable(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, importer: *con
     const note_loc = try fe.tokenLoc(errors, importer, token);
     try errors.addRootErrorMessage(.{
         // As upstream, the file by its base name; its path is the location.
-        .msg = try errors.printString("unable to load \"{s}\": {t}", .{ std.fs.path.basename(path), err }),
+        .msg = try errors.printString("unable to load \"{s}\": {t}", .{ Io.Dir.path.basename(path), err }),
         .src_loc = try wholeFileLoc(errors, path),
         .notes_len = 1,
     });
@@ -2027,7 +2027,7 @@ test "loads a file and its imports" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = "const a = @import(\"a.zig\");\npub fn main() void { a.f(); }\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "pub fn f() void {}\n" });
-    const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/main.zig", .{tmp.sub_path});
+    const root = try gpa.print(".zig-cache/tmp/{s}/main.zig", .{tmp.sub_path});
     defer gpa.free(root);
 
     var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent", .load_std = false });
@@ -2067,11 +2067,11 @@ test "reuses cached ZIR, drops stale guessed imports, and reports errors in cach
     try tmp.dir.setTimestamps(io, "main.zig", .{ .modify_timestamp = old });
     try tmp.dir.setTimestamps(io, "a.zig", .{ .modify_timestamp = old });
     try tmp.dir.setTimestamps(io, "c.zig", .{ .modify_timestamp = old });
-    const base = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try gpa.print(".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer gpa.free(base);
-    const root = try std.fs.path.join(gpa, &.{ base, "main.zig" });
+    const root = try Io.Dir.path.join(gpa, &.{ base, "main.zig" });
     defer gpa.free(root);
-    const cache = try std.fs.path.join(gpa, &.{ base, "cache" });
+    const cache = try Io.Dir.path.join(gpa, &.{ base, "cache" });
     defer gpa.free(cache);
 
     const Run = struct {
@@ -2130,7 +2130,7 @@ test "reuses cached ZIR, drops stale guessed imports, and reports errors in cach
         try std.testing.expectEqual(3, gone.fe.stats.stat_hits);
         const g = &gone.fe.files.items[1];
         var name_buf: [128]u8 = undefined;
-        const blob = try std.fmt.bufPrint(&name_buf, "{s}/bs/zir/{s}", .{ cache, &std.fmt.bytesToHex(g.content_hash, .lower) });
+        const blob = try std.mem.print(&name_buf, "{s}/bs/zir/{s}", .{ cache, &std.fmt.bytesToHex(g.content_hash, .lower) });
         try Io.Dir.cwd().deleteFile(io, blob);
         const c = cold.fe.file(@fromBackingInt(1));
         const w = gone.fe.file(@fromBackingInt(1));
@@ -2176,24 +2176,24 @@ test "drops the ZIR of edited sources once no build maps it" {
     try tmp.dir.createDirPath(io, "b");
     try tmp.dir.writeFile(io, .{ .sub_path = "b/main.zig", .data = sources[1] });
     try tmp.dir.setTimestamps(io, "b/main.zig", .{ .modify_timestamp = old });
-    const base = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try gpa.print(".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer gpa.free(base);
-    const global = try std.fs.path.join(gpa, &.{ base, "global" });
+    const global = try Io.Dir.path.join(gpa, &.{ base, "global" });
     defer gpa.free(global);
 
     // `a/main.zig` at `sources[i]`, built with its own local cache.
     const build = struct {
         fn build(dir: std.Io.Dir, b: []const u8, g: []const u8, sub: []const u8, src: ?[]const u8) !Frontend {
-            const path = try std.fmt.allocPrint(gpa, "{s}/main.zig", .{sub});
+            const path = try gpa.print("{s}/main.zig", .{sub});
             defer gpa.free(path);
             if (src) |s| {
                 try dir.writeFile(io, .{ .sub_path = path, .data = s });
                 // Old enough that the index trusts it, and another stat per source.
                 try dir.setTimestamps(io, path, .{ .modify_timestamp = .{ .new = .fromNanoseconds((1_000_000_000 + @as(i96, s[14])) * std.time.ns_per_s) } });
             }
-            const root = try std.fs.path.join(gpa, &.{ b, path });
+            const root = try Io.Dir.path.join(gpa, &.{ b, path });
             defer gpa.free(root);
-            const local = try std.fs.path.join(gpa, &.{ b, sub, "local" });
+            const local = try Io.Dir.path.join(gpa, &.{ b, sub, "local" });
             defer gpa.free(local);
             var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent", .load_std = false });
             errdefer fe.deinit();

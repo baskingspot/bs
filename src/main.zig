@@ -382,7 +382,7 @@ pub fn main(init_std: std.process.Init) !void {
         else
             try outputName(arena, command, opts.dynamic, opts.version, job.stem, opts.bs_target == .aarch64_macos),
     };
-    if (opts.emit_bin == .default and (command == .run or command == .@"test")) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
+    if (opts.emit_bin == .default and (command == .run or command == .@"test")) try Io.Dir.cwd().createDirPath(init.io, Io.Dir.path.dirname(out_path.?).?);
     var inc = job.openCache(out_path);
     defer if (inc) |*i| i.close();
     switch (try compile(init, &job, if (inc) |*i| i else null, out_path, null, .none, null)) {
@@ -549,7 +549,7 @@ pub const Job = struct {
             .cpu = opts.cpu,
             .target = opts.bs_target,
         };
-        const builtin_dir = try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }), builtin_opts);
+        const builtin_dir = try Builtin.writeToCache(arena, init_.io, try Io.Dir.path.join(arena, &.{ cache_dirs.global, "bs" }), builtin_opts);
         // A module whose `-O`, `-ferror-tracing` or `-fvalgrind` differs
         // from the root module's gets a builtin of its own, as upstream's.
         const modules = try arena.dupe(Frontend.ModuleArg, opts.modules);
@@ -558,7 +558,7 @@ pub const Job = struct {
             var o = builtin_opts;
             o.optimize, o.error_tracing, o.valgrind = .{ m.optimize.?, m.error_tracing.?, m.valgrind.? };
             o.start_code = false;
-            m.builtin_dir = try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }), o);
+            m.builtin_dir = try Builtin.writeToCache(arena, init_.io, try Io.Dir.path.join(arena, &.{ cache_dirs.global, "bs" }), o);
         }
         var job_opts = opts;
         job_opts.modules = modules;
@@ -569,7 +569,7 @@ pub const Job = struct {
         // than the test runner provides the `runner_*` functions the
         // fuzzer calls back itself (upstream's test/standalone/libfuzzer).
         const fuzzer_builtin_dir: ?[]const u8 = if (opts.fuzz and (is_test or command == .build_exe or command == .run))
-            try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }), .{
+            try Builtin.writeToCache(arena, init_.io, try Io.Dir.path.join(arena, &.{ cache_dirs.global, "bs" }), .{
                 .output_mode = .Lib,
                 .is_test = false,
                 .single_threaded = opts.single_threaded,
@@ -592,13 +592,13 @@ pub const Job = struct {
         }
         // The glibc version a -lc build links, which the arguments do not
         // spell for the native target. Keys only: `full_args` stay as given.
-        if (opts.link_libc and !opts.musl) try compile_args.append(arena, try std.fmt.allocPrint(arena, "--bs-glibc={f}", .{opts.glibc_version.?}));
+        if (opts.link_libc and !opts.musl) try compile_args.append(arena, try arena.print("--bs-glibc={f}", .{opts.glibc_version.?}));
         // What this system decides of a native OS, which builtin states.
         if (opts.native_os) if (opts.linux) |t| {
             const v = t.os.version_range.linux;
-            try compile_args.append(arena, try std.fmt.allocPrint(arena, "--bs-native={t},{f},{f},{f},{s}", .{ t.abi, v.range.min, v.range.max, v.glibc, t.dynamic_linker.get() orelse "" }));
+            try compile_args.append(arena, try arena.print("--bs-native={t},{f},{f},{f},{s}", .{ t.abi, v.range.min, v.range.max, v.glibc, t.dynamic_linker.get() orelse "" }));
         } else if (opts.bs_target == .aarch64_macos) {
-            try compile_args.append(arena, try std.fmt.allocPrint(arena, "--bs-native=macos,{f},{f},{?f}", .{ opts.macos_version.min, opts.macos_version.max, job_opts.macos_sdk }));
+            try compile_args.append(arena, try arena.print("--bs-native=macos,{f},{f},{?f}", .{ opts.macos_version.min, opts.macos_version.max, job_opts.macos_sdk }));
         };
         // The files the object and library arguments name, which `-l`
         // finds in the `-L` directories: the cache's link-only inputs,
@@ -609,8 +609,8 @@ pub const Job = struct {
             const cwd = try std.process.currentPathAlloc(init_.io, arena);
             for ([_][]const []const u8{ opts.link_inputs, opts.shared_libs }, [_][][]const u8{ link_objects, link_shared }) |paths, absolute| {
                 for (absolute, paths) |*abs, path| {
-                    abs.* = try std.fs.path.resolve(arena, &.{ cwd, path });
-                    try compile_args.append(arena, try std.fmt.allocPrint(arena, "--bs-link-input={s}", .{abs.*}));
+                    abs.* = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, path });
+                    try compile_args.append(arena, try arena.print("--bs-link-input={s}", .{abs.*}));
                 }
             }
         }
@@ -625,7 +625,7 @@ pub const Job = struct {
             .compile_args = compile_args.items,
             .link_objects = link_objects,
             .link_shared = link_shared,
-            .stem = opts.name orelse if (is_test) "test" else if (opts.c_only or opts.c_root) std.fs.path.stem(if (opts.c_sources.len != 0) opts.c_sources[0].path else if (opts.link_inputs.len != 0) opts.link_inputs[0] else opts.root_name) else std.fs.path.stem(opts.root_src_path),
+            .stem = opts.name orelse if (is_test) "test" else if (opts.c_only or opts.c_root) Io.Dir.path.stem(if (opts.c_sources.len != 0) opts.c_sources[0].path else if (opts.link_inputs.len != 0) opts.link_inputs[0] else opts.root_name) else Io.Dir.path.stem(opts.root_src_path),
             .run_test = command == .@"test" and !opts.test_no_exec and !opts.listen and opts.emit_bin != .none,
             .environ_map = init_.environ_map,
             .full_args = args,
@@ -635,7 +635,7 @@ pub const Job = struct {
     }
 
     fn bsLocal(job: *const Job, arena: std.mem.Allocator) []const u8 {
-        return std.fs.path.join(arena, &.{ job.cache_dirs.local, "bs" }) catch fatal("out of memory", .{});
+        return Io.Dir.path.join(arena, &.{ job.cache_dirs.local, "bs" }) catch fatal("out of memory", .{});
     }
 
     /// Whether a build with an output can use the on-disk cache.
@@ -681,7 +681,7 @@ pub const Job = struct {
             .build_lib => .lib,
             else => .exe,
         };
-        i.archive_stem = std.fs.path.stem(job.opts.root_src_path);
+        i.archive_stem = Io.Dir.path.stem(job.opts.root_src_path);
         // `bs run`'s program counts as used when it runs, as does the test
         // binary `bs test --test-no-exec` leaves in the cache
         // (`renew_output`); other outputs keep the stat the last link left,
@@ -951,7 +951,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, batch: ?*CSource.Batch,
     // The stamp covers the C objects and the output, not object inputs.
     const stamp_path: ?[]const u8 = if (out_path != null and job.opts.link_inputs.len == 0) path: {
         _, const key = try Incremental.compilationKey(arena, io, job.compile_args, job.zig_lib_dir, "c archive");
-        break :path try std.fs.path.join(arena, &.{ job.bsLocal(arena), "car", &std.fmt.bytesToHex(@as([16]u8, @bitCast(key)), .lower) });
+        break :path try Io.Dir.path.join(arena, &.{ job.bsLocal(arena), "car", &std.fmt.bytesToHex(@as([16]u8, @bitCast(key)), .lower) });
     } else null;
     // Object inputs alone (no batch) go into the output every build.
     if (batch) |b| if (b.misses == 0) if (stamp_path) |sp| if (try CSource.archiveStamp(b, arena, out_path.?)) |stamp| {
@@ -971,7 +971,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, batch: ?*CSource.Batch,
         if (!try writeMerged(init, bin_path, null, job.opts.link_inputs, c.objects, job.opts.bs_target)) return .failed;
     } else {
         var members: std.ArrayList(Archive.Input) = .empty;
-        for (job.opts.link_inputs) |path| try members.append(arena, .{ .name = std.fs.path.basename(path), .bytes = try readInput(init, path) });
+        for (job.opts.link_inputs) |path| try members.append(arena, .{ .name = Io.Dir.path.basename(path), .bytes = try readInput(init, path) });
         for (c.objects) |o| try members.append(arena, .{ .name = o.member, .bytes = o.bytes });
         (if (job.opts.bs_target == .aarch64_macos) Archive.writeDarwin(init.gpa, init.io, Io.Dir.cwd(), bin_path, members.items) else Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, members.items)) catch |err| {
             std.log.err("unable to write the archive '{s}': {t}", .{ bin_path, err });
@@ -983,7 +983,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, batch: ?*CSource.Batch,
         var bytes: [16]u8 = undefined;
         std.mem.writeInt(u128, &bytes, stamp, .little);
         Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = &bytes, .flags = .{} }) catch |err| switch (err) {
-            error.FileNotFound => if (Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(sp).?)) |_| {
+            error.FileNotFound => if (Io.Dir.cwd().createDirPath(io, Io.Dir.path.dirname(sp).?)) |_| {
                 Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = &bytes, .flags = .{} }) catch {};
             } else |_| {},
             else => {},
@@ -1148,11 +1148,11 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     };
 
     const is_test = opts.command.isTest();
-    const test_runner = opts.test_runner orelse try std.fs.path.join(arena, &.{ job.zig_lib_dir, "compiler", "test_runner.zig" });
+    const test_runner = opts.test_runner orelse try Io.Dir.path.join(arena, &.{ job.zig_lib_dir, "compiler", "test_runner.zig" });
     const plain = try plainC(arena, &opts, c_batch);
     const fe_node = prog.start("Load Sources", 0);
     var fe: Frontend = try .init(init.gpa, init.io, job.zig_lib_dir, .{
-        .root_src_path = if (is_test) test_runner else if (opts.c_root) try Builtin.writeCMain(arena, init.io, try std.fs.path.join(arena, &.{ job.cache_dirs.global, "bs" }), plain) else opts.root_src_path,
+        .root_src_path = if (is_test) test_runner else if (opts.c_root) try Builtin.writeCMain(arena, init.io, try Io.Dir.path.join(arena, &.{ job.cache_dirs.global, "bs" }), plain) else opts.root_src_path,
         .root_dir = opts.root_dir,
         .builtin_dir = job.builtin_dir,
         .main_src_path = if (is_test) opts.root_src_path else null,
@@ -1243,7 +1243,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     emit.pic = if (opts.pie) .pie else if (opts.pic) .pic else .none;
     emit.shared = opts.dynamic;
     if (opts.dynamic) emit.soname = switch (opts.soname) {
-        .default => if (opts.version) |v| try std.fmt.allocPrint(arena, "lib{s}.so.{d}", .{ job.stem, v.major }) else try outputName(arena, .build_lib, true, null, job.stem, false),
+        .default => if (opts.version) |v| try arena.print("lib{s}.so.{d}", .{ job.stem, v.major }) else try outputName(arena, .build_lib, true, null, job.stem, false),
         .name => |n| n,
         .none => null,
     };
@@ -1296,7 +1296,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // from the stub upstream links against.
     var libsystem: std.StringHashMapUnmanaged(void) = .empty;
     if (plain and macos) {
-        const tbd_path = try std.fs.path.join(arena, &.{ job.zig_lib_dir, "libc", "darwin", "libSystem.tbd" });
+        const tbd_path = try Io.Dir.path.join(arena, &.{ job.zig_lib_dir, "libc", "darwin", "libSystem.tbd" });
         const text = Io.Dir.cwd().readFileAlloc(init.io, tbd_path, arena, .unlimited) catch |err|
             fatal("unable to read '{s}': {t}", .{ tbd_path, err });
         try Tbd.exports(arena, text, &libsystem);
@@ -1439,7 +1439,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // A lazy edit build writes either itself.
     const archive = opts.command == .build_lib and !opts.dynamic;
     const merged = opts.command.isObj() and (opts.link_inputs.len != 0 or c_batch != null);
-    const link_path = if (archive or merged) try std.fmt.allocPrint(arena, "{s}.o.tmp", .{bin_path}) else bin_path;
+    const link_path = if (archive or merged) try arena.print("{s}.o.tmp", .{bin_path}) else bin_path;
     var linked = lazy_linked orelse try emit.link(init.io, Io.Dir.cwd(), link_path);
     if (linked and lazy_linked == null and merged) {
         defer Io.Dir.cwd().deleteFile(init.io, link_path) catch {};
@@ -1450,9 +1450,9 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         defer Io.Dir.cwd().deleteFile(init.io, link_path) catch {};
         const obj = try Io.Dir.cwd().readFileAlloc(init.io, link_path, arena, .unlimited);
         var members: std.ArrayList(Archive.Input) = .empty;
-        try members.append(arena, .{ .name = try std.fmt.allocPrint(arena, "{s}.o", .{std.fs.path.stem(opts.root_src_path)}), .bytes = obj });
+        try members.append(arena, .{ .name = try arena.print("{s}.o", .{Io.Dir.path.stem(opts.root_src_path)}), .bytes = obj });
         for (opts.link_inputs) |path| try members.append(arena, .{
-            .name = std.fs.path.basename(path),
+            .name = Io.Dir.path.basename(path),
             .bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err| fatal("unable to read '{s}': {t}", .{ path, err }),
         });
         if (c_batch) |b| for ((try b.wait()).objects) |o| try members.append(arena, .{ .name = o.member, .bytes = o.bytes });
@@ -1479,7 +1479,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
 fn emitDocs(init: std.process.Init, job: *const Job, path: []const u8, cache_hit: bool) !void {
     const io = init.io;
     if (cache_hit) {
-        const tar = try std.fs.path.join(init.arena.allocator(), &.{ path, "sources.tar" });
+        const tar = try Io.Dir.path.join(init.arena.allocator(), &.{ path, "sources.tar" });
         if (Io.Dir.cwd().access(io, tar, .{})) |_| return else |_| {}
     }
     Docs.emit(init.gpa, io, job.zig_lib_dir, path, job.stem, &job.opts) catch |err|
@@ -1496,15 +1496,15 @@ fn printEnv(init: std.process.Init) !void {
     const env = init.environ_map;
     const cwd = try std.process.currentPathAlloc(io, arena);
     const dirs = Frontend.resolveCacheDirs(arena, io, env, .{ .local_is_global = true });
-    const lib_dir = try std.fs.path.resolve(arena, &.{ cwd, (try toolchain.libDir(arena, io, env, dirs.global, null)).path });
+    const lib_dir = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, (try toolchain.libDir(arena, io, env, dirs.global, null)).path });
     var buf: [4096]u8 = undefined;
     var out = Io.File.stdout().writerStreaming(io, &buf);
     var serializer: std.zon.Serializer = .{ .writer = &out.interface };
     var root = try serializer.beginStruct(.{});
     try root.field("zig_exe", try std.process.executablePathAlloc(io, arena), .{});
     try root.field("lib_dir", lib_dir, .{});
-    try root.field("std_dir", try std.fs.path.join(arena, &.{ lib_dir, "std" }), .{});
-    try root.field("global_cache_dir", try std.fs.path.resolve(arena, &.{ cwd, dirs.global }), .{});
+    try root.field("std_dir", try Io.Dir.path.join(arena, &.{ lib_dir, "std" }), .{});
+    try root.field("global_cache_dir", try Io.Dir.path.resolveAlloc(arena, &.{ cwd, dirs.global }), .{});
     try root.field("version", zig_version, .{});
     try root.field("target", "x86_64-linux-none", .{});
     var env_struct = try root.beginStructField("env", .{});
@@ -1521,16 +1521,16 @@ fn printEnv(init: std.process.Init) !void {
 /// dylib's on macOS.
 fn outputName(arena: std.mem.Allocator, command: Command, dynamic: bool, version: ?std.SemanticVersion, stem: []const u8, macos: bool) ![]const u8 {
     return switch (command) {
-        .build_obj, .test_obj => std.fmt.allocPrint(arena, "{s}.o", .{stem}),
+        .build_obj, .test_obj => arena.print("{s}.o", .{stem}),
         .build_lib => if (!dynamic)
-            std.fmt.allocPrint(arena, "lib{s}.a", .{stem})
+            arena.print("lib{s}.a", .{stem})
         else if (macos) if (version) |v|
-            std.fmt.allocPrint(arena, "lib{s}.{d}.{d}.{d}.dylib", .{ stem, v.major, v.minor, v.patch })
+            arena.print("lib{s}.{d}.{d}.{d}.dylib", .{ stem, v.major, v.minor, v.patch })
         else
-            std.fmt.allocPrint(arena, "lib{s}.dylib", .{stem}) else if (version) |v|
-            std.fmt.allocPrint(arena, "lib{s}.so.{d}.{d}.{d}", .{ stem, v.major, v.minor, v.patch })
+            arena.print("lib{s}.dylib", .{stem}) else if (version) |v|
+            arena.print("lib{s}.so.{d}.{d}.{d}", .{ stem, v.major, v.minor, v.patch })
         else
-            std.fmt.allocPrint(arena, "lib{s}.so", .{stem}),
+            arena.print("lib{s}.so", .{stem}),
         else => stem,
     };
 }
@@ -1639,24 +1639,24 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
         // every build. The runner does not look at the binary.
         const hidden = opts.emit_bin == .none and j.cacheable();
         for (&outs, Incremental.outputDigests(key)) |*o, digest| {
-            const dir = try std.fs.path.join(arena, &.{ j.cache_dirs.local, "o", &std.fmt.bytesToHex(digest, .lower) });
+            const dir = try Io.Dir.path.join(arena, &.{ j.cache_dirs.local, "o", &std.fmt.bytesToHex(digest, .lower) });
             o.* = .{
                 .digest = digest,
                 .bin = switch (opts.emit_bin) {
-                    .none => if (hidden) try std.fs.path.join(arena, &.{ dir, name }) else null,
+                    .none => if (hidden) try Io.Dir.path.join(arena, &.{ dir, name }) else null,
                     .path => |p| p,
-                    .default => try std.fs.path.join(arena, &.{ dir, name }),
+                    .default => try Io.Dir.path.join(arena, &.{ dir, name }),
                 },
                 .docs = switch (opts.emit_docs) {
                     .none => null,
                     .path => |p| p,
-                    .default => try std.fmt.allocPrint(arena, "{s}/{s}-docs", .{ dir, j.stem }),
+                    .default => try arena.print("{s}/{s}-docs", .{ dir, j.stem }),
                 },
             };
         }
         // Upstream's compiler creates the local cache's `tmp`, where the
         // build runner then writes the configuration without creating it.
-        try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(arena, &.{ j.cache_dirs.local, "tmp" }));
+        try Io.Dir.cwd().createDirPath(io, try Io.Dir.path.join(arena, &.{ j.cache_dirs.local, "tmp" }));
     }
     const root_node = std.Progress.start(io, .{});
     defer root_node.end();
@@ -1684,8 +1684,8 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
                     const tb = if (Io.Dir.cwd().statFile(io, b, .{})) |st| st.mtime.toNanoseconds() else |_| null;
                     if (tb != null and (ta == null or tb.? > ta.?)) current = 1;
                     if (ta != null or tb != null) alt_path = outs[1 - current].bin;
-                    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(outs[current].bin.?).?);
-                    if (alt_path) |p| try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(p).?);
+                    try Io.Dir.cwd().createDirPath(io, Io.Dir.path.dirname(outs[current].bin.?).?);
+                    if (alt_path) |p| try Io.Dir.cwd().createDirPath(io, Io.Dir.path.dirname(p).?);
                 };
                 const out_path = outs[current].bin;
                 var inputs: std.ArrayList(u8) = .empty;
@@ -1776,10 +1776,10 @@ pub fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: s
     const Prefix = std.zig.Server.Message.PathPrefix;
     const Root = struct { prefix: Prefix, path: []const u8 };
     var roots: std.ArrayList(Root) = .empty;
-    try roots.append(arena, .{ .prefix = .zig_lib, .path = try std.fs.path.resolve(arena, &.{ cwd, job.zig_lib_dir }) });
-    try roots.append(arena, .{ .prefix = .local_cache, .path = try std.fs.path.resolve(arena, &.{ cwd, job.cache_dirs.local }) });
-    try roots.append(arena, .{ .prefix = .global_cache, .path = try std.fs.path.resolve(arena, &.{ cwd, job.cache_dirs.global }) });
-    if (job.build_root) |br| try roots.append(arena, .{ .prefix = .build_root, .path = try std.fs.path.resolve(arena, &.{ cwd, br }) });
+    try roots.append(arena, .{ .prefix = .zig_lib, .path = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, job.zig_lib_dir }) });
+    try roots.append(arena, .{ .prefix = .local_cache, .path = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, job.cache_dirs.local }) });
+    try roots.append(arena, .{ .prefix = .global_cache, .path = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, job.cache_dirs.global }) });
+    if (job.build_root) |br| try roots.append(arena, .{ .prefix = .build_root, .path = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, br }) });
     try roots.append(arena, .{ .prefix = .cwd, .path = cwd });
     const trusted_lib = job.trusted_lib;
     var out: std.ArrayList(u8) = .empty;
@@ -1788,7 +1788,7 @@ pub fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: s
         // Most inputs are the lib directory's, as the build read them:
         // absolute already, so left out before resolving each.
         if (trusted_lib and raw.len > roots.items[0].path.len and std.mem.startsWith(u8, raw, roots.items[0].path) and raw[roots.items[0].path.len] == '/') continue;
-        const abs = try std.fs.path.resolve(arena, &.{ cwd, raw });
+        const abs = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, raw });
         for (roots.items) |r| {
             if (abs.len > r.path.len and std.mem.startsWith(u8, abs, r.path) and abs[r.path.len] == '/') {
                 if (r.prefix == .zig_lib and trusted_lib) break;
@@ -1813,11 +1813,11 @@ test prefixInputs {
     const io = std.testing.io;
     const lib = "/z/lib";
     const dirs: Frontend.CacheDirs = .{ .local = "/p/.zig-cache", .global = "/g" };
-    const inputs = try std.mem.join(arena, "\x00", &.{ try std.fs.path.join(arena, &.{ lib, "std/std.zig" }), "/p/build.zig", "/g/p/dep/build.zig" });
+    const inputs = try std.mem.join(arena, "\x00", &.{ try Io.Dir.path.join(arena, &.{ lib, "std/std.zig" }), "/p/build.zig", "/g/p/dep/build.zig" });
     // The default lib directory: its files are left out.
     try std.testing.expectEqualStrings("\x05build.zig\x00\x04p/dep/build.zig", try prefixInputs(arena, io, inputs, .{ .zig_lib_dir = lib, .trusted_lib = true, .cache_dirs = dirs, .build_root = "/p" }));
     // Nothing else to report: nothing to send.
-    try std.testing.expectEqualStrings("", try prefixInputs(arena, io, inputs[0..std.mem.indexOfScalar(u8, inputs, 0).?], .{ .zig_lib_dir = lib, .trusted_lib = true, .cache_dirs = dirs, .build_root = "/p" }));
+    try std.testing.expectEqualStrings("", try prefixInputs(arena, io, inputs[0..std.mem.findScalar(u8, inputs, 0).?], .{ .zig_lib_dir = lib, .trusted_lib = true, .cache_dirs = dirs, .build_root = "/p" }));
     // Another lib directory: every file.
     try std.testing.expectEqualStrings("\x02std/std.zig\x00\x05build.zig", try prefixInputs(arena, io, "/l/std/std.zig\x00/p/build.zig", .{ .zig_lib_dir = "/l", .trusted_lib = false, .cache_dirs = dirs, .build_root = "/p" }));
 }
@@ -1860,7 +1860,7 @@ fn runExe(init: std.process.Init, path: []const u8, run_args: []const []const u8
     const arena = init.arena.allocator();
     const argv = arena.alloc([]const u8, 1 + run_args.len) catch fatal("out of memory", .{});
     // A path without a slash would be looked up in PATH.
-    argv[0] = if (std.mem.indexOfScalar(u8, path, '/') == null) std.fs.path.join(arena, &.{ ".", path }) catch fatal("out of memory", .{}) else path;
+    argv[0] = if (std.mem.findScalar(u8, path, '/') == null) Io.Dir.path.join(arena, &.{ ".", path }) catch fatal("out of memory", .{}) else path;
     @memcpy(argv[1..], run_args);
     // Upstream sets ZIG_EXE for the program.
     if (std.process.executablePathAlloc(init.io, arena)) |self| {
@@ -1882,14 +1882,14 @@ fn runBinPath(arena: std.mem.Allocator, io: Io, cache_dir: []const u8, compile_a
         h.update(&.{0});
         h.update(a);
     }
-    return std.fmt.allocPrint(arena, "{s}/o/{x:0>16}/{s}", .{ cache_dir, h.final(), stem });
+    return arena.print("{s}/o/{x:0>16}/{s}", .{ cache_dir, h.final(), stem });
 }
 
 /// Runs a test binary, then deletes it if it is `temporary`: named by
 /// `testBinPath` for this build alone.
 fn runTest(init: std.process.Init, path: []const u8, temporary: bool) !void {
     // A path without a slash would be looked up in PATH.
-    const exe = if (std.mem.indexOfScalar(u8, path, '/') == null) try std.fs.path.join(init.arena.allocator(), &.{ ".", path }) else path;
+    const exe = if (std.mem.findScalar(u8, path, '/') == null) try Io.Dir.path.join(init.arena.allocator(), &.{ ".", path }) else path;
     var child = try std.process.spawn(init.io, .{ .argv = &.{exe} });
     const term = try child.wait(init.io);
     if (temporary) Io.Dir.cwd().deleteFile(init.io, path) catch {};
@@ -1902,7 +1902,7 @@ fn runTest(init: std.process.Init, path: []const u8, temporary: bool) !void {
 fn testBinPath(arena: std.mem.Allocator, io: Io, cache_dir: []const u8, stem: []const u8) ![]const u8 {
     var r: [8]u8 = undefined;
     io.random(&r);
-    return std.fmt.allocPrint(arena, "{s}/tmp/{s}-{x}", .{ cache_dir, stem, &r });
+    return arena.print("{s}/tmp/{s}-{x}", .{ cache_dir, stem, &r });
 }
 
 /// `BS_TIMING`: wall time per stage of a build.
@@ -1931,9 +1931,9 @@ const Stages = struct {
             }
         }.f;
         const out = if (part.len == 0)
-            std.fmt.bufPrint(s.buf[s.len..], "{s}{s} {d:.1}", .{ if (s.len == 0) "" else ", ", name, ms(ns) })
+            std.mem.print(s.buf[s.len..], "{s}{s} {d:.1}", .{ if (s.len == 0) "" else ", ", name, ms(ns) })
         else
-            std.fmt.bufPrint(s.buf[s.len..], "{s}{s} {d:.1}, {s} {d:.1}", .{ if (s.len == 0) "" else ", ", name, ms(ns -| part_ns), part, ms(part_ns) });
+            std.mem.print(s.buf[s.len..], "{s}{s} {d:.1}, {s} {d:.1}", .{ if (s.len == 0) "" else ", ", name, ms(ns -| part_ns), part, ms(part_ns) });
         s.len += (out catch return).len;
     }
 
@@ -2046,7 +2046,7 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
 });
 
 pub fn setUnsupported(opts: *Options, arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
-    if (opts.unsupported == null) opts.unsupported = std.fmt.allocPrint(arena, fmt, args) catch fatal("out of memory", .{});
+    if (opts.unsupported == null) opts.unsupported = arena.print(fmt, args) catch fatal("out of memory", .{});
 }
 
 pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.process.Environ.Map, command: Command, args_in: []const []const u8) !Options {
@@ -2196,7 +2196,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             mode.strip = arg[2] == 's';
         } else if (std.mem.eql(u8, arg, "-O") or (std.mem.startsWith(u8, arg, "-O") and !std.mem.eql(u8, arg, "-ObjC"))) {
             const v = if (arg.len == 2) nextArg(args, &i, arg) else arg[2..];
-            const o = std.lang.Optimize.fromString(v) orelse fatal("unrecognized optimization mode: '{s}'", .{v});
+            // The names upstream's deprecated `Optimize.fromString` accepts.
+            const o = std.StaticStringMap(std.lang.Optimize).initComptime(.{
+                .{ "Debug", .debug }, .{ "ReleaseSafe", .safe }, .{ "ReleaseFast", .fast }, .{ "ReleaseSmall", .small },
+                .{ "debug", .debug }, .{ "safe", .safe },        .{ "fast", .fast },        .{ "small", .small },
+            }).get(v) orelse fatal("unrecognized optimization mode: '{s}'", .{v});
             // bs compiles every mode with its one code generation, with
             // upstream's builtin and defaults for the mode. ReleaseFast and
             // ReleaseSmall (no safety checks) only for `bs build`'s steps,
@@ -2230,7 +2234,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             c_flags.optimize = mode.optimize;
             // A module without a root source file holds C sources: no Zig
             // module, and `--dep`s on it name nothing.
-            const eq = std.mem.indexOfScalar(u8, spec, '=');
+            const eq = std.mem.findScalar(u8, spec, '=');
             if (eq == null) {
                 if (root == null and !rootless_root) {
                     rootless_root = true;
@@ -2379,12 +2383,12 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (std.mem.startsWith(u8, arg, "-")) {
             setUnsupported(&opts, arena, "bs does not support the option '{s}'", .{arg});
         } else if (!std.mem.endsWith(u8, arg, ".zig")) {
-            const ext = std.fs.path.extension(arg);
+            const ext = Io.Dir.path.extension(arg);
             if (CSource.Lang.ofPath(arg)) |lang| {
                 try c_files.append(arena, .{ .path = arg, .extra_flags = extra_cflags, .cc_argv = &.{}, .flags = .{}, .lang = lang });
             } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or (isSharedLib(arg) and !command.isObj())) {
                 try link_inputs.append(arena, arg);
-            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.indexOf(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib") or std.mem.eql(u8, ext, ".dylib") or std.mem.eql(u8, ext, ".tbd"))
+            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.find(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib") or std.mem.eql(u8, ext, ".dylib") or std.mem.eql(u8, ext, ".tbd"))
                 setUnsupported(&opts, arena, "bs does not link object files or libraries ('{s}'); build this step with upstream zig", .{arg})
             else
                 setUnsupported(&opts, arena, "bs does not compile C, C++, or assembly sources ('{s}'); build this step with upstream zig", .{arg});
@@ -2491,14 +2495,14 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         const global_cache = Frontend.resolveCacheDirs(arena, io, environ_map, .{ .global = opts.global_cache_dir }).global;
         var includes: std.ArrayList([]const u8) = .empty;
         if (try CSource.darwinSdk(arena, io, environ_map, global_cache)) |sdk| {
-            try search_dirs.append(arena, try std.fs.path.join(arena, &.{ sdk, "usr", "lib" }));
-            try search_frameworks.append(arena, try std.fs.path.join(arena, &.{ sdk, "System", "Library", "Frameworks" }));
-            try includes.append(arena, try std.fs.path.join(arena, &.{ sdk, "usr", "include" }));
+            try search_dirs.append(arena, try Io.Dir.path.join(arena, &.{ sdk, "usr", "lib" }));
+            try search_frameworks.append(arena, try Io.Dir.path.join(arena, &.{ sdk, "System", "Library", "Frameworks" }));
+            try includes.append(arena, try Io.Dir.path.join(arena, &.{ sdk, "usr", "include" }));
         }
         if (environ_map.get("HOMEBREW_PREFIX")) |prefix| {
-            const dir = try std.fs.path.join(arena, &.{ prefix, "lib" });
+            const dir = try Io.Dir.path.join(arena, &.{ prefix, "lib" });
             if (Io.Dir.cwd().access(io, dir, .{})) |_| try search_dirs.append(arena, dir) else |_| {}
-            try includes.append(arena, try std.fs.path.join(arena, &.{ prefix, "include" }));
+            try includes.append(arena, try Io.Dir.path.join(arena, &.{ prefix, "include" }));
         }
         opts.c_native_includes = includes.items;
     } else if (libs.items.len != 0 and native and !sysroot) {
@@ -2535,7 +2539,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         };
         var kept: usize = 0;
         for (link_inputs.items) |path| {
-            if (!opts.dynamic and (std.mem.eql(u8, std.fs.path.extension(path), ".a") or isSharedLib(path))) {
+            if (!opts.dynamic and (std.mem.eql(u8, Io.Dir.path.extension(path), ".a") or isSharedLib(path))) {
                 Io.Dir.cwd().access(io, path, .{}) catch fatal("{s}: file not found", .{path});
                 continue;
             }
@@ -2550,7 +2554,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     var shared_names: std.ArrayList([]const u8) = .empty;
     for (link_inputs.items) |path| if (isSharedLib(path)) {
         try shared.append(arena, path);
-        try shared_names.append(arena, if (found.contains(path)) std.fs.path.basename(path) else path);
+        try shared_names.append(arena, if (found.contains(path)) Io.Dir.path.basename(path) else path);
     } else try objects.append(arena, path);
     opts.link_inputs = objects.items;
     opts.shared_libs = shared.items;
@@ -2559,7 +2563,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         setUnsupported(&opts, arena, "bs links shared libraries only into executables and shared libraries that link libc ('{s}'); add -lc or build this step with upstream zig", .{shared.items[0]});
     // DT_RUNPATH: as upstream's `rpath_list`, deduplicated.
     if (native) try rpaths.appendSlice(arena, search_dirs.items[0..n_explicit_dirs]);
-    var unique_rpaths: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var unique_rpaths: std.array_hash_map.String(void) = .empty;
     for (rpaths.items) |r| try unique_rpaths.put(arena, r, {});
     if (unique_rpaths.count() != 0) opts.runpath = try std.mem.join(arena, ":", unique_rpaths.keys());
     opts.modules = modules.items;
@@ -2581,7 +2585,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     opts.c_global_cc_argv = cc_argv.items;
     // As upstream, a root file given without `-M` names its module "test"
     // under `bs test`, else after the file (not `--name`).
-    if (positional_root) opts.root_name = if (command.isTest()) "test" else std.fs.path.stem(opts.root_src_path);
+    if (positional_root) opts.root_name = if (command.isTest()) "test" else Io.Dir.path.stem(opts.root_src_path);
     // As upstream: a `--dep` names one module.
     for (modules.items, 0..) |m, k| {
         const prev = if (std.mem.eql(u8, m.name, opts.root_name)) opts.root_src_path else for (modules.items[0..k]) |p| {
@@ -2626,7 +2630,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
 fn dropDeps(arena: std.mem.Allocator, deps: []const []const u8, names: []const []const u8) ![]const []const u8 {
     var kept: std.ArrayList([]const u8) = .empty;
     for (deps) |spec| {
-        const name = if (std.mem.indexOfScalar(u8, spec, '=')) |e| spec[e + 1 ..] else spec;
+        const name = if (std.mem.findScalar(u8, spec, '=')) |e| spec[e + 1 ..] else spec;
         for (names) |n| {
             if (std.mem.eql(u8, n, name)) break;
         } else try kept.append(arena, spec);
@@ -2658,7 +2662,7 @@ fn inherit(m: *Frontend.ModuleArg, parent: Inherited) void {
 /// flags are given. `seen` has a slot per module.
 fn inheritFlags(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []const u8, parent: Inherited) void {
     for (deps) |spec| {
-        const name = if (std.mem.indexOfScalar(u8, spec, '=')) |e| spec[e + 1 ..] else spec;
+        const name = if (std.mem.findScalar(u8, spec, '=')) |e| spec[e + 1 ..] else spec;
         for (modules, seen) |*m, *s| {
             if (!std.mem.eql(u8, m.name, name)) continue;
             if (s.*) break;
@@ -2742,7 +2746,7 @@ pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []c
 
 /// glibc's symbols at the build's version, from the zig lib directory.
 fn loadGlibc(init: std.process.Init, job: *const Job) !Glibc {
-    const path = try std.fs.path.join(init.gpa, &.{ job.zig_lib_dir, Glibc.abilists_path });
+    const path = try Io.Dir.path.join(init.gpa, &.{ job.zig_lib_dir, Glibc.abilists_path });
     defer init.gpa.free(path);
     const contents = Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(1 << 20)) catch |err|
         fatal("unable to read glibc's symbols from '{s}': {t}", .{ path, err });
@@ -2761,10 +2765,10 @@ fn loadGlibc(init: std.process.Init, job: *const Job) !Glibc {
 /// Whether `path` names a shared library: `.so`, a versioned `.so.1`, a
 /// Mach-O `.dylib`, a macOS SDK stub (`.tbd`), or a framework's library.
 fn isSharedLib(path: []const u8) bool {
-    const base = std.fs.path.basename(path);
-    if (std.mem.endsWith(u8, base, ".so") or std.mem.indexOf(u8, base, ".so.") != null or std.mem.endsWith(u8, base, ".dylib") or std.mem.endsWith(u8, base, ".tbd")) return true;
+    const base = Io.Dir.path.basename(path);
+    if (std.mem.endsWith(u8, base, ".so") or std.mem.find(u8, base, ".so.") != null or std.mem.endsWith(u8, base, ".dylib") or std.mem.endsWith(u8, base, ".tbd")) return true;
     // A framework's library, `<name>.framework/<name>`.
-    const dir = std.fs.path.basename(std.fs.path.dirname(path) orelse return false);
+    const dir = Io.Dir.path.basename(Io.Dir.path.dirname(path) orelse return false);
     return std.mem.endsWith(u8, dir, ".framework") and std.mem.eql(u8, dir[0 .. dir.len - ".framework".len], base);
 }
 
@@ -2818,7 +2822,7 @@ const LibQuery = struct {
 
     fn exists(arena: std.mem.Allocator, io: Io, dir: []const u8, name: []const u8, exts: []const []const u8) !?[]const u8 {
         for (exts) |ext| {
-            const path = try std.fmt.allocPrint(arena, "{s}{s}lib{s}{s}", .{ dir, if (dir.len == 0 or dir[dir.len - 1] == '/') "" else "/", name, ext });
+            const path = try arena.print("{s}{s}lib{s}{s}", .{ dir, if (dir.len == 0 or dir[dir.len - 1] == '/') "" else "/", name, ext });
             if (Io.Dir.cwd().access(io, path, .{})) |_| return path else |_| {}
         }
         return null;
@@ -2844,7 +2848,7 @@ fn readTbds(arena: std.mem.Allocator, io: Io, libs: *std.ArrayList(MachODylib), 
         const path = libs.items[i].path;
         // The SDK the stub is in, whose stubs its re-exports' are.
         const root = for ([_][]const u8{ "/usr/lib/", "/System/Library/" }) |dir| {
-            if (std.mem.indexOf(u8, path, dir)) |at| break path[0..at];
+            if (std.mem.find(u8, path, dir)) |at| break path[0..at];
         } else "";
         // The library private re-exports merge into: the explicit one.
         const umbrella = i;
@@ -2859,7 +2863,7 @@ fn readTbds(arena: std.mem.Allocator, io: Io, libs: *std.ArrayList(MachODylib), 
             // `/usr/lib/libobjc.A.dylib`'s is `libobjc.A.tbd`; a framework's
             // library has no extension.
             const stem = if (std.mem.endsWith(u8, install_name, ".dylib")) install_name[0 .. install_name.len - ".dylib".len] else install_name;
-            const stub = try std.fmt.allocPrint(arena, "{s}{s}.tbd", .{ root, stem });
+            const stub = try arena.print("{s}{s}.tbd", .{ root, stem });
             const text = Io.Dir.cwd().readFileAlloc(io, stub, arena, .unlimited) catch |err|
                 fatal("'{s}' re-exports '{s}', whose stub '{s}' cannot be read: {t}", .{ path, install_name, stub, err });
             var reexported, const next = Tbd.dylib(arena, stub, text) catch |err| switch (err) {
@@ -2885,12 +2889,12 @@ fn readTbds(arena: std.mem.Allocator, io: Io, libs: *std.ArrayList(MachODylib), 
 /// of merging it into the library that re-exports it: in /usr/lib, or a
 /// framework's own library (upstream's `MachO.isHoisted`).
 fn isPublicDylib(install_name: []const u8) bool {
-    const dir = std.fs.path.dirname(install_name) orelse return false;
+    const dir = Io.Dir.path.dirname(install_name) orelse return false;
     if (std.mem.startsWith(u8, dir, "/usr/lib")) return true;
     if (!std.mem.startsWith(u8, dir, "/System/Library/Frameworks/")) return false;
     const rest = dir["/System/Library/Frameworks/".len..];
-    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return false;
-    return std.mem.eql(u8, std.fs.path.basename(install_name), rest[0..dot]);
+    const dot = std.mem.findScalar(u8, rest, '.') orelse return false;
+    return std.mem.eql(u8, Io.Dir.path.basename(install_name), rest[0..dot]);
 }
 
 /// Framework `name`'s library in one of `dirs`, as upstream's
@@ -2898,7 +2902,7 @@ fn isPublicDylib(install_name: []const u8) bool {
 /// stubs), `.dylib`, or the bare `<name>`, which may be either.
 fn findFramework(arena: std.mem.Allocator, io: Io, dirs: []const []const u8, name: []const u8) !?[]const u8 {
     for (dirs) |dir| for ([_][]const u8{ ".tbd", ".dylib", "" }) |ext| {
-        const path = try std.fmt.allocPrint(arena, "{s}/{s}.framework/{s}{s}", .{ std.mem.trimEnd(u8, dir, "/"), name, name, ext });
+        const path = try arena.print("{s}/{s}.framework/{s}{s}", .{ std.mem.trimEnd(u8, dir, "/"), name, name, ext });
         if (Io.Dir.cwd().access(io, path, .{})) |_| return path else |_| {}
     };
     return null;

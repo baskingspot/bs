@@ -36,12 +36,12 @@ defs: std.StringHashMapUnmanaged(Def) = .empty,
 visibility: std.StringHashMapUnmanaged(u2) = .empty,
 /// COMMON symbols: the largest size and alignment of each name, which one
 /// zero-filled atom gets, unless an object defines the name.
-commons: std.StringArrayHashMapUnmanaged(Common) = .empty,
+commons: std.array_hash_map.String(Common) = .empty,
 /// COMDAT group signatures, each kept in its first object.
 groups: std.StringHashMapUnmanaged(void) = .empty,
 /// Names the loaded objects reference without defining, in first-use
 /// order; some may be defined later (by a member pulled after).
-undefs: std.StringArrayHashMapUnmanaged(void) = .empty,
+undefs: std.array_hash_map.String(void) = .empty,
 /// Problems found while loading, as messages for the caller to report.
 errors: std.ArrayList([]const u8) = .empty,
 /// The output is a shared object (`build-lib -dynamic`): thread-locals
@@ -171,7 +171,7 @@ pub fn parseObjectFor(arena: Allocator, path: []const u8, bytes: []const u8, arc
     @memset(o.discarded, false);
     for (o.keys, 0..) |*k, i| {
         var buf: [64]u8 = undefined;
-        k.* = .fromName(std.fmt.bufPrint(&buf, "obj:{x:0>16}:{d}", .{ o.hash, i }) catch unreachable);
+        k.* = .fromName(std.mem.print(&buf, "obj:{x:0>16}:{d}", .{ o.hash, i }) catch unreachable);
     }
     for (shdrs) |sh| {
         if (sh.sh_type != elf.SHT_SYMTAB) continue;
@@ -259,7 +259,7 @@ fn load(in: *Inputs, o: Object) Error!void {
         if (gop.found_existing) {
             const prev = gop.value_ptr.*;
             if (!prev.weak and !weak) {
-                try in.errors.append(in.arena, try std.fmt.allocPrint(in.arena, "duplicate symbol: {s}, defined in {s} and {s}", .{ name, in.objects.items[prev.object].path, obj.path }));
+                try in.errors.append(in.arena, try in.arena.print("duplicate symbol: {s}, defined in {s} and {s}", .{ name, in.objects.items[prev.object].path, obj.path }));
             } else if (prev.weak and !weak) gop.value_ptr.* = .{ .object = index, .sym = @intCast(s), .weak = false };
             continue;
         }
@@ -287,10 +287,10 @@ pub fn pull(in: *Inputs, wanted: []const []const u8, ctx: anytype) !usize {
             } else false) continue;
             if ((try ar.pulled.getOrPut(in.arena, sym.member)).found_existing) continue;
             const m = try ar.reader.member(sym.member);
-            const path = try std.fmt.allocPrint(in.arena, "{s}({s})", .{ ar.path, m.name });
+            const path = try in.arena.print("{s}({s})", .{ ar.path, m.name });
             try in.load(parseObjectFor(in.arena, path, m.bytes, in.arch) catch |err| switch (err) {
                 error.InvalidObject => {
-                    try in.errors.append(in.arena, try std.fmt.allocPrint(in.arena, "{s}: not an {t} ELF relocatable object", .{ path, in.arch }));
+                    try in.errors.append(in.arena, try in.arena.print("{s}: not an {t} ELF relocatable object", .{ path, in.arch }));
                     continue;
                 },
                 else => |e| return e,
@@ -344,12 +344,12 @@ pub fn lookup(in: *Inputs, name: []const u8) Allocator.Error!?Target {
 /// values.
 fn absKey(value: u64) SymbolKey {
     var buf: [32]u8 = undefined;
-    return .fromName(std.fmt.bufPrint(&buf, "obj:abs:{x}", .{value}) catch unreachable);
+    return .fromName(std.mem.print(&buf, "obj:abs:{x}", .{value}) catch unreachable);
 }
 
 fn commonKey(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
-    return .fromName(std.fmt.bufPrint(&buf, "common.{s}", .{name}) catch name);
+    return .fromName(std.mem.print(&buf, "common.{s}", .{name}) catch name);
 }
 
 /// The key of section `index` of `o`, which is not a merged one.
@@ -520,7 +520,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
     // Two strong definitions of a name, one Zig's, are an error, as ld's.
     var defs = in.defs.iterator();
     while (defs.next()) |d| if (!d.value_ptr.weak) if (try ctx.zigExport(d.key_ptr.*) != null) {
-        try in.errors.append(arena, try std.fmt.allocPrint(arena, "duplicate symbol: {s}, defined by the Zig code and in {s}", .{ d.key_ptr.*, in.objects.items[d.value_ptr.object].path }));
+        try in.errors.append(arena, try arena.print("duplicate symbol: {s}, defined by the Zig code and in {s}", .{ d.key_ptr.*, in.objects.items[d.value_ptr.object].path }));
     };
     for (in.objects.items) |*o| {
         c.o = o;
@@ -546,7 +546,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
             sym.st_shndx < o.shdrs.len and !o.discarded[sym.st_shndx])
         {
             if (!in.dynamic) {
-                try in.errors.append(arena, try std.fmt.allocPrint(arena, "{s}: bs links GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) only into executables that link libc and shared libraries, whose loader calls their resolvers: {s}", .{ o.path, o.symName(sym) }));
+                try in.errors.append(arena, try arena.print("{s}: bs links GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) only into executables that link libc and shared libraries, whose loader calls their resolvers: {s}", .{ o.path, o.symName(sym) }));
                 continue;
             }
             const ifunc = try in.ifuncAtoms(o, @intCast(s_index));
@@ -635,7 +635,7 @@ const ArrayAtom = struct { atom: u32, priority: u32 };
 /// and the plain `.init_array` comes after every numbered one, as in ld's
 /// SORT_BY_INIT_PRIORITY.
 fn priority(name: []const u8) ?u32 {
-    const dot = std.mem.indexOfScalarPos(u8, name, 1, '.') orelse return 1 << 16;
+    const dot = std.mem.findScalarPos(u8, name, 1, '.') orelse return 1 << 16;
     const n = std.fmt.parseInt(u16, name[dot + 1 ..], 10) catch return null;
     return n;
 }
@@ -689,7 +689,7 @@ fn Converter(comptime Ctx: type) type {
         arrays: std.ArrayList(ArrayAtom) = .empty,
         /// The strong names nothing defines, each with the objects that
         /// reference it, in input order, for one error per name.
-        undefs: std.StringArrayHashMapUnmanaged(std.ArrayList([]const u8)) = .empty,
+        undefs: std.array_hash_map.String(std.ArrayList([]const u8)) = .empty,
 
         const C = @This();
 
@@ -719,7 +719,7 @@ fn Converter(comptime Ctx: type) type {
         }
 
         fn fail(c: *C, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
-            try c.in.errors.append(c.in.arena, try std.fmt.allocPrint(c.in.arena, fmt, args));
+            try c.in.errors.append(c.in.arena, try c.in.arena.print(fmt, args));
         }
 
         fn section(c: *C, index: u32) !void {
@@ -1211,7 +1211,7 @@ fn Converter(comptime Ctx: type) type {
                         if (op == 0xff and modrm == 0x25 and off + 4 <= bytes.len) {
                             const b = try c.writable(bytes, copy);
                             b[@intCast(off - 2)] = 0xe9; // jmp rel32; nop
-                            std.mem.copyForwards(u8, b[@intCast(off - 1)..][0..4], bytes[@intCast(off)..][0..4]);
+                            @memmove(b[@intCast(off - 1)..][0..4], bytes[@intCast(off)..][0..4]);
                             b[@intCast(off + 3)] = 0x90;
                             try c.add(off - 1, .x86_64_pc32, t, r.r_addend);
                             return 0;
@@ -1359,7 +1359,7 @@ fn Converter(comptime Ctx: type) type {
             const relocs = try arena.dupe(Atom.Reloc, &.{.init(2, .x86_64_pc32, 0, -4)});
             const code: []const u8 = &.{ 0xff, 0x25, 0, 0, 0, 0 };
             const key: SymbolKey = .fromContents(.text, .@"8", code, targets, relocs);
-            try c.atoms.append(arena, .{ .key = key, .name = try std.fmt.allocPrint(arena, "{s}@plt", .{name}), .section = .text, .alignment = .@"8", .bytes = code, .targets = targets, .relocs = relocs });
+            try c.atoms.append(arena, .{ .key = key, .name = try arena.print("{s}@plt", .{name}), .section = .text, .alignment = .@"8", .bytes = code, .targets = targets, .relocs = relocs });
             return key;
         }
 

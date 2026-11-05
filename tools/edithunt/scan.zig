@@ -178,8 +178,8 @@ fn scan(arena: std.mem.Allocator, tree: *const Ast, w: *Io.Writer) !void {
         };
         if (tag == .number_literal) {
             const text = tree.tokenSlice(tok);
-            if (std.mem.indexOfAny(u8, text, ".eEpP") != null and !std.mem.startsWith(u8, text, "0x")) continue;
-            if (std.mem.indexOfAny(u8, text, ".pP") != null) continue;
+            if (std.mem.findAny(u8, text, ".eEpP") != null and !std.mem.startsWith(u8, text, "0x")) continue;
+            if (std.mem.findAny(u8, text, ".pP") != null) continue;
         }
         if (tag == .string_literal and tok >= 2 and tree.tokenTag(tok - 1) == .l_paren and tree.tokenTag(tok - 2) == .builtin) continue;
         if (tag == .string_literal and tok >= 1 and tree.tokenTag(tok - 1) == .keyword_extern) continue;

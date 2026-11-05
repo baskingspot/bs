@@ -690,7 +690,7 @@ const shstrtab_no_cfi = shstrtab[0..shName(".eh_frame")];
 const shstrtab_no_debug = shstrtab[0..shName(".debug_abbrev")];
 
 fn shName(comptime name: []const u8) u32 {
-    return comptime @intCast(std.mem.indexOf(u8, shstrtab, "\x00" ++ name ++ "\x00").? + 1);
+    return comptime @intCast(std.mem.find(u8, shstrtab, "\x00" ++ name ++ "\x00").? + 1);
 }
 
 /// Links the atoms of `input` into `out.target(io, len)`.
@@ -2857,7 +2857,7 @@ pub const TestInput = struct {
 
     pub fn check(t: TestInput, i: usize) bool {
         t.checked[i].store(true, .monotonic);
-        return std.mem.indexOfScalar(usize, t.bad, i) == null;
+        return std.mem.findScalar(usize, t.bad, i) == null;
     }
 
     pub fn atom(t: TestInput, i: usize) Atom {
@@ -2957,7 +2957,7 @@ test "links and runs a program that writes from rodata and exits with 42" {
     defer targets.deinit(gpa);
     for (kept, &numbered_atoms, 0..) |a, *n, i| {
         n.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
-        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.indexOfScalar(SymbolKey, &numbering, t).?));
+        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.findScalar(SymbolKey, &numbering, t).?));
     }
     var symbols: Symbols = .{ .atoms = &numbered_atoms, .targets = targets.items, .values = &.{.{ .symbol = 5, .value = 42 }}, .entry = 0, .len = 6 };
     const numbered = try emit(gpa, io, kept, .{ .entry = start, .symbols = symbols });
@@ -3027,7 +3027,7 @@ test "links and runs a program that writes from rodata and exits with 42" {
             try std.testing.expectEqualSlices(u8, bytes, fixed);
         }
     }
-    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/hello", .{tmp.sub_path});
+    const path = try gpa.print(".zig-cache/tmp/{s}/hello", .{tmp.sub_path});
     defer gpa.free(path);
     const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
     defer gpa.free(result.stdout);
@@ -3150,7 +3150,7 @@ test "a shared object links the same with numbered symbols" {
     defer targets.deinit(gpa);
     for (atoms, &numbered_atoms, 0..) |a, *n, i| {
         n.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
-        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.indexOfScalar(SymbolKey, &numbering, t).?));
+        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.findScalar(SymbolKey, &numbering, t).?));
     }
     var symbols: Symbols = .{
         .atoms = &numbered_atoms,
@@ -3236,7 +3236,7 @@ test "a dynamically linked executable links the same with numbered symbols and r
     defer targets.deinit(gpa);
     for (atoms, &numbered_atoms, 0..) |a, *n, i| {
         n.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
-        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.indexOfScalar(SymbolKey, &numbering, t).?));
+        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.findScalar(SymbolKey, &numbering, t).?));
     }
     var numbered_options = options;
     numbered_options.symbols = .{
@@ -3253,7 +3253,7 @@ test "a dynamically linked executable links the same with numbered symbols and r
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "dyn", .data = numbered, .flags = .{ .permissions = .executable_file } });
-    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/dyn", .{tmp.sub_path});
+    const path = try gpa.print(".zig-cache/tmp/{s}/dyn", .{tmp.sub_path});
     defer gpa.free(path);
     const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
     defer gpa.free(result.stdout);
@@ -3312,7 +3312,7 @@ test "an alias links as a reference to its target, with numbered symbols too" {
     defer targets.deinit(gpa);
     for (atoms[0], &numbered_atoms, 0..) |a, *n, i| {
         n.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
-        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.indexOfScalar(SymbolKey, &numbering, t).?));
+        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.findScalar(SymbolKey, &numbering, t).?));
     }
     const numbered = try emit(gpa, io, &atoms[0], .{ .entry = start, .dynamic = &dynamic, .aliases = &aliases, .symbols = .{
         .atoms = &numbered_atoms,
@@ -3484,14 +3484,14 @@ test "thread-locals in .tdata and .tbss read back after static TLS setup" {
     try std.testing.expectEqual(rw.?.vaddr + 24, testSymbolAddr(bytes, "counter").?);
     try std.testing.expectEqual(rw.?.filesz, 24 + 8);
     // The first lea's displacement: a's offset minus 96.
-    const lea_a = std.mem.indexOf(u8, e.code.items, &.{ 0x48, 0x8d, 0x80 }).? + 3;
+    const lea_a = std.mem.find(u8, e.code.items, &.{ 0x48, 0x8d, 0x80 }).? + 3;
     const text_off = ehdr.entry - @as(u64, @intCast(base));
     try std.testing.expectEqual(-96, std.mem.readInt(i32, bytes[text_off + lea_a ..][0..4], .little));
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try link(gpa, io, tmp.dir, "tls", &atoms, .{ .entry = start });
-    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/tls", .{tmp.sub_path});
+    const path = try gpa.print(".zig-cache/tmp/{s}/tls", .{tmp.sub_path});
     defer gpa.free(path);
     const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
     defer gpa.free(result.stdout);
@@ -3538,7 +3538,7 @@ test "links many chunks of atoms the same way on any number of threads" {
     const fkey = struct {
         fn f(i: usize) SymbolKey {
             var buf: [16]u8 = undefined;
-            return .fromName(std.fmt.bufPrint(&buf, "f{d}", .{i}) catch unreachable);
+            return .fromName(std.mem.print(&buf, "f{d}", .{i}) catch unreachable);
         }
     }.f;
 
@@ -3566,7 +3566,7 @@ test "links many chunks of atoms the same way on any number of threads" {
         // Files change every 1000 functions, so chunks share some, and
         // units every 300, so units have several ranges in a chunk and
         // span chunks.
-        const name = try std.fmt.allocPrint(arena, "f{d}", .{i});
+        const name = try arena.print("f{d}", .{i});
         try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = e.lines.bytes.items, .unit = units[i / 300 % units.len] });
         try atoms.append(arena, .{ .key = fkey(i), .name = name, .section = .text, .alignment = alignments[i % 3], .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items, .unwind = .frame_pointer });
         try atoms.append(arena, constants[i % 50]);
@@ -3618,19 +3618,19 @@ test "links many chunks of atoms the same way on any number of threads" {
     defer ef.deinit(std.debug.getDebugInfoAllocator());
     const di = &ef.dwarf.?;
     for ([_]usize{ 0, 997, 1994, 2991, 3988, n - 1 }) |index| {
-        const name = try std.fmt.allocPrint(arena, "f{d}", .{index});
+        const name = try arena.print("f{d}", .{index});
         const addr = testSymbolAddr(one, name).?;
         const loc = try testSymbolize(di, arena, addr + 7);
         try std.testing.expectEqualStrings(name, loc.name);
         const unit = units[index / 300 % units.len];
-        try std.testing.expectEqualStrings(if (unit.len > 0) std.fs.path.basenamePosix(unit) else files[0], loc.unit);
+        try std.testing.expectEqualStrings(if (unit.len > 0) std.Io.Dir.path.basenamePosix(unit) else files[0], loc.unit);
         try std.testing.expectEqual(index + 2, loc.line);
         try std.testing.expectEqual(5, loc.column);
         const file = files[index / 1000 % files.len];
         if (file[0] == '/') {
             try std.testing.expectEqualStrings(file, loc.file);
         } else {
-            try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "/w/{s}", .{file}), loc.file);
+            try std.testing.expectEqualStrings(try arena.print("/w/{s}", .{file}), loc.file);
         }
         try std.testing.expectEqual(index + 1, (try testSymbolize(di, arena, addr)).line);
     }
@@ -3643,7 +3643,7 @@ test "links many chunks of atoms the same way on any number of threads" {
         defer gpa.free(written);
         try std.testing.expectEqualSlices(u8, one, written);
     }
-    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/chunks", .{tmp.sub_path});
+    const path = try gpa.print(".zig-cache/tmp/{s}/chunks", .{tmp.sub_path});
     defer gpa.free(path);
     const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
     defer gpa.free(result.stdout);
@@ -3716,7 +3716,7 @@ test "line programs decode with std.debug.Dwarf" {
     // Subprogram entries carry the atom's name as DW_AT_linkage_name,
     // after DW_AT_name.
     const info_sh = testSection(out, ".debug_info").?;
-    try std.testing.expect(std.mem.indexOf(u8, out[info_sh.offset..][0..info_sh.size], "f\x00root:f\x00") != null);
+    try std.testing.expect(std.mem.find(u8, out[info_sh.offset..][0..info_sh.size], "f\x00root:f\x00") != null);
     // Every symbol is local, as upstream writes them: names can repeat.
     const symtab = testSection(out, ".symtab").?;
     try std.testing.expectEqual(symtab.size / @sizeOf(elf.Elf64.Sym), symtab.info);
@@ -3809,8 +3809,8 @@ test "line programs decode with std.debug.Dwarf" {
 
     const stripped = try emit(gpa, io, &atoms, .{ .entry = key });
     defer gpa.free(stripped);
-    try std.testing.expect(std.mem.indexOf(u8, stripped, ".debug_") == null);
-    try std.testing.expect(std.mem.indexOf(u8, stripped, ".eh_frame") == null);
+    try std.testing.expect(std.mem.find(u8, stripped, ".debug_") == null);
+    try std.testing.expect(std.mem.find(u8, stripped, ".eh_frame") == null);
 }
 
 test "input sections follow bs's parts, relocated, and their FDEs join the sorted search table" {

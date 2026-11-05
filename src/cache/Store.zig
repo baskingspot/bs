@@ -101,7 +101,7 @@ const pack_ext = ".zsp";
 /// linked packs the store itself no longer has.
 pub const donors_dir = "donors";
 /// The global cache's ZIR directory (`Frontend`), relative to the store.
-const zir_dir = ".." ++ std.fs.path.sep_str ++ "zir";
+const zir_dir = ".." ++ Io.Dir.path.sep_str ++ "zir";
 /// A donor being written; `maintain` deletes one older than an hour.
 pub const donor_tmp_prefix = "tmp-";
 
@@ -224,7 +224,7 @@ pub fn reserveName(store: *Store, io: Io) PackName {
 
 fn nameOf(id: Hash) PackName {
     var name: PackName = undefined;
-    _ = std.fmt.bufPrint(&name, "{x:0>32}" ++ pack_ext, .{id}) catch unreachable;
+    _ = std.mem.print(&name, "{x:0>32}" ++ pack_ext, .{id}) catch unreachable;
     return name;
 }
 

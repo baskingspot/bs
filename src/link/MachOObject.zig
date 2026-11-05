@@ -204,16 +204,16 @@ pub fn emit(gpa: Allocator, atoms: []const Atom, options: Options) Error![]u8 {
         if (exports_of.get(a.key)) |list| {
             for (list.items, 0..) |x, k| {
                 if (k == 0) try key_sym.put(arena, a.key, @intCast(syms.items.len));
-                try syms.append(arena, .{ .name = try std.fmt.allocPrint(arena, "_{s}", .{x.name}), .sect = sect, .value = value + x.offset, .external = true, .private = x.visibility == .hidden, .weak = x.weak });
+                try syms.append(arena, .{ .name = try arena.print("_{s}", .{x.name}), .sect = sect, .value = value + x.offset, .external = true, .private = x.visibility == .hidden, .weak = x.weak });
             }
         } else {
             try key_sym.put(arena, a.key, @intCast(syms.items.len));
-            const name = if (a.name.len == 0) try std.fmt.allocPrint(arena, "l{d}", .{i}) else try std.fmt.allocPrint(arena, "_{s}", .{a.name});
+            const name = if (a.name.len == 0) try arena.print("l{d}", .{i}) else try arena.print("_{s}", .{a.name});
             try syms.append(arena, .{ .name = name, .sect = sect, .value = value, .external = false });
         }
         if (desc[i] != null) {
             init_sym[i] = @intCast(syms.items.len);
-            try syms.append(arena, .{ .name = try std.fmt.allocPrint(arena, "{s}$tlv$init", .{syms.items[key_sym.get(a.key).?].name}), .sect = sect_index[@backingInt(p.sect)], .value = pieceAddr(p, &sect_addr), .external = false });
+            try syms.append(arena, .{ .name = try arena.print("{s}$tlv$init", .{syms.items[key_sym.get(a.key).?].name}), .sect = sect_index[@backingInt(p.sect)], .value = pieceAddr(p, &sect_addr), .external = false });
             if (tlv_bootstrap == null) {
                 tlv_bootstrap = @intCast(syms.items.len);
                 try syms.append(arena, .{ .name = "__tlv_bootstrap", .sect = 0, .value = 0, .external = true });
@@ -223,7 +223,7 @@ pub fn emit(gpa: Allocator, atoms: []const Atom, options: Options) Error![]u8 {
     for (options.imports) |imp| {
         if (key_sym.contains(imp.key)) continue;
         try key_sym.put(arena, imp.key, @intCast(syms.items.len));
-        try syms.append(arena, .{ .name = try std.fmt.allocPrint(arena, "_{s}", .{imp.name}), .sect = 0, .value = 0, .external = true, .weak = imp.weak });
+        try syms.append(arena, .{ .name = try arena.print("_{s}", .{imp.name}), .sect = 0, .value = 0, .external = true, .weak = imp.weak });
     }
     var values: std.AutoHashMapUnmanaged(SymbolKey, u64) = .empty;
     for (options.values) |v| try values.put(arena, v.key, v.value);

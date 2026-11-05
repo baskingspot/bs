@@ -28,7 +28,7 @@ pub fn serve(init: std.process.Init, opts: *const main.Options) !void {
     const arena = init.arena.allocator();
     var digest: [16]u8 = undefined;
     std.crypto.hash.Blake3.hash(wasm, &digest, .{});
-    const dir = try std.fs.path.join(arena, &.{ opts.cache_dir orelse ".zig-cache", "o", &std.fmt.bytesToHex(digest, .lower) });
+    const dir = try Io.Dir.path.join(arena, &.{ opts.cache_dir orelse ".zig-cache", "o", &std.fmt.bytesToHex(digest, .lower) });
 
     var in_buf: [256]u8 = undefined;
     var out_buf: [4096]u8 = undefined;

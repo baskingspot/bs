@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
     const keys = try arena.alloc(Atom.SymbolKey, n_text + n_rodata + n_data + n_bss);
     const names = try arena.alloc([]const u8, keys.len);
     for (keys, names, 0..) |*k, *n, i| {
-        n.* = try std.fmt.allocPrint(arena, "bench:file{d}.zig:decl{d}", .{ i % 500, i });
+        n.* = try arena.print("bench:file{d}.zig:decl{d}", .{ i % 500, i });
         k.* = .fromName(n.*);
     }
     const all_atoms, const all_debug = try generate(arena, rand, keys, names);
@@ -69,11 +69,11 @@ pub fn main(init: std.process.Init) !void {
     const inputs_dir = try work.createDirPathOpen(io, "src", .{});
     const input_paths = try arena.alloc([]const u8, n_inputs);
     for (input_paths, 0..) |*p, i| {
-        const name = try std.fmt.allocPrint(arena, "file{d}.zig", .{i});
+        const name = try arena.print("file{d}.zig", .{i});
         try inputs_dir.writeFile(io, .{ .sub_path = name, .data = "pub fn f() void {}\n" });
         // Old enough to trust their stats.
         try inputs_dir.setTimestamps(io, name, .{ .modify_timestamp = .{ .new = .fromNanoseconds(1_000_000_000 * std.time.ns_per_s) } });
-        p.* = try std.fmt.allocPrint(arena, "{s}/src/{s}", .{ work_path, name });
+        p.* = try arena.print("{s}/src/{s}", .{ work_path, name });
     }
 
     const local = try work.createDirPathOpen(io, "local", .{});
@@ -104,8 +104,8 @@ pub fn main(init: std.process.Init) !void {
     const build_start = Io.Clock.real.now(io);
     for (input_paths) |p| try builder.addInput(p, p, try cwd.statFile(io, p, .{}), rand.int(u128), build_start);
     for (0..n_errors) |i| {
-        const name = try std.fmt.allocPrint(arena, "Error{d}", .{i});
-        _ = try builder.addErrorName(name, @backingInt(Atom.SymbolKey.fromName(try std.fmt.allocPrint(arena, "error.{s}", .{name}))));
+        const name = try arena.print("Error{d}", .{i});
+        _ = try builder.addErrorName(name, @backingInt(Atom.SymbolKey.fromName(try arena.print("error.{s}", .{name}))));
     }
     builder.entry = @backingInt(keys[0]);
     const t_fill = since(io, t);
@@ -200,7 +200,7 @@ pub fn main(init: std.process.Init) !void {
         const t1 = now(io);
         // Everything that transitively depends on the unit, without early
         // cutoff: an upper bound on the walk.
-        var seen: std.DynamicBitSetUnmanaged = try .initEmpty(gpa, m.nodeCount());
+        var seen: std.bit_set.Dynamic = try .initEmpty(gpa, m.nodeCount());
         defer seen.deinit(gpa);
         var stack: std.ArrayList(u32) = .empty;
         defer stack.deinit(gpa);
@@ -558,7 +558,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
 
         // Lookups with the 30k entries spread over k packs.
         for ([_]usize{ 1, 8, 64 }) |k| {
-            const sub = try std.fmt.allocPrint(arena, "packs-{d}", .{k});
+            const sub = try arena.print("packs-{d}", .{k});
             const kroot = try work.createDirPathOpen(io, sub, .{});
             {
                 var w: Store = try .open(gpa, io, kroot);
@@ -676,9 +676,9 @@ fn generate(arena: std.mem.Allocator, rand: std.Random, keys: []const Atom.Symbo
     var atoms: std.ArrayList(Atom) = .empty;
     // Each function's debug info, by its index in `atoms` before shuffling.
     var debug: std.ArrayList(Atom.Debug) = .empty;
-    var targets: std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
+    var targets: std.array_hash_map.Auto(Atom.SymbolKey, void) = .empty;
     var files: [500][]const u8 = undefined;
-    for (&files, 0..) |*f, j| f.* = try std.fmt.allocPrint(arena, "src/dir{d}/file{d}.zig", .{ j % 20, j });
+    for (&files, 0..) |*f, j| f.* = try arena.print("src/dir{d}/file{d}.zig", .{ j % 20, j });
     for (0..n_text) |i| {
         const len = rand.intRangeAtMost(u32, 32, 512);
         const bytes = try arena.alloc(u8, len);
@@ -706,7 +706,7 @@ fn generate(arena: std.mem.Allocator, rand: std.Random, keys: []const Atom.Symbo
             line += rand.intRangeAtMost(u32, 1, 3);
         }
         const name = names[i];
-        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i % files.len], .name = name[std.mem.lastIndexOfScalar(u8, name, ':').? + 1 ..], .base_line = rand.uintLessThan(u32, 5000), .lines = lines.bytes.items });
+        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i % files.len], .name = name[std.mem.findScalarLast(u8, name, ':').? + 1 ..], .base_line = rand.uintLessThan(u32, 5000), .lines = lines.bytes.items });
         try atoms.append(arena, .{ .key = keys[i], .name = name, .section = .text, .alignment = .@"16", .bytes = bytes, .targets = try arena.dupe(Atom.SymbolKey, targets.keys()), .relocs = relocs.items, .unwind = .frame_pointer });
     }
     for (0..n_rodata) |i| {

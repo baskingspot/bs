@@ -64,7 +64,7 @@ pub const Scratch = struct {
     /// Additions known not to wrap: overflow operations whose check the
     /// walk passed (`markChecked`), and the value reads `wrap` made
     /// wrapping operations.
-    exact: std.DynamicBitSetUnmanaged = .{},
+    exact: std.bit_set.Dynamic = .{},
     /// The loop walked with candidate facts at its start (`Walker.spec`):
     /// the candidates, the instructions its decisions changed, and the
     /// enclosing blocks' exits before it.
@@ -258,7 +258,7 @@ const Offset = struct { x: Term, c: u64, bits: u16 };
 /// and stay.
 pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *Scratch, fuzz: bool) Allocator.Error!Stats {
     // No branch, no check.
-    if (std.mem.indexOfScalar(Inst.Tag, ir.instructions.items(.tag), .cond_br) == null) return .{};
+    if (std.mem.findScalar(Inst.Tag, ir.instructions.items(.tag), .cond_br) == null) return .{};
     const n = ir.instructions.len;
     try scratch.kind.resize(gpa, n);
     try scratch.version.resize(gpa, n);

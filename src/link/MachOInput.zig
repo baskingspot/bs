@@ -29,10 +29,10 @@ archives: std.ArrayList(ArchiveInput) = .empty,
 /// the first in input order.
 defs: std.StringHashMapUnmanaged(Def) = .empty,
 /// COMMON symbols: the largest size and alignment of each name.
-commons: std.StringArrayHashMapUnmanaged(Common) = .empty,
+commons: std.array_hash_map.String(Common) = .empty,
 /// Names the loaded objects reference without defining, in first-use
 /// order.
-undefs: std.StringArrayHashMapUnmanaged(void) = .empty,
+undefs: std.array_hash_map.String(void) = .empty,
 /// Problems found while loading, as messages for the caller to report.
 errors: std.ArrayList([]const u8) = .empty,
 
@@ -228,7 +228,7 @@ pub fn parseObject(arena: Allocator, path: []const u8, file: []const u8) Error!O
     };
     for (o.keys, 0..) |*k, i| {
         var buf: [64]u8 = undefined;
-        k.* = .fromName(std.fmt.bufPrint(&buf, "mobj:{x:0>16}:{d}", .{ o.hash, i }) catch unreachable);
+        k.* = .fromName(std.mem.print(&buf, "mobj:{x:0>16}:{d}", .{ o.hash, i }) catch unreachable);
     }
     const pieces = try arena.alloc([]const Piece, sects.items.len);
     for (pieces, o.sects, 0..) |*p, s, i| {
@@ -248,7 +248,7 @@ pub fn parseObject(arena: Allocator, path: []const u8, file: []const u8) Error!O
                 var at: u64 = 0;
                 while (at < b.len) {
                     var end = at + entsize;
-                    if (entsize == 0) end = if (std.mem.indexOfScalarPos(u8, b, @intCast(at), 0)) |z| z + 1 else b.len;
+                    if (entsize == 0) end = if (std.mem.findScalarPos(u8, b, @intCast(at), 0)) |z| z + 1 else b.len;
                     end = @min(end, b.len);
                     try list.append(arena, .{ .start = at, .end = end, .key = .fromContents(kind, sectionAlignment(s), b[@intCast(at)..@intCast(end)], &.{}, &.{}) });
                     at = end;
@@ -271,7 +271,7 @@ pub fn parseObject(arena: Allocator, path: []const u8, file: []const u8) Error!O
                         break;
                     };
                     var buf: [64]u8 = undefined;
-                    try list.append(arena, .{ .start = start, .end = end, .key = .fromName(std.fmt.bufPrint(&buf, "mobj:{x:0>16}:{d}:{d}", .{ o.hash, i, start }) catch unreachable) });
+                    try list.append(arena, .{ .start = start, .end = end, .key = .fromName(std.mem.print(&buf, "mobj:{x:0>16}:{d}:{d}", .{ o.hash, i, start }) catch unreachable) });
                 }
             },
             else => {},
@@ -312,7 +312,7 @@ fn load(in: *Inputs, o: Object) Error!void {
             },
             macho.N_SECT, macho.N_ABS => {},
             else => {
-                try in.errors.append(in.arena, try std.fmt.allocPrint(in.arena, "{s}: symbol '{s}' has a type bs does not link ({x})", .{ obj.path, name, sym.n_type }));
+                try in.errors.append(in.arena, try in.arena.print("{s}: symbol '{s}' has a type bs does not link ({x})", .{ obj.path, name, sym.n_type }));
                 continue;
             },
         }
@@ -321,7 +321,7 @@ fn load(in: *Inputs, o: Object) Error!void {
         if (gop.found_existing) {
             const prev = gop.value_ptr.*;
             if (!prev.weak and !weak) {
-                try in.errors.append(in.arena, try std.fmt.allocPrint(in.arena, "duplicate symbol: {s}, defined in {s} and {s}", .{ name, in.objects.items[prev.object].path, obj.path }));
+                try in.errors.append(in.arena, try in.arena.print("duplicate symbol: {s}, defined in {s} and {s}", .{ name, in.objects.items[prev.object].path, obj.path }));
             } else if (prev.weak and !weak) gop.value_ptr.* = .{ .object = index, .sym = @intCast(s), .weak = false };
             continue;
         }
@@ -369,10 +369,10 @@ pub fn pull(in: *Inputs, wanted: []const []const u8, ctx: anytype) !usize {
             if (try ctx.zigExport(name) != null) continue;
             if ((try ar.pulled.getOrPut(in.arena, sym.member)).found_existing) continue;
             const m = try ar.reader.member(sym.member);
-            const path = try std.fmt.allocPrint(in.arena, "{s}({s})", .{ ar.path, m.name });
+            const path = try in.arena.print("{s}({s})", .{ ar.path, m.name });
             try in.load(parseObject(in.arena, path, m.bytes) catch |err| switch (err) {
                 error.InvalidObject => {
-                    try in.errors.append(in.arena, try std.fmt.allocPrint(in.arena, "{s}: not an arm64 Mach-O relocatable object", .{path}));
+                    try in.errors.append(in.arena, try in.arena.print("{s}: not an arm64 Mach-O relocatable object", .{path}));
                     continue;
                 },
                 else => |e| return e,
@@ -446,12 +446,12 @@ pub fn dynamicExports(in: *Inputs, skip: anytype) ![]ElfDynamic.Export {
 /// values.
 fn absKey(value: u64) SymbolKey {
     var buf: [32]u8 = undefined;
-    return .fromName(std.fmt.bufPrint(&buf, "mobj:abs:{x}", .{value}) catch unreachable);
+    return .fromName(std.mem.print(&buf, "mobj:abs:{x}", .{value}) catch unreachable);
 }
 
 fn commonKey(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
-    return .fromName(std.fmt.bufPrint(&buf, "common.{s}", .{name}) catch name);
+    return .fromName(std.mem.print(&buf, "common.{s}", .{name}) catch name);
 }
 
 /// Where defined symbol `sym` points: a thread-local descriptor's symbol
@@ -576,7 +576,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
     var c: Converter(@TypeOf(ctx)) = .{ .in = in, .ctx = ctx, .atoms = &atoms, .weak_used = &weak_used };
     var defs = in.defs.iterator();
     while (defs.next()) |d| if (!d.value_ptr.weak) if (try ctx.zigExport(d.key_ptr.*) != null) {
-        try in.errors.append(arena, try std.fmt.allocPrint(arena, "duplicate symbol: {s}, defined by the Zig code and in {s}", .{ d.key_ptr.*, in.objects.items[d.value_ptr.object].path }));
+        try in.errors.append(arena, try arena.print("duplicate symbol: {s}, defined by the Zig code and in {s}", .{ d.key_ptr.*, in.objects.items[d.value_ptr.object].path }));
     };
     for (in.objects.items) |*o| {
         c.o = o;
@@ -642,7 +642,7 @@ fn Converter(comptime Ctx: type) type {
         resolved: std.StringHashMapUnmanaged(?Target) = .empty,
         /// The strong names nothing defines, each with the objects that
         /// reference it, in input order, for one error per name.
-        undefs: std.StringArrayHashMapUnmanaged(std.ArrayList([]const u8)) = .empty,
+        undefs: std.array_hash_map.String(std.ArrayList([]const u8)) = .empty,
 
         const C = @This();
 
@@ -674,12 +674,12 @@ fn Converter(comptime Ctx: type) type {
         const Rel = struct { offset: u64, kind: Atom.Reloc.Kind, target: Target, addend: i64 };
 
         fn fail(c: *C, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
-            try c.in.errors.append(c.in.arena, try std.fmt.allocPrint(c.in.arena, fmt, args));
+            try c.in.errors.append(c.in.arena, try c.in.arena.print(fmt, args));
         }
 
         fn sectName(c: *C, index: usize) []const u8 {
             const s = &c.o.sects[index];
-            return std.fmt.allocPrint(c.in.arena, "{s},{s}", .{ name16(&s.segname), name16(&s.sectname) }) catch "?";
+            return c.in.arena.print("{s},{s}", .{ name16(&s.segname), name16(&s.sectname) }) catch "?";
         }
 
         fn section(c: *C, index: u32) !void {
@@ -706,7 +706,7 @@ fn Converter(comptime Ctx: type) type {
             const pieces = o.pieces[index];
             if (pieces.len == 0) return c.addAtom(.{
                 .key = o.keys[index],
-                .name = if (kind == .objc) try std.fmt.allocPrint(c.in.arena, ".{s}", .{name16(&s.sectname)}) else c.atomName(index),
+                .name = if (kind == .objc) try c.in.arena.print(".{s}", .{name16(&s.sectname)}) else c.atomName(index),
                 .section = kind,
                 .alignment = sectionAlignment(s),
                 .bytes = if (kind.isZeroFill()) &.{} else bytes,
@@ -1082,7 +1082,7 @@ test "Objective-C sections keep their names, and the image infos merge into one"
     };
     const c = try in.convert(Ctx{});
     try testing.expectEqual(0, in.errors.items.len);
-    var named: std.StringArrayHashMapUnmanaged(u32) = .empty;
+    var named: std.array_hash_map.String(u32) = .empty;
     var image_info: ?Atom = null;
     for (c.atoms) |a| switch (a.section) {
         .objc => {

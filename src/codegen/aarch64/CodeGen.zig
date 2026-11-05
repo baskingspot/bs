@@ -340,7 +340,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .name = ip.stringSlice(nav.name),
         .base_line = file.zir.getDeclaration(nav.zir_inst).src_line,
         .lines = try arena.dupe(u8, cg.e.lines.bytes.items),
-        .unit = try std.fs.path.join(arena, &.{ module.root_dir, module.root_file }),
+        .unit = try std.Io.Dir.path.join(arena, &.{ module.root_dir, module.root_file }),
         .files = files.items,
         .inlines = try arena.dupe(Atom.Debug.Inline, cg.dbg_inlines.items),
         .inline_names = try arena.dupe(u8, cg.dbg_inline_names.items),
@@ -576,7 +576,7 @@ fn allocateRegs(cg: *CodeGen) Error!void {
     // that may call (`callFree`); v20-v29 do not, so a value in one never
     // crosses a clobber point, and a vector that crosses one stays in
     // memory (`Ssa.want_vec`). None is split.
-    var split = try std.DynamicBitSetUnmanaged.initEmpty(cg.gpa, cg.ir.instructions.len);
+    var split = try std.bit_set.Dynamic.initEmpty(cg.gpa, cg.ir.instructions.len);
     defer split.deinit(cg.gpa);
     const survive = alloc_regs.len + float_regs.len;
     const n = survive + vreg_count;
@@ -4325,10 +4325,10 @@ fn mentionsVReg(source: []const u8, r: u8) bool {
     var k: usize = 0;
     while (k < source.len) {
         if (source[k] == '%') {
-            k = (std.mem.indexOfScalarPos(u8, source, k, ']') orelse return false) + 1;
+            k = (std.mem.findScalarPos(u8, source, k, ']') orelse return false) + 1;
             continue;
         }
-        if (std.mem.indexOfScalar(u8, "vqdshb", source[k]) != null and (k == 0 or !std.ascii.isAlphanumeric(source[k - 1]) and source[k - 1] != '_')) {
+        if (std.mem.findScalar(u8, "vqdshb", source[k]) != null and (k == 0 or !std.ascii.isAlphanumeric(source[k - 1]) and source[k - 1] != '_')) {
             var end = k + 1;
             while (end < source.len and std.ascii.isDigit(source[end])) end += 1;
             if (end > k + 1 and (end == source.len or !std.ascii.isAlphanumeric(source[end]) and source[end] != '_')) {
@@ -4355,10 +4355,10 @@ fn mentionsReg(source: []const u8, r: u8) bool {
 /// Of comma-separated alternative constraints, the register one if there
 /// is one, else the first.
 fn asmAlternative(c: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, c, ',') == null) return c;
+    if (std.mem.findScalar(u8, c, ',') == null) return c;
     var it = std.mem.splitScalar(u8, c, ',');
     while (it.next()) |alt| if (std.mem.eql(u8, alt, "r")) return alt;
-    return c[0..std.mem.indexOfScalar(u8, c, ',').?];
+    return c[0..std.mem.findScalar(u8, c, ',').?];
 }
 
 fn regConstraint(c: []const u8) ?[]const u8 {
@@ -4433,7 +4433,7 @@ fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnm
     var source_lines = std.mem.tokenizeScalar(u8, source, '\n');
     while (source_lines.next()) |source_line| {
         var code = source_line;
-        if (std.mem.indexOf(u8, code, "//")) |i| code = code[0..i];
+        if (std.mem.find(u8, code, "//")) |i| code = code[0..i];
         var statements = std.mem.tokenizeScalar(u8, code, ';');
         while (statements.next()) |raw| try cg.assembleStatement(std.mem.trim(u8, raw, " \t\r"), names, &locals);
     }
@@ -4479,8 +4479,8 @@ const Arrangement = enum {
 /// A SIMD register written as `v3`, `q3`, `d3`, `s3`, `h3` or `b3`,
 /// optionally with an arrangement (`v3.4s`).
 fn parseVReg(tok: []const u8) ?AsmOperand {
-    if (tok.len < 2 or std.mem.indexOfScalar(u8, "vqdshb", tok[0]) == null) return null;
-    const dot = std.mem.indexOfScalar(u8, tok, '.') orelse tok.len;
+    if (tok.len < 2 or std.mem.findScalar(u8, "vqdshb", tok[0]) == null) return null;
+    const dot = std.mem.findScalar(u8, tok, '.') orelse tok.len;
     const n = std.fmt.parseInt(u5, tok[1..dot], 10) catch return null;
     const arr: ?Arrangement = if (dot == tok.len) null else std.meta.stringToEnum(Arrangement, tok[dot + 1 ..]) orelse return null;
     return .{ .vreg = .{ .reg = @fromBackingInt(n), .arr = arr } };
@@ -4504,7 +4504,7 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
         }
         return cg.fail("bs does not support the assembler directive '{s}' yet", .{line});
     }
-    const sp = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
+    const sp = std.mem.findAny(u8, line, " \t") orelse line.len;
     const mnemonic = line[0..sp];
     var operands: [4]AsmOperand = undefined;
     var n: usize = 0;
@@ -4529,7 +4529,7 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
         }
     }
     // A post-index immediate follows the memory operand.
-    if (n >= 2 and operands[n - 2] == .mem and operands[n - 1] == .imm and std.mem.indexOf(u8, line, "]!") == null) {
+    if (n >= 2 and operands[n - 2] == .mem and operands[n - 1] == .imm and std.mem.find(u8, line, "]!") == null) {
         const m = operands[n - 2].mem;
         if (m.offset != .imm or m.offset.imm != 0) return cg.fail("bad post-indexed operand: '{s}'", .{line});
         operands[n - 2] = .{ .mem = .{ .base = m.base, .offset = .{ .post = @intCast(operands[n - 1].imm) } } };
@@ -4540,7 +4540,7 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
 
 fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg), locals: *LocalLabels, line: []const u8) Error!AsmOperand {
     if (tok[0] == '[') {
-        const close = std.mem.lastIndexOfScalar(u8, tok, ']') orelse return cg.fail("bad asm memory operand: '{s}'", .{line});
+        const close = std.mem.findScalarLast(u8, tok, ']') orelse return cg.fail("bad asm memory operand: '{s}'", .{line});
         const inner = tok[1..close];
         const pre = std.mem.endsWith(u8, tok, "!");
         var it = std.mem.tokenizeScalar(u8, inner, ',');
@@ -4588,11 +4588,11 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
         if (t.len > 0 and (t[0] == 'x' or t[0] == 'w')) {
             width = if (t[0] == 'x') .x else .w;
             t = t[1..];
-        } else if (t.len > 0 and std.mem.indexOfScalar(u8, "qdshb", t[0]) != null) {
+        } else if (t.len > 0 and std.mem.findScalar(u8, "qdshb", t[0]) != null) {
             t = t[1..];
         }
         var arr: ?Arrangement = null;
-        if (std.mem.lastIndexOfScalar(u8, t, ']')) |close| if (close + 1 < t.len) {
+        if (std.mem.findScalarLast(u8, t, ']')) |close| if (close + 1 < t.len) {
             if (t[close + 1] != '.') return cg.fail("bad asm operand '{s}'", .{tok});
             arr = std.meta.stringToEnum(Arrangement, t[close + 2 ..]) orelse return cg.fail("bad asm operand '{s}'", .{tok});
             t = t[0 .. close + 1];
@@ -4600,7 +4600,7 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
         if (t.len < 3 or t[0] != '[' or t[t.len - 1] != ']') return cg.fail("bad asm operand '{s}'", .{tok});
         var name = t[1 .. t.len - 1];
         // LLVM's `%[name:w]` form of the modifier.
-        if (std.mem.indexOfScalar(u8, name, ':')) |colon| {
+        if (std.mem.findScalar(u8, name, ':')) |colon| {
             const m = name[colon + 1 ..];
             if (m.len != 1 or (m[0] != 'x' and m[0] != 'w')) return cg.fail("asm operand modifier '{s}'", .{tok});
             width = if (m[0] == 'x') .x else .w;
@@ -4825,7 +4825,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
 /// for an instruction that is not one of them.
 fn asmNeon(cg: *CodeGen, mnemonic_in: []const u8, ops: []const AsmOperand, line: []const u8) Error!bool {
     if (ops.len == 0 or (ops[0] != .vreg)) return false;
-    const dot = std.mem.indexOfScalar(u8, mnemonic_in, '.') orelse mnemonic_in.len;
+    const dot = std.mem.findScalar(u8, mnemonic_in, '.') orelse mnemonic_in.len;
     const mnemonic = mnemonic_in[0..dot];
     const suffix: ?Arrangement = if (dot == mnemonic_in.len) null else std.meta.stringToEnum(Arrangement, mnemonic_in[dot + 1 ..]) orelse return cg.asmUnsupported(line);
     const Shape = enum { two, three, ext, tbl, movi };
@@ -5022,11 +5022,11 @@ fn storeFpRun(cg: *CodeGen, dst: Mem, first: u8, n: u8, size: u8) Error!void {
 fn libmName(cg: *CodeGen, op: []const u8, bits: u16) Error![]const u8 {
     const arena = cg.emit.allocator();
     return switch (bits) {
-        16 => std.fmt.allocPrint(arena, "__{s}h", .{op}),
-        32 => std.fmt.allocPrint(arena, "{s}f", .{op}),
+        16 => arena.print("__{s}h", .{op}),
+        32 => arena.print("{s}f", .{op}),
         64 => op,
-        80 => std.fmt.allocPrint(arena, "__{s}x", .{op}),
-        128 => std.fmt.allocPrint(arena, "{s}q", .{op}),
+        80 => arena.print("__{s}x", .{op}),
+        128 => arena.print("{s}q", .{op}),
         else => unreachable,
     };
 }
@@ -5055,7 +5055,7 @@ fn rtCall(cg: *CodeGen, file: []const u8, name: []const u8, args: []const Val, r
 }
 
 fn libmCall(cg: *CodeGen, op: []const u8, file: ?[]const u8, ty: Index, args: []const Val, dst: Mem) Error!void {
-    const f = file orelse try std.fmt.allocPrint(cg.emit.allocator(), "{s}.zig", .{op});
+    const f = file orelse try cg.emit.allocator().print("{s}.zig", .{op});
     try cg.rtCall(f, try cg.libmName(op, Type.floatBits(cg.ip, ty)), args, ty, dst);
 }
 
@@ -5092,7 +5092,7 @@ fn floatArith(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Val, rhs: Val, dst: M
         } },
         else => unreachable,
     };
-    const name = try std.fmt.allocPrint(cg.emit.allocator(), "__{s}{s}3", .{ op, rtFloatAbbrev(bits) });
+    const name = try cg.emit.allocator().print("__{s}{s}3", .{ op, rtFloatAbbrev(bits) });
     try cg.rtCall(file, name, &.{ lhs, rhs }, ty, dst);
 }
 
@@ -5265,7 +5265,7 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
             // each comparison is false for NaN.
             const bits = Type.floatBits(ip, ty);
             const ge = tag == .cmp_gt or tag == .cmp_gte;
-            const name = try std.fmt.allocPrint(cg.emit.allocator(), "__{s}{s}2", .{ if (ge) "ge" else "cmp", rtFloatAbbrev(bits) });
+            const name = try cg.emit.allocator().print("__{s}{s}2", .{ if (ge) "ge" else "cmp", rtFloatAbbrev(bits) });
             const res = try cg.allocSlot(4, 4);
             try cg.rtCall("comparef.zig", name, &.{ lhs, rhs }, .i32_type, res);
             try cg.loadMem(.x9, res, .i32_type);
@@ -5297,7 +5297,7 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
             const dst = try cg.resultMem(inst, ty) orelse return;
             if (from == to) return cg.copyTo(dst, data.ty_op.operand);
             const widen = to > from;
-            const name = try std.fmt.allocPrint(cg.emit.allocator(), "__{s}{s}{s}2", .{ if (widen) "extend" else "trunc", rtFloatAbbrev(from), rtFloatAbbrev(to) });
+            const name = try cg.emit.allocator().print("__{s}{s}{s}2", .{ if (widen) "extend" else "trunc", rtFloatAbbrev(from), rtFloatAbbrev(to) });
             try cg.rtCall(if (widen) "extendf.zig" else "truncf.zig", name, &.{operand}, ty, dst);
         },
         .float_from_int => {
@@ -5314,7 +5314,7 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
             const dst = try cg.resultMem(inst, ty) orelse return;
             if (info.bits > 128) return cg.fail("@floatFromInt of integers wider than 128 bits", .{});
             const abbrev = if (info.bits <= 32) "si" else if (info.bits <= 64) "di" else "ti";
-            const name = try std.fmt.allocPrint(cg.emit.allocator(), "__float{s}{s}{s}", .{ if (info.signedness == .unsigned) "un" else "", abbrev, rtFloatAbbrev(Type.floatBits(ip, ty)) });
+            const name = try cg.emit.allocator().print("__float{s}{s}{s}", .{ if (info.signedness == .unsigned) "un" else "", abbrev, rtFloatAbbrev(Type.floatBits(ip, ty)) });
             try cg.rtCall("float_from_int.zig", name, &.{operand}, ty, dst);
         },
         .int_from_float => {
@@ -5332,7 +5332,7 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
             const dst = try cg.resultMem(inst, ty) orelse return;
             if (info.bits > 128) return cg.fail("@intFromFloat to integers wider than 128 bits", .{});
             const abbrev = if (info.bits <= 32) "si" else if (info.bits <= 64) "di" else "ti";
-            const name = try std.fmt.allocPrint(cg.emit.allocator(), "__fix{s}{s}{s}", .{ if (info.signedness == .unsigned) "uns" else "", rtFloatAbbrev(Type.floatBits(ip, float_ty)), abbrev });
+            const name = try cg.emit.allocator().print("__fix{s}{s}{s}", .{ if (info.signedness == .unsigned) "uns" else "", rtFloatAbbrev(Type.floatBits(ip, float_ty)), abbrev });
             const s = info.signedness == .signed;
             const rt_ty: Index = if (info.bits <= 32) (if (s) .i32_type else .u32_type) else if (info.bits <= 64) (if (s) .i64_type else .u64_type) else if (s) .i128_type else .u128_type;
             if (Type.abiSize(ip, rt_ty) == size) return cg.rtCall("int_from_float.zig", name, &.{operand}, rt_ty, dst);

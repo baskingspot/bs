@@ -53,7 +53,7 @@ pub const Lang = enum {
     /// The language of a source file argument, by its extension, or null
     /// if it is not one bs compiles.
     pub fn ofPath(path: []const u8) ?Lang {
-        const ext = std.fs.path.extension(path);
+        const ext = Io.Dir.path.extension(path);
         if (std.mem.eql(u8, ext, ".c")) return .c;
         for ([_][]const u8{ ".C", ".cc", ".cpp", ".cxx", ".stub", ".c++" }) |e| if (std.mem.eql(u8, ext, e)) return .cpp;
         if (std.mem.eql(u8, ext, ".m")) return .objc;
@@ -284,7 +284,7 @@ pub const Batch = struct {
 
     fn run(b: *Batch, j: *Job) void {
         runFallible(b, j) catch |err| {
-            j.state = .{ .err = std.fmt.allocPrint(j.arena.allocator(), "unable to compile '{s}': {t}", .{ j.source, err }) catch "out of memory" };
+            j.state = .{ .err = j.arena.allocator().print("unable to compile '{s}': {t}", .{ j.source, err }) catch "out of memory" };
         };
     }
 
@@ -300,13 +300,13 @@ pub const Batch = struct {
         };
         // A runtime library's object goes straight into its build
         // directory; a record's output, once Clang succeeds.
-        const dep_path, const tmp_out = if (j.archive != null) .{ try std.fmt.allocPrint(arena, "{s}.d", .{j.out_path}), j.out_path } else paths: {
-            const tmp_dir = try std.fs.path.join(arena, &.{ std.fs.path.dirname(std.fs.path.dirname(j.record_path).?).?, "tmp" });
+        const dep_path, const tmp_out = if (j.archive != null) .{ try arena.print("{s}.d", .{j.out_path}), j.out_path } else paths: {
+            const tmp_dir = try Io.Dir.path.join(arena, &.{ Io.Dir.path.dirname(Io.Dir.path.dirname(j.record_path).?).?, "tmp" });
             try Io.Dir.cwd().createDirPath(io, tmp_dir);
             var rand: [8]u8 = undefined;
             io.random(&rand);
-            const tmp_base = try std.fs.path.join(arena, &.{ tmp_dir, &std.fmt.bytesToHex(rand, .lower) });
-            break :paths .{ try std.fmt.allocPrint(arena, "{s}-cc.d", .{tmp_base}), try std.fmt.allocPrint(arena, "{s}-cc.o", .{tmp_base}) };
+            const tmp_base = try Io.Dir.path.join(arena, &.{ tmp_dir, &std.fmt.bytesToHex(rand, .lower) });
+            break :paths .{ try arena.print("{s}-cc.d", .{tmp_base}), try arena.print("{s}-cc.o", .{tmp_base}) };
         };
         defer Io.Dir.cwd().deleteFile(io, dep_path) catch {};
         defer if (j.archive == null) Io.Dir.cwd().deleteFile(io, tmp_out) catch {};
@@ -327,7 +327,7 @@ pub const Batch = struct {
             .stderr_limit = .unlimited,
         });
         if (!res.term.success()) {
-            j.state = .{ .failed = if (res.stderr.len != 0) try arena.dupe(u8, res.stderr) else try std.fmt.allocPrint(arena, "clang failed ({f})", .{res.term}) };
+            j.state = .{ .failed = if (res.stderr.len != 0) try arena.dupe(u8, res.stderr) else try arena.print("clang failed ({f})", .{res.term}) };
             return;
         }
         if (j.archive != null) {
@@ -370,10 +370,10 @@ pub const Batch = struct {
                 .done => {
                     if (j.archive != null) continue;
                     const bytes = Io.Dir.cwd().readFileAlloc(b.io, j.out_path, arena, .unlimited) catch |err| {
-                        try errors.append(arena, .{ .loc = null, .msg = try std.fmt.allocPrint(arena, "unable to read the object of '{s}' ({s}): {t}", .{ j.source, j.out_path, err }) });
+                        try errors.append(arena, .{ .loc = null, .msg = try arena.print("unable to read the object of '{s}' ({s}): {t}", .{ j.source, j.out_path, err }) });
                         continue;
                     };
-                    try objects.append(arena, .{ .path = try arena.dupe(u8, j.out_path), .bytes = bytes, .member = try arena.dupe(u8, std.fs.path.basename(j.out_path)) });
+                    try objects.append(arena, .{ .path = try arena.dupe(u8, j.out_path), .bytes = bytes, .member = try arena.dupe(u8, Io.Dir.path.basename(j.out_path)) });
                 },
                 .failed => |stderr| try clangErrors(arena, paths, j.source, stderr, &errors),
                 .err => |msg| try errors.append(arena, .{ .loc = null, .msg = try arena.dupe(u8, msg) }),
@@ -384,15 +384,15 @@ pub const Batch = struct {
         for (b.archives) |a| {
             if (a.len != 0) {
                 b.writeArchive(arena, a) catch |err| {
-                    try errors.append(arena, .{ .loc = null, .msg = try std.fmt.allocPrint(arena, "unable to build '{s}': {t}", .{ a.path, err }) });
+                    try errors.append(arena, .{ .loc = null, .msg = try arena.print("unable to build '{s}': {t}", .{ a.path, err }) });
                     continue;
                 };
             }
             const bytes = Io.Dir.cwd().readFileAlloc(b.io, a.path, arena, .unlimited) catch |err| {
-                try errors.append(arena, .{ .loc = null, .msg = try std.fmt.allocPrint(arena, "unable to read '{s}': {t}", .{ a.path, err }) });
+                try errors.append(arena, .{ .loc = null, .msg = try arena.print("unable to read '{s}': {t}", .{ a.path, err }) });
                 continue;
             };
-            try (if (a.object) &runtime_objects else &archives).append(arena, .{ .path = a.path, .bytes = bytes, .member = std.fs.path.basename(a.path) });
+            try (if (a.object) &runtime_objects else &archives).append(arena, .{ .path = a.path, .bytes = bytes, .member = Io.Dir.path.basename(a.path) });
         }
         b.result = .{ .objects = objects.items, .archives = archives.items, .runtime_objects = runtime_objects.items, .errors = errors.items, .inputs = inputs.items };
         if (errors.items.len == 0) b.writeSummary();
@@ -429,7 +429,7 @@ pub const Batch = struct {
                 try Summary.add(arena, io, b.start_ns, &entries, &paths, p);
         };
         const header: Summary.Header = .{ .objects = objects, .files = @intCast(entries.items.len), .paths_len = @intCast(paths.items.len) };
-        try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(b.summary_path).?);
+        try Io.Dir.cwd().createDirPath(io, Io.Dir.path.dirname(b.summary_path).?);
         try cache.writeReplace(io, Io.Dir.cwd(), b.summary_path, &.{ std.mem.asBytes(&header), std.mem.sliceAsBytes(entries.items), paths.items });
     }
 
@@ -441,8 +441,8 @@ pub const Batch = struct {
         const jobs = b.jobs[a.first..][0..a.len];
         for (jobs) |j| if (j.state != .done) return error.CompileFailed;
         if (a.object) {
-            try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(a.path).?);
-            if (cache.useTool(io, std.fs.path.dirname(a.path).?)) |use| {
+            try Io.Dir.cwd().createDirPath(io, Io.Dir.path.dirname(a.path).?);
+            if (cache.useTool(io, Io.Dir.path.dirname(a.path).?)) |use| {
                 b.tool_locks.append(b.gpa, use) catch |err| {
                     use.close(io);
                     return err;
@@ -452,10 +452,10 @@ pub const Batch = struct {
             return cache.writeReplace(io, Io.Dir.cwd(), a.path, &.{bytes});
         }
         const members = try arena.alloc(@import("link/Archive.zig").Input, jobs.len);
-        for (members, jobs) |*m, j| m.* = .{ .name = std.fs.path.basename(j.out_path), .bytes = try Io.Dir.cwd().readFileAlloc(io, j.out_path, arena, .unlimited) };
-        try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(a.path).?);
+        for (members, jobs) |*m, j| m.* = .{ .name = Io.Dir.path.basename(j.out_path), .bytes = try Io.Dir.cwd().readFileAlloc(io, j.out_path, arena, .unlimited) };
+        try Io.Dir.cwd().createDirPath(io, Io.Dir.path.dirname(a.path).?);
         // Marked as a tool, and held until the batch reads it.
-        if (cache.useTool(io, std.fs.path.dirname(a.path).?)) |use| {
+        if (cache.useTool(io, Io.Dir.path.dirname(a.path).?)) |use| {
             b.tool_locks.append(b.gpa, use) catch |err| {
                 use.close(io);
                 return err;
@@ -531,7 +531,7 @@ const Summary = struct {
         std.hash.autoHashStrat(&h, sources, .DeepRecursive);
         var key: [16]u8 = undefined;
         h.final(&key);
-        return std.fs.path.join(arena, &.{ local, "bs", "cb", &std.fmt.bytesToHex(key, .lower) });
+        return Io.Dir.path.join(arena, &.{ local, "bs", "cb", &std.fmt.bytesToHex(key, .lower) });
     }
 
     /// Appends file `p` with its stat, unless its mtime is too new to
@@ -618,8 +618,8 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     defer scratch.deinit();
     const s = scratch.allocator();
     const cwd_path = try std.process.currentPathAlloc(io, s);
-    const lib = try std.fs.path.resolve(ra, &.{ cwd_path, o.zig_lib_dir });
-    const local = try std.fs.path.resolve(s, &.{ cwd_path, o.local_cache });
+    const lib = try Io.Dir.path.resolveAlloc(ra, &.{ cwd_path, o.zig_lib_dir });
+    const local = try Io.Dir.path.resolveAlloc(s, &.{ cwd_path, o.local_cache });
     const start_ns = Io.Clock.real.now(io).toNanoseconds();
 
     const zig = toolchain.findZig(s, io, environ);
@@ -627,7 +627,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     // other bytes.
     const zig_id = if (zig.found) |p| id: {
         const st = Io.Dir.cwd().statFile(io, p, .{}) catch break :id "";
-        break :id try std.fmt.allocPrint(s, "{s}\x00{d}\x00{d}\x00{d}", .{ p, st.inode, st.size, st.mtime.toNanoseconds() });
+        break :id try s.print("{s}\x00{d}\x00{d}\x00{d}", .{ p, st.inode, st.size, st.mtime.toNanoseconds() });
     } else "";
     const target = if (o.macos) try macosTarget(io, o.macos_version) else try cTarget(io, o.glibc_version, o.musl, o.cpu);
     const common = try commonArgs(ra, io, environ, &target, lib, o);
@@ -656,9 +656,9 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         try h.print(s, "bs c++ runtime 1\x00{s}\x00{s}\x00", .{ zig_id, rl.name });
         for (runtime.items[first..]) |rj| for (rj.argv) |a| try h.print(s, "{s}\x00", .{a});
         const hex = std.fmt.bytesToHex(@as([16]u8, @bitCast(cache.hash(2, h.items))), .lower);
-        const path = try std.fs.path.join(ra, &.{ o.global_cache, "bs", "o", &hex, if (rl.object) try std.fmt.allocPrint(s, "{s}.o", .{rl.name}) else try std.fmt.allocPrint(s, "lib{s}.a", .{rl.name}) });
+        const path = try Io.Dir.path.join(ra, &.{ o.global_cache, "bs", "o", &hex, if (rl.object) try s.print("{s}.o", .{rl.name}) else try s.print("lib{s}.a", .{rl.name}) });
         const found = found: {
-            const use = cache.useTool(io, std.fs.path.dirname(path).?) catch break :found false;
+            const use = cache.useTool(io, Io.Dir.path.dirname(path).?) catch break :found false;
             Io.Dir.cwd().access(io, path, .{}) catch {
                 use.close(io);
                 break :found false;
@@ -679,7 +679,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         } else {
             var rand: [8]u8 = undefined;
             io.random(&rand);
-            const tmp_dir = try std.fs.path.join(ra, &.{ o.global_cache, "bs", "tmp", try std.fmt.allocPrint(s, "{s}-{s}", .{ rl.name, &std.fmt.bytesToHex(rand, .lower) }) });
+            const tmp_dir = try Io.Dir.path.join(ra, &.{ o.global_cache, "bs", "tmp", try s.print("{s}-{s}", .{ rl.name, &std.fmt.bytesToHex(rand, .lower) }) });
             try Io.Dir.cwd().createDirPath(io, tmp_dir);
             try archives.append(ra, .{ .path = path, .tmp_dir = tmp_dir, .first = sources.len + first, .len = runtime.items.len - first, .object = rl.object });
         }
@@ -724,7 +724,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         try argv.appendSlice(arena, o.global_cc_argv);
         try argv.appendSlice(arena, src.cc_argv);
         try argv.appendSlice(arena, src.extra_flags);
-        const abs_source = try std.fs.path.resolve(arena, &.{ cwd_path, src.path });
+        const abs_source = try Io.Dir.path.resolveAlloc(arena, &.{ cwd_path, src.path });
 
         var key_args: std.ArrayList([]const u8) = .empty;
         try key_args.appendSlice(s, argv.items[1..]);
@@ -738,8 +738,8 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .argv = argv.items,
             .dep_at = dep_at,
             .depfile = src.lang != .assembly,
-            .record_path = try std.fs.path.join(arena, &.{ local, "bs", "tc", &hex }),
-            .out_path = try std.fs.path.join(arena, &.{ local, "o", &hex, try std.fmt.allocPrint(arena, "{s}.o", .{std.fs.path.stem(src.path)}) }),
+            .record_path = try Io.Dir.path.join(arena, &.{ local, "bs", "tc", &hex }),
+            .out_path = try Io.Dir.path.join(arena, &.{ local, "o", &hex, try arena.print("{s}.o", .{Io.Dir.path.stem(src.path)}) }),
             .start_ns = start_ns,
         };
         if (try ToolRecord.check(arena, io, j.record_path, j.out_path, start_ns, s, &stats)) |c| switch (c) {
@@ -758,10 +758,10 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         // own, as upstream's objects each go into their own.
         var stems: std.StringHashMapUnmanaged(u32) = .empty;
         for (runtime.items[a.first - sources.len ..][0..a.len], b.jobs[a.first..][0..a.len]) |rj, *j| {
-            const stem = std.fs.path.stem(rj.argv[2]);
+            const stem = Io.Dir.path.stem(rj.argv[2]);
             const seen = try stems.getOrPut(s, stem);
             seen.value_ptr.* = if (seen.found_existing) seen.value_ptr.* + 1 else 0;
-            const dir = if (seen.value_ptr.* == 0) a.tmp_dir else try std.fmt.allocPrint(ra, "{s}/{d}", .{ a.tmp_dir, seen.value_ptr.* });
+            const dir = if (seen.value_ptr.* == 0) a.tmp_dir else try ra.print("{s}/{d}", .{ a.tmp_dir, seen.value_ptr.* });
             if (seen.value_ptr.* != 0) try Io.Dir.cwd().createDirPath(io, dir);
             j.* = .{
                 .arena = j.arena,
@@ -771,7 +771,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
                 .dep_at = rj.dep_at,
                 .depfile = !std.mem.endsWith(u8, rj.argv[2], ".s"),
                 .record_path = "",
-                .out_path = try std.fs.path.join(ra, &.{ dir, try std.fmt.allocPrint(ra, "{s}.o", .{stem}) }),
+                .out_path = try Io.Dir.path.join(ra, &.{ dir, try ra.print("{s}.o", .{stem}) }),
                 .archive = @intCast(ai),
                 .start_ns = start_ns,
             };
@@ -783,7 +783,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     b.zig = if (misses == 0) .{ .path = "" } else if (zig.found) |p|
         if (try checkZig(s, io, p)) |msg| .{ .missing = try gpa.dupe(u8, msg) } else .{ .path = try gpa.dupe(u8, p) }
     else
-        .{ .missing = try std.fmt.allocPrint(gpa, "compiling C sources needs upstream zig 0.17.1; bs looked for it in BS_ZIG, as 'zig' on PATH, and in {s}", .{zig.looked}) };
+        .{ .missing = try gpa.print("compiling C sources needs upstream zig 0.17.1; bs looked for it in BS_ZIG, as 'zig' on PATH, and in {s}", .{zig.looked}) };
     b.misses = misses;
     const workers = @min(misses, std.Thread.getCpuCount() catch 1);
     for (0..workers) |_| b.group.concurrent(io, Batch.worker, .{b}) catch break;
@@ -810,7 +810,7 @@ pub fn destroy(b: *Batch) void {
 /// compilation's (`-mcpu`).
 pub fn cTarget(io: Io, glibc_version: ?std.SemanticVersion, musl: bool, cpu: std.Target.Cpu) !std.Target {
     var buf: [64]u8 = undefined;
-    const text = if (glibc_version) |v| try std.fmt.bufPrint(&buf, "{t}-linux-gnu.{f}", .{ cpu.arch, v }) else try std.fmt.bufPrint(&buf, "{t}-linux-{s}", .{ cpu.arch, if (musl) "musl" else "none" });
+    const text = if (glibc_version) |v| try std.mem.print(&buf, "{t}-linux-gnu.{f}", .{ cpu.arch, v }) else try std.mem.print(&buf, "{t}-linux-{s}", .{ cpu.arch, if (musl) "musl" else "none" });
     const query = try std.Target.Query.parse(.{ .arch_os_abi = text, .cpu_features = "baseline" });
     var target = try std.zig.system.resolveTargetQuery(io, query);
     target.cpu = cpu;
@@ -872,7 +872,7 @@ fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Envi
         const name = feature.llvm_name orelse continue;
         if (std.mem.startsWith(u8, name, "soft-float") or std.mem.startsWith(u8, name, "hard-float") or std.mem.startsWith(u8, name, "x32")) continue;
         const on = target.cpu.features.isEnabled(@intCast(i));
-        const f = try std.fmt.allocPrint(arena, "{c}{s}", .{ "-+"[@intFromBool(on)], name });
+        const f = try arena.print("{c}{s}", .{ "-+"[@intFromBool(on)], name });
         try features.appendSlice(arena, &.{ "-Xclang", "-target-feature", "-Xclang", f });
         try asm_features.appendSlice(arena, &.{ "-Xclangas", "-target-feature", "-Xclangas", f });
     }
@@ -906,12 +906,12 @@ fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Envi
         const min = target.os.version_range.semver.min;
         // In the arena: a literal with a runtime element would be a
         // temporary that dies with this block.
-        break :os try arena.dupe([]const u8, &.{ try std.fmt.allocPrint(arena, "-mmacos-version-min={d}.{d}.{d}", .{ min.major, min.minor, min.patch }), "-Wno-overriding-option" });
+        break :os try arena.dupe([]const u8, &.{ try arena.print("-mmacos-version-min={d}.{d}.{d}", .{ min.major, min.minor, min.patch }), "-Wno-overriding-option" });
     } else &.{};
     return .{
         .os_args = os_args,
         .triple = try std.zig.llvm.Builder.tripleForTarget(arena, target),
-        .glibc_minor = if (o.glibc_version) |v| try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{v.minor}) else "",
+        .glibc_minor = if (o.glibc_version) |v| try arena.print("-D__GLIBC_MINOR__={d}", .{v.minor}) else "",
         .lib = lib,
         .libc_includes = libc_includes.items,
         .libc_frameworks = libc_frameworks.items,
@@ -975,13 +975,13 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
     }
     if (m.link_libc and common.glibc_minor.len != 0) try argv.append(arena, common.glibc_minor);
     if (m.libcpp) {
-        try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libcxx", "include" }), "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libcxxabi", "include" }) });
+        try argv.appendSlice(arena, &.{ "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "libcxx", "include" }), "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "libcxxabi", "include" }) });
         try argv.appendSlice(arena, common.cxx_defines);
     }
-    try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ common.lib, "include" }) });
+    try argv.appendSlice(arena, &.{ "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "include" }) });
     if (m.link_libc) try argv.appendSlice(arena, common.libc_includes);
     if (m.native) try argv.appendSlice(arena, common.native_includes);
-    if (m.libunwind) try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libunwind", "include" }) });
+    if (m.libunwind) try argv.appendSlice(arena, &.{ "-isystem", try Io.Dir.path.join(arena, &.{ common.lib, "libunwind", "include" }) });
     if (m.link_libc) try argv.appendSlice(arena, common.libc_frameworks);
     if (!assembly) {
         try argv.append(arena, "-fno-spell-checking");
@@ -1161,7 +1161,7 @@ const nonshared_stat_files = [_][]const u8{
 /// sub-compilation's (ReleaseFast, PIC, no sanitizer or stack protector,
 /// no libc), then glibc's own build flags.
 fn nonsharedJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), common: Common, lib: []const u8, o: Options) !void {
-    const join = std.fs.path.join;
+    const join = Io.Dir.path.join;
     const v = o.glibc_version.?;
     const old_stat = v.order(.{ .major = 2, .minor = 32, .patch = 0 }) != .gt;
     const old_init = v.order(.{ .major = 2, .minor = 33, .patch = 0 }) != .gt;
@@ -1241,7 +1241,7 @@ fn muslJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Runti
     for (files) |file| {
         const lang: Lang = if (std.mem.endsWith(u8, file, ".S")) .asm_cpp else if (std.mem.endsWith(u8, file, ".s")) .assembly else .c;
         var argv: std.ArrayList([]const u8) = .empty;
-        const dep_at = try appendArgs(arena, &argv, common, try std.fs.path.join(arena, &.{ lib, rl.dir, file }), .{
+        const dep_at = try appendArgs(arena, &argv, common, try Io.Dir.path.join(arena, &.{ lib, rl.dir, file }), .{
             .lang = lang,
             .optimize = .fast,
             .sanitize_c = .off,
@@ -1269,7 +1269,7 @@ const RuntimeJob = struct { argv: []const []const u8, dep_at: usize };
 /// no sanitizer, sections, asynchronous unwind tables, glibc), then the
 /// library's own.
 fn runtimeJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: RuntimeLib, common: Common, lib: []const u8, o: Options) !void {
-    const join = std.fs.path.join;
+    const join = Io.Dir.path.join;
     const cxx_include = try join(arena, &.{ lib, "libcxx", "include" });
     const cxxabi_include = try join(arena, &.{ lib, "libcxxabi", "include" });
     const cxx_src_include = try join(arena, &.{ lib, "libcxx", "src" });
@@ -1336,8 +1336,8 @@ pub const LibcDirs = struct {
 pub fn libcIncludeDirs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8, lib: []const u8, target: *const std.Target, native_abi: bool) !LibcDirs {
     if (native_abi and target.os.tag == .macos) {
         if (try darwinSdk(arena, io, environ, global_cache)) |sdk| return .{
-            .includes = try arena.dupe([]const u8, &.{try std.fs.path.join(arena, &.{ sdk, "usr", "include" })}),
-            .frameworks = try arena.dupe([]const u8, &.{try std.fs.path.join(arena, &.{ sdk, "System", "Library", "Frameworks" })}),
+            .includes = try arena.dupe([]const u8, &.{try Io.Dir.path.join(arena, &.{ sdk, "usr", "include" })}),
+            .frameworks = try arena.dupe([]const u8, &.{try Io.Dir.path.join(arena, &.{ sdk, "System", "Library", "Frameworks" })}),
         };
     } else if (native_abi) if (nativeLibcIncludes(arena, io, environ, global_cache) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
@@ -1367,7 +1367,7 @@ pub fn darwinSdk(arena: std.mem.Allocator, io: Io, environ: *const std.process.E
     const record = try libcRecordPath(arena, global_cache, key.items);
     if (try readLibcRecord(arena, io, record)) |dirs| if (dirs.len == 1) {
         // A record whose SDK went away is xcrun's to answer.
-        if (Io.Dir.cwd().access(io, try std.fs.path.join(arena, &.{ dirs[0], "usr", "include", "stdlib.h" }), .{})) |_| return dirs[0] else |_| {}
+        if (Io.Dir.cwd().access(io, try Io.Dir.path.join(arena, &.{ dirs[0], "usr", "include", "stdlib.h" }), .{})) |_| return dirs[0] else |_| {}
     };
 
     const select = runCc(arena, io, &.{ "xcode-select", "--print-path" }, environ) catch |err| switch (err) {
@@ -1390,7 +1390,7 @@ pub fn darwinSdk(arena: std.mem.Allocator, io: Io, environ: *const std.process.E
 /// zig lib directory's (`libc/darwin`). Null when the file names none.
 pub fn darwinSdkVersion(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8, lib: []const u8, native: bool) !?std.SemanticVersion {
     const sdk = if (native) try darwinSdk(arena, io, environ, global_cache) else null;
-    const path = if (sdk) |dir| try std.fs.path.join(arena, &.{ dir, "SDKSettings.json" }) else try std.fs.path.join(arena, &.{ lib, "libc", "darwin", "SDKSettings.json" });
+    const path = if (sdk) |dir| try Io.Dir.path.join(arena, &.{ dir, "SDKSettings.json" }) else try Io.Dir.path.join(arena, &.{ lib, "libc", "darwin", "SDKSettings.json" });
     const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 24)) catch return null;
     const settings = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch return null;
     if (settings != .object) return null;
@@ -1401,7 +1401,7 @@ pub fn darwinSdkVersion(arena: std.mem.Allocator, io: Io, environ: *const std.pr
 
 fn libcRecordPath(arena: std.mem.Allocator, global_cache: []const u8, key: []const u8) ![]const u8 {
     const hex = std.fmt.bytesToHex(@as([16]u8, @bitCast(cache.hash(2, key))), .lower);
-    return std.fs.path.join(arena, &.{ global_cache, "bs", "libc", &hex });
+    return Io.Dir.path.join(arena, &.{ global_cache, "bs", "libc", &hex });
 }
 
 /// The directories a libc record lists, NUL-separated.
@@ -1415,7 +1415,7 @@ fn readLibcRecord(arena: std.mem.Allocator, io: Io, record: []const u8) !?[]cons
 
 /// Best effort: without the record, the next build asks again.
 fn writeLibcRecord(io: Io, record: []const u8, dirs: []const []const u8) void {
-    if (std.fs.path.dirname(record)) |d| Io.Dir.cwd().createDirPath(io, d) catch {};
+    if (Io.Dir.path.dirname(record)) |d| Io.Dir.cwd().createDirPath(io, d) catch {};
     var parts: [4][]const u8 = undefined;
     for (dirs, 0..) |d, k| {
         parts[2 * k] = d;
@@ -1454,10 +1454,10 @@ fn nativeLibcIncludes(arena: std.mem.Allocator, io: Io, environ: *const std.proc
     try key.print(arena, "bs native libc 1\x00{d}\x00", .{@intFromBool(skip_cc_env_var)});
     for (argv.items) |a| try key.print(arena, "{s}\x00", .{a});
     const exe = argv.items[0];
-    const exe_path: ?[]const u8 = if (std.mem.indexOfScalar(u8, exe, '/') != null) exe else p: {
+    const exe_path: ?[]const u8 = if (std.mem.findScalar(u8, exe, '/') != null) exe else p: {
         var it = std.mem.tokenizeScalar(u8, environ.get("PATH") orelse "", ':');
         while (it.next()) |dir| {
-            const p = try std.fs.path.join(arena, &.{ dir, exe });
+            const p = try Io.Dir.path.join(arena, &.{ dir, exe });
             if (Io.Dir.cwd().access(io, p, .{ .execute = true })) |_| break :p p else |_| {}
         }
         break :p null;
@@ -1469,7 +1469,7 @@ fn nativeLibcIncludes(arena: std.mem.Allocator, io: Io, environ: *const std.proc
     const record = try libcRecordPath(arena, global_cache, key.items);
     if (exe_stat != null) if (try readLibcRecord(arena, io, record)) |dirs| {
         // A record whose headers went away is the compiler's to answer.
-        if (Io.Dir.cwd().access(io, try std.fs.path.join(arena, &.{ dirs[0], "stdlib.h" }), .{})) |_| return dirs else |_| {}
+        if (Io.Dir.cwd().access(io, try Io.Dir.path.join(arena, &.{ dirs[0], "stdlib.h" }), .{})) |_| return dirs else |_| {}
     };
 
     var env = try environ.clone(arena);
@@ -1490,10 +1490,10 @@ fn nativeLibcIncludes(arena: std.mem.Allocator, io: Io, environ: *const std.proc
     while (i > 0) {
         i -= 1;
         const dir = search_paths.items[i];
-        if (include_dir == null) if (Io.Dir.cwd().access(io, try std.fs.path.join(arena, &.{ dir, "stdlib.h" }), .{})) |_| {
+        if (include_dir == null) if (Io.Dir.cwd().access(io, try Io.Dir.path.join(arena, &.{ dir, "stdlib.h" }), .{})) |_| {
             include_dir = dir;
         } else |_| {};
-        if (sys_include_dir == null) if (Io.Dir.cwd().access(io, try std.fs.path.join(arena, &.{ dir, "sys", "errno.h" }), .{})) |_| {
+        if (sys_include_dir == null) if (Io.Dir.cwd().access(io, try Io.Dir.path.join(arena, &.{ dir, "sys", "errno.h" }), .{})) |_| {
             sys_include_dir = dir;
         } else |_| {};
         if (include_dir != null and sys_include_dir != null) break;
@@ -1503,14 +1503,14 @@ fn nativeLibcIncludes(arena: std.mem.Allocator, io: Io, environ: *const std.proc
     // and fails without them (`findNativeCrtDirPosix`,
     // `findNativeGccDirPosix`), though bs links its own.
     for ([_][]const u8{ "crt1.o", "crtbeginS.o" }) |basename| {
-        const print = try std.mem.concat(arena, []const u8, &.{ cc_argv, &.{try std.fmt.allocPrint(arena, "-print-file-name={s}", .{basename})} });
+        const print = try std.mem.concat(arena, []const u8, &.{ cc_argv, &.{try arena.print("-print-file-name={s}", .{basename})} });
         const out = runCc(arena, io, print, &env) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.CCompilerFailed => return null,
         };
         var it = std.mem.tokenizeAny(u8, out.stdout, "\n\r");
         const line = it.next() orelse return error.LibCRuntimeNotFound;
-        if (std.mem.eql(u8, line, basename) or std.fs.path.dirname(line) == null) return error.LibCRuntimeNotFound;
+        if (std.mem.eql(u8, line, basename) or Io.Dir.path.dirname(line) == null) return error.LibCRuntimeNotFound;
     }
     const dirs: []const []const u8 = if (std.mem.eql(u8, include_dir.?, sys_include_dir.?))
         try arena.dupe([]const u8, &.{include_dir.?})
@@ -1541,10 +1541,10 @@ fn runCc(arena: std.mem.Allocator, io: Io, argv: []const []const u8, env: *const
 /// Null when `zig` is upstream's 0.17.1, else why not.
 fn checkZig(arena: std.mem.Allocator, io: Io, zig: []const u8) !?[]const u8 {
     const res = std.process.run(arena, io, .{ .argv = &.{ zig, "version" } }) catch |err|
-        return try std.fmt.allocPrint(arena, "compiling C sources needs upstream zig 0.17.1; unable to run '{s}': {t}", .{ zig, err });
+        return try arena.print("compiling C sources needs upstream zig 0.17.1; unable to run '{s}': {t}", .{ zig, err });
     const version = std.mem.trim(u8, res.stdout, " \n");
     if (res.term.success() and std.mem.eql(u8, version, "0.17.1")) return null;
-    return try std.fmt.allocPrint(arena, "compiling C sources needs upstream zig 0.17.1; '{s}' is version '{s}' (set BS_ZIG to upstream 0.17.1)", .{ zig, version });
+    return try arena.print("compiling C sources needs upstream zig 0.17.1; '{s}' is version '{s}' (set BS_ZIG to upstream 0.17.1)", .{ zig, version });
 }
 
 /// Clang's errors and their notes, as diagnostics: `path:line:col: error:
@@ -1567,13 +1567,13 @@ fn clangErrors(arena: std.mem.Allocator, paths: diag.Paths, source: []const u8, 
     if (out.items.len > first) {
         out.items[out.items.len - 1].notes = try notes.toOwnedSlice(arena);
     } else {
-        try out.append(arena, .{ .loc = null, .msg = try std.fmt.allocPrint(arena, "unable to compile '{s}': {s}", .{ source, std.mem.trimEnd(u8, stderr, "\n") }) });
+        try out.append(arena, .{ .loc = null, .msg = try arena.print("unable to compile '{s}': {s}", .{ source, std.mem.trimEnd(u8, stderr, "\n") }) });
     }
 }
 
 fn parseLine(arena: std.mem.Allocator, paths: diag.Paths, line: []const u8) ?struct { enum { err, note }, ?diag.Loc, []const u8 } {
     inline for (.{ .{ ": error: ", .err }, .{ ": fatal error: ", .err }, .{ ": note: ", .note } }) |k| {
-        if (std.mem.indexOf(u8, line, k[0])) |at| {
+        if (std.mem.find(u8, line, k[0])) |at| {
             const msg = line[at + k[0].len ..];
             return .{ k[1], locOf(arena, paths, line[0..at]), msg };
         }
@@ -1592,7 +1592,7 @@ fn locOf(arena: std.mem.Allocator, paths: diag.Paths, text: []const u8) ?diag.Lo
     const source = Io.Dir.cwd().readFileAlloc(paths.io, path, arena, .limited(64 << 20)) catch return null;
     var offset: usize = 0;
     var l: u32 = 1;
-    while (l < line) : (l += 1) offset = (std.mem.indexOfScalarPos(u8, source, offset, '\n') orelse return null) + 1;
+    while (l < line) : (l += 1) offset = (std.mem.findScalarPos(u8, source, offset, '\n') orelse return null) + 1;
     offset = @min(offset + col - 1, source.len);
     const o: u32 = @intCast(offset);
     return paths.loc(arena, path, source, o, o, o, false) catch null;

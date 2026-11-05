@@ -94,7 +94,7 @@ pub fn lower(gpa: std.mem.Allocator, ctx: anytype, cases: []const Case, lo: u64,
             const span = cases[j].hi - cases[i].lo;
             if (span >= table_max) break;
             covered += cases[j].hi - cases[j].lo + 1;
-            if (distinct < labels.len and std.mem.indexOfScalar(u32, labels[0..distinct], cases[j].label) == null) {
+            if (distinct < labels.len and std.mem.findScalar(u32, labels[0..distinct], cases[j].label) == null) {
                 labels[distinct] = cases[j].label;
                 distinct += 1;
             }

@@ -204,11 +204,11 @@ pub const Paths = struct {
 
     pub fn init(arena: std.mem.Allocator, io: std.Io, zig_lib_dir: []const u8) !Paths {
         const cwd = try std.process.currentPathAlloc(io, arena);
-        return .{ .lib_dir = try std.fs.path.resolve(arena, &.{ cwd, zig_lib_dir }), .cwd = cwd, .io = io };
+        return .{ .lib_dir = try std.Io.Dir.path.resolveAlloc(arena, &.{ cwd, zig_lib_dir }), .cwd = cwd, .io = io };
     }
 
     pub fn display(p: Paths, arena: std.mem.Allocator, raw: []const u8) !struct { []const u8, bool } {
-        const abs = try std.fs.path.resolve(arena, &.{ p.cwd, raw });
+        const abs = try std.Io.Dir.path.resolveAlloc(arena, &.{ p.cwd, raw });
         if (under(abs, p.lib_dir)) |rel| return .{ rel, true };
         if (under(abs, p.cwd)) |rel| return .{ rel, false };
         return .{ abs, false };
@@ -405,8 +405,8 @@ pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorB
 
 /// The text between the first and last `'` of `msg`, if any.
 fn quoted(msg: []const u8) ?[]const u8 {
-    const open = std.mem.indexOfScalar(u8, msg, '\'') orelse return null;
-    const close = std.mem.lastIndexOfScalar(u8, msg, '\'') orelse return null;
+    const open = std.mem.findScalar(u8, msg, '\'') orelse return null;
+    const close = std.mem.findScalarLast(u8, msg, '\'') orelse return null;
     if (close <= open + 1) return null;
     return msg[open + 1 .. close];
 }
@@ -535,15 +535,15 @@ const migration_map = std.StaticStringMap([]const u8).initComptime(kvs: {
 /// source goes on to access `next` (`AnyWriter` in `std.io.AnyWriter`):
 /// a hint for `name.next` wins over one for `name`.
 pub fn migrationHint(container: []const u8, name: []const u8, next: ?[]const u8) ?[]const u8 {
-    const base = container[0 .. std.mem.indexOfScalar(u8, container, '(') orelse container.len];
+    const base = container[0 .. std.mem.findScalar(u8, container, '(') orelse container.len];
     var buf: [256]u8 = undefined;
     if (next) |n| {
-        const path = std.fmt.bufPrint(&buf, "{s}\x00{s}.{s}", .{ base, name, n }) catch return null;
+        const path = std.mem.print(&buf, "{s}\x00{s}.{s}", .{ base, name, n }) catch return null;
         if (migration_map.get(path)) |h| return h;
     }
     // The whole name first (`@typeInfo(lang.Type).@"union".tag_type.?`).
     for ([_][]const u8{ container, base }) |c| for ([_][]const u8{ name, "*" }) |n| {
-        const key = std.fmt.bufPrint(&buf, "{s}\x00{s}", .{ c, n }) catch return null;
+        const key = std.mem.print(&buf, "{s}\x00{s}", .{ c, n }) catch return null;
         if (migration_map.get(key)) |h| return h;
     };
     return null;
@@ -592,7 +592,7 @@ const migration_fixes = [_]struct { []const u8, []const u8, []const u8, []const 
 /// A replacement starting with `^` replaces the whole path, `std.os.exit`
 /// for `os` and `exit`, written as `std.<container>.<name>` in the source.
 pub fn migrationFix(arena: std.mem.Allocator, container: []const u8, name: []const u8, source: []const u8, start: u32) !?RawFix {
-    const base = container[0 .. std.mem.indexOfScalar(u8, container, '(') orelse container.len];
+    const base = container[0 .. std.mem.findScalar(u8, container, '(') orelse container.len];
     for (migration_fixes) |f| {
         if (!std.mem.eql(u8, f[0], base) or !std.mem.eql(u8, f[1], name)) continue;
         const end = start + name.len;
@@ -628,7 +628,7 @@ pub fn typeInfoFix(arena: std.mem.Allocator, name: []const u8, names: []const []
         } else try snake.append(arena, c);
     }
     for (names) |n| if (std.mem.eql(u8, n, snake.items)) {
-        const text = if (std.zig.Token.getKeyword(n) != null) try std.fmt.allocPrint(arena, "@\"{s}\"", .{n}) else n;
+        const text = if (std.zig.Token.getKeyword(n) != null) try arena.print("@\"{s}\"", .{n}) else n;
         return try rawFix(arena, .exact, &.{.{ .start = start, .end = @intCast(start + name.len), .text = text }});
     };
     return null;
@@ -1057,7 +1057,7 @@ fn astGenFix(arena: std.mem.Allocator, tree: *const Ast, code: Code, msg: []cons
             const name = tree.tokenSlice(tok);
             if (std.mem.startsWith(u8, msg, "unused local ")) {
                 const semi = statementEnd(tree, tok) orelse return null;
-                const discard = try statementAfter(arena, tree, semi, indentOf(tree.source, tree.tokenStart(tok)), try std.fmt.allocPrint(arena, "_ = {s};", .{name}));
+                const discard = try statementAfter(arena, tree, semi, indentOf(tree.source, tree.tokenStart(tok)), try arena.print("_ = {s};", .{name}));
                 // An unused variable is never mutated either.
                 if (tok > 0 and tree.tokenTag(tok - 1) == .keyword_var)
                     return try rawFix(arena, .exact, &.{ replaceToken(tree, tok - 1, "const"), discard });
@@ -1066,8 +1066,8 @@ fn astGenFix(arena: std.mem.Allocator, tree: *const Ast, code: Code, msg: []cons
             if (std.mem.eql(u8, msg, "unused function parameter")) {
                 const body = enclosingFnBody(tree, tok) orelse return null;
                 const lbrace = tree.firstToken(body);
-                const indent = try std.fmt.allocPrint(arena, "{s}    ", .{indentOf(tree.source, tree.tokenStart(lbrace))});
-                return try rawFix(arena, .exact, &.{try statementAfter(arena, tree, lbrace, indent, try std.fmt.allocPrint(arena, "_ = {s};", .{name}))});
+                const indent = try arena.print("{s}    ", .{indentOf(tree.source, tree.tokenStart(lbrace))});
+                return try rawFix(arena, .exact, &.{try statementAfter(arena, tree, lbrace, indent, try arena.print("_ = {s};", .{name}))});
             }
             if (std.mem.eql(u8, msg, "unused capture") or std.mem.eql(u8, msg, "unused switch tag capture"))
                 return captureFix(arena, tree, tok, msg[7] == 's');
@@ -1460,7 +1460,7 @@ pub fn originNote(arena: std.mem.Allocator, tree: *const Ast, origin: Origin, ki
             if (tree.tokenTag(local.mut_tok) != .keyword_const) return null;
             return .{
                 .span = tree.tokenToSpan(local.mut_tok + 1),
-                .msg = try std.fmt.allocPrint(arena, "'{s}' is declared 'const'; declare it with 'var'{s} to modify it", .{ local.name, if (local.var_ok) "" else " and a type" }),
+                .msg = try arena.print("'{s}' is declared 'const'; declare it with 'var'{s} to modify it", .{ local.name, if (local.var_ok) "" else " and a type" }),
                 .decl = true,
                 .fix = try varFix(arena, tree, local),
             };
@@ -1478,11 +1478,11 @@ pub fn originNote(arena: std.mem.Allocator, tree: *const Ast, origin: Origin, ki
                 var buf: [1]Ast.Node.Index = undefined;
                 const callee: ?[]const u8 = if (tree.fullCall(&buf, node)) |call| tree.getNodeSource(call.ast.fn_expr) else null;
                 msg = if (callee != null and callee.?.len <= 60)
-                    try std.fmt.allocPrint(arena, "'{s}' holds the {s} returned by '{s}'; consider using {s} here", .{ local.name, what, callee.?, how })
+                    try arena.print("'{s}' holds the {s} returned by '{s}'; consider using {s} here", .{ local.name, what, callee.?, how })
                 else
-                    try std.fmt.allocPrint(arena, "'{s}' holds this {s}; consider using {s} here", .{ local.name, what, how });
+                    try arena.print("'{s}' holds this {s}; consider using {s} here", .{ local.name, what, how });
             } else if (at_use) {
-                msg = try std.fmt.allocPrint(arena, "this argument is an {s}; consider using {s} here", .{ what, how });
+                msg = try arena.print("this argument is an {s}; consider using {s} here", .{ what, how });
             }
             const fix = if (kind == .optional)
                 try unwrapFix(arena, tree, node, .optional)
@@ -1608,7 +1608,7 @@ pub fn prongsFix(arena: std.mem.Allocator, tree: *const Ast, offset: u32, prongs
 /// (the name in `s.name` or `s.name()`).
 pub fn nameIn(text: []const u8, name: []const u8) ?u32 {
     var end = text.len;
-    while (std.mem.lastIndexOf(u8, text[0..end], name)) |at| : (end = at) {
+    while (std.mem.findLast(u8, text[0..end], name)) |at| : (end = at) {
         const after = at + name.len;
         const ident = struct {
             fn f(c: u8) bool {
@@ -1652,7 +1652,7 @@ fn astGenHint(arena: std.mem.Allocator, tree: *const Ast, code: Code, msg: []con
         .@"arg-count" => {
             const name = tree.tokenSlice(tok);
             if (!result_type_casts.has(name) or !std.mem.eql(u8, msg, "expected 1 argument, found 2")) return null;
-            return try std.fmt.allocPrint(arena, "since 0.11, {0s} takes its type from the result type: `@as(T, {0s}(x))`, or give the destination a type (`const y: T = {0s}(x);`)", .{name});
+            return try arena.print("since 0.11, {0s} takes its type from the result type: `@as(T, {0s}(x))`, or give the destination a type (`const y: T = {0s}(x);`)", .{name});
         },
         .@"bad-capture" => if (std.mem.eql(u8, msg, "extra capture in for loop"))
             return "since 0.11, a for loop's index is an input of its own: `for (items, 0..) |item, i|`",
@@ -1699,7 +1699,7 @@ fn builtinFix(arena: std.mem.Allocator, tree: *const Ast, tok: Ast.TokenIndex, n
     if (n != n_args) return null;
     var text: std.ArrayList(u8) = .empty;
     var rest: []const u8 = template;
-    while (std.mem.indexOfScalar(u8, rest, '{')) |open| {
+    while (std.mem.findScalar(u8, rest, '{')) |open| {
         try text.appendSlice(arena, rest[0..open]);
         const a = args[rest[open + 1] - '0'];
         try text.appendSlice(arena, tree.source[a[0]..a[1]]);
@@ -1845,8 +1845,8 @@ fn statementAfter(arena: std.mem.Allocator, tree: *const Ast, tok: Ast.TokenInde
     const end = tokenEnd(tree, tok);
     const line_end = lineEnd(source, end);
     if (line_end == source.len or tree.tokenStart(tok + 1) < line_end)
-        return .{ .start = end, .end = end, .text = try std.fmt.allocPrint(arena, " {s}", .{stmt}) };
-    return .{ .start = line_end + 1, .end = line_end + 1, .text = try std.fmt.allocPrint(arena, "{s}{s}\n", .{ indent, stmt }) };
+        return .{ .start = end, .end = end, .text = try arena.print(" {s}", .{stmt}) };
+    return .{ .start = line_end + 1, .end = line_end + 1, .text = try arena.print("{s}{s}\n", .{ indent, stmt }) };
 }
 
 fn replaceToken(tree: *const Ast, tok: Ast.TokenIndex, text: []const u8) RawEdit {
@@ -1870,11 +1870,11 @@ fn tokenEnd(tree: *const Ast, tok: Ast.TokenIndex) u32 {
 }
 
 fn lineStart(source: []const u8, offset: u32) u32 {
-    return if (std.mem.lastIndexOfScalar(u8, source[0..offset], '\n')) |i| @intCast(i + 1) else 0;
+    return if (std.mem.findScalarLast(u8, source[0..offset], '\n')) |i| @intCast(i + 1) else 0;
 }
 
 fn lineEnd(source: []const u8, offset: u32) u32 {
-    return @intCast(std.mem.indexOfScalarPos(u8, source, offset, '\n') orelse source.len);
+    return @intCast(std.mem.findScalarPos(u8, source, offset, '\n') orelse source.len);
 }
 
 /// The indentation of the line holding byte `offset`.
@@ -2383,7 +2383,7 @@ fn matchFormat(fmt: []const u8, msg: []const u8) bool {
     var f = fmt;
     var first = true;
     while (true) {
-        const open = std.mem.indexOfScalar(u8, f, '{') orelse {
+        const open = std.mem.findScalar(u8, f, '{') orelse {
             return if (first) std.mem.eql(u8, rest, f) else std.mem.endsWith(u8, rest, f);
         };
         const lit = f[0..open];
@@ -2391,10 +2391,10 @@ fn matchFormat(fmt: []const u8, msg: []const u8) bool {
             if (!std.mem.startsWith(u8, rest, lit)) return false;
             rest = rest[lit.len..];
         } else {
-            const at = std.mem.indexOf(u8, rest, lit) orelse return false;
+            const at = std.mem.find(u8, rest, lit) orelse return false;
             rest = rest[at + lit.len ..];
         }
-        const close = std.mem.indexOfScalarPos(u8, f, open, '}') orelse return false;
+        const close = std.mem.findScalarPos(u8, f, open, '}') orelse return false;
         f = f[close + 1 ..];
         first = false;
     }
@@ -2590,7 +2590,7 @@ test matchFormat {
 test "every AstGen error format has a code" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const path = try std.fs.path.join(gpa, &.{ @import("build_options").zig_lib_dir, "std", "zig", "AstGen.zig" });
+    const path = try std.Io.Dir.path.join(gpa, &.{ @import("build_options").zig_lib_dir, "std", "zig", "AstGen.zig" });
     defer gpa.free(path);
     const src = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4 << 20));
     defer gpa.free(src);
@@ -2600,13 +2600,13 @@ test "every AstGen error format has a code" {
     var missing: usize = 0;
     for ([_][]const u8{ "fail", "appendError" }) |prefix| {
         var i: usize = 0;
-        while (std.mem.indexOfPos(u8, src, i, prefix)) |at| : (i = at + prefix.len) {
+        while (std.mem.findPos(u8, src, i, prefix)) |at| : (i = at + prefix.len) {
             if (at > 0 and (std.ascii.isAlphanumeric(src[at - 1]) or src[at - 1] == '_' or src[at - 1] == '"')) continue;
             var name_end = at + prefix.len;
             while (std.ascii.isAlphanumeric(src[name_end])) name_end += 1;
             if (src[name_end] != '(') continue;
-            const stmt_end = std.mem.indexOfScalarPos(u8, src, name_end, ';') orelse break;
-            const q = std.mem.indexOfScalarPos(u8, src[0..stmt_end], name_end, '"') orelse continue;
+            const stmt_end = std.mem.findScalarPos(u8, src, name_end, ';') orelse break;
+            const q = std.mem.findScalarPos(u8, src[0..stmt_end], name_end, '"') orelse continue;
             var e = q + 1;
             while (src[e] != '"') : (e += 1) {
                 if (src[e] == '\\') e += 1;

@@ -66,7 +66,7 @@ fn scan(gpa: Allocator, text: []const u8, comptime V: type, out: *std.StringHash
                 section = .other;
                 continue;
             }
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue;
             const key = std.mem.trim(u8, line[0..colon], " -");
             if (line.len != 0 and line[0] != ' ') {
                 section = if (std.mem.eql(u8, key, "exports") or std.mem.eql(u8, key, "reexports"))
@@ -88,7 +88,7 @@ fn scan(gpa: Allocator, text: []const u8, comptime V: type, out: *std.StringHash
                 continue;
             }
             if (section == .other) continue;
-            const open = std.mem.indexOfScalarPos(u8, line, colon, '[') orelse continue;
+            const open = std.mem.findScalarPos(u8, line, colon, '[') orelse continue;
             const eql = std.mem.eql;
             list = if (eql(u8, key, "targets"))
                 .targets
@@ -113,7 +113,7 @@ fn scan(gpa: Allocator, text: []const u8, comptime V: type, out: *std.StringHash
             if (list == .targets) arm64 = false;
             rest = line[open + 1 ..];
         }
-        const close = std.mem.indexOfScalar(u8, rest, ']');
+        const close = std.mem.findScalar(u8, rest, ']');
         var items = std.mem.tokenizeAny(u8, rest[0 .. close orelse rest.len], ", \r");
         while (items.next()) |item| {
             const name = std.mem.trim(u8, item, "'");
@@ -127,11 +127,11 @@ fn scan(gpa: Allocator, text: []const u8, comptime V: type, out: *std.StringHash
                 // Their symbols, without the leading underscore, as ld64
                 // makes them for an objc2 stub.
                 .objc_classes => {
-                    try put(gpa, V, out, try std.fmt.allocPrint(gpa, "OBJC_CLASS_$_{s}", .{name}), .{ .weak = false, .tls = false });
-                    try put(gpa, V, out, try std.fmt.allocPrint(gpa, "OBJC_METACLASS_$_{s}", .{name}), .{ .weak = false, .tls = false });
+                    try put(gpa, V, out, try gpa.print("OBJC_CLASS_$_{s}", .{name}), .{ .weak = false, .tls = false });
+                    try put(gpa, V, out, try gpa.print("OBJC_METACLASS_$_{s}", .{name}), .{ .weak = false, .tls = false });
                 },
-                .objc_eh_types => try put(gpa, V, out, try std.fmt.allocPrint(gpa, "OBJC_EHTYPE_$_{s}", .{name}), .{ .weak = false, .tls = false }),
-                .objc_ivars => try put(gpa, V, out, try std.fmt.allocPrint(gpa, "OBJC_IVAR_$_{s}", .{name}), .{ .weak = false, .tls = false }),
+                .objc_eh_types => try put(gpa, V, out, try gpa.print("OBJC_EHTYPE_$_{s}", .{name}), .{ .weak = false, .tls = false }),
+                .objc_ivars => try put(gpa, V, out, try gpa.print("OBJC_IVAR_$_{s}", .{name}), .{ .weak = false, .tls = false }),
                 .libraries => try info.reexports.append(gpa, name),
                 .skip, .none => {},
             }

@@ -54,9 +54,9 @@ pub const Resolved = struct {
 /// `baseline` or `native`, then `+feature` and `-feature`).
 pub fn resolve(arena: std.mem.Allocator, io: std.Io, text: []const u8) Resolved {
     const query = std.Target.Query.parse(.{ .arch_os_abi = "x86_64-linux", .cpu_features = text }) catch |err|
-        return .{ .cpu = baseline, .refused = std.fmt.allocPrint(arena, "invalid CPU '{s}' ('-mcpu'): {t}", .{ text, err }) catch "out of memory" };
+        return .{ .cpu = baseline, .refused = arena.print("invalid CPU '{s}' ('-mcpu'): {t}", .{ text, err }) catch "out of memory" };
     const target = std.zig.system.resolveTargetQuery(io, query) catch |err|
-        return .{ .cpu = baseline, .refused = std.fmt.allocPrint(arena, "unable to resolve CPU '{s}' ('-mcpu'): {t}", .{ text, err }) catch "out of memory" };
+        return .{ .cpu = baseline, .refused = arena.print("unable to resolve CPU '{s}' ('-mcpu'): {t}", .{ text, err }) catch "out of memory" };
     if (query.cpu_model == .native) return .{ .cpu = clamp(target.cpu) };
     var names: std.ArrayList(u8) = .empty;
     var avx = false;
@@ -67,7 +67,7 @@ pub fn resolve(arena: std.mem.Allocator, io: std.Io, text: []const u8) Resolved 
         names.appendSlice(arena, f.name) catch {};
     }
     if (names.items.len == 0) return .{ .cpu = target.cpu };
-    return .{ .cpu = baseline, .refused = std.fmt.allocPrint(arena, "bs generates code for x86_64 CPUs up to x86-64-v2 (SSE4.2){s}; '-mcpu {s}' enables {s}", .{
+    return .{ .cpu = baseline, .refused = arena.print("bs generates code for x86_64 CPUs up to x86-64-v2 (SSE4.2){s}; '-mcpu {s}' enables {s}", .{
         if (avx) " and does not support AVX" else "",
         text,
         names.items,
@@ -112,7 +112,7 @@ test resolve {
     try std.testing.expect(resolve(arena, io, "nehalem").cpu.has(.x86, .sse4_2));
     // AVX, explicitly or through a model, and other features beyond v2.
     try std.testing.expectEqualStrings("bs generates code for x86_64 CPUs up to x86-64-v2 (SSE4.2) and does not support AVX; '-mcpu x86_64_v2+avx' enables avx", resolve(arena, io, "x86_64_v2+avx").refused.?);
-    try std.testing.expect(std.mem.indexOf(u8, resolve(arena, io, "haswell").refused.?, "does not support AVX") != null);
+    try std.testing.expect(std.mem.find(u8, resolve(arena, io, "haswell").refused.?, "does not support AVX") != null);
     try std.testing.expectEqualStrings("bs generates code for x86_64 CPUs up to x86-64-v2 (SSE4.2); '-mcpu x86_64_v2+sha' enables sha", resolve(arena, io, "x86_64_v2+sha").refused.?);
     try std.testing.expect(resolve(arena, io, "nosuchcpu").refused != null);
 }

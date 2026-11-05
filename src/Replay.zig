@@ -45,19 +45,19 @@ pack: Pack,
 /// The target's unwind record format, to decode the packs' atoms.
 arch: Atom.Unwind.Arch,
 /// Nodes an edit reaches over reverse edges.
-outdated: std.DynamicBitSetUnmanaged,
+outdated: std.bit_set.Dynamic,
 state: []State,
 /// Inputs whose contents changed, with their instruction maps.
 maps: seeds.InstMaps = .{},
 /// The same inputs, a bit each (`inChangedInput`).
-changed_input: std.DynamicBitSetUnmanaged = .{},
+changed_input: std.bit_set.Dynamic = .{},
 /// The nodes in those inputs, in order (`Manifest.nodesOfInputs`).
 changed_nodes: std.ArrayList(u32) = .empty,
 /// A donor's inputs that are this build's files but whose modules'
 /// `--dep`s give other modules (`Incremental.inputKeyRebound`): their
 /// units are analyzed again, since an `@import` in one gives another
 /// module than the source alone tells.
-rebound: std.DynamicBitSetUnmanaged = .{},
+rebound: std.bit_set.Dynamic = .{},
 /// Changed inputs `lateMap` tried to map.
 late_mapped: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// Whether `lateMap` failed for one, whose old ZIR was gone (the global
@@ -89,7 +89,7 @@ by_path: std.StringHashMapUnmanaged(u32) = .empty,
 /// `has_dependee` is. From the page allocator and never cleared, so that
 /// only the pages of the nodes decoded are touched.
 dependees: []Zcu.Dependee,
-has_dependee: std.DynamicBitSetUnmanaged,
+has_dependee: std.bit_set.Dynamic,
 /// Units' nodes, as their subjects were decoded.
 unit_nodes: std.AutoHashMapUnmanaged(Zcu.AnalUnit, u32) = .empty,
 decoder: results.Decoder(Resolver),
@@ -112,7 +112,7 @@ lazy: bool = false,
 eager_why: ?[]const u8 = null,
 /// The nodes `walk` reached: the units a full build would analyze, whose
 /// atoms the build links.
-visited: std.DynamicBitSetUnmanaged = .{},
+visited: std.bit_set.Dynamic = .{},
 walk_stack: std.ArrayList(u32) = .empty,
 /// Where the walk started (`startWalk`): the root files' namespaces and
 /// the link's node.
@@ -120,23 +120,23 @@ roots: std.ArrayList(u32) = .empty,
 /// Nodes the last build reached that the walk takes as reached without
 /// walking them (`assumeReached`), and the reached nodes it walks; empty
 /// if it walks everything.
-assumed: std.DynamicBitSetUnmanaged = .{},
-cone: std.DynamicBitSetUnmanaged = .{},
+assumed: std.bit_set.Dynamic = .{},
+cone: std.bit_set.Dynamic = .{},
 /// The cone's nodes that assumed nodes name, which `startWalk` visits.
 entries: std.ArrayList(u32) = .empty,
 /// Nodes the walk reached and left to analysis (`walkNode`), which may
 /// not be visited again.
 unvisited: std.ArrayList(u32) = .empty,
 /// Green units whose results are in the Zcu.
-loaded: std.DynamicBitSetUnmanaged = .{},
+loaded: std.bit_set.Dynamic = .{},
 /// Declarations whose data a live node refers to (`walk`), which a red
 /// one's must be lowered again for.
-data_refs: std.DynamicBitSetUnmanaged = .{},
+data_refs: std.bit_set.Dynamic = .{},
 /// Nodes whose subject is gone: what they were about no longer exists.
-dead: std.DynamicBitSetUnmanaged = .{},
+dead: std.bit_set.Dynamic = .{},
 /// Green functions whose line information may have moved: they or a
 /// function they inline are in a changed input (`Incremental.refreshDebug`).
-refresh: std.DynamicBitSetUnmanaged = .{},
+refresh: std.bit_set.Dynamic = .{},
 /// Functions in changed files that a lazy build loaded, by node, with
 /// their declarations now: for those whose recorded declaration does not
 /// map (a container whose fields changed maps none of its declarations),
@@ -150,13 +150,13 @@ timing: bool = false,
 /// By stable hash, each type the manifest's units offered names
 /// (`contributeNames`): its recorded name, from the offer that won, and
 /// the least creator's offer among the units this build kept.
-type_names: std.AutoArrayHashMapUnmanaged(InternPool.Hash, NameEntry) = .empty,
+type_names: std.array_hash_map.Auto(InternPool.Hash, NameEntry) = .empty,
 /// The log's nodes' offers, by type (`collectOffers`): the manifest's
 /// index has only the base's.
 log_offers: std.AutoHashMapUnmanaged(InternPool.Hash, std.ArrayList(u32)) = .empty,
 /// By stable hash, the types whose names, or the offers that give them,
 /// differ from when they were recorded (`contributeNames`).
-renamed: std.AutoArrayHashMapUnmanaged(InternPool.Hash, void) = .empty,
+renamed: std.array_hash_map.Auto(InternPool.Hash, void) = .empty,
 /// File root types by stable hash, which no unit offers names
 /// (`finalName`), made on first use.
 root_types: ?std.AutoHashMapUnmanaged(InternPool.Hash, u32) = null,
@@ -244,7 +244,7 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
     var path_buf: std.ArrayList(u8) = .empty;
     defer path_buf.deinit(gpa);
     const changed = &r.changed;
-    var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m.inputCount());
+    var seen = try std.bit_set.Dynamic.initEmpty(gpa, m.inputCount());
     defer seen.deinit(gpa);
     // Files match inputs by key (`Manifest.Input.key`), which is what the
     // nodes name them by: within a compilation keys and paths correspond,
@@ -322,7 +322,7 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
         r.debug_paths = .empty;
         const d = &r.debug_paths.?;
         for (fe.modules.items) |*mod| {
-            const unit = try std.fs.path.join(gpa, &.{ mod.root_dir, mod.root_file });
+            const unit = try Io.Dir.path.join(gpa, &.{ mod.root_dir, mod.root_file });
             const gop = d.getOrPut(gpa, unit) catch |err| {
                 gpa.free(unit);
                 return err;
@@ -376,7 +376,7 @@ fn assumeReached(r: *Replay) !void {
     const n = m.nodeCount();
     var reached = try m.reachedSet(gpa);
     defer reached.deinit(gpa);
-    var cone = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n);
+    var cone = try std.bit_set.Dynamic.initEmpty(gpa, n);
     defer cone.deinit(gpa);
     var list: std.ArrayList(u32) = .empty;
     defer list.deinit(gpa);
@@ -420,7 +420,7 @@ fn assumeReached(r: *Replay) !void {
             if (!reached.isSet(p)) continue;
             next.clearRetainingCapacity();
             try Incremental.reachNext(m.deps(p), m.nodeRefs(p), &next, gpa);
-            if (std.mem.indexOfScalar(u32, next.items, x) != null) entered = true;
+            if (std.mem.findScalar(u32, next.items, x) != null) entered = true;
             for (m.nodeRefs(p)) |ref| if (ref.kind == .nav and ref.value == x) r.data_refs.set(x);
         };
         if (entered) try r.entries.append(gpa, x);
@@ -797,9 +797,9 @@ fn isChangedPath(r: *Replay, path: []const u8) bool {
     defer path_buf.deinit(r.gpa);
     for (fe.modules.items) |*mod| {
         const dir = mod.root_dir;
-        if (path.len <= dir.len or !std.mem.startsWith(u8, path, dir) or path[dir.len] != std.fs.path.sep) continue;
+        if (path.len <= dir.len or !std.mem.startsWith(u8, path, dir) or path[dir.len] != Io.Dir.path.sep) continue;
         path_buf.clearRetainingCapacity();
-        path_buf.print(r.gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse dir, std.fs.path.sep, path[dir.len + 1 ..] }) catch return true;
+        path_buf.print(r.gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse dir, Io.Dir.path.sep, path[dir.len + 1 ..] }) catch return true;
         const input = r.by_path.get(path_buf.items) orelse continue;
         return r.maps.maps.contains(input);
     }
@@ -1114,7 +1114,7 @@ fn decodeDependee(r: *Replay, d: u32, tag: Tag) !?Zcu.Dependee {
         .embed_file => blk: {
             if (s != .embed_file) return null;
             const key = s.embed_file;
-            const colon = std.mem.indexOfScalar(u8, key, ':') orelse return null;
+            const colon = std.mem.findScalar(u8, key, ':') orelse return null;
             const mod = for (zcu.fe.modules.items, 0..) |mo, i| {
                 if (std.mem.eql(u8, mo.name, key[0..colon])) break @as(Frontend.Module.Index, @fromBackingInt(@as(u32, @intCast(i))));
             } else return null;
@@ -1442,7 +1442,7 @@ pub fn contributeNames(r: *Replay, zcu: *Zcu) !void {
     // The types that matter: those this build has, and those whose
     // winning offer is in a node the build did not keep (its least
     // creator may have left). Most of the manifest's are neither.
-    var wanted: std.AutoArrayHashMapUnmanaged(InternPool.Hash, void) = .empty;
+    var wanted: std.array_hash_map.Auto(InternPool.Hash, void) = .empty;
     defer wanted.deinit(gpa);
     for (0..ip.locals.len) |local| for (ip.localNames(local)) |name| {
         if (name.ty != .none) try wanted.put(gpa, ip.stableHash(name.ty), {});
@@ -1549,7 +1549,7 @@ fn checkNameReads(r: *Replay, zcu: *Zcu) !void {
                 // so a renamed type's old name if it changed.
                 for (r.renamed.keys()) |h| {
                     const old = r.type_names.get(h).?.won orelse return r.fullBuild("a kept unit read a name that may have changed");
-                    if (std.mem.indexOf(u8, rd.name, old) != null) return r.fullBuild("a kept unit read a name that may have changed");
+                    if (std.mem.find(u8, rd.name, old) != null) return r.fullBuild("a kept unit read a name that may have changed");
                 }
                 continue;
             };
@@ -1653,7 +1653,7 @@ fn collectOffers(r: *Replay, tys: []const InternPool.Hash) !void {
     const gpa = r.gpa;
     const m = r.m;
     const changed = &m.overlay.nodes;
-    var nodes: std.AutoArrayHashMapUnmanaged(u32, void) = .empty;
+    var nodes: std.array_hash_map.Auto(u32, void) = .empty;
     defer nodes.deinit(gpa);
     for (tys) |ty| {
         const gop = try r.type_names.getOrPut(gpa, ty);
@@ -1700,7 +1700,7 @@ fn collectOffers(r: *Replay, tys: []const InternPool.Hash) !void {
 }
 
 /// Adds to `wanted` the types whose winning offer is node `i`'s.
-fn addOrphans(r: *const Replay, wanted: *std.AutoArrayHashMapUnmanaged(InternPool.Hash, void), i: u32) !void {
+fn addOrphans(r: *const Replay, wanted: *std.array_hash_map.Auto(InternPool.Hash, void), i: u32) !void {
     var reader: results.Names.Reader = .init(r.m.typeNames(i));
     while (reader.nextOffer()) |o| if (o.won.len != 0) try wanted.put(r.gpa, o.ty, {});
 }

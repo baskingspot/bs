@@ -49,7 +49,7 @@ const Loop = struct {
 /// Unrolls the loops that qualify; returns how many.
 pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir) Allocator.Error!u32 {
     const tags = ir.instructions.items(.tag);
-    if (std.mem.indexOfScalar(Inst.Tag, tags, .loop) == null) return 0;
+    if (std.mem.findScalar(Inst.Tag, tags, .loop) == null) return 0;
     const uses = try gpa.alloc(u32, ir.instructions.len);
     defer gpa.free(uses);
     @memset(uses, 0);

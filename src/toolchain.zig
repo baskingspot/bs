@@ -24,17 +24,17 @@ pub fn findZig(arena: std.mem.Allocator, io: Io, environ: *const std.process.Env
     if (environ.get("PATH")) |path| {
         var it = std.mem.tokenizeScalar(u8, path, ':');
         while (it.next()) |dir| {
-            const p = std.fs.path.join(arena, &.{ dir, "zig" }) catch continue;
+            const p = Io.Dir.path.join(arena, &.{ dir, "zig" }) catch continue;
             if (cwd.access(io, p, .{ .execute = true })) |_| return .{ .found = p, .looked = p } else |_| {}
         }
     }
     const home = environ.get("HOME") orelse return .{ .found = null, .looked = "~/.cache/bs" };
     const host = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag);
     for ([_][]const u8{ "zig-" ++ version, "zig-" ++ host ++ "-" ++ version }) |sub| {
-        const p = std.fs.path.join(arena, &.{ home, ".cache", "bs", sub, "zig" }) catch continue;
+        const p = Io.Dir.path.join(arena, &.{ home, ".cache", "bs", sub, "zig" }) catch continue;
         if (cwd.access(io, p, .{ .execute = true })) |_| return .{ .found = p, .looked = p } else |_| {}
     }
-    return .{ .found = null, .looked = std.fs.path.join(arena, &.{ home, ".cache", "bs", "zig-" ++ host ++ "-" ++ version }) catch "~/.cache/bs" };
+    return .{ .found = null, .looked = Io.Dir.path.join(arena, &.{ home, ".cache", "bs", "zig-" ++ host ++ "-" ++ version }) catch "~/.cache/bs" };
 }
 
 /// `zig`'s lib directory if it is upstream's 0.17.1, else why not.
@@ -50,25 +50,25 @@ fn check(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.M
     const memo: ?[]const u8 = memo: {
         const real = cwd.realPathFileAlloc(io, zig, arena) catch break :memo null;
         const st = cwd.statFile(io, real, .{}) catch break :memo null;
-        const key = try std.fmt.allocPrint(arena, "{s}\x00{d}\x00{d}\x00{d}\x00{d}", .{ real, st.inode, st.size, st.mtime.toNanoseconds(), st.ctime.toNanoseconds() });
-        break :memo try std.fmt.allocPrint(arena, "{s}/bs/zig/{x:0>32}", .{ global_cache, cache.hash(0, key) });
+        const key = try arena.print("{s}\x00{d}\x00{d}\x00{d}\x00{d}", .{ real, st.inode, st.size, st.mtime.toNanoseconds(), st.ctime.toNanoseconds() });
+        break :memo try arena.print("{s}/bs/zig/{x:0>32}", .{ global_cache, cache.hash(0, key) });
     };
     // `zig` may be a version manager's shim that picks another zig later,
     // but the lib directory it named is still 0.17.1's while it exists.
     if (memo) |m| if (cwd.readFileAlloc(io, m, arena, .limited(4096))) |lib| {
-        if (cwd.access(io, try std.fs.path.join(arena, &.{ lib, "std", "std.zig" }), .{})) |_| return .{ .lib_dir = lib } else |_| {}
+        if (cwd.access(io, try Io.Dir.path.join(arena, &.{ lib, "std", "std.zig" }), .{})) |_| return .{ .lib_dir = lib } else |_| {}
     } else |_| {};
 
     const ver = std.process.run(arena, io, .{ .argv = &.{ zig, "version" } }) catch |err|
-        return .{ .bad = try std.fmt.allocPrint(arena, "unable to run '{s}': {t}", .{ zig, err }) };
+        return .{ .bad = try arena.print("unable to run '{s}': {t}", .{ zig, err }) };
     const got = std.mem.trim(u8, ver.stdout, " \r\n");
     if (!ver.term.success() or !std.mem.eql(u8, got, version))
-        return .{ .bad = try std.fmt.allocPrint(arena, "'{s}' is version '{s}'", .{ zig, got }) };
+        return .{ .bad = try arena.print("'{s}' is version '{s}'", .{ zig, got }) };
     // Its own lib directory, not one ZIG_LIB_DIR names.
     var env = try environ.clone(arena);
     _ = env.swapRemove("ZIG_LIB_DIR");
     const res = std.process.run(arena, io, .{ .argv = &.{ zig, "env" }, .environ_map = &env }) catch |err|
-        return .{ .bad = try std.fmt.allocPrint(arena, "unable to run '{s} env': {t}", .{ zig, err }) };
+        return .{ .bad = try arena.print("unable to run '{s} env': {t}", .{ zig, err }) };
     var diagnostics: std.zon.parse.Diagnostics = undefined;
     const parsed = std.zon.parse.fromSlice(struct { lib_dir: []const u8 }, .{
         .gpa = arena,
@@ -76,9 +76,9 @@ fn check(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.M
         .source = try arena.dupeSentinel(u8, res.stdout, 0),
         .diagnostics = &diagnostics,
         .ignore_unknown_fields = true,
-    }) catch return .{ .bad = try std.fmt.allocPrint(arena, "'{s} env' printed no lib directory", .{zig}) };
+    }) catch return .{ .bad = try arena.print("'{s} env' printed no lib directory", .{zig}) };
     if (memo) |m| write: {
-        cwd.createDirPath(io, std.fs.path.dirname(m).?) catch break :write;
+        cwd.createDirPath(io, Io.Dir.path.dirname(m).?) catch break :write;
         var atomic = cwd.createFileAtomic(io, m, .{ .replace = true }) catch break :write;
         defer atomic.deinit(io);
         atomic.file.writeStreamingAll(io, parsed.lib_dir) catch break :write;
@@ -121,12 +121,12 @@ fn defaultLibDir(arena: std.mem.Allocator, io: Io, environ: *const std.process.E
         .lib_dir => |lib| return .{ .path = lib },
         .bad => |why| why,
     } else null;
-    const built = try std.fs.path.join(arena, &.{ build_options.zig_lib_dir, "std", "std.zig" });
+    const built = try Io.Dir.path.join(arena, &.{ build_options.zig_lib_dir, "std", "std.zig" });
     if (Io.Dir.cwd().access(io, built, .{})) |_| return .{ .path = build_options.zig_lib_dir } else |_| {}
     const need = "bs needs upstream zig " ++ version ++ ", whose std library it compiles";
     const fix = "install zig " ++ version ++ " and put it on PATH (or set BS_ZIG to it), or pass --zig-lib-dir <its lib directory>";
     return .{ .missing = if (bad) |why|
-        try std.fmt.allocPrint(arena, "{s}, and {s}; {s}", .{ need, why, fix })
+        try arena.print("{s}, and {s}; {s}", .{ need, why, fix })
     else
-        try std.fmt.allocPrint(arena, "{s}, and found no zig in BS_ZIG, on PATH, or at {s}; {s}", .{ need, zig.looked, fix }) };
+        try arena.print("{s}, and found no zig in BS_ZIG, on PATH, or at {s}; {s}", .{ need, zig.looked, fix }) };
 }

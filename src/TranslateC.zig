@@ -283,10 +283,10 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     const cwd_path = try std.process.currentPathAlloc(io, arena);
     const cwd = Io.Dir.cwd();
     const start_ns = Io.Clock.real.now(io).toNanoseconds();
-    const lib = try std.fs.path.resolve(arena, &.{ cwd_path, req.zig_lib.path });
-    const global = try std.fs.path.resolve(arena, &.{ cwd_path, req.cache_dirs.global });
+    const lib = try Io.Dir.path.resolveAlloc(arena, &.{ cwd_path, req.zig_lib.path });
+    const global = try Io.Dir.path.resolveAlloc(arena, &.{ cwd_path, req.cache_dirs.global });
     const local = req.cache_dirs.local;
-    const source = try std.fs.path.resolve(arena, &.{ cwd_path, req.source });
+    const source = try Io.Dir.path.resolveAlloc(arena, &.{ cwd_path, req.source });
 
     // As the build runner, translate-c from the default lib directory is
     // trusted not to change.
@@ -297,10 +297,10 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     // last so that the key does not depend on them.
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{
-        exe,                                                    "--zig-integration",
-        try std.fmt.allocPrint(arena, "--zig-lib={s}", .{lib}), "--",
-        "-x",                                                   "c",
-        "-isystem",                                             try std.fs.path.join(arena, &.{ lib, "compiler", "aro", "include" }),
+        exe,                                      "--zig-integration",
+        try arena.print("--zig-lib={s}", .{lib}), "--",
+        "-x",                                     "c",
+        "-isystem",                               try Io.Dir.path.join(arena, &.{ lib, "compiler", "aro", "include" }),
     });
     // Darwin code is always position-independent.
     const macos = req.target == .aarch64_macos;
@@ -311,12 +311,12 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
         "-nostdinc",
     });
     var target = if (macos) try CSource.macosTarget(io, req.macos_version) else target: {
-        const query_text = if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "{t}-linux-gnu.{f}", .{ req.cpu.arch, v }) else try std.fmt.allocPrint(arena, "{t}-linux-{s}", .{ req.cpu.arch, if (req.musl) "musl" else "none" });
+        const query_text = if (req.glibc_version) |v| try arena.print("{t}-linux-gnu.{f}", .{ req.cpu.arch, v }) else try arena.print("{t}-linux-{s}", .{ req.cpu.arch, if (req.musl) "musl" else "none" });
         break :target try std.zig.system.resolveTargetQuery(io, try std.Target.Query.parse(.{ .arch_os_abi = query_text, .cpu_features = "baseline" }));
     };
     target.cpu = req.cpu;
-    if (req.link_libc and !macos and !req.musl) try argv.append(arena, try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{req.glibc_version.?.minor}));
-    try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ lib, "include" }) });
+    if (req.link_libc and !macos and !req.musl) try argv.append(arena, try arena.print("-D__GLIBC_MINOR__={d}", .{req.glibc_version.?.minor}));
+    try argv.appendSlice(arena, &.{ "-isystem", try Io.Dir.path.join(arena, &.{ lib, "include" }) });
     const libc_dirs: CSource.LibcDirs = if (req.link_libc) try CSource.libcIncludeDirs(arena, io, init.environ_map, global, lib, &target, req.native_abi) else .{ .includes = &.{} };
     for (libc_dirs.includes) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
     for (req.native_includes) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
@@ -333,9 +333,9 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     const key = try ToolRecord.key(arena, io, "translate-c", &std.fmt.bytesToHex(@as([16]u8, @bitCast(exe_hash)), .lower), lib, key_args.items);
     const digest: [16]u8 = @bitCast(key);
     const hex = std.fmt.bytesToHex(digest, .lower);
-    const record_path = try std.fs.path.join(arena, &.{ local, "bs", "tc", &hex });
-    const out_dir = try std.fs.path.join(arena, &.{ local, "o", &hex });
-    const out_path = try std.fs.path.join(arena, &.{ out_dir, try std.fmt.allocPrint(arena, "{s}.zig", .{std.fs.path.stem(source)}) });
+    const record_path = try Io.Dir.path.join(arena, &.{ local, "bs", "tc", &hex });
+    const out_dir = try Io.Dir.path.join(arena, &.{ local, "o", &hex });
+    const out_path = try Io.Dir.path.join(arena, &.{ out_dir, try arena.print("{s}.zig", .{Io.Dir.path.stem(source)}) });
 
     var old_output: ?cache.Hash = null;
     if (try ToolRecord.check(arena, io, record_path, out_path, start_ns, arena, null)) |c| switch (c) {
@@ -345,13 +345,13 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
 
     // Translate into the local cache's `bs/tmp`, then move the output
     // into place.
-    const tmp_dir = try std.fs.path.join(arena, &.{ local, "bs", "tmp" });
+    const tmp_dir = try Io.Dir.path.join(arena, &.{ local, "bs", "tmp" });
     try cwd.createDirPath(io, tmp_dir);
     var rand: [8]u8 = undefined;
     io.random(&rand);
-    const tmp_base = try std.fs.path.join(arena, &.{ tmp_dir, &std.fmt.bytesToHex(rand, .lower) });
-    const dep_path = try std.fmt.allocPrint(arena, "{s}-tc.d", .{tmp_base});
-    const tmp_out = try std.fmt.allocPrint(arena, "{s}-tc.zig", .{tmp_base});
+    const tmp_base = try Io.Dir.path.join(arena, &.{ tmp_dir, &std.fmt.bytesToHex(rand, .lower) });
+    const dep_path = try arena.print("{s}-tc.d", .{tmp_base});
+    const tmp_out = try arena.print("{s}-tc.zig", .{tmp_base});
     defer cwd.deleteFile(io, dep_path) catch {};
     defer cwd.deleteFile(io, tmp_out) catch {};
     // The source as given, as upstream, so that diagnostics name it so.
@@ -409,10 +409,10 @@ fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, tru
     const io = init.io;
     const seed, _ = try Incremental.compilationKey(arena, io, &.{}, lib, "x86_64-linux");
     const dir_hash = cache.hash(3, try std.mem.concat(arena, u8, &.{ std.mem.asBytes(&seed), lib }));
-    const dir = try std.fmt.allocPrint(arena, "{s}/bs/o/{x:0>32}", .{ global, dir_hash });
-    const exe = try std.fs.path.join(arena, &.{ dir, "translate-c" });
-    const stamp = try std.fs.path.join(arena, &.{ dir, "translate-c.stat" });
-    const hash_path = try std.fs.path.join(arena, &.{ dir, "translate-c.hash" });
+    const dir = try arena.print("{s}/bs/o/{x:0>32}", .{ global, dir_hash });
+    const exe = try Io.Dir.path.join(arena, &.{ dir, "translate-c" });
+    const stamp = try Io.Dir.path.join(arena, &.{ dir, "translate-c.stat" });
+    const hash_path = try Io.Dir.path.join(arena, &.{ dir, "translate-c.hash" });
     try Io.Dir.cwd().createDirPath(io, dir);
     const use = cache.useTool(io, dir) catch null;
     errdefer if (use) |f| f.close(io);
@@ -435,10 +435,10 @@ fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, tru
         "-OReleaseSafe",
         "--dep",
         "aro",
-        try std.fmt.allocPrint(arena, "-Mroot={s}/compiler/translate-c/main.zig", .{lib}),
+        try arena.print("-Mroot={s}/compiler/translate-c/main.zig", .{lib}),
         "-OReleaseSafe",
-        try std.fmt.allocPrint(arena, "-Maro={s}/compiler/aro/aro.zig", .{lib}),
-    }, "Compiling translate-c (first time setup)", "translate-c", try std.fmt.allocPrint(arena, "{s}/compiler/translate-c/main.zig", .{lib}), try std.fmt.allocPrint(arena, "{s}/compiler", .{lib}));
+        try arena.print("-Maro={s}/compiler/aro/aro.zig", .{lib}),
+    }, "Compiling translate-c (first time setup)", "translate-c", try arena.print("{s}/compiler/translate-c/main.zig", .{lib}), try arena.print("{s}/compiler", .{lib}));
     // The binary's contents, hashed again only when it changed.
     if (BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h, use };
     const content = cache.hash(0, try Io.Dir.cwd().readFileAlloc(io, exe, arena, .unlimited));

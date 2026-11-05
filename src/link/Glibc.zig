@@ -51,7 +51,7 @@ pub fn interp(arch: Arch) []const u8 {
 }
 
 fn soname(arch: Arch, lib: u8) []const u8 {
-    if (lib == lib_ld) return std.fs.path.basename(interp(arch));
+    if (lib == lib_ld) return std.Io.Dir.path.basename(interp(arch));
     return libs[lib].soname;
 }
 
@@ -343,9 +343,9 @@ pub fn get(g: *const Glibc, name: []const u8) ?Symbol {
 pub fn versionName(g: *const Glibc, arena: Allocator, index: u8) Allocator.Error![]const u8 {
     const v = g.versions[index];
     return if (v.patch == 0)
-        std.fmt.allocPrint(arena, "GLIBC_{d}.{d}", .{ v.major, v.minor })
+        arena.print("GLIBC_{d}.{d}", .{ v.major, v.minor })
     else
-        std.fmt.allocPrint(arena, "GLIBC_{d}.{d}.{d}", .{ v.major, v.minor, v.patch });
+        arena.print("GLIBC_{d}.{d}.{d}", .{ v.major, v.minor, v.patch });
 }
 
 const Reader = struct {
@@ -365,7 +365,7 @@ const Reader = struct {
     }
 
     fn string(r: *Reader) Error![]const u8 {
-        const end = std.mem.indexOfScalarPos(u8, r.bytes, r.pos, 0) orelse return error.InvalidAbilists;
+        const end = std.mem.findScalarPos(u8, r.bytes, r.pos, 0) orelse return error.InvalidAbilists;
         defer r.pos = end + 1;
         return r.bytes[r.pos..end];
     }
@@ -387,7 +387,7 @@ test load {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const build_options = @import("build_options");
-    const path = try std.fs.path.join(gpa, &.{ build_options.zig_lib_dir, abilists_path });
+    const path = try std.Io.Dir.path.join(gpa, &.{ build_options.zig_lib_dir, abilists_path });
     defer gpa.free(path);
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
     defer gpa.free(contents);

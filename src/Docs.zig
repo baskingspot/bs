@@ -28,7 +28,7 @@ pub fn emit(gpa: Allocator, io: Io, zig_lib_dir: []const u8, out_path: []const u
     var lib_dir = try Io.Dir.cwd().openDir(io, zig_lib_dir, .{});
     defer lib_dir.close(io);
     for ([_][]const u8{ "docs/main.js", "docs/index.html" }) |sub_path|
-        try lib_dir.copyFile(sub_path, out_dir, std.fs.path.basename(sub_path), io, .{});
+        try lib_dir.copyFile(sub_path, out_dir, Io.Dir.path.basename(sub_path), io, .{});
     // Executable, as upstream's, which copies the viewer its linker wrote.
     try out_dir.writeFile(io, .{ .sub_path = "main.wasm", .data = viewer, .flags = .{ .permissions = .executable_file } });
 
@@ -39,14 +39,14 @@ pub fn emit(gpa: Allocator, io: Io, zig_lib_dir: []const u8, out_path: []const u
     const Seen = struct { id: usize, name: []const u8, dir: []const u8 };
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(gpa);
-    const std_dir = try std.fs.path.join(gpa, &.{ zig_lib_dir, "std" });
+    const std_dir = try Io.Dir.path.join(gpa, &.{ zig_lib_dir, "std" });
     defer gpa.free(std_dir);
-    const std_root = try std.fs.path.resolve(gpa, &.{ zig_lib_dir, "std", "std.zig" });
+    const std_root = try Io.Dir.path.resolveAlloc(gpa, &.{ zig_lib_dir, "std", "std.zig" });
     defer gpa.free(std_root);
-    const root = try std.fs.path.resolve(gpa, &.{opts.root_src_path});
+    const root = try Io.Dir.path.resolveAlloc(gpa, &.{opts.root_src_path});
     defer gpa.free(root);
     if (!std.mem.eql(u8, root, std_root))
-        try seen.append(gpa, .{ .id = 0, .name = root_name, .dir = std.fs.path.dirname(opts.root_src_path) orelse "." });
+        try seen.append(gpa, .{ .id = 0, .name = root_name, .dir = Io.Dir.path.dirname(opts.root_src_path) orelse "." });
     try seen.append(gpa, .{ .id = 1, .name = "std", .dir = std_dir });
 
     var tar_file = try out_dir.createFile(io, "sources.tar", .{});
@@ -63,14 +63,14 @@ pub fn emit(gpa: Allocator, io: Io, zig_lib_dir: []const u8, out_path: []const u
             else => opts.modules[m.id - 2].deps,
         };
         for (deps) |spec| {
-            const eq = std.mem.indexOfScalar(u8, spec, '=');
+            const eq = std.mem.findScalar(u8, spec, '=');
             const target = if (eq) |e| spec[e + 1 ..] else spec;
             const k = for (opts.modules, 0..) |om, k| {
                 if (std.mem.eql(u8, om.name, target)) break k;
             } else continue;
             for (seen.items) |s| {
                 if (s.id == k + 2) break;
-            } else try seen.append(gpa, .{ .id = k + 2, .name = target, .dir = std.fs.path.dirname(opts.modules[k].path) orelse "." });
+            } else try seen.append(gpa, .{ .id = k + 2, .name = target, .dir = Io.Dir.path.dirname(opts.modules[k].path) orelse "." });
         }
     }
     try tar_writer.end();

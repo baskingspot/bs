@@ -67,9 +67,9 @@ pub fn parse(arena: Allocator, path: []const u8, source: []const u8) Allocator.E
         if (anonymous and nodes.items.len != 0 or !anonymous and nodes.items.len == 1 and nodes.items[0].name.len == 0)
             return .{ .err = .{ .offset = tok.offset, .msg = "an anonymous version node must be the script's only node" } };
         if (!anonymous) {
-            if (tok.quoted or isPunct(tok.text)) return .{ .err = .{ .offset = tok.offset, .msg = try std.fmt.allocPrint(arena, "expected a version node name or '{{', found '{s}'", .{tok.text}) } };
+            if (tok.quoted or isPunct(tok.text)) return .{ .err = .{ .offset = tok.offset, .msg = try arena.print("expected a version node name or '{{', found '{s}'", .{tok.text}) } };
             for (nodes.items) |n| if (std.mem.eql(u8, n.name, tok.text))
-                return .{ .err = .{ .offset = tok.offset, .msg = try std.fmt.allocPrint(arena, "version node '{s}' is defined twice", .{tok.text}) } };
+                return .{ .err = .{ .offset = tok.offset, .msg = try arena.print("version node '{s}' is defined twice", .{tok.text}) } };
             if (p.expect("{")) |e| return .{ .err = e };
         }
         var globals: std.ArrayList(Pattern) = .empty;
@@ -80,7 +80,7 @@ pub fn parse(arena: Allocator, path: []const u8, source: []const u8) Allocator.E
             const t = p.next() orelse return .{ .err = .{ .offset = @intCast(source.len), .msg = "expected ';' after the version node" } };
             if (t.err) |msg| return .{ .err = .{ .offset = t.offset, .msg = msg } };
             if (std.mem.eql(u8, t.text, ";") and !t.quoted) break;
-            if (anonymous or t.quoted or isPunct(t.text)) return .{ .err = .{ .offset = t.offset, .msg = try std.fmt.allocPrint(arena, "expected ';' after the version node, found '{s}'", .{t.text}) } };
+            if (anonymous or t.quoted or isPunct(t.text)) return .{ .err = .{ .offset = t.offset, .msg = try arena.print("expected ';' after the version node, found '{s}'", .{t.text}) } };
         }
         try nodes.append(arena, .{ .name = if (anonymous) "" else tok.text, .globals = globals.items, .locals = locals.items });
     }
@@ -203,7 +203,7 @@ fn matchSet(pat: []const u8, c: u8) ?struct { len: usize, matched: bool } {
 }
 
 fn isPunct(t: []const u8) bool {
-    return t.len == 1 and std.mem.indexOfScalar(u8, "{};:", t[0]) != null;
+    return t.len == 1 and std.mem.findScalar(u8, "{};:", t[0]) != null;
 }
 
 const Parser = struct {
@@ -221,7 +221,7 @@ const Parser = struct {
             } else if (c == '#') {
                 while (p.at < s.len and s[p.at] != '\n') p.at += 1;
             } else if (c == '/' and p.at + 1 < s.len and s[p.at + 1] == '*') {
-                const end = std.mem.indexOfPos(u8, s, p.at + 2, "*/") orelse {
+                const end = std.mem.findPos(u8, s, p.at + 2, "*/") orelse {
                     const at = p.at;
                     p.at = s.len;
                     return .{ .text = "", .offset = @intCast(at), .err = "unterminated comment" };
@@ -232,7 +232,7 @@ const Parser = struct {
         if (p.at >= s.len) return null;
         const start = p.at;
         if (s[start] == '"') {
-            const end = std.mem.indexOfScalarPos(u8, s, start + 1, '"') orelse {
+            const end = std.mem.findScalarPos(u8, s, start + 1, '"') orelse {
                 p.at = s.len;
                 return .{ .text = "", .offset = @intCast(start), .err = "unterminated quoted pattern" };
             };
@@ -243,7 +243,7 @@ const Parser = struct {
             p.at += 1;
             return .{ .text = s[start .. start + 1], .offset = @intCast(start) };
         }
-        while (p.at < s.len and !std.ascii.isWhitespace(s[p.at]) and std.mem.indexOfScalar(u8, "{};:\"", s[p.at]) == null and
+        while (p.at < s.len and !std.ascii.isWhitespace(s[p.at]) and std.mem.findScalar(u8, "{};:\"", s[p.at]) == null and
             !(s[p.at] == '/' and p.at + 1 < s.len and s[p.at + 1] == '*')) p.at += 1;
         return .{ .text = s[start..p.at], .offset = @intCast(start) };
     }
@@ -274,7 +274,7 @@ const Parser = struct {
                     const lang = p.next() orelse return .{ .offset = t.offset, .msg = "expected a language after 'extern'" };
                     if (!lang.quoted) return .{ .offset = lang.offset, .msg = "expected a quoted language after 'extern', such as \"C\"" };
                     if (!std.mem.eql(u8, lang.text, "C"))
-                        return .{ .offset = lang.offset, .msg = try std.fmt.allocPrint(arena, "bs does not support extern \"{s}\" blocks in version scripts, which need demangled names; list the mangled names instead", .{lang.text}) };
+                        return .{ .offset = lang.offset, .msg = try arena.print("bs does not support extern \"{s}\" blocks in version scripts, which need demangled names; list the mangled names instead", .{lang.text}) };
                     if (p.expect("{")) |e| return e;
                     // The block's patterns go where its node's are.
                     const block = if (into == globals) try p.body(arena, globals, globals) else try p.body(arena, locals, locals);
@@ -282,10 +282,10 @@ const Parser = struct {
                     if (p.expect(";")) |e| return e;
                     continue;
                 } else if (isPunct(t.text)) {
-                    return .{ .offset = t.offset, .msg = try std.fmt.allocPrint(arena, "expected a symbol pattern, found '{s}'", .{t.text}) };
+                    return .{ .offset = t.offset, .msg = try arena.print("expected a symbol pattern, found '{s}'", .{t.text}) };
                 }
             }
-            const wildcard = !t.quoted and std.mem.indexOfAny(u8, t.text, "*?[") != null;
+            const wildcard = !t.quoted and std.mem.findAny(u8, t.text, "*?[") != null;
             try into.append(arena, .{ .text = t.text, .wildcard = wildcard, .offset = t.offset });
             // A pattern ends at `;`, or at the `}` closing an `extern`
             // block, as in lld.
@@ -297,7 +297,7 @@ const Parser = struct {
                     p.at = save;
                     continue;
                 }
-                return .{ .offset = end.offset, .msg = try std.fmt.allocPrint(arena, "expected ';' after the symbol pattern '{s}'", .{t.text}) };
+                return .{ .offset = end.offset, .msg = try arena.print("expected ';' after the symbol pattern '{s}'", .{t.text}) };
             }
         }
     }
@@ -380,6 +380,6 @@ test "a malformed script fails at the offending token" {
         const src, const at, const msg = case;
         const e = (try parse(arena, "t.map", src)).err;
         try std.testing.expectEqualStrings(msg, e.msg);
-        try std.testing.expectEqual(if (at.len == 0) src.len else std.mem.lastIndexOf(u8, src, at).?, e.offset);
+        try std.testing.expectEqual(if (at.len == 0) src.len else std.mem.findLast(u8, src, at).?, e.offset);
     }
 }

@@ -163,7 +163,7 @@ pub fn commit(arena: std.mem.Allocator, io: Io, c: Commit) ![]const u8 {
         .prereq, .prereq_must_resolve => {
             var buf: std.ArrayList(u8) = .empty;
             if (tok == .prereq_must_resolve) try tok.resolve(arena, &buf);
-            const p = try std.fs.path.resolve(arena, &.{ cwd_path, if (tok == .prereq) tok.prereq else buf.items });
+            const p = try Io.Dir.path.resolveAlloc(arena, &.{ cwd_path, if (tok == .prereq) tok.prereq else buf.items });
             if (!(try seen.getOrPut(arena, p)).found_existing) try paths.append(arena, p);
         },
         else => return error.InvalidDepFile,
@@ -191,12 +191,12 @@ pub fn commit(arena: std.mem.Allocator, io: Io, c: Commit) ![]const u8 {
         break :same std.mem.eql(u8, old, output);
     };
     if (!same) {
-        try cwd.createDirPath(io, std.fs.path.dirname(c.out_path).?);
+        try cwd.createDirPath(io, Io.Dir.path.dirname(c.out_path).?);
         try cwd.rename(c.tmp_out, cwd, c.out_path, io);
     }
     // Then the record, so that a record never names an output that is not
     // there.
-    try cwd.createDirPath(io, std.fs.path.dirname(c.record_path).?);
+    try cwd.createDirPath(io, Io.Dir.path.dirname(c.record_path).?);
     const header: Header = .{ .output_hash = output_hash, .n = @intCast(entries.items.len), .paths_len = @intCast(path_bytes.items.len) };
     try cache.writeReplace(io, cwd, c.record_path, &.{ std.mem.asBytes(&header), std.mem.sliceAsBytes(entries.items), path_bytes.items });
     return std.mem.join(arena, "\x00", paths.items);

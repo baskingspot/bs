@@ -33,7 +33,7 @@ file_root_types: std.ArrayList(InternPool.Index) = .empty,
 namespaces: std.ArrayList(Namespace) = .empty,
 /// Dependencies recorded per unit by `Sema.declareDependency`. Nothing
 /// persists them yet; the on-disk cache (milestone 6) will.
-deps: std.AutoArrayHashMapUnmanaged(AnalUnit, []const Dependee) = .empty,
+deps: std.array_hash_map.Auto(AnalUnit, []const Dependee) = .empty,
 /// For units some of whose `deps` only the comptime evaluator's lowering
 /// read (see "Comptime evaluator" in docs/slop/architecture.md): the indices of
 /// those, ascending. Such an edge counts for invalidation, but the unit
@@ -63,7 +63,7 @@ uav_refs: std.AutoHashMapUnmanaged(InternPool.Index, InternPool.Index) = .empty,
 /// Sema-only.
 ref_ptr_types: std.AutoHashMapUnmanaged(InternPool.Index, InternPool.Index) = .empty,
 /// Analysis state of runtime function bodies.
-funcs: std.AutoArrayHashMapUnmanaged(InternPool.Index, FuncState) = .empty,
+funcs: std.array_hash_map.Auto(InternPool.Index, FuncState) = .empty,
 func_queue: std.ArrayList(InternPool.Index) = .empty,
 /// Declarations whose address code took (`ensureNavTy`), whose values
 /// `analyzeAll` resolves later, as upstream queues a `nav_val` unit.
@@ -89,7 +89,7 @@ dep_stack: std.ArrayList(Sema.DepFrame) = .empty,
 phase_deps: std.AutoHashMapUnmanaged(AnalUnit, PhaseDeps) = .empty,
 /// Which unit queued which function (`queueFuncFrom`), for the on-disk
 /// cache: a unit loaded from it queues them again.
-func_refs: std.AutoArrayHashMapUnmanaged(FuncRef, void) = .empty,
+func_refs: std.array_hash_map.Auto(FuncRef, void) = .empty,
 /// For each analyzed unit, the first unit that referred to it and where:
 /// the reference trace of its errors.
 referenced_by: std.AutoHashMapUnmanaged(AnalUnit, Reference) = .empty,
@@ -115,7 +115,7 @@ return_error: InternPool.Index = .none,
 /// error set), waiting to be passed to the sink.
 ready_irs: std.ArrayList(Ir) = .empty,
 /// `comptime` declarations, analyzed once each.
-comptime_decls: std.AutoArrayHashMapUnmanaged(ComptimeDecl, enum { queued, done }) = .empty,
+comptime_decls: std.array_hash_map.Auto(ComptimeDecl, enum { queued, done }) = .empty,
 /// Memoized comptime calls, keyed by `Sema.comptimeCallKey`.
 comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, Memo) = .empty,
 /// The comptime evaluator's state of each function called at comptime,
@@ -154,12 +154,12 @@ exports: std.ArrayList(Export) = .empty,
 /// (src/codegen/global_asm.zig).
 global_asm: std.ArrayList(GlobalAsm) = .empty,
 /// Files read by `@embedFile`, each once; `Dependee.embed_file` indexes it.
-embed_files: std.StringArrayHashMapUnmanaged(EmbedFile) = .empty,
+embed_files: std.array_hash_map.String(EmbedFile) = .empty,
 /// compiler_rt functions that CodeGen calls and the functions and
 /// variables the link resolves names to, by the stable key of their
 /// declaration; `analyzeAll` resolves each to its declaration (`.none`
 /// until then) and queues a function's body.
-rt_helpers: std.StringArrayHashMapUnmanaged(InternPool.NavIndex) = .empty,
+rt_helpers: std.array_hash_map.String(InternPool.NavIndex) = .empty,
 /// `bs test`: collect the main module's tests into `builtin.test_functions`.
 is_test: bool = false,
 /// `-fsingle-threaded`: `threadlocal` variables are ordinary globals, as
@@ -184,16 +184,16 @@ compile_logs: std.ArrayList(CompileLog) = .empty,
 /// whose namespace has `effects` (`Sema.createContainerType`). The cache
 /// makes an edit build analyze such a unit again rather than load it,
 /// unless loading it makes the type anyway (see `Incremental.record`).
-effect_uses: std.AutoArrayHashMapUnmanaged(EffectUse, void) = .empty,
+effect_uses: std.array_hash_map.Auto(EffectUse, void) = .empty,
 /// Each unit's candidate names for the types it made (`offerName`),
 /// including those a memo hit made again, for the cache: an edit build
 /// offers the loaded units' candidates again (docs/slop/architecture.md, "Type
 /// names"). The value is the template, in `arena`.
-name_offers: std.AutoArrayHashMapUnmanaged(NameOffer, InternPool.Template) = .empty,
+name_offers: std.array_hash_map.Auto(NameOffer, InternPool.Template) = .empty,
 /// Which types' names each unit's analysis rendered into a value
 /// (`@typeName`), for the cache, which must analyze such a unit again if a
 /// name it read changed.
-name_reads: std.AutoArrayHashMapUnmanaged(NameRead, void) = .empty,
+name_reads: std.array_hash_map.Auto(NameRead, void) = .empty,
 /// Whether a name that analysis read changed afterwards (`offerName`).
 name_read_changed: bool = false,
 /// In a build redone because one did, the final names of the first
@@ -320,7 +320,7 @@ pub const Bytecode = struct {
     /// `alloc` used only by `load` and `store` to it, which stays out of
     /// comptime memory, and an `*_with_overflow` read only by
     /// `struct_field_val`, which is never interned as a tuple.
-    in_frame: std.DynamicBitSetUnmanaged,
+    in_frame: std.bit_set.Dynamic,
     /// Per instruction: the integer type of up to 64 bits its value has
     /// (for a frame-kept `alloc`, the value it holds; for a frame-kept
     /// `*_with_overflow`, the wrapped result), which the evaluator holds
@@ -471,7 +471,7 @@ pub const Namespace = struct {
     /// a declaration's nav is made when it is first looked up
     /// (`Zcu.declNav`), since most of a namespace's declarations are never
     /// used. Exported ones are made at once.
-    decls: std.AutoArrayHashMapUnmanaged(InternPool.String, InternPool.NavIndex) = .empty,
+    decls: std.array_hash_map.Auto(InternPool.String, InternPool.NavIndex) = .empty,
     /// The `declaration` instruction of each of `decls`.
     decl_insts: std.ArrayList(Zir.Inst.Index) = .empty,
     /// Whether creating it queued `comptime`, exported or test
@@ -590,9 +590,9 @@ pub const PhaseDeps = struct { deps: []const Dependee, conditional: []const bool
 pub fn embedFile(zcu: *Zcu, module: Frontend.Module.Index, sub_path: []const u8) !u32 {
     const arena = zcu.arena.allocator();
     const mod = zcu.fe.module(module);
-    const key = try std.fmt.allocPrint(arena, "{s}:{s}", .{ mod.name, sub_path });
+    const key = try arena.print("{s}:{s}", .{ mod.name, sub_path });
     if (zcu.embed_files.getIndex(key)) |i| return @intCast(i);
-    const path = try std.fs.path.join(arena, &.{ mod.root_dir, sub_path });
+    const path = try Io.Dir.path.join(arena, &.{ mod.root_dir, sub_path });
     const bytes = try Io.Dir.cwd().readFileAlloc(zcu.fe.io, path, arena, .unlimited);
     try zcu.embed_files.put(zcu.gpa, key, .{ .key = key, .module = module, .sub_path = key[mod.name.len + 1 ..], .hash = cache.hash(0, bytes), .bytes = bytes });
     return @intCast(zcu.embed_files.count() - 1);
@@ -612,14 +612,14 @@ pub fn fileKey(zcu: *Zcu, index: u32) ![]const u8 {
     const f = zcu.file(index);
     const mod = zcu.fe.module(f.module);
     const sub_path = if (std.mem.eql(u8, f.sub_path, mod.root_file)) "" else f.sub_path;
-    return std.fmt.allocPrint(zcu.arena.allocator(), "{s}:{s}", .{ mod.name, sub_path });
+    return zcu.arena.allocator().print("{s}:{s}", .{ mod.name, sub_path });
 }
 
 /// The display name of a file's root struct, as upstream renders it: the path
 /// within its module, without extension, with slashes as dots.
 pub fn fileFqn(zcu: *Zcu, index: u32) ![]const u8 {
     const sub_path = zcu.file(index).sub_path;
-    const noext = sub_path[0 .. sub_path.len - std.fs.path.extension(sub_path).len];
+    const noext = sub_path[0 .. sub_path.len - Io.Dir.path.extension(sub_path).len];
     const fqn = try zcu.arena.allocator().dupe(u8, noext);
     std.mem.replaceScalar(u8, fqn, '/', '.');
     return fqn;
@@ -633,7 +633,7 @@ pub fn moduleRootFile(zcu: *Zcu, mod: @import("Frontend.zig").Module.Index) ?u32
 /// The loaded file `sub_path` of module `mod`, if any.
 pub fn moduleFile(zcu: *Zcu, mod: @import("Frontend.zig").Module.Index, sub_path: []const u8) ?u32 {
     var buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "{d}:{s}", .{ @backingInt(mod), sub_path }) catch return null;
+    const key = std.mem.print(&buf, "{d}:{s}", .{ @backingInt(mod), sub_path }) catch return null;
     const index = zcu.fe.file_map.get(key) orelse return null;
     return @backingInt(index);
 }
@@ -647,30 +647,30 @@ pub fn addError(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []cons
 
 /// `addError` with a code other than its format's (`diag.formatCode`).
 pub fn addErrorCode(zcu: *Zcu, file_index: u32, span: Ast.Span, code: diag.Code, comptime fmt: []const u8, args: anytype) !void {
-    const msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args);
+    const msg = try zcu.arena.allocator().print(fmt, args);
     try zcu.errors.append(zcu.gpa, .{ .file = file_index, .span = span, .msg = msg, .code = code });
 }
 
 /// Adds an error in embedded file `embed_index` (an imported ZON file).
 pub fn addEmbedError(zcu: *Zcu, embed_index: u32, span: Ast.Span, code: diag.Code, comptime fmt: []const u8, args: anytype) !void {
-    const msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args);
+    const msg = try zcu.arena.allocator().print(fmt, args);
     try zcu.errors.append(zcu.gpa, .{ .file = embed_index, .embed = true, .span = span, .msg = msg, .code = code });
 }
 
 /// Adds a note in embedded file `embed_index` to the most recent error.
 pub fn addEmbedNote(zcu: *Zcu, embed_index: u32, span: Ast.Span, comptime fmt: []const u8, args: anytype) !void {
-    try zcu.appendNote(.{ .file = embed_index, .embed = true, .span = span, .msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args) });
+    try zcu.appendNote(.{ .file = embed_index, .embed = true, .span = span, .msg = try zcu.arena.allocator().print(fmt, args) });
 }
 
 /// Adds a note to the most recent error.
 pub fn addNote(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []const u8, args: anytype) !void {
-    try zcu.appendNote(.{ .file = file_index, .span = span, .msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args) });
+    try zcu.appendNote(.{ .file = file_index, .span = span, .msg = try zcu.arena.allocator().print(fmt, args) });
 }
 
 /// Adds a note pointing at a declaration to the most recent error; it shows
 /// the declaration's source line.
 pub fn addDeclNote(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []const u8, args: anytype) !void {
-    try zcu.appendNote(.{ .file = file_index, .span = span, .msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args), .decl = true });
+    try zcu.appendNote(.{ .file = file_index, .span = span, .msg = try zcu.arena.allocator().print(fmt, args), .decl = true });
 }
 
 /// Fails on two strong exports of one name, as upstream's
@@ -727,7 +727,7 @@ fn diagLoc(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, file_index: u32
 fn diagLocIn(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, file_index: u32, embed: bool, span: Ast.Span) !diag.Loc {
     if (!embed) return zcu.diagLoc(arena, paths, file_index, span);
     const e = zcu.embed_files.values()[file_index];
-    const path = try std.fs.path.join(arena, &.{ zcu.fe.module(e.module).root_dir, e.sub_path });
+    const path = try Io.Dir.path.join(arena, &.{ zcu.fe.module(e.module).root_dir, e.sub_path });
     return paths.loc(arena, path, e.bytes, span.start, span.main, span.end, false);
 }
 
@@ -808,8 +808,8 @@ fn argumentOrigin(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, e: Error
             count += 1;
         } else if (ip.keyAs(.tuple_type, p)) |t| for (t.types, 0..) |ft, j| {
             if (ip.keyTag(ft) != .error_union_type and ip.keyTag(ft) != .opt_type) continue;
-            const quoted = try std.fmt.allocPrint(arena, "'{s}'", .{try print.typeAlloc(ip, ft, arena)});
-            if (std.mem.indexOf(u8, e.msg, quoted) == null) continue;
+            const quoted = try arena.print("'{s}'", .{try print.typeAlloc(ip, ft, arena)});
+            if (std.mem.find(u8, e.msg, quoted) == null) continue;
             found = .{ .param = i, .field = j, .ty = ft };
             count += 1;
         };
@@ -1042,9 +1042,9 @@ pub fn createContainerType(
                 if (!collect_tests) continue;
                 if (d.kind == .unnamed_test) {
                     defer unnamed_tests += 1;
-                    break :blk try std.fmt.allocPrint(arena, "test_{d}", .{unnamed_tests});
+                    break :blk try arena.print("test_{d}", .{unnamed_tests});
                 }
-                break :blk try std.fmt.allocPrint(arena, "{t}.{s}", .{ d.kind, zir.nullTerminatedString(d.name) });
+                break :blk try arena.print("{t}.{s}", .{ d.kind, zir.nullTerminatedString(d.name) });
             },
             .@"const", .@"var" => {
                 const ns = &zcu.namespaces.items[ns_index];
@@ -1068,7 +1068,7 @@ pub fn createContainerType(
             print.writeNavName(ip, nav, &aw.writer, .read) catch return error.OutOfMemory;
             const decl_fqn = aw.written();
             for (zcu.test_filters) |filter| {
-                if (std.mem.indexOf(u8, decl_fqn, filter) != null) break;
+                if (std.mem.find(u8, decl_fqn, filter) != null) break;
             } else continue;
         }
         try zcu.test_functions.append(zcu.gpa, nav);
@@ -1307,7 +1307,7 @@ pub const UnitTiming = struct {
     /// Time spent in the units the innermost unit in progress analyzed in
     /// turn, which `ns` does not count against it.
     nested_ns: u64 = 0,
-    ns: std.AutoArrayHashMapUnmanaged(AnalUnit, u64) = .empty,
+    ns: std.array_hash_map.Auto(AnalUnit, u64) = .empty,
 
     /// Starts timing a unit (`Sema.create`); pass the result to `stop`.
     pub fn start(t: *UnitTiming, io: Io) [2]u64 {
@@ -1624,14 +1624,14 @@ pub fn addDeps(zcu: *Zcu, unit: AnalUnit, more: []const Dependee) !void {
 /// `lib/compiler_rt.zig`, the module's root: the key of its function unit
 /// (its symbol), whose file part is empty for the root (`fileKey`).
 pub fn compilerRtKey(buf: *[128]u8, file_name: []const u8, name: []const u8) []const u8 {
-    if (file_name.len == 0) return std.fmt.bufPrint(buf, "compiler_rt::{s}", .{name}) catch unreachable;
-    return std.fmt.bufPrint(buf, "compiler_rt:compiler_rt/{s}:{s}", .{ file_name, name }) catch unreachable;
+    if (file_name.len == 0) return std.mem.print(buf, "compiler_rt::{s}", .{name}) catch unreachable;
+    return std.mem.print(buf, "compiler_rt:compiler_rt/{s}:{s}", .{ file_name, name }) catch unreachable;
 }
 
 /// The file and declaration names `compilerRtKey` made `key` from.
 pub fn compilerRtKeyParts(key: []const u8) struct { []const u8, []const u8 } {
     const rest = key["compiler_rt:".len..];
-    const colon = std.mem.lastIndexOfScalar(u8, rest, ':').?;
+    const colon = std.mem.findScalarLast(u8, rest, ':').?;
     const path = rest[0..colon];
     return .{ if (std.mem.startsWith(u8, path, "compiler_rt/")) path["compiler_rt/".len..] else "", rest[colon + 1 ..] };
 }
@@ -1710,7 +1710,7 @@ fn linksFuzzer(zcu: *Zcu) bool {
 fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
     const no_span: Ast.Span = .{ .start = 0, .end = 0, .main = 0 };
     const rest = key["compiler_rt:".len..];
-    const colon = std.mem.lastIndexOfScalar(u8, rest, ':').?;
+    const colon = std.mem.findScalarLast(u8, rest, ':').?;
     const name = rest[colon + 1 ..];
     // compiler_rt's files load on demand, like its analysis.
     const sub_path = if (colon == 0) zcu.fe.module(.compiler_rt).root_file else rest[0..colon];

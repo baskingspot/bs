@@ -23,7 +23,7 @@ const ref = @import("Elf.zig").ref;
 const Dwarf = @This();
 
 /// The output's units, in first-use order, with what `place` built.
-units: std.StringArrayHashMapUnmanaged(Unit) = .empty,
+units: std.array_hash_map.String(Unit) = .empty,
 /// Sizes of .debug_info, .debug_rnglists, .debug_line, and .debug_aranges.
 info_size: u64 = 0,
 ranges_size: u64 = 0,
@@ -44,7 +44,7 @@ pub const Unit = struct {
     name: []const u8 = "",
     dir: []const u8 = "",
     /// The unit's line program's files.
-    files: std.StringArrayHashMapUnmanaged(void) = .empty,
+    files: std.array_hash_map.String(void) = .empty,
     info_off: u64 = 0,
     info_len: u64 = 0,
     ranges_off: u64 = 0,
@@ -172,8 +172,8 @@ pub fn place(gpa: Allocator, chunks: []Chunk, comp_dir: []const u8, text_addr: u
         // reserves the all-ones index for `skip`.
         if (u.files.count() >= (1 << file_bits) - 1) return error.OutOfMemory;
         if (unit.len > 0) {
-            u.name = std.fs.path.basenamePosix(unit);
-            u.dir = try std.fs.path.resolvePosix(arena, &.{ comp_dir, std.fs.path.dirnamePosix(unit) orelse "." });
+            u.name = std.Io.Dir.path.basenamePosix(unit);
+            u.dir = try std.Io.Dir.path.resolveAllocPosix(arena, &.{ comp_dir, std.Io.Dir.path.dirnamePosix(unit) orelse "." });
         } else {
             u.name = u.files.keys()[0];
             u.dir = comp_dir;
@@ -268,16 +268,16 @@ fn buildLineHeader(arena: Allocator, line: *std.Io.Writer, files: []const []cons
     try line.writeAll(&.{ 1, 1, 1 }); // minimum_instruction_length, maximum_operations_per_instruction, default_is_stmt
     try line.writeAll(&.{ @bitCast(@as(i8, Atom.LineProgram.line_base)), Atom.LineProgram.line_range, Atom.LineProgram.opcode_base });
     try line.writeAll(&standard_opcode_lengths);
-    var dirs: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var dirs: std.array_hash_map.String(void) = .empty;
     try dirs.put(arena, unit_dir, {});
     const file_dirs = try arena.alloc(usize, files.len);
     // Files share few directories: resolve each spelling once.
     var by_dirname: std.StringHashMapUnmanaged(usize) = .empty;
     for (files, file_dirs) |f, *dir| {
-        const dirname = std.fs.path.dirnamePosix(f) orelse ".";
+        const dirname = std.Io.Dir.path.dirnamePosix(f) orelse ".";
         const gop = try by_dirname.getOrPut(arena, dirname);
         if (!gop.found_existing) {
-            const resolved = try std.fs.path.resolvePosix(arena, &.{ comp_dir, dirname });
+            const resolved = try std.Io.Dir.path.resolveAllocPosix(arena, &.{ comp_dir, dirname });
             gop.value_ptr.* = (try dirs.getOrPut(arena, resolved)).index;
         }
         dir.* = gop.value_ptr.*;
@@ -291,7 +291,7 @@ fn buildLineHeader(arena: Allocator, line: *std.Io.Writer, files: []const []cons
     try line.writeAll(&.{ 2, DW.LNCT.path, DW.FORM.string, DW.LNCT.directory_index, DW.FORM.udata });
     try line.writeUleb128(files.len);
     for (files, file_dirs) |f, dir| {
-        try line.writeAll(std.fs.path.basenamePosix(f));
+        try line.writeAll(std.Io.Dir.path.basenamePosix(f));
         try line.writeByte(0);
         try line.writeUleb128(dir);
     }
@@ -378,7 +378,7 @@ pub fn relocatableFields(info: []const u8, line: []const u8, ctx: anytype, compt
 }
 
 fn skipString(bytes: []const u8, at: usize) usize {
-    return std.mem.indexOfScalarPos(u8, bytes, at, 0).? + 1;
+    return std.mem.findScalarPos(u8, bytes, at, 0).? + 1;
 }
 
 pub fn deinit(d: *Dwarf, gpa: Allocator) void {
@@ -609,10 +609,10 @@ pub const Chunk = struct {
     frame_bytes: u32,
     /// Source files of the chunk's entries, each with its entry's unit, in
     /// first-use order; `file_of` indexes it.
-    files: std.ArrayHashMapUnmanaged(FileKey, void, FileKey.Context, true),
+    files: std.array_hash_map.Custom(FileKey, void, FileKey.Context, true),
     /// Units of the chunk's entries, in first-use order, and the chunk's
     /// part of each.
-    units: std.StringArrayHashMapUnmanaged(UnitPart),
+    units: std.array_hash_map.String(UnitPart),
     /// The index in `files` of each local file (`Atom.Debug.files`) of the
     /// entries written, in order, so that writing them hashes no path;
     /// `local_starts` has each such entry's start in it.
@@ -728,7 +728,7 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
             if (!valid(d, l.input.atom(atom).bytes.len)) return l.fail(task, atom, error.InvalidDebugInfo, .{ .atom = l.input.atom(atom).name });
             var start: usize = 0;
             while (start < d.files.len) {
-                const path_end = std.mem.indexOfScalarPos(u8, d.files, start, 0).?;
+                const path_end = std.mem.findScalarPos(u8, d.files, start, 0).?;
                 const gop = c.files.getOrPut(l.gpa, .{ .unit = unit, .path = d.files[start..path_end] }) catch return l.fail(task, atom, error.OutOfMemory, .{});
                 c.locals.append(l.gpa, @intCast(gop.index)) catch return l.fail(task, atom, error.OutOfMemory, .{});
                 start = path_end + 1;

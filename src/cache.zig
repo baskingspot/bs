@@ -45,7 +45,7 @@ pub const Hash = u128;
 pub fn compilationDir(io: Io, local_cache: Io.Dir, key: Hash) !Io.Dir {
     const hex = std.fmt.hex(key);
     var buf: [64]u8 = undefined;
-    const sub_path = std.fmt.bufPrint(&buf, "bs/c/{s}", .{&hex}) catch unreachable;
+    const sub_path = std.mem.print(&buf, "bs/c/{s}", .{&hex}) catch unreachable;
     return local_cache.createDirPathOpen(io, sub_path, .{ .open_options = .{ .iterate = true } });
 }
 
@@ -250,7 +250,7 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
                 var d = switch (entry.kind) {
                     .compilation => c_.openDir(io_, entry.name(), .{ .iterate = true }),
                     .run, .tool => o_.?.openDir(io_, entry.name(), .{ .iterate = true }),
-                    .translation => local.openDir(io_, std.fmt.bufPrint(&path_buf, "o/{s}", .{entry.name()}) catch unreachable, .{ .iterate = true }),
+                    .translation => local.openDir(io_, std.mem.print(&path_buf, "o/{s}", .{entry.name()}) catch unreachable, .{ .iterate = true }),
                 } catch continue;
                 defer d.close(io_);
                 var files = d.iterate();
@@ -338,14 +338,14 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
         switch (e.kind) {
             .run => o.?.deleteTree(io, e.name()) catch continue,
             .tool => {
-                const use_path = std.fmt.bufPrint(&buf, "{s}/" ++ tool_use_name, .{e.name()}) catch unreachable;
+                const use_path = std.mem.print(&buf, "{s}/" ++ tool_use_name, .{e.name()}) catch unreachable;
                 const f = o.?.openFile(io, use_path, .{ .mode = .read_write }) catch continue;
                 defer f.close(io);
                 if (!(f.tryLock(io, .exclusive) catch false)) continue;
                 o.?.deleteTree(io, e.name()) catch continue;
             },
             .compilation => {
-                const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{e.name()}) catch unreachable;
+                const lock_path = std.mem.print(&buf, "{s}/lock", .{e.name()}) catch unreachable;
                 const f = c.openFile(io, lock_path, .{ .mode = .read_write }) catch continue;
                 defer f.close(io);
                 if (!(f.tryLock(io, .exclusive) catch false)) continue;
@@ -354,7 +354,7 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
             },
             .translation => {
                 tc.?.deleteFile(io, e.name()) catch continue;
-                local_cache.deleteTree(io, std.fmt.bufPrint(&buf, "o/{s}", .{e.name()}) catch unreachable) catch {};
+                local_cache.deleteTree(io, std.mem.print(&buf, "o/{s}", .{e.name()}) catch unreachable) catch {};
             },
         }
         total -= e.bytes;
@@ -517,12 +517,12 @@ test "maintainCompilations counts translate-c records with their outputs and evi
     const new = std.fmt.hex(@as(Hash, 0x2e3));
     for ([_][]const u8{ &old, &new }, [_]i64{ 6 * std.time.ns_per_day, std.time.ns_per_hour }) |hex, age| {
         var buf: [64]u8 = undefined;
-        const record = try std.fmt.bufPrint(&buf, "bs/tc/{s}", .{hex});
+        const record = try std.mem.print(&buf, "bs/tc/{s}", .{hex});
         try tmp.dir.createDirPath(io, "bs/tc");
         try tmp.dir.writeFile(io, .{ .sub_path = record, .data = &(@as([10]u8, @splat(0))) });
         try tmp.dir.setTimestamps(io, record, .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-age)) } });
         var buf2: [64]u8 = undefined;
-        const out = try std.fmt.bufPrint(&buf2, "o/{s}", .{hex});
+        const out = try std.mem.print(&buf2, "o/{s}", .{hex});
         try tmp.dir.createDirPath(io, out);
         var od = try tmp.dir.openDir(io, out, .{});
         defer od.close(io);
@@ -534,10 +534,10 @@ test "maintainCompilations counts translate-c records with their outputs and evi
     try t.expectEqual(1, r.deleted);
     try t.expectEqual(r.bytes - 110, r.bytes_after);
     var buf: [64]u8 = undefined;
-    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "bs/tc/{s}", .{&old}), .{}));
-    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "o/{s}", .{&old}), .{}));
-    _ = try tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "bs/tc/{s}", .{&new}), .{});
-    _ = try tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "o/{s}/x.zig", .{&new}), .{});
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, try std.mem.print(&buf, "bs/tc/{s}", .{&old}), .{}));
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, try std.mem.print(&buf, "o/{s}", .{&old}), .{}));
+    _ = try tmp.dir.statFile(io, try std.mem.print(&buf, "bs/tc/{s}", .{&new}), .{});
+    _ = try tmp.dir.statFile(io, try std.mem.print(&buf, "o/{s}/x.zig", .{&new}), .{});
 }
 
 test "setTimestamps takes a file another process deleted as not found" {
@@ -585,7 +585,7 @@ test "maintainCompilations keeps tools in use and recent programs, and ranks too
     };
     for (entries) |e| {
         var buf: [64]u8 = undefined;
-        var od = try tmp.dir.createDirPathOpen(io, try std.fmt.bufPrint(&buf, "bs/o/{s}", .{e.name}), .{});
+        var od = try tmp.dir.createDirPathOpen(io, try std.mem.print(&buf, "bs/o/{s}", .{e.name}), .{});
         defer od.close(io);
         try od.writeFile(io, .{ .sub_path = e.file, .data = &(@as([100]u8, @splat(0))) });
         try od.setTimestamps(io, e.file, .{ .modify_timestamp = .{ .new = ago(now, e.age) } });

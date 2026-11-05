@@ -239,7 +239,7 @@ pub const LinkAtoms = struct {
     /// checked (`Incremental.linkFrom`): `check` tests only their bounds.
     /// Packs are append-only and base packs never change, so a record
     /// that was well-formed stays so.
-    trusted: ?std.DynamicBitSetUnmanaged = null,
+    trusted: ?std.bit_set.Dynamic = null,
 
     pub fn deinit(in: LinkAtoms, gpa: Allocator) void {
         gpa.free(in.mems);

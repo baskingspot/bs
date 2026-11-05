@@ -612,7 +612,7 @@ test "an object's symbols and relocations" {
         try names.print(gpa, "{s}:{t}:{d}:{d} ", .{ std.mem.sliceTo(strtab[s.name..], 0), s.info.bind, s.shndx, s.value });
         try std.testing.expectEqual(i >= symtab.info, s.info.bind != .LOCAL);
     }
-    const expected = try std.fmt.allocPrint(gpa, "helper:LOCAL:{0d}:10 ptr:LOCAL:{1d}:0 _start:GLOBAL:{0d}:0 helper_alias:GLOBAL:{0d}:10 ext:WEAK:0:0 ", .{ text, section(shdrs, shstr, ".data").?.index });
+    const expected = try gpa.print("helper:LOCAL:{0d}:10 ptr:LOCAL:{1d}:0 _start:GLOBAL:{0d}:0 helper_alias:GLOBAL:{0d}:10 ext:WEAK:0:0 ", .{ text, section(shdrs, shstr, ".data").?.index });
     defer gpa.free(expected);
     try std.testing.expectEqualStrings(expected, names.items);
 
@@ -661,7 +661,7 @@ test "an object larger than a huge page" {
         .imports = &.{.{ .key = ext, .name = "ext" }},
     });
     defer gpa.free(bytes);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, big) != null);
+    try std.testing.expect(std.mem.find(u8, bytes, big) != null);
 }
 
 test "an object with no atoms" {

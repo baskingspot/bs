@@ -51,7 +51,7 @@ pub fn assembleAll(emit: *Emit) !bool {
 /// The module's symbols, by the name Zig code and C know them by
 /// (`symbolName`).
 const Module = struct {
-    labels: std.StringArrayHashMapUnmanaged(Emit.ExternTarget) = .empty,
+    labels: std.array_hash_map.String(Emit.ExternTarget) = .empty,
     globals: std.ArrayList(Named) = .empty,
     /// `.set name, target`.
     aliases: std.ArrayList(Named) = .empty,
@@ -100,8 +100,8 @@ fn assemble(comptime Asm: type, emit: *Emit, block: *const Zcu.GlobalAsm, nth: u
         // `//` starts a comment; on x86_64, `#` too (in aarch64 syntax it
         // marks an immediate).
         var code = source_line;
-        if (std.mem.indexOf(u8, code, "//")) |i| code = code[0..i];
-        if (target.arch() == .x86_64) if (std.mem.indexOfScalar(u8, code, '#')) |i| {
+        if (std.mem.find(u8, code, "//")) |i| code = code[0..i];
+        if (target.arch() == .x86_64) if (std.mem.findScalar(u8, code, '#')) |i| {
             code = code[0..i];
         };
         var statements = std.mem.tokenizeScalar(u8, code, ';');
@@ -118,7 +118,7 @@ fn assemble(comptime Asm: type, emit: *Emit, block: *const Zcu.GlobalAsm, nth: u
                 try g.statement(s);
                 continue;
             }
-            const sp = std.mem.indexOfAny(u8, s, " \t") orelse s.len;
+            const sp = std.mem.findAny(u8, s, " \t") orelse s.len;
             const directive = s[0..sp];
             const arg = std.mem.trim(u8, s[sp..], " \t");
             const eql = std.mem.eql;
@@ -129,7 +129,7 @@ fn assemble(comptime Asm: type, emit: *Emit, block: *const Zcu.GlobalAsm, nth: u
                 if (symbolName(target, arg)) |name| try m.globals.append(arena, .{ .name = try arena.dupe(u8, name), .block = block });
             } else if (eql(u8, directive, ".set") or eql(u8, directive, ".equ")) {
                 // A symbol alias: `.set alias, symbol`.
-                const comma = std.mem.indexOfScalar(u8, arg, ',') orelse return g.fail("bad '{s}'", .{s});
+                const comma = std.mem.findScalar(u8, arg, ',') orelse return g.fail("bad '{s}'", .{s});
                 const alias = std.mem.trim(u8, arg[0..comma], " \t");
                 const to = std.mem.trim(u8, arg[comma + 1 ..], " \t");
                 if (!isSymbol(alias) or !isSymbol(to) or std.ascii.isDigit(to[0]))
@@ -143,7 +143,7 @@ fn assemble(comptime Asm: type, emit: *Emit, block: *const Zcu.GlobalAsm, nth: u
                 // Symbols and code are functions in `.text` already.
             } else if (eql(u8, directive, ".p2align") or eql(u8, directive, ".balign")) {
                 if (g.cg.e.code.items.len != 0) return g.fail("bs does not support '{s}' after the start of container-level assembly yet", .{s});
-                const first = std.mem.trim(u8, arg[0 .. std.mem.indexOfScalar(u8, arg, ',') orelse arg.len], " \t");
+                const first = std.mem.trim(u8, arg[0 .. std.mem.findScalar(u8, arg, ',') orelse arg.len], " \t");
                 const n = std.fmt.parseInt(u8, first, 0) catch return g.fail("bad alignment in '{s}'", .{s});
                 const a: std.mem.Alignment = if (eql(u8, directive, ".p2align"))
                     if (n < 16) @fromBackingInt(@intCast(n)) else return g.fail("bad alignment in '{s}'", .{s})
@@ -192,7 +192,7 @@ fn assemble(comptime Asm: type, emit: *Emit, block: *const Zcu.GlobalAsm, nth: u
 /// The name of label `l`: `name:` at the start of `s`, unless it is a
 /// numeric local label.
 fn namedLabel(s: []const u8) ?[]const u8 {
-    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return null;
+    const colon = std.mem.findScalar(u8, s, ':') orelse return null;
     const name = s[0..colon];
     if (!isSymbol(name) or std.ascii.isDigit(name[0])) return null;
     return name;

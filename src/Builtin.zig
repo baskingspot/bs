@@ -211,7 +211,7 @@ pub fn writeCMain(gpa: Allocator, io: Io, cache_dir: []const u8, no_panic: bool)
     const src = if (no_panic) c_main_no_panic else c_main;
     var hash: [16]u8 = undefined;
     std.crypto.hash.Blake3.hash(src, &hash, .{});
-    const path = try std.fmt.allocPrint(gpa, "{s}/c_main/{x}/c_main.zig", .{ cache_dir, &hash });
+    const path = try gpa.print("{s}/c_main/{x}/c_main.zig", .{ cache_dir, &hash });
     errdefer gpa.free(path);
     const cwd = Io.Dir.cwd();
     if (cwd.access(io, path, .{})) |_| return path else |_| {}
@@ -223,7 +223,7 @@ pub fn writeCMain(gpa: Allocator, io: Io, cache_dir: []const u8, no_panic: bool)
 }
 
 pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
-    if (opts.target == .aarch64_macos) return std.fmt.allocPrint(gpa,
+    if (opts.target == .aarch64_macos) return gpa.print(
         \\const std = @import("std");
         \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
         \\pub const zig_version_string = "0.17.1";
@@ -381,7 +381,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     const glibc = opts.glibc orelse versions.glibc;
     var ld_buf: [255 * 4 + 16]u8 = undefined;
     const dynamic_linker = if (opts.linux) |t| if (t.dynamic_linker.get()) |ld|
-        std.fmt.bufPrint(&ld_buf, ".init(\"{f}\")", .{std.zig.fmtString(ld)}) catch unreachable
+        std.mem.print(&ld_buf, ".init(\"{f}\")", .{std.zig.fmtString(ld)}) catch unreachable
     else
         ".none" else ".none";
     const cpu_ns = switch (opts.cpu.arch) {
@@ -521,16 +521,16 @@ pub fn writeToCache(gpa: Allocator, io: Io, cache_dir: []const u8, opts: Options
     const start = opts.glibc != null and opts.start_code;
     if (start) hasher.update(glibcStart(opts.cpu.arch));
     hasher.final(&hash);
-    const dir = try std.fmt.allocPrint(gpa, "{s}/builtin/{x}", .{ cache_dir, &hash });
+    const dir = try gpa.print("{s}/builtin/{x}", .{ cache_dir, &hash });
     errdefer gpa.free(dir);
-    const path = try std.fs.path.join(gpa, &.{ dir, "builtin.zig" });
+    const path = try Io.Dir.path.join(gpa, &.{ dir, "builtin.zig" });
     defer gpa.free(path);
     const cwd = Io.Dir.cwd();
     if (cwd.access(io, path, .{})) |_| return dir else |_| {}
     // The start file first: builtin.zig's presence says the directory is
     // complete.
     if (start) {
-        const start_path = try std.fs.path.join(gpa, &.{ dir, "glibc_start.zig" });
+        const start_path = try Io.Dir.path.join(gpa, &.{ dir, "glibc_start.zig" });
         defer gpa.free(start_path);
         var atomic = try cwd.createFileAtomic(io, start_path, .{ .make_path = true, .replace = true });
         defer atomic.deinit(io);

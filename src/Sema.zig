@@ -711,7 +711,7 @@ pub const Src = struct {
                 for (tree.nodes.items(.tag), 0..) |t, n| {
                     if (t != .for_simple and t != .@"for") continue;
                     const f = tree.fullFor(@fromBackingInt(@intCast(n))).?;
-                    const index = std.mem.indexOfScalar(Ast.Node.Index, f.ast.inputs, input) orelse continue;
+                    const index = std.mem.findScalar(Ast.Node.Index, f.ast.inputs, input) orelse continue;
                     var count = index;
                     var tok = f.payload_token;
                     while (true) : (tok += 1) switch (tree.tokenTag(tok)) {
@@ -1223,7 +1223,7 @@ fn checkDeclPlacement(sema: *Sema, block: *Block, src: Src, nav: *InternPool.Nav
     if (decl.linksection_body) |body| {
         const section_src: Src = .{ .base = src.base, .loc = .{ .decl_section = .zero } };
         const bytes = try sema.resolveConstString(block, section_src, try sema.resolveInlineBody(block, body, nav.zir_inst));
-        if (std.mem.indexOfScalar(u8, bytes, 0) != null) return sema.fail(block, section_src, "linksection cannot contain null bytes", .{});
+        if (std.mem.findScalar(u8, bytes, 0) != null) return sema.fail(block, section_src, "linksection cannot contain null bytes", .{});
         if (bytes.len == 0) return sema.fail(block, section_src, "linksection cannot be empty", .{});
     }
     if (decl.addrspace_body) |body| {
@@ -1864,7 +1864,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                     .bytes = try sema.arena.dupe(u8, "@typeInfo().@\"union\".tag_type.?"),
                     .holes = try sema.arena.dupe(InternPool.Template.Hole, &.{.{ .at = "@typeInfo(".len, .ty = sema.zcu.namespacePtr(info.namespace).owner_type }}),
                 } };
-                const tag_key = try std.fmt.allocPrint(sema.arena, "{s}@tag", .{ip.stringSlice(key.key)});
+                const tag_key = try sema.arena.print("{s}@tag", .{ip.stringSlice(key.key)});
                 // It shares the union's namespace, whose declarations are
                 // not its own (`ownsNamespace`).
                 const tag_info = try ip.createContainerInfo(Zcu.tid, .{
@@ -2109,7 +2109,7 @@ fn failCode(sema: *Sema, block: *const Block, src: Src, code: @import("diag.zig"
     // A type named twice (`'S' and 'S'`) is noted once.
     var noted: [args.len]Index = undefined;
     var n_noted: usize = 0;
-    inline for (args) |arg| if (@TypeOf(arg) == FmtType) if (arg.decl_note and std.mem.indexOfScalar(Index, noted[0..n_noted], arg.ty) == null) {
+    inline for (args) |arg| if (@TypeOf(arg) == FmtType) if (arg.decl_note and std.mem.findScalar(Index, noted[0..n_noted], arg.ty) == null) {
         try sema.addDeclaredHereNote(arg.ty);
         noted[n_noted] = arg.ty;
         n_noted += 1;
@@ -2165,13 +2165,13 @@ fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames
         diag.nextName(source, last.span.start + at + @as(u32, @intCast(name.len)))
     else
         null else null;
-    const container = try std.fmt.allocPrint(sema.arena, "{f}", .{sema.fmtType(ty)});
+    const container = try sema.arena.print("{f}", .{sema.fmtType(ty)});
     last.hint = diag.migrationHint(container, name, next);
     try sema.attachCandidates(names.items, name, which == .fields);
     // A mechanical rewrite of the removed name, where the error points at it.
     if (last.file == sema.file and last.span.end <= source.len) if (diag.nameIn(source[last.span.start..last.span.end], name)) |at| {
         if (try diag.migrationFix(zcu.arena.allocator(), container, name, source, last.span.start + at)) |fix| last.fix = fix;
-        if (last.fix == null and std.mem.indexOf(u8, container, "lang.Type") != null)
+        if (last.fix == null and std.mem.find(u8, container, "lang.Type") != null)
             last.fix = try diag.typeInfoFix(zcu.arena.allocator(), name, names.items, last.span.start + at);
     };
 }
@@ -2272,7 +2272,7 @@ fn failSwitchEnum(sema: *Sema, block: *Block, src: Src, enum_ty: Index, union_ty
     const prongs = try sema.arena.alloc([]const u8, missing.len);
     for (missing, prongs) |fi, *prong| {
         const name = ip.stringSlice(names[fi]);
-        prong.* = try std.fmt.allocPrint(sema.arena, ".{f} => @panic(\"TODO\"),", .{std.zig.fmtId(name)});
+        prong.* = try sema.arena.print(".{f} => @panic(\"TODO\"),", .{std.zig.fmtId(name)});
         const field = if (decl) |d| fieldNameToken(decl_tree.?, d.node, name) else null;
         if (field) |t| {
             const start = decl_tree.?.tokenStart(t);
@@ -2689,7 +2689,7 @@ fn failDepLoop(sema: *Sema, block: *Block, src: Src) CompileError {
     try zcu.errors.append(zcu.gpa, .{
         .file = first.file,
         .span = first_span,
-        .msg = try std.fmt.allocPrint(arena, "dependency loop with length {d}", .{frames.len}),
+        .msg = try arena.print("dependency loop with length {d}", .{frames.len}),
         .code = .@"dependency-loop",
         .unit = unit,
         .no_loc = true,
@@ -2831,7 +2831,7 @@ fn noteEffects(sema: *Sema, ty: Index, file_root: bool) Allocator.Error!void {
     if (ns == Zcu.Namespace.none or !(file_root or zcu.namespaces.items[ns].effects)) return;
     if (sema.memo_start) |start| _ = try sema.memoCollect(.{ .effect = ty }, start);
     if (sema.bc) |bc| {
-        const index = std.mem.indexOfScalar(Index, bc.effects.items, ty) orelse blk: {
+        const index = std.mem.findScalar(Index, bc.effects.items, ty) orelse blk: {
             try bc.effects.append(sema.arena, ty);
             break :blk bc.effects.items.len - 1;
         };
@@ -3036,8 +3036,8 @@ fn memoEffects(sema: *Sema, start: u32) ![]const Index {
     var out: std.ArrayList(Index) = .empty;
     for (sema.memo_deps.items[start..]) |e| switch (e) {
         .dep, .func, .name, .name_read => {},
-        .body => |b| for (b.entry_effects) |i| if (std.mem.indexOfScalar(Index, out.items, b.effects[i]) == null) try out.append(sema.arena, b.effects[i]),
-        .effect => |ty| if (std.mem.indexOfScalar(Index, out.items, ty) == null) try out.append(sema.arena, ty),
+        .body => |b| for (b.entry_effects) |i| if (std.mem.findScalar(Index, out.items, b.effects[i]) == null) try out.append(sema.arena, b.effects[i]),
+        .effect => |ty| if (std.mem.findScalar(Index, out.items, ty) == null) try out.append(sema.arena, ty),
     };
     return sema.zcu.arena.allocator().dupe(Index, out.items);
 }
@@ -3420,7 +3420,7 @@ fn inactiveUnionFieldMsg(sema: *Sema, block: *Block, active: Ref, accessed: Ref)
     var bodies: std.ArrayList(u32) = .empty;
     defer bodies.deinit(gpa);
     for (info.field_names, 0..) |name, k| {
-        const msg = try std.fmt.allocPrint(sema.arena, "access of union field '{s}' while field '{s}' is active", .{ accessed_name, ip.stringSlice(name) });
+        const msg = try sema.arena.print("access of union field '{s}' while field '{s}' is active", .{ accessed_name, ip.stringSlice(name) });
         var case = block.child();
         defer case.deinitInsts();
         _ = try sema.addInst(&case, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = try sema.coerce(&case, .slice_const_u8_type, .fromInterned(try sema.stringLiteral(msg)), block.nodeSrc(.zero)) } } });
@@ -5617,7 +5617,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.un_node.src_node);
             const ty = try sema.resolveType(block, src, data.un_node.operand);
             try sema.noteNameRead(ty);
-            break :blk .fromInterned(try sema.stringLiteral(try std.fmt.allocPrint(sema.arena, "{f}", .{sema.fmtType(ty)})));
+            break :blk .fromInterned(try sema.stringLiteral(try sema.arena.print("{f}", .{sema.fmtType(ty)})));
         },
         .offset_of, .bit_offset_of => blk: {
             const src = block.nodeSrc(data.pl_node.src_node);
@@ -5819,7 +5819,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                     const init = try sema.coerce(block, t.*, sema.resolveInst(refs[2 * k + 1]), src);
                     v.* = (try sema.resolveDefinedValue(block, src, init)) orelse
                         return sema.failNeededComptime(block, src, "tuple field default value must be comptime-known");
-                    try sema.checkNoComptimeVarRef(block, src.fieldSrc(k, .value), v.*, "field default value", try std.fmt.allocPrint(sema.arena, "{d}", .{k}));
+                    try sema.checkNoComptimeVarRef(block, src.fieldSrc(k, .value), v.*, "field default value", try sema.arena.print("{d}", .{k}));
                 }
             }
             break :blk .fromInterned(try sema.intern(.{ .tuple_type = .{ .types = types, .values = values } }));
@@ -6232,8 +6232,8 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const root: []const u8 = module.abs_root_dir orelse
         std.Io.Dir.cwd().realPathFileAlloc(sema.zcu.fe.io, module.root_dir, sema.arena) catch |err|
         return sema.fail(block, src, "unable to resolve module directory '{s}': {t}", .{ module.root_dir, err });
-    const dir = std.fs.path.dirname(file.sub_path) orelse "";
-    const full = try std.fs.path.resolveAllocPosix(sema.arena, &.{ root, dir, name });
+    const dir = std.Io.Dir.path.dirname(file.sub_path) orelse "";
+    const full = try std.Io.Dir.path.resolveAllocPosix(sema.arena, &.{ root, dir, name });
     if (full.len <= root.len + 1 or !std.mem.startsWith(u8, full, root) or full[root.len] != '/')
         return sema.fail(block, sema.callArgSrc(src, false, 0), "embed of file outside package path: '{s}'", .{name});
     const sub_path = full[root.len + 1 ..];
@@ -6474,7 +6474,7 @@ fn typeInfo(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!Index 
                 var default: Index = .none;
                 if (class == .tuple) {
                     const t = ip.keyPayload(.tuple_type, ty);
-                    names[i] = if (is_tuple) try sema.getString(try std.fmt.allocPrint(sema.arena, "{d}", .{i})) else t.names[i];
+                    names[i] = if (is_tuple) try sema.getString(try sema.arena.print("{d}", .{i})) else t.names[i];
                     default = t.values[i];
                     is_comptime = default != .none;
                 } else {
@@ -6950,7 +6950,7 @@ fn castDestType(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref, remove_
         // As upstream, named by the builtin: the call's main token.
         const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
         const rest = tree.source[src.span(tree).main..];
-        const name = rest[0 .. std.mem.indexOfScalar(u8, rest, '(') orelse 0];
+        const name = rest[0 .. std.mem.findScalar(u8, rest, '(') orelse 0];
         const err = sema.fail(block, src, "{s} must have a known result type", .{name});
         if (sema.genericPoisonReason(block, ref)) |r| try sema.zcu.addNote(sema.file, r.src.span(tree), "result type is unknown due to {s}", .{if (r.anytype_param) "anytype parameter" else "opaque pointer type"});
         try sema.zcu.addNote(sema.file, src.span(tree), "use @as to provide explicit result type", .{});
@@ -7647,10 +7647,10 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         else
             sema.zcu.moduleRootFile(m).?
     else if (std.mem.endsWith(u8, path, ".zig")) blk: {
-        const dir = std.fs.path.dirname(this_file.sub_path) orelse "";
-        const sub = try std.fs.path.resolvePosix(sema.arena, &.{ dir, path });
+        const dir = std.Io.Dir.path.dirname(this_file.sub_path) orelse "";
+        const sub = try std.Io.Dir.path.resolveAllocPosix(sema.arena, &.{ dir, path });
         if (std.mem.eql(u8, sub, "..") or std.mem.startsWith(u8, sub, "../")) return sema.fail(block, src, "import of file outside module path", .{});
-        const key = try std.fmt.allocPrint(sema.arena, "{d}:{s}", .{ @backingInt(this_file.module), sub });
+        const key = try sema.arena.print("{d}:{s}", .{ @backingInt(this_file.module), sub });
         const file_index = fe.file_map.get(key) orelse return sema.fail(block, src, "unable to find '{s}'", .{path});
         break :blk @backingInt(file_index);
     } else if (fe.familyModule(this_file.module, path)) |m|
@@ -7686,8 +7686,8 @@ fn importZon(sema: *Sema, block: *Block, src: Src, path: []const u8, dep: ?Front
         const root: []const u8 = module.abs_root_dir orelse
             std.Io.Dir.cwd().realPathFileAlloc(sema.zcu.fe.io, module.root_dir, sema.arena) catch |err|
             return sema.fail(block, src, "unable to resolve module directory '{s}': {t}", .{ module.root_dir, err });
-        const dir = std.fs.path.dirname(file.sub_path) orelse "";
-        const full = try std.fs.path.resolveAllocPosix(sema.arena, &.{ root, dir, path });
+        const dir = std.Io.Dir.path.dirname(file.sub_path) orelse "";
+        const full = try std.Io.Dir.path.resolveAllocPosix(sema.arena, &.{ root, dir, path });
         if (full.len <= root.len + 1 or !std.mem.startsWith(u8, full, root) or full[root.len] != '/')
             return sema.fail(block, src, "import of file outside module path: '{s}'", .{path});
         break :blk full[root.len + 1 ..];
@@ -7858,13 +7858,13 @@ const Zon = struct {
                     t.* = sema.ip.typeOf(v.*);
                 }
                 const ast_node = @backingInt(node.getAstNode(z.zoir));
-                const stem = std.fs.path.basenamePosix(sema.zcu.embed_files.values()[z.embed].sub_path);
+                const stem = std.Io.Dir.path.basenamePosix(sema.zcu.embed_files.values()[z.embed].sub_path);
                 const ty = try sema.internNamed(.{ .tuple_type = .{
                     .types = types,
                     .values = values,
                     .names = names,
-                    .site = try sema.getString(try std.fmt.allocPrint(sema.arena, "{s}#zon{d}", .{ z.key, ast_node })),
-                } }, .{ .creator = 0, .template = .{ .bytes = try std.fmt.allocPrint(sema.arena, "{s}__struct_{d}", .{ stem, ast_node }) } });
+                    .site = try sema.getString(try sema.arena.print("{s}#zon{d}", .{ z.key, ast_node })),
+                } }, .{ .creator = 0, .template = .{ .bytes = try sema.arena.print("{s}__struct_{d}", .{ stem, ast_node }) } });
                 return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = values } } });
             },
         }
@@ -8701,7 +8701,7 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
             // As upstream; `.C` was 0.13's name for `.c`.
             const err = sema.fail(block, src, "union 'lang.CallingConvention' has no member named '{s}'", .{name});
             // The tags and the union's declarations (`.c`, `.winapi`).
-            const names = comptime [_][]const u8{ "c", "winapi", "kernel" } ++ std.meta.fieldNames(std.lang.CallingConvention.Tag)[0..].*;
+            const names = comptime [_][]const u8{ "c", "winapi", "kernel" } ++ @typeInfo(std.lang.CallingConvention.Tag).@"enum".field_names[0..].*;
             try sema.attachCandidates(&names, name, false);
             return err;
         }
@@ -8715,9 +8715,9 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
             if (err != error.AnalysisFail) return err;
             const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
             const span = src.span(tree);
-            if (std.mem.eql(u8, tree.source[span.start..span.end], try std.fmt.allocPrint(sema.arena, ".{s}", .{name}))) {
+            if (std.mem.eql(u8, tree.source[span.start..span.end], try sema.arena.print(".{s}", .{name}))) {
                 const arena = sema.zcu.arena.allocator();
-                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .exact, .edits = try arena.dupe(@import("diag.zig").RawEdit, &.{.{ .start = span.start, .end = span.end, .text = try std.fmt.allocPrint(arena, ".{{ .{s} = .{{}} }}", .{name}) }}) };
+                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .exact, .edits = try arena.dupe(@import("diag.zig").RawEdit, &.{.{ .start = span.start, .end = span.end, .text = try arena.print(".{{ .{s} = .{{}} }}", .{name}) }}) };
             }
             return err;
         }
@@ -8780,7 +8780,7 @@ fn internCallconv(sema: *Sema, block: *Block, src: Src, cc: Callconv) CompileErr
             // not support: bs supports the same ones.
             if (cc.tag != .async) {
                 const archs = std.Target.Cpu.Arch.fromCallingConvention(cc.tag);
-                if (std.mem.indexOfScalar(std.Target.Cpu.Arch, archs, target.arch()) == null) {
+                if (std.mem.findScalar(std.Target.Cpu.Arch, archs, target.arch()) == null) {
                     var list: std.Io.Writer.Allocating = .init(sema.arena);
                     for (archs, 0..) |arch, i| list.writer.print("{s}'{t}'", .{ if (i == 0) "" else ", ", arch }) catch return error.OutOfMemory;
                     return sema.fail(block, src, "calling convention '{s}' only available on architectures {s}", .{ @tagName(cc.tag), list.written() });
@@ -8853,7 +8853,7 @@ noinline fn failCoerce(sema: *Sema, block: *Block, src: Src, dest_ty: Index, ins
                 const text = tree.source[span.start..span.end];
                 if (text.len != 0 and for (text) |c| {
                     if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '.') break false;
-                } else true) sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(@import("diag.zig").RawEdit, &.{.{ .start = span.end, .end = span.end, .text = try std.fmt.allocPrint(sema.zcu.arena.allocator(), "[0..{d}]", .{ip.keyPayload(.array_type, d.child).len}) }}) };
+                } else true) sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(@import("diag.zig").RawEdit, &.{.{ .start = span.end, .end = span.end, .text = try sema.zcu.arena.allocator().print("[0..{d}]", .{ip.keyPayload(.array_type, d.child).len}) }}) };
                 return err;
             };
             if (sema.isUndef(v) or ip.keyPayload(.slice, v).len == .undef_usize) {
@@ -8930,7 +8930,7 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
                     const arena = sema.zcu.arena.allocator();
                     const source = try sema.zcu.fe.source(@fromBackingInt(loc.file));
                     const last = &sema.zcu.errors.items[sema.zcu.errors.items.len - 1];
-                    last.hint = try std.fmt.allocPrint(arena, "return type '!{s}' lets the function return errors", .{source[loc.span.start..loc.span.end]});
+                    last.hint = try arena.print("return type '!{s}' lets the function return errors", .{source[loc.span.start..loc.span.end]});
                     last.fix = .{ .applicability = .maybe, .edits = try arena.dupe(@import("diag.zig").RawEdit, &.{.{ .start = loc.span.start, .end = loc.span.start, .text = "!" }}), .file = loc.file };
                 }
             } else try sema.zcu.addDeclNote(loc.file, loc.span, "function return type declared here", .{});
@@ -9018,7 +9018,7 @@ fn noteTypeDifference(sema: *Sema, span: Ast.Span, wanted_ty: Index, actual_ty: 
                 // Inferred sets may be unresolved here: no note.
                 const w = ip.keyAs(.error_set_type, wanted) orelse return;
                 const a = ip.keyAs(.error_set_type, actual) orelse return;
-                for (a) |name| if (std.mem.indexOfScalar(InternPool.String, w, name) == null)
+                for (a) |name| if (std.mem.findScalar(InternPool.String, w, name) == null)
                     try zcu.addNote(file, span, "'error.{s}' not a member of destination error set", .{ip.stringSlice(name)});
                 return;
             },
@@ -9192,7 +9192,7 @@ fn notePtrDifference(sema: *Sema, span: Ast.Span, wanted: Index, actual: Index, 
 fn isTestFunc(sema: *Sema, func: Index) bool {
     const f = sema.ip.keyAs(.func, func) orelse return false;
     const nav = f.owner_nav;
-    return std.mem.indexOfScalar(InternPool.NavIndex, sema.zcu.test_functions.items, nav) != null;
+    return std.mem.findScalar(InternPool.NavIndex, sema.zcu.test_functions.items, nav) != null;
 }
 
 /// Where function `func` declares the type of parameter `param`, or its
@@ -9623,7 +9623,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 // Interned names compare by index.
                 const name = ip.keyPayload(.enum_literal, val.?);
                 try sema.resolveLayout(block, src, dest_ty);
-                const i: u32 = @intCast(std.mem.indexOfScalar(InternPool.String, ip.structInfo(dest_ty).field_names, name) orelse
+                const i: u32 = @intCast(std.mem.findScalar(InternPool.String, ip.structInfo(dest_ty).field_names, name) orelse
                     return sema.withCandidates(sema.fail(block, src, "no field named '{s}' in enum '{f}'", .{ ip.stringSlice(name), sema.fmtType(dest_ty) }), dest_ty, ip.stringSlice(name), .fields));
                 return .fromInterned(try sema.enumTagValue(dest_ty, i));
             },
@@ -10088,7 +10088,7 @@ fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
         if (dst == .anyerror_type) return true;
         const sn = ip.keyAs(.error_set_type, src) orelse return false;
         const dn = ip.keyAs(.error_set_type, dst) orelse return false;
-        for (sn) |n| if (std.mem.indexOfScalar(InternPool.String, dn, n) == null) return false;
+        for (sn) |n| if (std.mem.findScalar(InternPool.String, dn, n) == null) return false;
         return true;
     }
     const sk = ip.indexToKey(src);
@@ -13504,7 +13504,7 @@ fn onlyArithmeticSince(sema: *Sema, block: *Block, store: Ir.Inst.Index, lines: 
             .dbg_stmt => if (!lines) return null,
             .block => {
                 const c = sema.packed_chain orelse return null;
-                if (c.store != store or std.mem.indexOfScalar(Ir.Inst.Index, c.checks[0..c.checks_len], insts[k]) == null) return null;
+                if (c.store != store or std.mem.findScalar(Ir.Inst.Index, c.checks[0..c.checks_len], insts[k]) == null) return null;
             },
             else => return null,
         }
@@ -14725,18 +14725,18 @@ fn readMemBytes(sema: *Sema, ty: Index, buf_in: []const u8, undef: []const bool)
         for (info.field_types, 0..) |ft, i| {
             const fs = Type.abiSize(ip, ft);
             if (fs > buf.len or (best != null and fs <= best.?.size)) continue;
-            if (std.mem.indexOfScalar(bool, undef[0..@intCast(fs)], true) != null) continue;
+            if (std.mem.findScalar(bool, undef[0..@intCast(fs)], true) != null) continue;
             const fv = (try sema.readMemBytes(ft, buf[0..@intCast(fs)], undef[0..@intCast(fs)])) orelse continue;
             best = .{ .i = @intCast(i), .size = fs, .val = fv };
         }
         const b = best orelse return try sema.undefValue(ty);
         return try sema.intern(.{ .un = .{ .ty = ty, .tag = try sema.unionFieldTagValue(ty, b.i), .val = b.val } });
     }
-    if (std.mem.indexOfScalar(bool, undef[0..used], true) != null) {
+    if (std.mem.findScalar(bool, undef[0..used], true) != null) {
         // Like upstream, undefined memory reads as 0xaa bytes once part of
         // the scalar is written, so a value written a byte at a time
         // through a `*[N]u8` view becomes defined.
-        if (std.mem.indexOfScalar(bool, undef[0..used], false) == null) return try sema.undefValue(ty);
+        if (std.mem.findScalar(bool, undef[0..used], false) == null) return try sema.undefValue(ty);
         const filled = try sema.arena.dupe(u8, buf);
         for (filled[0..used], undef[0..used]) |*b, u| {
             if (u) b.* = 0xaa;
@@ -15664,7 +15664,7 @@ fn ccSupportsVarArgs(target: InternPool.Target, tag: std.lang.CallingConvention.
         .x86_64_sysv, .x86_64_x32, .x86_64_win => true,
         .aarch64_aapcs, .aarch64_aapcs_darwin, .aarch64_aapcs_win, .aarch64_vfabi, .aarch64_vfabi_sve => true,
         .auto, .async, .naked, .@"inline" => false,
-        else => std.mem.indexOfScalar(std.Target.Cpu.Arch, std.Target.Cpu.Arch.fromCallingConvention(tag), target.arch()) == null,
+        else => std.mem.findScalar(std.Target.Cpu.Arch, std.Target.Cpu.Arch.fromCallingConvention(tag), target.arch()) == null,
     };
 }
 
@@ -16257,7 +16257,7 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
             const iv = sema.resolveValue(try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1))) orelse return sema.fail(block, src, "tuple index must be comptime-known", .{});
             const i = ip.intValue(u64, iv).?;
             var buf: [20]u8 = undefined;
-            return sema.fieldPtr(block, src, ptr, std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
+            return sema.fieldPtr(block, src, ptr, std.mem.print(&buf, "{d}", .{i}) catch unreachable);
         },
         else => {},
     }
@@ -16845,7 +16845,7 @@ fn checkSliceSentinel(sema: *Sema, block: *Block, src: Src, many: Ref, start_val
             const prefix = "exceeds bounds of containing decl of type ";
             if (err != error.AnalysisFail or sema.zcu.errors.items.len != n + 1) return err;
             const msg = sema.zcu.errors.items[n].msg;
-            const at = std.mem.indexOf(u8, msg, prefix) orelse return err;
+            const at = std.mem.find(u8, msg, prefix) orelse return err;
             _ = sema.zcu.errors.pop();
             return sema.fail(block, src.operandSrc(2), "slice end index {d} exceeds bounds of containing decl of type {s}", .{ ip.intValue(u64, end_val.?).?, msg[at + prefix.len ..] });
         };
@@ -17478,7 +17478,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
             if (case.prong_info.is_comptime_unreach and info.unwrap() == .error_value and Type.class(ip, operand_ty) == .error_set) {
                 if (try sema.errorSetNames(parent, src, operand_ty)) |names| {
                     const name = try sema.getString(sema.zirString(info.unwrap().error_value));
-                    if (std.mem.indexOfScalar(InternPool.String, names, name) == null) continue;
+                    if (std.mem.findScalar(InternPool.String, names, name) == null) continue;
                 }
             }
             const item = try sema.switchItem(&item_block, item_src, inst, info, operand_ty, &extra_index);
@@ -17592,7 +17592,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         if (info.nonexhaustive or seen.values.count() != info.field_defaults.len) for (info.field_defaults, 0..) |fv, fi| {
             const tv = try sema.intern(.{ .enum_tag = .{ .ty = operand_ty, .int = fv } });
             for (cases.items) |c| {
-                if (std.mem.indexOfScalar(Index, c.items, tv) != null) break;
+                if (std.mem.findScalar(Index, c.items, tv) != null) break;
             } else try missing.append(sema.arena, @intCast(fi));
         };
         if (missing.items.len != 0) return sema.failSwitchEnum(parent, src, operand_ty, if (is_union) sema.typeOf(operand) else null, missing.items);
@@ -17613,7 +17613,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
                 const span = src.span(tree);
                 for (prongs.items) |*p| {
                     try sema.zcu.addNote(sema.file, span, "unhandled error value: 'error.{s}'", .{p.*});
-                    p.* = try std.fmt.allocPrint(sema.arena, "error.{f} => @panic(\"TODO\"),", .{std.zig.fmtId(p.*)});
+                    p.* = try sema.arena.print("error.{f} => @panic(\"TODO\"),", .{std.zig.fmtId(p.*)});
                 }
                 sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = try @import("diag.zig").prongsFix(sema.zcu.arena.allocator(), tree, span.main, prongs.items);
                 return err;
@@ -17650,7 +17650,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         for (info.field_types, 0..) |ft, i| {
             const tv = try sema.unionFieldTagValue(sema.typeOf(operand), @intCast(i));
             for (cases.items) |c| {
-                if (std.mem.indexOfScalar(Index, c.items, tv) != null) break;
+                if (std.mem.findScalar(Index, c.items, tv) != null) break;
             } else {
                 if (!Type.hasNoPossibleValue(ip, ft)) break;
                 try rest.append(sema.arena, tv);
@@ -17667,7 +17667,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         for (ip.structInfo(operand_ty).field_defaults) |fv| {
             const tv = try sema.intern(.{ .enum_tag = .{ .ty = operand_ty, .int = fv } });
             for (cases.items) |c| {
-                if (std.mem.indexOfScalar(Index, c.items, tv) != null) break;
+                if (std.mem.findScalar(Index, c.items, tv) != null) break;
             } else try rest.append(sema.arena, tv);
         }
         var c = e;
@@ -18415,7 +18415,7 @@ fn aggregate(sema: *Sema, block: *Block, src: Src, ty: Index, elems: []const Ref
     if (block.is_comptime and !block.discards_runtime) {
         const err = sema.fail(block, src, "unable to evaluate comptime expression", .{});
         const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
-        try sema.zcu.addNote(sema.file, sema.initElemSrc(src, ty, std.mem.indexOfScalar(Index, vals, .none).?).span(tree), "operation is runtime due to this operand", .{});
+        try sema.zcu.addNote(sema.file, sema.initElemSrc(src, ty, std.mem.findScalar(Index, vals, .none).?).span(tree), "operation is runtime due to this operand", .{});
         if (block.comptime_reason) |r| try sema.zcu.addNote(sema.file, src.span(tree), "{s}", .{r});
         return err;
     }
@@ -18424,7 +18424,7 @@ fn aggregate(sema: *Sema, block: *Block, src: Src, ty: Index, elems: []const Ref
     const class = Type.class(sema.ip, ty);
     if ((class == .@"struct" or class == .tuple) and try sema.isComptimeOnlyResolved(block, src, ty)) {
         // As upstream, at the first runtime-known field.
-        const i = std.mem.indexOfScalar(Index, vals, .none).?;
+        const i = std.mem.findScalar(Index, vals, .none).?;
         const elem_src = sema.initElemSrc(src, ty, i);
         const err = sema.fail(block, elem_src, "unable to resolve comptime value", .{});
         const span = elem_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
@@ -19898,7 +19898,7 @@ fn clobbersValue(sema: *Sema, mask: u32) !Index {
 fn clobberBit(name: []const u8) u32 {
     var buf: [4]u8 = undefined;
     var canonical = name;
-    if (name.len >= 2 and name.len <= buf.len and std.mem.indexOfScalar(u8, "wzdshb", name[0]) != null) {
+    if (name.len >= 2 and name.len <= buf.len and std.mem.findScalar(u8, "wzdshb", name[0]) != null) {
         buf[0] = if (name[0] == 'w') 'x' else 'v';
         @memcpy(buf[1..name.len], name[1..]);
         canonical = buf[0..name.len];
@@ -20535,7 +20535,7 @@ fn analyzeCall(
         "call with 'compile_time' modifier is evaluated at comptime"
     else if (fn_ty.cc != .@"inline" and modifier != .always_inline and fn_ty.return_type != .generic_poison_type and
         try sema.isComptimeOnlyResolved(block, src, fn_ty.return_type))
-        try std.fmt.allocPrint(sema.arena, "call to function with comptime-only return type '{f}' is evaluated at comptime", .{sema.fmtType(fn_ty.return_type)})
+        try sema.arena.print("call to function with comptime-only return type '{f}' is evaluated at comptime", .{sema.fmtType(fn_ty.return_type)})
     else
         null;
     var arg_i: usize = 0;
@@ -21299,7 +21299,7 @@ const BcLowering = struct {
     /// For a loop body lowered in the walker's place (`bcOsr`): the ZIR
     /// instructions of the bodies lowering has entered, which a break
     /// leaves the lowered code for if its target is not one of them.
-    osr: ?*std.DynamicBitSetUnmanaged = null,
+    osr: ?*std.bit_set.Dynamic = null,
     /// The ZIR `osr` indexes: the loop's file. Bodies of other files
     /// (inline callees, generic parameter types) are not part of the loop.
     osr_code: ?*const Zir = null,
@@ -21481,7 +21481,7 @@ fn bcLowerLoop(sema: *Sema, block: *Block, body: []const Zir.Inst.Index) Allocat
     defer arena_state.deinit();
     var l = create(zcu, arena_state.allocator(), sema.file, sema.owner);
     defer l.destroy();
-    var seen = try std.DynamicBitSetUnmanaged.initEmpty(l.arena, sema.code.instructions.len);
+    var seen = try std.bit_set.Dynamic.initEmpty(l.arena, sema.code.instructions.len);
     var bc: BcLowering = .{ .osr = &seen, .osr_code = sema.code };
     l.bc = &bc;
     l.func = sema.func;
@@ -21628,8 +21628,8 @@ fn bcFinish(sema: *Sema, ok: bool, n_errors: usize, params: []const Zcu.Bytecode
     var in_frame = try bcInFrame(gpa, &ir);
     errdefer in_frame.deinit(gpa);
     // Plain reads no reachable `comptime_dep` marks.
-    var marked = try std.DynamicBitSetUnmanaged.initEmpty(sema.arena, deps.len);
-    var marked_effects = try std.DynamicBitSetUnmanaged.initEmpty(sema.arena, bc.effects.items.len);
+    var marked = try std.bit_set.Dynamic.initEmpty(sema.arena, deps.len);
+    var marked_effects = try std.bit_set.Dynamic.initEmpty(sema.arena, bc.effects.items.len);
     bcMarkDeps(&ir, ir.mainBody(), &marked, &marked_effects);
     var entry_deps: std.ArrayList(u32) = .empty;
     defer entry_deps.deinit(gpa);
@@ -21652,7 +21652,7 @@ fn bcFinish(sema: *Sema, ok: bool, n_errors: usize, params: []const Zcu.Bytecode
 }
 
 /// `Bytecode.ints`.
-fn bcInts(gpa: Allocator, ip: *InternPool, ir: *const Ir, in_frame: *const std.DynamicBitSetUnmanaged) Allocator.Error![]Zcu.BcInt {
+fn bcInts(gpa: Allocator, ip: *InternPool, ir: *const Ir, in_frame: *const std.bit_set.Dynamic) Allocator.Error![]Zcu.BcInt {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
     const ints = try gpa.alloc(Zcu.BcInt, tags.len);
@@ -21685,7 +21685,7 @@ fn bcIntOp(tag: Ir.Inst.Tag, x: i128, y: i128) ?i128 {
 
 /// Sets the dependencies and effects the `comptime_dep` and
 /// `comptime_effect` instructions reachable from `body` mark.
-fn bcMarkDeps(ir: *const Ir, body: []const Ir.Inst.Index, marked: *std.DynamicBitSetUnmanaged, marked_effects: *std.DynamicBitSetUnmanaged) void {
+fn bcMarkDeps(ir: *const Ir, body: []const Ir.Inst.Index, marked: *std.bit_set.Dynamic, marked_effects: *std.bit_set.Dynamic) void {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
     for (body) |inst| {
@@ -21714,17 +21714,17 @@ fn bcMarkDeps(ir: *const Ir, body: []const Ir.Inst.Index, marked: *std.DynamicBi
 
 /// The instructions of `ir` whose values the evaluator can keep in its
 /// frame (see `Zcu.Bytecode.in_frame`).
-fn bcInFrame(gpa: Allocator, ir: *const Ir) Allocator.Error!std.DynamicBitSetUnmanaged {
+fn bcInFrame(gpa: Allocator, ir: *const Ir) Allocator.Error!std.bit_set.Dynamic {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
-    var set = try std.DynamicBitSetUnmanaged.initEmpty(gpa, tags.len);
+    var set = try std.bit_set.Dynamic.initEmpty(gpa, tags.len);
     for (tags, datas, 0..) |tag, data, i| switch (tag) {
         .alloc => if (data.ty != .none) set.set(i),
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => set.set(i),
         else => {},
     };
     const S = struct {
-        set: *std.DynamicBitSetUnmanaged,
+        set: *std.bit_set.Dynamic,
         tags: []const Ir.Inst.Tag,
         /// A use other than the ones that keep a value in the frame.
         fn escape(s: @This(), ref: Ref) void {
@@ -22104,7 +22104,7 @@ const BcFrame = struct {
     /// For an `*_with_overflow` kept in the frame, the overflow bit (`vals`
     /// holds the wrapped result).
     overflow: []Index,
-    in_frame: *const std.DynamicBitSetUnmanaged,
+    in_frame: *const std.bit_set.Dynamic,
     deps: []const Zcu.Dependee,
     effects: []const Index,
     /// See `Sema.bc_declared`.
@@ -23022,7 +23022,7 @@ fn vectorMap(sema: *Sema, block: *Block, src: Src, len: u32, result_ty: Index, o
                 if (sema.resolveValue(sc) == null) break false;
             } else true) {
                 const e = sema.zcu.errors.items[sema.zcu.errors.items.len - 1];
-                if (e.file == sema.file and !e.embed) try sema.zcu.appendNote(.{ .file = e.file, .span = e.span, .msg = try std.fmt.allocPrint(sema.zcu.arena.allocator(), "when computing vector element at index '{d}'", .{i}) });
+                if (e.file == sema.file and !e.embed) try sema.zcu.appendNote(.{ .file = e.file, .span = e.span, .msg = try sema.zcu.arena.allocator().print("when computing vector element at index '{d}'", .{i}) });
             }
             return err;
         };
@@ -23589,7 +23589,7 @@ fn testAnalyze(source: []const u8) ![]u8 {
     const full = try std.mem.concat(gpa, u8, &.{ source, test_panic });
     defer gpa.free(full);
     try tmp.dir.writeFile(io, .{ .sub_path = "t.zig", .data = full });
-    const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/t.zig", .{tmp.sub_path});
+    const root = try gpa.print(".zig-cache/tmp/{s}/t.zig", .{tmp.sub_path});
     defer gpa.free(root);
     var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent", .load_std = false });
     defer fe.deinit();
@@ -23892,7 +23892,7 @@ fn testTypeHashes(source: []const u8, out: []InternPool.Hash) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "t.zig", .data = source });
-    const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/t.zig", .{tmp.sub_path});
+    const root = try gpa.print(".zig-cache/tmp/{s}/t.zig", .{tmp.sub_path});
     defer gpa.free(root);
     var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent", .load_std = false });
     defer fe.deinit();

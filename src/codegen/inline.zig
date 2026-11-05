@@ -600,7 +600,7 @@ const Hasher = struct {
     /// The types of the values the body holds and of the memory it
     /// addresses, in order of first appearance, for their layouts
     /// (`hashBody`). Not a pointer's child the code does not address.
-    types: std.AutoArrayHashMapUnmanaged(Index, void) = .empty,
+    types: std.array_hash_map.Auto(Index, void) = .empty,
 
     fn word(h: *Hasher, w: u32) Allocator.Error!void {
         try h.words.append(h.gpa, w);

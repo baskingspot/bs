@@ -1441,7 +1441,7 @@ fn loopWrites(ir: *const Ir, ip: *const InternPool, uses: []const u32, x: Inst.I
     const stride = w.addr.terms[0].stride;
     if (w.hi - w.lo < stride) return null;
     var addr = w.addr;
-    std.mem.copyForwards(FillAddr.Index, addr.terms[0 .. addr.n - 1], addr.terms[1..addr.n]);
+    @memmove(addr.terms[0 .. addr.n - 1], addr.terms[1..addr.n]);
     addr.n -= 1;
     const first = std.math.mul(u64, lo, stride) catch return null;
     const last = std.math.mul(u64, hi - 1, stride) catch return null;
@@ -2026,7 +2026,7 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// `clobbers`), `restricted_clobbers` counts those lowerings so far, and
 /// a value takes such a register only if none lies in its interval, at
 /// its definition, or at its last use. Returns the mask of registers used.
-pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.DynamicBitSetUnmanaged, restricted: u32, restricted_clobbers: []const u32) u32 {
+pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.bit_set.Dynamic, restricted: u32, restricted_clobbers: []const u32) u32 {
     const total = n + n_float;
     assert(total <= max_regs);
     const gprs: u32 = (@as(u32, 1) << @intCast(n)) - 1;
@@ -2138,7 +2138,7 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, 
             reg2[t] == no_reg and (share[t] == no_tie or reg[share[t]] != reg[t]))
         {
             // Take over the tied operand's register, which dies here.
-            const k = std.mem.indexOfScalar(u32, active[0..active_len], t).?;
+            const k = std.mem.findScalar(u32, active[0..active_len], t).?;
             reg[inst] = reg[t];
             active[k] = inst;
             continue;

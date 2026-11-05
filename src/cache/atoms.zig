@@ -226,7 +226,7 @@ pub fn check(bytes: []align(alignment) const u8, arch: Atom.Unwind.Arch) ?usize 
 /// `advance_line` opcode within `lines` (see `LineProgram.switchTo`).
 fn debugValid(atom_len: usize, d: *const Atom.Debug) bool {
     // 0-terminated, nonempty paths.
-    if (d.files.len != 0 and (d.files[0] == 0 or d.files[d.files.len - 1] != 0 or std.mem.indexOf(u8, d.files, "\x00\x00") != null)) return false;
+    if (d.files.len != 0 and (d.files[0] == 0 or d.files[d.files.len - 1] != 0 or std.mem.find(u8, d.files, "\x00\x00") != null)) return false;
     const files = std.mem.countScalar(u8, d.files, 0);
     for (d.inlines, 0..) |inl, i| {
         if (@as(u64, inl.name_off) + inl.name_len > d.inline_names.len) return false;

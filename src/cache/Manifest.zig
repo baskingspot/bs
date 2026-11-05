@@ -635,7 +635,7 @@ const Overlay = struct {
     rrefs: std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)) = .empty,
     /// The nodes any of the maps above or `flags` and `sources` has, so
     /// that the accessors look up only those (`touched`).
-    touched: std.DynamicBitSetUnmanaged = .{},
+    touched: std.bit_set.Dynamic = .{},
     inputs: std.AutoHashMapUnmanaged(u32, InputState) = .empty,
     added_inputs: u32 = 0,
     error_names: std.ArrayList([]const u8) = .empty,
@@ -820,11 +820,11 @@ fn readLog(m: *Manifest, gpa: Allocator, io: Io, dir: Io.Dir) !void {
 
 /// The nodes whose `Flags.reached` is set, from the base's bits and the
 /// nodes the log changed.
-pub fn reachedSet(m: *const Manifest, gpa: Allocator) !std.DynamicBitSetUnmanaged {
-    var set = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m.nodeCount());
+pub fn reachedSet(m: *const Manifest, gpa: Allocator) !std.bit_set.Dynamic {
+    var set = try std.bit_set.Dynamic.initEmpty(gpa, m.nodeCount());
     errdefer set.deinit(gpa);
     const bytes = std.mem.sliceAsBytes(m.reached_bits);
-    @memcpy(std.mem.sliceAsBytes(set.masks[0 .. (set.bit_length + @bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt) - 1) / @bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt)])[0..bytes.len], bytes);
+    @memcpy(std.mem.sliceAsBytes(set.masks[0 .. (set.bit_length + @bitSizeOf(std.bit_set.Dynamic.MaskInt) - 1) / @bitSizeOf(std.bit_set.Dynamic.MaskInt)])[0..bytes.len], bytes);
     var it = m.overlay.touched.iterator(.{});
     while (it.next()) |i| set.setValue(i, m.flags(@intCast(i)).reached);
     for (m.nodes.len..set.bit_length) |i| set.setValue(i, m.flags(@intCast(i)).reached);
@@ -843,7 +843,7 @@ pub fn staleNodes(m: *const Manifest, gpa: Allocator, out: *std.ArrayList(u32)) 
 /// Appends the nodes whose `Source.input` is set in `inputs`, in node
 /// order: one pass over the base's sources, looking up only the nodes the
 /// log changed.
-pub fn nodesOfInputs(m: *const Manifest, gpa: Allocator, inputs: *const std.DynamicBitSetUnmanaged, out: *std.ArrayList(u32)) !void {
+pub fn nodesOfInputs(m: *const Manifest, gpa: Allocator, inputs: *const std.bit_set.Dynamic, out: *std.ArrayList(u32)) !void {
     for (m.sources, 0..) |base, i_usize| {
         const i: u32 = @intCast(i_usize);
         const src = if (m.touched(i)) m.source(i) else base;
@@ -2526,11 +2526,11 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "a" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data = "b" });
-    const base_path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base_path = try gpa.print(".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer gpa.free(base_path);
-    const a_path = try std.fs.path.join(gpa, &.{ base_path, "a.zig" });
+    const a_path = try Io.Dir.path.join(gpa, &.{ base_path, "a.zig" });
     defer gpa.free(a_path);
-    const b_path = try std.fs.path.join(gpa, &.{ base_path, "b.zig" });
+    const b_path = try Io.Dir.path.join(gpa, &.{ base_path, "b.zig" });
     defer gpa.free(b_path);
     const old_time: Io.Timestamp = .fromNanoseconds(1_000_000_000 * std.time.ns_per_s);
     try tmp.dir.setTimestamps(io, "a.zig", .{ .modify_timestamp = .{ .new = old_time } });
@@ -2696,7 +2696,7 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
             try m3.staleNodes(gpa, &stale);
             std.mem.sort(u32, stale.items, {}, std.sort.asc(u32));
             try t.expectEqualSlices(u32, &.{ 0, 4 }, stale.items);
-            var in1 = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m3.inputCount());
+            var in1 = try std.bit_set.Dynamic.initEmpty(gpa, m3.inputCount());
             defer in1.deinit(gpa);
             in1.set(1);
             var of_in1: std.ArrayList(u32) = .empty;
