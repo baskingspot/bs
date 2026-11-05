@@ -5984,7 +5984,8 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         const src: Encoder.Operand = switch (ops[0]) {
             .reg => |r| .{ .reg = r.reg },
             .imm => |v| .{ .imm = v },
-            .sym, .mem => return cg.fail("symbol or memory operand in '{s}'", .{line}),
+            .mem => |m| if (m.fs) return cg.fail("symbol or memory operand in '{s}'", .{line}) else .{ .mem = m.mem },
+            .sym => return cg.fail("symbol or memory operand in '{s}'", .{line}),
         };
         if (eql(u8, base, "mov") or eql(u8, mnemonic, "movabs")) return e.mov(size, .{ .reg = dst.reg }, src);
         const alu_ops = [_]struct { []const u8, Encoder.AluOp }{
@@ -6001,6 +6002,28 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             .sym, .mem => {},
         };
         if (eql(u8, base, "xchg") and ops[0] == .reg) return e.xchg(size, .{ .reg = dst.reg }, ops[0].reg.reg);
+    } else if (ops[1] == .mem and !ops[1].mem.fs and ops[0] != .sym and ops[0] != .mem) {
+        // An ALU operation on memory: compiler_rt's `__zig_probe_stack`
+        // touches each page with `orl $0,16(%rsp)`.
+        const alu_ops = [_]struct { []const u8, Encoder.AluOp }{
+            .{ "add", .add }, .{ "or", .@"or" }, .{ "and", .@"and" }, .{ "sub", .sub }, .{ "xor", .xor }, .{ "cmp", .cmp },
+        };
+        for (alu_ops) |op| {
+            if (!std.mem.startsWith(u8, mnemonic, op[0])) continue;
+            const size: Size = if (mnemonic.len == op[0].len + 1) switch (mnemonic[op[0].len]) {
+                'b' => .byte,
+                'w' => .word,
+                'l' => .dword,
+                'q' => .qword,
+                else => continue,
+            } else if (mnemonic.len == op[0].len and ops[0] == .reg) ops[0].reg.size else continue;
+            const src: Encoder.Operand = switch (ops[0]) {
+                .reg => |r| .{ .reg = r.reg },
+                .imm => |v| .{ .imm = v },
+                .sym, .mem => unreachable,
+            };
+            return e.alu(op[1], size, .{ .mem = ops[1].mem.mem }, src);
+        }
     }
     return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
 }
