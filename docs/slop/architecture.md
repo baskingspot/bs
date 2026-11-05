@@ -1599,8 +1599,8 @@ layout order of pass 4:
   `Ssa.allocate` takes restrictions, each a register mask and per
   position a count of the lowerings that write those registers; a value
   takes none of a restriction's registers when such a lowering lies in
-  its interval, at its definition, or at its last use. x86_64 has two:
-  r11 (`usesR11`), and the registers inline assembly pins or clobbers
+  its interval, at its definition, or at its last use. x86_64 has one
+  per allocatable scratch register (`scratchUse`), and the registers inline assembly pins or clobbers
   plus rsi, rdi, r8, r9 and r11, which its `r` operands and output
   addresses may get. An asm statement is also an x86_64 clobber point.
   aarch64 restricts the registers an asm statement names; an asm
@@ -2677,9 +2677,18 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    allocation (deferred loads and values in the function's result read
    through r11, as do loads forwarded from them, which take their home
    only when emitted, so the check looks through `Live.fwd`; division, bit counting,
-   wide integers, odd-sized moves, calls, overflow bits, vector masks), and
-   every lowering names r11 through `CodeGen.r11`, so emission fails the
-   function where one does where they said it does not. A clobber point in a
+   wide integers, odd-sized moves, calls, overflow bits, vector masks).
+   `CodeGen.scratchUse` and `termScratch` return those decisions as a
+   mask of the scratch registers (rcx, rdx, r10, r11), one restriction
+   per allocatable one. The encoder records the general-purpose registers
+   each instruction writes (`Encoder.written`: destinations, implicit
+   ones such as mul's rdx or rep movsb's rcx, rsi and rdi, every
+   caller-saved one for a call or an inline assembly instruction), and
+   emission fails the function when a value or terminator writes one that
+   is neither in its mask, nor a clobber point's (when it is one), nor
+   its own home: its result's, an overflow pair's fields', the promoted
+   variable a store writes, a `br`'s block result, a `ret`'s callee-saved
+   registers, or for inline assembly any (`CodeGen.checkWrites`). A clobber point in a
    doomed block, one from which every path ends the function (a return,
    the panic call of a failing check, an error return's `returnError`
    call, or in a function without loops every block), matters only to
