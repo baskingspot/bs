@@ -2879,9 +2879,11 @@ fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSe
     var written = try std.DynamicBitSetUnmanaged.initEmpty(arena, n_prev);
     for (final, write) |f, w| if (w and f < n_prev) written.set(f);
     // Only the nodes written or whose flags may change (`check`) can
-    // change the sets: without an external reference among them, they
-    // are the same.
+    // change the sets: without an external reference among them, and
+    // without new error names, they are the same.
     const involved = involved: {
+        // New error names change the table that unchanged nodes refer to.
+        if (rp.zcu.ip.error_names.items.len - 1 != m.errorCount()) break :involved true;
         for (0..n_prev) |i_usize| {
             const i: u32 = @intCast(i_usize);
             if (!check.isSet(i) and !written.isSet(i)) continue;

@@ -1322,6 +1322,18 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &rq.step, 10);
         test_step.dependOn(&rq.step);
     }
+    // A test's edit that adds an error name: test/run/edit_error_names_table.sh.
+    {
+        const en = b.addSystemCommand(&.{"sh"});
+        en.setName("bs test edit adding an error name");
+        en.addFileArg(b.path("test/run/edit_error_names_table.sh"));
+        en.addArtifactArg(bs);
+        _ = en.addOutputDirectoryArg("work");
+        en.addDirectoryArg(std_zir);
+        en.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &en.step, 10);
+        test_step.dependOn(&en.step);
+    }
 
     const bs_run = b.addRunArtifact(bs);
     bs_run.setName("bs run args");

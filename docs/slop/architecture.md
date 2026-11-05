@@ -5855,8 +5855,9 @@ records only what changed, and links from the manifest.
   outdated, the analyzed, what reach gained or lost, and every node in
   a build that assumed nothing), finds exported nodes through `rrefs`,
   and skips `checkLinkInputs` unless a checked or written node has
-  external or error-name references. zls Server.zig edit: setup 10.4 →
-  4.2 ms.
+  external or error-name references, or the build made new error names
+  (whose table an unchanged node, a test runner's `@errorName`, may
+  link). zls Server.zig edit: setup 10.4 → 4.2 ms.
 - *Loading on demand.* A green unit's result is decoded only when
   analysis reads it (`ensureNavVal` and the rest). Writing a result into
   the Zcu first brings the unit's plain dependencies up to date, as
