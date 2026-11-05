@@ -405,7 +405,8 @@ pub fn main(init_std: std.process.Init) !void {
 /// Valgrind. ('=' is in no module's name.)
 /// Atoms inlined other than by default (`inlining`) get entries of their
 /// own too, as `+inline<budget>` and `s` for the safe variant, and
-/// atoms with every check kept (`BS_PROVE=off`) as `+noprove`. A CPU
+/// atoms with every check kept (`BS_PROVE=off`) as `+noprove`, and
+/// without memory forwarding (`BS_FORWARD=off`) as `+noforward`. A CPU
 /// other than the baseline (`-mcpu`), which changes builtin and the code
 /// generated for every function, follows the target as `@<model>` and its
 /// feature words (`cpu.cacheName`).
@@ -417,8 +418,9 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
     } else true;
     const unsafe = opts.optimize == .fast or opts.optimize == .small;
     const prove_on = proving(env);
+    const forward_on = forwarding(env);
     const cpu_name = try cpu_mod.cacheName(arena, opts.cpu);
-    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on and cpu_name.len == 0) return opts.bs_target.name();
+    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on and forward_on and cpu_name.len == 0) return opts.bs_target.name();
     var s: std.ArrayList(u8) = .empty;
     try s.appendSlice(arena, opts.bs_target.name());
     try s.appendSlice(arena, cpu_name);
@@ -437,6 +439,7 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
     }
     if (!default_inl) try s.print(arena, "+inline{d}{s}", .{ inl.budget, if (inl.safe) "s" else "" });
     if (!prove_on) try s.appendSlice(arena, "+noprove");
+    if (!forward_on) try s.appendSlice(arena, "+noforward");
     return s.items;
 }
 
@@ -447,6 +450,15 @@ fn proving(env: *const std.process.Environ.Map) bool {
     if (std.mem.eql(u8, v, "off")) return false;
     if (std.mem.eql(u8, v, "on")) return true;
     fatal("invalid BS_PROVE '{s}': expected 'on' or 'off'", .{v});
+}
+
+/// Whether copies and loads are forwarded through memory
+/// (docs/slop/architecture.md, "Forwarding"): `BS_FORWARD=off` keeps them.
+fn forwarding(env: *const std.process.Environ.Map) bool {
+    const v = env.get("BS_FORWARD") orelse return true;
+    if (std.mem.eql(u8, v, "off")) return false;
+    if (std.mem.eql(u8, v, "on")) return true;
+    fatal("invalid BS_FORWARD '{s}': expected 'on' or 'off'", .{v});
 }
 
 /// How calls are inlined (docs/slop/architecture.md, "Inlining within a
@@ -1205,6 +1217,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     emit.entry_name = opts.entry;
     emit.fuzz = opts.fuzz;
     emit.prove_on = proving(job.environ_map);
+    emit.forward_on = forwarding(job.environ_map);
     // Executables and shared libraries link glibc: an object or a static
     // library with -lc is an ordinary one, as upstream's.
     const links_glibc = opts.link_libc and !opts.command.isObj() and (opts.command != .build_lib or opts.dynamic);

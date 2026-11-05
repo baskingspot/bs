@@ -215,6 +215,9 @@ forward_scratch: std.ArrayList(u32) = .empty,
 /// Whether `prove.run` removes the checks it proves (`BS_PROVE=off`
 /// turns it off, to compare a program's behavior with and without).
 prove_on: bool = true,
+/// Whether `forward.run` forwards copies and loads (`BS_FORWARD=off`
+/// turns it off, to compare a program's behavior with and without).
+forward_on: bool = true,
 /// Per-stage backend time and size, for `BS_TIMING` and bench-codegen.
 codegen_stats: CodeGenStats = .{},
 /// The CodeGen workers, on the main Emit (`startPool`).
@@ -591,6 +594,7 @@ pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64, late: bool) !void {
         w.obj = emit.obj;
         w.fuzz = emit.fuzz;
         w.prove_on = emit.prove_on;
+        w.forward_on = emit.forward_on;
         w.pic = emit.pic;
         w.shared = emit.shared;
         w.glibc = emit.glibc;
@@ -1142,7 +1146,7 @@ fn generateFunction(emit: *Emit, ir: *const Ir) Allocator.Error!void {
     const t0 = std.Io.Timestamp.now(io, .awake);
     defer emit.codegen_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
     // The IR is this job's own.
-    emit.codegen_stats.forwarded += try forward.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.forward_scratch);
+    if (emit.forward_on) emit.codegen_stats.forwarded += try forward.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.forward_scratch);
     const t1 = std.Io.Timestamp.now(io, .awake);
     emit.codegen_stats.forward_ns += @intCast(t0.durationTo(t1).nanoseconds);
     const st: prove.Stats = if (!emit.prove_on) .{} else try prove.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.prove_scratch, emit.fuzz);
@@ -1363,6 +1367,7 @@ pub fn benchCodegen(emit: *Emit, runs: u32) !void {
         defer e.deinit();
         e.fuzz = emit.fuzz;
         e.prove_on = emit.prove_on;
+        e.forward_on = emit.forward_on;
         for (irs.items) |*ir| try e.generateFunction(ir);
         const s = e.codegen_stats;
         if (best == null or s.build_ns + s.alloc_ns + s.emit_ns < best.?.build_ns + best.?.alloc_ns + best.?.emit_ns) best = s;

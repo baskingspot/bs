@@ -2030,6 +2030,10 @@ rewrites use it:
   promotes their loads, and forwarding them first only lengthened
   intervals (fmt +3%).
 
+`BS_FORWARD=off` turns the pass off (its own cache entries, as
+`+noforward`), to compare a program's behavior with and without it;
+scalar replacement still leaves the copies whole.
+
 #### Rewrite rules
 
 Built on the IR, after inlining (`src/codegen/rewrite.zig`): a table of
