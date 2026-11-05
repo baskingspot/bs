@@ -44,8 +44,18 @@ and bit pointers (`t_packed_odd`); error sets, their merges and
 `@intFromError`/`@errorFromInt` round trips (`t_errors`); structs,
 enums, unions and tuples rebuilt from `@typeInfo` (`t_reify`); tuples
 (`t_tuples`); slices of slices (`t_slices2`); peer types from
-`@TypeOf(a, b, ...)` and each peer coerced to it (`t_peer`); and
-`std.fmt.comptimePrint` of integers and floats (`t_fmt`).
+`@TypeOf(a, b, ...)` and each peer coerced to it (`t_peer`);
+`std.fmt.comptimePrint` of integers and floats (`t_fmt`); huge
+`comptime_int` and `comptime_float` values and their conversions
+(`t_comptime_num`); `@typeName` of generic instances (`t_typename`);
+`StaticStringMap`, `EnumArray`, `EnumSet`, tokenizers,
+`readInt`/`writeInt` and hashes (`t_std2`); many-pointer arithmetic,
+`@memmove`/`@memset` and reinterpreting bytes through pointers
+(`t_ptr_arith`); `inline else` over unions, enums, error sets and ranges
+(`t_inline_switch`); recursive functions and types (`t_recursion`); and
+destructuring of comptime-built tuples (`t_destructure`). A test is a
+constant printed by `main`, or, for code that must run at run time
+(`t_destructure`'s runtime half), a function `main` calls.
 
 Programs are meant to be well defined, but a test may hit a comptime
 error upstream reports (an overflow, the branch quota): each test has a

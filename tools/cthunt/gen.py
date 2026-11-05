@@ -1779,6 +1779,391 @@ class Gen:
         out.append("};")
         return out, "any"
 
+    def t_comptime_num(self, name):
+        """comptime_int and comptime_float: huge values, conversions to and
+        from fixed-width types, rounding, division and comparisons."""
+        out = [f"const {name} = blk: {{"]
+        big = self.ch(
+            [
+                "1 << 200",
+                "-(1 << 130) + 7",
+                "0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff",
+                "12345678901234567890123456789",
+                "-1",
+                "0",
+            ]
+        )
+        fl = self.ch(
+            [
+                "1.0e300",
+                "0.1",
+                "-2.5",
+                "1.0 / 3.0",
+                "123456789.987654321",
+                "0x1.8p-1070",
+                "1e-320",
+                "9007199254740993.0",
+            ]
+        )
+        res = []
+        out.append(f"    const I = {big};")
+        out.append(f"    const F = {fl};")
+        k = self.r.random()
+        res.append("I / 7")
+        res.append("@rem(I, 11)")
+        res.append("@mod(I, -13)")
+        res.append("I >> 3")
+        res.append("I * I % 1000003")
+        ft = self.ch(["f16", "f32", "f64", "f80", "f128"])
+        res.append(f"@as({ft}, @floatFromInt(I))")
+        res.append(f"@as({ft}, F)")
+        res.append("@as(f128, F * 3.0)")
+        res.append("@floor(F)")
+        res.append("@round(F * 10.0)")
+        res.append("F < 0.5")
+        res.append("@as(f64, F) == F")
+        res.append(
+            "@as(i128, @intFromFloat(@trunc(@as(f64, 1.0e20))))"
+            if k < 0.5
+            else "@as(u64, @intFromFloat(@floor(@as(f32, 1.5e9))))"
+        )
+        res.append("@as(comptime_int, @intFromFloat(@floor(F * 1000.0)))" if fl not in ("1.0e300",) else "0")
+        res.append("std.math.log2(I + (1 << 300))")
+        res.append("@abs(I)")
+        res.append("@as(u256, @intCast(@abs(I) & ((1 << 256) - 1)))")
+        out.append("    break :blk .{ " + ", ".join(res) + " };")
+        out.append("};")
+        return out, "any"
+
+    def t_typename(self, name):
+        """@typeName of generic types instantiated with integers, enums,
+        types, slices, optionals and nested generics."""
+        g = self.fresh("Gen")
+        out = [f"fn {g}(comptime T: type, comptime n: anytype) type {{"]
+        out.append("    return struct { x: T, pub const N = n; };")
+        out.append("}")
+        argsets = [
+            ("u8", "3"),
+            ("i64", "-1"),
+            ("[]const u8", '"str"'),
+            ("?u3", "null"),
+            ("[2]u4", ".{ 1, 2 }"),
+            ("E_peer", "E_peer.b"),
+            ("type", "u7"),
+            ("*const fn () void", "@as(u16, 9)"),
+            ("error{X}!u8", "true"),
+            ("@Vector(2, f32)", "1.5"),
+        ]
+        out.append(f"const {name} = blk: {{")
+        res = []
+        for _ in range(self.r.randint(1, 4)):
+            t, v = self.ch(argsets)
+            if self.p(0.3):
+                t2, v2 = self.ch(argsets)
+                res.append(f"@typeName({g}({g}({t2}, {v2}), {v}))")
+            else:
+                res.append(f"@typeName({g}({t}, {v}))")
+        res.append(f"@typeName(?*const {g}(u8, 0))")
+        res.append("@typeName([3:0]u8)")
+        res.append("@typeName(fn (u8) error{A}!void)")
+        out.append("    break :blk .{ " + ", ".join(res) + " };")
+        out.append("};")
+        return out, "any"
+
+    def t_std2(self, name):
+        """More std at comptime: StaticStringMap, EnumArray, EnumSet,
+        FieldEnum, tokenizers, readInt/writeInt, bytesAsSlice and hashes."""
+        en = self.fresh("En")
+        tags = [f"k{i}" for i in range(self.r.randint(1, 6))]
+        out = [f"const {en} = enum {{ {', '.join(tags)} }};"]
+        out.append(f"const {name} = blk: {{")
+        out.append("    @setEvalBranchQuota(100000);")
+        res = []
+        for _ in range(self.r.randint(1, 4)):
+            k = self.r.random()
+            v = self.fresh("v")
+            if k < 0.15:
+                keys = self.r.sample(["a", "bb", "ccc", "zig", "", "abc", "ab", "longer_key"], self.r.randint(1, 5))
+                kv = ", ".join(f'.{{ "{kk}", @as(u8, {i}) }}' for i, kk in enumerate(keys))
+                look = self.ch(keys + ["nope", "a", "ab"])
+                out.append(f"    const {v}m = std.StaticStringMap(u8).initComptime(.{{ {kv} }});")
+                out.append(f'    const {v} = .{{ {v}m.get("{look}"), {v}m.has("{self.ch(keys)}"), {v}m.keys().len }};')
+                res.append(v)
+            elif k < 0.3:
+                out.append(f"    var {v}a = std.EnumArray({en}, u16).initFill({self.r.randint(0, 9)});")
+                out.append(f"    {v}a.set(.{self.ch(tags)}, {self.r.randint(0, 999)});")
+                out.append(f"    {v}a.getPtr(.{self.ch(tags)}).* +%= 7;")
+                out.append(f"    const {v} = {v}a.values;")
+                res.append(v)
+            elif k < 0.45:
+                sub = self.r.sample(tags, self.r.randint(0, len(tags)))
+                init = ", ".join(f".{t} = true" for t in sub)
+                out.append(f"    var {v}s = std.EnumSet({en}).init(.{{ {init} }});")
+                out.append(f"    {v}s.toggle(.{self.ch(tags)});")
+                out.append(
+                    f"    const {v} = .{{ {v}s.count(), {v}s.contains(.{self.ch(tags)}), {v}s.complement().count() }};"
+                )
+                res.append(v)
+            elif k < 0.55:
+                out.append(f"    const {v}F = std.meta.FieldEnum(struct {{ a: u8, bb: u16, ccc: bool }});")
+                out.append(
+                    f'    const {v} = .{{ @tagName(@as({v}F, @enumFromInt({self.r.randint(0, 2)}))), std.enums.values({en}).len, std.meta.stringToEnum({en}, "{self.ch(tags + ["zz"])}") }};'
+                )
+                res.append(v)
+            elif k < 0.7:
+                s = self.ch(["a,b,,c", ",,x", "", "one", "1,22,333,", "a b  c"])
+                sep = self.ch([",", " "])
+                fn = self.ch(["tokenizeScalar", "splitScalar"])
+                out.append(f"    var {v}it = std.mem.{fn}(u8, \"{s}\", '{sep}');")
+                out.append(f"    var {v}: [8]usize = @splat(99);")
+                out.append(f"    var {v}i: usize = 0;")
+                out.append(f"    while ({v}it.next()) |tok| : ({v}i += 1) {v}[{v}i] = tok.len;")
+                res.append(v)
+            elif k < 0.85:
+                t = self.ch(["u16", "u32", "i24", "u64", "i48", "u128"])
+                end = self.ch([".little", ".big"])
+                nb = {"u16": 2, "u32": 4, "i24": 3, "u64": 8, "i48": 6, "u128": 16}[t]
+                bs = ", ".join(str(self.r.randint(0, 255)) for _ in range(nb + 2))
+                out.append(f"    var {v}b: [{nb + 2}]u8 = .{{ {bs} }};")
+                out.append(f"    const {v}x = std.mem.readInt({t}, {v}b[1..{nb + 1}], {end});")
+                out.append(f"    std.mem.writeInt({t}, {v}b[0..{nb}], {v}x +% 1, {self.ch(['.little', '.big'])});")
+                out.append(f"    const {v} = .{{ {v}x, {v}b }};")
+                res.append(v)
+            else:
+                d = self.ch(["hello", "", "comptime", "\\x00\\xff"])
+                out.append(
+                    f'    const {v} = .{{ std.hash.Crc32.hash("{d}"), std.hash.Fnv1a_64.hash("{d}"), std.hash.Adler32.hash("{d}") }};'
+                )
+                res.append(v)
+        out.append("    break :blk .{ " + ", ".join(res) + " };")
+        out.append("};")
+        return out, "any"
+
+    def t_ptr_arith(self, name):
+        """Many pointers into comptime arrays: arithmetic, slicing,
+        @memcpy/@memmove/@memset, reinterpreting byte arrays as wider
+        integers through pointers, and pointer comparison."""
+        et = self.ch(["u8", "u16", "u32", "i64"])
+        n = self.r.randint(4, 12)
+        out = [f"const {name} = blk: {{"]
+        out.append(f"    var a: [{n}]{et} = .{{ " + ", ".join(self.scalar_lit(et) for _ in range(n)) + " };")
+        out.append(f"    var p: [*]{et} = &a;")
+        out.append("    _ = &p;")
+        res = []
+        for _ in range(self.r.randint(1, 6)):
+            k = self.r.random()
+            i = self.r.randint(0, n - 2)
+            v = self.fresh("v")
+            if k < 0.15:
+                out.append(f"    p += {self.r.randint(0, n - 1 - i) // 2};")
+                out.append(f"    p[0] = {self.scalar_lit(et)};")
+            elif k < 0.25:
+                lo = self.r.randint(0, n // 2)
+                hi = self.r.randint(lo, n // 2)
+                out.append(f"    const {v} = (p - 0)[{lo}..{hi}];")
+                res.append(f"{v}.len")
+            elif k < 0.4:
+                lo = self.r.randint(0, n - 2)
+                ln = self.r.randint(0, (n - lo) // 2)
+                dst = self.r.randint(0, n - ln)
+                out.append(f"    @memmove(a[{dst}..{dst + ln}], a[{lo}..{lo + ln}]);")
+            elif k < 0.5:
+                lo = self.r.randint(0, n - 1)
+                out.append(f"    @memset(a[{lo}..], {self.scalar_lit(et)});")
+            elif k < 0.65:
+                out.append(f"    const {v} = &a[{i}];")
+                out.append(f"    const {v}2: *{et} = @ptrCast(@as([*]{et}, @ptrCast({v})) + 1);")
+                out.append(f"    {v}2.* = {v}.*;")
+                res.append(f"@intFromBool(@as([*]{et}, @ptrCast({v})) + 1 == @as([*]{et}, @ptrCast({v}2)))")
+            elif k < 0.8 and et == "u8":
+                w = self.ch(["u16", "u32"])
+                bw = {"u16": 2, "u32": 4}[w]
+                if n >= bw + 1:
+                    j = self.r.randint(0, n - bw)
+                    out.append(f"    const {v}: *align(1) const {w} = @ptrCast(&a[{j}]);")
+                    res.append(f"{v}.*")
+            elif k < 0.9:
+                lo = self.r.randint(0, n - 1)
+                out.append(f"    const {v} = std.mem.sliceAsBytes(a[{lo}..]);")
+                res.append(f"{v}.len")
+                res.append(f"{v}[{v}.len - 1]")
+            else:
+                out.append(f"    const {v}: []const {et} = p[0..2];")
+                out.append(f"    a[{i}] = {v}[1];")
+        out.append("    break :blk .{ a" + "".join(", " + r for r in res) + " };")
+        out.append("};")
+        return out, "any"
+
+    def t_inline_switch(self, name):
+        """`inline else` and inline prongs over tagged unions, enums,
+        error sets and integer ranges, with captured tags and payloads."""
+        u = self.fresh("U")
+        tys = [
+            self.ch(["u8", "i16", "u3", "f32", "bool", "void", "[2]u8", "?u4", "u0"])
+            for _ in range(self.r.randint(1, 5))
+        ]
+        fields = [f"f{i}: {t}" for i, t in enumerate(tys)]
+        out = [f"const {u} = union(enum) {{ {', '.join(fields)} }};"]
+        f = self.fresh("sw")
+        out.append(f"fn {f}(x: {u}) usize {{")
+        out.append("    return switch (x) {")
+        if self.p(0.5) and len(tys) > 1:
+            out.append("        .f0 => |v| @sizeOf(@TypeOf(v)) + 100,")
+        out.append("        inline else => |v, tag| @tagName(tag).len * 10 + @sizeOf(@TypeOf(v)),")
+        out.append("    };")
+        out.append("}")
+
+        def ulit():
+            i = self.r.randrange(len(tys))
+            t = tys[i]
+            lit = {
+                "u8": "200",
+                "i16": "-3",
+                "u3": "5",
+                "f32": "1.5",
+                "bool": "true",
+                "void": "{}",
+                "[2]u8": ".{ 1, 2 }",
+                "?u4": "null",
+                "u0": "0",
+            }[t]
+            return f"{u}{{ .f{i} = {lit} }}"
+
+        out.append(f"const {name} = blk: {{")
+        out.append("    var r: [4]usize = undefined;")
+        out.append(f"    for (&r, [_]{u}{{ {', '.join(ulit() for _ in range(4))} }}) |*o, x| o.* = {f}(x);")
+        k = self.r.random()
+        if k < 0.4:
+            out.append("    var acc: u32 = 0;")
+            out.append("    for (0..6) |i| {")
+            out.append("        acc += switch (@as(u3, @intCast(i))) {")
+            out.append("            inline 0...2 => |c| @as(u32, c) * 7,")
+            out.append("            inline else => |c| @as(u32, @bitSizeOf(@TypeOf(c))) + c,")
+            out.append("        };")
+            out.append("    }")
+        elif k < 0.7:
+            out.append("    const E = error{ A, BB, CCC };")
+            out.append("    var acc: usize = 0;")
+            out.append("    for ([_]E{ error.A, error.CCC, error.BB }) |e| acc = acc * 10 + switch (e) {")
+            out.append("        inline else => |c| @errorName(c).len,")
+            out.append("    };")
+        else:
+            out.append("    var acc: usize = 0;")
+            out.append("    for (std.enums.values(E_peer)) |e| acc += switch (e) {")
+            out.append("        inline else => |t| @intFromEnum(t) + @tagName(t).len,")
+            out.append("    };")
+        out.append(f'    const tag_count = @typeInfo(@typeInfo({u}).@"union".tag_type.?).@"enum".field_names.len;')
+        out.append("    break :blk .{ r, acc, tag_count };")
+        out.append("};")
+        return out, "any"
+
+    def t_recursion(self, name):
+        """Recursive comptime functions: memoized recursion into a
+        comptime array, recursive type construction, and mutual
+        recursion."""
+        out = []
+        k = self.r.random()
+        n = self.r.randint(0, 25)
+        if k < 0.35:
+            f = self.fresh("fib")
+            out.append(f"fn {f}(comptime n: u32) u64 {{")
+            out.append(f"    return if (n < 2) n else {f}(n - 1) + {f}(n - 2);")
+            out.append("}")
+            out.append(
+                f"const {name} = blk: {{ @setEvalBranchQuota(1000000); break :blk .{{ {f}({min(n, 18)}), {f}(0) }}; }};"
+            )
+        elif k < 0.6:
+            f = self.fresh("Nest")
+            d = self.r.randint(0, 6)
+            out.append(f"fn {f}(comptime d: u32) type {{")
+            out.append(
+                f"    return if (d == 0) u8 else struct {{ inner: {f}(d - 1), tag: u16 = d, pub const depth = d; }};"
+            )
+            out.append("}")
+            out.append(f"const {name} = blk: {{")
+            out.append(f"    const T = {f}({d});")
+            out.append("    const v: T = undefined;")
+            out.append("    _ = v;")
+            out.append(
+                f'    break :blk .{{ @sizeOf(T), @alignOf(T), @typeInfo(T) == .@"struct", @bitSizeOf({f}({max(d - 1, 0)})) }};'
+            )
+            out.append("};")
+        elif k < 0.8:
+            e = self.fresh("even")
+            o = self.fresh("odd")
+            out.append(f"fn {e}(n: u32) bool {{ return if (n == 0) true else {o}(n - 1); }}")
+            out.append(f"fn {o}(n: u32) bool {{ return if (n == 0) false else {e}(n - 1); }}")
+            out.append(
+                f"const {name} = blk: {{ @setEvalBranchQuota(100000); break :blk .{{ {e}({n * 7}), {o}({n}) }}; }};"
+            )
+        else:
+            f = self.fresh("memo")
+            out.append(f"const {name} = blk: {{")
+            out.append(f"    var m: [{n + 2}]u64 = undefined;")
+            out.append("    m[0] = 1;")
+            out.append("    m[1] = 1;")
+            out.append(f"    for (2..{n + 2}) |i| m[i] = m[i - 1] *% @as(u64, i) +% m[i - 2];")
+            out.append("    const final = m;")
+            out.append("    break :blk .{ final, final.len };")
+            out.append("};")
+        return out, "any"
+
+    def t_destructure(self, name):
+        """Destructuring of comptime-built tuples and arrays, in runtime
+        code (the values' addresses taken at run time) and in comptime
+        code."""
+        et = self.ch(["u8", "i16", "u32", "u64", "u5"])
+        n = self.r.randint(1, 6)
+        strs = self.r.sample(["ab", "cde", "", "zig", "x"], self.r.randint(1, 4))
+        fill = self.ch(["@intCast(i * 3 + 1)", "@intCast((i * 7) % 5)", "@intCast(i)"])
+        build = [
+            f"        var arr: [{n}]{et} = undefined;",
+            f"        for (&arr, 0..) |*e, i| e.* = {fill};",
+            f"        var strs: [{len(strs)}][]const u8 = undefined;",
+        ]
+        build += [f'        strs[{i}] = "{s}";' for i, s in enumerate(strs)]
+        k = self.r.randint(0, 99)
+        order = self.ch([("k", "arr", "strs"), ("arr", "strs", "k"), ("strs", "k", "arr")])
+        typed = self.p(0.3)
+        types = {"k": "u8", "arr": f"[{n}]{et}", "strs": f"[{len(strs)}][]const u8"}
+        runtime = self.p(0.75)
+        decls = []
+        for v in order:
+            kw = "var" if v == "k" and runtime and self.p(0.3) else "const"
+            decls.append(f"{kw} d_{v}" + (f": {types[v]}" if typed else ""))
+        if runtime:
+            out = [f"fn {name}() [4]u64 {{"]
+            out.append(f"    {', '.join(decls)} = comptime blk: {{")
+            out += build
+            out.append(f"        const k: u8 = {k};")
+            out.append(f"        break :blk .{{ {', '.join(order)} }};")
+            out.append("    };")
+            if "var d_k" in ", ".join(decls):
+                out.append("    d_k +%= 1;")
+            out.append(f"    var idx: usize = {self.r.randint(0, 9)};")
+            out.append("    _ = &idx;")
+            out.append(f"    const s: []const {et} = &d_arr;")
+            out.append("    const ss: []const []const u8 = &d_strs;")
+            out.append("    var lens: u64 = 0;")
+            out.append("    for (ss) |x| lens = lens * 7 + x.len;")
+            out.append(
+                "    return .{ d_k, "
+                + ("@as(u64, @bitCast(@as(i64, s[idx % s.len])))" if et == "i16" else "s[idx % s.len]")
+                + ", lens, "
+                + self.ch(["ss[idx % ss.len].len", "@intFromBool(s.ptr == &d_arr)", "d_arr.len"])
+                + " };"
+            )
+            out.append("}")
+            return out, "call"
+        out = [f"const {name} = blk: {{"]
+        out += [ln[4:] for ln in build]
+        out.append(f"    const k: u8 = {k};")
+        out.append(f"    {', '.join(decls)} = .{{ {', '.join(order)} }};")
+        out.append("    const s: []const u8 = d_strs[0];")
+        out.append("    break :blk .{ d_k, d_arr, s, d_strs.len };")
+        out.append("};")
+        return out, "any"
+
     KINDS = (
         (t_arith, 5),
         (t_fn_eval, 4),
@@ -1802,6 +2187,13 @@ class Gen:
         (t_slices2, 2),
         (t_peer, 3),
         (t_fmt, 2),
+        (t_comptime_num, 3),
+        (t_typename, 2),
+        (t_std2, 3),
+        (t_ptr_arith, 3),
+        (t_inline_switch, 2),
+        (t_recursion, 2),
+        (t_destructure, 3),
     )
 
     def test(self, i):
@@ -1825,7 +2217,7 @@ def generate(seed, size=1.0, only=None):
         out += lines
         # A comptime block of its own analyzes the test even when an
         # earlier test's error stops main's analysis.
-        out.append(f"comptime {{ _ = t{i}; }}")
+        out.append(f"comptime {{ _ = {'&' if rt == 'call' else ''}t{i}; }}")
         out.append(f"// end {i}")
         if isinstance(rt, Float):
             # The bits too (the sign of zero, rounding), except a NaN's:
@@ -1834,7 +2226,8 @@ def generate(seed, size=1.0, only=None):
                 f'    std.debug.print("t{i} {{any}} {{x}}\\n", .{{ t{i}, if (std.math.isNan(t{i})) 0 else @as(u{rt.bits}, @bitCast(t{i})) }}); // test {i}'
             )
         else:
-            prints.append(f'    std.debug.print("t{i} {{any}}\\n", .{{t{i}}}); // test {i}')
+            call = "()" if rt == "call" else ""
+            prints.append(f'    std.debug.print("t{i} {{any}}\\n", .{{t{i}{call}}}); // test {i}')
     out.append("")
     out.append("pub fn main() void {")
     out += prints
