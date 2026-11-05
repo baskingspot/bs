@@ -3424,7 +3424,7 @@ thread's abilists imports. No bytes come from it.
   hidden becomes a name with its version (null for the base version, so
   the import is unversioned, as ld writes zlib's), type, size and value.
   `aliases` finds the objects at one address. The soname falls back to
-  the path, as ld's. A linker script (`libc.so`-style text) is an error.
+  the name main.zig gives (below). A linker script (`libc.so`-style text) is an error.
 - Resolution order: Zig exports, then objects, then compiler_rt, then
   the shared libraries in input order, then glibc (`Emit.libraryDefines`
   answers for the last two; `exportTarget`, `InputResolver.importSym`
@@ -3437,8 +3437,18 @@ thread's abilists imports. No bytes come from it.
   still pull before any `.so`, whatever their order on the command
   line; lld's order would let an earlier `.so` win there too.
 - `Glibc.dynamicOptions` puts the given `.so` files that are alive in
-  DT_NEEDED, in input order and before glibc's libraries, as upstream's
-  linker keeps them (`Object.markLive`, `SharedObject.markLive`; fixed
+  DT_NEEDED, in input order, as upstream's linker keeps them. In a
+  program with Zig code, which upstream links with its own linker,
+  libm.so.6, libc.so.6 and ld-linux-x86-64.so.2 always come first, so
+  the loader finds glibc's definitions before the given libraries'
+  (`zig build-exe -lc` lists them so even for hello world); in a program
+  of C only (`Emit.lld`), which upstream links with lld, glibc's
+  libraries come after, as needed (2026-11-04: bs listed glibc's last
+  and only libc, so a library defining `getpid` won over glibc in a Zig
+  program). A library without DT_SONAME is needed by its file name if
+  `-l` found it, else by its path as given, as both linkers name it
+  (bs wrote the `-L` path, `./libx.so`, which only resolves from the
+  build's directory). Liveness is upstream's (`Object.markLive`, `SharedObject.markLive`; fixed
   2026-11-04, when bs listed every one): a library is alive when a
   strong reference resolves to it, from the compilation's imports and
   copies or from a live library's undefined symbols (`ElfShared.undefs`),

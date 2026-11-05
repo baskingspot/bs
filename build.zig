@@ -1813,6 +1813,34 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         test_step.dependOn(&r.step);
     }
 
+    // A library without DT_SONAME that `-l` finds is needed by its file
+    // name, and glibc's libraries come before it in a program with Zig
+    // code and after it in one of C only, as upstream's linkers order
+    // them; run from another directory.
+    {
+        const libs = b.addSystemCommand(&.{
+            "sh", "-c",
+            \\set -e; z=$(realpath "$1"); d=$2; s=$(realpath "$3"); b=$(realpath "$4"); zig=$z
+            \\"$z" cc -shared -fPIC "$s/dup_lib.c" -o "$d/libdup.so"
+            \\cd "$d"
+            \\for m in dup_main.zig dup_main.c; do BS_ZIG="$zig" BS_CACHE=off "$b" build-exe -lc "$s/$m" -L. -ldup -femit-bin="$m.exe"; done
+            ,
+            "sh", upstreamZig(b),
+        });
+        const dir = libs.addOutputDirectoryArg("dup");
+        libs.addDirectoryArg(b.path("test/link_input"));
+        libs.addArtifactArg(bs);
+        for ([_][]const u8{ "dup_main.zig", "dup_main.c" }, [_][]const u8{ "false\n", "true\n" }) |m, want| {
+            const r = b.addSystemCommand(&.{ "sh", "-c", "d=$(realpath \"$1\"); cd / && LD_LIBRARY_PATH=\"$d\" exec \"$d/$2.exe\" 2>&1", "sh" });
+            r.setName(b.fmt("run bs link of {s} with a library glibc's definitions precede or follow", .{m}));
+            r.addDirectoryArg(dir);
+            r.addArg(m);
+            r.addCheck(.{ .expect_stdout_exact = want });
+            r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+            test_step.dependOn(&r.step);
+        }
+    }
+
     // A shared library's operator new replaces libc++'s, which the C++
     // runtime's archive would otherwise supply, as upstream links it.
     {

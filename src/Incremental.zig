@@ -138,11 +138,16 @@ objects_changed: bool = false,
 /// binds the externs again, and an import no library defines any more is
 /// an error.
 link_shared: []const []const u8 = &.{},
+/// Their DT_NEEDED names without a DT_SONAME (`Options.shared_names` in
+/// main.zig), which the absolute paths are not.
+link_shared_names: []const []const u8 = &.{},
 /// The parsed `link_shared`, if the build parsed them (main.zig does in
 /// every build, for CodeGen's `exportTarget`).
 shared: ?[]const ElfShared = null,
 /// Such an executable's DT_RUNPATH (`Options.runpath` in main.zig).
 runpath: ?[]const u8 = null,
+/// `Emit.lld`.
+lld: bool = false,
 /// Whether a build that does not relink renews the output's mtime, as a
 /// relink would: `bs run`'s programs are trimmed by it.
 renew_output: bool = false,
@@ -588,7 +593,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     const shared: []const ElfShared = if (!exe_dyn) &.{} else inc.shared orelse (try inc.loadShared(arena, &maps)) orelse return null;
     if (inc.link_objects.len != 0 and inc.output == .exe) return inc.linkWithInputs(arena, &maps, m, &input, in.numbered, exports.items, imports.items, glibc, shared, out_dir, sub_path, cwd, gathered);
     if (glibc) |g| {
-        dynamic = g.dynamicOptions(arena, imports.items, &.{}, exports.items, shared) catch |err| switch (err) {
+        dynamic = g.dynamicOptions(arena, imports.items, &.{}, exports.items, shared, inc.lld) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.NotInGlibc => return inc.noLink("an import no shared library or glibc defines", .{}),
         };
@@ -701,9 +706,9 @@ fn mapInput(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io.F
 /// why.
 fn loadShared(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io.File.MemoryMap)) !?[]const ElfShared {
     const shared = try arena.alloc(ElfShared, inc.link_shared.len);
-    for (shared, inc.link_shared) |*lib, path| {
+    for (shared, inc.link_shared, inc.link_shared_names) |*lib, path, name| {
         const bytes = try inc.mapInput(arena, maps, path) orelse return null;
-        lib.* = ElfShared.parse(arena, path, bytes) catch |err| {
+        lib.* = ElfShared.parse(arena, path, name, bytes) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             _ = inc.noRelink("{s}: {t}", .{ path, err });
             return null;
@@ -896,7 +901,7 @@ fn linkWithInputs(
         // The Zig exports and the objects' definitions, which the shared
         // libraries may name, as `Emit.convertInputs` gathers them.
         const defined = if (shared.len == 0) exports else try std.mem.concat(arena, ElfObject.Export, &.{ exports, try objects.dynamicExports(resolver) });
-        dynamic = g.dynamicOptions(arena, imports[0..n], imports[n..], defined, shared) catch |err| switch (err) {
+        dynamic = g.dynamicOptions(arena, imports[0..n], imports[n..], defined, shared, inc.lld) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.NotInGlibc => return inc.noLink("an import no shared library or glibc defines", .{}),
         };

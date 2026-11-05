@@ -136,6 +136,10 @@ pub const Options = struct {
     /// Shared libraries (`.so`) the executable imports from, in
     /// command-line order, given by path or found by `-l`.
     shared_libs: []const []const u8 = &.{},
+    /// The DT_NEEDED name of each of `shared_libs` that has no DT_SONAME,
+    /// as upstream's linkers write it: the file name of one `-l` found,
+    /// else the path as given.
+    shared_names: []const []const u8 = &.{},
     /// DT_RUNPATH of a dynamically linked executable, as upstream's: the
     /// `-rpath` arguments, then for the native target the `-L`
     /// directories, without repeats, joined with ':'; null for none.
@@ -575,6 +579,8 @@ pub const Job = struct {
         i.stack_size = job.opts.stack_size;
         i.link_objects = job.link_objects;
         i.link_shared = job.link_shared;
+        i.link_shared_names = job.opts.shared_names;
+        i.lld = job.opts.c_root;
         if (job.opts.link_libc and !job.opts.pic) {
             i.glibc_version = job.opts.glibc_version;
             i.glibc_lib_dir = job.zig_lib_dir;
@@ -1123,11 +1129,12 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         i.glibc = null;
     };
     if (glibc != null) emit.runpath = opts.runpath;
+    emit.lld = opts.c_root;
     const shared_libs = try arena.alloc(ElfShared, opts.shared_libs.len);
-    for (shared_libs, opts.shared_libs) |*lib, path| {
+    for (shared_libs, opts.shared_libs, opts.shared_names) |*lib, path, name| {
         const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
             fatal("unable to read '{s}': {t}", .{ path, err });
-        lib.* = ElfShared.parse(arena, path, bytes) catch |err| switch (err) {
+        lib.* = ElfShared.parse(arena, path, name, bytes) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.InvalidShared => if (!std.mem.startsWith(u8, bytes, std.elf.MAGIC))
                 fatal("bs does not read linker scripts ('{s}') yet", .{path})
@@ -2234,9 +2241,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             } else |_| {}
         } else |_| {}
     }
+    var found: std.StringHashMapUnmanaged(void) = .empty;
     for (libs.items) |q| {
         link_inputs.items[q.at] = try q.find(arena, io, search_dirs.items) orelse
             fatal("unable to find library '-l{s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_dirs.items) });
+        try found.put(arena, link_inputs.items[q.at], {});
     }
     // As upstream, an object or a static library links nothing: it leaves
     // archive and shared library inputs out (`-l` names are still found).
@@ -2266,9 +2275,14 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // Shared libraries are imported from, not linked in.
     var objects: std.ArrayList([]const u8) = .empty;
     var shared: std.ArrayList([]const u8) = .empty;
-    for (link_inputs.items) |path| try (if (isSharedLib(path)) &shared else &objects).append(arena, path);
+    var shared_names: std.ArrayList([]const u8) = .empty;
+    for (link_inputs.items) |path| if (isSharedLib(path)) {
+        try shared.append(arena, path);
+        try shared_names.append(arena, if (found.contains(path)) std.fs.path.basename(path) else path);
+    } else try objects.append(arena, path);
     opts.link_inputs = objects.items;
     opts.shared_libs = shared.items;
+    opts.shared_names = shared_names.items;
     if (shared.items.len != 0 and !opts.link_libc)
         setUnsupported(&opts, arena, "bs links shared libraries only into executables that link libc ('{s}'); add -lc or build this step with upstream zig", .{shared.items[0]});
     // DT_RUNPATH: as upstream's `rpath_list`, deduplicated.

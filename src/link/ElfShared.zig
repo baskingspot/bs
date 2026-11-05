@@ -10,7 +10,7 @@ const Allocator = std.mem.Allocator;
 const Shared = @This();
 
 path: []const u8,
-/// DT_SONAME, or the path for a library without one, as ld names it.
+/// DT_SONAME, or for a library without one the name `parse` was given.
 soname: []const u8,
 /// Its defined dynamic symbols, by name: the default version of each, as
 /// an unversioned reference binds to it.
@@ -38,8 +38,11 @@ pub const Symbol = struct {
 
 pub const Error = error{ OutOfMemory, InvalidShared };
 
-/// Parses `bytes`, an ELF64 x86_64 ET_DYN, kept in place.
-pub fn parse(arena: Allocator, path: []const u8, bytes: []const u8) Error!Shared {
+/// Parses `bytes`, an ELF64 x86_64 ET_DYN, kept in place. `needed_name` is the
+/// DT_NEEDED name if it has no DT_SONAME: as upstream's linkers name
+/// such a library, the file name of one `-l` found, else its path as
+/// given.
+pub fn parse(arena: Allocator, path: []const u8, needed_name: []const u8, bytes: []const u8) Error!Shared {
     if (bytes.len < @sizeOf(elf.Elf64_Ehdr) or !std.mem.eql(u8, bytes[0..4], elf.MAGIC)) return error.InvalidShared;
     const eh = std.mem.bytesToValue(elf.Elf64_Ehdr, bytes[0..@sizeOf(elf.Elf64_Ehdr)]);
     if (eh.e_ident[elf.EI.CLASS] != elf.ELFCLASS64 or eh.e_ident[elf.EI.DATA] != elf.ELFDATA2LSB) return error.InvalidShared;
@@ -97,7 +100,7 @@ pub fn parse(arena: Allocator, path: []const u8, bytes: []const u8) Error!Shared
         at += vd.next;
     }
 
-    var lib: Shared = .{ .path = path, .soname = path };
+    var lib: Shared = .{ .path = path, .soname = needed_name };
     for (dynamic) |d| if (d.d_tag == elf.DT_SONAME) {
         lib.soname = str(strtab, d.d_val);
     };

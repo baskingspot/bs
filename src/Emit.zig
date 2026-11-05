@@ -100,6 +100,9 @@ glibc: ?*const Glibc = null,
 /// glibc's (`Glibc.dynamicOptions`), and its DT_RUNPATH.
 shared_libs: []const ElfShared = &.{},
 runpath: ?[]const u8 = null,
+/// The program is C only, which upstream links with lld rather than its
+/// own linker (`Glibc.dynamicOptions`).
+lld: bool = false,
 /// An executable's object and archive inputs, which `sync` pulls archive
 /// members for and `finish` converts into atoms.
 inputs: ?*ElfInput = null,
@@ -1407,7 +1410,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         const defined = try std.mem.concat(arena, ElfDynamic.Export, &.{ emit.exports.items, emit.input_exports });
-        var dynamic = g.dynamicOptions(arena, imports[0..n_imports], imports[n_imports..], defined, emit.shared_libs) catch |err| switch (err) {
+        var dynamic = g.dynamicOptions(arena, imports[0..n_imports], imports[n_imports..], defined, emit.shared_libs, emit.lld) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             // Imports come from the shared libraries and glibc only
             // (`libraryDefines`), but a unit an edit build loaded may
