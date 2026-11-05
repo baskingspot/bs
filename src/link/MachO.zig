@@ -425,6 +425,10 @@ const chunk_len = 2048;
 /// of an import, or `unset`.
 const unset = std.math.maxInt(u32);
 const value_tag = 1 << 31;
+
+/// A fixup slot that layout counted for a pointer to an absolute symbol,
+/// which gets no fixup.
+const no_fixup = std.math.maxInt(u64);
 const dylinker_path = "/usr/lib/dyld";
 const libsystem_path = "/usr/lib/libSystem.B.dylib";
 const mh_execute_header = "__mh_execute_header";
@@ -922,8 +926,18 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     }
 
     // Chained fixups: header, per-segment page starts with each page's
-    // fixups linked into a chain, imports, and their names.
-    cf.write(buf, fixups_off, fixups, bind_imports);
+    // fixups linked into a chain, imports, and their names, without the
+    // slots of pointers to absolute symbols.
+    var live_fixups: []u64 = fixups;
+    if (std.mem.indexOfScalar(u64, fixups, no_fixup)) |first| {
+        var n = first;
+        for (fixups[first..]) |f| if (f != no_fixup) {
+            fixups[n] = f;
+            n += 1;
+        };
+        live_fixups = fixups[0..n];
+    }
+    cf.write(buf, fixups_off, live_fixups, bind_imports);
     @memcpy(buf[trie_off..][0..trie.len], trie);
 
     // Symbols after the atoms': those within atoms, the exported ones
@@ -2094,8 +2108,16 @@ fn LinkOf(comptime Input: type) type {
                                 if (addend < 0 or addend > 255) return error.RelocationOverflow;
                                 break :bind bindPointer(@intCast(t.v), @intCast(addend));
                             },
-                            .value => return invalid,
-                        };
+                            // An absolute symbol's value, which the
+                            // loader must not slide, as ld64 leaves it;
+                            // layout counted a fixup, which `emit` drops.
+                            .value => absolute: {
+                                l.fixups[fixups.*] = no_fixup;
+                                fixups.* += 1;
+                                std.mem.writeInt(u64, field[0..8], t.v +% @as(u64, @bitCast(addend)), .little);
+                                break :absolute null;
+                            },
+                        } orelse continue;
                         std.mem.writeInt(u64, field[0..8], v, .little);
                         l.fixups[fixups.*] = p - base_address;
                         fixups.* += 1;
@@ -2910,6 +2932,37 @@ test "chained fixups list no zero-fill page of __DATA" {
         if (info != 0 and std.mem.readInt(u64, image[info + 8 ..][0..8], .little) == data_seg.?.fileoff) break image[info..];
     } else return error.TestUnexpectedResult;
     try std.testing.expectEqual(try std.math.divCeil(u64, data_seg.?.filesize, page_size), @as(u64, std.mem.readInt(u16, starts[20..22], .little)));
+}
+
+test "a pointer to an absolute value is written as is, with no fixup" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // A rebase, a pointer to the absolute 0x1234 (`.quad sym` for
+    // `.set sym, 0x1234`), and a rebase: ld64 slides neither the value
+    // nor anything else for it, so the page's chain links the two rebases.
+    const main: SymbolKey = .fromName("main");
+    const zeros: SymbolKey = .fromName("zeros");
+    const abs: SymbolKey = .fromName("abs");
+    const ret = [_]u8{ 0xc0, 0x03, 0x5f, 0xd6 };
+    const atoms = [_]Atom{
+        .{ .key = main, .name = "main", .section = .text, .alignment = .@"4", .bytes = &ret },
+        .{ .key = .fromName("table"), .name = "table", .section = .data, .alignment = .@"8", .bytes = &@as([24]u8, @splat(0)), .targets = &.{ zeros, abs }, .relocs = &.{
+            .init(0, .aarch64_abs64, 0, 0), .init(8, .aarch64_abs64, 1, 0), .init(16, .aarch64_abs64, 0, 8),
+        } },
+        .{ .key = zeros, .name = "zeros", .section = .bss, .alignment = .@"8", .zero_fill = 16 },
+    };
+    const out = try emit(gpa, io, &atoms, .{ .entry = main, .values = &.{.{ .key = abs, .value = 0x1234 }} });
+    defer gpa.free(out);
+    const table = out[testMachOSymbol(out, "table").? - base_address ..][0..24];
+    try std.testing.expectEqual(0x1234, std.mem.readInt(u64, table[8..16], .little));
+    // DYLD_CHAINED_PTR_64_OFFSET rebases: the first's `next` (bits 51..62,
+    // in 4-byte strides) skips the value to the third, which ends the
+    // chain.
+    const first = std.mem.readInt(u64, table[0..8], .little);
+    const third = std.mem.readInt(u64, table[16..24], .little);
+    try std.testing.expectEqual(16 / 4, (first >> 51) & 0xfff);
+    try std.testing.expectEqual(0, (third >> 51) & 0xfff);
+    try std.testing.expectEqual(first & 0xf_ffff_ffff, (third & 0xf_ffff_ffff) - 8);
 }
 
 test "links many chunks of atoms and pages of fixups the same way on any number of threads" {

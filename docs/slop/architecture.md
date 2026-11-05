@@ -3224,6 +3224,10 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
   x0; add x0, x0; ldr x16, [x0]; blr x16`, x0 = the address). Imports (`Options.imports`, all from libSystem) each get a GOT
   slot and a stub; branch26 to an import goes to the stub, the GOT forms
   load the slot, and absolute addresses of imports in data are binds.
+  A pointer to an absolute symbol's value is written as is, with no
+  fixup, as ld64 writes it (upstream's linker rebases it, so its value
+  moves with the slide); layout counted a fixup for it, and the serial
+  pass drops that slot before linking the chains.
   Rebases and binds are chained fixups (`DYLD_CHAINED_PTR_64_OFFSET`, as
   ld64 emits for arm64 since macOS 12), linked into per-page chains in one
   serial pass; there are no dyld opcodes. The file ends in an ld64-style
@@ -4474,7 +4478,8 @@ splits only what must be split.
   `-fobjc-msgsend-selector-stubs`), which bs does not synthesize.
 
 **Symbols.** N_SECT (external, private external, local), N_UNDF (COMMON
-when n_value > 0), N_ABS, N_WEAK_DEF and N_WEAK_REF (`n_desc`), and
+when n_value > 0), N_ABS (an external one binds from every object and
+from Zig externs through `lookup`, as ELF's), N_WEAK_DEF and N_WEAK_REF (`n_desc`), and
 N_ALT_ENTRY (a second name inside its section's atom). N_INDR is an
 error. Local `l`/`ltmp` symbols are relocation anchors only; external
 and private-external functions and objects get `local_symbols` entries,

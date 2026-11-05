@@ -24,6 +24,7 @@ Changes a user of bs notices, newest first, in the
 
 - On aarch64-macos, `__unwind_info`'s second-level pages are at most 4 KiB, as ld64 writes them, so `objdump --unwind-info` and lldb read them without "attempt to read past end of buffer" warnings.
 - On ELF targets, a global absolute symbol an object defines (`.globl sym; .set sym, 0x1234`) binds from other objects and from Zig `extern` declarations, as upstream's, instead of being an undefined symbol.
+- On aarch64-macos, a global absolute symbol an object defines (`.globl _sym; .set _sym, 0x1234`) binds from other objects and from Zig `extern` declarations instead of becoming a libSystem import that dyld cannot find, and pointers to it hold the value unslid, as ld64 links them.
 - x86_64 inline assembly accepts memory operands with an index register, such as `lea (%rdi,%rsi,1), %eax`.
 - On aarch64, functions with stack frames of 16 MiB or more compile, and a large `@splat` (such as `std.mem.zeroes` of a big array) is written by one copy loop instead of one store per element, which made such a function hundreds of times larger than upstream's.
 - A pointer to an array coerces to a pointer to a one-element array of it, such as `*[3]u8` to `*[1][3]u8`, as upstream allows.

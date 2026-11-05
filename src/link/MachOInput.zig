@@ -407,6 +407,7 @@ pub fn lookup(in: *Inputs, name: []const u8) Allocator.Error!?Target {
     if (in.defs.get(name)) |d| {
         const o = &in.objects.items[d.object];
         const sym = o.syms[d.sym];
+        if (sym.kind() == macho.N_ABS) return .{ .key = absKey(sym.n_value), .offset = 0 };
         if (sym.kind() != macho.N_SECT) return null;
         return symTarget(o, sym);
     }
@@ -439,6 +440,13 @@ pub fn dynamicExports(in: *Inputs, skip: anytype) ![]ElfDynamic.Export {
         }
     }.lt);
     return out.items;
+}
+
+/// The key of absolute value `value`, which `convert` lists in its
+/// values.
+fn absKey(value: u64) SymbolKey {
+    var buf: [32]u8 = undefined;
+    return .fromName(std.fmt.bufPrint(&buf, "mobj:abs:{x}", .{value}) catch unreachable);
 }
 
 fn commonKey(name: []const u8) SymbolKey {
@@ -603,6 +611,15 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
         std.mem.writeInt(u32, bytes[0..4], info[0], .little);
         std.mem.writeInt(u32, bytes[4..8], info[1], .little);
         try atoms.append(arena, .{ .key = .fromName("mobj:objc_imageinfo"), .name = ".__objc_imageinfo", .section = .objc, .alignment = .@"4", .bytes = bytes });
+    }
+    // A global absolute definition binds through `lookup`, the Zig
+    // code's externs included, which no object relocation goes through,
+    // so its value is listed whether or not one names it (see
+    // `ElfInput`'s).
+    var abs_defs = in.defs.valueIterator();
+    while (abs_defs.next()) |d| {
+        const sym = in.objects.items[d.object].syms[d.sym];
+        if (sym.kind() == macho.N_ABS) _ = try c.absolute(sym.n_value);
     }
     try c.reportUndefined();
     if (weak_used) try values.append(arena, .{ .key = undefined_weak_key, .value = 0 });
@@ -841,8 +858,7 @@ fn Converter(comptime Ctx: type) type {
         }
 
         fn absolute(c: *C, value: u64) Allocator.Error!Target {
-            var buf: [32]u8 = undefined;
-            const key: SymbolKey = .fromName(std.fmt.bufPrint(&buf, "mobj:abs:{x}", .{value}) catch unreachable);
+            const key = absKey(value);
             for (c.abs_values.items) |v| if (v.key == key) return .{ .key = key, .offset = 0 };
             try c.abs_values.append(c.in.arena, .{ .key = key, .value = value });
             return .{ .key = key, .offset = 0 };
@@ -977,6 +993,14 @@ test "objects and a Darwin archive from upstream's Clang and llvm-ar" {
     try testing.expectEqual(0, in.errors.items.len);
     const second = (try in.lookup("second")).?;
     try testing.expectEqual(4, second.offset);
+    // The global absolute `macho_abs`, which no relocation names, binds
+    // to its value, as a Zig extern would.
+    const abs = (try in.lookup("macho_abs")).?;
+    var abs_value: ?u64 = null;
+    for (c.values) |v| if (v.key == abs.key) {
+        abs_value = v.value;
+    };
+    try testing.expectEqual(0x1234, abs_value.?);
     var text: ?Atom = null;
     var init_array: ?Atom = null;
     var data: ?Atom = null;
