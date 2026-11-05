@@ -2381,6 +2381,11 @@ def main():
         for name in targets:
             cfg = dict(TARGETS[name], name=name)
             exec_prefix = [] if cfg["host"] == host else emulator(cfg, host) or []
+            # A --mcpu CPU may have instructions the emulated baseline core
+            # lacks; qemu's `max` has every one bs generates.
+            if exec_prefix and args.mcpu and "-cpu" in exec_prefix:
+                exec_prefix = exec_prefix.copy()
+                exec_prefix[exec_prefix.index("-cpu") + 1] = "max"
             if name not in runnable:
                 print(f"{name}: not run (needs an {name} host or its emulator)")
             elif args.compile_errors:

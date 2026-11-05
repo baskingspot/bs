@@ -442,7 +442,7 @@ pub fn main(init_std: std.process.Init) !void {
 /// own too, as `+inline<budget>` and `s` for the safe variant, and
 /// atoms with every check kept (`BS_PROVE=off`) as `+noprove`, and
 /// without memory forwarding (`BS_FORWARD=off`) as `+noforward`. A CPU
-/// other than the baseline (`-mcpu`), which changes builtin and the code
+/// other than the target's default (`-mcpu`), which changes builtin and the code
 /// generated for every function, follows the target as `@<model>` and its
 /// feature words (`cpu.cacheName`).
 fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.process.Environ.Map) ![]const u8 {
@@ -454,7 +454,7 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
     const unsafe = opts.optimize == .fast or opts.optimize == .small;
     const prove_on = proving(env);
     const forward_on = forwarding(env);
-    const cpu_name = try cpu_mod.cacheName(arena, opts.cpu);
+    const cpu_name = try cpu_mod.cacheName(arena, opts.cpu, cpu_mod.targetDefault(opts.bs_target.arch(), opts.bs_target == .aarch64_macos));
     if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on and forward_on and cpu_name.len == 0) return opts.bs_target.name();
     var s: std.ArrayList(u8) = .empty;
     try s.appendSlice(arena, opts.bs_target.name());
@@ -2473,30 +2473,12 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             setUnsupported(&opts, "bs does not merge C sources or objects into aarch64-macos objects yet; build this step with upstream zig", arena, .{})
         else if (opts.fuzz)
             setUnsupported(&opts, "bs does not instrument code for fuzzing on aarch64-macos yet ('-ffuzz'); build this step with upstream zig", arena, .{});
-        // Code is generated for Apple's M1 (`-target aarch64-macos`), the
-        // target's baseline. `zig build` passes `-mcpu baseline` with an
-        // explicit target and `-mcpu native` for `-Dcpu=native`.
-        if (mcpu) |text| if (!std.mem.eql(u8, text, "baseline") and !std.mem.eql(u8, text, "native") and !std.mem.eql(u8, text, "apple_m1"))
-            setUnsupported(&opts, "bs generates code only for apple_m1 on aarch64-macos ('-mcpu {s}'); drop -mcpu or build this step with upstream zig", arena, .{text});
-        opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
         opts.link_libc = false;
     } else if (opts.bs_target == .aarch64_linux) {
         if (opts.fuzz)
             setUnsupported(&opts, "bs does not instrument code for fuzzing on aarch64-linux yet ('-ffuzz'); build this step with upstream zig", arena, .{});
-        // Code is generated for the generic ARMv8-A CPU, the target's
-        // baseline, as `-target aarch64-linux` gives upstream.
-        if (mcpu) |text| if (!std.mem.eql(u8, text, "baseline") and !std.mem.eql(u8, text, "native") and !std.mem.eql(u8, text, "generic"))
-            setUnsupported(&opts, "bs generates code only for the generic CPU on aarch64-linux ('-mcpu {s}'); drop -mcpu or build this step with upstream zig", arena, .{text});
-        opts.cpu = std.Target.aarch64.cpu.generic.toCpu(.aarch64);
-    } else if (mcpu) |text| {
-        const r = cpu_mod.resolve(arena, io, text);
-        opts.cpu = r.cpu;
-        if (r.refused) |msg| setUnsupported(&opts, "{s}", arena, .{msg});
-    } else if (opts.target == null or std.mem.eql(u8, opts.target.?, "native")) {
-        // As upstream, the native target's CPU is the host's (as
-        // `-mcpu=native`, clamped); an explicit target's is its baseline.
-        opts.cpu = cpu_mod.resolve(arena, io, "native").cpu;
     }
+    resolveCpu(&opts, arena, io, mcpu);
     // The last of `-static` and `-dynamic` (upstream's `link_mode`). Shared
     // objects are position-independent; executables stay static unless
     // they link libc.
@@ -2749,6 +2731,31 @@ fn inheritFlags(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []con
 fn unsupportedTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8) void {
     opts.unsupported = null;
     setUnsupported(opts, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", arena, .{target});
+}
+
+/// Sets `opts.cpu` for the checked target from `-mcpu` value `mcpu`: as
+/// upstream, without one the host's CPU (clamped to what bs supports) for
+/// the native target and the target's default for an explicit one
+/// (`cpu.targetDefault`). `zig build` passes `-mcpu baseline` with an
+/// explicit target and `-mcpu native` for `-Dcpu=native`.
+pub fn resolveCpu(opts: *Options, arena: std.mem.Allocator, io: Io, mcpu: ?[]const u8) void {
+    const native = opts.target == null or std.mem.eql(u8, opts.target.?, "native");
+    const macos = opts.bs_target == .aarch64_macos;
+    if (opts.bs_target == .x86_64_linux) {
+        if (mcpu == null and !native) {
+            opts.cpu = cpu_mod.baseline;
+            return;
+        }
+        const r = cpu_mod.resolve(arena, io, mcpu orelse "native");
+        opts.cpu = r.cpu;
+        if (r.refused) |msg| setUnsupported(opts, "{s}", arena, .{msg});
+    } else if (mcpu) |text| {
+        const r = cpu_mod.resolveAarch64(arena, io, text, macos);
+        opts.cpu = r.cpu;
+        if (r.refused) |msg| setUnsupported(opts, "{s}", arena, .{msg});
+    } else {
+        opts.cpu = (if (native) cpu_mod.nativeAarch64(io) else null) orelse cpu_mod.targetDefault(.aarch64, macos);
+    }
 }
 
 pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, io: Io, target: []const u8) void {

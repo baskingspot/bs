@@ -1620,8 +1620,7 @@ backend does, not scalarized. The split has three parts:
   comptime-known), the scalar operation is analyzed with its usual
   safety checks, and the results are reassembled with `aggregate_init`.
   So an answer may change only together with the backend. Sema asks
-  for `Zcu.cpu`: the `-mcpu` CPU on x86_64-linux, `apple_m1` on
-  aarch64-macos (main.zig). On aarch64 it answers by architecture alone,
+  for `Zcu.cpu`, the compilation's CPU (`main.resolveCpu`). On aarch64 it answers by architecture alone,
   since every ARMv8 core has NEON (f16 lanes, which need FEAT_FP16, are
   not lanes).
 - **The IR**: the existing element-wise tags (`add_wrap`, `sub_wrap`,
@@ -4810,7 +4809,7 @@ and a `MachOInput`, picked by the target, so `pullInputs`, the
 resolver and `externTarget` serve both; on aarch64-macos every name
 nothing defines is a libSystem import, as ld64 binds it. C sources on
 aarch64-macos compile through upstream's Clang with upstream's flags
-(`CSource.Options.macos`: the `aarch64-macos` triple and apple_m1,
+(`CSource.Options.macos`: the `aarch64-macos` triple and bs's CPU,
 `-mmacos-version-min`, `-fPIE -fPIC`, libSystem's headers from
 `any-darwin-any`, libc always on; for the native target the SDK's, as
 decision 1's *as built* says). A C `main` with no Zig entry is the
@@ -8116,8 +8115,9 @@ libraries as inputs. To be agreed with that thread.
   `-lc`; the generic CPU), whose output matches upstream's.
 - **Aro's arguments** are upstream's (`Compilation.translateC`, read from
   the argv upstream's zig passes its translate-c binary) for bs's
-  target: `-mcpu` is bs's CPU (`cpu.zig`: the clamped host CPU for
-  the native target, else the baseline, unless `-mcpu` says otherwise),
+  target: `-mcpu` is bs's CPU (`main.resolveCpu`: the clamped host CPU
+  for the native target, else the target's default, unless `-mcpu` says
+  otherwise),
   so CPU feature macros are its; the triple is the native
   one without `-target` (glibc's
   ABI and detected version, with or without `-lc`, as upstream's native
@@ -9500,22 +9500,26 @@ the choice instead of failing:
   clamped instead: its model becomes `x86_64_v2` when the host has all
   of its instructions, else `x86_64`, plus the host's features bs
   accepts; std takes its SSE paths, as upstream's on a CPU without AVX.
-  aarch64 has no such choice yet: bs generates code for `apple_m1` on
-  aarch64-macos and the generic ARMv8.0 core on aarch64-linux, with or
-  without `-mcpu=native`, where upstream's native target uses the
-  host's CPU. Following upstream there would need main.zig to resolve
-  and clamp the host's aarch64 CPU as `cpu.zig` does x86_64's, to the
-  features the aarch64 backend and its inline assembler handle;
-  aarch64-macos's `builtin.cpu` and C target built from that CPU
-  (`Builtin.zig` and `CSource.macosTarget` write `apple_m1`); and
-  `cpu.cacheName` to name CPUs against each target's default. On the
-  Mac that changes no std path: every M-series model has aes, sha2 and
-  lse, the only aarch64 features std and compiler_rt test besides neon
-  and sve. On aarch64-linux a host CPU instead of generic turns on std's
-  AES, GHASH and SHA-256 asm paths (the assembler encodes them) and the
-  backend's LSE atomics, and on SVE hosts (Neoverse V1 and V2)
+  aarch64 follows upstream the same way: no `-mcpu` means the host's
+  CPU for the native target and the target's default for an explicit
+  one (`apple_m1` on aarch64-macos, the generic ARMv8.0 core on
+  aarch64-linux; `cpu.targetDefault`, which drops apple_m1's fuse_aes as
+  upstream's `resolveTargetQuery` does). The host's CPU is clamped by
+  removing SVE and SME (`cpu.clampAarch64`), which bs's backend and
+  assembler do not handle and with which std would take
   `std.simd`'s 256-bit vector length and the syscalls' z and p register
-  clobbers, so sve would be clamped out as x86_64's AVX is.
+  clobbers. An explicit model or feature list (upstream's syntax) is
+  accepted unless it enables SVE or SME, which is refused with a message
+  naming the features. `builtin.cpu`, the C and translate-c targets and
+  the cache name (`cpu.cacheName`, against the target's default) come
+  from the resolved CPU. The backend tests lse and lse2 (atomics), crc
+  (inline assembly) and fullfp16 (native f16 arithmetic). On the Mac no
+  std path changes: every M-series model has aes, sha2 and lse, the only
+  aarch64 features std and compiler_rt test besides neon and sve. On an
+  aarch64-linux host, a CPU instead of generic turns on std's AES, GHASH
+  and SHA-256 asm paths and the backend's LSE atomics; conformance and
+  the hunters pass an explicit target, so they stay on generic unless
+  run with `--mcpu`.
   With `cx16` (x86-64-v2) 128-bit atomics are allowed, as upstream
   (`Sema.atomicElemType`), and lowered with `lock cmpxchg16b`
   (`codegen/x86_64/atomic128.zig`).

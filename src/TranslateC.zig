@@ -29,7 +29,6 @@ const ToolRecord = @import("ToolRecord.zig");
 const CSource = @import("CSource.zig");
 const toolchain = @import("toolchain.zig");
 const InternPool = @import("InternPool.zig");
-const cpu_mod = @import("cpu.zig");
 const builtin = @import("builtin");
 
 const Request = struct {
@@ -87,7 +86,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
     var cc_args: std.ArrayList([]const u8) = .empty;
     var named_libs = false;
     var opts: main.Options = .{ .command = .build_exe, .root_src_path = "" };
-    var mcpu = false;
+    var mcpu: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -96,10 +95,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         } else if (std.mem.eql(u8, arg, "-target")) {
             opts.target = next(args, &i);
         } else if (std.mem.eql(u8, arg, "-mcpu") or std.mem.startsWith(u8, arg, "-mcpu=")) {
-            const r = cpu_mod.resolve(arena, io, if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else next(args, &i));
-            opts.cpu = r.cpu;
-            mcpu = true;
-            if (r.refused) |msg| main.setUnsupported(&opts, "{s}", arena, .{msg});
+            mcpu = if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else next(args, &i);
         } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {
             opts.zig_lib_dir = next(args, &i);
         } else if (std.mem.eql(u8, arg, "--cache-dir")) {
@@ -155,8 +151,6 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         if (!(host.cpu.arch == .x86_64 and host.os.tag == .linux))
             main.setUnsupported(&opts, "bs translates C only for x86_64-linux and aarch64-macos so far ('native'); pass -target x86_64-linux", arena, .{})
         else if (std.zig.system.resolveTargetQuery(io, .{})) |native| {
-            // The host's CPU, clamped, as a compilation's without -mcpu.
-            if (!mcpu) opts.cpu = cpu_mod.resolve(arena, io, "native").cpu;
             if (native.abi.isGnu()) opts.glibc_version = native.os.version_range.linux.glibc;
             if (named_libs) if (std.zig.system.NativePaths.detect(arena, io, &native, init.environ_map)) |paths| {
                 native_includes = paths.include_dirs.items;
@@ -165,19 +159,13 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         if (opts.link_libc and opts.unsupported == null) main.resolveGlibc(&opts, arena);
     } else {
         main.checkTarget(&opts, arena, io, target);
-        // The target's baseline CPU, as its compilations' (`-mcpu` there
-        // takes only the baseline).
-        if (opts.bs_target == .aarch64_linux) opts.cpu = std.Target.aarch64.cpu.generic.toCpu(.aarch64);
         if (opts.link_libc and opts.unsupported == null and opts.bs_target != .aarch64_macos) main.resolveGlibc(&opts, arena);
     }
-    // As the code bs compiles the headers into: apple_m1, whatever the
-    // host (`-mcpu native` included).
+    // The CPU of the code bs compiles the headers into.
+    main.resolveCpu(&opts, arena, io, mcpu);
     // Darwin always links libc (libSystem), as upstream's
     // `requiresLibC`, so its headers are always on the include path.
-    if (opts.bs_target == .aarch64_macos) {
-        opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
-        opts.link_libc = true;
-    }
+    if (opts.bs_target == .aarch64_macos) opts.link_libc = true;
     const cache_dirs = Frontend.resolveCacheDirs(arena, io, init.environ_map, .{ .local = opts.cache_dir, .global = opts.global_cache_dir });
     return .{
         .source = source orelse if (opts.unsupported != null) "" else main.fatal("expected a C source file to translate", .{}),

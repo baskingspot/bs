@@ -183,7 +183,7 @@ pub const Options = struct {
     native_abi: bool = false,
     /// `--verbose-cc`.
     verbose: bool = false,
-    /// aarch64-macos (apple_m1 and libSystem's headers, which every
+    /// aarch64-macos (`cpu` and libSystem's headers, which every
     /// compile sees, as Darwin always links libc), not x86_64-linux.
     macos: bool = false,
     /// With `macos`: the macOS versions (`-mmacos-version-min`).
@@ -637,7 +637,8 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         const st = Io.Dir.cwd().statFile(io, p, .{}) catch break :id "";
         break :id try s.print("{s}\x00{d}\x00{d}\x00{d}", .{ p, st.inode, st.size, st.mtime.toNanoseconds() });
     } else "";
-    const target = if (o.macos) try macosTarget(io, o.macos_version) else try cTarget(io, o.glibc_version, o.musl, o.cpu);
+    var target = if (o.macos) try macosTarget(io, o.macos_version) else try cTarget(io, o.glibc_version, o.musl, o.cpu);
+    target.cpu = o.cpu;
     const common = try commonArgs(ra, io, environ, &target, lib, o);
 
     // The runtime libraries first, to know how many of their sources to
@@ -828,8 +829,9 @@ pub fn cTarget(io: Io, glibc_version: ?std.SemanticVersion, musl: bool, cpu: std
     return target;
 }
 
-/// aarch64-macos for the macOS `versions` (`main.Options.macos_version`)
-/// and apple_m1, which bs's own code is generated for.
+/// aarch64-macos for the macOS `versions` (`main.Options.macos_version`),
+/// with the target's default CPU (apple_m1); callers set the
+/// compilation's.
 pub fn macosTarget(io: Io, versions: std.SemanticVersion.Range) !std.Target {
     return std.zig.system.resolveTargetQuery(io, .{
         .cpu_arch = .aarch64,

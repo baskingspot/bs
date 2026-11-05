@@ -3,8 +3,8 @@
 //! The text follows upstream Zig 0.17.1's `src/Builtin.zig` output for
 //! bs's targets, Debug or ReleaseSafe: x86_64-linux-none with the
 //! self-hosted x86_64 backend, linked statically unless it links glibc,
-//! aarch64-linux-none (CPU `generic`) with LLVM, linked statically, and
-//! aarch64-macos (CPU `apple_m1`, macOS 15.0 to 27.0 as `-target
+//! aarch64-linux-none with LLVM, linked statically, and
+//! aarch64-macos (macOS 15.0 to 27.0 as `-target
 //! aarch64-macos` gives, or the versions the target names) with LLVM,
 //! linked against libSystem.
 //! `zig_backend` is upstream's Debug default for the target, so std takes
@@ -224,6 +224,12 @@ pub fn writeCMain(gpa: Allocator, io: Io, cache_dir: []const u8, no_panic: bool)
 }
 
 pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
+    // As upstream: every enabled feature, in the feature list's order.
+    var features: std.ArrayList(u8) = .empty;
+    defer features.deinit(gpa);
+    for (opts.cpu.arch.allFeaturesList(), 0..) |feature, i| {
+        if (opts.cpu.features.isEnabled(@intCast(i))) try features.print(gpa, "        .{f},\n", .{std.zig.fmtIdPU(feature.name)});
+    }
     if (opts.target == .aarch64_macos) return gpa.print(
         \\const std = @import("std");
         \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
@@ -240,76 +246,9 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\/// Deprecated; to be removed in 0.18.0. Use `target.cpu` instead.
         \\pub const cpu: std.Target.Cpu = .{{
         \\    .arch = .aarch64,
-        \\    .model = &std.Target.aarch64.cpu.apple_m1,
+        \\    .model = &std.Target.aarch64.cpu.{f},
         \\    .features = std.Target.aarch64.featureSet(&.{{
-        \\        .aes,
-        \\        .aggressive_fma,
-        \\        .alternate_sextload_cvt_f32_pattern,
-        \\        .altnzcv,
-        \\        .am,
-        \\        .arith_bcc_fusion,
-        \\        .arith_cbz_fusion,
-        \\        .ccdp,
-        \\        .ccidx,
-        \\        .ccpp,
-        \\        .complxnum,
-        \\        .contextidr_el2,
-        \\        .crc,
-        \\        .disable_latency_sched_heuristic,
-        \\        .dit,
-        \\        .dotprod,
-        \\        .el2vmsa,
-        \\        .el3,
-        \\        .flagm,
-        \\        .fp16fml,
-        \\        .fp_armv8,
-        \\        .fptoint,
-        \\        .fullfp16,
-        \\        .fuse_address,
-        \\        .fuse_arith_logic,
-        \\        .fuse_crypto_eor,
-        \\        .fuse_csel,
-        \\        .fuse_literals,
-        \\        .jsconv,
-        \\        .lor,
-        \\        .lse,
-        \\        .lse2,
-        \\        .max_interleave_factor_4,
-        \\        .mpam,
-        \\        .neon,
-        \\        .no_zcz_fpr64,
-        \\        .nv,
-        \\        .pan,
-        \\        .pan_rwv,
-        \\        .pauth,
-        \\        .perfmon,
-        \\        .predres,
-        \\        .ras,
-        \\        .rcpc,
-        \\        .rcpc_immo,
-        \\        .rdm,
-        \\        .sb,
-        \\        .sel2,
-        \\        .sha2,
-        \\        .sha3,
-        \\        .specrestrict,
-        \\        .ssbs,
-        \\        .store_pair_suppress,
-        \\        .tlb_rmi,
-        \\        .tracev8_4,
-        \\        .uaops,
-        \\        .v8_1a,
-        \\        .v8_2a,
-        \\        .v8_3a,
-        \\        .v8_4a,
-        \\        .v8a,
-        \\        .vh,
-        \\        .zcm_fpr128,
-        \\        .zcm_gpr64,
-        \\        .zcz_fpr128,
-        \\        .zcz_gpr32,
-        \\        .zcz_gpr64,
-        \\    }}),
+        \\{s}    }}),
         \\}};
         \\/// Deprecated; to be removed in 0.18.0. Use `target.os` instead.
         \\pub const os: std.Target.Os = .{{
@@ -357,6 +296,8 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         @tagName(opts.unwind_tables),
         if (opts.is_test) "true" else "false",
         if (opts.single_threaded) "true" else "false",
+        std.zig.fmtIdPU(opts.cpu.model.name),
+        features.items,
         opts.macos.min.major,
         opts.macos.min.minor,
         opts.macos.min.patch,
@@ -389,12 +330,6 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         .x86_64 => "x86",
         else => @tagName(opts.cpu.arch),
     };
-    // As upstream: every enabled feature, in the feature list's order.
-    var features: std.ArrayList(u8) = .empty;
-    defer features.deinit(gpa);
-    for (opts.cpu.arch.allFeaturesList(), 0..) |feature, i| {
-        if (opts.cpu.features.isEnabled(@intCast(i))) try features.print(gpa, "        .{f},\n", .{std.zig.fmtIdPU(feature.name)});
-    }
     // Two calls: format takes at most 32 arguments.
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
