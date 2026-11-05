@@ -501,7 +501,7 @@ pub const Miss = struct {
 /// such an item is taken as it is.
 pub fn Decoder(comptime Resolver: type) type {
     return struct {
-        const D = @This();
+        const Self = @This();
 
         gpa: Allocator,
         ip: *InternPool,
@@ -515,13 +515,13 @@ pub fn Decoder(comptime Resolver: type) type {
         limbs: std.ArrayList(std.math.big.Limb) = .empty,
         miss: Miss = .{},
 
-        pub fn init(gpa: Allocator, ip: *InternPool, items: Items, resolver: Resolver) !D {
+        pub fn init(gpa: Allocator, ip: *InternPool, items: Items, resolver: Resolver) !Self {
             const decoded = try gpa.alloc(u32, items.count());
             @memset(decoded, 0);
             return .{ .gpa = gpa, .ip = ip, .items = items, .resolver = resolver, .decoded = decoded };
         }
 
-        pub fn deinit(d: *D) void {
+        pub fn deinit(d: *Self) void {
             d.gpa.free(d.decoded);
             d.scratch.deinit(d.gpa);
             d.bytes.deinit(d.gpa);
@@ -529,7 +529,7 @@ pub fn Decoder(comptime Resolver: type) type {
         }
 
         /// The index `r` refers to, or null (`miss` says why).
-        pub fn index(d: *D, r: Ref) anyerror!?Index {
+        pub fn index(d: *Self, r: Ref) anyerror!?Index {
             if (r == none_ref) return .none;
             if (r < InternPool.static_len) return @fromBackingInt(r);
             const id = r - InternPool.static_len;
@@ -554,16 +554,16 @@ pub fn Decoder(comptime Resolver: type) type {
             return i;
         }
 
-        fn ref(d: *D, c: *Cursor) !?Index {
+        fn ref(d: *Self, c: *Cursor) !?Index {
             return d.index(c.next());
         }
 
-        fn string(d: *D, c: *Cursor) !InternPool.String {
+        fn string(d: *Self, c: *Cursor) !InternPool.String {
             return d.ip.getString(Zcu.tid, c.bytes());
         }
 
         /// Decodes a counted list of refs onto `scratch`; returns its start.
-        fn refs(d: *D, c: *Cursor) !?usize {
+        fn refs(d: *Self, c: *Cursor) !?usize {
             const n = c.next();
             const start = d.scratch.items.len;
             for (0..n) |_| {
@@ -573,12 +573,12 @@ pub fn Decoder(comptime Resolver: type) type {
             return start;
         }
 
-        fn nav(d: *D, c: *Cursor) !?InternPool.NavIndex {
+        fn nav(d: *Self, c: *Cursor) !?InternPool.NavIndex {
             const owner = try d.ref(c) orelse return null;
             return d.resolver.nav(owner, c.bytes());
         }
 
-        fn item(d: *D, tag: KeyTag, c: *Cursor) !?Index {
+        fn item(d: *Self, tag: KeyTag, c: *Cursor) !?Index {
             const base = d.scratch.items.len;
             defer d.scratch.shrinkRetainingCapacity(base);
             const key: InternPool.Key = switch (tag) {
@@ -784,7 +784,7 @@ pub fn Decoder(comptime Resolver: type) type {
             return d.intern(key);
         }
 
-        fn intern(d: *D, key: InternPool.Key) !?Index {
+        fn intern(d: *Self, key: InternPool.Key) !?Index {
             return d.resolver.intern(key);
         }
     };

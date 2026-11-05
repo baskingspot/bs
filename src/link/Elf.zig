@@ -1634,7 +1634,7 @@ const Failure = struct { atom: usize, err: Error, diag: Diagnostic };
 /// (see `AtomSlice`).
 fn LinkOf(comptime Input: type) type {
     return struct {
-        const Link = @This();
+        const Self = @This();
 
         gpa: Allocator,
         input: Input,
@@ -1729,7 +1729,7 @@ fn LinkOf(comptime Input: type) type {
         /// `copyDebug` copies bs's entries to.
         hdr_table: []HdrEntry = &.{},
 
-        fn check(l: *Link, diag: *Diagnostic) Error!void {
+        fn check(l: *Self, diag: *Diagnostic) Error!void {
             var first: ?Failure = null;
             for (l.failures) |f| if (f) |failure| {
                 if (first == null or failure.atom < first.?.atom) first = failure;
@@ -1741,11 +1741,11 @@ fn LinkOf(comptime Input: type) type {
             return failure.err;
         }
 
-        pub fn fail(l: *Link, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
+        pub fn fail(l: *Self, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
             if (l.failures[task] == null) l.failures[task] = .{ .atom = atom, .err = err, .diag = diag };
         }
 
-        fn atomAddr(l: *const Link, index: u64) u64 {
+        fn atomAddr(l: *const Self, index: u64) u64 {
             const p = l.places[index];
             return l.section_addrs[p.section] + l.chunks[index / chunk_len].bases[p.section] + p.offset;
         }
@@ -1753,7 +1753,7 @@ fn LinkOf(comptime Input: type) type {
         /// Replaces atom indices with addresses in one partition of `symbols`,
         /// so that resolving a relocation target is one lookup. With numbered
         /// symbols, sets the addresses of one chunk's atoms' numbers instead.
-        fn resolveAddrs(l: *Link, task: usize, _: usize) void {
+        fn resolveAddrs(l: *Self, task: usize, _: usize) void {
             const s = l.numbered orelse {
                 for (l.symbols.partitionEntries(task)) |*e| {
                     if (e.used) e.value = l.atomAddr(e.value);
@@ -1772,7 +1772,7 @@ fn LinkOf(comptime Input: type) type {
         /// after `resolveAddrs`: in `addrs`, or as a value. All targets are
         /// looked up before any alias is added, so an alias of an alias is
         /// undefined.
-        fn resolveAliases(l: *Link, aliases: []const Alias, values: *const SymbolTable, diag: *Diagnostic) Error!void {
+        fn resolveAliases(l: *Self, aliases: []const Alias, values: *const SymbolTable, diag: *Diagnostic) Error!void {
             if (aliases.len == 0) return;
             const resolved = try l.gpa.alloc(u64, aliases.len);
             defer l.gpa.free(resolved);
@@ -1831,21 +1831,21 @@ fn LinkOf(comptime Input: type) type {
         }
 
         /// The address or value an `addrs` entry stands for.
-        fn numberedAddr(l: *const Link, e: u32) ?u64 {
+        fn numberedAddr(l: *const Self, e: u32) ?u64 {
             if (e < value_tag) return l.base + e;
             if (e == unset) return null;
             if (e >= import_tag) return l.plt_start + (e - import_tag) * l.plt_entry;
             return l.numbered.?.values[e - value_tag].value;
         }
 
-        fn populateOutput(l: *Link, part: usize, _: usize) void {
+        fn populateOutput(l: *Self, part: usize, _: usize) void {
             const buf = l.target.memory;
             const begin = part * populate_len;
             populate(buf[begin..@min(buf.len, begin + populate_len)]);
         }
 
         /// Writes `bytes` at `offset` of the output.
-        fn put(l: *Link, offset: u64, bytes: []const u8) Error!void {
+        fn put(l: *Self, offset: u64, bytes: []const u8) Error!void {
             switch (l.target) {
                 .memory => |buf| @memcpy(buf[offset..][0..bytes.len], bytes),
                 .file => |fd| try l.writeChanged(fd, bytes, offset),
@@ -1853,7 +1853,7 @@ fn LinkOf(comptime Input: type) type {
         }
 
         /// Writes `len` zero bytes at `offset` of the output.
-        fn fill(l: *Link, offset: u64, len: u64) Error!void {
+        fn fill(l: *Self, offset: u64, len: u64) Error!void {
             switch (l.target) {
                 .memory => |buf| @memset(buf[offset..][0..len], 0),
                 .file => |fd| {
@@ -1868,7 +1868,7 @@ fn LinkOf(comptime Input: type) type {
         /// range of `lens[k]` bytes at `offsets[k]`: the output itself, or
         /// with a `.file` target, the thread's scratch, which `writeParts`
         /// writes out.
-        fn parts(l: *Link, thread: usize, comptime n: usize, offsets: [n]u64, lens: [n]u64) [n][]u8 {
+        fn parts(l: *Self, thread: usize, comptime n: usize, offsets: [n]u64, lens: [n]u64) [n][]u8 {
             var out: [n][]u8 = undefined;
             switch (l.target) {
                 .memory => |buf| for (&out, offsets, lens) |*o, off, len| {
@@ -1885,7 +1885,7 @@ fn LinkOf(comptime Input: type) type {
             return out;
         }
 
-        fn writeParts(l: *Link, task: usize, atom: usize, comptime n: usize, offsets: [n]u64, bufs: [n][]u8) void {
+        fn writeParts(l: *Self, task: usize, atom: usize, comptime n: usize, offsets: [n]u64, bufs: [n][]u8) void {
             const fd = switch (l.target) {
                 .memory => return,
                 .file => |fd| fd,
@@ -1899,7 +1899,7 @@ fn LinkOf(comptime Input: type) type {
         /// it writes under the inode lock, which serializes the threads.
         /// The old bytes are read back with pread, which maps nothing that
         /// would have to be torn down.
-        fn writeChanged(l: *const Link, fd: std.posix.fd_t, bytes: []const u8, offset: u64) Error!void {
+        fn writeChanged(l: *const Self, fd: std.posix.fd_t, bytes: []const u8, offset: u64) Error!void {
             var old: [16 * page_size]u8 = undefined;
             var at: usize = 0;
             var run: ?usize = null;
@@ -1926,7 +1926,7 @@ fn LinkOf(comptime Input: type) type {
             if (r < bytes.len) try pwriteAll(fd, bytes[r..], offset + r);
         }
 
-        fn gatherKeys(l: *Link, chunk: usize, _: usize) void {
+        fn gatherKeys(l: *Self, chunk: usize, _: usize) void {
             const begin = chunk * chunk_len;
             const end = @min(l.n_atoms, begin + chunk_len);
             for (l.keys[begin..end], begin..) |*k, i| {
@@ -1939,7 +1939,7 @@ fn LinkOf(comptime Input: type) type {
         /// Inserts the keys of one partition, in input order, so the first atom
         /// with a key is the one kept. Writes nothing but the partition, which
         /// keeps threads off each other's cache lines.
-        fn dedup(l: *Link, partition: usize, _: usize) void {
+        fn dedup(l: *Self, partition: usize, _: usize) void {
             l.symbols.populate(partition);
             const keys = l.keys;
             for (keys, 0..) |key, i| {
@@ -1952,19 +1952,19 @@ fn LinkOf(comptime Input: type) type {
 
         /// Lays out one chunk's atoms within each section, as if the chunk's
         /// part of every section started at 0.
-        fn layOutKeyed(l: *Link, chunk: usize, _: usize) void {
+        fn layOutKeyed(l: *Self, chunk: usize, _: usize) void {
             l.layOut(chunk, false, true);
         }
 
         /// A relink of a pic or shared image is rare; the static one keeps
         /// its loop free of their checks.
-        fn layOutNumbered(l: *Link, chunk: usize, _: usize) void {
+        fn layOutNumbered(l: *Self, chunk: usize, _: usize) void {
             if (l.pic or l.dynamic) l.layOut(chunk, true, true) else l.layOut(chunk, true, false);
         }
 
         /// The key-based and numbered paths are compiled apart, so that each
         /// is as tight as if it were the only one.
-        fn layOut(l: *Link, chunk: usize, comptime numbered: bool, comptime pic_or_dynamic: bool) void {
+        fn layOut(l: *Self, chunk: usize, comptime numbered: bool, comptime pic_or_dynamic: bool) void {
             const begin = chunk * chunk_len;
             const end = @min(l.n_atoms, begin + chunk_len);
             var c: Chunk = .{
@@ -2043,7 +2043,7 @@ fn LinkOf(comptime Input: type) type {
         /// Whether absolute relocation `r` of `a` needs the loader: in a
         /// shared object every one, in an executable those to imports,
         /// and an executable's thread-pointer offsets of imports.
-        fn needsDynamicReloc(l: *const Link, a: *const Atom, r: Atom.Reloc) bool {
+        fn needsDynamicReloc(l: *const Self, a: *const Atom, r: Atom.Reloc) bool {
             switch (r.info.kind) {
                 .x86_64_abs64, .aarch64_abs64 => {},
                 .x86_64_tpoff64, .aarch64_tprel64 => return isImport(l.exe_imports orelse return false, a.targets[r.info.target]),
@@ -2062,7 +2062,7 @@ fn LinkOf(comptime Input: type) type {
 
         /// In an executable, whether `a` holds an absolute address or a
         /// thread-pointer offset of an import, which the loader writes.
-        fn hasImportAbs(l: *const Link, a: *const Atom) bool {
+        fn hasImportAbs(l: *const Self, a: *const Atom) bool {
             const imports = l.exe_imports orelse return false;
             for (a.relocs) |r| {
                 const abs = switch (r.info.kind) {
@@ -2082,16 +2082,16 @@ fn LinkOf(comptime Input: type) type {
             }.order) != null;
         }
 
-        fn resolveAddrsAndLayOutDebug(l: *Link, task: usize, thread: usize) void {
+        fn resolveAddrsAndLayOutDebug(l: *Self, task: usize, thread: usize) void {
             if (task < l.n_resolve_tasks) l.resolveAddrs(task, thread) else l.layOutDebug(task - l.n_resolve_tasks);
         }
 
         /// Sizes one chunk's debug entries and collects their files.
-        fn layOutDebug(l: *Link, chunk: usize) void {
+        fn layOutDebug(l: *Self, chunk: usize) void {
             Dwarf.layOutChunk(l, chunk, l.chunks.len + chunk, @backingInt(Atom.Section.text));
         }
 
-        fn copyAll(l: *Link, task: usize, thread: usize) void {
+        fn copyAll(l: *Self, task: usize, thread: usize) void {
             if (task >= l.chunks.len + l.debug_chunks.len) return l.copyInput(task - l.chunks.len - l.debug_chunks.len, thread);
             // The debug chunks first: they take longer than the atom chunks,
             // so starting them first leaves less of the phase to one thread.
@@ -2099,14 +2099,14 @@ fn LinkOf(comptime Input: type) type {
             return l.copyChunk(task - l.debug_chunks.len, thread);
         }
 
-        fn copyChunk(l: *Link, task: usize, thread: usize) void {
+        fn copyChunk(l: *Self, task: usize, thread: usize) void {
             if (l.dynamic) return l.copyDynamic(task, thread);
             if (l.numbered == null) l.copy(task, thread, false, false) else l.copyNumbered(task, thread);
         }
 
         /// Writes one chunk's subprogram entries, line sequences, FDEs, and
         /// search table entries.
-        noinline fn copyDebug(l: *Link, chunk: usize, thread: usize) void {
+        noinline fn copyDebug(l: *Self, chunk: usize, thread: usize) void {
             const begin = chunk * chunk_len;
             const end = @min(l.n_debug, begin + chunk_len);
             const c = &l.debug_chunks[chunk];
@@ -2190,18 +2190,18 @@ fn LinkOf(comptime Input: type) type {
         }
 
         /// The file offset of input section `i`.
-        fn inputOff(l: *const Link, i: usize) u64 {
+        fn inputOff(l: *const Self, i: usize) u64 {
             const k = @backingInt(l.input_sections[i].kind);
             return l.sec_offs[k] + l.bs_parts[k] + l.input_offs[i];
         }
 
         /// The address or value of `key`, after `resolveAddrs`.
-        fn resolveKey(l: *const Link, key: SymbolKey) ?u64 {
+        fn resolveKey(l: *const Self, key: SymbolKey) ?u64 {
             return l.symbols.get(key) orelse l.values.get(key);
         }
 
         /// Copies input section `i` and applies its relocations.
-        noinline fn copyInput(l: *Link, i: usize, thread: usize) void {
+        noinline fn copyInput(l: *Self, i: usize, thread: usize) void {
             const s = &l.input_sections[i];
             const task = l.chunks.len + l.debug_chunks.len + i;
             const off = l.inputOff(i);
@@ -2214,7 +2214,7 @@ fn LinkOf(comptime Input: type) type {
             l.writeParts(task, l.n_atoms + i, 1, .{off}, out);
         }
 
-        fn inputReloc(l: *const Link, s: *const InputSection, r: InputReloc, dst: []u8, p_base: u64) Error!void {
+        fn inputReloc(l: *const Self, s: *const InputSection, r: InputReloc, dst: []u8, p_base: u64) Error!void {
             const wide = switch (r.kind) {
                 .abs64, .pc64, .dtpoff64, .offset64, .const64 => true,
                 .abs32, .pc32, .dtpoff32, .offset32, .const32 => false,
@@ -2249,7 +2249,7 @@ fn LinkOf(comptime Input: type) type {
         }
 
         /// Writes `bytes` at `offset` of a debug section.
-        fn putDebug(l: *Link, section: Dwarf.Section, offset: u64, bytes: []const u8) Error!void {
+        fn putDebug(l: *Self, section: Dwarf.Section, offset: u64, bytes: []const u8) Error!void {
             switch (section) {
                 .info => try l.put(l.info_off + offset, bytes),
                 .ranges => try l.put(l.ranges_off + offset, bytes),
@@ -2261,11 +2261,11 @@ fn LinkOf(comptime Input: type) type {
         /// Sets `res` to the addresses or values of the targets of `a`, atom
         /// `i`, from `addrs`.
         /// Whether atom `a` has its own symbol.
-        fn listed(l: *const Link, a: *const Atom) bool {
+        fn listed(l: *const Self, a: *const Atom) bool {
             return listedAtom(a) and (l.unlisted.count() == 0 or !l.unlisted.contains(a.key));
         }
 
-        fn resolveNumbered(l: *Link, a: *const Atom, i: usize, chunk: usize, res: []u64) bool {
+        fn resolveNumbered(l: *Self, a: *const Atom, i: usize, chunk: usize, res: []u64) bool {
             const s = l.numbered.?;
             const first = s.atoms[i].targets;
             // A run lies wholly in `targets` or wholly in `targets_tail`.
@@ -2291,17 +2291,17 @@ fn LinkOf(comptime Input: type) type {
         /// Copies one chunk's atoms, applies their relocations, and writes
         /// their symbols.
         /// Out of line, so that the key-based `copy` compiles as if alone.
-        noinline fn copyNumbered(l: *Link, chunk: usize, thread: usize) void {
+        noinline fn copyNumbered(l: *Self, chunk: usize, thread: usize) void {
             l.copy(chunk, thread, true, false);
         }
 
         /// A shared object's, which also writes a .rela.dyn record per
         /// absolute relocation; out of line, as `copyNumbered`.
-        noinline fn copyDynamic(l: *Link, chunk: usize, thread: usize) void {
+        noinline fn copyDynamic(l: *Self, chunk: usize, thread: usize) void {
             if (l.numbered == null) l.copy(chunk, thread, false, true) else l.copy(chunk, thread, true, true);
         }
 
-        fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool, comptime dynamic: bool) void {
+        fn copy(l: *Self, chunk: usize, thread: usize, comptime numbered: bool, comptime dynamic: bool) void {
             const c = &l.chunks[chunk];
             const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
             // The chunk's part of each section with file contents, from the

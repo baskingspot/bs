@@ -691,9 +691,9 @@ fn Converter(comptime Ctx: type) type {
         /// reference it, in input order, for one error per name.
         undefs: std.array_hash_map.String(std.ArrayList([]const u8)) = .empty,
 
-        const C = @This();
+        const Self = @This();
 
-        fn undefinedSymbol(c: *C, name: []const u8) Allocator.Error!void {
+        fn undefinedSymbol(c: *Self, name: []const u8) Allocator.Error!void {
             const gop = try c.undefs.getOrPut(c.in.arena, name);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             const objects = gop.value_ptr;
@@ -703,7 +703,7 @@ fn Converter(comptime Ctx: type) type {
 
         /// Reports `undefs`: "undefined symbol: X (referenced by a.o,
         /// b.o and 3 more objects)".
-        fn reportUndefined(c: *C) Allocator.Error!void {
+        fn reportUndefined(c: *Self) Allocator.Error!void {
             const max_listed = 8;
             for (c.undefs.keys(), c.undefs.values()) |name, objects| {
                 var msg: std.ArrayList(u8) = .empty;
@@ -718,11 +718,11 @@ fn Converter(comptime Ctx: type) type {
             }
         }
 
-        fn fail(c: *C, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+        fn fail(c: *Self, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
             try c.in.errors.append(c.in.arena, try c.in.arena.print(fmt, args));
         }
 
-        fn section(c: *C, index: u32) !void {
+        fn section(c: *Self, index: u32) !void {
             const o = c.o;
             if (o.discarded[index]) return;
             const kind = sectionOf(o, index) orelse return;
@@ -783,7 +783,7 @@ fn Converter(comptime Ctx: type) type {
         /// Adds `o`'s unwind and debug sections to `sections`: each debug
         /// section whole, and .eh_frame without the FDEs of sections the
         /// link dropped (later copies of a COMDAT group).
-        fn inputSections(c: *C) !void {
+        fn inputSections(c: *Self) !void {
             const o = c.o;
             const arena = c.in.arena;
             c.input_of = try arena.realloc(c.input_of, o.shdrs.len);
@@ -813,7 +813,7 @@ fn Converter(comptime Ctx: type) type {
         }
 
         /// The relocations of section `index`, sorted by offset.
-        fn sortedRelas(c: *C, index: u32) ![]elf.Elf64_Rela {
+        fn sortedRelas(c: *Self, index: u32) ![]elf.Elf64_Rela {
             const o = c.o;
             if (o.rela_of[index] == 0) return &.{};
             const src = std.mem.bytesAsSlice(elf.Elf64_Rela, o.sectionBytes(o.rela_of[index]));
@@ -838,7 +838,7 @@ fn Converter(comptime Ctx: type) type {
 
         /// Where a relocation of an unwind or debug section against
         /// symbol `s` points, `addend` bytes on.
-        fn inputTarget(c: *C, s: u32, addend: i64) !InputTarget {
+        fn inputTarget(c: *Self, s: u32, addend: i64) !InputTarget {
             const o = c.o;
             if (s >= o.syms.len) return .none;
             const sym = o.syms[s];
@@ -862,7 +862,7 @@ fn Converter(comptime Ctx: type) type {
         /// Converts relocation `r` of an unwind or debug section. A
         /// reference to what the link dropped becomes `tombstone`, as
         /// lld's.
-        fn inputReloc(c: *C, index: u32, relocs: *std.ArrayList(Elf.InputReloc), r: elf.Elf64_Rela, new_offset: u64, tombstone: u64) !void {
+        fn inputReloc(c: *Self, index: u32, relocs: *std.ArrayList(Elf.InputReloc), r: elf.Elf64_Rela, new_offset: u64, tombstone: u64) !void {
             const R = elf.R_X86_64;
             // aarch64's data relocations, as x86_64's of the same width.
             const ty: R = if (c.in.arch == .aarch64) switch (std.enums.fromInt(elf.R_AARCH64, r.r_type()) orelse return c.unsupported(index, r.r_type())) {
@@ -913,7 +913,7 @@ fn Converter(comptime Ctx: type) type {
             try relocs.append(c.in.arena, rel);
         }
 
-        fn debugRelocs(c: *C, index: u32, s: *Elf.InputSection, relocs: *std.ArrayList(Elf.InputReloc)) !void {
+        fn debugRelocs(c: *Self, index: u32, s: *Elf.InputSection, relocs: *std.ArrayList(Elf.InputReloc)) !void {
             // A dropped function's range would end a DWARF 4 range or
             // location list as (0, 0); lld writes 1 there.
             const tombstone: u64 = @intFromBool(s.kind == .debug_ranges or s.kind == .debug_loc);
@@ -927,7 +927,7 @@ fn Converter(comptime Ctx: type) type {
         /// the sections the link keeps, each FDE's initial location a
         /// PC-relative relocation, as the unwinder's binary search table
         /// needs. The records stop at a terminator, if any.
-        fn ehFrame(c: *C, index: u32, s: *Elf.InputSection, relocs: *std.ArrayList(Elf.InputReloc)) !void {
+        fn ehFrame(c: *Self, index: u32, s: *Elf.InputSection, relocs: *std.ArrayList(Elf.InputReloc)) !void {
             const o = c.o;
             const bytes = s.bytes;
             const relas = try c.sortedRelas(index);
@@ -998,14 +998,14 @@ fn Converter(comptime Ctx: type) type {
         }
 
         /// The section's first global symbol at its start, else its name.
-        fn atomName(c: *C, index: u32) []const u8 {
+        fn atomName(c: *Self, index: u32) []const u8 {
             const s = c.names[index];
             return if (s != 0) c.o.symName(c.o.syms[s]) else c.o.sectionName(index);
         }
 
         /// Where symbol `s` resolves, `addend` bytes on, or null after
         /// reporting it undefined.
-        fn target(c: *C, s: u32, addend: i64) !?Target {
+        fn target(c: *Self, s: u32, addend: i64) !?Target {
             const o = c.o;
             if (s >= o.syms.len) {
                 try c.fail("{s}: relocation against symbol {d}, which does not exist", .{ o.path, s });
@@ -1043,7 +1043,7 @@ fn Converter(comptime Ctx: type) type {
 
         /// The compilation's exports come first, then the objects', then
         /// compiler_rt, as upstream links them.
-        fn resolve(c: *C, name: []const u8, weak: bool) !?Target {
+        fn resolve(c: *Self, name: []const u8, weak: bool) !?Target {
             if (try c.ctx.zigExport(name)) |key| return .{ .key = key, .offset = 0 };
             if (try c.in.lookup(name)) |t| return t;
             if (try c.ctx.rtExport(name)) |key| return .{ .key = key, .offset = 0 };
@@ -1060,14 +1060,14 @@ fn Converter(comptime Ctx: type) type {
             return null;
         }
 
-        fn absolute(c: *C, value: u64) Allocator.Error!Target {
+        fn absolute(c: *Self, value: u64) Allocator.Error!Target {
             const key = absKey(value);
             for (c.abs_values.items) |v| if (v.key == key) return .{ .key = key, .offset = 0 };
             try c.abs_values.append(c.in.arena, .{ .key = key, .value = value });
             return .{ .key = key, .offset = 0 };
         }
 
-        fn add(c: *C, offset: u64, kind: Atom.Reloc.Kind, t: Target, addend: i64) Allocator.Error!void {
+        fn add(c: *Self, offset: u64, kind: Atom.Reloc.Kind, t: Target, addend: i64) Allocator.Error!void {
             const a = @as(i64, @bitCast(t.offset)) +% addend;
             const a32 = std.math.cast(i32, a) orelse return c.fail("{s}: relocation addend {d} out of range", .{ c.o.path, a });
             try c.list.append(c.in.arena, @intCast(offset), kind, t.key, a32);
@@ -1077,7 +1077,7 @@ fn Converter(comptime Ctx: type) type {
         /// in `copy` (a copy of `bytes` made on the first rewrite) when it
         /// relaxes an instruction sequence. Returns how many relocations
         /// after `k` the rewrite consumed.
-        fn reloc(c: *C, index: u32, relas: []align(1) const elf.Elf64_Rela, k: usize, bytes: []const u8, copy: *?[]u8) !usize {
+        fn reloc(c: *Self, index: u32, relas: []align(1) const elf.Elf64_Rela, k: usize, bytes: []const u8, copy: *?[]u8) !usize {
             if (c.in.arch == .aarch64) {
                 try c.relocA64(index, relas[k], bytes, copy);
                 return 0;
@@ -1299,7 +1299,7 @@ fn Converter(comptime Ctx: type) type {
         /// (`tlsSlot`): ld's relaxations of general-dynamic to
         /// initial-exec. Returns how many relocations after `k` the
         /// rewrite consumed, as `reloc`.
-        fn importReloc(c: *C, index: u32, relas: []align(1) const elf.Elf64_Rela, k: usize, bytes: []const u8, copy: *?[]u8) !usize {
+        fn importReloc(c: *Self, index: u32, relas: []align(1) const elf.Elf64_Rela, k: usize, bytes: []const u8, copy: *?[]u8) !usize {
             const r = relas[k];
             const o = c.o;
             const off = r.r_offset;
@@ -1343,7 +1343,7 @@ fn Converter(comptime Ctx: type) type {
 
         /// The executable's copy of the data object `sym` names, or null
         /// after reporting that it is not one.
-        fn copied(c: *C, index: u32, sym: elf.Elf64_Sym) !?SymbolKey {
+        fn copied(c: *Self, index: u32, sym: elf.Elf64_Sym) !?SymbolKey {
             const o = c.o;
             if (try c.ctx.copySym(o.symName(sym))) |key| return key;
             try c.fail("{s}: section '{s}' takes the address of {s}, a function a shared library defines, without the GOT (non-PIC code does), which bs does not link yet; compile it with -fPIC", .{ o.path, o.sectionName(index), o.symName(sym) });
@@ -1353,7 +1353,7 @@ fn Converter(comptime Ctx: type) type {
         /// A stub that jumps through `t`'s slot (`jmp [rip + slot]`, the
         /// slot's relocation of `kind`), content-addressed, so all calls
         /// to one target share it.
-        fn stub(c: *C, t: Target, kind: Atom.Reloc.Kind, name: []const u8) Allocator.Error!SymbolKey {
+        fn stub(c: *Self, t: Target, kind: Atom.Reloc.Kind, name: []const u8) Allocator.Error!SymbolKey {
             const arena = c.in.arena;
             const targets = try arena.dupe(SymbolKey, &.{try c.slot(t, kind)});
             const relocs = try arena.dupe(Atom.Reloc, &.{.init(2, .x86_64_pc32, 0, -4)});
@@ -1364,14 +1364,14 @@ fn Converter(comptime Ctx: type) type {
         }
 
         /// Whether `s` is `_TLS_MODULE_BASE_`, which the linker defines.
-        fn isTlsModuleBase(c: *C, s: u32) bool {
+        fn isTlsModuleBase(c: *Self, s: u32) bool {
             return s < c.o.syms.len and std.mem.eql(u8, c.o.symName(c.o.syms[s]), "_TLS_MODULE_BASE_");
         }
 
         /// Whether thread-local `t`, which relocation `r` names, is another
         /// module's in a shared object, which bs does not link yet, after
         /// reporting it.
-        fn sharedTlsImport(c: *C, r: elf.Elf64_Rela, t: Target) !bool {
+        fn sharedTlsImport(c: *Self, r: elf.Elf64_Rela, t: Target) !bool {
             if (!c.in.shared or !t.import) return false;
             try c.fail("{s}: bs does not import thread-local {s} into shared objects yet", .{ c.o.path, c.o.symName(c.o.syms[r.r_sym()]) });
             return true;
@@ -1381,7 +1381,7 @@ fn Converter(comptime Ctx: type) type {
         /// exports with default visibility (`ElfInput.dynamicExports`),
         /// which an executable may preempt. Indirect functions and the Zig
         /// code's exports bind locally.
-        fn preemptible(c: *C, s: u32) !bool {
+        fn preemptible(c: *Self, s: u32) !bool {
             const sym = c.o.syms[s];
             if (s < c.o.first_global or sym.st_bind() == elf.STB_LOCAL) return false;
             const name = c.o.symName(sym);
@@ -1396,7 +1396,7 @@ fn Converter(comptime Ctx: type) type {
         /// loader's, against the export, with the relocation's addend in
         /// the field; a GOT load reads a slot the loader fills; a call
         /// jumps through such a slot.
-        fn preemptReloc(c: *C, index: u32, r: elf.Elf64_Rela, t: Target, bytes: []const u8, copy: *?[]u8) !void {
+        fn preemptReloc(c: *Self, index: u32, r: elf.Elf64_Rela, t: Target, bytes: []const u8, copy: *?[]u8) !void {
             const off = r.r_offset;
             switch (@as(elf.R_X86_64, @fromBackingInt(@intCast(r.r_type())))) {
                 .@"64" => {
@@ -1416,7 +1416,7 @@ fn Converter(comptime Ctx: type) type {
         /// that an executable's definition wins as upstream's; else the
         /// module's own, whose offset in its block is known.
         /// Content-addressed, so references to one variable share it.
-        fn tlsPair(c: *C, t: Target, kind: Atom.Reloc.Kind, preempt: bool) Allocator.Error!SymbolKey {
+        fn tlsPair(c: *Self, t: Target, kind: Atom.Reloc.Kind, preempt: bool) Allocator.Error!SymbolKey {
             const arena = c.in.arena;
             const targets = try arena.dupe(SymbolKey, &.{t.key});
             const off = std.math.cast(i32, t.offset) orelse {
@@ -1439,7 +1439,7 @@ fn Converter(comptime Ctx: type) type {
 
         /// Whether relocation `k + 1` is the call to `__tls_get_addr` at
         /// `field` that a general- or local-dynamic sequence ends with.
-        fn callsTlsGetAddr(c: *C, relas: []align(1) const elf.Elf64_Rela, k: usize, field: u64) bool {
+        fn callsTlsGetAddr(c: *Self, relas: []align(1) const elf.Elf64_Rela, k: usize, field: u64) bool {
             if (k + 1 >= relas.len) return false;
             const n = relas[k + 1];
             const ty: elf.R_X86_64 = @fromBackingInt(@intCast(n.r_type()));
@@ -1448,7 +1448,7 @@ fn Converter(comptime Ctx: type) type {
             return std.mem.eql(u8, c.o.symName(c.o.syms[n.r_sym()]), "__tls_get_addr");
         }
 
-        fn unsupported(c: *C, index: u32, ty: u32) Allocator.Error!void {
+        fn unsupported(c: *Self, index: u32, ty: u32) Allocator.Error!void {
             const prefix, const name = switch (c.in.arch) {
                 .x86_64 => .{ "R_X86_64_", if (std.enums.fromInt(elf.R_X86_64, ty)) |t| @tagName(t) else "unknown" },
                 .aarch64 => .{ "R_AARCH64_", if (std.enums.fromInt(elf.R_AARCH64, ty)) |t| @tagName(t) else "unknown" },
@@ -1466,7 +1466,7 @@ fn Converter(comptime Ctx: type) type {
         /// `movz x0, #tprel_g1, lsl #16; movk x0, #tprel_g0_nc`, and the
         /// initial-exec `adrp` and `ldr` the same pair into their own
         /// register.
-        fn relocA64(c: *C, index: u32, r: elf.Elf64_Rela, bytes: []const u8, copy: *?[]u8) !void {
+        fn relocA64(c: *Self, index: u32, r: elf.Elf64_Rela, bytes: []const u8, copy: *?[]u8) !void {
             const o = c.o;
             if (r.r_offset + 4 > bytes.len) return c.fail("{s}: relocation at offset {d} past the end of section '{s}'", .{ o.path, r.r_offset, o.sectionName(index) });
             const R = elf.R_AARCH64;
@@ -1562,7 +1562,7 @@ fn Converter(comptime Ctx: type) type {
         /// the loader writes; a call or jump goes through a stub that
         /// branches through the symbol's slot; a GOT load reads the slot;
         /// and PC-relative data references use the executable's copy.
-        fn importA64(c: *C, index: u32, r: elf.Elf64_Rela, kind: Atom.Reloc.Kind, t: Target) !void {
+        fn importA64(c: *Self, index: u32, r: elf.Elf64_Rela, kind: Atom.Reloc.Kind, t: Target) !void {
             const o = c.o;
             const sym = o.syms[r.r_sym()];
             switch (kind) {
@@ -1580,7 +1580,7 @@ fn Converter(comptime Ctx: type) type {
         /// slot the loader writes its offset into (`tlsSlot`), as lld
         /// relaxes descriptors: `adrp x0, slot; ldr x0, [x0, :lo12:slot];
         /// nop; nop`, and the initial-exec pair reads the slot as is.
-        fn tlsImportA64(c: *C, index: u32, r: elf.Elf64_Rela, ty: elf.R_AARCH64, insn: u32, bytes: []const u8, copy: *?[]u8, t: Target) !void {
+        fn tlsImportA64(c: *Self, index: u32, r: elf.Elf64_Rela, ty: elf.R_AARCH64, insn: u32, bytes: []const u8, copy: *?[]u8, t: Target) !void {
             const at: usize = @intCast(r.r_offset);
             const ie: Target = .{ .key = try c.tlsSlot(t), .offset = 0 };
             switch (ty) {
@@ -1600,7 +1600,7 @@ fn Converter(comptime Ctx: type) type {
 
         /// `stub` for aarch64: `adrp x16, slot; ldr x16, [x16, :lo12:slot];
         /// br x16`, as lld's PLT entries use x16. `kind` is the slot's.
-        fn stubA64(c: *C, t: Target, kind: Atom.Reloc.Kind) Allocator.Error!SymbolKey {
+        fn stubA64(c: *Self, t: Target, kind: Atom.Reloc.Kind) Allocator.Error!SymbolKey {
             const arena = c.in.arena;
             const s = try c.slot(t, kind);
             const targets = try arena.dupe(SymbolKey, &.{s});
@@ -1611,7 +1611,7 @@ fn Converter(comptime Ctx: type) type {
             return key;
         }
 
-        fn writable(c: *C, bytes: []const u8, copy: *?[]u8) Allocator.Error![]u8 {
+        fn writable(c: *Self, bytes: []const u8, copy: *?[]u8) Allocator.Error![]u8 {
             if (copy.*) |b| return b;
             const b = try c.in.arena.dupe(u8, bytes);
             copy.* = b;
@@ -1622,7 +1622,7 @@ fn Converter(comptime Ctx: type) type {
         /// cannot be relaxed: content-addressed, so references to one
         /// target share it. `kind` is `.x86_64_abs64`, or
         /// `.x86_64_abs64_sym` for an export the loader may preempt.
-        fn slot(c: *C, t: Target, kind: Atom.Reloc.Kind) Allocator.Error!SymbolKey {
+        fn slot(c: *Self, t: Target, kind: Atom.Reloc.Kind) Allocator.Error!SymbolKey {
             const arena = c.in.arena;
             const targets = try arena.dupe(SymbolKey, &.{t.key});
             const off = std.math.cast(i32, t.offset) orelse {
@@ -1640,7 +1640,7 @@ fn Converter(comptime Ctx: type) type {
         /// pointer, which the loader writes (TPOFF64, or TLS_TPREL64 on
         /// aarch64): initial-exec code's
         /// GOT entry, content-addressed as `slot`.
-        fn tlsSlot(c: *C, t: Target) Allocator.Error!SymbolKey {
+        fn tlsSlot(c: *Self, t: Target) Allocator.Error!SymbolKey {
             const arena = c.in.arena;
             const targets = try arena.dupe(SymbolKey, &.{t.key});
             const relocs = try arena.dupe(Atom.Reloc, &.{.init(0, if (c.in.arch == .aarch64) .aarch64_tprel64 else .x86_64_tpoff64, 0, 0)});

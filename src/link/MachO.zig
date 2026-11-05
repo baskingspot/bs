@@ -1408,7 +1408,7 @@ const Resolved = struct { v: u64, kind: enum(u8) { addr, import, value } };
 /// (see `Elf.AtomSlice`; the debug declarations are not used).
 fn LinkOf(comptime Input: type) type {
     return struct {
-        const Link = @This();
+        const Self = @This();
 
         gpa: Allocator,
         input: Input,
@@ -1468,7 +1468,7 @@ fn LinkOf(comptime Input: type) type {
         /// File offset of __unwind_info.
         unwind_off: u64 = 0,
 
-        fn check(l: *Link, diag: *Diagnostic) Error!void {
+        fn check(l: *Self, diag: *Diagnostic) Error!void {
             var first: ?Failure = null;
             for (l.failures) |f| if (f) |failure| {
                 if (first == null or failure.atom < first.?.atom) first = failure;
@@ -1480,23 +1480,23 @@ fn LinkOf(comptime Input: type) type {
             return failure.err;
         }
 
-        pub fn fail(l: *Link, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
+        pub fn fail(l: *Self, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
             if (l.failures[task] == null) l.failures[task] = .{ .atom = atom, .err = err, .diag = diag };
         }
 
-        fn atomAddr(l: *const Link, index: u64) u64 {
+        fn atomAddr(l: *const Self, index: u64) u64 {
             const p = l.places[index];
             return l.section_addrs[p.section] + l.chunks[index / chunk_len].bases[p.section] + p.offset;
         }
 
-        fn resolveAddrsKeyed(l: *Link, partition: usize, _: usize) void {
+        fn resolveAddrsKeyed(l: *Self, partition: usize, _: usize) void {
             for (l.symbols.partitionEntries(partition)) |*e| {
                 if (e.used) e.value = l.atomAddr(e.value);
             }
         }
 
         /// Sets the addresses of one chunk's atoms' numbers.
-        fn resolveAddrsNumbered(l: *Link, chunk: usize, _: usize) void {
+        fn resolveAddrsNumbered(l: *Self, chunk: usize, _: usize) void {
             const s = l.numbered.?;
             const begin = chunk * chunk_len;
             const end = @min(l.n_atoms, begin + chunk_len);
@@ -1513,7 +1513,7 @@ fn LinkOf(comptime Input: type) type {
         /// As `Elf`'s: each alias takes its target's entry, an address
         /// moved by its addend; imports and values only with an addend of
         /// 0. Targets are all looked up first.
-        fn resolveAliases(l: *Link, aliases: []const Elf.Alias, values: *const SymbolTable, imports: *const SymbolTable, diag: *Diagnostic) Error!void {
+        fn resolveAliases(l: *Self, aliases: []const Elf.Alias, values: *const SymbolTable, imports: *const SymbolTable, diag: *Diagnostic) Error!void {
             if (aliases.len == 0) return;
             const Entry = struct { table: enum { symbols, imports, values, addrs }, v: u64 };
             const resolved = try l.gpa.alloc(Entry, aliases.len);
@@ -1572,7 +1572,7 @@ fn LinkOf(comptime Input: type) type {
             }
         }
 
-        fn resolveNumbered(l: *Link, a: *const Atom, i: usize, chunk: usize, res: []Resolved) bool {
+        fn resolveNumbered(l: *Self, a: *const Atom, i: usize, chunk: usize, res: []Resolved) bool {
             const s = l.numbered.?;
             const first = s.atoms[i].targets;
             // A run lies wholly in `targets` or wholly in `targets_tail`.
@@ -1601,7 +1601,7 @@ fn LinkOf(comptime Input: type) type {
             return true;
         }
 
-        fn gatherKeys(l: *Link, chunk: usize, _: usize) void {
+        fn gatherKeys(l: *Self, chunk: usize, _: usize) void {
             const begin = chunk * chunk_len;
             const end = @min(l.n_atoms, begin + chunk_len);
             for (l.keys[begin..end], begin..) |*k, i| {
@@ -1611,7 +1611,7 @@ fn LinkOf(comptime Input: type) type {
             }
         }
 
-        fn dedup(l: *Link, partition: usize, _: usize) void {
+        fn dedup(l: *Self, partition: usize, _: usize) void {
             l.symbols.populate(partition);
             const keys = l.keys;
             for (keys, 0..) |key, i| {
@@ -1625,17 +1625,17 @@ fn LinkOf(comptime Input: type) type {
         /// Lays out one chunk's atoms within each section, as if the chunk's
         /// part of every section started at 0, and counts the fixups its
         /// absolute addresses need.
-        fn layOutKeyed(l: *Link, chunk: usize, _: usize) void {
+        fn layOutKeyed(l: *Self, chunk: usize, _: usize) void {
             l.layOut(chunk, false);
         }
 
-        fn layOutNumbered(l: *Link, chunk: usize, _: usize) void {
+        fn layOutNumbered(l: *Self, chunk: usize, _: usize) void {
             l.layOut(chunk, true);
         }
 
         /// The key-based and numbered paths are compiled apart, so that each
         /// is as tight as if it were the only one.
-        fn layOut(l: *Link, chunk: usize, comptime numbered: bool) void {
+        fn layOut(l: *Self, chunk: usize, comptime numbered: bool) void {
             const begin = chunk * chunk_len;
             const end = @min(l.n_atoms, begin + chunk_len);
             var c: Chunk = .{
@@ -1760,16 +1760,16 @@ fn LinkOf(comptime Input: type) type {
 
         /// Copies one chunk's atoms, applies their relocations, records their
         /// fixups, and writes their symbols.
-        fn copyKeyed(l: *Link, chunk: usize, thread: usize) void {
+        fn copyKeyed(l: *Self, chunk: usize, thread: usize) void {
             l.copy(chunk, thread, false);
         }
 
         /// Out of line, so that the key-based `copy` compiles as if alone.
-        noinline fn copyNumbered(l: *Link, chunk: usize, thread: usize) void {
+        noinline fn copyNumbered(l: *Self, chunk: usize, thread: usize) void {
             l.copy(chunk, thread, true);
         }
 
-        fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool) void {
+        fn copy(l: *Self, chunk: usize, thread: usize, comptime numbered: bool) void {
             const c = &l.chunks[chunk];
             const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
             for (c.lead_gaps, c.bases, l.section_addrs, 0..) |gap, chunk_base, sa, s| {
@@ -1854,26 +1854,26 @@ fn LinkOf(comptime Input: type) type {
 
         /// Sizes one debug chunk's entries, collects their files, and
         /// counts its __unwind_info entries.
-        fn layOutDebug(l: *Link, chunk: usize, _: usize) void {
+        fn layOutDebug(l: *Self, chunk: usize, _: usize) void {
             const task = l.chunks.len + chunk;
             Dwarf.layOutChunk(l, chunk, task, text);
             if (l.failures[task] != null) return;
             l.unwind_pages[chunk].count = l.walkDebug(chunk, undefined, false);
         }
 
-        fn copyAll(l: *Link, task: usize, thread: usize) void {
+        fn copyAll(l: *Self, task: usize, thread: usize) void {
             if (task >= l.chunks.len) return l.copyDebug(task - l.chunks.len, thread);
             if (l.numbered == null) l.copyKeyed(task, thread) else l.copyNumbered(task, thread);
         }
 
         /// Writes one debug chunk's subprogram entries and line sequences
         /// into the dSYM, if there is one, and its __unwind_info page.
-        noinline fn copyDebug(l: *Link, chunk: usize, thread: usize) void {
+        noinline fn copyDebug(l: *Self, chunk: usize, thread: usize) void {
             _ = l.walkDebug(chunk, thread, true);
         }
 
         /// Writes `bytes` at `offset` of the dSYM.
-        fn putDsym(l: *Link, offset: u64, bytes: []const u8) Error!void {
+        fn putDsym(l: *Self, offset: u64, bytes: []const u8) Error!void {
             switch (l.dsym) {
                 .memory => |m| @memcpy(m[offset..][0..bytes.len], bytes),
                 .file => |fd| try Elf.pwriteAll(fd, bytes, offset),
@@ -1881,7 +1881,7 @@ fn LinkOf(comptime Input: type) type {
         }
 
         /// Writes `bytes` at `offset` of a debug section of the dSYM.
-        fn putDsymDebug(l: *Link, section: Dwarf.Section, offset: u64, bytes: []const u8) Error!void {
+        fn putDsymDebug(l: *Self, section: Dwarf.Section, offset: u64, bytes: []const u8) Error!void {
             try l.putDsym(offset + switch (section) {
                 .info => l.dsym_info_off,
                 .ranges => l.dsym_ranges_off,
@@ -1899,7 +1899,7 @@ fn LinkOf(comptime Input: type) type {
         /// next code in __text, so padding between functions takes the
         /// encoding before it, as with ld64; code without debug info ends
         /// it.
-        fn walkDebug(l: *Link, chunk: usize, thread: usize, comptime write: bool) u32 {
+        fn walkDebug(l: *Self, chunk: usize, thread: usize, comptime write: bool) u32 {
             const begin = chunk * Dwarf.chunk_len;
             const end = @min(l.n_debug, begin + Dwarf.chunk_len);
             const c = &l.debug_chunks[chunk];
@@ -2015,7 +2015,7 @@ fn LinkOf(comptime Input: type) type {
         }
 
         /// Whether code that is kept lies between atoms `a` and `b`.
-        fn textBetween(l: *const Link, a: u32, b: u32) bool {
+        fn textBetween(l: *const Self, a: u32, b: u32) bool {
             for (l.places[a + 1 .. b]) |p| {
                 if (p.section == text and !p.isDuplicate()) return true;
             }
@@ -2031,7 +2031,7 @@ fn LinkOf(comptime Input: type) type {
 
         /// Applies `a`'s relocations to its copy `dst` at address `p_base` in
         /// section `sect`, recording fixups from `fixups.*` on.
-        fn applyRelocs(l: *const Link, a: *const Atom, dst: []u8, p_base: u64, sect: u5, resolved: []const Resolved, fixups: *u64, diag: *Diagnostic) Error!void {
+        fn applyRelocs(l: *const Self, a: *const Atom, dst: []u8, p_base: u64, sect: u5, resolved: []const Resolved, fixups: *u64, diag: *Diagnostic) Error!void {
             for (a.relocs) |r| {
                 const width: u4 = switch (r.info.kind) {
                     .aarch64_abs64, .value64 => 8,

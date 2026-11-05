@@ -644,9 +644,9 @@ fn Converter(comptime Ctx: type) type {
         /// reference it, in input order, for one error per name.
         undefs: std.array_hash_map.String(std.ArrayList([]const u8)) = .empty,
 
-        const C = @This();
+        const Self = @This();
 
-        fn undefinedSymbol(c: *C, name: []const u8) Allocator.Error!void {
+        fn undefinedSymbol(c: *Self, name: []const u8) Allocator.Error!void {
             const gop = try c.undefs.getOrPut(c.in.arena, name);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             const objects = gop.value_ptr;
@@ -655,7 +655,7 @@ fn Converter(comptime Ctx: type) type {
         }
 
         /// Reports `undefs` as `ElfInput` does.
-        fn reportUndefined(c: *C) Allocator.Error!void {
+        fn reportUndefined(c: *Self) Allocator.Error!void {
             const max_listed = 8;
             for (c.undefs.keys(), c.undefs.values()) |name, objects| {
                 var msg: std.ArrayList(u8) = .empty;
@@ -673,16 +673,16 @@ fn Converter(comptime Ctx: type) type {
         /// A converted relocation, at an offset in its section.
         const Rel = struct { offset: u64, kind: Atom.Reloc.Kind, target: Target, addend: i64 };
 
-        fn fail(c: *C, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+        fn fail(c: *Self, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
             try c.in.errors.append(c.in.arena, try c.in.arena.print(fmt, args));
         }
 
-        fn sectName(c: *C, index: usize) []const u8 {
+        fn sectName(c: *Self, index: usize) []const u8 {
             const s = &c.o.sects[index];
             return c.in.arena.print("{s},{s}", .{ name16(&s.segname), name16(&s.sectname) }) catch "?";
         }
 
-        fn section(c: *C, index: u32) !void {
+        fn section(c: *Self, index: u32) !void {
             const o = c.o;
             const s = o.sects[index];
             if (unsupportedSection(s)) |why| return c.fail("{s}: bs does not link section '{s}' ({s})", .{ o.path, c.sectName(index), why });
@@ -729,7 +729,7 @@ fn Converter(comptime Ctx: type) type {
         /// ld64 does: a class-properties or signed-class_ro flag only if
         /// every object has it, the Swift version bits from the first
         /// object that has them, the rest from the first object.
-        fn imageInfo(c: *C, index: u32) !void {
+        fn imageInfo(c: *Self, index: u32) !void {
             const bytes = c.o.sectionBytes(index);
             if (bytes.len != 8 or c.o.sects[index].nreloc != 0) return c.fail("{s}: section '{s}' is not 8 bytes of image info", .{ c.o.path, c.sectName(index) });
             const next: [2]u32 = .{ std.mem.readInt(u32, bytes[0..4], .little), std.mem.readInt(u32, bytes[4..8], .little) };
@@ -750,7 +750,7 @@ fn Converter(comptime Ctx: type) type {
         }
 
         /// Adds `a` with the relocations of `rels` in `[start, end)`.
-        fn addAtom(c: *C, a: Atom, rels: []const Rel, start: u64, end: u64) !void {
+        fn addAtom(c: *Self, a: Atom, rels: []const Rel, start: u64, end: u64) !void {
             const arena = c.in.arena;
             var list: Atom.RelocList = .{};
             for (rels) |r| {
@@ -768,7 +768,7 @@ fn Converter(comptime Ctx: type) type {
 
         /// The section's first external symbol at its start, else the
         /// first at its start, else its name.
-        fn atomName(c: *C, index: usize) []const u8 {
+        fn atomName(c: *Self, index: usize) []const u8 {
             return c.pieceName(index, 0);
         }
 
@@ -776,7 +776,7 @@ fn Converter(comptime Ctx: type) type {
         /// template piece `key`: the writer puts the atom's symbol at its
         /// own descriptor, as ld64 puts `_x` there and `_x$tlv$init` at
         /// the template.
-        fn tlvName(c: *C, key: SymbolKey) ?[]const u8 {
+        fn tlvName(c: *Self, key: SymbolKey) ?[]const u8 {
             const o = c.o;
             for (o.syms) |sym| {
                 if (sym.isStab() or sym.kind() != macho.N_SECT or sectionType(o.sects[sym.n_sect]) != macho.S_THREAD_LOCAL_VARIABLES) continue;
@@ -789,7 +789,7 @@ fn Converter(comptime Ctx: type) type {
             return null;
         }
 
-        fn pieceName(c: *C, index: usize, at: u64) []const u8 {
+        fn pieceName(c: *Self, index: usize, at: u64) []const u8 {
             const o = c.o;
             const addr = o.sects[index].addr + at;
             var local: ?[]const u8 = null;
@@ -803,7 +803,7 @@ fn Converter(comptime Ctx: type) type {
         }
 
         /// Where symbol `s` resolves, or null after reporting it.
-        fn target(c: *C, s: u32) !?Target {
+        fn target(c: *Self, s: u32) !?Target {
             const o = c.o;
             if (s >= o.syms.len) {
                 try c.fail("{s}: relocation against symbol {d}, which does not exist", .{ o.path, s });
@@ -841,7 +841,7 @@ fn Converter(comptime Ctx: type) type {
             };
         }
 
-        fn resolve(c: *C, name: []const u8, weak: bool) !?Target {
+        fn resolve(c: *Self, name: []const u8, weak: bool) !?Target {
             if (try c.ctx.zigExport(name)) |key| return .{ .key = key, .offset = 0 };
             if (try c.in.lookup(name)) |t| return t;
             if (try c.ctx.rtExport(name)) |key| return .{ .key = key, .offset = 0 };
@@ -857,14 +857,14 @@ fn Converter(comptime Ctx: type) type {
             return null;
         }
 
-        fn absolute(c: *C, value: u64) Allocator.Error!Target {
+        fn absolute(c: *Self, value: u64) Allocator.Error!Target {
             const key = absKey(value);
             for (c.abs_values.items) |v| if (v.key == key) return .{ .key = key, .offset = 0 };
             try c.abs_values.append(c.in.arena, .{ .key = key, .value = value });
             return .{ .key = key, .offset = 0 };
         }
 
-        fn writable(c: *C, bytes: []const u8, copy: *?[]u8) Allocator.Error![]u8 {
+        fn writable(c: *Self, bytes: []const u8, copy: *?[]u8) Allocator.Error![]u8 {
             if (copy.*) |b| return b;
             const b = try c.in.arena.dupe(u8, bytes);
             copy.* = b;
@@ -874,7 +874,7 @@ fn Converter(comptime Ctx: type) type {
         /// Converts section `index`'s relocations into `rels`, rewriting
         /// the bytes in `copy` where a relocation's addend lives in the
         /// field or an instruction changes.
-        fn relocs(c: *C, index: u32, bytes: []const u8, copy: *?[]u8, rels: *std.ArrayList(Rel)) !void {
+        fn relocs(c: *Self, index: u32, bytes: []const u8, copy: *?[]u8, rels: *std.ArrayList(Rel)) !void {
             const o = c.o;
             const s = o.sects[index];
             const raw = o.bytes[s.reloff..][0 .. @as(usize, s.nreloc) * 8];

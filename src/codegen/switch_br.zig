@@ -118,23 +118,23 @@ fn Lowering(comptime Ctx: type) type {
         /// The key the flags hold the operand's compare with, if any.
         flags: ?u64 = null,
 
-        const L = @This();
+        const Self = @This();
 
-        fn branch(l: *L, key: u64, cond: std.math.CompareOperator, label: u32) !void {
+        fn branch(l: *Self, key: u64, cond: std.math.CompareOperator, label: u32) !void {
             try l.ctx.branch(key, cond, label, l.flags == key);
             l.flags = key;
         }
 
-        fn runLo(l: *const L, r: Run) u64 {
+        fn runLo(l: *const Self, r: Run) u64 {
             return l.cases[r.start].lo;
         }
 
-        fn runHi(l: *const L, r: Run) u64 {
+        fn runHi(l: *const Self, r: Run) u64 {
             return l.cases[r.end - 1].hi;
         }
 
         /// A binary search over `runs` for a key in `lo`...`hi`.
-        fn search(l: *L, runs: []const Run, lo: u64, hi: u64) !bool {
+        fn search(l: *Self, runs: []const Run, lo: u64, hi: u64) !bool {
             if (runs.len <= linear_max) return l.linear(runs, lo, hi);
             const mid = runs.len / 2;
             const pivot = l.runLo(runs[mid]);
@@ -148,7 +148,7 @@ fn Lowering(comptime Ctx: type) type {
         }
 
         /// Tests `runs` in order for a key in `lo`...`hi`.
-        fn linear(l: *L, runs: []const Run, lo_in: u64, hi_in: u64) !bool {
+        fn linear(l: *Self, runs: []const Run, lo_in: u64, hi_in: u64) !bool {
             var lo = lo_in;
             var hi = hi_in;
             for (runs, 0..) |r, k| {
