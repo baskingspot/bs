@@ -247,7 +247,7 @@ const Finder = struct {
         if (cb.len != 2 or tags[@backingInt(cb[0])] != .cmp_lt or tags[@backingInt(cb[1])] != .cond_br) return null;
         const cmp = datas[@backingInt(cb[0])].bin_op;
         if (cmp.lhs != load.toRef()) return null;
-        const end = f.int(cmp.rhs) orelse return null;
+        const end = f.int(cmp.rhs) orelse f.constLen(cmp.rhs) orelse return null;
         const br = datas[@backingInt(cb[1])].pl_op;
         if (br.operand != cb[0].toRef() or f.uses[@backingInt(cb[0])] != 1) return null;
         const x = ir.extraData(Ir.CondBr, br.payload);
@@ -277,6 +277,37 @@ const Finder = struct {
         n.body(then_body) catch unreachable;
         if (!n.ok or n.n * trips > max_copied) return null;
         return .{ .outer = outer, .counter = counter, .cont = cont, .body_start = x.end, .body_len = x.data.then_body_len, .start = start, .trips = trips };
+    }
+
+    /// The length of a slice that is a constant: `std.mem.swap`'s
+    /// `@ptrCast` of a `*T` to `[]u8`, which Sema keeps in a `const`
+    /// local, so a `for` over it reloads its length.
+    fn constLen(f: *const Finder, ref: Inst.Ref) ?u64 {
+        const ir = f.ir;
+        const tags = ir.instructions.items(.tag);
+        const datas = ir.instructions.items(.data);
+        const i = @backingInt(ref.toIndex() orelse return null);
+        if (tags[i] != .slice_len) return null;
+        var s = datas[i].ty_op.operand;
+        if (s.toIndex()) |l| if (tags[@backingInt(l)] == .load) {
+            // A `const` local stored once.
+            const a = datas[@backingInt(l)].ty_op.operand.toIndex() orelse return null;
+            if (tags[@backingInt(a)] != .alloc or datas[@backingInt(a)].ty == .none or !f.ip.keyPayload(.ptr_type, datas[@backingInt(a)].ty).flags.is_const) return null;
+            var stored: ?Inst.Ref = null;
+            for (tags, datas) |tag, data| {
+                if (tag != .store or data.bin_op.lhs != a.toRef()) continue;
+                if (stored != null) return null;
+                stored = data.bin_op.rhs;
+            }
+            s = stored orelse return null;
+        };
+        if (s.toInterned()) |v| {
+            if (f.ip.keyTag(v) != .slice) return null;
+            return f.int(.fromInterned(f.ip.keyPayload(.slice, v).len));
+        }
+        const si = @backingInt(s.toIndex().?);
+        if (tags[si] != .slice) return null;
+        return f.int(ir.extraData(Ir.Bin, datas[si].ty_pl.payload).data.rhs);
     }
 
     fn int(f: *const Finder, ref: Inst.Ref) ?u64 {

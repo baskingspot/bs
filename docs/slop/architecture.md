@@ -2001,7 +2001,9 @@ loop, `i < N` against a constant, `i +% 1`, and no other use of the
 counter) runs at most 8 times and copies at most 256 instructions in
 all, becomes one copy of its body per iteration, each in a block that
 `continue` exits, with the counter's load replaced by the iteration's
-constant. The copies reuse the inliner's `Copier`. The rewrite rules
+constant. `N` may also be the length of a slice built with a constant
+length, directly or through a `const` local stored once, as
+`std.mem.swap`'s loop over `@ptrCast` byte slices of `*T`. The copies reuse the inliner's `Copier`. The rewrite rules
 then fold what the constants make constant: elements of the constant
 arrays, and the bounds checks against their lengths, which are copied
 like every other check and fold only where the constant proves them.
