@@ -522,14 +522,7 @@ pub const Job = struct {
         }
         var job_opts = opts;
         job_opts.modules = modules;
-        if (opts.c_root) {
-            // Objects and archives may call ubsan_rt, which reports through
-            // the panic handler.
-            const ubsan = opts.link_inputs.len != 0 or for (opts.c_sources) |s| {
-                if (s.flags.sanitizeC() == .full) break true;
-            } else false;
-            job_opts.root_src_path = try Builtin.writeCMain(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }), !ubsan);
-        }
+        if (opts.c_root) job_opts.root_src_path = try Builtin.writeCMain(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }), plainC(&opts));
         // An executable or test that fuzzes links the fuzzer, whose
         // module family has a builtin of its own, as upstream's separate
         // compilation of it (a static library) does. A program other
@@ -996,6 +989,17 @@ fn cxxRuntime(opts: *const Options) bool {
     return opts.link_libcpp and !opts.command.isObj() and (opts.command != .build_lib or opts.dynamic);
 }
 
+/// Whether the build is C only (`Options.c_root`) and nothing in it calls
+/// ubsan_rt: no C source has `-fsanitize-c=full`, and there are no object
+/// or archive inputs, which may have been built with it. Upstream links
+/// no ubsan_rt then, and its compiler_rt (an archive after libc, of one
+/// member) only for names libc lacks.
+fn plainC(opts: *const Options) bool {
+    if (!opts.c_root or opts.link_inputs.len != 0) return false;
+    for (opts.c_sources) |s| if (s.flags.sanitizeC() == .full) return false;
+    return true;
+}
+
 /// Whether the build links glibc's libc_nonshared.a: an executable or
 /// shared library linking glibc, as upstream links it into both. C and
 /// Zig externs call its functions (`atexit`, `__stack_chk_fail_local`,
@@ -1093,7 +1097,11 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
         // Only executables link the C runtimes; a library's C objects
         // reach them when an executable links the library, as upstream's.
-        .c_runtimes = !opts.objects_only and ((!opts.command.isObj() and opts.command != .build_lib) or opts.dynamic) and (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp),
+        // Plain C (`plainC`) against glibc links neither, as upstream's,
+        // and calls glibc's `__stack_chk_fail`; glibc before 2.4 lacks
+        // it, and upstream's then comes from compiler_rt.
+        .c_runtimes = !opts.objects_only and ((!opts.command.isObj() and opts.command != .build_lib) or opts.dynamic) and (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp) and
+            !(plainC(&opts) and opts.glibc_version != null and opts.glibc_version.?.order(.{ .major = 2, .minor = 4, .patch = 0 }) != .lt),
     });
     defer fe.deinit();
     try fe.enableCache(job.cache_dirs);
@@ -1191,6 +1199,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     };
     if (glibc != null) emit.runpath = opts.runpath;
     emit.lld = opts.c_root;
+    emit.libc_first = glibc != null and plainC(&opts);
     // aarch64-macos links against Mach-O dylibs, with LC_RPATHs.
     const macos = opts.bs_target == .aarch64_macos;
     if (macos) {

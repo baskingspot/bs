@@ -120,6 +120,10 @@ runpath: ?[]const u8 = null,
 /// The program is C only, which upstream links with lld rather than its
 /// own linker (`Glibc.dynamicOptions`).
 lld: bool = false,
+/// Plain C against glibc (`main.plainC`): names glibc defines resolve to
+/// it before compiler_rt, as upstream's compiler_rt archive after libc
+/// leaves them (`memset`, `memcpy`, libm's functions).
+libc_first: bool = false,
 /// An executable's object and archive inputs, which `sync` pulls archive
 /// members for and `finish` converts into atoms.
 inputs: ?Inputs = null,
@@ -952,7 +956,9 @@ fn pullInputs(emit: *Emit, in: anytype) !void {
     // As the link's own requests (`.link` refs), which the cache's link
     // node keeps, so an edit build can tell whether the inputs need more.
     std.debug.assert(emit.owner == .link);
-    for (names.items) |name| _ = try emit.requestCompilerRtExport(name);
+    for (names.items) |name| if (!emit.libcFirst(name)) {
+        _ = try emit.requestCompilerRtExport(name);
+    };
 }
 
 /// Link inputs: ELF objects and archives on x86_64-linux, Mach-O ones on
@@ -988,7 +994,7 @@ const InputResolver = struct {
     /// compiler_rt's, and the bounds of the init and fini arrays.
     pub fn rtExport(r: InputResolver, name: []const u8) !?SymbolKey {
         if (arrayBound(name)) |key| return key;
-        if (Zcu.compilerRtExport(name) == null) return null;
+        if (Zcu.compilerRtExport(name) == null or r.emit.libcFirst(name)) return null;
         return r.emit.rtExport(name);
     }
 
@@ -1910,8 +1916,9 @@ pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
     // A shared object links compiler_rt in, as upstream's do.
     if (emit.obj and !emit.shared) return try emit.useImport(name, .{});
     // compiler_rt before libc, as upstream: its `fmod` and `memcpy` stay
-    // in the executable, and only names it lacks are imported.
-    if (try emit.rtExport(name)) |key| return key;
+    // in the executable, and only names it lacks are imported; plain C's
+    // come from libc first (`libc_first`).
+    if (!emit.libcFirst(name)) if (try emit.rtExport(name)) |key| return key;
     // On aarch64-macos, then libSystem's.
     if (emit.zcu.ip.target == .aarch64_macos) return try emit.useImport(name, .{});
     if (emit.libraryDefines(name)) return try emit.useImport(name, .{});
@@ -1930,6 +1937,11 @@ fn sharedTls(emit: *const Emit, name: []const u8) bool {
 fn libraryDefines(emit: *const Emit, name: []const u8) bool {
     const g = emit.glibc orelse return false;
     return Glibc.sharedSymbol(emit.shared_libs, name) != null or g.get(name) != null;
+}
+
+/// Whether `name` resolves to glibc's before compiler_rt's (`libc_first`).
+fn libcFirst(emit: *const Emit, name: []const u8) bool {
+    return emit.libc_first and emit.libraryDefines(name);
 }
 
 /// The compiler_rt function exported as `name`, requested, or null.

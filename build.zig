@@ -1694,6 +1694,28 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         cexe_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
         test_step.dependOn(&cexe_run.step);
     }
+    // Which memcmp C only calls: glibc's (interposable) without UBSan's
+    // runtime, compiler_rt's with it, as upstream's compiler_rt archive
+    // after libc resolves only names libc lacks unless ubsan_rt pulls it.
+    {
+        const preload = b.addSystemCommand(&.{ zig, "cc", "-shared", "-fPIC" });
+        preload.addFileArg(b.path("test/link_input/plain_c_preload.c"));
+        const preload_so = preload.addPrefixedOutputFileArg("-o", "libplain_preload.so");
+        for ([_]struct { flag: []const u8, out: []const u8 }{ .{ .flag = "-fsanitize-c", .out = "0\n" }, .{ .flag = "-fno-sanitize-c", .out = "42\n" } }) |v| {
+            const pexe = b.addRunArtifact(bs);
+            pexe.setName(b.fmt("bs build-exe -lc {s} plain_c.c", .{v.flag}));
+            pexe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu", v.flag });
+            pexe.addFileArg(b.path("test/link_input/plain_c.c"));
+            pexe.setEnvironmentVariable("BS_ZIG", zig);
+            const r = b.addSystemCommand(&.{ "sh", "-c", "LD_PRELOAD=\"$1\" exec \"$2\"", "sh" });
+            r.setName(b.fmt("run plain_c ({s}) with a preloaded memcmp", .{v.flag}));
+            r.addFileArg(preload_so);
+            r.addFileArg(pexe.addPrefixedOutputFileArg("-femit-bin=", "plain_c"));
+            r.addCheck(.{ .expect_stdout_exact = v.out });
+            r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+            test_step.dependOn(&r.step);
+        }
+    }
     // A Zig executable calling libc_nonshared.a's functions: atexit, and
     // stat and fstatat, which glibc before 2.33 has only there.
     {

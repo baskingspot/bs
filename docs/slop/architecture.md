@@ -7547,8 +7547,20 @@ libraries as inputs. To be agreed with that thread.
   `__stack_chk_fail` and the std functions it shares with the program
   reach std's default handler, whose I/O imports glibc functions that
   glibc before 2.16 lacks (`accept4`, `sendmmsg`), and the program
-  grows from 275 KB to 2.4 MB. Without `-lc` it stays `[unsupported]`,
-  since C has no `_start` of its own.
+  grows from 275 KB to 2.4 MB.
+  Such plain C (`main.plainC`) against glibc also links the way
+  upstream's lld link does, where compiler_rt is an archive of one
+  member after `-lc` and no ubsan_rt is linked: names glibc defines
+  (`memset`, `memcpy`, `strlen`, libm's functions) are imported before
+  compiler_rt's (`Emit.libc_first`), and neither ubsan_rt nor ssp is a
+  root, so `__stack_chk_fail` is glibc's ("*** stack smashing detected
+  ***") except before glibc 2.4, which lacks it. One difference is
+  deliberate: when a name glibc lacks (`__udivti3`, or
+  `__stack_chk_fail` before 2.4) pulls upstream's member in, all of
+  its functions override glibc's, and bs keeps importing glibc's,
+  which are faster than bs's compiler_rt (memset 25 GB/s against 2.5,
+  2026-11-05). Without `-lc` it stays `[unsupported]`, since C has no
+  `_start` of its own.
 - **Clang's arguments** (`CSource.zig`) are upstream's `addCCArgs` for
   bs's target and the baseline CPU, in Debug: the triple from the glibc
   version (native: detected, with or without `-lc`, as upstream's native
