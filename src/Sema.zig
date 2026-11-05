@@ -16258,6 +16258,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
                 if (block.is_comptime) if (try sema.indexedOnePossibleValue(ty)) |v| return .fromInterned(v);
                 try sema.requireRuntime(block, src);
                 try sema.runtimeElemAccess(block, src, p.child);
+                if (sema.escapesComptimeVar(lhs)) try sema.validateRuntimeValue(block, src, lhs);
                 return sema.addBinOp(block, .slice_elem_val, lhs, index);
             },
             // As upstream, a pointer to a vector or tuple indexes through
@@ -16300,6 +16301,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
             if (!Type.hasRuntimeBits(ip, a.child) and !Type.isComptimeOnly(ip, a.child)) if (try sema.onePossibleValue(a.child)) |v| return .fromInterned(v);
             try sema.requireRuntime(block, src);
             try sema.runtimeElemAccess(block, src, a.child);
+            if (sema.escapesComptimeVar(lhs)) try sema.validateRuntimeValue(block, src, lhs);
             return sema.addBinOp(block, .array_elem_val, lhs, index);
         },
         .vector_type => |v| {
