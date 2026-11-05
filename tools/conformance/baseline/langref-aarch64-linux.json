@@ -297,9 +297,9 @@
   "libc_export_entry_point": {
    "kind": "exe=succeed",
    "outcome": "built",
-   "exit": 255,
+   "exit": 0,
    "stdout": "",
-   "stderr": "qemu-aarch64-static: Could not open '/lib/ld-linux-aarch64.so.1': No such file or directory\n",
+   "stderr": "Hello! argv[0] is 'libc_export_entry_point'\n",
    "panic": null
   },
   "math": {
@@ -1746,8 +1746,8 @@
   "test_variadic_function": {
    "kind": "test",
    "outcome": "built",
-   "exit": 255,
-   "summary": null,
+   "exit": 0,
+   "summary": "All 1 tests passed.",
    "panic": null
   },
   "test_vector": {

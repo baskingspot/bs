@@ -1867,6 +1867,10 @@ def run_one_langref(compiler, path, cfg, args, workdir):
     shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True)
     argv = langref_argv(compiler, path, kind, opts, name, cfg)
+    # Under the emulator, an example linking glibc needs the target's
+    # glibc (.agents/setup installs it); without it the run says nothing.
+    if exec_prefix and "link_libc" in opts and not Path(cfg.get("emulated_glibc", ""), "lib").is_dir():
+        argv = None
     if argv is None:
         r["outcome"] = "skip"
         return name, r
