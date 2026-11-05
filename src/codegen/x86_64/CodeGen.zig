@@ -1459,6 +1459,7 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         // A frame address takes no register and emits nothing; nor does
         // an address its users fold into their addressing.
         .struct_field_ptr, .ptr_elem_ptr, .ptr_add => if (cg.frameFoldable(inst.toRef()) or cg.addrFoldable(inst)) return false,
+        .slice_ptr, .slice_len => if (cg.pairFoldable(inst)) return false,
         else => {},
     }
     const class: RegClass = if (cg.has_asm) .none else cg.wantsReg(inst);
@@ -3067,8 +3068,12 @@ const no_base = std.math.maxInt(u32);
 /// or `ptr_add`, or a copy of a by-reference argument, `ref_alias`) is an
 /// offset from.
 fn addrOperand(cg: *CodeGen, inst: Inst.Index) Ref {
-    if (cg.ir.instructions.items(.tag)[@backingInt(inst)] == .alloc) return Inst.Index.toRef(@fromBackingInt(cg.copy_of.get(@backingInt(inst)).?));
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .alloc => return Inst.Index.toRef(@fromBackingInt(cg.copy_of.get(@backingInt(inst)).?)),
+        .slice_ptr, .slice_len => return data.ty_op.operand,
+        else => {},
+    }
     // `StructField.operand` and `Bin.lhs` come first.
     return @fromBackingInt(cg.ir.extra[data.ty_pl.payload]);
 }
@@ -3102,6 +3107,17 @@ fn addrFoldable(cg: *CodeGen, inst: Inst.Index) bool {
     const root = if (cg.addr_base[b] != no_base) cg.addr_base[b] else b;
     if (cg.emit.ssa.live.items(.reg)[root] != Ssa.want_reg) return false;
     cg.addr_base[@backingInt(inst)] = root;
+    return true;
+}
+
+/// Whether `slice_ptr` or `slice_len` `inst` of a slice that wants two
+/// registers is folded into that slice's register: it takes none, and its
+/// users read the slice's (`lengthenIntervals`, as for `addrFoldable`).
+fn pairFoldable(cg: *CodeGen, inst: Inst.Index) bool {
+    if (cg.has_asm) return false;
+    const b = cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op.operand.toIndex() orelse return false;
+    if (cg.emit.ssa.live.items(.reg)[@backingInt(b)] != Ssa.want_pair) return false;
+    cg.addr_base[@backingInt(inst)] = @backingInt(b);
     return true;
 }
 
@@ -4438,7 +4454,15 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.copyMem(dst, Mem.at(.r10, 0), size);
         },
         .slice_ptr, .slice_len => {
-            if (cg.pairOf(data.ty_op.operand)) |p| return cg.setResult(inst, data.ty_op.ty, if (tag == .slice_len) p.hi else p.lo);
+            if (cg.pairOf(data.ty_op.operand)) |p| {
+                const r = if (tag == .slice_len) p.hi else p.lo;
+                // Folded: the slice's register itself (`pairFoldable`).
+                if (cg.addr_base[@backingInt(inst)] != no_base and cg.homes[@backingInt(inst)] == .none) {
+                    cg.homes[@backingInt(inst)] = .{ .reg = r };
+                    return;
+                }
+                return cg.setResult(inst, data.ty_op.ty, r);
+            }
             const src = try cg.memOf(data.ty_op.operand);
             const d = cg.destReg(inst);
             try cg.e.mov(.qword, .{ .reg = d }, .{ .mem = offsetMem(src, if (tag == .slice_len) 8 else 0) });

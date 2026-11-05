@@ -2417,7 +2417,10 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      (`Home.reg_addr`, `addrFoldable`): its users address `[base + off]`,
      and the base's interval grows over theirs (and crosses what they
      cross) right after liveness; if the base gets no register, the
-     pointer is computed as before.
+     pointer is computed as before. A slice's `.ptr` or `.len` of a slice
+     that wants two registers is that register the same way
+     (`pairFoldable`): no move into a register of its own before each
+     bounds check.
    - Initializers and results (`planCopies`, before liveness): a `*const`
      alloc stored to once with a value that always lives in memory is that
      memory when the value is in place first (an argument in the incoming
