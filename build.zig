@@ -782,6 +782,7 @@ fn isThreadChecked(file: []const u8) bool {
 ///
 ///   // error
 ///   // args: --error-format=json      (optional: more arguments)
+///                                    (with `-Mroot=<file>`, in place of the file)
 ///   // <expected stderr line>
 ///   // ...
 ///
@@ -837,7 +838,10 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         run.setCwd(b.path("test/diag"));
         // An explicit target, so the expected diagnostics print on a Mac
         // too, where native aarch64-macos is refused until its CodeGen exists.
-        run.addArgs(&.{ "build-exe", "-target", "x86_64-linux", "-fno-emit-bin", file });
+        run.addArgs(&.{ "build-exe", "-target", "x86_64-linux", "-fno-emit-bin" });
+        // Arguments that give the root module (`--dep a -Mroot=<file>`)
+        // name the file themselves.
+        if (std.mem.indexOf(u8, args, "-Mroot=") == null) run.addArg(file);
         var arg_it = std.mem.tokenizeScalar(u8, args, ' ');
         while (arg_it.next()) |a| run.addArg(a);
         run.addFileInput(b.path(src_path));

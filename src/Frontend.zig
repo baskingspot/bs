@@ -1136,6 +1136,9 @@ const Job = struct {
     /// directory: Sema reads them, but as upstream, one that cannot be
     /// read is an error even if the import is never analyzed.
     zon_imports: [][]const u8 = &.{},
+    /// The job that imports it first, breadth-first, set when files are
+    /// numbered: upstream's reference for the notes of a file-level error.
+    importer: ?*Job = null,
     /// New stat index entry for the file's cache directory.
     index_update: ?IndexUpdate = null,
     index: ?File.Index = null,
@@ -1524,9 +1527,11 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
         for (job.imports) |imp| {
             if (imp.index != null) continue;
             imp.index = @fromBackingInt(@intCast(base + order.items.len));
+            imp.importer = job;
             order.appendAssumeCapacity(imp);
         }
     }
+    if (try fe.checkModuleOverlap(errors, root_jobs[0..roots.len], order.items)) return false;
     if (any_missing) return false;
     var existing: u32 = 0;
     var jit = l.jobs.valueIterator();
@@ -1798,6 +1803,84 @@ fn resolveImport(fe: *const Frontend, f: *const File, name: []const u8) !?Import
     if (fe.familyModule(f.module, name)) |m| return .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) };
     // ZON files are Sema's to read (`collectZonImports`).
     return null;
+}
+
+/// As upstream, a file belongs to one module: if two modules reach the same
+/// file (`order` is breadth-first, as upstream's traversal), reports the
+/// first such file, with notes on how each module reaches it, and returns
+/// true. Only the main family's modules count: the fuzzer's is upstream's
+/// separate compilation.
+fn checkModuleOverlap(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, root_jobs: []const *Job, order: []const *Job) !bool {
+    var arena_state: std.heap.ArenaAllocator = .init(fe.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var seen: std.StringHashMapUnmanaged(*Job) = .empty;
+    const job = for (order) |job| {
+        if (job.missing != null) continue;
+        const m = fe.module(job.file.module);
+        if (m.std_mod != .std) continue;
+        const path = try std.fs.path.resolve(arena, &.{ m.abs_root_dir orelse m.root_dir, job.file.sub_path });
+        const gop = try seen.getOrPut(arena, path);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = job;
+            continue;
+        }
+        break [2]*Job{ gop.value_ptr.*, job };
+    } else return false;
+    var notes: std.ArrayList(std.zig.ErrorBundle.MessageIndex) = .empty;
+    try notes.append(arena, try errors.addErrorMessage(.{
+        .msg = try errors.addString("files must belong to only one module"),
+        .src_loc = try wholeFileLoc(errors, job[0].file.display_path),
+    }));
+    for (job) |j| {
+        // Upstream's `explainWhyFileIsInModule`: up the importers to the
+        // root of the module.
+        if (fe.isModuleRoot(j, root_jobs)) {
+            try notes.append(arena, try errors.addErrorMessage(.{
+                .msg = try errors.printString("file is the root of module '{s}'", .{fe.overlapName(j.file.module)}),
+                .src_loc = try wholeFileLoc(errors, j.file.display_path),
+            }));
+            continue;
+        }
+        var cur = j;
+        var thing: []const u8 = "file";
+        while (cur.importer) |imp| : (thing = "which") {
+            const loc = try fe.tokenLoc(errors, imp, try fe.importToken(imp, cur.file.module, cur.file.sub_path, false));
+            if (fe.isModuleRoot(imp, root_jobs)) {
+                try notes.append(arena, try errors.addErrorMessage(.{
+                    .msg = try errors.printString("{s} is imported here by the root of module '{s}'", .{ thing, fe.overlapName(imp.file.module) }),
+                    .src_loc = loc,
+                }));
+                break;
+            }
+            try notes.append(arena, try errors.addErrorMessage(.{
+                .msg = try errors.printString("{s} is imported here", .{thing}),
+                .src_loc = loc,
+            }));
+            cur = imp;
+        }
+    }
+    try errors.addRootErrorMessage(.{
+        .msg = try errors.printString("file exists in modules '{s}' and '{s}'", .{ fe.overlapName(job[0].file.module), fe.overlapName(job[1].file.module) }),
+        .src_loc = try wholeFileLoc(errors, job[0].file.display_path),
+        .notes_len = @intCast(notes.items.len),
+    });
+    const notes_start = try errors.reserveNotes(@intCast(notes.items.len));
+    @memcpy(errors.extra.items[notes_start..][0..notes.items.len], @as([]const u32, @ptrCast(notes.items)));
+    return true;
+}
+
+/// Whether `job` is the root file of its module, or one of the files a
+/// load starts from.
+fn isModuleRoot(fe: *const Frontend, job: *const Job, root_jobs: []const *Job) bool {
+    return std.mem.indexOfScalar(*const Job, root_jobs, job) != null or
+        std.mem.eql(u8, job.file.sub_path, fe.module(job.file.module).root_file);
+}
+
+/// A module's name in `checkModuleOverlap`'s error: upstream's fully
+/// qualified name, `root` for the root module.
+fn overlapName(fe: *const Frontend, m: Module.Index) []const u8 {
+    return if (m == .root) "root" else fe.displayName(m);
 }
 
 /// Reports `job`, which `importer` imports, as a file that could not be
