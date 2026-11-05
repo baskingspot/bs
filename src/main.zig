@@ -15,6 +15,7 @@ const cache = @import("cache.zig");
 const Builtin = @import("Builtin.zig");
 const Archive = @import("link/Archive.zig");
 const ElfMerge = @import("link/ElfMerge.zig");
+const MachOMerge = @import("link/MachOMerge.zig");
 const ElfInput = @import("link/ElfInput.zig");
 const MachOInput = @import("link/MachOInput.zig");
 const Tbd = @import("link/Tbd.zig");
@@ -1052,15 +1053,27 @@ fn readInput(init: std.process.Init, path: []const u8) ![]u8 {
 
 /// Writes the object merging the Zig object `zig_obj` (if any), the object
 /// inputs and the C objects, in that order, as upstream's `build-obj`
-/// does (link/ElfMerge.zig). Returns false after reporting an error.
+/// does (link/ElfMerge.zig, link/MachOMerge.zig; on aarch64-macos a
+/// single input is copied as it is, debug info included, as upstream
+/// copies it). Returns false after reporting an error.
 fn writeMerged(init: std.process.Init, bin_path: []const u8, zig_obj: ?[]const u8, link_inputs: []const []const u8, c_objects: []const CSource.Object, target: InternPool.Target) !bool {
     const arena = init.arena.allocator();
     var inputs: std.ArrayList(ElfMerge.Input) = .empty;
     if (zig_obj) |bytes| try inputs.append(arena, .{ .path = bin_path, .bytes = bytes });
     for (link_inputs) |path| try inputs.append(arena, .{ .path = path, .bytes = try readInput(init, path) });
     for (c_objects) |o| try inputs.append(arena, .{ .path = o.path, .bytes = o.bytes });
+    if (target == .aarch64_macos and inputs.items.len == 1) {
+        Io.Dir.cwd().writeFile(init.io, .{ .sub_path = bin_path, .data = inputs.items[0].bytes }) catch |err| {
+            std.log.err("unable to write '{s}': {t}", .{ bin_path, err });
+            return false;
+        };
+        return true;
+    }
     var why: []const u8 = "";
-    const merged = ElfMerge.merge(init.gpa, arena, inputs.items, if (target.arch() == .aarch64) .aarch64 else .x86_64, &why) catch |err| switch (err) {
+    const merged = (if (target == .aarch64_macos)
+        MachOMerge.merge(init.gpa, arena, inputs.items, &why)
+    else
+        ElfMerge.merge(init.gpa, arena, inputs.items, if (target.arch() == .aarch64) .aarch64 else .x86_64, &why)) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => {
             std.log.err("{s}", .{why});
@@ -2470,9 +2483,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // against libSystem, which is macOS's libc (`-lc` asks for nothing
     // more), with C sources, Mach-O objects and archives.
     if (opts.bs_target == .aarch64_macos) {
-        if (command.isObj() and (c_files.items.len != 0 or link_inputs.items.len != 0))
-            setUnsupported(&opts, "bs does not merge C sources or objects into aarch64-macos objects yet; build this step with upstream zig", arena, .{})
-        else if (opts.fuzz)
+        if (opts.fuzz)
             setUnsupported(&opts, "bs does not instrument code for fuzzing on aarch64-macos yet ('-ffuzz'); build this step with upstream zig", arena, .{});
         opts.link_libc = false;
     } else if (opts.bs_target == .aarch64_linux) {
@@ -2574,7 +2585,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // As upstream, an object or a static library links nothing: it leaves
     // archive and shared library inputs out (`-l` names are still found).
     // A static library holds object inputs as members after its own
-    // object, an object merges them (`ElfMerge`), and a shared library
+    // object, an object merges them (`ElfMerge`, `MachOMerge`), and a shared library
     // links both, as an executable does.
     if (command.isObj() or command == .build_lib) {
         // As upstream's `Config.resolve`, a library that links a shared
@@ -3051,6 +3062,7 @@ test {
     _ = @import("codegen/x86_64/CodeGen.zig");
     _ = @import("link/MachO.zig");
     _ = @import("link/MachOInput.zig");
+    _ = @import("link/MachOMerge.zig");
     _ = @import("link/MachOObject.zig");
     _ = @import("link/Tbd.zig");
     _ = @import("codegen/aarch64/Encoder.zig");

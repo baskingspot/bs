@@ -4900,8 +4900,8 @@ The other direction, bs's own relocatable output, is new:
   line's, then the implicit libraries' in first-use order (upstream
   sorts), and libSystem's current version stays 1.0.0.
   `-weak_framework` is refused.
-Still refused on aarch64-macos: `build-obj` that would merge C sources
-or objects into its output, and `-lc++`.
+`build-obj` with C sources or objects merges them (`MachOMerge`, see
+"Relocatable links"), and `-lc++` links libc++ and libc++abi.
 
 ### compiler_rt (decided 2026-11-02)
 
@@ -8259,6 +8259,30 @@ libraries as inputs. To be agreed with that thread.
   C++ COMDATs and exceptions, and bs's) and keeps C and Zig lines in
   traces. The cache relinks the Zig object and merges again
   (`Incremental.linkFrom`; test/obj/cache.sh).
+- **Mach-O relocatable links** (2026-11-05, for zine's 400+ C-only
+  tree-sitter `build-obj` steps; `link/MachOMerge.zig`), as upstream's
+  `MachO/relocatable.zig`: a single input (one C source, no Zig code) is
+  copied as it is, debug info included, as upstream copies it, since
+  merging drops `__DWARF`. Several are merged as ElfMerge merges them:
+  sections by segment and section name in input order at their
+  alignment, zero-fill last, symbols renumbered (locals, then the
+  defined globals and the undefined and COMMON ones, each by name, as
+  LC_DYSYMTAB groups them; the same rules for duplicates), relocations
+  moved and renumbered in their order so ADDEND and SUBTRACTOR pairs
+  stay together. A section-relative UNSIGNED (`__compact_unwind`'s
+  function field) names its target by address, so its field moves with
+  the target section; Clang emits no other section-relative arm64
+  relocation. `__compact_unwind` and `__eh_frame` are concatenated,
+  which ld64 and `MachOInput` read as they read the inputs' (upstream
+  regenerates both); `__eh_frame` pieces must need no padding.
+  S_ATTR_DEBUG sections other than `__compact_unwind` are dropped, as
+  upstream drops them: Mach-O DWARF has no relocations for its offsets
+  into its own sections, so it cannot be concatenated. The inputs'
+  `__objc_imageinfo` merge into one (`MachOInput.mergeImageInfo`).
+  LC_BUILD_VERSION and LC_LINKER_OPTIONs are kept; linker optimization
+  hints and data-in-code, which are hints, are dropped;
+  MH_SUBSECTIONS_VIA_SYMBOLS only if every input has it (bs's own
+  objects do not set it).
 - **Shared libraries with inputs** (`build-lib -dynamic` with object or
   archive inputs or C sources, built 2026-11-04), as upstream's: the
   objects are converted and linked as an executable's are

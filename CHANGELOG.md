@@ -8,6 +8,7 @@ Changes a user of bs notices, newest first, in the
 ### Added
 
 - LLVM IR sources, `.ll` and `.bc`, compile through upstream's Clang as upstream compiles them (no preprocessor, no depfile), in `bs build-exe`, `build-obj`, `build-lib`, `test` and `bs build` steps. They were `[unsupported]`; evm.zig's native precompiles pass mcl's `.ll` files.
+- On aarch64-macos, `bs build-obj` with C sources or object inputs writes one relocatable Mach-O object of them, as upstream does (a single C object is copied as it is), so zine's tree-sitter steps build.
 - `--force_undefined <name>` (`forceUndefinedSymbol` in build.zig) makes the link treat the name as referenced, so the archive member that defines it is linked, as lld's and ld64's `-u` do. On aarch64-macos the name is a Mach-O symbol name (`_keep_me` for C's `keep_me`), and one that nothing defines is an `undefined-symbol` error, as with upstream.
 - Binary releases for x86_64 Linux, aarch64 Linux, and Apple Silicon macOS, on GitHub and in the Homebrew tap (`brew install --cask baskingspot/tap/bs`); mise installs them as `github:baskingspot/bs`.
 - `bs cc`, `bs c++`, `bs ar` and `bs ranlib` run upstream zig's with the same arguments, so build scripts that run them through `b.graph.zig_exe` under `bs build` work, such as ghostty's `zig ar -M` that combines its archives. They were `[unsupported]` (`cc`, `c++`) or unknown commands.

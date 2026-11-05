@@ -56,13 +56,13 @@ pub const Sym = extern struct {
     n_desc: u16,
     n_value: u64 align(4),
 
-    fn kind(s: Sym) u8 {
+    pub fn kind(s: Sym) u8 {
         return s.n_type & macho.N_TYPE;
     }
-    fn isExternal(s: Sym) bool {
+    pub fn isExternal(s: Sym) bool {
         return s.n_type & macho.N_EXT != 0;
     }
-    fn isStab(s: Sym) bool {
+    pub fn isStab(s: Sym) bool {
         return s.n_type & macho.N_STAB != 0;
     }
 };
@@ -71,7 +71,7 @@ const n_weak_def: u16 = 0x80;
 const n_weak_ref: u16 = 0x40;
 
 /// `relocation_info`, read as plain fields.
-const Reloc = struct {
+pub const Reloc = struct {
     address: u32,
     symbolnum: u24,
     pcrel: bool,
@@ -79,7 +79,7 @@ const Reloc = struct {
     external: bool,
     type: u4,
 
-    fn read(bytes: *const [8]u8) Reloc {
+    pub fn read(bytes: *const [8]u8) Reloc {
         const a = std.mem.readInt(u32, bytes[0..4], .little);
         const w = std.mem.readInt(u32, bytes[4..8], .little);
         return .{
@@ -136,7 +136,21 @@ fn sectionType(s: macho.section_64) u8 {
     return @truncate(s.flags & macho.SECTION_TYPE);
 }
 
-fn isZeroFill(s: macho.section_64) bool {
+/// Merges an object's `__objc_imageinfo` (version, flags) into `info`,
+/// as ld64 does: a class-properties or signed-class_ro flag only if every
+/// object has it, the Swift version bits from the first object that has
+/// them, the rest from the first object.
+pub fn mergeImageInfo(info: *?[2]u32, bytes: *const [8]u8) void {
+    const next: [2]u32 = .{ std.mem.readInt(u32, bytes[0..4], .little), std.mem.readInt(u32, bytes[4..8], .little) };
+    const all_of: u32 = 1 << 4 | 1 << 6;
+    const swift: u32 = 0xffff_ff00;
+    if (info.*) |*i| {
+        i[1] &= ~all_of | next[1];
+        if (i[1] & swift == 0) i[1] |= next[1] & swift;
+    } else info.* = next;
+}
+
+pub fn isZeroFill(s: macho.section_64) bool {
     return switch (sectionType(s)) {
         macho.S_ZEROFILL, macho.S_GB_ZEROFILL, macho.S_THREAD_LOCAL_ZEROFILL => true,
         else => false,
@@ -752,20 +766,11 @@ fn Converter(comptime Ctx: type) type {
             }
         }
 
-        /// Merges object `c.o`'s `__objc_imageinfo` into `image_info`, as
-        /// ld64 does: a class-properties or signed-class_ro flag only if
-        /// every object has it, the Swift version bits from the first
-        /// object that has them, the rest from the first object.
+        /// Merges object `c.o`'s `__objc_imageinfo` into `image_info`.
         fn imageInfo(c: *Self, index: u32) !void {
             const bytes = c.o.sectionBytes(index);
             if (bytes.len != 8 or c.o.sects[index].nreloc != 0) return c.fail("{s}: section '{s}' is not 8 bytes of image info", .{ c.o.path, c.sectName(index) });
-            const next: [2]u32 = .{ std.mem.readInt(u32, bytes[0..4], .little), std.mem.readInt(u32, bytes[4..8], .little) };
-            const all_of: u32 = 1 << 4 | 1 << 6;
-            const swift: u32 = 0xffff_ff00;
-            if (c.image_info) |*info| {
-                info[1] &= ~all_of | next[1];
-                if (info[1] & swift == 0) info[1] |= next[1] & swift;
-            } else c.image_info = next;
+            mergeImageInfo(&c.image_info, bytes[0..8]);
         }
 
         /// The largest power of two, up to the section's alignment, that
