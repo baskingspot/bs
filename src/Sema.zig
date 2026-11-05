@@ -11045,8 +11045,9 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
         };
         return err;
     }
-    const lhs = try sema.coerce(block, ty, uncasted_lhs, src);
-    const rhs = try sema.coerce(block, ty, uncasted_rhs, src);
+    // A coercion fails at its operand, as upstream.
+    const lhs = try sema.coerce(block, ty, uncasted_lhs, src.operandSrc(0));
+    const rhs = try sema.coerce(block, ty, uncasted_rhs, src.operandSrc(1));
     const signed = !is_bool and (class == .comptime_int or Type.intInfo(ip, ty).signedness == .signed);
 
     // Signed division and remainder need an explicit rounding mode.
@@ -11883,8 +11884,8 @@ fn analyzeFloatArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Ta
         .add, .add_unsafe, .sub, .mul, .div, .div_trunc, .div_floor, .div_ceil, .div_exact, .rem, .mod, .mod_rem, .min, .max => {},
         else => return sema.fail(block, src, "invalid operands to binary expression: '{t}' and '{t}'", .{ Type.class(ip, lt), Type.class(ip, rt) }),
     }
-    const lhs = try sema.coerce(block, ty, uncasted_lhs, src);
-    const rhs = try sema.coerce(block, ty, uncasted_rhs, src);
+    const lhs = try sema.coerce(block, ty, uncasted_lhs, src.operandSrc(0));
+    const rhs = try sema.coerce(block, ty, uncasted_rhs, src.operandSrc(1));
     const lv = sema.resolveValue(lhs);
     const rv = sema.resolveValue(rhs);
 
