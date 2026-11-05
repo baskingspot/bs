@@ -77,6 +77,8 @@ candidates: std.ArrayList(u32) = .empty,
 var_loads: std.ArrayList(u32) = .empty,
 /// The innermost loop around each of `var_loads`.
 var_load_loops: std.ArrayList(u32) = .empty,
+/// Scratch for `deadFills`.
+fills: Fills = .{},
 
 pub const no_loop = std.math.maxInt(u32);
 
@@ -250,6 +252,7 @@ pub fn deinit(f: *Func, gpa: Allocator) void {
     f.candidates.deinit(gpa);
     f.var_loads.deinit(gpa);
     f.var_load_loops.deinit(gpa);
+    f.fills.deinit(gpa);
 }
 
 pub fn blockInsts(f: *const Func, block: Block.Index) []const Inst.Index {
@@ -679,6 +682,7 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
     const fwd = live.items(.fwd);
     @memset(fwd, no_tie);
     f.pairs.clearRetainingCapacity();
+    try f.deadFills(gpa, ir, ip);
     {
         const Uses = struct {
             uses: []u32,
@@ -779,7 +783,7 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                     try f.var_loads.append(gpa, i);
                     try f.var_load_loops.append(gpa, f.block_loop.items[@backingInt(block)]);
                 },
-                .store => {
+                .store => if (fate[i] != .dead) {
                     const bin = datas[i].bin_op;
                     const v = @backingInt(bin.lhs.toIndex() orelse continue);
                     if (count[v] != no_tie and bin.rhs != bin.lhs) count[v] -%= 1;
@@ -1058,6 +1062,747 @@ const SharedReads = struct {
         if (l != c.tie) c.other = true;
     }
 };
+
+/// The most allocs `deadFills` considers in one function.
+const max_fill_allocs = 16;
+/// The most sweeps its dataflow takes before it keeps every fill.
+const max_fill_sweeps = 16;
+
+/// Scratch for `deadFills`, reused for the next function.
+pub const Fills = struct {
+    allocs: std.ArrayList(FillAlloc) = .empty,
+    /// Per IR instruction: the candidate alloc a pointer points into, and
+    /// where (`FillPtr.none` for any other, which every entry is again
+    /// once `deadFills` returns).
+    ptrs: std.ArrayList(FillPtr) = .empty,
+    /// The pointers into candidates (`FillPtr.slot`), and how many of
+    /// their uses `deadFills` followed: a pointer with another use
+    /// escapes.
+    family: std.ArrayList(u32) = .empty,
+    seen: std.ArrayList(u32) = .empty,
+    /// The candidates' reads and writes in layout order, and per block its
+    /// range of them.
+    events: std.ArrayList(FillEvent) = .empty,
+    spans: std.ArrayList([2]u32) = .empty,
+    /// What `for` loops write (`loopWrites`), as writes at the start of
+    /// the blocks their exit branches go to.
+    pending: std.ArrayList(Pending) = .empty,
+    /// Per block and candidate (`ok[block * n + c]`): the chunks that every
+    /// path from the block's start writes before it reads them.
+    ok: std.ArrayList(u64) = .empty,
+
+    fn deinit(s: *Fills, gpa: Allocator) void {
+        s.allocs.deinit(gpa);
+        s.ptrs.deinit(gpa);
+        s.family.deinit(gpa);
+        s.seen.deinit(gpa);
+        s.events.deinit(gpa);
+        s.spans.deinit(gpa);
+        s.pending.deinit(gpa);
+        s.ok.deinit(gpa);
+    }
+
+    const Pending = struct { block: u32, event: FillEvent };
+
+    /// The pointer `ref` is, if it points into a candidate; counts the
+    /// use.
+    fn ptrOf(s: *Fills, ref: Inst.Ref) ?FillPtr {
+        const i = ref.toIndex() orelse return null;
+        const p = s.ptrs.items[@backingInt(i)];
+        if (p.cand == FillPtr.none.cand) return null;
+        s.seen.items[p.slot] += 1;
+        return p;
+    }
+
+    /// Records `p` as the pointer instruction `inst` computes.
+    fn derive(s: *Fills, gpa: Allocator, inst: u32, p: FillPtr) Allocator.Error!void {
+        var q = p;
+        q.slot = @intCast(s.family.items.len);
+        try s.family.append(gpa, inst);
+        try s.seen.append(gpa, 0);
+        s.ptrs.items[inst] = q;
+    }
+
+    fn add(s: *Fills, gpa: Allocator, p: FillPtr, kind: FillEvent.Kind, mask: u64, inst: Inst.Index) Allocator.Error!void {
+        if (mask == 0) return;
+        try s.events.append(gpa, .{ .mask = mask, .cover = mask, .inst = @backingInt(inst), .cand = p.cand, .kind = kind });
+    }
+};
+
+/// An alloc a fill stores into. Its bytes are tracked in up to 64 chunks
+/// of `chunk` bytes each.
+const FillAlloc = struct {
+    alloc: u32,
+    size: u64,
+    chunk: u64,
+    escaped: bool,
+
+    fn bits(lo: u64, hi: u64) u64 {
+        if (hi <= lo) return 0;
+        const ones: u64 = if (hi - lo == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(hi - lo)) - 1;
+        return ones << @intCast(lo);
+    }
+
+    /// The chunks that lie wholly inside bytes `lo..hi`.
+    fn cover(a: FillAlloc, lo: u64, hi_in: u64) u64 {
+        const hi = @min(hi_in, a.size);
+        if (lo >= hi) return 0;
+        const end = if (hi == a.size) std.math.divCeil(u64, a.size, a.chunk) catch unreachable else hi / a.chunk;
+        return bits(std.math.divCeil(u64, lo, a.chunk) catch unreachable, end);
+    }
+
+    /// The chunks that bytes `lo..hi` touch.
+    fn touch(a: FillAlloc, lo: u64, hi_in: u64) u64 {
+        const hi = @min(hi_in, a.size);
+        if (lo >= hi) return 0;
+        return bits(lo / a.chunk, std.math.divCeil(u64, hi, a.chunk) catch unreachable);
+    }
+
+    fn all(a: FillAlloc) u64 {
+        return a.touch(0, a.size);
+    }
+
+    /// The chunks a store of a `ty` at `off` surely writes (`write`), or
+    /// that a load of one may read: the bytes of its value, not its
+    /// padding. Unknown layouts write nothing and read everything.
+    fn typeMask(a: FillAlloc, ip: *const InternPool, ty: InternPool.Index, off: u64, comptime write: bool, budget: *u32) u64 {
+        const size = Type.abiSize(ip, ty);
+        if (size == 0) return 0;
+        const full = if (write) a.cover(off, off + size) else a.touch(off, off + size);
+        if (budget.* == 0) return if (write) 0 else full;
+        budget.* -= 1;
+        switch (Type.class(ip, ty)) {
+            .@"struct" => if (!Type.isPacked(ip, ty)) {
+                var m: u64 = 0;
+                const info = ip.structInfo(ty);
+                for (info.field_types, 0..) |ft, i| {
+                    if (info.fieldIsComptime(i) or !Type.hasRuntimeBits(ip, ft)) continue;
+                    m |= a.typeMask(ip, ft, off + info.field_offsets[i], write, budget);
+                }
+                return m;
+            } else if (write) {
+                return a.cover(off, off + (@as(u64, Type.intInfo(ip, ip.structInfo(ty).tag_type).bits) + 7) / 8);
+            },
+            .tuple => {
+                var m: u64 = 0;
+                const t = ip.keyPayload(.tuple_type, ty);
+                for (t.types, t.values, 0..) |ft, fv, i| {
+                    if (fv != .none or !Type.hasRuntimeBits(ip, ft)) continue;
+                    m |= a.typeMask(ip, ft, off + Type.tupleLayout(ip, ty, i).field_offset, write, budget);
+                }
+                return m;
+            },
+            else => if (!write) return full,
+        }
+        // What a store surely writes of the rest.
+        return switch (Type.class(ip, ty)) {
+            .int, .@"enum", .error_set => a.cover(off, off + (@as(u64, Type.intInfo(ip, ty).bits) + 7) / 8),
+            .float => a.cover(off, off + Type.floatBits(ip, ty) / 8),
+            .bool, .pointer => full,
+            .array => blk: {
+                const arr = ip.keyPayload(.array_type, ty);
+                if (arr.len > 64) break :blk 0;
+                const es = Type.abiSize(ip, arr.child);
+                var m: u64 = 0;
+                for (0..arr.len) |i| m |= a.typeMask(ip, arr.child, off + i * es, true, budget);
+                break :blk m;
+            },
+            .vector => blk: {
+                const v = ip.keyPayload(.vector_type, ty);
+                if (v.child == .bool_type) break :blk 0;
+                const es = Type.abiSize(ip, v.child);
+                if (Type.class(ip, v.child) == .float and Type.floatBits(ip, v.child) != es * 8) break :blk 0;
+                if (Type.class(ip, v.child) == .int and Type.intInfo(ip, v.child).bits != es * 8) break :blk 0;
+                break :blk a.cover(off, off + v.len * es);
+            },
+            .optional => blk: {
+                const child = Type.childType(ip, ty);
+                if (Type.optionalReprIsPayload(ip, child)) break :blk a.typeMask(ip, child, off, true, budget);
+                const flag = Type.optionalFlagOffset(ip, ty);
+                break :blk a.typeMask(ip, child, off, true, budget) | a.cover(off + flag, off + flag + 1);
+            },
+            .error_union => blk: {
+                const l = Type.errorUnionLayout(ip, ty);
+                const payload = ip.keyPayload(.error_union_type, ty).payload_type;
+                break :blk a.cover(off + l.err_offset, off + l.err_offset + 2) | a.typeMask(ip, payload, off + l.payload_offset, true, budget);
+            },
+            else => 0,
+        };
+    }
+};
+
+/// A pointer into candidate alloc `cand`, `off` bytes in (`unknown` when
+/// not constant).
+const FillPtr = packed struct(u64) {
+    cand: u8,
+    /// Its index in `Fills.family`.
+    slot: u24 = 0,
+    off: u32,
+
+    const unknown = std.math.maxInt(u32);
+    const none: FillPtr = .{ .cand = 0xff, .off = 0 };
+
+    fn plus(p: FillPtr, n: ?u64) FillPtr {
+        const k = n orelse return .{ .cand = p.cand, .off = unknown };
+        if (p.off == unknown or k >= unknown - p.off) return .{ .cand = p.cand, .off = unknown };
+        return .{ .cand = p.cand, .off = @intCast(p.off + k) };
+    }
+};
+
+/// A read of the chunks `mask`, a write of them, or a fill of bytes that
+/// touch `mask` and wholly write `cover`.
+const FillEvent = struct {
+    mask: u64,
+    cover: u64,
+    inst: u32,
+    cand: u8,
+    kind: Kind,
+
+    const Kind = enum(u8) { read, write, fill };
+};
+
+/// An address: alloc `root`, plus `off` bytes, plus each term's index
+/// times its stride (innermost first).
+const FillAddr = struct {
+    root: u32,
+    off: u64,
+    terms: [3]Index = undefined,
+    n: u8 = 0,
+
+    const Index = struct { idx: Inst.Ref, stride: u64 };
+
+    fn of(ir: *const Ir, ip: *const InternPool, ptr: Inst.Ref) ?FillAddr {
+        const tags = ir.instructions.items(.tag);
+        const datas = ir.instructions.items(.data);
+        var a: FillAddr = .{ .root = undefined, .off = 0 };
+        var r = ptr;
+        while (true) {
+            const i = @backingInt(r.toIndex() orelse return null);
+            switch (tags[i]) {
+                .alloc => {
+                    a.root = i;
+                    return a;
+                },
+                .ptr_elem_ptr => {
+                    const bin = ir.extraData(Ir.Bin, datas[i].ty_pl.payload).data;
+                    const stride = Type.abiSize(ip, Type.ptrInfo(ip, datas[i].ty_pl.ty).child);
+                    if (bin.rhs.toInterned()) |k| {
+                        a.off = std.math.add(u64, a.off, std.math.mul(u64, ip.intValue(u64, k) orelse return null, stride) catch return null) catch return null;
+                    } else {
+                        if (a.n == a.terms.len) return null;
+                        a.terms[a.n] = .{ .idx = bin.rhs, .stride = stride };
+                        a.n += 1;
+                    }
+                    r = bin.lhs;
+                },
+                .struct_field_ptr => {
+                    const sf = ir.extraData(Ir.StructField, datas[i].ty_pl.payload).data;
+                    const container = Type.ptrInfo(ip, ir.typeOf(sf.operand, ip)).child;
+                    switch (ip.keyTag(container)) {
+                        .struct_type, .tuple_type => {},
+                        else => return null,
+                    }
+                    if (Type.isPacked(ip, container)) return null;
+                    a.off = std.math.add(u64, a.off, Type.fieldOffset(ip, container, sf.index)) catch return null;
+                    r = sf.operand;
+                },
+                .bitcast => {
+                    if (ip.keyTag(datas[i].ty_op.ty) != .ptr_type or Type.isSlice(ip, datas[i].ty_op.ty)) return null;
+                    r = datas[i].ty_op.operand;
+                },
+                else => return null,
+            }
+        }
+    }
+};
+
+/// Bytes `lo..hi` of `addr` (and its terms, which outer loops index).
+const FillSpan = struct { addr: FillAddr, lo: u64, hi: u64 };
+
+/// Whether a store of a `ty` writes all of its bytes: it has no padding.
+fn denseType(ip: *const InternPool, ty: InternPool.Index) bool {
+    const size = Type.abiSize(ip, ty);
+    return switch (Type.class(ip, ty)) {
+        .int, .@"enum", .error_set => @as(u64, Type.intInfo(ip, ty).bits) == size * 8,
+        .float => @as(u64, Type.floatBits(ip, ty)) == size * 8,
+        .bool, .pointer => true,
+        .array => denseType(ip, ip.keyPayload(.array_type, ty).child) and ip.keyPayload(.array_type, ty).sentinel == .none,
+        .vector => blk: {
+            const v = ip.keyPayload(.vector_type, ty);
+            break :blk v.child != .bool_type and denseType(ip, v.child) and v.len * Type.abiSize(ip, v.child) == size;
+        },
+        else => false,
+    };
+}
+
+/// What `block` `x` surely writes when control leaves it normally, if it
+/// is a `for` loop over a counter that writes one element per iteration:
+///
+///     store(c, lo)                    // `init`
+///     x = block { loop {
+///         h = load(c)
+///         block { cond_br(cmp_lt(h, hi), { ...; W; ... }, { br x }) }
+///         store(c, add_wrap(h, 1))
+///         repeat
+///     } }
+///
+/// where counter `c` has no other use, nothing before `W` in the body
+/// leaves it but by returning or not returning, `W` writes element `h` of
+/// an alloc wholly (a store of a type without padding, or an inner such
+/// loop over its bytes), and only the exit branch goes to `x`. Every
+/// iteration that reaches the increment passed `W`, so leaving through
+/// `x` follows the iterations of `lo` through `hi - 1`.
+fn loopWrites(ir: *const Ir, ip: *const InternPool, uses: []const u32, x: Inst.Index, init: Inst.Index, depth: u32) ?FillSpan {
+    if (depth > 3) return null;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const Body = struct {
+        insts: []const Inst.Index,
+        i: usize = 0,
+        fn next(b: *@This(), t: []const Inst.Tag) ?Inst.Index {
+            while (b.i < b.insts.len) {
+                const inst = b.insts[b.i];
+                b.i += 1;
+                if (t[@backingInt(inst)] != .dbg_stmt) return inst;
+            }
+            return null;
+        }
+        fn of(irr: *const Ir, inst: Inst.Index) @This() {
+            const e = irr.extraData(Ir.Block, irr.instructions.items(.data)[@backingInt(inst)].ty_pl.payload);
+            return .{ .insts = irr.bodySlice(e.end, e.data.body_len) };
+        }
+    };
+    var xb: Body = .of(ir, x);
+    const l = xb.next(tags) orelse return null;
+    if (tags[@backingInt(l)] != .loop or xb.next(tags) != null) return null;
+    var lb: Body = .of(ir, l);
+    const h = lb.next(tags) orelse return null;
+    if (tags[@backingInt(h)] != .load) return null;
+    const c = datas[@backingInt(h)].ty_op.operand.toIndex() orelse return null;
+    if (tags[@backingInt(c)] != .alloc or uses[@backingInt(c)] != 3) return null;
+    const y = lb.next(tags) orelse return null;
+    const inc = lb.next(tags) orelse return null;
+    const st = lb.next(tags) orelse return null;
+    const rep = lb.next(tags) orelse return null;
+    if (tags[@backingInt(y)] != .block or tags[@backingInt(inc)] != .add_wrap or tags[@backingInt(st)] != .store or tags[@backingInt(rep)] != .repeat) return null;
+    if (datas[@backingInt(inc)].bin_op.lhs != h.toRef() or datas[@backingInt(inc)].bin_op.rhs.toInterned() == null) return null;
+    if (ip.intValue(u64, datas[@backingInt(inc)].bin_op.rhs.toInterned().?) != 1) return null;
+    if (datas[@backingInt(st)].bin_op.lhs != c.toRef() or datas[@backingInt(st)].bin_op.rhs != inc.toRef()) return null;
+    if (tags[@backingInt(init)] != .store or datas[@backingInt(init)].bin_op.lhs != c.toRef()) return null;
+    const lo = ip.intValue(u64, datas[@backingInt(init)].bin_op.rhs.toInterned() orelse return null) orelse return null;
+
+    var yb: Body = .of(ir, y);
+    const cmp = yb.next(tags) orelse return null;
+    const cb = yb.next(tags) orelse return null;
+    if (tags[@backingInt(cmp)] != .cmp_lt or tags[@backingInt(cb)] != .cond_br or yb.next(tags) != null) return null;
+    if (datas[@backingInt(cmp)].bin_op.lhs != h.toRef() or datas[@backingInt(cb)].pl_op.operand != cmp.toRef()) return null;
+    const hi = ip.intValue(u64, datas[@backingInt(cmp)].bin_op.rhs.toInterned() orelse return null) orelse return null;
+    if (lo >= hi) return null;
+    const cx = ir.extraData(Ir.CondBr, datas[@backingInt(cb)].pl_op.payload);
+    const then_body = ir.bodySlice(cx.end, cx.data.then_body_len);
+    var eb: Body = .{ .insts = ir.bodySlice(cx.end + then_body.len, cx.data.else_body_len) };
+    const exit = eb.next(tags) orelse return null;
+    if (tags[@backingInt(exit)] != .br or datas[@backingInt(exit)].br.block_inst != x or eb.next(tags) != null) return null;
+    if (brsTo(ir, then_body, x)) return null;
+
+    // `W`, and what one iteration writes: `span` of the address with
+    // term `h` at 0.
+    var prev: ?Inst.Index = null;
+    const w: FillSpan = for (then_body) |t| {
+        const ti = @backingInt(t);
+        switch (tags[ti]) {
+            .dbg_stmt => continue,
+            .store => if (FillAddr.of(ir, ip, datas[ti].bin_op.lhs)) |a| {
+                const rhs = datas[ti].bin_op.rhs;
+                const ty = ir.typeOf(rhs, ip);
+                const undef = if (rhs.toInterned()) |v| ip.keyTag(v) == .undef else false;
+                if (!undef and a.n != 0 and a.terms[0].idx == h.toRef() and denseType(ip, ty))
+                    break .{ .addr = a, .lo = a.off, .hi = a.off + Type.abiSize(ip, ty) };
+            },
+            .block => if (prev) |p| if (loopWrites(ir, ip, uses, t, p, depth + 1)) |inner| {
+                if (inner.addr.n != 0 and inner.addr.terms[0].idx == h.toRef()) break inner;
+            },
+            else => {},
+        }
+        if (!staysInside(ir, t)) return null;
+        prev = t;
+    } else return null;
+    const stride = w.addr.terms[0].stride;
+    if (w.hi - w.lo < stride) return null;
+    var addr = w.addr;
+    std.mem.copyForwards(FillAddr.Index, addr.terms[0 .. addr.n - 1], addr.terms[1..addr.n]);
+    addr.n -= 1;
+    const first = std.math.mul(u64, lo, stride) catch return null;
+    const last = std.math.mul(u64, hi - 1, stride) catch return null;
+    return .{ .addr = addr, .lo = std.math.add(u64, w.lo, first) catch return null, .hi = std.math.add(u64, w.hi, last) catch return null };
+}
+
+/// Whether every `br` and `repeat` in the bodies `inst` holds goes to a
+/// block or loop among them: control leaves `inst` only by finishing it,
+/// by returning, or by not returning.
+fn staysInside(ir: *const Ir, inst: Inst.Index) bool {
+    var stack: [16]Inst.Index = undefined;
+    return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .br, .repeat => false,
+        .block, .loop, .cond_br, .switch_br => scanInside(ir, inst, &stack, 0),
+        else => true,
+    };
+}
+
+fn scanInside(ir: *const Ir, inst: Inst.Index, stack: *[16]Inst.Index, depth: usize) bool {
+    var d = depth;
+    switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .block, .loop => {
+            if (d == stack.len) return false;
+            stack[d] = inst;
+            d += 1;
+        },
+        else => {},
+    }
+    var ok = true;
+    forEachBody(ir, inst, struct {
+        stack: *[16]Inst.Index,
+        d: usize,
+        ok: *bool,
+        fn visit(c: @This(), irr: *const Ir, body: []const Inst.Index) void {
+            const datas = irr.instructions.items(.data);
+            for (body) |b| {
+                const target = switch (irr.instructions.items(.tag)[@backingInt(b)]) {
+                    .br => datas[@backingInt(b)].br.block_inst,
+                    .repeat => datas[@backingInt(b)].repeat.loop_inst,
+                    .block, .loop, .cond_br, .switch_br => {
+                        if (!scanInside(irr, b, c.stack, c.d)) c.ok.* = false;
+                        continue;
+                    },
+                    else => continue,
+                };
+                if (std.mem.findScalar(Inst.Index, c.stack[0..c.d], target) == null) c.ok.* = false;
+            }
+        }
+    }{ .stack = stack, .d = d, .ok = &ok });
+    return ok;
+}
+
+/// Whether a `br` in `body` (or the bodies it holds) goes to block `x`.
+fn brsTo(ir: *const Ir, body: []const Inst.Index, x: Inst.Index) bool {
+    const datas = ir.instructions.items(.data);
+    for (body) |b| switch (ir.instructions.items(.tag)[@backingInt(b)]) {
+        .br => if (datas[@backingInt(b)].br.block_inst == x) return true,
+        .block, .loop, .cond_br, .switch_br => {
+            var found = false;
+            forEachBody(ir, b, struct {
+                x: Inst.Index,
+                found: *bool,
+                fn visit(c: @This(), irr: *const Ir, inner: []const Inst.Index) void {
+                    if (brsTo(irr, inner, c.x)) c.found.* = true;
+                }
+            }{ .x = x, .found = &found });
+            if (found) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
+/// Calls `ctx.visit(ir, body)` for each body instruction `inst` holds.
+fn forEachBody(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .block, .loop => {
+            const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
+            ctx.visit(ir, ir.bodySlice(extra.end, extra.data.body_len));
+        },
+        .cond_br => {
+            const extra = ir.extraData(Ir.CondBr, data.pl_op.payload);
+            ctx.visit(ir, ir.bodySlice(extra.end, extra.data.then_body_len));
+            ctx.visit(ir, ir.bodySlice(extra.end + extra.data.then_body_len, extra.data.else_body_len));
+        },
+        .switch_br => {
+            var it = ir.switchCases(data.pl_op.payload);
+            while (it.next()) |c| ctx.visit(ir, c.body);
+            ctx.visit(ir, it.elseBody());
+        },
+        else => {},
+    }
+}
+
+/// The alloc a fill's pointer points into, through field and element
+/// pointers and pointer casts, if the pointer is not volatile.
+fn fillBase(ir: *const Ir, ip: *const InternPool, ptr: Inst.Ref) ?u32 {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    if (Type.ptrInfo(ip, ir.typeOf(ptr, ip)).flags.is_volatile) return null;
+    var r = ptr;
+    while (true) {
+        const i = @backingInt(r.toIndex() orelse return null);
+        r = switch (tags[i]) {
+            .alloc => return if (datas[i].ty == .none) null else i,
+            .struct_field_ptr => ir.extraData(Ir.StructField, datas[i].ty_pl.payload).data.operand,
+            .ptr_elem_ptr, .ptr_add => ir.extraData(Ir.Bin, datas[i].ty_pl.payload).data.lhs,
+            .bitcast => datas[i].ty_op.operand,
+            else => return null,
+        };
+    }
+}
+
+/// Fill elimination: a store of `undefined` (the 0xaa fill, upstream's
+/// Debug aid) into a local whose address only its loads, its stores, and
+/// the field and element pointers of these see is `dead` when, on every
+/// path from it, each byte it fills is written again before anything
+/// reads it (or nothing reads it before the function returns or ends in a
+/// panic, which reads no local). Then nothing can observe the fill. A
+/// backward dataflow over the blocks, per alloc, of the bytes written
+/// before they are read, from the end of each path; loops take sweeps to
+/// the greatest fixpoint, so a path through a loop that does not touch
+/// the alloc keeps what holds after it. Bytes are tracked in up to 64
+/// chunks; a store covers the chunks it writes wholly, a load kills those
+/// it touches. A load reads its value's bytes, not its padding, which
+/// holds no value in Zig. Removing one dead fill keeps the others dead:
+/// the bytes it fills are written again before any read on every path.
+fn deadFills(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Allocator.Error!void {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const insts = f.values.items(.inst);
+    const s = &f.fills;
+    s.allocs.clearRetainingCapacity();
+    for (insts) |inst| {
+        const i = @backingInt(inst);
+        if (tags[i] != .store) continue;
+        const bin = datas[i].bin_op;
+        const v = bin.rhs.toInterned() orelse continue;
+        if (ip.keyTag(v) != .undef) continue;
+        const base = fillBase(ir, ip, bin.lhs) orelse continue;
+        if (for (s.allocs.items) |c| {
+            if (c.alloc == base) break true;
+        } else false) continue;
+        const size = Type.abiSize(ip, Type.ptrInfo(ip, datas[base].ty).child);
+        if (size == 0) continue;
+        try s.allocs.append(gpa, .{ .alloc = base, .size = size, .chunk = std.math.divCeil(u64, size, 64) catch unreachable, .escaped = false });
+        if (s.allocs.items.len == max_fill_allocs) break;
+    }
+    if (s.allocs.items.len == 0) return;
+
+    // The candidates' accesses, in layout order: definitions come before
+    // their uses there.
+    if (s.ptrs.items.len < ir.instructions.len) {
+        const old = s.ptrs.items.len;
+        try s.ptrs.resize(gpa, ir.instructions.len);
+        @memset(s.ptrs.items[old..], FillPtr.none);
+    }
+    s.family.clearRetainingCapacity();
+    s.seen.clearRetainingCapacity();
+    defer for (s.family.items) |i| {
+        s.ptrs.items[i] = FillPtr.none;
+    };
+    for (s.allocs.items, 0..) |c, k| try s.derive(gpa, c.alloc, .{ .cand = @intCast(k), .off = 0 });
+    s.events.clearRetainingCapacity();
+    s.pending.clearRetainingCapacity();
+    // Every block is in the layout, which sets its span.
+    try s.spans.resize(gpa, f.blocks.items.len);
+    const uses = f.live.items(.uses);
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        const first: u32 = @intCast(s.events.items.len);
+        for (s.pending.items) |pe| {
+            if (pe.block == @backingInt(block)) try s.events.append(gpa, pe.event);
+        }
+        var prev: ?Inst.Index = null;
+        for (insts[b.start..][0..b.len]) |inst| {
+            const i = @backingInt(inst);
+            const data = datas[i];
+            defer if (tags[i] != .dbg_stmt) {
+                prev = inst;
+            };
+            switch (tags[i]) {
+                .block => if (prev) |p| if (loopWrites(ir, ip, uses, inst, p, 0)) |span| {
+                    if (span.addr.n != 0) continue;
+                    // Not a use: the loop's own stores are counted.
+                    const ptr = s.ptrs.items[span.addr.root];
+                    if (ptr.cand == FillPtr.none.cand or ptr.off == FillPtr.unknown) continue;
+                    const a = s.allocs.items[ptr.cand];
+                    const mask = a.cover(std.math.add(u64, ptr.off, span.lo) catch continue, std.math.add(u64, ptr.off, span.hi) catch continue);
+                    if (mask == 0) continue;
+                    try s.pending.append(gpa, .{ .block = @backingInt(f.targets.items[i]), .event = .{ .mask = mask, .cover = mask, .inst = i, .cand = ptr.cand, .kind = .write } });
+                },
+                .struct_field_ptr => {
+                    const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+                    const p = s.ptrOf(sf.operand) orelse continue;
+                    const container = Type.ptrInfo(ip, ir.typeOf(sf.operand, ip)).child;
+                    try s.derive(gpa, i, switch (ip.keyTag(container)) {
+                        .struct_type, .union_type, .tuple_type => p.plus(Type.fieldOffset(ip, container, sf.index)),
+                        else => p.plus(null),
+                    });
+                },
+                .ptr_elem_ptr, .ptr_add => {
+                    const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+                    const p = s.ptrOf(bin.lhs) orelse continue;
+                    const es = Type.abiSize(ip, Type.ptrInfo(ip, data.ty_pl.ty).child);
+                    const idx = if (bin.rhs.toInterned()) |k| ip.intValue(u64, k) else null;
+                    try s.derive(gpa, i, p.plus(if (idx) |n| std.math.mul(u64, n, es) catch null else null));
+                },
+                .bitcast => {
+                    // A cast to another kind of value is not followed: it
+                    // escapes.
+                    if (ip.keyTag(data.ty_op.ty) != .ptr_type or Type.isSlice(ip, data.ty_op.ty)) continue;
+                    const p = s.ptrOf(data.ty_op.operand) orelse continue;
+                    try s.derive(gpa, i, p);
+                },
+                .load, .ptr_elem_val => {
+                    const ptr = if (tags[i] == .load) data.ty_op.operand else data.bin_op.lhs;
+                    var p = s.ptrOf(ptr) orelse continue;
+                    if (tags[i] == .ptr_elem_val) {
+                        const es = Type.abiSize(ip, ir.typeOfIndex(inst, ip));
+                        const idx = if (data.bin_op.rhs.toInterned()) |k| ip.intValue(u64, k) else null;
+                        p = p.plus(if (idx) |n| std.math.mul(u64, n, es) catch null else null);
+                    }
+                    const a = s.allocs.items[p.cand];
+                    const info = Type.ptrInfo(ip, ir.typeOf(ptr, ip));
+                    var budget: u32 = 256;
+                    const mask = if (p.off == FillPtr.unknown or info.packed_offset.host_size != 0 or info.flags.vector_index != 0)
+                        a.all()
+                    else
+                        a.typeMask(ip, ir.typeOfIndex(inst, ip), p.off, false, &budget);
+                    try s.add(gpa, p, .read, mask, inst);
+                },
+                .store => {
+                    const bin = data.bin_op;
+                    const p = s.ptrOf(bin.lhs) orelse continue;
+                    const a = s.allocs.items[p.cand];
+                    const info = Type.ptrInfo(ip, ir.typeOf(bin.lhs, ip));
+                    // A bit pointer's store reads the rest of its host.
+                    if (info.packed_offset.host_size != 0 or info.flags.vector_index != 0) {
+                        try s.add(gpa, p, .read, a.all(), inst);
+                        continue;
+                    }
+                    if (p.off == FillPtr.unknown) continue;
+                    const ty = ir.typeOf(bin.rhs, ip);
+                    const undef = if (bin.rhs.toInterned()) |v| ip.keyTag(v) == .undef else false;
+                    const size = Type.abiSize(ip, ty);
+                    if (undef and !info.flags.is_volatile and size != 0) {
+                        try s.events.append(gpa, .{ .mask = a.touch(p.off, p.off + size), .cover = a.cover(p.off, p.off + size), .inst = i, .cand = p.cand, .kind = .fill });
+                    } else {
+                        var budget: u32 = 256;
+                        try s.add(gpa, p, .write, a.typeMask(ip, ty, p.off, true, &budget), inst);
+                    }
+                },
+                .vector_store_elem => {
+                    const bin = ir.extraData(Ir.Bin, data.pl_op.payload).data;
+                    const p = s.ptrOf(data.pl_op.operand) orelse continue;
+                    // Bools are bits; another element's store leaves the
+                    // other elements as they were.
+                    const ety = ir.typeOf(bin.rhs, ip);
+                    if (ety == .bool_type or p.off == FillPtr.unknown) continue;
+                    const es = Type.abiSize(ip, ety);
+                    const idx = ip.intValue(u64, bin.lhs.toInterned() orelse continue) orelse continue;
+                    const q = p.plus(std.math.mul(u64, idx, es) catch continue);
+                    if (q.off == FillPtr.unknown) continue;
+                    var budget: u32 = 256;
+                    try s.add(gpa, q, .write, s.allocs.items[p.cand].typeMask(ip, ety, q.off, true, &budget), inst);
+                },
+                else => {},
+            }
+        }
+        s.spans.items[@backingInt(block)] = .{ first, @intCast(s.events.items.len) };
+    }
+    // Any use of a pointer not followed above (a call's argument, a
+    // stored value, a terminator's operand) lets its alloc escape.
+    for (s.family.items, s.seen.items) |i, k| {
+        if (k != uses[i]) s.allocs.items[s.ptrs.items[i].cand].escaped = true;
+    }
+    // The dataflow runs for the candidates left with a fill, numbered
+    // from 0.
+    var remap: [max_fill_allocs]u8 = @splat(0xff);
+    var n: u8 = 0;
+    for (s.events.items) |e| {
+        if (e.kind == .fill and !s.allocs.items[e.cand].escaped and remap[e.cand] == 0xff) {
+            remap[e.cand] = n;
+            n += 1;
+        }
+    }
+    if (n == 0) return;
+
+    try s.ok.resize(gpa, f.blocks.items.len * n);
+    @memset(s.ok.items, ~@as(u64, 0));
+    var sweeps: u32 = 0;
+    while (true) : (sweeps += 1) {
+        if (sweeps == max_fill_sweeps) return;
+        var changed = false;
+        var li = f.layout.items.len;
+        while (li > 0) {
+            li -= 1;
+            const block = @backingInt(f.layout.items[li]);
+            var cur: [max_fill_allocs]u64 = undefined;
+            f.fillsOut(ir, block, n, &cur);
+            const span = s.spans.items[block];
+            var k = span[1];
+            while (k > span[0]) {
+                k -= 1;
+                const e = s.events.items[k];
+                const c = remap[e.cand];
+                if (c == 0xff) continue;
+                if (e.kind == .read) cur[c] &= ~e.mask else cur[c] |= e.cover;
+            }
+            for (s.ok.items[block * n ..][0..n], cur[0..n]) |*in, c| {
+                if (in.* != c) changed = true;
+                in.* = c;
+            }
+        }
+        if (!changed) break;
+    }
+
+    const live = f.live.slice();
+    const fate = live.items(.fate);
+    const reg = live.items(.reg);
+    for (f.layout.items) |blk| {
+        const block = @backingInt(blk);
+        var cur: [max_fill_allocs]u64 = undefined;
+        f.fillsOut(ir, block, n, &cur);
+        const span = s.spans.items[block];
+        var k = span[1];
+        while (k > span[0]) {
+            k -= 1;
+            const e = s.events.items[k];
+            const c = remap[e.cand];
+            if (c == 0xff) continue;
+            switch (e.kind) {
+                .read => cur[c] &= ~e.mask,
+                .write => cur[c] |= e.cover,
+                .fill => {
+                    if (e.mask & ~cur[c] == 0) {
+                        fate[e.inst] = .dead;
+                        reg[e.inst] = no_reg;
+                        if (datas[e.inst].bin_op.lhs.toIndex()) |p| uses[@backingInt(p)] -= 1;
+                    }
+                    cur[c] |= e.cover;
+                },
+            }
+        }
+    }
+}
+
+/// The chunks every path from the end of `block` writes before reading
+/// them, per candidate: what holds at the start of all its successors,
+/// everything at an end of the function.
+fn fillsOut(f: *const Func, ir: *const Ir, block: u32, n: usize, out: *[max_fill_allocs]u64) void {
+    const ok = f.fills.ok.items;
+    for (out[0..n]) |*o| o.* = ~@as(u64, 0);
+    const term = f.blocks.items[block].term;
+    const meet = struct {
+        fn and_(o: *[max_fill_allocs]u64, in: []const u64) void {
+            for (o[0..in.len], in) |*x, y| x.* &= y;
+        }
+    }.and_;
+    switch (term.tag) {
+        .jump, .fallthrough => meet(out, ok[term.succ[0] * n ..][0..n]),
+        .branch => for (term.succ) |succ| meet(out, ok[succ * n ..][0..n]),
+        .switch_br => {
+            const cases = ir.extraData(Ir.SwitchBr, ir.instructions.items(.data)[@backingInt(term.inst)].pl_op.payload).data.cases_len;
+            for (f.switchCases(term, cases)) |c| meet(out, ok[@backingInt(c) * n ..][0..n]);
+            meet(out, ok[term.succ[1] * n ..][0..n]);
+        },
+        .ret, .unreach, .noreturn => {},
+    }
+}
 
 /// Whether value `inst` may go unemitted when nothing reads it: it reads
 /// no volatile memory, writes nothing but its own result, cannot trap, and

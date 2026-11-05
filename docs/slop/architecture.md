@@ -2518,6 +2518,19 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    Still to come: renaming (a variable in different registers on
    different paths), floats in registers (below), and copy elision for
    larger aggregates.
+   Dead fills, first in `plan` (`Ssa.deadFills`): a store of `undefined`
+   (the 0xaa fill) into a local whose address only loads, stores, and
+   field and element pointers see is `dead` when every byte it
+   fills is written again before any read on every path from it, or not
+   read before the function ends; nothing can observe it then. A
+   backward dataflow per local (up to 16) over the blocks, to the greatest
+   fixpoint, of the bytes written before they are read, in up to 64
+   chunks; a load reads its value's bytes, not padding. A `for` loop over
+   a counter whose every iteration writes element `i` wholly (`for (0..16)
+   |j| a[j] = ...`, nested too: blake3's `transposeMsg`) counts as a
+   write of the elements it covers where it exits. Upstream's
+   ReleaseSafe drops the same fills through LLVM; heap fills (`alloc`,
+   `free`) and fills of locals whose address escapes stay.
    Division, after it: unsigned division by a constant divides without
    `div` (a shift and mask for a power of two; else a multiply by a magic
    number, Granlund and Montgomery 1994, with the add-and-halve fixup when
