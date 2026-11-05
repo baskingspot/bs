@@ -540,7 +540,7 @@ fn printCallconv(f: InternPool.FuncType, w: *std.Io.Writer) std.Io.Writer.Error!
     switch (f.cc) {
         .auto, .naked, .@"inline" => return w.print("callconv(.{s})", .{@tagName(f.cc)}),
         .c => if (f.stack_align == 0) return w.writeAll("callconv(.c)"),
-        .x86_64_win => {},
+        .x86_64_win, .aarch64_preserve_none => {},
     }
     try w.print("callconv(.{{ .{s} = .{{ .incoming_stack_alignment = ", .{if (f.cc == .c) "x86_64_sysv" else @tagName(f.cc)});
     if (f.stack_align == 0) try w.writeAll("null") else try w.print("{d}", .{@as(u64, 1) << @intCast(f.stack_align - 1)});

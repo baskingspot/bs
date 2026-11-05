@@ -6526,6 +6526,7 @@ fn ccName(target: InternPool.Target, cc: InternPool.CallingConvention) []const u
         .naked => "naked",
         .@"inline" => "inline",
         .x86_64_win => "x86_64_win",
+        .aarch64_preserve_none => "aarch64_preserve_none",
     };
 }
 
@@ -8481,6 +8482,8 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
         .c
     else if (sema.ip.target == .x86_64_linux and std.mem.eql(u8, name, "x86_64_win"))
         .x86_64_win
+    else if (sema.ip.target != .x86_64_linux and std.mem.eql(u8, name, "aarch64_preserve_none"))
+        .aarch64_preserve_none
     else {
         if (std.meta.stringToEnum(std.lang.CallingConvention.Tag, name) == null) {
             // As upstream; `.C` was 0.13's name for `.c`.
@@ -8545,6 +8548,8 @@ fn internCallconv(sema: *Sema, block: *Block, src: Src, cc: Callconv) CompileErr
             .c
         else if (cc.tag == .x86_64_win and target == .x86_64_linux)
             .x86_64_win
+        else if (cc.tag == .aarch64_preserve_none and target != .x86_64_linux)
+            .aarch64_preserve_none
         else {
             // As upstream, a convention of another architecture is an
             // error, and so is one that upstream's own x86_64 backend does

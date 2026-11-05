@@ -224,6 +224,10 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     try f.live.resize(gpa, ir.instructions.len);
     @memset(f.live.items(.reg), Ssa.no_reg);
     if (!naked) {
+        // preserve_none passes arguments in x20-x28, where values live, and
+        // its callee clobbers them all, so such functions get no registers,
+        // as with inline assembly.
+        if (cg.fn_ty.cc == .aarch64_preserve_none or cg.callsPreserveNone()) f.has_asm = true;
         // `clobbers` marks the values that want a register.
         try f.liveness(gpa, ir, &cg);
         try f.plan(gpa, ir, ip, &cg);
@@ -589,6 +593,16 @@ fn passInRegs(cg: *CodeGen, ty: Index) bool {
     return size == 1 or size == 2 or size == 4 or size == 8;
 }
 
+fn callsPreserveNone(cg: *CodeGen) bool {
+    const ir = cg.ir;
+    for (cg.ssa.values.items(.inst)) |inst| {
+        if (ir.instructions.items(.tag)[@backingInt(inst)] != .call) continue;
+        const callee = ir.instructions.items(.data)[@backingInt(inst)].pl_op.operand;
+        if (cg.calleeType(callee).cc == .aarch64_preserve_none) return true;
+    }
+    return false;
+}
+
 /// The size of the outgoing argument area: the most any call's stack
 /// arguments need.
 fn outgoingArgsSize(cg: *CodeGen) u32 {
@@ -610,7 +624,7 @@ fn outgoingArgsSize(cg: *CodeGen) u32 {
             // Arguments past the first 32 all go on the stack: count them
             // at their largest.
             if (i == 0) {
-                stack = if (callee_ty.cc == .c) cg.cArgs(tys[0..n], if (callee_ty.is_var_args) callee_ty.param_types.len else null, null) else cg.autoArgs(tys[0..n], null);
+                stack = if (isC(callee_ty.cc)) cg.cArgs(callee_ty.cc, tys[0..n], if (callee_ty.is_var_args) callee_ty.param_types.len else null, null) else cg.autoArgs(tys[0..n], null);
             } else for (tys[0..n]) |t| {
                 stack = std.mem.alignForward(u32, stack, 16) + @as(u32, @intCast(std.mem.alignForward(u64, Type.abiSize(ip, t), 16)));
             }
@@ -651,11 +665,27 @@ const ArgLoc = union(enum) {
     gpr: u8,
     gpr_pair: u8,
     fpr: u8,
+    /// C: a homogeneous float aggregate's members in v`first`... (`Hfa`).
+    fpr_run: struct { first: u8, n: u8, size: u8 },
+    /// C: a vector's `n` bools (`CClass.bool_split`), in x`gp` to x7, then
+    /// in stack slots of `slot` bytes from `stack`.
+    bool_split: BoolSplit,
     stack: u32,
     /// C: a copy of the value, passed by its address in a register or on
     /// the stack.
     gpr_indirect: u8,
     stack_indirect: u32,
+};
+
+const BoolSplit = struct {
+    n: u8,
+    gp: u8,
+    slot: u8,
+    stack: u32,
+
+    fn inRegs(b: BoolSplit) u8 {
+        return @min(b.n, 8 - b.gp);
+    }
 };
 
 /// Where `.auto` passes each argument; returns the stack bytes used.
@@ -698,13 +728,20 @@ fn autoArgs(cg: *CodeGen, tys: []const Index, locs: ?[]ArgLoc) u32 {
 /// address of a copy (and results through x8). f128 is Linux's `long
 /// double`, in a q register there; on Apple's, where C does not have it,
 /// it goes as 16 bytes in two general registers, and so does f80 on both.
-/// Homogeneous float aggregates and vectors, which go in vector
-/// registers, are not supported yet.
-const CClass = enum { none, int, int_pair, fpr, indirect, unsupported };
+/// A homogeneous floating-point aggregate (`cHfa`) goes in consecutive
+/// vector registers, one member each (`fpr_run`), and a vector of at most
+/// 16 bytes in one, as upstream's `aarch64/abi.zig` classifies them; a
+/// larger vector by the address of a copy.
+/// A vector of 32 to 128 bools is passed as that many bools, each as an
+/// argument of its own (`bool_split`), and returned in memory, as LLVM
+/// lowers `<N x i1>` (upstream's c_abi tests and Clang's `ext_vector_type`
+/// bools agree).
+const CClass = enum { none, int, int_pair, fpr, fpr_run, bool_split, indirect, unsupported };
 
 fn cClass(cg: *CodeGen, ty: Index) CClass {
     const ip = cg.ip;
     if (!Type.hasRuntimeBits(ip, ty)) return .none;
+    const size = Type.abiSize(ip, ty);
     switch (Type.class(ip, ty)) {
         .float => return switch (Type.floatBits(ip, ty)) {
             16, 32, 64 => .fpr,
@@ -714,29 +751,64 @@ fn cClass(cg: *CodeGen, ty: Index) CClass {
             // (`compilerRtFloatAbi`).
             else => .int_pair,
         },
-        .vector => return .unsupported,
-        .@"struct", .array => if (cg.isFloatAggregate(ty)) return .unsupported,
+        // A vector register holds 2 to 16 bytes; a 1-byte vector (of up
+        // to 8 bools) goes as an integer.
+        .vector => {
+            const v = ip.keyPayload(.vector_type, ty);
+            if (v.child == .bool_type and v.len >= 32 and v.len <= 128) return .bool_split;
+            return if (size > 16) .indirect else if (size >= 2) .fpr else .int;
+        },
+        .@"struct", .@"union" => if (cg.cHfa(ty) != null) return .fpr_run,
         else => {},
     }
-    const size = Type.abiSize(ip, ty);
     return if (size <= 8) .int else if (size <= 16) .int_pair else .indirect;
 }
 
-/// Whether `ty` may be a homogeneous floating-point aggregate: a struct or
-/// array whose fields are all floats.
-fn isFloatAggregate(cg: *CodeGen, ty: Index) bool {
+/// `cClass` for a result: a split bool vector is returned in memory.
+fn cRetClass(cg: *CodeGen, ty: Index) CClass {
+    const c = cg.cClass(ty);
+    return if (c == .bool_split) .indirect else c;
+}
+
+/// A homogeneous floating-point aggregate: `n` (1 to 4) floats of `size`
+/// bytes each, laid out back to back.
+const Hfa = struct { n: u8, size: u8 };
+
+/// `ty` as a homogeneous floating-point aggregate, or null: a non-packed
+/// struct or union of floats of one width (f16, f32, f64, f128), nested
+/// structs and unions of them included, as upstream's `countFloats`:
+/// each struct field at the offset the members before it fill, at most 4
+/// members, and no padding. Arrays are not members, as upstream's.
+fn cHfa(cg: *CodeGen, ty: Index) ?Hfa {
     const ip = cg.ip;
-    switch (ip.indexToKey(ty)) {
-        .array_type => |a| return Type.class(ip, a.child) == .float or cg.isFloatAggregate(a.child),
-        else => {},
+    if (!Type.hasRuntimeBits(ip, ty)) return .{ .n = 0, .size = 0 };
+    switch (Type.class(ip, ty)) {
+        .float => return switch (Type.floatBits(ip, ty)) {
+            16, 32, 64, 128 => |bits| .{ .n = 1, .size = @intCast(bits / 8) },
+            else => null,
+        },
+        .@"struct", .@"union" => {},
+        else => return null,
     }
-    if (Type.class(ip, ty) != .@"struct") return false;
+    if (Type.isPacked(ip, ty)) return null;
+    const is_union = Type.class(ip, ty) == .@"union";
     const info = ip.structInfo(ty);
-    if (info.field_types.len == 0) return false;
-    for (info.field_types) |ft| {
-        if (Type.class(ip, ft) != .float and !cg.isFloatAggregate(ft)) return false;
+    var r: Hfa = .{ .n = 0, .size = 0 };
+    for (info.field_types, 0..) |ft, i| {
+        if (!is_union and Type.fieldOffset(ip, ty, i) != @as(u64, r.size) * r.n) return null;
+        const f = cg.cHfa(ft) orelse return null;
+        if (r.n == 0 and r.size == 0) {
+            r.size = f.size;
+        } else if (r.size != f.size) return null;
+        if (is_union) {
+            r.n = @max(r.n, f.n);
+        } else {
+            if (f.n > 4 - r.n) return null;
+            r.n += f.n;
+        }
     }
-    return true;
+    if (Type.abiSize(ip, ty) != @as(u64, r.size) * r.n) return null;
+    return r;
 }
 
 /// Where the C convention passes each argument; returns the stack bytes
@@ -746,9 +818,10 @@ fn isFloatAggregate(cg: *CodeGen, ty: Index) bool {
 /// arguments as named ones, and each stack argument in its own slot of a
 /// multiple of 8 bytes, aligned to 8 or to 16 for 16-byte aligned values.
 /// `locs` may be null.
-fn cArgs(cg: *CodeGen, tys: []const Index, var_from: ?usize, locs: ?[]ArgLoc) u32 {
+fn cArgs(cg: *CodeGen, cc: InternPool.CallingConvention, tys: []const Index, var_from: ?usize, locs: ?[]ArgLoc) u32 {
     const ip = cg.ip;
     const linux = ip.target == .aarch64_linux;
+    const n_gpr = cGprs(cc).len;
     var gp: u8 = 0;
     var fp: u8 = 0;
     var stack: u32 = 0;
@@ -761,8 +834,8 @@ fn cArgs(cg: *CodeGen, tys: []const Index, var_from: ?usize, locs: ?[]ArgLoc) u3
             const slot = std.mem.alignForward(u32, stack, @max(8, @min(alignment, 16)));
             switch (class) {
                 .none, .unsupported => {},
-                .int, .indirect => if (gp < 8) {
-                    l = if (class == .int) .{ .gpr = gp } else .{ .gpr_indirect = gp };
+                .int, .indirect => if (gp < n_gpr) {
+                    l = if (class == .int) .{ .gpr = cGprs(cc)[gp] } else .{ .gpr_indirect = cGprs(cc)[gp] };
                     gp += 1;
                 } else {
                     l = if (class == .int) .{ .stack = slot } else .{ .stack_indirect = slot };
@@ -786,6 +859,23 @@ fn cArgs(cg: *CodeGen, tys: []const Index, var_from: ?usize, locs: ?[]ArgLoc) u3
                     l = .{ .stack = slot };
                     stack = slot + std.mem.alignForward(u32, size, 8);
                 },
+                .fpr_run => {
+                    const h = cg.cHfa(ty).?;
+                    if (fp + h.n <= 8) {
+                        l = .{ .fpr_run = .{ .first = fp, .n = h.n, .size = h.size } };
+                        fp += h.n;
+                    } else {
+                        fp = 8;
+                        l = .{ .stack = slot };
+                        stack = slot + std.mem.alignForward(u32, size, 8);
+                    }
+                },
+                .bool_split => {
+                    const b: BoolSplit = .{ .n = @intCast(ip.keyPayload(.vector_type, ty).len), .gp = gp, .slot = 8, .stack = std.mem.alignForward(u32, stack, 8) };
+                    l = .{ .bool_split = b };
+                    gp += b.inRegs();
+                    if (b.n > b.inRegs()) stack = b.stack + 8 * @as(u32, b.n - b.inRegs());
+                },
             }
         } else if (var_from != null and i >= var_from.?) {
             if (class != .none) {
@@ -796,8 +886,8 @@ fn cArgs(cg: *CodeGen, tys: []const Index, var_from: ?usize, locs: ?[]ArgLoc) u3
             }
         } else switch (class) {
             .none, .unsupported => {},
-            .int => if (gp < 8) {
-                l = .{ .gpr = gp };
+            .int => if (gp < n_gpr) {
+                l = .{ .gpr = cGprs(cc)[gp] };
                 gp += 1;
             } else {
                 const a = if (Type.isInt(ip, ty) or Type.class(ip, ty) == .pointer) alignment else 8;
@@ -828,8 +918,28 @@ fn cArgs(cg: *CodeGen, tys: []const Index, var_from: ?usize, locs: ?[]ArgLoc) u3
                 l = .{ .stack = stack };
                 stack += size;
             },
-            .indirect => if (gp < 8) {
-                l = .{ .gpr_indirect = gp };
+            // Darwin's stack bools take 4 bytes each, as Clang passes them.
+            .bool_split => {
+                const b: BoolSplit = .{ .n = @intCast(ip.keyPayload(.vector_type, ty).len), .gp = gp, .slot = 4, .stack = std.mem.alignForward(u32, stack, 4) };
+                l = .{ .bool_split = b };
+                gp += b.inRegs();
+                stack = b.stack + 4 * @as(u32, b.n - b.inRegs());
+            },
+            // An aggregate, at 8 on the stack, as `.int`'s.
+            .fpr_run => {
+                const h = cg.cHfa(ty).?;
+                if (fp + h.n <= 8) {
+                    l = .{ .fpr_run = .{ .first = fp, .n = h.n, .size = h.size } };
+                    fp += h.n;
+                } else {
+                    fp = 8;
+                    stack = std.mem.alignForward(u32, stack, @max(8, @min(alignment, 16)));
+                    l = .{ .stack = stack };
+                    stack += std.mem.alignForward(u32, size, 8);
+                }
+            },
+            .indirect => if (gp < n_gpr) {
+                l = .{ .gpr_indirect = cGprs(cc)[gp] };
                 gp += 1;
             } else {
                 stack = std.mem.alignForward(u32, stack, 8);
@@ -840,6 +950,34 @@ fn cArgs(cg: *CodeGen, tys: []const Index, var_from: ?usize, locs: ?[]ArgLoc) u3
         if (locs) |ls| ls[i] = l;
     }
     return std.mem.alignForward(u32, stack, 8);
+}
+
+/// The C conventions: the target's, and `aarch64_preserve_none`.
+fn isC(cc: InternPool.CallingConvention) bool {
+    return cc == .c or cc == .aarch64_preserve_none;
+}
+
+/// The general registers convention `cc` passes integer arguments in, in
+/// order. LLVM's preserve_none takes x9-x14 after x0-x7 too, which bs's
+/// argument moves use as scratch registers, so bs passes at most 17
+/// integers in registers with it (`cArgsSupported`).
+fn cGprs(cc: InternPool.CallingConvention) []const u8 {
+    return if (cc == .aarch64_preserve_none) &.{ 20, 21, 22, 23, 24, 25, 26, 27, 28, 0, 1, 2, 3, 4, 5, 6, 7 } else &.{ 0, 1, 2, 3, 4, 5, 6, 7 };
+}
+
+/// Fails for the arguments of convention `cc` that bs cannot pass yet:
+/// with `aarch64_preserve_none`, values in two general registers or many
+/// bools, more than 17 integers, and variadic arguments.
+fn cArgsSupported(cg: *CodeGen, cc: InternPool.CallingConvention, tys: []const Index, var_args: bool) Error!void {
+    if (cc != .aarch64_preserve_none) return;
+    if (var_args) return cg.fail("variadic functions with calling convention 'aarch64_preserve_none'", .{});
+    var n: usize = 0;
+    for (tys) |ty| switch (cg.cClass(ty)) {
+        .int, .indirect => n += 1,
+        .int_pair, .bool_split => return cg.fail("passing '{f}' with calling convention 'aarch64_preserve_none'", .{cg.fmtType(ty)}),
+        else => {},
+    };
+    if (n > 17) return cg.fail("more than 17 integer arguments with calling convention 'aarch64_preserve_none'", .{});
 }
 
 fn argReg(i: u8) Reg {
@@ -856,7 +994,7 @@ fn setupParams(cg: *CodeGen) Error!void {
     const ip = cg.ip;
     const ir = cg.ir;
     const tags = ir.instructions.items(.tag);
-    const is_c = cg.fn_ty.cc == .c;
+    const is_c = isC(cg.fn_ty.cc);
     if (!is_c) {
         // The error return trace pointer arrives in x15; a function that
         // neither reads it nor calls drops it.
@@ -870,7 +1008,7 @@ fn setupParams(cg: *CodeGen) Error!void {
         }
     }
     const ret_ty = cg.fn_ty.return_type;
-    if (if (is_c) cg.cClass(ret_ty) == .indirect else cg.autoClass(ret_ty) == .memory) {
+    if (if (is_c) cg.cRetClass(ret_ty) == .indirect else cg.autoClass(ret_ty) == .memory) {
         cg.ret_ptr_slot = try cg.allocSlot(8, 8);
         try cg.storeReg(cg.ret_ptr_slot.?, .x8, 8);
     }
@@ -889,7 +1027,8 @@ fn setupParams(cg: *CodeGen) Error!void {
     for (args, tys) |inst, *ty| ty.* = ir.instructions.items(.data)[@backingInt(inst)].arg.ty;
     if (is_c) {
         for (tys) |ty| if (cg.cClass(ty) == .unsupported) return cg.fail("C parameter of type '{f}'", .{cg.fmtType(ty)});
-        cg.va_stack = cg.cArgs(tys, null, locs);
+        try cg.cArgsSupported(cg.fn_ty.cc, tys, false);
+        cg.va_stack = cg.cArgs(cg.fn_ty.cc, tys, null, locs);
     } else _ = cg.autoArgs(tys, locs);
     for (args, tys, locs) |inst, ty, l| {
         const size = Type.abiSize(ip, ty);
@@ -914,6 +1053,8 @@ fn setupParams(cg: *CodeGen) Error!void {
                 try cg.storeBytes(m.plus(8), argReg(r + 1), size - 8);
             },
             .fpr => |v| try cg.storeFp((try cg.resultMem(inst, ty)).?, argVReg(v), size),
+            .fpr_run => |run| try cg.storeFpRun((try cg.resultMem(inst, ty)).?, run.first, run.n, run.size),
+            .bool_split => |b| try cg.gatherBools((try cg.resultMem(inst, ty)).?, b, size),
             .stack => |off| cg.homes[@backingInt(inst)] = .{ .slot = .at(.fp, @intCast(16 + off)) },
             .gpr_indirect => |r| {
                 // The callee owns the caller's copy, but a slot keeps every
@@ -2981,7 +3122,7 @@ fn atomicOp(cg: *CodeGen, op: Encoder.AtomicOp, size: Size, src: Reg, dst: Reg, 
 
 fn ret(cg: *CodeGen, operand: Ref) Error!void {
     const ty = cg.fn_ty.return_type;
-    if (cg.fn_ty.cc == .c) {
+    if (isC(cg.fn_ty.cc)) {
         try cg.cRet(operand);
     } else switch (cg.autoClass(ty)) {
         .none => {},
@@ -2998,16 +3139,20 @@ fn ret(cg: *CodeGen, operand: Ref) Error!void {
 
 fn cRet(cg: *CodeGen, operand: Ref) Error!void {
     const ty = cg.fn_ty.return_type;
-    switch (cg.cClass(ty)) {
+    switch (cg.cRetClass(ty)) {
         .none => {},
         .int => try cg.loadGpr(.x0, operand),
         .int_pair => try cg.loadPair(.x0, .x1, try cg.valOf(operand)),
         .fpr => try cg.loadFp(.v0, try cg.valOf(operand)),
+        .fpr_run => {
+            const h = cg.cHfa(ty).?;
+            try cg.loadFpRun(try cg.valMem(try cg.valOf(operand)), 0, h.n, h.size);
+        },
         .indirect => {
             try cg.loadMem(.x12, cg.ret_ptr_slot.?, .usize_type);
             try cg.copyTo(.at(.x12, 0), operand);
         },
-        .unsupported => unreachable, // rejected by `setupParams`
+        .unsupported, .bool_split => unreachable, // rejected by `setupParams`
     }
 }
 
@@ -3093,10 +3238,11 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     } else null;
     const callee_ty = cg.calleeType(callee_ref);
     const ret_ty = extra.data.ret_ty;
-    const is_c = callee_ty.cc == .c;
+    const is_c = isC(callee_ty.cc);
     // A scalar result in a register is moved there from x0.
     const in_reg = !tail and cg.homes[@backingInt(inst)] == .reg;
     const dst = if (tail or in_reg) null else try cg.resultMem(inst, ret_ty);
+    var pn_save: ?Mem = null;
 
     const vals = try cg.gpa.alloc(Val, args.len);
     defer cg.gpa.free(vals);
@@ -3104,8 +3250,15 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     if (is_c) {
         if (cg.cClass(ret_ty) == .unsupported) return cg.fail("C call returning '{f}'", .{cg.fmtType(ret_ty)});
         if (tail and callee_ty.is_var_args) return cg.fail("tail call to a variadic function", .{});
-        try cg.cCallArgs(vals, if (callee_ty.is_var_args) callee_ty.param_types.len else null, tail);
-        if (cg.cClass(ret_ty) == .indirect) try cg.resultPtrTo(dst, tail);
+        if (callee_ty.cc == .aarch64_preserve_none and cg.fn_ty.cc != .aarch64_preserve_none) {
+            if (tail) return cg.fail("tail call with calling convention 'aarch64_preserve_none'", .{});
+            // The callee preserves none of x19-x28, which this function's
+            // callers expect kept, and its arguments use x20-x28.
+            pn_save = try cg.allocSlot(80, 16);
+            for (0..10) |k| try cg.storeReg(pn_save.?.plus(@intCast(8 * k)), @fromBackingInt(@intCast(19 + k)), 8);
+        }
+        try cg.cCallArgs(callee_ty.cc, vals, if (callee_ty.is_var_args) callee_ty.param_types.len else null, tail);
+        if (cg.cRetClass(ret_ty) == .indirect) try cg.resultPtrTo(dst, tail);
     } else {
         const tys = try cg.gpa.alloc(Index, args.len);
         defer cg.gpa.free(tys);
@@ -3124,6 +3277,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         return;
     }
     if (callee_val) |f| try cg.e.bl(.{ .sym = try cg.emit.funcKey(f) }) else try cg.e.blr(.x16);
+    if (pn_save) |save| for (0..10) |k| try cg.loadMem(@fromBackingInt(@intCast(19 + k)), save.plus(@intCast(8 * k)), .usize_type);
     if (in_reg) return cg.setResult(inst, ret_ty, .x0);
     const m = dst orelse return;
     if (is_c) return cg.cCallResult(ret_ty, m);
@@ -3161,6 +3315,14 @@ fn placeArgs(cg: *CodeGen, vals: []const Val, locs: []const ArgLoc, tail: bool) 
             temps[i] = try cg.allocSlot(Type.abiSize(ip, v.ty), @min(Type.abiAlignment(ip, v.ty), 16));
             try cg.copyVal(temps[i], v);
         } else try cg.copyVal(.at(.sp, @intCast(off)), v),
+        .bool_split => |b| if (b.n > b.inRegs()) {
+            if (tail) return cg.fail("tail call passing '{f}' on the stack", .{cg.fmtType(v.ty)});
+            const m = try cg.valMem(v);
+            for (b.inRegs()..b.n) |k| {
+                try cg.extractBool(.x9, m, @intCast(k));
+                try cg.e.str(.byte, .x9, try cg.access(.at(.sp, @intCast(b.stack + (k - b.inRegs()) * b.slot)), 1, .x16));
+            }
+        },
         .gpr_indirect, .stack_indirect => {
             // The copy lives in the caller's frame, which a tail call pops.
             if (tail) return cg.fail("tail call passing '{f}' by reference", .{cg.fmtType(v.ty)});
@@ -3185,12 +3347,44 @@ fn placeArgs(cg: *CodeGen, vals: []const Val, locs: []const ArgLoc, tail: bool) 
         .gpr => |r| try cg.loadGprVal(argReg(r), v),
         .gpr_pair => |r| try cg.loadPair(argReg(r), argReg(r + 1), v),
         .fpr => |r| try cg.loadFp(argVReg(r), v),
+        .fpr_run => |run| try cg.loadFpRun(try cg.valMem(v), run.first, run.n, run.size),
+        .bool_split => |b| {
+            const m = try cg.valMem(v);
+            for (0..b.inRegs()) |k| try cg.extractBool(argReg(b.gp + @as(u8, @intCast(k))), m, @intCast(k));
+        },
         else => {},
     };
 }
 
+/// Loads bool `k` of the bit-packed bool vector at `m` into `reg`.
+fn extractBool(cg: *CodeGen, reg: Reg, m: Mem, k: u8) Error!void {
+    try cg.e.ldr(.byte, reg, try cg.access(m.plus(k / 8), 1, .x16));
+    const bit: u6 = @intCast(k % 8);
+    try cg.e.bitfield(.ubfm, .w, reg, reg, bit, bit); // ubfx reg, reg, #bit, #1
+}
+
+/// Packs the bools of `b`, arguments of this function, into the
+/// `size`-byte bool vector at `dst`.
+fn gatherBools(cg: *CodeGen, dst: Mem, b: BoolSplit, size: u64) Error!void {
+    for (0..size) |byte| {
+        try cg.e.movImm(.x, .x9, 0);
+        for (0..8) |j| {
+            const k = byte * 8 + j;
+            if (k >= b.n) break;
+            if (k < b.inRegs()) {
+                try cg.e.logic(.@"and", .w, .x10, argReg(b.gp + @as(u8, @intCast(k))), .{ .imm = 1 });
+            } else {
+                try cg.e.ldr(.byte, .x10, try cg.access(.at(.fp, @intCast(16 + b.stack + (k - b.inRegs()) * b.slot)), 1, .x16));
+                try cg.e.logic(.@"and", .w, .x10, .x10, .{ .imm = 1 });
+            }
+            try cg.e.logic(.orr, .w, .x9, .x9, .{ .reg = .{ .reg = .x10, .amount = @intCast(j) } });
+        }
+        try cg.storeReg(dst.plus(@intCast(byte)), .x9, 1);
+    }
+}
+
 /// Places the arguments of a call to a C function, as `placeArgs`.
-fn cCallArgs(cg: *CodeGen, vals: []const Val, var_from: ?usize, tail: bool) Error!void {
+fn cCallArgs(cg: *CodeGen, cc: InternPool.CallingConvention, vals: []const Val, var_from: ?usize, tail: bool) Error!void {
     const tys = try cg.gpa.alloc(Index, vals.len);
     defer cg.gpa.free(tys);
     const locs = try cg.gpa.alloc(ArgLoc, vals.len);
@@ -3199,21 +3393,26 @@ fn cCallArgs(cg: *CodeGen, vals: []const Val, var_from: ?usize, tail: bool) Erro
         t.* = v.ty;
         if (cg.cClass(v.ty) == .unsupported) return cg.fail("C argument of type '{f}'", .{cg.fmtType(v.ty)});
     }
-    _ = cg.cArgs(tys, var_from, locs);
+    try cg.cArgsSupported(cc, tys, var_from != null);
+    _ = cg.cArgs(cc, tys, var_from, locs);
     try cg.placeArgs(vals, locs, tail);
 }
 
 /// Stores the result of a C call, of type `ret_ty`, to `dst`.
 fn cCallResult(cg: *CodeGen, ret_ty: Index, dst: Mem) Error!void {
     const size = Type.abiSize(cg.ip, ret_ty);
-    switch (cg.cClass(ret_ty)) {
-        .none, .indirect, .unsupported => {},
+    switch (cg.cRetClass(ret_ty)) {
+        .none, .indirect, .unsupported, .bool_split => {},
         .int => try cg.storeBytes(dst, .x0, size),
         .int_pair => {
             try cg.storeReg(dst, .x0, 8);
             try cg.storeBytes(dst.plus(8), .x1, size - 8);
         },
         .fpr => try cg.storeFp(dst, .v0, size),
+        .fpr_run => {
+            const h = cg.cHfa(ret_ty).?;
+            try cg.storeFpRun(dst, 0, h.n, h.size);
+        },
     }
 }
 
@@ -4025,6 +4224,27 @@ fn storeFp(cg: *CodeGen, dst: Mem, v: VReg, size: u64) Error!void {
     }
 }
 
+/// Loads `n` floats of `size` bytes, back to back at `src`, into v`first`
+/// and the registers after it.
+fn loadFpRun(cg: *CodeGen, src: Mem, first: u8, n: u8, size: u8) Error!void {
+    for (0..n) |k| {
+        const v = argVReg(first + @as(u8, @intCast(k)));
+        const a = try cg.access(src.plus(@intCast(k * size)), size, .x16);
+        if (size == 16) try cg.e.ldrQ(v, a) else try cg.e.ldrFp(switch (size) {
+            2 => .f16,
+            4 => .f32,
+            8 => .f64,
+            else => unreachable,
+        }, v, a);
+    }
+}
+
+/// Stores v`first` and the `n - 1` registers after it, floats of `size`
+/// bytes, back to back to `dst`.
+fn storeFpRun(cg: *CodeGen, dst: Mem, first: u8, n: u8, size: u8) Error!void {
+    for (0..n) |k| try cg.storeFp(dst.plus(@intCast(k * size)), argVReg(first + @as(u8, @intCast(k))), size);
+}
+
 /// libm's name for operation `op` on floats of `bits` bits.
 fn libmName(cg: *CodeGen, op: []const u8, bits: u16) Error![]const u8 {
     const arena = cg.emit.allocator();
@@ -4055,8 +4275,8 @@ fn rtCall(cg: *CodeGen, file: []const u8, name: []const u8, args: []const Val, r
     for (args) |a| if (cg.cClass(a.ty) == .unsupported) return cg.fail("compiler_rt call with an argument of type '{f}'", .{cg.fmtType(a.ty)});
     if (cg.cClass(ret_ty) == .unsupported) return cg.fail("compiler_rt call returning '{f}'", .{cg.fmtType(ret_ty)});
     const key: SymbolKey = .fromName(try cg.emit.requestCompilerRt(file, name));
-    try cg.cCallArgs(args, null, false);
-    if (cg.cClass(ret_ty) == .indirect) try cg.addrTo(.x8, dst);
+    try cg.cCallArgs(.c, args, null, false);
+    if (cg.cRetClass(ret_ty) == .indirect) try cg.addrTo(.x8, dst);
     try cg.e.bl(.{ .sym = key });
     try cg.cCallResult(ret_ty, dst);
 }

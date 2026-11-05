@@ -49,7 +49,8 @@ targets: std.ArrayList(Block.Index) = .empty,
 loops: std.ArrayList(Loop) = .empty,
 block_loop: std.ArrayList(u32) = .empty,
 /// The function contains inline assembly, so no value gets a register
-/// (its constraints do not come from the allocator yet).
+/// (its constraints do not come from the allocator yet). aarch64 also
+/// sets it for functions that use the preserve_none convention.
 has_asm: bool = false,
 
 /// Liveness and register allocation, per IR instruction (values are IR

@@ -455,6 +455,11 @@ pub const CallingConvention = enum(u8) {
     /// x86_64's Windows convention (`.x86_64_win`), which C code declares
     /// with `__attribute__((ms_abi))`.
     x86_64_win,
+    /// aarch64's `.aarch64_preserve_none`, LLVM's (Clang's
+    /// `__attribute__((preserve_none))`): the C convention with integer
+    /// arguments in x20-x28, then x0-x7, and no callee-saved registers
+    /// but fp and lr.
+    aarch64_preserve_none,
 };
 
 pub const PtrType = struct {

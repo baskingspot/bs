@@ -920,8 +920,18 @@ comptime arguments are run-time values in the lowered code (uucode's
   over 16 bytes by the address of a caller's copy, stack arguments packed
   at natural alignment, variadic arguments all on the stack in 8-byte
   slots (`va_list` is a pointer); f80 and f128, which C lacks here, go in
-  two GPRs as compiler_rt's soft-float ABI declares them, and homogeneous
-  float aggregates and vectors are rejected for now. f16 arithmetic is
+  two GPRs as compiler_rt's soft-float ABI declares them. Both
+  conventions classify as upstream's `aarch64/abi.zig`: a homogeneous
+  float aggregate (up to four members of one float type or one short
+  vector type, `cHfa`) goes one member per v register, or whole on the
+  stack once v0-v7 run out; a vector of at most 16 bytes goes in one v
+  register, a larger one by reference; a vector of 32 to 128 bools goes
+  as that many bool arguments (`bool_split`: x registers, then stack
+  slots of 8 bytes on Linux and 4 on Darwin) and returns in memory, as
+  LLVM lowers `<N x i1>` and Clang's `ext_vector_type` bools agree.
+  `aarch64_preserve_none` passes integers in x20-x28 then x0-x7; its
+  callers save and restore x19-x28 around the call, and a function using
+  it gets no allocated registers (`Ssa.has_asm`). f16 arithmetic is
   native (FEAT_FP16); f80 and f128 call compiler_rt. Atomics use LSE
   (`ldadd`, `swp`, `cas`, ...) with acquire-release, `ldar`/`stlr` for
   loads and stores; 16-byte ones load and store with `ldp`/`stp` and
