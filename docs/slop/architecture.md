@@ -3803,7 +3803,9 @@ differs from the design above:
   Zig extern slot of the same name.
 - With `-lc`, names nothing else defines are glibc's imports
   (`InputResolver.importSym`, after compiler_rt). A C call to one goes
-  through a content-addressed stub atom, `jmp [rip + slot]`, whose slot
+  through a content-addressed stub atom named `<symbol>@plt` in .symtab
+  (the name tools give lld's PLT entries, so a disassembly or profile
+  shows `call <printf@plt>`), `jmp [rip + slot]`, whose slot
   is the content-addressed 8-byte atom GOT references use, with an
   `x86_64_abs64` that the executable's link turns into R_X86_64_64.
 - The C runtimes: with inputs, `<lib>/ubsan_rt.zig` (a module of its

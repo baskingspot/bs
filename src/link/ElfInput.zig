@@ -1129,7 +1129,7 @@ fn Converter(comptime Ctx: type) type {
             if (t.key == undefined_weak_key and c.in.dynamic and !c.in.shared) switch (@as(R, @fromBackingInt(@intCast(ty)))) {
                 .PLT32, .GOTPCREL, .GOTPCRELX, .REX_GOTPCRELX => |rt| if (try c.ctx.weakImport(c.o.symName(c.o.syms[r.r_sym()]))) |key| {
                     const imp: Target = .{ .key = key, .offset = 0, .import = true };
-                    const via = if (rt == .PLT32) try c.stub(imp, .x86_64_abs64) else try c.slot(imp, .x86_64_abs64);
+                    const via = if (rt == .PLT32) try c.stub(imp, .x86_64_abs64, c.o.symName(c.o.syms[r.r_sym()])) else try c.slot(imp, .x86_64_abs64);
                     try c.add(off, .x86_64_pc32, .{ .key = via, .offset = 0 }, r.r_addend);
                     return 0;
                 },
@@ -1274,7 +1274,7 @@ fn Converter(comptime Ctx: type) type {
                 .PLT32, .PC32 => {
                     const op = if (off >= 1) bytes[@intCast(off - 1)] else 0;
                     if (ty == .PLT32 or op == 0xe8 or op == 0xe9) {
-                        try c.add(off, .x86_64_pc32, .{ .key = try c.stub(t, .x86_64_abs64), .offset = 0 }, r.r_addend);
+                        try c.add(off, .x86_64_pc32, .{ .key = try c.stub(t, .x86_64_abs64, c.o.symName(c.o.syms[r.r_sym()])), .offset = 0 }, r.r_addend);
                         return 0;
                     }
                     try c.add(off, .x86_64_pc32, .{ .key = try c.copied(index, sym) orelse return 0, .offset = 0 }, r.r_addend);
@@ -1314,13 +1314,13 @@ fn Converter(comptime Ctx: type) type {
         /// A stub that jumps through `t`'s slot (`jmp [rip + slot]`, the
         /// slot's relocation of `kind`), content-addressed, so all calls
         /// to one target share it.
-        fn stub(c: *C, t: Target, kind: Atom.Reloc.Kind) Allocator.Error!SymbolKey {
+        fn stub(c: *C, t: Target, kind: Atom.Reloc.Kind, name: []const u8) Allocator.Error!SymbolKey {
             const arena = c.in.arena;
             const targets = try arena.dupe(SymbolKey, &.{try c.slot(t, kind)});
             const relocs = try arena.dupe(Atom.Reloc, &.{.init(2, .x86_64_pc32, 0, -4)});
             const code: []const u8 = &.{ 0xff, 0x25, 0, 0, 0, 0 };
             const key: SymbolKey = .fromContents(.text, .@"8", code, targets, relocs);
-            try c.atoms.append(arena, .{ .key = key, .name = "", .section = .text, .alignment = .@"8", .bytes = code, .targets = targets, .relocs = relocs });
+            try c.atoms.append(arena, .{ .key = key, .name = try std.fmt.allocPrint(arena, "{s}@plt", .{name}), .section = .text, .alignment = .@"8", .bytes = code, .targets = targets, .relocs = relocs });
             return key;
         }
 
@@ -1365,7 +1365,7 @@ fn Converter(comptime Ctx: type) type {
                     std.mem.writeInt(i64, (try c.writable(bytes, copy))[@intCast(off)..][0..8], r.r_addend, .little);
                     try c.add(off, .x86_64_abs64_sym, t, 0);
                 },
-                .PLT32 => try c.add(off, .x86_64_pc32, .{ .key = try c.stub(t, .x86_64_abs64_sym), .offset = 0 }, r.r_addend),
+                .PLT32 => try c.add(off, .x86_64_pc32, .{ .key = try c.stub(t, .x86_64_abs64_sym, c.o.symName(c.o.syms[r.r_sym()])), .offset = 0 }, r.r_addend),
                 else => try c.add(off, .x86_64_pc32, .{ .key = try c.slot(t, .x86_64_abs64_sym), .offset = 0 }, r.r_addend),
             }
         }
