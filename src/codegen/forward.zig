@@ -426,16 +426,16 @@ const Walk = struct {
     /// Loop-invariant loads (`cands`: loads in loops that `forwardLoads`
     /// did not forward, in position order): a load of a scalar whose
     /// address is computed before its innermost loop, or is a field of a
-    /// pointer that is, or of a load that moves too, moves to before the loop when no write in the
-    /// loop may reach its memory (`loopWrites`), and when that memory was
-    /// already read or written through the same base before the loop, or
-    /// is first in the loop, with no call between that might free it
-    /// (`accessedBefore`): the load then cannot fault where the original
-    /// might not have run. The loop becomes `block { loads;
-    /// loop }` in its slot, and the load's users read the moved load
-    /// (`subst`). The moved loads run on the line of the statement before
-    /// the loop. Safety checks stay where they are. Returns how many
-    /// loads moved.
+    /// pointer that is, or of a load that moves too, moves to before the
+    /// loop when no write in the loop may reach its memory (`loopWrites`),
+    /// and when that memory was already read or written through the same
+    /// base before the loop, or is first in the loop, with no call
+    /// between that might free it (`accessedBefore`): the load then
+    /// cannot fault where the original might not have run. The loop
+    /// becomes `block { loads; loop }` in its slot, and the load's users
+    /// read the moved load (`subst`). The moved loads run on the line of
+    /// the statement before the loop. Safety checks stay where they are.
+    /// Returns how many loads moved.
     fn hoistLoads(w: *Walk, gpa: Allocator, cands: []const u32) Allocator.Error!u32 {
         const ir = w.ir;
         const ip = w.ip;

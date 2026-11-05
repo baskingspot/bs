@@ -1276,8 +1276,8 @@ upstream ReleaseSafe's (`bench/runtime.py`, below).
   load's value. Pure values may be folded into their user (an immediate,
   an address, a compare into a branch) or removed when dead, but are not
   hoisted or sunk across blocks. There is no memory SSA, no general alias
-  analysis, no GVN, and no LICM beyond those loads. Line tables stay in source order, which is what a debugger stepping a
-  Debug build expects. This is a rule of the default mode's pass list,
+  analysis, no GVN, and no LICM beyond those loads. Line tables stay in
+  source order, which is what a debugger stepping a Debug build expects. This is a rule of the default mode's pass list,
   not of the SSA form or the allocator: nothing below assumes memory
   operations stay put, so a later mode can relax it.
 - **A pass list per mode.** The driver runs the pass list of the build's
