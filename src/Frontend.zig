@@ -1758,8 +1758,8 @@ fn addMissingFile(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, importer: *co
     const gpa = fe.gpa;
     const f = &importer.file;
     if (!f.zir_ready.load(.acquire)) fe.ensureZir(@constCast(f));
-    // The import's token and name, as written.
-    const token: ?Ast.TokenIndex, const name: []const u8 = tok: {
+    // The import's token.
+    const token: ?Ast.TokenIndex, _ = tok: {
         const imports_index = f.zir.extra[@backingInt(Zir.ExtraIndex.imports)];
         if (imports_index == 0) break :tok .{ null, job.file.sub_path };
         const imports = f.zir.extraData(Zir.Inst.Imports, imports_index);
@@ -1796,7 +1796,8 @@ fn addMissingFile(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, importer: *co
         });
     };
     try errors.addRootErrorMessage(.{
-        .msg = try errors.printString("unable to load \"{s}\": {t}", .{ name, err }),
+        // As upstream, the file by its base name; its path is the location.
+        .msg = try errors.printString("unable to load \"{s}\": {t}", .{ std.fs.path.basename(job.file.sub_path), err }),
         .src_loc = try errors.addSourceLocation(.{ .src_path = try errors.addString(job.file.display_path), .line = 0, .column = 0, .span_start = 0, .span_main = 0, .span_end = 0 }),
         .notes_len = 1,
     });

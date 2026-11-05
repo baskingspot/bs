@@ -1,10 +1,15 @@
 const missing = @import("does_not_exist.zig");
+// Named by its base name, at its path, as upstream.
+const nested = @import("sub/also_missing.zig");
 
 pub fn main() void {
     _ = missing;
+    _ = nested;
 }
 
 // error
 // does_not_exist.zig:1:1: error[bad-import]: unable to load "does_not_exist.zig": FileNotFound
 //   note missing_import.zig:1:25: file imported here
-// 1 error
+// sub/also_missing.zig:1:1: error[bad-import]: unable to load "also_missing.zig": FileNotFound
+//   note missing_import.zig:3:24: file imported here
+// 2 errors
