@@ -1,0 +1,969 @@
+{
+ "format": 1,
+ "target": "x86_64-linux",
+ "compiler": "zig 0.17.1",
+ "cases": {
+  "address_of_extern_var_as_const.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "address_space_pointer_access_chaining_pointer_to_optional_array.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "address_spaces_pointer_access_chaining_array_pointer.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "address_spaces_pointer_access_chaining_complex.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "address_spaces_pointer_access_chaining_struct_pointer.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "ambiguous_reference.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "array_in_anon_struct.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "array_sentinel_cursor.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "blocks.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "compile_error.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "comptime_aggregate_print.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "decl_qualifier_cursor.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "decl_value_arena.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "default_value_references_comptime_var.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "dereferencing_though_multiple_pointers_with_address_spaces.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "disable_stack_tracing.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "Cannot print stack trace: stack tracing is disabled\nCannot print stack trace: stack tracing is disabled\nstack trace index: 0\n",
+   "status": "pass"
+  },
+  "error_union_variant_is_runtime_known.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "exit.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "export_from_body_of_coerced_fn.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "export_override_libc.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "f32_passed_to_variadic_fn.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "f64: 2.000000\nf32: 10.000000\n",
+   "status": "pass"
+  },
+  "float_mode_optimized_reduce.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "fn_typeinfo_passed_to_comptime_fn.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "for_loop.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "function_redeclaration.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "global_variable_redeclaration.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "hello_world.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "hello world!\n",
+   "status": "pass"
+  },
+  "inherit_want_safety.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "inner_func_accessing_outer_var.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "large_slices.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "maximum_sized_integer_literal.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "nested_blocks.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "no_compile_panic_for_unchecked_arith.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "non_leaf_functions.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "optionals.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "passing_u0_to_function.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "pointer_keeps_address_space.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "pointer_keeps_address_space_when_taking_address_of_dereference.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "pointer_to_explicit_generic_address_space_coerces_to_implicit_pointer.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "recursive_fibonacci.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "rem.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "returning_undefined_sentinel_terminated_const_u8_slice.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "returns_in_try.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "runtime_bitwise_and.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "runtime_bitwise_or.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@alignCast misaligned.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@enumFromInt - no matching tag value.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@enumFromInt truncated bits - exhaustive.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@enumFromInt truncated bits - nonexhaustive.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@errorCast error not present in destination.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@errorCast error union casted to disjoint set.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intCast negative to u0.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intCast positive to u0.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intFromFloat cannot fit - boundary case - signed max.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intFromFloat cannot fit - boundary case - signed min.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intFromFloat cannot fit - boundary case - u0 max.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intFromFloat cannot fit - boundary case - u0 min.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intFromFloat cannot fit - boundary case - unsigned max.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intFromFloat cannot fit - boundary case - unsigned min.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intFromFloat cannot fit - boundary case - vector max.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intFromFloat cannot fit - boundary case - vector min.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intFromFloat cannot fit - negative out of range.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intFromFloat cannot fit - negative to unsigned.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@intFromFloat cannot fit - positive out of range.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@ptrFromInt address zero to non-optional byte-aligned pointer.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@ptrFromInt address zero to non-optional pointer.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@ptrFromInt with misaligned address.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@tagName on corrupted enum value.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/@tagName on corrupted union value.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/array slice sentinel mismatch vector.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/array slice sentinel mismatch.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/backing_int_no_matching_tag_value.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/bad union field access.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/bitcast_to_enum_no_matching_tag_value.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/calling panic.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/cast []u8 to bigger slice of wrong size.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/cast integer to global error and no code matches.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/deref_null_c_pointer.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/empty slice with sentinel out of bounds.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/exact division failure - vectors.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/exact division failure.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/for_len_mismatch.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/for_len_mismatch_three.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/ignored expression integer overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/integer addition overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/integer division by zero - vectors.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/integer division by zero.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/integer multiplication overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/integer negation overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/integer subtraction overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/load_uninstantiable_enum.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/load_uninstantiable_enum_from_slice.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/load_uninstantiable_union.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/load_uninstantiable_union_from_slice.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/memcpy_alias.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/memcpy_len_mismatch.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/memmove_len_mismatch.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/memset_array_undefined_bytes.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/memset_array_undefined_large.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/memset_slice_undefined_bytes.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/memset_slice_undefined_large.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/modrem by zero.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/modulus by zero.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/noreturn returned.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/optional unwrap operator on C pointer.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/optional unwrap operator on null pointer.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/optional_empty_error_set.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/out of bounds array slice by length.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/out of bounds slice access.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/pointer casting null to non-optional pointer.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/pointer casting to null function pointer.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/pointer slice sentinel mismatch.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/ref_deref_null_c_pointer.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/remainder division by zero.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/shift left by huge amount.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/shift right by huge amount.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/signed integer division overflow - vectors.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/signed integer division overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/signed integer not fitting in cast to unsigned integer - widening.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/signed integer not fitting in cast to unsigned integer.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/signed shift left overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/signed shift right overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/signed-unsigned vector cast.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slice by length sentinel mismatch on lhs.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slice by length sentinel mismatch on rhs.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slice sentinel mismatch - floats.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slice sentinel mismatch - optional pointers.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slice slice sentinel mismatch.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slice start index greater than end index.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slice with sentinel out of bounds - runtime len.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slice with sentinel out of bounds.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slice_cast_change_len_0.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slice_cast_change_len_1.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slice_cast_change_len_2.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slicing null C pointer - runtime len.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/slicing null C pointer.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/switch else on corrupt enum value - one prong.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/switch else on corrupt enum value - union.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/switch else on corrupt enum value.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/switch on corrupted enum value.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/switch on corrupted union value.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/truncating vector cast.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/unreachable.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/unsigned integer not fitting in cast to signed integer - same bit count.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/unsigned shift left overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/unsigned shift right overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/unsigned-signed vector cast.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/unwrap error switch.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/unwrap error.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/value does not fit in shortening cast - u0.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/value does not fit in shortening cast.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/vector integer addition overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/vector integer multiplication overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/vector integer negation overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/vector integer subtraction overflow.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "safety/zero casted to error.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "save_function_return_values_in_callee_preserved_register.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "sentinel_references_comptime_var.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "setting_an_address_space_on_a_local_variable.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "simple_addition_and_subtraction.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "simple_if_statement.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "std_debug_no_panic.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "std_debug_simple_panic.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "taking_pointer_of_global_tagged_union.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "try_in_comptime_in_struct_in_test.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "tuple_assign_cursor.zig": {
+   "kind": "compile",
+   "status": "pass"
+  },
+  "type_names.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "union_unresolved_layout.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  },
+  "unused_vars.zig": {
+   "kind": "error",
+   "status": "pass"
+  },
+  "while_loops.zig": {
+   "kind": "run",
+   "exit": 0,
+   "stdout": "",
+   "status": "pass"
+  }
+ },
+ "summary": {
+  "cases": 170,
+  "pass": 170
+ }
+}

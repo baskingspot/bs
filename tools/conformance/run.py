@@ -56,6 +56,15 @@ error lines (location and message) as the case expects, "same location"
 when only the messages differ, and otherwise "different", "accepted" (no
 error), "crash" or "timeout". Notes are compared separately.
 
+With --cases, the measure is the rest of upstream's test/cases (the
+run cases, including test/cases/safety, plus compile and error cases)
+that apply to the target with the self-hosted backend: each built as
+upstream's case harness builds it (root tmp.zig, Debug), a run case run
+and its exit status (0) and stdout compared with the manifest's, a
+compile case only built, an error case compared as --compile-errors
+compares. The cases upstream passes are recorded by --cases --upstream
+in baseline/cases-<target>.json.
+
 Portable to Linux and macOS: Python 3 standard library only.
 """
 
@@ -1280,6 +1289,229 @@ def compile_errors_target(compiler, cfg, args, workdir):
         print(f"  crash at {frame}: {len(names)} ({', '.join(sorted(names)[:3])}{', ...' if len(names) > 3 else ''})")
 
 
+# ---------------------------------------------------------------- cases mode
+
+CASES_ROOT = UPSTREAM_TEST / "cases"
+
+
+def parse_manifest(src):
+    """Upstream's test manifest (test/src/Cases.zig, TestManifest.parse):
+    the last block of `//` lines, its first line the case type, then
+    key=value lines up to a blank comment line, then the trailing lines
+    (a run case's expected stdout). None without a manifest."""
+    lines = src.rstrip(" \r\n\t").split("\n")
+    start = len(lines)
+    while start > 0 and lines[start - 1].startswith("//"):
+        start -= 1
+    block = [ln.rstrip("\r") for ln in lines[start:] if ln.rstrip("\r")]
+    if not block:
+        return None
+    kind = block[0][2:].strip(" \t")
+    cfg, i = {}, 1
+    while i < len(block):
+        text = block[i][2:].strip(" \t")
+        i += 1
+        if not text:
+            break
+        key, _, value = text.partition("=")
+        cfg[key] = value
+    # TrailingIterator: '//' alone is an empty line, else the text after
+    # '// ', right-trimmed; trailingSplit joins them with newlines.
+    trailing = ["" if len(ln) == 2 else ln[3:].rstrip(" \t") for ln in block[i:]]
+    return kind, cfg, "\n".join(trailing)
+
+
+def case_target(cfg, kind, target):
+    """The `-target` a case is built for on bs's `target` ("native" for
+    none), or None when the case does not run there: its targets (default
+    native, plus wasm) must name the target and its backends the
+    self-hosted one."""
+    default = "native" if kind == "error" else "native,wasm32-wasi"
+    arch_os = target.split("-")[:2]
+    backends = cfg.get("backend", "auto").split(",")
+    if not any(b in ("auto", "selfhosted", "stage2") for b in backends):
+        return None
+    for t in cfg.get("target", default).split(","):
+        parts = t.split("-")
+        if (
+            t == "native"
+            or parts[:2] == arch_os
+            or t in ("x86_64-native", "native-linux")
+            and arch_os == ["x86_64", "linux"]
+        ):
+            if parts[:2] != arch_os:
+                return "native"
+            # With libc, glibc: bs links no musl, the default ABI of
+            # x86_64-linux.
+            if len(parts) == 2 and cfg.get("link_libc") == "true" and arch_os[1] == "linux":
+                return t + "-gnu"
+            return t
+    return None
+
+
+def collect_cases(cfg):
+    """Upstream's test/cases other than compile_errors (the --compile-errors
+    mode's): (name, path, kind, config, trailing, -target) for each case
+    that runs on the target."""
+    cases = []
+    for path in sorted(CASES_ROOT.rglob("*.zig")):
+        rel_path = path.relative_to(CASES_ROOT)
+        if rel_path.parts[0] == "compile_errors":
+            continue
+        m = parse_manifest(path.read_text(errors="replace"))
+        if not m or m[0] not in ("run", "compile", "error"):
+            continue
+        target = case_target(m[1], m[0], cfg["zig_target"])
+        if target:
+            cases.append((str(rel_path), path, *m, target))
+    return cases
+
+
+def run_one_case(compiler, case, args, workdir):
+    """Builds a case as upstream's harness builds it (root file tmp.zig in
+    module root, Debug) and runs a run case. The result: `status` (pass,
+    compile_error, compile_crash, compile_timeout, wrong_exit, wrong_stdout,
+    run_timeout; for error cases, the --compile-errors statuses) and what
+    was observed."""
+    name, path, kind, cfg, trailing, target = case
+    out_dir = workdir / "cases" / re.sub(r"[^\w.-]", "_", name)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    if kind == "error":
+        _, expected = parse_case(path)
+        if args.upstream:
+            # Upstream passes when each expected line ends one of its
+            # diagnostic lines, as its harness matches them.
+            root = out_dir / "tmp.zig"
+            shutil.copyfile(path, root)
+            code, _out, err, _t = run_process(
+                [
+                    str(compiler),
+                    "build-obj",
+                    *(["-target", target] if target != "native" else []),
+                    f"-Mroot={root}",
+                    "-fno-emit-bin",
+                ],
+                out_dir,
+                args.compile_timeout,
+            )
+            got = [ln.split("tmp.zig", 1)[-1] for ln in err.splitlines()]
+            ok = code > 0 and all(any(g.endswith(e.lstrip(":?")) for g in got) for e in expected)
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return name, {"kind": kind, "status": "pass" if ok else "different"}
+        # The --compile-errors comparison, on these few outside that
+        # directory.
+        _, r = run_case(compiler, path, cfg, expected, args, out_dir)
+        r["kind"], r["status"] = kind, {"exact": "pass"}.get(r["status"], r["status"])
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return name, r
+    root = out_dir / "tmp.zig"
+    shutil.copyfile(path, root)
+    for imp in filter(None, cfg.get("imports", "").split(",")):
+        shutil.copyfile(path.parent / imp, out_dir / imp)
+    is_test = cfg.get("is_test") == "true"
+    mode = cfg.get("output_mode", "Exe" if kind == "run" else "Obj").lower()
+    bin_path = out_dir / "case"
+    argv = [str(compiler), "test" if is_test else {"exe": "build-exe", "lib": "build-lib", "obj": "build-obj"}[mode]]
+    if target != "native":
+        argv += ["-target", target]
+    argv.append(f"-Mroot={root}")
+    if is_test:
+        argv.append("--test-no-exec")
+    if cfg.get("link_libc") == "true":
+        argv.append("-lc")
+    if cfg.get("cpu_features"):
+        argv.append(f"-mcpu=baseline{cfg['cpu_features']}")
+    for key, flag in (("pic", "PIC"), ("pie", "PIE")):
+        if cfg.get(key) in ("true", "false"):
+            argv.append(f"-f{'' if cfg[key] == 'true' else 'no-'}{flag}")
+    argv.append("-fno-emit-bin" if cfg.get("emit_bin") == "false" else f"-femit-bin={bin_path}")
+    code, _out, err, timed_out = run_process(argv, out_dir, args.compile_timeout)
+    r = {"kind": kind}
+    if timed_out:
+        r["status"] = "compile_timeout"
+    elif code < 0 or code != 0 and "panic: " in err and not re.search(r"^\S+:\d+:\d+: error", err, re.MULTILINE):
+        r["status"], r["crash"] = "compile_crash", crash_frame(err)
+    elif code != 0:
+        r["status"], r["log"] = "compile_error", err[-LOG_LIMIT:]
+    elif kind != "run":
+        r["status"] = "pass"
+    else:
+        code, out, err, timed_out = run_process([str(bin_path)], out_dir, args.run_timeout)
+        r["exit"], r["stdout"] = code, out[-LOG_LIMIT:]
+        if timed_out:
+            r["status"] = "run_timeout"
+        elif code != 0:
+            r["status"], r["log"] = "wrong_exit", err[-LOG_LIMIT:]
+        elif not is_test and out != trailing:
+            r["status"], r["expected_stdout"] = "wrong_stdout", trailing
+        else:
+            r["status"] = "pass"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    return name, r
+
+
+def cases_target(compiler, cfg, args, workdir):
+    """--cases: upstream's test/cases (run, compile and error cases outside
+    compile_errors), against baseline/cases-<target>.json."""
+    os.environ["BS_CACHE"] = "off"
+    cases = collect_cases(cfg)
+    if args.files:
+        cases = [c for c in cases if c[0] in args.files or c[1].name in args.files]
+    results = {}
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        futs = [ex.submit(run_one_case, compiler, c, args, workdir) for c in cases]
+        for f in as_completed(futs):
+            name, r = f.result()
+            results[name] = r
+            if args.verbose:
+                print(f"  {name}: {r['status']}", file=sys.stderr)
+    data = {"format": FORMAT, "target": cfg["name"], "compiler": str(compiler), "cases": dict(sorted(results.items()))}
+    baseline_path = BASELINE_DIR / f"cases-{cfg['name']}.json"
+    if args.upstream:
+        zig_version = subprocess.run(
+            [str(compiler), "version"], capture_output=True, text=True, check=False
+        ).stdout.strip()
+        data["compiler"] = f"zig {zig_version}"
+        data["summary"] = {"cases": len(results), "pass": sum(r["status"] == "pass" for r in results.values())}
+        write_json(baseline_path, data)
+        print(f"{cfg['name']} cases (upstream): {data['summary']['pass']}/{len(results)} pass -> {rel(baseline_path)}")
+        return
+    baseline = json.loads(baseline_path.read_text())["cases"] if baseline_path.exists() else {}
+    up_pass = [n for n, b in baseline.items() if b["status"] == "pass" and (n in results or not args.files)]
+    passed = [n for n in up_pass if results.get(n, {}).get("status") == "pass"]
+    # Cases bs passes and upstream does not, and those where bs's result
+    # differs from upstream's on a case neither passes.
+    extra = sorted(
+        n for n, r in results.items() if r["status"] == "pass" and baseline.get(n, {}).get("status") != "pass"
+    )
+    for n, r in results.items():
+        b = baseline.get(n)
+        if b:
+            r["upstream"] = b["status"]
+    counts = {}
+    for r in results.values():
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    pct = 100 * len(passed) / len(up_pass) if up_pass else 0
+    data["summary"] = {
+        "pass": len(passed),
+        "of": len(up_pass),
+        "percent": round(pct, 2),
+        "cases": len(results),
+        **counts,
+    }
+    out_path = args.out or workdir / f"cases-{cfg['name']}.json"
+    write_json(out_path, data)
+    fails = ", ".join(f"{counts[k]} {k.replace('_', ' ')}" for k in sorted(counts) if k != "pass")
+    print(
+        f"{cfg['name']} cases: {len(passed)}/{len(up_pass)} pass ({pct:.1f}% of upstream); "
+        f"{len(results)} cases{'; ' + fails if fails else ''}"
+        f"{'; ' + str(len(extra)) + ' pass only with bs' if extra else ''} -> {rel(out_path)}"
+    )
+    for n in sorted(set(up_pass) - set(passed)):
+        print(f"  {n}: {results.get(n, {}).get('status', 'missing')}")
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -1324,6 +1556,11 @@ def main():
         "--compile-errors",
         action="store_true",
         help="bs only: measure diagnostics on upstream's test/cases/compile_errors instead of test/behavior",
+    )
+    p.add_argument(
+        "--cases",
+        action="store_true",
+        help="measure upstream's test/cases outside compile_errors (run, compile and error cases), against baseline/cases-<target>.json",
     )
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
@@ -1370,6 +1607,8 @@ def main():
                 print(f"{name}: not run (needs an {name} host)")
             elif args.compile_errors:
                 compile_errors_target(compiler, cfg, args, args.workdir)
+            elif args.cases:
+                cases_target(compiler, cfg, args, args.workdir)
             elif args.std or args.c_abi:
                 std_target(compiler, cfg, args, args.workdir)
             elif args.upstream:

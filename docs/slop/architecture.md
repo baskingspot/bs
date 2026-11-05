@@ -7501,6 +7501,19 @@ and `zig build -Dtarget=aarch64-macos`.
   matters: upstream built for the host CPU runs two fewer tests (the
   bitsliced AES cross-checks) and runs `math.lerp`, which it skips without
   FMA.
+- `run.py --cases` measures the rest of upstream's `test/cases`: the run
+  cases (with `test/cases/safety`, whose panic handlers exit 0 only for
+  the expected panic message), the compile cases, and the few error
+  cases outside `compile_errors`, those whose targets include bs's and
+  whose backends include the self-hosted one (170 on x86_64-linux). Each
+  is built as upstream's case harness (test/src/Cases.zig) builds it:
+  root `tmp.zig` in module `root`, Debug, the manifest's `-target`
+  verbatim (`native` when it names none; with `link_libc`, glibc, since
+  bs links no musl). A run case passes when its binary exits 0 with the
+  manifest's stdout, a compile case when it builds, an error case when
+  `--compile-errors` would call it exact. `run.py --upstream --cases`
+  records upstream's results in `baseline/cases-<target>.json`, and the
+  measure is the share of upstream's passes that bs passes.
 
 ## Diagnostics (designed 2026-11-03, accepted by the owner; being built)
 
