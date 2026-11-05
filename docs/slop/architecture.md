@@ -4530,9 +4530,10 @@ splits only what must be split.
   are not copied: a descriptor's symbol (`_x`) resolves to its init
   atom, and the TLVP relocations to it become `aarch64_tlvp_*`, so C's
   and Zig's thread-locals share the writer's descriptors.
-- Dropped: `__DWARF` (see debug info), `__LD,__compact_unwind` and
-  `__TEXT,__eh_frame` (see unwind), `__LLVM`, `__llvm_addrsig`,
-  `__apple_*` accelerator tables.
+- Dropped: `__DWARF` (see debug info), `__LD,__compact_unwind` (read
+  into unwind records, see unwind), `__LLVM`, `__llvm_addrsig`,
+  `__apple_*` accelerator tables. `__TEXT,__eh_frame` is copied (see
+  unwind).
 - Objective-C (decided 2026-11-05). The sections libobjc finds by name
   (`__objc_classlist`, `__objc_nlclslist`, `__objc_catlist`,
   `__objc_nlcatlist`, `__objc_protolist`, `__objc_imageinfo`,
@@ -4576,30 +4577,75 @@ BRANCH26 after it; UNSIGNED keeps its addend in the field.
   `aarch64_got_load_*` (the writer already relaxes an image's own
   targets); TLVP_LOAD_PAGE21/PAGEOFF12 → `aarch64_tlvp_*`.
 - SUBTRACTOR + UNSIGNED (A - B): within one atom it is a constant the
-  converter writes; in `__eh_frame` see unwind; elsewhere an error.
-- POINTER_TO_GOT (4-byte pcrel, personality pointers): a
-  content-addressed GOT-like slot atom, as ELF's C GOT slots, and a new
-  32-bit PC-relative aarch64 kind, `aarch64_pc32`.
+  converter writes; with B the section's own atom (a section without
+  pieces, such as `__eh_frame`'s FDE pc_begin and LSDA fields) and A
+  elsewhere it is `aarch64_prel64` or `aarch64_prel32` to A; elsewhere
+  an error.
+- POINTER_TO_GOT (4-byte pcrel; the personality pointers of
+  `__eh_frame` CIEs and of `__gcc_except_tab`'s type tables) →
+  `aarch64_prel32` to a content-addressed 8-byte slot atom (rodata
+  with a pointer, so `__DATA_CONST,__const`) holding the target (`gotSlot`, as ELF's C GOT slots;
+  a bind for an import, a rebase otherwise), with addend 0: the field
+  holds minus its own offset from the assembler, not an addend, and
+  ld64 and upstream compute G − P. MachO.zig applies `aarch64_prel32`
+  and `aarch64_prel64` (S + A − P) to image addresses, which no slide
+  changes.
 - AUTHENTICATED_POINTER (arm64e) is an error.
 - C reaches libSystem data through the GOT (`___stderrp`), and calls it
   through stubs; a direct PAGE21 to an import is an error, as ld64's.
 
 **Unwind (stage A2).** zig cc's Debug functions mostly use DWARF mode
-(compact encoding 0x03000000: ubsan's calls and the frame layout), so
-`__eh_frame` is needed, unlike for bs's own frames.
-- Each `__compact_unwind` entry (function, length, encoding,
-  personality, LSDA, the first and the last two by relocation) becomes
-  an input unwind record for the writer's `__unwind_info`, next to
-  bs's frames: personalities in its personality array (through their
-  GOT slots), LSDAs in its LSDA index (`__gcc_except_tab` atoms).
-- `__eh_frame` is copied as ELF's stage B copies `.eh_frame` (CIEs as
-  they are, FDEs whose function the link drops dropped; Mach-O's
-  pc_begin is a SUBTRACTOR pair against the FDE's own address, i.e.
-  pcrel), into a new `__TEXT,__eh_frame`, and a DWARF-mode entry's
-  encoding gets its FDE's offset in that section. A function with an
-  FDE and no compact entry gets a DWARF-mode entry.
-- Check: a throw caught across C++ frames on the Mac (libunwind reads
-  `__unwind_info` first).
+(compact encoding 0x03000000), and Objective-C `@try` and C++ `try`
+need their LSDAs, so `__eh_frame` is needed, unlike for bs's own frames.
+libunwind looks a pc up in `__unwind_info` first and treats an entry
+with encoding 0 as "no unwind info" (it does not fall back to
+`__eh_frame` then); `__eh_frame` alone serves only a stripped
+executable, which has no `__unwind_info`.
+- `__eh_frame` is copied whole per object as an `.objc` atom named
+  `.__eh_frame` into a new `__TEXT,__eh_frame` after `__unwind_info`
+  (ld64's flags), 4-byte aligned so no zero padding between objects
+  reads as libunwind's terminator. pc_begin and LSDA are SUBTRACTOR
+  pairs (above), CIE personalities POINTER_TO_GOT. FDEs of functions
+  the link drops stay (their pc_begin still resolves: input atoms are
+  not garbage-collected).
+- Each `__LD,__compact_unwind` entry (function, length, encoding,
+  personality, LSDA) becomes a `MachO.UnwindRecord`: function atom key
+  and offset, length, encoding, and for DWARF mode the FDE's
+  `__eh_frame` atom and offset, found from the FDE's pc_begin
+  relocation (its personality and LSDA are the FDE's), and otherwise
+  its personality's GOT slot (`gotSlot`) and its LSDA (a
+  `__gcc_except_tab` target). Clang gives a function with a personality
+  a compact encoding and no FDE whenever compact unwind describes its
+  frame (libc++'s inline `__throw_*` helpers), so those need
+  `__unwind_info`'s personality array and LSDA index, as ld64 writes
+  them. The converter returns the records in `Converted.unwind`, Emit
+  passes them as `MachO.Options.unwind` (keyed links only).
+- The link resolves each record's atom through the symbol table (a
+  deduplicated atom's record describes the kept copy) and sorts them by
+  atom and offset, and drops one past its atom's end or overlapping
+  the one before (so both walk passes list every record). It numbers
+  the personalities' slot atoms in that order (the first three; a
+  record with a fourth gets encoding 0) and sets each record's
+  UNWIND_PERSONALITY_MASK bits and, if it has an LSDA,
+  UNWIND_HAS_LSDA. The section is the header, the personality array
+  (the slots' offsets from __TEXT), the first-level index, the LSDA
+  array (function offset, LSDA offset), the leading page and the
+  chunks' pages. Each chunk's first LSDA entry is the count of LSDA
+  records before its atom range, so chunks write their LSDA entries in
+  parallel, in address order; `writeUnwindIndex` finds each index
+  entry's first LSDA by binary search. When there are any records,
+  each debug chunk's `walkDebug` also lists the kept text between its functions, by atom
+  range (from its first entry's atom to the next chunk's, so no chunk
+  reads another's `file_of`): each record's encoding over its range and
+  0 over the rest, merging runs of 0. A DWARF-mode encoding gets its
+  FDE's offset in `__eh_frame` in the low 24 bits in the write pass;
+  the count pass uses the bare mode, which takes the same branches, so
+  both passes count the same entries. Without records the pages are
+  as before.
+- Checked on the Mac: an Objective-C `@throw` caught by `@catch` in the
+  same C function returns, as upstream's (exit 3), stripped and not;
+  with `-lc++`, a C++ program that throws through libc++'s helpers and
+  rethrows prints and returns what upstream's does.
 
 **Debug info (stage A3; decided 2026-11-04: rewrite into the dSYM).**
 A Mach-O object's DWARF has no relocations for offsets into its own

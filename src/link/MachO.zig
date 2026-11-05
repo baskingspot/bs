@@ -133,6 +133,10 @@ pub const Options = struct {
     /// The compilation directory that relative `Atom.Debug.file` paths are
     /// relative to (DW_AT_comp_dir).
     comp_dir: []const u8 = ".",
+    /// The input objects' functions' unwind entries (their
+    /// `__compact_unwind`), which `__unwind_info` lists between bs's
+    /// functions. Not with `symbols`.
+    unwind: []const UnwindRecord = &.{},
     /// As `Elf.Options.aliases`; with `symbols`, `Symbols.aliases` numbers
     /// them.
     aliases: []const Elf.Alias = &.{},
@@ -315,6 +319,7 @@ const Sect = enum(u5) {
     stubs,
     text_const,
     unwind_info,
+    eh_frame,
     got,
     mod_init_func,
     data_const,
@@ -341,6 +346,9 @@ const sect_info = [n_sects]struct { seg: Seg, name: []const u8, flags: u32 }{
     .{ .seg = .text, .name = "__stubs", .flags = macho.S_SYMBOL_STUBS | macho.S_ATTR_PURE_INSTRUCTIONS | macho.S_ATTR_SOME_INSTRUCTIONS },
     .{ .seg = .text, .name = "__const", .flags = macho.S_REGULAR },
     .{ .seg = .text, .name = "__unwind_info", .flags = macho.S_REGULAR },
+    // The objects' CFI, where libunwind finds the FDEs of their DWARF-mode
+    // functions when __unwind_info has no encoding for them.
+    .{ .seg = .text, .name = "__eh_frame", .flags = macho.S_COALESCED | macho.S_ATTR_NO_TOC | macho.S_ATTR_STRIP_STATIC_SYMS | macho.S_ATTR_LIVE_SUPPORT },
     .{ .seg = .data_const, .name = "__got", .flags = macho.S_NON_LAZY_SYMBOL_POINTERS },
     .{ .seg = .data_const, .name = "__mod_init_func", .flags = macho.S_MOD_INIT_FUNC_POINTERS },
     .{ .seg = .data_const, .name = "__const", .flags = macho.S_REGULAR },
@@ -387,9 +395,11 @@ fn zeroFill(s: usize) bool {
     return s == bss or s == thread_bss;
 }
 
-/// The output section of an `.objc` atom, named `.<section name>`.
+/// The output section of an `.objc` atom, named `.<section name>`:
+/// an Objective-C section, or `__eh_frame`.
 fn objcSect(name: []const u8) ?u5 {
     if (name.len == 0 or name[0] != '.') return null;
+    if (std.mem.eql(u8, name[1..], "__eh_frame")) return @backingInt(Sect.eh_frame);
     for (sect_info, 0..) |info, s| {
         if (s >= @backingInt(Sect.objc_classlist) and s <= @backingInt(Sect.objc_superrefs) and std.mem.eql(u8, name[1..], info.name)) return @intCast(s);
     }
@@ -452,7 +462,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const n_partitions = std.math.ceilPowerOfTwoAssert(usize, @min(n_threads, 8));
 
     const numbered = options.symbols;
-    if (numbered) |s| if (s.atoms.len != n_atoms or s.entry >= s.len or s.imports.len != options.imports.len or s.aliases.len != options.aliases.len or options.local_symbols.len != 0 or options.dylib != null) return error.InvalidSymbols;
+    if (numbered) |s| if (s.atoms.len != n_atoms or s.entry >= s.len or s.imports.len != options.imports.len or s.aliases.len != options.aliases.len or options.local_symbols.len != 0 or options.dylib != null or options.unwind.len != 0) return error.InvalidSymbols;
     var symbols: SymbolTable = if (numbered == null) try .init(n_atoms + options.aliases.len, n_partitions) else .empty;
     defer symbols.deinit();
     // With numbered symbols, each number's address, import, or value.
@@ -474,6 +484,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     defer gpa.free(file_of);
     const unwind_pages = try gpa.alloc(UnwindPage, n_debug_chunks);
     defer gpa.free(unwind_pages);
+    @memset(unwind_pages, .{ .count = 0, .off = 0, .first = 0 });
     // Atom chunks, then debug chunks.
     const failures = try gpa.alloc(?Failure, @max(n_chunks + n_debug_chunks, n_partitions));
     defer gpa.free(failures);
@@ -514,6 +525,79 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         try parallel(&l, Link.layOutNumbered, io, n_threads, n_chunks);
     }
     try l.check(diag);
+    // The input objects' unwind records, by kept atom and offset; a
+    // record of an atom deduplicated away describes the kept copy's code.
+    var recs: std.ArrayList(Link.Rec) = .empty;
+    defer recs.deinit(gpa);
+    if (options.unwind.len > 0) {
+        try recs.ensureTotalCapacityPrecise(gpa, options.unwind.len);
+        for (options.unwind) |u| {
+            const atom = symbols.get(u.atom) orelse continue;
+            if (places[atom].section != text) continue;
+            const fde: ?u64 = if (u.fde) |f| symbols.get(f.atom) else null;
+            const pers: ?u64 = if (u.personality) |k| symbols.get(k) else null;
+            const lsda: ?u64 = if (u.lsda) |f| symbols.get(f.atom) else null;
+            recs.appendAssumeCapacity(.{
+                .pers_atom = if (pers) |a| @intCast(a) else Link.no_fde,
+                .lsda_atom = if (lsda) |a| @intCast(a) else Link.no_fde,
+                .lsda_offset = if (u.lsda) |f| f.offset else 0,
+                .atom = @intCast(atom),
+                .offset = u.offset,
+                .length = u.length,
+                .encoding = u.encoding,
+                .fde_atom = if (fde) |f| @intCast(f) else Link.no_fde,
+                .fde_offset = if (u.fde) |f| f.offset else 0,
+            });
+        }
+        std.mem.sort(Link.Rec, recs.items, {}, Link.Rec.lessThan);
+        // Each record within its atom and after the one before, so that
+        // `gapEntries` lists every one and counts LSDAs as here.
+        var kept: usize = 0;
+        for (recs.items) |r| {
+            if (r.offset >= input.atom(r.atom).bytes.len) continue;
+            if (kept > 0 and recs.items[kept - 1].atom == r.atom and r.offset < @as(u64, recs.items[kept - 1].offset) + recs.items[kept - 1].length) continue;
+            recs.items[kept] = r;
+            kept += 1;
+        }
+        recs.shrinkRetainingCapacity(kept);
+        // Personalities and LSDAs, which `__unwind_info` has only with
+        // debug chunks.
+        if (n_debug > 0) {
+            for (recs.items) |*r| {
+                if (r.pers_atom != Link.no_fde) {
+                    const i = for (l.personalities[0..l.n_personalities], 1..) |p, i| {
+                        if (p == r.pers_atom) break i;
+                    } else if (l.n_personalities < l.personalities.len) new: {
+                        l.personalities[l.n_personalities] = r.pers_atom;
+                        l.n_personalities += 1;
+                        break :new l.n_personalities;
+                    } else {
+                        // A fourth personality: no unwind info.
+                        r.encoding = 0;
+                        r.lsda_atom = Link.no_fde;
+                        continue;
+                    };
+                    r.encoding |= @as(u32, @intCast(i)) << unwind_personality_shift;
+                }
+                if (r.lsda_atom != Link.no_fde) {
+                    r.encoding |= unwind_has_lsda;
+                    l.n_lsdas += 1;
+                }
+            }
+        } else {
+            for (recs.items) |*r| r.lsda_atom = Link.no_fde;
+        }
+        l.recs = recs.items;
+        // Each debug chunk's first LSDA: those of the records before its
+        // atoms (see `walkDebug`).
+        var r: usize = 0;
+        var lsdas: u32 = 0;
+        for (unwind_pages, 0..) |*page, chunk| {
+            const lo: u32 = if (chunk == 0) 0 else @intCast(input.debugAtom(chunk * Dwarf.chunk_len));
+            while (r < recs.items.len and recs.items[r].atom < lo) : (r += 1) lsdas += @intFromBool(recs.items[r].lsda_atom != Link.no_fde);
+            page.lsda = lsdas;
+        }
+    }
     // Size the debug chunks, which needs only where atoms went.
     if (n_debug > 0) {
         try parallel(&l, Link.layOutDebug, io, n_threads, n_debug_chunks);
@@ -658,7 +742,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     if (n_debug > 0) {
         var n_pages: usize = 0;
         for (unwind_pages) |p| n_pages += unwindPageCount(p.count);
-        var at = unwindPagesOff(n_pages) + unwind_lead_page_size;
+        l.unwind_lsda_off = unwindLsdaOff(l.n_personalities, n_pages);
+        var at = unwindPagesOff(l.n_personalities, n_pages, l.n_lsdas) + unwind_lead_page_size;
         for (unwind_pages) |*p| {
             p.off = at;
             at += unwindChunkSize(p.count);
@@ -912,7 +997,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         try parallel(&l, Link.copyNumbered, io, n_threads, n_chunks);
     }
     try l.check(diag);
-    if (n_debug > 0) writeUnwindIndex(buf[starts[unwind_info]..][0..sizes[unwind_info]], unwind_pages, @intCast(starts[text]), @intCast(starts[text] + sizes[text]));
+    if (n_debug > 0) {
+        var personalities: [3]u32 = undefined;
+        for (l.personalities[0..l.n_personalities], personalities[0..l.n_personalities]) |atom, *off| off.* = @intCast(l.atomAddr(atom) - base_address);
+        writeUnwindIndex(buf[starts[unwind_info]..][0..sizes[unwind_info]], unwind_pages, personalities[0..l.n_personalities], l.n_lsdas, @intCast(starts[text]), @intCast(starts[text] + sizes[text]));
+    }
 
     // GOT slots: one bind per import. Stubs: load the slot and jump.
     for (0..n_imports) |i| {
@@ -1265,11 +1354,16 @@ const unwind_lead_page_size = unwind_page_header_size + unwind_entry_size;
 /// The entries a full 4 KiB page holds.
 const unwind_page_entries = (0x1000 - unwind_page_header_size) / unwind_entry_size;
 
-/// Offset of the LSDA array and the pages, for `n_pages` pages of the
-/// debug chunks' (the index has room for them, the leading page and the
-/// end).
-fn unwindPagesOff(n_pages: usize) u64 {
-    return unwind_header_size + (n_pages + 2) * unwind_index_entry_size;
+/// Offset of the LSDA array, after the header, `n_personalities`
+/// personalities and the index, for `n_pages` pages of the debug chunks'
+/// (the index has room for them, the leading page and the end).
+fn unwindLsdaOff(n_personalities: usize, n_pages: usize) u64 {
+    return unwind_header_size + 4 * n_personalities + (n_pages + 2) * unwind_index_entry_size;
+}
+
+/// Offset of the pages, after `n_lsdas` LSDA entries.
+fn unwindPagesOff(n_personalities: usize, n_pages: usize, n_lsdas: usize) u64 {
+    return unwindLsdaOff(n_personalities, n_pages) + n_lsdas * @sizeOf(macho.unwind_info_section_header_lsda_index_entry);
 }
 
 /// The number of pages `count` entries fill.
@@ -1283,9 +1377,10 @@ fn unwindChunkSize(count: u32) u64 {
 }
 
 /// A debug chunk's pages: its number of entries (from `Link.layOutDebug`),
-/// the offset of its first page in the section, and its first function
-/// offset (from `Link.copyDebug`). Its pages are full but the last.
-const UnwindPage = struct { count: u32, off: u64, first: u32 };
+/// the offset of its first page in the section, its first function
+/// offset (from `Link.copyDebug`), and the index of its first LSDA
+/// entry. Its pages are full but the last.
+const UnwindPage = struct { count: u32, off: u64, first: u32, lsda: u32 = 0 };
 
 /// The compact unwind encoding of a frame. `frame_pointer` is the
 /// prologue `stp x29, x30, [sp, #-16]!; mov x29, sp`, which leaves x29
@@ -1300,6 +1395,32 @@ pub fn unwindEncoding(u: Atom.Unwind) u32 {
         .none, .outermost => 0,
     };
 }
+
+/// An input object's function's compact unwind entry: `length` bytes at
+/// `offset` in atom `atom`, with `encoding`. A DWARF-mode one
+/// (UNWIND_ARM64_MODE_DWARF) names its FDE, in an `__eh_frame` atom,
+/// whose offset in the output's `__eh_frame` the link puts in the
+/// encoding. Another names its personality's pointer slot and its LSDA,
+/// if it has them, which the link puts in `__unwind_info`'s personality
+/// array (at most 3; a function with a fourth gets encoding 0) and LSDA
+/// index.
+pub const UnwindRecord = struct {
+    atom: SymbolKey,
+    offset: u32,
+    length: u32,
+    encoding: u32,
+    fde: ?struct { atom: SymbolKey, offset: u32 } = null,
+    personality: ?SymbolKey = null,
+    lsda: ?struct { atom: SymbolKey, offset: u32 } = null,
+};
+
+/// UNWIND_PERSONALITY_MASK and UNWIND_HAS_LSDA.
+const unwind_personality_shift = 28;
+const unwind_has_lsda = 0x4000_0000;
+
+/// UNWIND_ARM64_MODE_DWARF, with the FDE's offset in `__eh_frame` in the
+/// low 24 bits.
+pub const unwind_mode_dwarf = 0x0300_0000;
 
 /// A compact unwind entry of a function: from `off` on, `encoding`.
 pub const UnwindPart = struct { off: u32, encoding: u32 };
@@ -1321,16 +1442,32 @@ pub fn unwindParts(u: Atom.Unwind, size: u32, out: *[3]UnwindPart) []const Unwin
     return out[0..3];
 }
 
-/// Writes the header, the first-level index, and the leading page of
-/// `out`, the __unwind_info section, after the debug chunks wrote their
-/// pages. Offsets are from the start of __TEXT; __text spans `text_start`
-/// to `text_end`.
-fn writeUnwindIndex(out: []u8, pages: []const UnwindPage, text_start: u32, text_end: u32) void {
+/// Writes the header, the personality array (`personalities`, each the
+/// offset of a pointer to it), the first-level index, and the leading
+/// page of `out`, the __unwind_info section, after the debug chunks wrote
+/// their pages and `n_lsdas` LSDA entries. Offsets are from the start of
+/// __TEXT; __text spans `text_start` to `text_end`.
+fn writeUnwindIndex(out: []u8, pages: []const UnwindPage, personalities: []const u32, n_lsdas: u32, text_start: u32, text_end: u32) void {
     var n_pages: usize = 0;
     for (pages) |p| n_pages += unwindPageCount(p.count);
-    const pages_off: u32 = @intCast(unwindPagesOff(n_pages));
+    const lsda_off: u32 = @intCast(unwindLsdaOff(personalities.len, n_pages));
+    const pages_off: u32 = @intCast(unwindPagesOff(personalities.len, n_pages, n_lsdas));
+    for (personalities, 0..) |p, i| std.mem.writeInt(u32, out[unwind_header_size + 4 * i ..][0..4], p, .little);
+    const lsdas = std.mem.bytesAsSlice(macho.unwind_info_section_header_lsda_index_entry, out[lsda_off..pages_off]);
+    // The first LSDA entry of the functions from `function` on.
+    const lsdaAt = struct {
+        fn f(all: @TypeOf(lsdas), at: u32, function: u32) u32 {
+            var lo: usize = 0;
+            var hi: usize = all.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (std.mem.readInt(u32, std.mem.asBytes(&all[mid])[0..4], .little) < function) lo = mid + 1 else hi = mid;
+            }
+            return at + @as(u32, @intCast(lo)) * @sizeOf(macho.unwind_info_section_header_lsda_index_entry);
+        }
+    }.f;
     var n: u32 = 0;
-    var index_at: usize = unwind_header_size;
+    var index_at: usize = unwind_header_size + 4 * personalities.len;
     const putIndex = struct {
         fn f(o: []u8, at: *usize, count: *u32, function: u32, page: u32, lsda: u32) void {
             writeStruct(o[at.*..], macho.unwind_info_section_header_index_entry{ .functionOffset = function, .secondLevelPagesSectionOffset = page, .lsdaIndexArraySectionOffset = lsda });
@@ -1343,25 +1480,26 @@ fn writeUnwindIndex(out: []u8, pages: []const UnwindPage, text_start: u32, text_
     } else null;
     const lead = out[pages_off..][0..unwind_lead_page_size];
     if (first != null and first.? > text_start) {
-        putIndex(out, &index_at, &n, text_start, pages_off, pages_off);
+        putIndex(out, &index_at, &n, text_start, pages_off, lsda_off);
         writeStruct(lead, macho.unwind_info_regular_second_level_page_header{ .entryPageOffset = unwind_page_header_size, .entryCount = 1 });
         writeStruct(lead[unwind_page_header_size..], macho.unwind_info_regular_second_level_entry{ .functionOffset = text_start, .encoding = 0 });
     } else @memset(lead, 0);
     // Each page's first function, which its chunk wrote.
     for (pages) |p| for (0..unwindPageCount(p.count)) |k| {
         const off: u32 = @intCast(p.off + k * 0x1000);
-        putIndex(out, &index_at, &n, std.mem.readInt(u32, out[off + unwind_page_header_size ..][0..4], .little), off, pages_off);
+        const function = std.mem.readInt(u32, out[off + unwind_page_header_size ..][0..4], .little);
+        putIndex(out, &index_at, &n, function, off, lsdaAt(lsdas, lsda_off, function));
     };
     // The end: past it, no unwind info.
     putIndex(out, &index_at, &n, text_end, 0, pages_off);
-    @memset(out[index_at..pages_off], 0);
+    @memset(out[index_at..lsda_off], 0);
     writeStruct(out, macho.unwind_info_section_header{
         .version = macho.UNWIND_SECTION_VERSION,
         .commonEncodingsArraySectionOffset = unwind_header_size,
         .commonEncodingsArrayCount = 0,
         .personalityArraySectionOffset = unwind_header_size,
-        .personalityArrayCount = 0,
-        .indexSectionOffset = unwind_header_size,
+        .personalityArrayCount = @intCast(personalities.len),
+        .indexSectionOffset = @intCast(unwind_header_size + 4 * personalities.len),
         .indexCount = n,
     });
 }
@@ -1469,6 +1607,38 @@ fn LinkOf(comptime Input: type) type {
         dsym_scratch_len: usize = 0,
         /// File offset of __unwind_info.
         unwind_off: u64 = 0,
+        /// `Options.unwind`, by kept atom and offset.
+        recs: []const Rec = &.{},
+        /// The kept atoms of the personality pointers `recs` use, in
+        /// order of first use: personality i + 1 of their encodings.
+        personalities: [3]u32 = undefined,
+        n_personalities: u32 = 0,
+        /// The number of `recs` with an LSDA, and the offset of the LSDA
+        /// array in __unwind_info.
+        n_lsdas: u32 = 0,
+        unwind_lsda_off: u64 = 0,
+
+        /// An `UnwindRecord` of kept atom `atom`; a DWARF-mode one's FDE is
+        /// at `fde_offset` in atom `fde_atom`, if it has one, and another's
+        /// LSDA at `lsda_offset` in atom `lsda_atom` (`encoding` has
+        /// UNWIND_HAS_LSDA then, and its personality's number).
+        const Rec = struct {
+            atom: u32,
+            offset: u32,
+            length: u32,
+            encoding: u32,
+            fde_atom: u32,
+            fde_offset: u32,
+            lsda_atom: u32 = no_fde,
+            lsda_offset: u32 = 0,
+            /// The personality pointer's atom, until `link` numbers it.
+            pers_atom: u32 = no_fde,
+
+            fn lessThan(_: void, a: Rec, b: Rec) bool {
+                return a.atom < b.atom or (a.atom == b.atom and a.offset < b.offset);
+            }
+        };
+        const no_fde = std.math.maxInt(u32);
 
         fn check(l: *Self, diag: *Diagnostic) Error!void {
             var first: ?Failure = null;
@@ -1948,6 +2118,15 @@ fn LinkOf(comptime Input: type) type {
             var encoding: u32 = 0;
             var run_end: u32 = 0;
             var prev_atom: u32 = 0;
+            // With input unwind records, the chunk also lists the kept code
+            // between its functions: from its first entry's atom (the first
+            // chunk: from atom 0) to the next chunk's (the last: to the
+            // end). Atom ranges, since other chunks' `file_of` is not
+            // written yet when this one counts.
+            const gaps = l.recs.len > 0;
+            var gap_lo: u32 = if (chunk == 0) 0 else @intCast(input.debugAtom(begin));
+            const gap_hi: u32 = @intCast(if (end == l.n_debug) l.n_atoms else input.debugAtom(end));
+            var lsda = l.unwind_pages[chunk].lsda;
             for (l.file_of[begin..end], begin..) |file_of, j| {
                 // The entries stream; their fragments, names, and atoms do not.
                 if (write and j + 12 < end) {
@@ -1960,7 +2139,11 @@ fn LinkOf(comptime Input: type) type {
                 const atom = input.debugAtom(j);
                 const a = input.atom(atom);
                 const e = unwindEncoding(Elf.ref(&a).unwind);
-                const continues = n > 0 and !l.textBetween(prev_atom, atom);
+                const continues = if (gaps) gap: {
+                    l.gapEntries(gap_lo, atom, page, &n, &first, &encoding, &run_end, &lsda, write);
+                    gap_lo = atom + 1;
+                    break :gap n > 0;
+                } else n > 0 and !l.textBetween(prev_atom, atom);
                 prev_atom = atom;
                 var start: u32 = 0;
                 if (write) {
@@ -1990,6 +2173,8 @@ fn LinkOf(comptime Input: type) type {
                 }
                 if (write) run_end = start + @as(u32, @intCast(input.atom(atom).bytes.len));
             }
+            if (gaps) l.gapEntries(gap_lo, gap_hi, page, &n, &first, &encoding, &run_end, &lsda, write);
+            if (write) std.debug.assert(lsda == if (chunk + 1 < l.unwind_pages.len) l.unwind_pages[chunk + 1].lsda else l.n_lsdas);
             if (n > 0 and encoding != 0) {
                 if (write) putUnwindEntry(page, n, run_end, 0);
                 n += 1;
@@ -2016,6 +2201,62 @@ fn LinkOf(comptime Input: type) type {
             return n;
         }
 
+        /// Puts the unwind entries of the kept code in atoms `lo` up to
+        /// `hi`, which has no debug entries: each `recs` entry's encoding
+        /// over its range, and 0 over the rest. Its choices do not depend
+        /// on addresses, so counting (`write` false) and writing agree.
+        fn gapEntries(l: *const Self, lo: u32, hi: u32, page: []u8, n: *u32, first: *u32, encoding: *u32, run_end: *u32, lsda: *u32, comptime write: bool) void {
+            var r = std.sort.lowerBound(Rec, l.recs, lo, struct {
+                fn order(atom: u32, rec: Rec) std.math.Order {
+                    return std.math.order(atom, rec.atom);
+                }
+            }.order);
+            var i = lo;
+            while (i < hi) : (i += 1) {
+                const p = l.places[i];
+                if (p.section != text or p.isDuplicate()) continue;
+                const a = l.input.atom(i);
+                const size: u32 = @intCast(a.bytes.len);
+                if (size == 0) continue;
+                const start: u32 = if (write) @intCast(l.atomAddr(i) - base_address) else 0;
+                var cursor: u32 = 0;
+                while (r < l.recs.len and l.recs[r].atom <= i) : (r += 1) {
+                    const rec = l.recs[r];
+                    if (rec.atom < i or rec.offset < cursor or rec.offset >= size) continue;
+                    if (rec.offset > cursor and (n.* == 0 or encoding.* != 0)) put(page, n, first, encoding, start + cursor, 0, write);
+                    const e = if (rec.encoding == unwind_mode_dwarf and write) l.dwarfEncoding(rec) else rec.encoding;
+                    if (n.* == 0 or e != 0 or encoding.* != 0) put(page, n, first, encoding, start + rec.offset, e, write);
+                    if (rec.lsda_atom != no_fde) {
+                        if (write) writeStruct(l.buf[l.unwind_off + l.unwind_lsda_off + @as(u64, lsda.*) * @sizeOf(macho.unwind_info_section_header_lsda_index_entry) ..], macho.unwind_info_section_header_lsda_index_entry{
+                            .functionOffset = start + rec.offset,
+                            .lsdaOffset = @intCast(l.atomAddr(rec.lsda_atom) + rec.lsda_offset - base_address),
+                        });
+                        lsda.* += 1;
+                    }
+                    cursor = @intCast(@min(size, @as(u64, rec.offset) + rec.length));
+                }
+                if (cursor < size and (n.* == 0 or encoding.* != 0)) put(page, n, first, encoding, start + cursor, 0, write);
+                if (write) run_end.* = start + size;
+            }
+        }
+
+        /// UNWIND_ARM64_MODE_DWARF with `rec`'s FDE's offset in
+        /// __eh_frame, if it has one that fits.
+        fn dwarfEncoding(l: *const Self, rec: Rec) u32 {
+            if (rec.fde_atom == no_fde) return unwind_mode_dwarf;
+            const off = l.atomAddr(rec.fde_atom) + rec.fde_offset - l.section_addrs[@backingInt(Sect.eh_frame)];
+            return if (off <= 0xff_ffff) unwind_mode_dwarf | @as(u32, @intCast(off)) else unwind_mode_dwarf;
+        }
+
+        fn put(page: []u8, n: *u32, first: *u32, encoding: *u32, function: u32, e: u32, comptime write: bool) void {
+            if (write) {
+                if (n.* == 0) first.* = function;
+                putUnwindEntry(page, n.*, function, e);
+            }
+            n.* += 1;
+            encoding.* = e;
+        }
+
         /// Whether code that is kept lies between atoms `a` and `b`.
         fn textBetween(l: *const Self, a: u32, b: u32) bool {
             for (l.places[a + 1 .. b]) |p| {
@@ -2036,7 +2277,7 @@ fn LinkOf(comptime Input: type) type {
         fn applyRelocs(l: *const Self, a: *const Atom, dst: []u8, p_base: u64, sect: u5, resolved: []const Resolved, fixups: *u64, diag: *Diagnostic) Error!void {
             for (a.relocs) |r| {
                 const width: u4 = switch (r.info.kind) {
-                    .aarch64_abs64, .value64 => 8,
+                    .aarch64_abs64, .aarch64_prel64, .value64 => 8,
                     .value16 => 2,
                     .value8 => 1,
                     else => 4,
@@ -2154,7 +2395,18 @@ fn LinkOf(comptime Input: type) type {
                             std.mem.writeInt(u32, field[0..4], insn | @as(u32, @intCast(t.v & 0xfff)) << 10, .little);
                         }
                     },
-                    .aarch64_tprel_hi12, .aarch64_tprel_lo12_nc, .aarch64_prel32, .aarch64_prel64, .aarch64_tprel64, .aarch64_irelative, .aarch64_abs32, .aarch64_tprel_g1, .aarch64_tprel_g0_nc, .aarch64_tlsdesc, .aarch64_tlsdesc_sym, .aarch64_abs64_sym, .aarch64_tlsdesc_page21, .aarch64_tlsdesc_ld64_lo12, .aarch64_tlsdesc_add_lo12, .aarch64_tlsdesc_call, .aarch64_gottprel_page21, .aarch64_gottprel_lo12 => return invalid,
+                    .aarch64_prel32, .aarch64_prel64 => {
+                        // An offset in data to an address in the image
+                        // (POINTER_TO_GOT's, to its GOT entry; an FDE's
+                        // function and LSDA), which no slide changes.
+                        if (t.kind != .addr) return invalid;
+                        const delta: i64 = @bitCast((t.v +% @as(u64, @bitCast(addend))) -% p);
+                        if (r.info.kind == .aarch64_prel64)
+                            std.mem.writeInt(i64, field[0..8], delta, .little)
+                        else
+                            std.mem.writeInt(i32, field[0..4], std.math.cast(i32, delta) orelse return error.RelocationOverflow, .little);
+                    },
+                    .aarch64_tprel_hi12, .aarch64_tprel_lo12_nc, .aarch64_tprel64, .aarch64_irelative, .aarch64_abs32, .aarch64_tprel_g1, .aarch64_tprel_g0_nc, .aarch64_tlsdesc, .aarch64_tlsdesc_sym, .aarch64_abs64_sym, .aarch64_tlsdesc_page21, .aarch64_tlsdesc_ld64_lo12, .aarch64_tlsdesc_add_lo12, .aarch64_tlsdesc_call, .aarch64_gottprel_page21, .aarch64_gottprel_lo12 => return invalid,
                     .x86_64_abs64, .x86_64_pc32, .x86_64_tpoff32, .x86_64_tlsld, .x86_64_dtpoff32, .x86_64_gottpoff, .x86_64_tlsgd, .x86_64_abs32, .x86_64_abs32s, .x86_64_tpoff64, .x86_64_dtpmod64, .x86_64_tlsdesc, .x86_64_irelative, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym, .x86_64_tlsdesc_sym, .x86_64_abs64_sym => return invalid,
                 }
             }
@@ -3188,7 +3440,7 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = @truncate(expected) }, result.term);
 }
 
-test "writes a dSYM that std.debug symbolizes and __unwind_info for each function" {
+test "writes a dSYM that std.debug symbolizes and __unwind_info for each function and input record" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -3200,6 +3452,10 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     // frame; every tenth is naked and tail-calls instead. Every seventh is
     // followed by a function without debug info, and one function appears
     // twice, the copy's entry losing with it. _main exits with w19.
+    // Every fourteenth helper stands for an input's DWARF-mode function,
+    // whose FDE is in an __eh_frame atom after another's, and every other
+    // twenty-first for a frameless one whose record covers its second
+    // half, with a personality (a pointer slot) and an LSDA.
     const n = 2 * Dwarf.chunk_len + 300;
     const main: SymbolKey = .fromName("_main");
     const fkey = struct {
@@ -3212,6 +3468,12 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     const units = [_][]const u8{ "src/root.zig", "/zig/lib/std/std.zig" };
     var atoms: std.ArrayList(Atom) = .empty;
     var debug: std.ArrayList(Atom.Debug) = .empty;
+    var unwind: std.ArrayList(UnwindRecord) = .empty;
+    const eh: SymbolKey = .fromName("eh_frame");
+    const frameless: u32 = 0x0200_0000;
+    var n_fdes: u32 = 0;
+    const pers: SymbolKey = .fromName("personality");
+    const except: SymbolKey = .fromName("except");
     var m: Encoder = .init(arena);
     try m.stp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .pre = -16 } });
     try m.mov(.x, .fp, .sp);
@@ -3260,10 +3522,23 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
             try debug.append(arena, d);
             try atoms.append(arena, atom);
         }
-        if (i % 7 == 0) try atoms.append(arena, .{ .key = fkey("helper", i), .name = "helper", .section = .text, .alignment = .@"4", .bytes = &.{ 0xc0, 0x03, 0x5f, 0xd6 } });
+        if (i % 7 == 0) {
+            try atoms.append(arena, .{ .key = fkey("helper", i), .name = "helper", .section = .text, .alignment = .@"4", .bytes = &.{ 0xc0, 0x03, 0x5f, 0xd6, 0xc0, 0x03, 0x5f, 0xd6 } });
+            if (i % 14 == 0) {
+                try unwind.append(arena, .{ .atom = fkey("helper", i), .offset = 0, .length = 8, .encoding = unwind_mode_dwarf, .fde = .{ .atom = eh, .offset = n_fdes * 16 } });
+                n_fdes += 1;
+            } else if (i % 21 == 0) {
+                try unwind.append(arena, .{ .atom = fkey("helper", i), .offset = 4, .length = 4, .encoding = frameless, .personality = pers, .lsda = .{ .atom = except, .offset = @intCast(i) } });
+            }
+        }
     }
+    const eh_lead = 24;
+    try atoms.append(arena, .{ .key = .fromName("eh_frame0"), .name = ".__eh_frame", .section = .objc, .alignment = .@"4", .bytes = &@as([eh_lead]u8, @splat(0)) });
+    try atoms.append(arena, .{ .key = eh, .name = ".__eh_frame", .section = .objc, .alignment = .@"4", .bytes = try arena.alloc(u8, n_fdes * 16) });
+    try atoms.append(arena, .{ .key = pers, .name = "pers_slot", .section = .rodata, .alignment = .@"8", .bytes = &@as([8]u8, @splat(0)), .targets = &.{main}, .relocs = &.{.init(0, .aarch64_abs64, 0, 0)} });
+    try atoms.append(arena, .{ .key = except, .name = "except", .section = .rodata, .alignment = .@"4", .bytes = try arena.alloc(u8, n) });
 
-    const options: Options = .{ .entry = main, .identifier = "prog", .debug = debug.items, .comp_dir = "/w" };
+    const options: Options = .{ .entry = main, .identifier = "prog", .debug = debug.items, .comp_dir = "/w", .unwind = unwind.items };
     const one = try emitWithDsym(gpa, io, atoms.items, o: {
         var o = options;
         o.threads = 1;
@@ -3364,6 +3639,15 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     // debug info none, looked up as std.debug's unwinder does.
     const frame: u32 = 0x0400_0000;
     const main_addr = testMachOSymbol(one.exe, "main").?;
+    const except_addr = testMachOSymbol(one.exe, "except").?;
+    {
+        // One personality: its pointer slot.
+        const sect = testMachOSection(one.exe, "__unwind_info").?;
+        const header = std.mem.bytesToValue(macho.unwind_info_section_header, one.exe[sect.offset..][0..@sizeOf(macho.unwind_info_section_header)]);
+        try std.testing.expectEqual(1, header.personalityArrayCount);
+        const slot = std.mem.readInt(u32, one.exe[sect.offset + header.personalityArraySectionOffset ..][0..4], .little);
+        try std.testing.expectEqual(testMachOSymbol(one.exe, "pers_slot").?, base_address + @as(u64, slot));
+    }
     try std.testing.expectEqual(0, testUnwindEncoding(one.exe, main_addr + 4).?);
     for (0..n) |index| {
         const name = try arena.print("f{d}", .{index});
@@ -3374,7 +3658,16 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
         if (index % 7 == 0) {
             // The helper after it, which starts at the next 4-byte boundary.
             const helper = addr + atoms.items[debug.items[index + @intFromBool(index > dup)].atom].bytes.len;
-            try std.testing.expectEqual(0, testUnwindEncoding(one.exe, helper).?);
+            if (index % 14 == 0) {
+                const fde: u32 = @intCast(eh_lead + index / 14 * 16);
+                try std.testing.expectEqual(unwind_mode_dwarf | fde, testUnwindEncoding(one.exe, helper).?);
+                try std.testing.expectEqual(unwind_mode_dwarf | fde, testUnwindEncoding(one.exe, helper + 4).?);
+            } else {
+                try std.testing.expectEqual(0, testUnwindEncoding(one.exe, helper).?);
+                // Personality 1, and an LSDA.
+                try std.testing.expectEqual(if (index % 21 == 0) frameless | 0x5000_0000 else 0, testUnwindEncoding(one.exe, helper + 4).?);
+                try std.testing.expectEqual(if (index % 21 == 0) except_addr + index else null, testLsda(one.exe, helper + 4));
+            }
         }
     }
     try std.testing.expectEqual(null, testUnwindEncoding(one.exe, text_sect.addr + text_sect.size));
@@ -3388,6 +3681,8 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     for (indices) |ix| if (ix.secondLevelPagesSectionOffset != 0) {
         const page = std.mem.bytesToValue(macho.unwind_info_regular_second_level_page_header, uinfo[ix.secondLevelPagesSectionOffset..][0..@sizeOf(macho.unwind_info_regular_second_level_page_header)]);
         try std.testing.expect(page.entryCount > 0 and page.entryPageOffset + page.entryCount * unwind_entry_size <= 0x1000);
+        const entries = std.mem.bytesAsSlice(macho.unwind_info_regular_second_level_entry, uinfo[ix.secondLevelPagesSectionOffset + page.entryPageOffset ..][0 .. page.entryCount * unwind_entry_size]);
+        for (entries[0 .. entries.len - 1], entries[1..]) |a, b| try std.testing.expect(a.functionOffset < b.functionOffset);
         n_pages += 1;
     };
     try std.testing.expect(n_pages > 4);
@@ -3477,6 +3772,24 @@ fn testUnwindEncoding(bytes: []const u8, addr: u64) ?u32 {
         }
     }
     return entries[left].encoding;
+}
+
+/// The LSDA of the function at `addr`, found as libunwind finds it: in
+/// the LSDA entries of `addr`'s first-level index entry.
+fn testLsda(bytes: []const u8, addr: u64) ?u64 {
+    const sect = testMachOSection(bytes, "__unwind_info").?;
+    const info = bytes[sect.offset..][0..sect.size];
+    const header = std.mem.bytesToValue(macho.unwind_info_section_header, info[0..@sizeOf(macho.unwind_info_section_header)]);
+    const indices = std.mem.bytesAsSlice(macho.unwind_info_section_header_index_entry, info[header.indexSectionOffset..][0 .. header.indexCount * @sizeOf(macho.unwind_info_section_header_index_entry)]);
+    const pc = addr - base_address;
+    var i: usize = 0;
+    while (i + 1 < indices.len and indices[i + 1].functionOffset <= pc) i += 1;
+    if (i + 1 >= indices.len) return null;
+    const lo = indices[i].lsdaIndexArraySectionOffset;
+    const hi = indices[i + 1].lsdaIndexArraySectionOffset;
+    const lsdas = std.mem.bytesAsSlice(macho.unwind_info_section_header_lsda_index_entry, info[lo..hi]);
+    for (lsdas) |l| if (l.functionOffset == pc) return base_address + @as(u64, l.lsdaOffset);
+    return null;
 }
 
 /// dyld's `trieWalk`, for the tests: from the root, take the first edge

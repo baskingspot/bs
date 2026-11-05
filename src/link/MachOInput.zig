@@ -19,6 +19,7 @@ const SymbolKey = Atom.SymbolKey;
 const Archive = @import("Archive.zig");
 const Elf = @import("Elf.zig");
 const ElfDynamic = @import("ElfDynamic.zig");
+const MachO = @import("MachO.zig");
 
 const MachOInput = @This();
 
@@ -489,19 +490,36 @@ fn localTarget(o: *const Object, index: usize, addr: u64) ?Target {
 
 pub const undefined_weak_key: SymbolKey = .fromName("mobj:undefined-weak");
 
+/// Whether the CFI record at `at` of `eh_frame` is an FDE (its CIE
+/// pointer, after the length, is not 0).
+fn isFde(eh_frame: []const u8, at: u64) bool {
+    var p: u64 = 0;
+    while (p + 8 <= eh_frame.len) {
+        const len = std.mem.readInt(u32, eh_frame[@intCast(p)..][0..4], .little);
+        if (len == 0 or len == 0xffff_ffff) return false;
+        if (p == at) return std.mem.readInt(u32, eh_frame[@intCast(p + 4)..][0..4], .little) != 0;
+        if (p > at) return false;
+        p += 4 + @as(u64, len);
+    }
+    return false;
+}
+
 fn sectionAlignment(s: macho.section_64) std.mem.Alignment {
     return .fromByteUnits(@as(u64, 1) << @intCast(@min(s.@"align", 15)));
 }
 
 /// The `Atom.Section` a section's atoms go to, or null for one the link
-/// drops: debug info, unwind tables (stage A2), descriptors, and
-/// toolchain metadata.
+/// drops: debug info, compact unwind entries (stage A2), descriptors,
+/// and toolchain metadata. `__eh_frame` keeps its own output section,
+/// where libunwind finds a DWARF-mode function's FDE, with its
+/// personality and LSDA.
 fn sectionOf(o: *const Object, index: usize) ?Atom.Section {
     const s = o.sects[index];
     const seg = name16(&s.segname);
     const sect = name16(&s.sectname);
     if (s.flags & macho.S_ATTR_DEBUG != 0 or std.mem.eql(u8, seg, "__DWARF") or std.mem.eql(u8, seg, "__LD") or std.mem.eql(u8, seg, "__LLVM")) return null;
-    if (std.mem.eql(u8, sect, "__eh_frame") or std.mem.eql(u8, sect, "__llvm_addrsig")) return null;
+    if (std.mem.eql(u8, sect, "__llvm_addrsig")) return null;
+    if (std.mem.eql(u8, sect, "__eh_frame")) return .objc;
     if (objc_named.has(sect)) return .objc;
     return switch (sectionType(s)) {
         macho.S_ZEROFILL, macho.S_GB_ZEROFILL => .bss,
@@ -558,6 +576,8 @@ pub const Converted = struct {
     /// The objects' functions and objects within their sections' atoms,
     /// for the symbol table, except those that name their atom.
     symbols: []const Elf.LocalSymbol,
+    /// The functions' compact unwind entries, for `MachO.Options.unwind`.
+    unwind: []const MachO.UnwindRecord = &.{},
 };
 
 /// Converts every loaded object into atoms. `ctx` resolves what the
@@ -578,7 +598,9 @@ pub fn convert(in: *MachOInput, ctx: anytype) !Converted {
     };
     for (in.objects.items) |*o| {
         c.o = o;
+        c.fdes.clearRetainingCapacity();
         for (1..o.sects.len) |i| try c.section(@intCast(i));
+        try c.compactUnwind();
         // Named places inside atoms, for the symbol table: functions and
         // objects, static ones too, but not the assembler's labels
         // (`ltmp0`, `l_.str`), which C names never start with, since
@@ -622,7 +644,7 @@ pub fn convert(in: *MachOInput, ctx: anytype) !Converted {
     try c.reportUndefined();
     if (weak_used) try values.append(arena, .{ .key = undefined_weak_key, .value = 0 });
     try values.appendSlice(arena, c.abs_values.items);
-    return .{ .atoms = atoms.items, .values = values.items, .symbols = symbols.items };
+    return .{ .atoms = atoms.items, .values = values.items, .symbols = symbols.items, .unwind = c.unwind.items };
 }
 
 fn Converter(comptime Ctx: type) type {
@@ -636,6 +658,10 @@ fn Converter(comptime Ctx: type) type {
         /// The merged `__objc_imageinfo` (version, flags), if an object
         /// has one.
         image_info: ?[2]u32 = null,
+        /// The object's FDEs, by the function their pc_begin names (its
+        /// atom and offset), as their `__eh_frame` atom and offset.
+        fdes: std.AutoHashMapUnmanaged(struct { SymbolKey, u64 }, struct { SymbolKey, u32 }) = .empty,
+        unwind: std.ArrayList(MachO.UnwindRecord) = .empty,
         /// How each external name the objects reference resolved.
         resolved: std.StringHashMapUnmanaged(?Target) = .empty,
         /// The strong names nothing defines, each with the objects that
@@ -706,7 +732,10 @@ fn Converter(comptime Ctx: type) type {
                 .key = o.keys[index],
                 .name = if (kind == .objc) try c.in.arena.print(".{s}", .{name16(&s.sectname)}) else c.atomName(index),
                 .section = kind,
-                .alignment = sectionAlignment(s),
+                // CFI records are 4-byte multiples: padding between two
+                // objects' would read as the zero length that ends
+                // libunwind's scan.
+                .alignment = if (std.mem.eql(u8, name16(&s.sectname), "__eh_frame")) .@"4" else sectionAlignment(s),
                 .bytes = if (kind.isZeroFill()) &.{} else bytes,
                 .zero_fill = if (kind.isZeroFill()) s.size else 0,
             }, rels.items, 0, s.size);
@@ -855,6 +884,80 @@ fn Converter(comptime Ctx: type) type {
             return null;
         }
 
+        /// The object's `__compact_unwind` entries (32 bytes: function,
+        /// length, encoding, personality, LSDA, the first and the last
+        /// two by relocation) as `MachO.UnwindRecord`s.
+        fn compactUnwind(c: *Self) !void {
+            const o = c.o;
+            const index = for (o.sects, 0..) |s, i| {
+                if (std.mem.eql(u8, name16(&s.segname), "__LD") and std.mem.eql(u8, name16(&s.sectname), "__compact_unwind")) break i;
+            } else return;
+            const s = o.sects[index];
+            const bytes = o.sectionBytes(index);
+            const raw = o.bytes[s.reloff..][0 .. @as(usize, s.nreloc) * 8];
+            // The targets of each entry's function, personality and LSDA
+            // fields (at 0, 16 and 24), by entry.
+            const n = bytes.len / 32;
+            const fields = try c.in.arena.alloc([3]?Target, n);
+            @memset(fields, @splat(null));
+            for (0..s.nreloc) |k| {
+                const r = Reloc.read(raw[k * 8 ..][0..8]);
+                const slot: usize = switch (r.address % 32) {
+                    0 => 0,
+                    16 => 1,
+                    24 => 2,
+                    else => continue,
+                };
+                if (r.address / 32 >= n or r.type != @backingInt(macho.reloc_type_arm64.ARM64_RELOC_UNSIGNED) or r.length != 3) continue;
+                const field = std.mem.readInt(u64, bytes[r.address..][0..8], .little);
+                fields[r.address / 32][slot] = if (r.external) t: {
+                    const t = try c.target(r.symbolnum) orelse continue;
+                    break :t .{ .key = t.key, .offset = t.offset +% field, .import = t.import };
+                } else localTarget(o, r.symbolnum, field);
+            }
+            for (fields, 0..) |f, e| {
+                const t = f[0] orelse continue;
+                if (t.import) continue;
+                const entry = bytes[e * 32 ..][0..32];
+                const length = std.mem.readInt(u32, entry[8..12], .little);
+                var encoding = std.mem.readInt(u32, entry[12..16], .little);
+                if (length == 0) continue;
+                // The link numbers the personalities and indexes the LSDAs
+                // (UNWIND_PERSONALITY_MASK, UNWIND_HAS_LSDA).
+                encoding &= ~@as(u32, 0x7000_0000);
+                const dwarf = encoding & 0x0f00_0000 == MachO.unwind_mode_dwarf;
+                const fde = if (dwarf) c.fdes.get(.{ t.key, t.offset }) else null;
+                // A DWARF-mode function's personality and LSDA are its
+                // FDE's.
+                const lsda: ?Target = if (dwarf) null else f[2];
+                try c.unwind.append(c.in.arena, .{
+                    .atom = t.key,
+                    .offset = std.math.cast(u32, t.offset) orelse continue,
+                    .length = length,
+                    .encoding = if (dwarf) MachO.unwind_mode_dwarf else encoding,
+                    .fde = if (fde) |d| .{ .atom = d[0], .offset = d[1] } else null,
+                    .personality = if (dwarf) null else if (f[1]) |p| try c.gotSlot(p) else null,
+                    .lsda = if (lsda) |l| if (l.import) null else .{ .atom = l.key, .offset = std.math.cast(u32, l.offset) orelse continue } else null,
+                });
+            }
+        }
+
+        /// An 8-byte pointer to `t`, content-addressed so that every
+        /// reference to `t` shares it: a GOT entry outside the GOT.
+        fn gotSlot(c: *Self, t: Target) Allocator.Error!SymbolKey {
+            const arena = c.in.arena;
+            const targets = try arena.dupe(SymbolKey, &.{t.key});
+            const off = std.math.cast(i32, t.offset) orelse {
+                try c.fail("{s}: GOT entry offset out of range", .{c.o.path});
+                return t.key;
+            };
+            const pointer = try arena.dupe(Atom.Reloc, &.{.init(0, .aarch64_abs64, 0, off)});
+            const zeros: []const u8 = &@as([8]u8, @splat(0));
+            const key: SymbolKey = .fromContents(.rodata, .@"8", zeros, targets, pointer);
+            try c.atoms.append(arena, .{ .key = key, .name = "", .section = .rodata, .alignment = .@"8", .bytes = zeros, .targets = targets, .relocs = pointer });
+            return key;
+        }
+
         fn absolute(c: *Self, value: u64) Allocator.Error!Target {
             const key = absKey(value);
             for (c.abs_values.items) |v| if (v.key == key) return .{ .key = key, .offset = 0 };
@@ -910,6 +1013,22 @@ fn Converter(comptime Ctx: type) type {
                             return c.fail("{s}: malformed SUBTRACTOR pair in '{s}'", .{ o.path, c.sectName(index) });
                         const b = try c.target(r.symbolnum) orelse continue;
                         const a = try c.target(n.symbolnum) orelse continue;
+                        if (a.key != b.key and !a.import and o.pieces[index].len == 0 and b.key == o.keys[index] and r.length >= 2) {
+                            // A - B + field with B in this section's atom
+                            // (an FDE's pc_begin and LSDA, `f - EH_frame`
+                            // with the field holding minus its offset): an
+                            // offset from the field, relocated.
+                            const field: i64 = if (r.length == 3) std.mem.readInt(i64, bytes[@intCast(off)..][0..8], .little) else std.mem.readInt(i32, bytes[@intCast(off)..][0..4], .little);
+                            const w = try c.writable(bytes, copy);
+                            @memset(w[@intCast(off)..][0..@intCast(width)], 0);
+                            const delta = field +% @as(i64, @intCast(off)) -% @as(i64, @bitCast(b.offset));
+                            try rels.append(c.in.arena, .{ .offset = off, .kind = if (r.length == 3) .aarch64_prel64 else .aarch64_prel32, .target = a, .addend = delta });
+                            // An FDE's pc_begin, 8 bytes in: the FDE of
+                            // the function at `a`.
+                            if (std.mem.eql(u8, name16(&s.sectname), "__eh_frame") and off >= 8 and isFde(bytes, off - 8))
+                                try c.fdes.put(c.in.arena, .{ a.key, a.offset +% @as(u64, @bitCast(delta)) }, .{ o.keys[index], @intCast(off - 8) });
+                            continue;
+                        }
                         if (a.key != b.key or a.import) return c.fail("{s}: difference of two symbols in different atoms in '{s}', which bs does not link yet", .{ o.path, c.sectName(index) });
                         const w = try c.writable(bytes, copy);
                         const delta: i64 = @as(i64, @bitCast(a.offset -% b.offset));
@@ -952,7 +1071,22 @@ fn Converter(comptime Ctx: type) type {
                             return c.fail("{s}: '{s}' reaches {s}, which libSystem defines, without the GOT", .{ o.path, c.sectName(index), o.linkName(o.syms[r.symbolnum]) });
                         try rels.append(c.in.arena, .{ .offset = off, .kind = kind, .target = t, .addend = a });
                     },
-                    .ARM64_RELOC_POINTER_TO_GOT => return c.fail("{s}: POINTER_TO_GOT in '{s}', which bs does not link yet", .{ o.path, c.sectName(index) }),
+                    .ARM64_RELOC_POINTER_TO_GOT => {
+                        // The 32-bit offset from the field to a GOT entry
+                        // holding the target's address, as Clang writes
+                        // the type info references of __gcc_except_tab
+                        // (an Objective-C `@catch`'s, from libobjc). The
+                        // entry is a pointer slot of its own, a bind or a
+                        // rebase, as ld64 gives a local target a GOT
+                        // entry too.
+                        if (!r.external or !r.pcrel or r.length != 2) return c.fail("{s}: POINTER_TO_GOT of width {d} in '{s}', which bs does not link yet", .{ o.path, width, c.sectName(index) });
+                        // The field's contents are not an addend (the
+                        // assembler leaves minus the field's offset in
+                        // its section there); the entry is G - P, as in
+                        // upstream's and ld64's links.
+                        const t = try c.target(r.symbolnum) orelse continue;
+                        try rels.append(c.in.arena, .{ .offset = off, .kind = .aarch64_prel32, .target = .{ .key = try c.gotSlot(t), .offset = 0 }, .addend = 0 });
+                    },
                     .ARM64_RELOC_ADDEND => unreachable,
                 }
             }
@@ -1093,11 +1227,12 @@ test "Objective-C sections keep their names, and the image infos merge into one"
         else => {},
     };
     // One class list entry, class reference and selector reference per
-    // object, each its own atom, and one image info for both.
-    for ([_][]const u8{ ".__objc_classlist", ".__objc_classrefs", ".__objc_selrefs" }) |name|
+    // object, each its own atom, one image info for both, and each
+    // object's __eh_frame whole.
+    for ([_][]const u8{ ".__objc_classlist", ".__objc_classrefs", ".__objc_selrefs", ".__eh_frame" }) |name|
         try testing.expectEqual(2, named.get(name).?);
     try testing.expectEqual(1, named.get(".__objc_imageinfo").?);
-    try testing.expectEqual(4, named.count());
+    try testing.expectEqual(5, named.count());
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0x40, 0, 0, 0 }, image_info.?.bytes);
     // The classes themselves are data the runtime writes; each selector
     const class = (try in.lookup("OBJC_CLASS_$_RootA")).?;

@@ -219,6 +219,8 @@ error_values: std.ArrayList(Elf.Value) = .empty,
 input_symbols: []const Elf.LocalSymbol = &.{},
 /// Their unwind and debug sections (`Elf.Options.input_sections`).
 input_sections: []const Elf.InputSection = &.{},
+/// The Mach-O input objects' functions' compact unwind entries.
+input_unwind: []const MachO.UnwindRecord = &.{},
 /// Time spent in `CodeGen.generate`, for `BS_TIMING`.
 codegen_ns: u64 = 0,
 /// `BS_BENCH_CODEGEN`: a copy of every function's IR, which
@@ -1188,6 +1190,7 @@ fn convertMachOInputs(emit: *Emit, in: *MachOInput) !bool {
     for (converted.atoms) |atom| try emit.addAtom(atom);
     try emit.error_values.appendSlice(emit.gpa, converted.values);
     emit.input_symbols = converted.symbols;
+    emit.input_unwind = converted.unwind;
     // A dylib exports the objects' globals too, as upstream's.
     if (emit.shared) try emit.exports.appendSlice(emit.gpa, try in.dynamicExports(InputResolver{ .emit = emit }));
     return true;
@@ -1645,7 +1648,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         if (emit.shared) for (emit.exports.items) |x| if (x.visibility != .hidden)
             try dylib_exports.append(emit.gpa, .{ .key = x.key, .name = x.name, .offset = x.offset, .weak = x.weak });
         const dylib: MachO.Dylib = .{ .install_name = emit.install_name orelse sub_path, .current_version = emit.dylib_version, .exports = dylib_exports.items };
-        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry orelse undefined, .dylib = if (emit.shared) &dylib else null, .libs = libs, .rpaths = rpaths.items, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = if (emit.strip) &.{} else emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .min_os = emit.macos_min, .sdk = emit.macos_sdk, .aliases = emit.aliases.items, .local_symbols = emit.input_symbols }) catch |err| {
+        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry orelse undefined, .dylib = if (emit.shared) &dylib else null, .libs = libs, .rpaths = rpaths.items, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = if (emit.strip) &.{} else emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .min_os = emit.macos_min, .sdk = emit.macos_sdk, .aliases = emit.aliases.items, .local_symbols = emit.input_symbols, .unwind = emit.input_unwind }) catch |err| {
             try emit.linkFailed(err, diag);
             return false;
         };
