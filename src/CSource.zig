@@ -1540,11 +1540,14 @@ fn runCc(arena: std.mem.Allocator, io: Io, argv: []const []const u8, env: *const
 
 /// Null when `zig` is upstream's 0.17.1, else why not.
 fn checkZig(arena: std.mem.Allocator, io: Io, zig: []const u8) !?[]const u8 {
-    const res = std.process.run(arena, io, .{ .argv = &.{ zig, "version" } }) catch |err|
-        return try arena.print("compiling C sources needs upstream zig 0.17.1; unable to run '{s}': {t}", .{ zig, err });
+    const res = std.process.run(arena, io, .{ .argv = &.{ zig, "version" } }) catch |err| {
+        const why = try arena.print("compiling C sources needs upstream zig 0.17.1; unable to run '{s}': {t}", .{ zig, err });
+        return why;
+    };
     const version = std.mem.trim(u8, res.stdout, " \n");
     if (res.term.success() and std.mem.eql(u8, version, "0.17.1")) return null;
-    return try arena.print("compiling C sources needs upstream zig 0.17.1; '{s}' is version '{s}' (set BS_ZIG to upstream 0.17.1)", .{ zig, version });
+    const why = try arena.print("compiling C sources needs upstream zig 0.17.1; '{s}' is version '{s}' (set BS_ZIG to upstream 0.17.1)", .{ zig, version });
+    return why;
 }
 
 /// Clang's errors and their notes, as diagnostics: `path:line:col: error:

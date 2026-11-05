@@ -1095,7 +1095,8 @@ pub fn declNav(zcu: *Zcu, ns_index: u32, i: usize) !InternPool.NavIndex {
 /// (`declNav`).
 pub fn findDecl(zcu: *Zcu, ns_index: u32, name: InternPool.String) !?InternPool.NavIndex {
     const i = zcu.namespaces.items[ns_index].decls.getIndex(name) orelse return null;
-    return try zcu.declNav(ns_index, i);
+    const result = try zcu.declNav(ns_index, i);
+    return result;
 }
 
 /// Whether declaration `i` of namespace `ns` is `pub`, without creating

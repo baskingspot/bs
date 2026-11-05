@@ -1085,10 +1085,14 @@ const InputResolver = struct {
     /// Zig code does (`exportTarget`). On aarch64-macos, every name is
     /// libSystem's, as the Zig code's are.
     pub fn importSym(r: InputResolver, name: []const u8, weak: bool) !?SymbolKey {
-        if (r.emit.zcu.ip.target == .aarch64_macos) return try r.emit.useImport(name, .{ .weak = weak });
+        if (r.emit.zcu.ip.target == .aarch64_macos) {
+            const result = try r.emit.useImport(name, .{ .weak = weak });
+            return result;
+        }
         if (r.emit.shared and std.mem.eql(u8, name, "_DYNAMIC")) return ElfDynamic.dynamic_key;
         if (!r.emit.shared and !r.emit.libraryDefines(name)) return null;
-        return try r.emit.useImport(name, .{ .weak = weak, .tls = r.emit.sharedTls(name) });
+        const result = try r.emit.useImport(name, .{ .weak = weak, .tls = r.emit.sharedTls(name) });
+        return result;
     }
 
     /// The executable's copy of a shared library's data object `name`, an
@@ -1099,7 +1103,8 @@ const InputResolver = struct {
     /// resolves to 0, as in upstream's own links of Zig code.
     pub fn weakImport(r: InputResolver, name: []const u8) !?SymbolKey {
         if (!r.emit.lld or r.emit.shared) return null;
-        return try r.emit.useImport(name, .{ .weak = true });
+        const result = try r.emit.useImport(name, .{ .weak = true });
+        return result;
     }
 
     pub fn copySym(r: InputResolver, name: []const u8) !?SymbolKey {
@@ -1833,7 +1838,8 @@ pub fn requestCompilerRt(emit: *Emit, file_name: []const u8, name: []const u8) !
 /// `Zcu.requestCompilerRtExport` on behalf of the current unit.
 pub fn requestCompilerRtExport(emit: *Emit, name: []const u8) !?[]const u8 {
     const e = Zcu.compilerRtExport(name) orelse return null;
-    return try emit.requestCompilerRt(e.file, e.decl);
+    const result = try emit.requestCompilerRt(e.file, e.decl);
+    return result;
 }
 
 /// Requests compiler_rt function `key` and returns the key, owned: from a
@@ -2140,15 +2146,27 @@ pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
     emit.export_lookups += 1;
     if (try emit.userExport(name)) |key| return key;
     // A shared object links compiler_rt in, as upstream's do.
-    if (emit.obj and !emit.shared) return try emit.useImport(name, .{});
+    if (emit.obj and !emit.shared) {
+        const result = try emit.useImport(name, .{});
+        return result;
+    }
     // compiler_rt before libc, as upstream: its `fmod` and `memcpy` stay
     // in the executable, and only names it lacks are imported; plain C's
     // come from libc first (`libc_first`).
     if (!emit.libcFirst(name)) if (try emit.rtExport(name)) |key| return key;
     // On aarch64-macos, then libSystem's.
-    if (emit.zcu.ip.target == .aarch64_macos) return try emit.useImport(name, .{});
-    if (emit.libraryDefines(name)) return try emit.useImport(name, .{});
-    if (emit.shared) return try emit.useImport(name, .{});
+    if (emit.zcu.ip.target == .aarch64_macos) {
+        const result = try emit.useImport(name, .{});
+        return result;
+    }
+    if (emit.libraryDefines(name)) {
+        const result = try emit.useImport(name, .{});
+        return result;
+    }
+    if (emit.shared) {
+        const result = try emit.useImport(name, .{});
+        return result;
+    }
     return null;
 }
 

@@ -389,7 +389,8 @@ pub fn mapFile(io: Io, dir: Io.Dir, sub_path: []const u8) !?Io.File.MemoryMap {
         else => |e| return e,
     };
     defer f.close(io);
-    return try mapOpenFile(io, f, try f.length(io), false);
+    const map = try mapOpenFile(io, f, try f.length(io), false);
+    return map;
 }
 
 /// Maps `len` bytes of `f` read-only. `populate` faults every page in up

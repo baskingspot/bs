@@ -10204,7 +10204,10 @@ fn sentinelsMatch(sema: *Sema, s: Index, d: Index) bool {
 fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError!?Ref {
     const ip = sema.ip;
     const src_ty = sema.typeOf(inst);
-    if (sema.ptrCoercibleInPlace(src_ty, dest_ty)) return try sema.coercePtrTo(block, inst, dest_ty);
+    if (sema.ptrCoercibleInPlace(src_ty, dest_ty)) {
+        const result = try sema.coercePtrTo(block, inst, dest_ty);
+        return result;
+    }
     const s = Type.ptrInfo(ip, src_ty);
     const d = Type.ptrInfo(ip, dest_ty);
     // A pointer to a zero-length array without a sentinel (`&.{}`) to a
@@ -10216,7 +10219,10 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
             var info = s;
             info.flags.is_const = d.flags.is_const;
             info.flags.alignment = d.flags.alignment;
-            if (sema.ptrCoercibleInPlace(try sema.ptrType(info), dest_ty)) return try sema.coercePtrTo(block, inst, dest_ty);
+            if (sema.ptrCoercibleInPlace(try sema.ptrType(info), dest_ty)) {
+                const result = try sema.coercePtrTo(block, inst, dest_ty);
+                return result;
+            }
         }
     }
     // `*[N]T` to `[]T`.
@@ -10233,7 +10239,8 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
         const many_ty = try sema.ptrType(.{ .child = d.child, .sentinel = d.sentinel, .flags = .{ .size = .many, .is_const = d.flags.is_const, .is_volatile = d.flags.is_volatile, .address_space = d.flags.address_space } });
         const ptr = try sema.coercePtrTo(block, inst, many_ty);
         const len: Ref = .fromInterned(try sema.intValue(.usize_type, a.len));
-        return try sema.makeSlice(block, dest_ty, ptr, len);
+        const result = try sema.makeSlice(block, dest_ty, ptr, len);
+        return result;
     }
     // A pointer to a tuple to a const slice or array pointer: the tuple
     // coerced to an array, by reference, as upstream. An empty tuple
@@ -10266,7 +10273,8 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
         if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return null;
         if (!sema.ptrAlignOk(s, d)) return null;
         const raw = try sema.slicePtr(block, inst);
-        return try sema.coercePtrTo(block, raw, dest_ty);
+        const result = try sema.coercePtrTo(block, raw, dest_ty);
+        return result;
     }
     // A zero-terminated `[:0]T` to `[*c]T`, as upstream.
     if (s.flags.size == .slice and d.flags.size == .c) {
@@ -10274,7 +10282,8 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
         if (s.flags.is_const and !d.flags.is_const) return null;
         if (s.sentinel == .none or Type.class(ip, s.child) != .int or s.sentinel != try sema.intValue(s.child, 0)) return null;
         const raw = try sema.slicePtr(block, inst);
-        return try sema.coercePtrTo(block, raw, dest_ty);
+        const result = try sema.coercePtrTo(block, raw, dest_ty);
+        return result;
     }
     // A pointer to a function, to a pointer to a function type it can be
     // called as (`&f` to `*const @TypeOf(f)` names its inferred error set).
@@ -10858,7 +10867,7 @@ fn peerPtrs(sema: *Sema, a: Index, b: Index) !?Index {
         if (sa.size == .slice or sb.size == .slice) return null;
         break :blk .many;
     } else .slice;
-    return try sema.ptrType(.{
+    const result = try sema.ptrType(.{
         .child = sa.elem,
         .sentinel = if (sa.sentinel == sb.sentinel) sa.sentinel else .none,
         .flags = .{
@@ -10870,6 +10879,7 @@ fn peerPtrs(sema: *Sema, a: Index, b: Index) !?Index {
             .address_space = sa.p.flags.address_space,
         },
     });
+    return result;
 }
 
 /// The alignment flag of the peer of pointers `a` and `b`: the smaller
@@ -10910,7 +10920,7 @@ fn peerCPtr(sema: *Sema, a: Index, b: Index) !?Index {
     const child = if (pa.flags.size == .c) pa.child else pb.child;
     if (elem(ip, pa) != child or elem(ip, pb) != child) return null;
     if (pa.flags.address_space != pb.flags.address_space) return null;
-    return try sema.ptrType(.{ .child = child, .flags = .{
+    const result = try sema.ptrType(.{ .child = child, .flags = .{
         .size = .c,
         .is_const = pa.flags.is_const or pb.flags.is_const,
         .is_volatile = pa.flags.is_volatile or pb.flags.is_volatile,
@@ -10918,6 +10928,7 @@ fn peerCPtr(sema: *Sema, a: Index, b: Index) !?Index {
         .alignment = sema.peerAlignment(pa, pb) orelse return null,
         .address_space = pa.flags.address_space,
     } });
+    return result;
 }
 
 /// Pointer-to-tuple `ptr_ty` as a pointer to an array of `other`'s element
@@ -10935,7 +10946,8 @@ fn tuplePtrAsArrayPtr(sema: *Sema, ptr_ty: Index, other: Index) !?Index {
     const arr = try sema.intern(.{ .array_type = .{ .len = ip.keyPayload(.tuple_type, p.child).types.len, .child = elem } });
     var info = p;
     info.child = arr;
-    return try sema.ptrType(info);
+    const result = try sema.ptrType(info);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -13046,7 +13058,8 @@ fn foldConstAlloc(sema: *Sema, block: *Block, src: Src, alloc: Ir.Inst.Index) Co
     var info = Type.ptrInfo(ip, ptr_ty);
     info.flags.is_const = true;
     const const_ty = try sema.ptrType(info);
-    return try sema.intern(.{ .ptr = .{ .ty = const_ty, .base = .{ .uav = .{ .val = val, .orig_ty = const_ty } } } });
+    const result = try sema.intern(.{ .ptr = .{ .ty = const_ty, .base = .{ .uav = .{ .val = val, .orig_ty = const_ty } } } });
+    return result;
 }
 
 /// Runtime pointer `ptr` into `alloc`, as a pointer into comptime alloc
@@ -14043,7 +14056,10 @@ fn comptimeLoadKey(sema: *Sema, block: *Block, src: Src, key: InternPool.Ptr, lo
     // function type (`coerceInner`), so a field or element of a function
     // type may hold one.
     if (Type.class(ip, load_ty) == .@"fn" and Type.class(ip, v_ty) == .@"fn") return v;
-    if (sema.childCoercibleInMemory(v_ty, load_ty)) return try sema.retypeInMemory(v, load_ty);
+    if (sema.childCoercibleInMemory(v_ty, load_ty)) {
+        const result = try sema.retypeInMemory(v, load_ty);
+        return result;
+    }
     // The pointer views the memory as another type.
     return sema.reinterpretLoadOrNull(block, src, ptr);
 }
@@ -14178,12 +14194,17 @@ fn loadAtOffset(sema: *Sema, val: Index, key: InternPool.Ptr, load_ty: Index) !?
     if (key.byte_offset == 0 and ip.keyTag(load_ty) == .array_type) {
         const b = ip.keyPayload(.array_type, load_ty);
         // `*T` viewed as `*[1]T`.
-        if (b.len == 1 and b.child == val_ty and b.sentinel == .none)
-            return try sema.intern(.{ .aggregate = .{ .ty = load_ty, .storage = .{ .elems = &.{val} } } });
+        if (b.len == 1 and b.child == val_ty and b.sentinel == .none) {
+            const result = try sema.intern(.{ .aggregate = .{ .ty = load_ty, .storage = .{ .elems = &.{val} } } });
+            return result;
+        }
         // `*[N:s]T` viewed as `*[N]T`.
         if (ip.keyTag(val_ty) == .array_type) {
             const a = ip.keyPayload(.array_type, val_ty);
-            if (a.len == b.len and a.child == b.child and b.sentinel == .none) return try sema.subArray(val, 0, load_ty);
+            if (a.len == b.len and a.child == b.child and b.sentinel == .none) {
+                const result = try sema.subArray(val, 0, load_ty);
+                return result;
+            }
         }
     }
     if (ip.keyTag(val_ty) != .array_type) return if (key.byte_offset == 0) val else null;
@@ -14198,7 +14219,8 @@ fn loadAtOffset(sema: *Sema, val: Index, key: InternPool.Ptr, load_ty: Index) !?
         const start = key.byte_offset / size;
         if (b.sentinel != .none and start + b.len == a.len and a.sentinel != b.sentinel) return null;
         if (b.sentinel != .none and try sema.elemValue(val, start + b.len) != b.sentinel) return null;
-        return try sema.subArray(val, start, load_ty);
+        const result = try sema.subArray(val, start, load_ty);
+        return result;
     }
     // Elements may be read through a pointer to an in-memory coercible
     // type (`[:0]const u8` elements as `[]const u8`).
@@ -14443,7 +14465,8 @@ fn reinterpretLoad(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileErro
     const root_ty = sema.ip.typeOf(root_val);
     if (root.offset > Type.abiSize(sema.ip, root_ty) or Type.abiSize(sema.ip, ty) > Type.abiSize(sema.ip, root_ty) - root.offset)
         return sema.fail(block, src, "dereference of '{f}' exceeds bounds of containing decl of type '{f}'", .{ sema.fmtType(sema.ip.typeOf(ptr)), sema.fmtType(root_ty) });
-    return try sema.readMem(block, src, root_val, root.offset, ty);
+    const result = try sema.readMem(block, src, root_val, root.offset, ty);
+    return result;
 }
 
 /// Whether the bytes of `ty`'s values are defined, so memory can be
@@ -14536,7 +14559,8 @@ fn restructureLoad(sema: *Sema, block: *Block, src: Src, ptr: Index, ty: Index) 
     var n: usize = 0;
     try sema.flattenArray(root_val, flat, &n);
     var i: usize = @intCast(pos);
-    return try sema.buildArray(ty, flat, &i);
+    const result = try sema.buildArray(ty, flat, &i);
+    return result;
 }
 
 fn flattenArray(sema: *Sema, val: Index, out: []Index, n: *usize) CompileError!void {
@@ -14632,7 +14656,8 @@ fn spliceMem(sema: *Sema, val: Index, offset: i64, bytes: []const u8, undef: []c
         for (elems[0..n], 0..) |*e, i| {
             e.* = (try sema.spliceMem(e.*, offset - @as(i64, @intCast(sema.memChildOffset(ty, i))), bytes, undef)) orelse return null;
         }
-        return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+        const result = try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+        return result;
     }
     const n: usize = @intCast(size);
     const buf = try sema.arena.alloc(u8, n);
@@ -14718,7 +14743,8 @@ fn readMemBytes(sema: *Sema, ty: Index, buf_in: []const u8, undef: []const bool)
         // The type's sentinel, whatever the bytes say.
         if (ip.keyTag(ty) == .array_type and ip.keyPayload(.array_type, ty).sentinel != .none)
             elems[n - 1] = ip.keyPayload(.array_type, ty).sentinel;
-        return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+        const result = try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+        return result;
     }
     const class = Type.class(ip, ty);
     const used: usize = if (class == .float) Type.floatBits(ip, ty) / 8 else buf.len;
@@ -14736,13 +14762,17 @@ fn readMemBytes(sema: *Sema, ty: Index, buf_in: []const u8, undef: []const bool)
             best = .{ .i = @intCast(i), .size = fs, .val = fv };
         }
         const b = best orelse return try sema.undefValue(ty);
-        return try sema.intern(.{ .un = .{ .ty = ty, .tag = try sema.unionFieldTagValue(ty, b.i), .val = b.val } });
+        const result = try sema.intern(.{ .un = .{ .ty = ty, .tag = try sema.unionFieldTagValue(ty, b.i), .val = b.val } });
+        return result;
     }
     if (std.mem.findScalar(bool, undef[0..used], true) != null) {
         // Like upstream, undefined memory reads as 0xaa bytes once part of
         // the scalar is written, so a value written a byte at a time
         // through a `*[N]u8` view becomes defined.
-        if (std.mem.findScalar(bool, undef[0..used], false) == null) return try sema.undefValue(ty);
+        if (std.mem.findScalar(bool, undef[0..used], false) == null) {
+            const result = try sema.undefValue(ty);
+            return result;
+        }
         const filled = try sema.arena.dupe(u8, buf);
         for (filled[0..used], undef[0..used]) |*b, u| {
             if (u) b.* = 0xaa;
@@ -17020,7 +17050,8 @@ fn runtimeWeakExtern(sema: *Sema, block: *Block, v: Index) !?Ref {
     if (base != .uav or ip.keyTag(base.uav.val) != .extern_func) return null;
     const f = ip.keyPayload(.extern_func, base.uav.val);
     if (!f.is_weak or ip.keyPayload(.ptr, p).byte_offset != 0) return null;
-    return try sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = ip.typeOf(v), .payload = @backingInt(f.name) } } });
+    const result = try sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = ip.typeOf(v), .payload = @backingInt(f.name) } } });
+    return result;
 }
 
 /// "expected optional type" with upstream's notes (`failWithExpectedOptionalType`),
@@ -22876,7 +22907,8 @@ fn vectorArith(sema: *Sema, block: *Block, tag: Zir.Inst.Tag, ty: Index, lhs: Re
         else => return null,
     };
     if (!try sema.vectorNative(block, op, ty, &.{ lhs, rhs })) return null;
-    return try sema.addBinOp(block, ir_tag, lhs, rhs);
+    const result = try sema.addBinOp(block, ir_tag, lhs, rhs);
+    return result;
 }
 
 /// `lhs << rhs` or `lhs >> rhs` (`tag`, also exact) on vector type `ty` as
@@ -22935,10 +22967,12 @@ fn vectorUnaryOp(sema: *Sema, block: *Block, op: vector.Op, tag: Ir.Inst.Tag, op
     if (tag == .sub_wrap) {
         const zero = try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .repeated_elem = try sema.intValue(Type.childType(sema.ip, ty), 0) } } });
         if (!try sema.vectorNative(block, .sub_wrap, ty, &.{ .fromInterned(zero), operand })) return null;
-        return try sema.addBinOp(block, .sub_wrap, .fromInterned(zero), operand);
+        const result = try sema.addBinOp(block, .sub_wrap, .fromInterned(zero), operand);
+        return result;
     }
     if (!try sema.vectorNative(block, op, ty, &.{operand})) return null;
-    return try sema.addUnOp(block, tag, operand);
+    const result = try sema.addUnOp(block, tag, operand);
+    return result;
 }
 
 /// `~operand` or `!operand` on a vector as one instruction
@@ -22946,7 +22980,8 @@ fn vectorUnaryOp(sema: *Sema, block: *Block, op: vector.Op, tag: Ir.Inst.Tag, op
 fn vectorNot(sema: *Sema, block: *Block, operand: Ref) CompileError!?Ref {
     const ty = sema.typeOf(operand);
     if (sema.vectorLen(ty) == null or !try sema.vectorNative(block, .not, ty, &.{operand})) return null;
-    return try sema.addTyOp(block, .not, ty, operand);
+    const result = try sema.addTyOp(block, .not, ty, operand);
+    return result;
 }
 
 fn vectorType(sema: *Sema, len: u32, child: Index) !Index {
@@ -23158,7 +23193,8 @@ fn cmpBytes(sema: *Sema, block: *Block, src: Src, eq: bool, ty: Index, len: u32,
     }
     if (eq) bits = try sema.addBinOp(block, .xor, bits, .fromInterned(try sema.intValue(.u64_type, @as(u64, std.math.maxInt(u64)) >> @intCast(64 - len))));
     if (len < 64) bits = try sema.addTyOp(block, .trunc, try sema.intType(.unsigned, @intCast(len)), bits);
-    return try sema.bitCast(block, src, try sema.vectorType(len, .bool_type), bits);
+    const result = try sema.bitCast(block, src, try sema.vectorType(len, .bool_type), bits);
+    return result;
 }
 
 /// Whether every value of `src` coerces to `dest`, both integers or both
@@ -23253,7 +23289,8 @@ const VectorCast = struct {
 /// `f(operand)` element by element if `operand` is a vector.
 fn vectorUnary(sema: *Sema, block: *Block, src: Src, operand: Ref, f: *const fn (*Sema, *Block, Src, Ref) CompileError!Ref) CompileError!?Ref {
     const len = sema.vectorLen(sema.typeOf(operand)) orelse return null;
-    return try sema.vectorMap(block, src, len, .none, &.{operand}, VectorUnary{ .f = f });
+    const result = try sema.vectorMap(block, src, len, .none, &.{operand}, VectorUnary{ .f = f });
+    return result;
 }
 
 /// The cast `f` to `dest_ty` element by element if either type is a vector.
@@ -23265,7 +23302,8 @@ fn vectorCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref
     if (d_len == null or s_len == null) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected type '{f}', found '{f}'", .{ sema.fmtType(dest_ty), sema.fmtType(sema.typeOf(operand)) });
     if (d_len.? != s_len.?) return sema.fail(block, src, "vector length mismatch: {d} and {d}", .{ d_len.?, s_len.? });
     if (f == &analyzeIntCast or f == &analyzeTruncate) if (try sema.vectorIntCast(block, dest_ty, operand, f == &analyzeTruncate)) |r| return r;
-    return try sema.vectorMap(block, src, d_len.?, dest_ty, &.{operand}, VectorCast{ .f = f, .elem_ty = Type.childType(sema.ip, dest_ty) });
+    const result = try sema.vectorMap(block, src, d_len.?, dest_ty, &.{operand}, VectorCast{ .f = f, .elem_ty = Type.childType(sema.ip, dest_ty) });
+    return result;
 }
 
 /// `@intCast` (or with `truncate`, `@truncate`) of integer vector
@@ -23286,7 +23324,8 @@ fn vectorIntCast(sema: *Sema, block: *Block, dest_ty: Index, operand: Ref, trunc
         s.signedness == d.signedness and d.bits < s.bits
     else if (s.signedness == d.signedness) d.bits > s.bits else s.signedness == .unsigned and d.bits > s.bits;
     if (!ok or !try sema.vectorNative(block, .{ .cast = dest_ty }, src_ty, &.{operand})) return null;
-    return try sema.addTyOp(block, if (truncate) .trunc else .intcast, dest_ty, operand);
+    const result = try sema.addTyOp(block, if (truncate) .trunc else .intcast, dest_ty, operand);
+    return result;
 }
 
 fn zirReduce(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {

@@ -334,7 +334,8 @@ pub fn lookup(in: *ElfInput, name: []const u8) Allocator.Error!?Target {
         const o = &in.objects.items[d.object];
         const sym = o.syms[d.sym];
         if (sym.st_shndx == elf.SHN_ABS) return .{ .key = absKey(sym.st_value), .offset = 0 };
-        return try in.symTarget(o, d.sym, 0);
+        const result = try in.symTarget(o, d.sym, 0);
+        return result;
     }
     if (in.commons.contains(name)) return .{ .key = commonKey(name), .offset = 0 };
     return null;

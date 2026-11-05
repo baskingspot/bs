@@ -589,7 +589,12 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
 /// user (`in_place`), with r10 as the base if its pointer is not in a
 /// register.
 pub fn resultMem(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Mem {
-    if (cg.in_place.count() != 0) if (cg.in_place.get(@backingInt(inst))) |ptr| return try cg.ptrMem(ptr);
+    if (cg.in_place.count() != 0) {
+        if (cg.in_place.get(@backingInt(inst))) |ptr| {
+            const result = try cg.ptrMem(ptr);
+            return result;
+        }
+    }
     return switch (try cg.slotFor(inst, ty)) {
         .slot => |off| Mem.at(.rbp, off),
         else => null,

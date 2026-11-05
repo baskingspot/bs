@@ -4122,7 +4122,8 @@ const Putter = struct {
         try p.store.beginPack(io, p.inc.dir, &w);
         defer w.deinit(io);
         try forChunks(io, p.nodes.len, Writer{ .p = p, .w = &w });
-        return try p.store.commitPack(p.inc.gpa, io, &w, entries, end, p.inc.dir);
+        const result = try p.store.commitPack(p.inc.gpa, io, &w, entries, end, p.inc.dir);
+        return result;
     }
 
     /// Encodes a chunk's entries, which are contiguous in the pack, into a

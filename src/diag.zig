@@ -610,7 +610,8 @@ pub fn migrationFix(arena: std.mem.Allocator, container: []const u8, name: []con
                 from -= 4;
             }
         }
-        return try rawFix(arena, .exact, &.{.{ .start = from, .end = @intCast(end + f[2].len), .text = text }});
+        const fix = try rawFix(arena, .exact, &.{.{ .start = from, .end = @intCast(end + f[2].len), .text = text }});
+        return fix;
     }
     return null;
 }
@@ -629,7 +630,8 @@ pub fn typeInfoFix(arena: std.mem.Allocator, name: []const u8, names: []const []
     }
     for (names) |n| if (std.mem.eql(u8, n, snake.items)) {
         const text = if (std.zig.Token.getKeyword(n) != null) try arena.print("@\"{s}\"", .{n}) else n;
-        return try rawFix(arena, .exact, &.{.{ .start = start, .end = @intCast(start + name.len), .text = text }});
+        const fix = try rawFix(arena, .exact, &.{.{ .start = start, .end = @intCast(start + name.len), .text = text }});
+        return fix;
     };
     return null;
 }
@@ -1147,14 +1149,16 @@ pub fn renameFix(arena: std.mem.Allocator, source: []const u8, start: u32, end: 
     }.f;
     if (!oneEdit(name, candidates[0])) return null;
     if (candidates.len > 1 and oneEdit(name, candidates[1])) return null;
-    return try rawFix(arena, .maybe, &.{.{ .start = start, .end = end, .text = candidates[0] }});
+    const fix = try rawFix(arena, .maybe, &.{.{ .start = start, .end = end, .text = candidates[0] }});
+    return fix;
 }
 
 /// Wraps the expression at `start..end` as `<before><expression><after>`
 /// (a cast). Null when the span is not exactly one expression's.
 pub fn wrapFix(arena: std.mem.Allocator, tree: *const Ast, start: u32, end: u32, before: []const u8, after: []const u8) !?RawFix {
     if (!isExpression(tree, start, end)) return null;
-    return try rawFix(arena, .maybe, &.{.{ .start = start, .end = end, .text = try std.mem.concat(arena, u8, &.{ before, tree.source[start..end], after }) }});
+    const fix = try rawFix(arena, .maybe, &.{.{ .start = start, .end = end, .text = try std.mem.concat(arena, u8, &.{ before, tree.source[start..end], after }) }});
+    return fix;
 }
 
 /// Puts `try ` before the expression at `start..end`, an ignored error
@@ -1178,7 +1182,8 @@ pub fn tryFix(arena: std.mem.Allocator, tree: *const Ast, start: u32, end: u32, 
         else => false,
     };
     const text = if (statement and !payload_void) "_ = try " else "try ";
-    return try rawFix(arena, .maybe, &.{.{ .start = start, .end = start, .text = text }});
+    const fix = try rawFix(arena, .maybe, &.{.{ .start = start, .end = start, .text = text }});
+    return fix;
 }
 
 /// Swaps keyword `from` at offset `at` for `to`: `orelse` for a `catch` of
@@ -1188,7 +1193,8 @@ pub fn tryFix(arena: std.mem.Allocator, tree: *const Ast, start: u32, end: u32, 
 pub fn keywordFix(arena: std.mem.Allocator, tree: *const Ast, at: u32, from: std.zig.Token.Tag, to: []const u8) !?RawFix {
     const tok = tokenAt(tree, at) orelse return null;
     if (tree.tokenTag(tok) != from or (tok + 1 < tree.tokens.len and tree.tokenTag(tok + 1) == .pipe)) return null;
-    return try rawFix(arena, .maybe, &.{.{ .start = at, .end = tokenEnd(tree, tok), .text = to }});
+    const fix = try rawFix(arena, .maybe, &.{.{ .start = at, .end = tokenEnd(tree, tok), .text = to }});
+    return fix;
 }
 
 /// Whether `start..end` is exactly the span of an expression node.
@@ -1406,7 +1412,8 @@ fn localNamed(tree: *const Ast, use: Ast.TokenIndex) ?Local {
 /// Turns the `const` of `local` into `var`.
 pub fn varFix(arena: std.mem.Allocator, tree: *const Ast, local: Local) !?RawFix {
     if (tree.tokenTag(local.mut_tok) != .keyword_const or !local.var_ok) return null;
-    return try rawFix(arena, .maybe, &.{replaceToken(tree, local.mut_tok, "var")});
+    const fix = try rawFix(arena, .maybe, &.{replaceToken(tree, local.mut_tok, "var")});
+    return fix;
 }
 
 /// Unwraps the error union or optional value of expression `node`: puts
@@ -1421,15 +1428,22 @@ pub fn unwrapFix(arena: std.mem.Allocator, tree: *const Ast, node: Ast.Node.Inde
     const start = tree.tokenStart(tree.firstToken(node));
     const last = tree.lastToken(node);
     const end = tokenEnd(tree, last);
-    if (how == .optional) return try rawFix(arena, .maybe, &.{.{ .start = end, .end = end, .text = ".?" }});
+    if (how == .optional) {
+        const fix = try rawFix(arena, .maybe, &.{.{ .start = end, .end = end, .text = ".?" }});
+        return fix;
+    }
     // Not in a `defer`.
     if (try tryFix(arena, tree, start, end, true) == null) return null;
     const suffix = switch (tree.tokenTag(last + 1)) {
         .period, .l_bracket, .l_paren, .period_asterisk => true,
         else => false,
     };
-    if (!suffix) return try rawFix(arena, .maybe, &.{.{ .start = start, .end = start, .text = "try " }});
-    return try rawFix(arena, .maybe, &.{ .{ .start = start, .end = start, .text = "(try " }, .{ .start = end, .end = end, .text = ")" } });
+    if (!suffix) {
+        const fix = try rawFix(arena, .maybe, &.{.{ .start = start, .end = start, .text = "try " }});
+        return fix;
+    }
+    const fix = try rawFix(arena, .maybe, &.{ .{ .start = start, .end = start, .text = "(try " }, .{ .start = end, .end = end, .text = ")" } });
+    return fix;
 }
 
 /// What is wrong with a value whose origin an error notes.
@@ -1706,7 +1720,8 @@ fn builtinFix(arena: std.mem.Allocator, tree: *const Ast, tok: Ast.TokenIndex, n
         rest = rest[open + 3 ..];
     }
     try text.appendSlice(arena, rest);
-    return try rawFix(arena, .exact, &.{.{ .start = tree.tokenStart(tok), .end = tokenEnd(tree, t), .text = text.items }});
+    const fix = try rawFix(arena, .exact, &.{.{ .start = tree.tokenStart(tok), .end = tokenEnd(tree, t), .text = text.items }});
+    return fix;
 }
 
 /// Discards an unused capture at `tok` (`tag`: a switch prong's tag
@@ -1735,11 +1750,13 @@ fn captureFix(arena: std.mem.Allocator, tree: *const Ast, tok: Ast.TokenIndex, t
     if (tag) {
         // `|payload, tag|`: drop `, tag`.
         if (tree.tokenTag(tok - 1) != .comma) return null;
-        return try rawFix(arena, .exact, &.{.{ .start = tokenEnd(tree, tok - 2), .end = tokenEnd(tree, tok), .text = "" }});
+        const fix = try rawFix(arena, .exact, &.{.{ .start = tokenEnd(tree, tok - 2), .end = tokenEnd(tree, tok), .text = "" }});
+        return fix;
     }
     if (only and (before == .equal_angle_bracket_right or before == .keyword_catch)) {
         // `|x| ` goes, up to what follows it.
-        return try rawFix(arena, .exact, &.{.{ .start = tree.tokenStart(open), .end = tree.tokenStart(close + 1), .text = "" }});
+        const fix = try rawFix(arena, .exact, &.{.{ .start = tree.tokenStart(open), .end = tree.tokenStart(close + 1), .text = "" }});
+        return fix;
     }
     if (forCounter(tree, open, name_start)) |input| {
         const index = captureIndex(tree, open, name_start);
@@ -1753,9 +1770,11 @@ fn captureFix(arena: std.mem.Allocator, tree: *const Ast, tok: Ast.TokenIndex, t
             .{ .start = tokenEnd(tree, name_start - 2), .end = tokenEnd(tree, tok), .text = "" }
         else
             .{ .start = tree.tokenStart(name_start), .end = tree.tokenStart(tok + 2), .text = "" };
-        return try rawFix(arena, .exact, &edits);
+        const fix = try rawFix(arena, .exact, &edits);
+        return fix;
     }
-    return try rawFix(arena, .exact, &.{.{ .start = tree.tokenStart(name_start), .end = tokenEnd(tree, tok), .text = "_" }});
+    const fix = try rawFix(arena, .exact, &.{.{ .start = tree.tokenStart(name_start), .end = tokenEnd(tree, tok), .text = "_" }});
+    return fix;
 }
 
 /// The position of the capture starting at `name_start` in the list

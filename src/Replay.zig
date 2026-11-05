@@ -980,7 +980,8 @@ fn resolveRefs(r: *Replay, g: Green, is_func: bool) !?[]Ref {
         .analyze, .quota, .root, .defaults => {},
         else => if (is_func) try out.append(r.gpa, .{ .other = ref }),
     };
-    return try out.toOwnedSlice(r.gpa);
+    const result = try out.toOwnedSlice(r.gpa);
+    return result;
 }
 
 /// A green unit in a lazy build: it is live, and its result is in the
@@ -1568,7 +1569,8 @@ fn rootName(r: *Replay, ty: InternPool.Hash) !?[]const u8 {
         for (0..zcu.fe.files.items.len) |i| try r.root_types.?.put(r.gpa, InternPool.rootStructHash(try zcu.fileKey(@intCast(i))), @intCast(i));
     }
     const file = r.root_types.?.get(ty) orelse return null;
-    return try zcu.fileFqn(file);
+    const result = try zcu.fileFqn(file);
+    return result;
 }
 
 /// The final name of the type with stable hash `ty`, whether this build
@@ -1819,7 +1821,8 @@ const Resolver = struct {
             if (inst != .main_struct_inst or kind != .struct_type) return null;
             if (zcu.file_root_types.items.len < zcu.fe.files.items.len)
                 try zcu.file_root_types.appendNTimes(zcu.gpa, .none, zcu.fe.files.items.len - zcu.file_root_types.items.len);
-            return try zcu.fileRootType(file);
+            const result = try zcu.fileRootType(file);
+            return result;
         }
         if (zir.instructions.items(.tag)[@backingInt(inst)] != .extended) return null;
         const opcode = zir.instructions.items(.data)[@backingInt(inst)].extended.opcode;
@@ -1835,7 +1838,7 @@ const Resolver = struct {
                 .size = t.size,
                 .alignment = t.alignment,
             });
-            return try zcu.internNamed(.{ .enum_type = .{
+            const result = try zcu.internNamed(.{ .enum_type = .{
                 .file = file,
                 .zir_inst = inst,
                 .captures = try zcu.ip.arena(Zcu.tid).dupe(Index, c.captures),
@@ -1843,6 +1846,7 @@ const Resolver = struct {
                 .key = try zcu.ip.getString(Zcu.tid, c.key),
                 .info = info,
             } }, recordedName(c.name));
+            return result;
         }
         const ck: Zcu.ContainerKind = switch (kind) {
             .struct_type => if (opcode == .struct_decl or opcode == .reify_struct) .@"struct" else return null,
@@ -1883,14 +1887,17 @@ const Resolver = struct {
             .func, .func_inferred, .func_fancy => {},
             else => return null,
         }
-        return try zcu.ip.get(Zcu.tid, .{ .func = key });
+        const result = try zcu.ip.get(Zcu.tid, .{ .func = key });
+        return result;
     }
 
     pub fn intern(res: Resolver, key: InternPool.Key) !?Index {
-        return try res.r.zcu.ip.get(Zcu.tid, key);
+        const result = try res.r.zcu.ip.get(Zcu.tid, key);
+        return result;
     }
 
     pub fn namedTuple(res: Resolver, key: InternPool.Key, name: []const u8) !?Index {
-        return try res.r.zcu.internNamed(key, recordedName(name));
+        const result = try res.r.zcu.internNamed(key, recordedName(name));
+        return result;
     }
 };
