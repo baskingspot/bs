@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import time
+from typing import ClassVar
 
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(os.path.dirname(TOOL_DIR))
@@ -36,12 +37,12 @@ WORK = os.path.join(TOOL_DIR, ".work")
 FOUND = os.path.join(WORK, "found")
 UPSTREAM = os.path.join(REPO_DIR, "upstream")
 sys.path.insert(0, os.path.join(REPO_DIR, "tools", "corpus"))
-import run as corpus  # noqa: E402
+import run as corpus
 
 BUILD_TIMEOUT = 1800
 RUN_TIMEOUT = 300
 # Builds that reproduce a finding before it counts (a race shows in some).
-ERROR_RE = re.compile(r"^(\S.*?):(\d+):(\d+): error(?:\[[^\]]*\])?: (.*)$", re.M)
+ERROR_RE = re.compile(r"^(\S.*?):(\d+):(\d+): error(?:\[[^\]]*\])?: (.*)$", re.MULTILINE)
 
 
 def log(msg):
@@ -65,8 +66,18 @@ class Project:
             self.src = os.path.join(UPSTREAM, "src")
             self.copy_to = "src"
             self.extra = {"build_options.zig": os.path.join(REPO_DIR, "bench", "workloads", "zig", "build_options.zig")}
-            self.args = ["build-exe", "--stack", "48234496", "-fno-sanitize-thread", "--dep", "build_options",
-                         "-Mroot=src/main.zig", "-Mbuild_options=build_options.zig", "--name", "zig"]
+            self.args = [
+                "build-exe",
+                "--stack",
+                "48234496",
+                "-fno-sanitize-thread",
+                "--dep",
+                "build_options",
+                "-Mroot=src/main.zig",
+                "-Mbuild_options=build_options.zig",
+                "--name",
+                "zig",
+            ]
             self.run_args = ["version"]
         elif name == "hello":
             self.src = os.path.join(REPO_DIR, "bench", "workloads", "hello")
@@ -79,7 +90,15 @@ class Project:
             self.src = os.path.join(TOOL_DIR, "swap")
             self.copy_to, self.extra = "", {}
             deps = ["--dep", "revo=root", "--dep", "vm", "--dep", "capi"]
-            self.args = ["test", "--test-no-exec"] + deps + ["-Mroot=root.zig"] + deps + ["-Mvm=vm.zig"] + deps + ["-Mcapi=capi.zig"]
+            self.args = (
+                ["test", "--test-no-exec"]
+                + deps
+                + ["-Mroot=root.zig"]
+                + deps
+                + ["-Mvm=vm.zig"]
+                + deps
+                + ["-Mcapi=capi.zig"]
+            )
             self.is_test = True
         else:
             proj_name, tgt_name = name.split("/", 1)
@@ -146,8 +165,12 @@ class Project:
         builds run from."""
         shutil.rmtree(dest, ignore_errors=True)
         root = dest
-        shutil.copytree(self.src, os.path.join(dest, self.copy_to) if self.copy_to else dest, symlinks=True,
-                        ignore=shutil.ignore_patterns(".git", ".zig-cache", "zig-out"))
+        shutil.copytree(
+            self.src,
+            os.path.join(dest, self.copy_to) if self.copy_to else dest,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(".git", ".zig-cache", "zig-out"),
+        )
         for rel, path in self.extra.items():
             shutil.copy(path, os.path.join(dest, rel))
         return root
@@ -212,8 +235,17 @@ class Scanner:
         src = os.path.join(TOOL_DIR, "scan.zig")
         if not os.path.exists(self.exe) or os.path.getmtime(self.exe) < os.path.getmtime(src):
             os.makedirs(WORK, exist_ok=True)
-            subprocess.run([shutil.which("zig"), "build-exe", src, f"-femit-bin={self.exe}",
-                            "--cache-dir", os.path.join(WORK, "zig-cache")], check=True)
+            subprocess.run(
+                [
+                    shutil.which("zig"),
+                    "build-exe",
+                    src,
+                    f"-femit-bin={self.exe}",
+                    "--cache-dir",
+                    os.path.join(WORK, "zig-cache"),
+                ],
+                check=True,
+            )
 
     def scan(self, path):
         p = subprocess.run([self.exe, "scan", path], capture_output=True, check=False)
@@ -240,13 +272,30 @@ def indent_at(data, off):
 class Editor:
     """Makes one random edit to the tree, `kind` drawn by weight."""
 
-    KINDS = {
+    KINDS: ClassVar[dict[str, int]] = {
         # Semantic edits.
-        "int": 6, "string": 3, "bool": 2, "field_add": 3, "field_remove": 2, "fn_add": 4, "fn_remove": 2,
-        "param_type": 2, "flag_add": 2, "flag_flip": 3, "error_add": 2, "error_remove": 1, "generic": 3,
-        "rename": 2, "move": 2, "const_int": 3, "inline": 2, "pub": 1,
+        "int": 6,
+        "string": 3,
+        "bool": 2,
+        "field_add": 3,
+        "field_remove": 2,
+        "fn_add": 4,
+        "fn_remove": 2,
+        "param_type": 2,
+        "flag_add": 2,
+        "flag_flip": 3,
+        "error_add": 2,
+        "error_remove": 1,
+        "generic": 3,
+        "rename": 2,
+        "move": 2,
+        "const_int": 3,
+        "inline": 2,
+        "pub": 1,
         # No-ops for the program: they move lines, or nothing.
-        "blank_line": 3, "comment": 2, "touch": 2,
+        "blank_line": 3,
+        "comment": 2,
+        "touch": 2,
         # A compile error, fixed by a later step.
         "break": 3,
     }
@@ -295,11 +344,19 @@ class Editor:
 
     # Literals in function bodies.
     def _literal(self, kind, generic=None):
-        rel, info = self.pick_file(lambda i: any(l["kind"] == kind and l["body"] is not None and
-                                                 (generic is None or l["generic"] == generic) for l in i["literals"]))
+        rel, info = self.pick_file(
+            lambda i: any(
+                l["kind"] == kind and l["body"] is not None and (generic is None or l["generic"] == generic)
+                for l in i["literals"]
+            )
+        )
         if not rel:
             return None
-        lits = [l for l in info["literals"] if l["kind"] == kind and l["body"] is not None and (generic is None or l["generic"] == generic)]
+        lits = [
+            l
+            for l in info["literals"]
+            if l["kind"] == kind and l["body"] is not None and (generic is None or l["generic"] == generic)
+        ]
         return rel, self.rng.choice(self._live(lits, lambda l: l["body"]))
 
     def e_int(self, generic=None):
@@ -307,7 +364,7 @@ class Editor:
         if not r:
             return None
         rel, lit = r
-        text = self.read(rel)[lit["start"]:lit["end"]].decode()
+        text = self.read(rel)[lit["start"] : lit["end"]].decode()
         try:
             v = int(text.replace("_", ""), 0)
         except ValueError:
@@ -323,7 +380,7 @@ class Editor:
         if not rel:
             return None
         lit = self.rng.choice([l for l in info["literals"] if l["kind"] == "int" and l["body"] is None])
-        text = self.read(rel)[lit["start"]:lit["end"]].decode()
+        text = self.read(rel)[lit["start"] : lit["end"]].decode()
         try:
             v = int(text.replace("_", ""), 0)
         except ValueError:
@@ -340,7 +397,10 @@ class Editor:
             return None
         d = self.rng.choice(decls)
         data = self.read(rel)
-        m = re.match(rb"((?:[ \t]*///[^\n]*\n)*[ \t]*)(pub\s+)?(inline\s+|noinline\s+)?(fn|const|var)\b", data[d["start"]:d["end"]])
+        m = re.match(
+            rb"((?:[ \t]*///[^\n]*\n)*[ \t]*)(pub\s+)?(inline\s+|noinline\s+)?(fn|const|var)\b",
+            data[d["start"] : d["end"]],
+        )
         return (d, m) if m else None
 
     def e_inline(self):
@@ -396,6 +456,7 @@ class Editor:
     def e_field_add(self):
         def ok(c):
             return c["kind"] in ("struct", "union", "enum") and (not c["root"] or c["fields"])
+
         rel, info = self.pick_file(lambda i: any(ok(c) for c in i["containers"]))
         if not rel:
             return None
@@ -409,8 +470,9 @@ class Editor:
             member = f"bs_eh_f{n}: u32 = {self.rng.randrange(100)},"
         data = self.read(rel)
         at = c["fields"][-1]["end"] if c["root"] else c["open"]
-        return [op(rel, at, at, "\n" + indent_at(data, at)[4 if c["root"] else 0:] + member)], \
-            f"{rel}: {c['kind']} gains field bs_eh_f{n}"
+        return [
+            op(rel, at, at, "\n" + indent_at(data, at)[4 if c["root"] else 0 :] + member)
+        ], f"{rel}: {c['kind']} gains field bs_eh_f{n}"
 
     def e_field_remove(self):
         # Fields this hunt added, else any field.
@@ -464,7 +526,9 @@ class Editor:
     def e_fn_remove(self):
         for rel in self.rng.sample(self.files, min(len(self.files), 30)):
             data = self.read(rel)
-            defs = list(re.finditer(rb"\nfn (bsEh[0-9_]+)\(x: u\d+\) u32 \{\n    return @truncate\(x \+% \d+\);\n\}\n", data))
+            defs = list(
+                re.finditer(rb"\nfn (bsEh[0-9_]+)\(x: u\d+\) u32 \{\n    return @truncate\(x \+% \d+\);\n\}\n", data)
+            )
             if defs:
                 d = self.rng.choice(defs)
                 name = d.group(1)
@@ -478,7 +542,16 @@ class Editor:
         return None
 
     def e_param_type(self):
-        widths = {"u8": "u16", "u16": "u32", "u32": "u64", "u64": "u32", "i32": "i64", "i64": "i32", "usize": "u64", "isize": "i64"}
+        widths = {
+            "u8": "u16",
+            "u16": "u32",
+            "u32": "u64",
+            "u64": "u32",
+            "i32": "i64",
+            "i64": "i32",
+            "usize": "u64",
+            "isize": "i64",
+        }
         # This hunt's functions first: their bodies take any width.
         for rel in self.rng.sample(self.files, min(len(self.files), 30)):
             data = self.read(rel)
@@ -487,7 +560,9 @@ class Editor:
                 m = self.rng.choice(ms)
                 old = m.group(1).decode()
                 new = "u64" if old == "u32" else "u32"
-                return [op(rel, m.start(1), m.end(1), new)], f"{rel}: parameter of {m.group(0)[4:-6].decode()} {old} -> {new}"
+                return [
+                    op(rel, m.start(1), m.end(1), new)
+                ], f"{rel}: parameter of {m.group(0)[4:-6].decode()} {old} -> {new}"
         rel, info = self.pick_file()
         if not rel:
             return None
@@ -496,7 +571,7 @@ class Editor:
         for c in info["containers"]:
             for d in c["decls"]:
                 for p in d.get("params", []):
-                    t = data[p["type_start"]:p["type_end"]].decode()
+                    t = data[p["type_start"] : p["type_end"]].decode()
                     if t in widths:
                         cands.append((d["name"], p, t))
         if not cands:
@@ -505,18 +580,23 @@ class Editor:
         return [op(rel, p["type_start"], p["type_end"], widths[t])], f"{rel}: parameter of {name} {t} -> {widths[t]}"
 
     def e_flag_add(self):
-        rel, info = self.pick_file(lambda i: bool(self._bodies(i)) and any(
-            d["name"] == "std" for d in i["containers"][0]["decls"]))
+        rel, info = self.pick_file(
+            lambda i: bool(self._bodies(i)) and any(d["name"] == "std" for d in i["containers"][0]["decls"])
+        )
         if not rel:
             return None
         n = self.name()
         k1, k2 = self.rng.randrange(1000), self.rng.randrange(1000)
-        stmt = (f"if (bs_eh_flag{n}) std.mem.doNotOptimizeAway(@as(u32, {k1})) "
-                f"else std.mem.doNotOptimizeAway(@as(u64, {k2}));")
+        stmt = (
+            f"if (bs_eh_flag{n}) std.mem.doNotOptimizeAway(@as(u32, {k1})) "
+            f"else std.mem.doNotOptimizeAway(@as(u64, {k2}));"
+        )
         ins, where = self._insert_stmt(rel, info, stmt)
         end = len(self.read(rel))
-        return [op(rel, end, end, f"\nconst bs_eh_flag{n} = {self.rng.choice(['true', 'false'])};\n"), ins], \
-            f"{rel}: adds flag bs_eh_flag{n}, which selects code in {where}"
+        return [
+            op(rel, end, end, f"\nconst bs_eh_flag{n} = {self.rng.choice(['true', 'false'])};\n"),
+            ins,
+        ], f"{rel}: adds flag bs_eh_flag{n}, which selects code in {where}"
 
     def e_flag_flip(self):
         for rel in self.rng.sample(self.files, min(len(self.files), 30)):
@@ -533,7 +613,7 @@ class Editor:
             return None
         d = self.rng.choice(self._flags(info))
         data = self.read(rel)
-        seg = data[d["start"]:d["end"]]
+        seg = data[d["start"] : d["end"]]
         m = re.search(rb"=\s*(true|false)\s*;", seg)
         if not m:
             return None
@@ -549,8 +629,9 @@ class Editor:
             return None
         e = self.rng.choice(info["error_sets"])
         n = self.name()
-        return [op(rel, e["open"], e["open"], f"BsEh{n}, ")], \
-            f"{rel}: error set {{{', '.join(e['names'][:3])}{', ...' if len(e['names']) > 3 else ''}}} gains BsEh{n}"
+        return [
+            op(rel, e["open"], e["open"], f"BsEh{n}, ")
+        ], f"{rel}: error set {{{', '.join(e['names'][:3])}{', ...' if len(e['names']) > 3 else ''}}} gains BsEh{n}"
 
     def e_error_remove(self):
         for rel in self.rng.sample(self.files, min(len(self.files), 30)):
@@ -583,8 +664,14 @@ class Editor:
         return [minimal_op(rel, self.read(rel), data)], f"{rel}: renames {d['name']} to {new}"
 
     def _renamable(self, info):
-        return [d for d in info["containers"][0]["decls"] if not d["pub"] and not d["extern"] and d["name"] not in ("std", "builtin")
-                and not d["name"].startswith("@")]
+        return [
+            d
+            for d in info["containers"][0]["decls"]
+            if not d["pub"]
+            and not d["extern"]
+            and d["name"] not in ("std", "builtin")
+            and not d["name"].startswith("@")
+        ]
 
     def e_move(self):
         """Moves a top-level declaration that names no other one of its
@@ -604,19 +691,24 @@ class Editor:
             if d["name"] in names or not set(d["uses"]) <= names:
                 continue
             data = self.read(rel)
-            text = data[d["start"]:d["end"]].decode()
+            text = data[d["start"] : d["end"]].decode()
             lines = text.split("\n")
             i = next(i for i, l in enumerate(lines) if not l.lstrip().startswith("///"))
             lines[i] = "pub " + lines[i]
             end = len(self.read(dest))
             imp = f'const {d["name"]} = @import("{os.path.basename(dest)}").{d["name"]};'
-            return [op(rel, d["start"], d["end"], imp), op(dest, end, end, "\n" + "\n".join(lines) + "\n")], \
-                f"{rel}: moves {d['name']} to {dest}"
+            return [
+                op(rel, d["start"], d["end"], imp),
+                op(dest, end, end, "\n" + "\n".join(lines) + "\n"),
+            ], f"{rel}: moves {d['name']} to {dest}"
         return None
 
     def _movable(self, info):
-        return [d for d in self._renamable(info) if set(d["uses"]) <= {"std", "builtin"} and d["kind"] in ("fn", "const")
-                and d["end"] - d["start"] < 4000]
+        return [
+            d
+            for d in self._renamable(info)
+            if set(d["uses"]) <= {"std", "builtin"} and d["kind"] in ("fn", "const") and d["end"] - d["start"] < 4000
+        ]
 
     def e_blank_line(self):
         rel = self.choose_file()
@@ -633,7 +725,7 @@ class Editor:
         starts = line_starts(data)
         for _ in range(20):
             i = self.rng.randrange(len(starts))
-            near = data[starts[max(0, i - 1)]:starts[min(len(starts) - 1, i + 1)]]
+            near = data[starts[max(0, i - 1)] : starts[min(len(starts) - 1, i + 1)]]
             # Not inside or next to a multiline string literal.
             if b"\\\\" not in near:
                 return starts[i]
@@ -673,7 +765,7 @@ def minimal_op(path, old, new):
     b = 0
     while b < min(len(old), len(new)) - a and old[-1 - b] == new[-1 - b]:
         b += 1
-    return op(path, a, len(old) - b, new[a:len(new) - b].decode())
+    return op(path, a, len(old) - b, new[a : len(new) - b].decode())
 
 
 def apply_ops(tree, ops):
@@ -687,9 +779,9 @@ def apply_ops(tree, ops):
         with open(path, "rb") as f:
             data = f.read()
         new = o["text"].encode()
-        inverse.append(op(o["path"], o["start"], o["start"] + len(new), data[o["start"]:o["end"]].decode()))
+        inverse.append(op(o["path"], o["start"], o["start"] + len(new), data[o["start"] : o["end"]].decode()))
         with open(path, "wb") as f:
-            f.write(data[:o["start"]] + new + data[o["end"]:])
+            f.write(data[: o["start"]] + new + data[o["end"] :])
     return list(reversed(inverse))
 
 
@@ -726,7 +818,16 @@ class Session:
                 e.pop(k, None)
         t0 = time.monotonic()
         try:
-            p = subprocess.run(argv, cwd=self.tree, env=e, capture_output=True, text=True, errors="replace", timeout=BUILD_TIMEOUT)
+            p = subprocess.run(
+                argv,
+                check=False,
+                cwd=self.tree,
+                env=e,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=BUILD_TIMEOUT,
+            )
             code, err = p.returncode, p.stderr + p.stdout
         except subprocess.TimeoutExpired as x:
             code, err = "timeout", str(x.stderr or "")
@@ -735,7 +836,9 @@ class Session:
     def run(self, path):
         argv = self.runner + [path] + self.p.run_args
         try:
-            p = subprocess.run(argv, cwd=self.tree, stdin=subprocess.DEVNULL, capture_output=True, timeout=RUN_TIMEOUT)
+            p = subprocess.run(
+                argv, check=False, cwd=self.tree, stdin=subprocess.DEVNULL, capture_output=True, timeout=RUN_TIMEOUT
+            )
             code = p.returncode
             out, err = p.stdout.decode(errors="replace"), p.stderr.decode(errors="replace")
         except subprocess.TimeoutExpired:
@@ -769,19 +872,33 @@ class Session:
         off = self.build({"BS_CACHE": "off"}, off_out, args=self.sib_args)
         stats["sibling_s"] = round(d["secs"], 2)
         stats["donor"] = "replaying donor" in d["log"]
-        if internal(d["log"]) or not isinstance(d["code"], int) or d["code"] < 0 or (d["code"] != 0 and not ERROR_RE.search(d["log"])):
+        if (
+            internal(d["log"])
+            or not isinstance(d["code"], int)
+            or d["code"] < 0
+            or (d["code"] != 0 and not ERROR_RE.search(d["log"]))
+        ):
             return "sibling-build-failed", tail(d["log"])
         if (d["code"] == 0) != (off["code"] == 0):
-            return "sibling-outcome", f"donor build exit {d['code']}, without the cache exit {off['code']}\n--- donor\n{tail(d['log'])}\n--- off\n{tail(off['log'])}"
+            return (
+                "sibling-outcome",
+                f"donor build exit {d['code']}, without the cache exit {off['code']}\n--- donor\n{tail(d['log'])}\n--- off\n{tail(off['log'])}",
+            )
         if d["code"] != 0:
             de, oe = errors(d["log"]), errors(off["log"])
             if de != oe:
-                return "sibling-errors", "only the donor build: %s\nonly without the cache: %s" % (sorted(de - oe)[:10], sorted(oe - de)[:10])
+                return (
+                    "sibling-errors",
+                    f"only the donor build: {sorted(de - oe)[:10]}\nonly without the cache: {sorted(oe - de)[:10]}",
+                )
             return None, ""
         if not filecmp.cmp(out, off_out, shallow=False):
             rd, ro = self.run(out), self.run(off_out)
             if rd != ro:
-                return "sibling-behavior", f"donor build: {rd!r}\nwithout the cache: {ro!r}\n{describe_diff(out, off_out)}"
+                return (
+                    "sibling-behavior",
+                    f"donor build: {rd!r}\nwithout the cache: {ro!r}\n{describe_diff(out, off_out)}",
+                )
         return None, ""
 
     def step_main(self, verify):
@@ -792,17 +909,35 @@ class Session:
         off_out = os.path.join(self.work, "out", "off")
         off = self.build({"BS_CACHE": "off"}, off_out)
         stats = {"edit_s": round(e["secs"], 2), "off_s": round(off["secs"], 2)}
-        if internal(e["log"]) or not isinstance(e["code"], int) or e["code"] < 0 or (e["code"] != 0 and not ERROR_RE.search(e["log"])):
+        if (
+            internal(e["log"])
+            or not isinstance(e["code"], int)
+            or e["code"] < 0
+            or (e["code"] != 0 and not ERROR_RE.search(e["log"]))
+        ):
             return "edit-build-failed", tail(e["log"]), stats
-        if internal(off["log"]) or not isinstance(off["code"], int) or off["code"] < 0 or (off["code"] != 0 and not ERROR_RE.search(off["log"])):
+        if (
+            internal(off["log"])
+            or not isinstance(off["code"], int)
+            or off["code"] < 0
+            or (off["code"] != 0 and not ERROR_RE.search(off["log"]))
+        ):
             return "off-build-failed", tail(off["log"]), stats
         if (e["code"] == 0) != (off["code"] == 0):
-            return "outcome", f"edit build exit {e['code']}, without the cache exit {off['code']}\n--- edit\n{tail(e['log'])}\n--- off\n{tail(off['log'])}", stats
+            return (
+                "outcome",
+                f"edit build exit {e['code']}, without the cache exit {off['code']}\n--- edit\n{tail(e['log'])}\n--- off\n{tail(off['log'])}",
+                stats,
+            )
         if e["code"] != 0:
             ee, oe = errors(e["log"]), errors(off["log"])
             stats["errors"] = len(oe)
             if ee != oe:
-                return "errors", "only the edit build: %s\nonly without the cache: %s" % (sorted(ee - oe)[:10], sorted(oe - ee)[:10]), stats
+                return (
+                    "errors",
+                    f"only the edit build: {sorted(ee - oe)[:10]}\nonly without the cache: {sorted(oe - ee)[:10]}",
+                    stats,
+                )
             return None, "compile error", stats
         # The full build, checked node by node against the edit build's
         # records, in a copy of the cache so that the session goes on
@@ -870,13 +1005,27 @@ class Session:
         """Whether the session's records end in a log since their base: a
         lazy edit build's, laid out base first."""
         c = os.path.join(self.local, "bs", "c")
-        return any(os.path.getsize(os.path.join(c, d, "manifest.log")) > 0 for d in os.listdir(c)
-                   if os.path.exists(os.path.join(c, d, "manifest.log")))
+        return any(
+            os.path.getsize(os.path.join(c, d, "manifest.log")) > 0
+            for d in os.listdir(c)
+            if os.path.exists(os.path.join(c, d, "manifest.log"))
+        )
 
 
 def internal(log):
-    return any(s in log for s in ("panic:", "error: BS_CACHE", "BS_CACHE_CHECK found", "Segmentation fault", "unable to use the cache",
-                                  "the cache did not record", "error: out of memory", "warning: cache"))
+    return any(
+        s in log
+        for s in (
+            "panic:",
+            "error: BS_CACHE",
+            "BS_CACHE_CHECK found",
+            "Segmentation fault",
+            "unable to use the cache",
+            "the cache did not record",
+            "error: out of memory",
+            "warning: cache",
+        )
+    )
 
 
 def errors(log):
@@ -986,8 +1135,10 @@ def save(seq, cls, det, s, counts):
     with open(os.path.join(d, "sequence.json"), "w") as f:
         json.dump(seq, f, indent=1)
     with open(os.path.join(d, "steps.txt"), "w") as f:
-        for i, st in enumerate(seq["steps"], 1):
-            f.write(f"{i}: {st['kind']}: {st['what']}{' (verify)' if st['verify'] else ''}\n")
+        f.writelines(
+            f"{i}: {st['kind']}: {st['what']}{' (verify)' if st['verify'] else ''}\n"
+            for i, st in enumerate(seq["steps"], 1)
+        )
     log(f"FOUND {cls} at step {len(seq['steps'])}: {d}\n{det[:3000]}")
     return d
 
@@ -1041,7 +1192,7 @@ def reduce(seq_dir, args):
         chunk = max(1, len(keep) // n)
         reduced = False
         for i in range(0, len(keep), chunk):
-            cand = keep[:i] + keep[i + chunk:]
+            cand = keep[:i] + keep[i + chunk :]
             if fails(cand):
                 keep, n, reduced = cand, max(n - 1, 2), True
                 break
@@ -1075,21 +1226,30 @@ def reduce(seq_dir, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("project", nargs="?", help="zig, hello, or a corpus target <project>/<target> (libvaxis/test, zls/test)")
+    ap.add_argument(
+        "project", nargs="?", help="zig, hello, or a corpus target <project>/<target> (libvaxis/test, zls/test)"
+    )
     ap.add_argument("--bs", default=os.path.join(REPO_DIR, "zig-out", "bin", "bs"))
     ap.add_argument("--target", help="for example aarch64-linux (binaries run under qemu)")
     ap.add_argument("--sequences", type=int, default=0, help="stop after this many sequences (default: until ^C)")
     ap.add_argument("--seed", type=int, help="the first sequence's seed (default: from the clock)")
     ap.add_argument("--min-steps", type=int, default=20)
     ap.add_argument("--max-steps", type=int, default=50)
-    ap.add_argument("--verify-every", type=int, default=0,
-                    help="every Nth step's edit build also runs under BS_CACHE_VERIFY=1, whose full build then replaces "
-                         "the session's records (default 0: never; each step's full build runs in a copy instead)")
+    ap.add_argument(
+        "--verify-every",
+        type=int,
+        default=0,
+        help="every Nth step's edit build also runs under BS_CACHE_VERIFY=1, whose full build then replaces "
+        "the session's records (default 0: never; each step's full build runs in a copy instead)",
+    )
     ap.add_argument("--keep-going", action="store_true", help="start the next sequence after a finding")
-    ap.add_argument("--sibling", action="store_true",
-                    help="after each step, also build the project's sibling (two modules' names swapped, the main "
-                         "module among them in a test) from an empty local cache, which replays the program's donor, "
-                         "and compare it with the sibling built without the cache")
+    ap.add_argument(
+        "--sibling",
+        action="store_true",
+        help="after each step, also build the project's sibling (two modules' names swapped, the main "
+        "module among them in a test) from an empty local cache, which replays the program's donor, "
+        "and compare it with the sibling built without the cache",
+    )
     ap.add_argument("--replay", metavar="DIR")
     ap.add_argument("--reduce", metavar="DIR")
     args = ap.parse_args()
