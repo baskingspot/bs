@@ -412,13 +412,24 @@ fn linkPath(inc: *const Incremental, n: usize) []const u8 {
 
 /// The content hash the manifest records for an input, of the file at
 /// `path`, or null if it cannot be read.
+/// A large one (a racy link input) is mapped rather than copied; a small
+/// one, such as a source an editor may rewrite in place, is read.
 fn contentHash(inc: *const Incremental, path: []const u8) !?Hash {
-    const src = Io.Dir.cwd().readFileAlloc(inc.io, path, inc.gpa, .unlimited) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        else => return null,
-    };
-    defer inc.gpa.free(src);
-    return @bitCast(Frontend.hashSource(src));
+    const io = inc.io;
+    const f = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer f.close(io);
+    const len = f.length(io) catch return null;
+    if (len < hashed_by_stat_min) {
+        const src = Io.Dir.cwd().readFileAlloc(io, path, inc.gpa, .unlimited) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => return null,
+        };
+        defer inc.gpa.free(src);
+        return @bitCast(Frontend.hashSource(src));
+    }
+    var map = cache.mapOpenFile(io, f, len, true) catch return null;
+    defer map.destroy(io);
+    return @bitCast(Frontend.hashSource(map.memory));
 }
 
 /// Whether every input of the last build but its link inputs has the
@@ -461,12 +472,7 @@ fn sameContents(inc: *const Incremental, m: *const Manifest, i: u32) !bool {
     // Recorded by its stat (`hashedByStat`, whose rule `Input.init`
     // applies to the same stat), which changed.
     if (isLinkInput(m.inputKey(i)) and in.size >= hashed_by_stat_min and in.mtime != Manifest.Input.racy_mtime) return false;
-    const src = Io.Dir.cwd().readFileAlloc(inc.io, path, inc.gpa, .unlimited) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        else => return false,
-    };
-    defer inc.gpa.free(src);
-    return @as(Hash, @bitCast(Frontend.hashSource(src))) == in.content_hash;
+    return try inc.contentHash(path) == in.content_hash;
 }
 
 /// Whether one of manifest `m`'s link-only inputs changed: its objects may
@@ -3862,11 +3868,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         key_buf.clearRetainingCapacity();
         try key_buf.print(gpa, "{s}{s}", .{ link_input_prefix, path });
         const stat = try Io.Dir.cwd().statFile(io, path, .{});
-        const hash = if (inc.hashedByStat(stat)) statHash(stat) else hash: {
-            const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
-            defer gpa.free(bytes);
-            break :hash @as(Hash, @bitCast(Frontend.hashSource(bytes)));
-        };
+        const hash = if (inc.hashedByStat(stat)) statHash(stat) else try inc.contentHash(path) orelse return error.FileNotFound;
         try b.addInput(path, key_buf.items, stat, hash, inc.build_start);
     }
     const t4 = now(io);

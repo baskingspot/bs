@@ -4213,7 +4213,9 @@ thread's abilists imports. No bytes come from it.
   That is as sound as the stat check, which trusts a matching stat
   anyway; a stat-hashed input whose stat changed counts as changed even
   if only touched (`sameContents` tells the two kinds apart by the
-  recorded size and racy mtime). A racy one is hashed by content. Changing one invalidates nothing, but it
+  recorded size and racy mtime). A racy one is hashed by content,
+  mapped rather than copied (`contentHash`; siv's 76 MB libsiv.so, linked
+  just before the programs that use it, costs 26 ms instead of 60). Changing one invalidates nothing, but it
   blocks the skip-the-link fast path and forces a relink (built: see
   below).
 - The conversion reruns on every build and relink: it is a scan plus
