@@ -9,7 +9,7 @@ const std = @import("std");
 const macho = std.macho;
 const Allocator = std.mem.Allocator;
 
-const Dylib = @This();
+const MachODylib = @This();
 
 path: []const u8,
 install_name: []const u8,
@@ -27,12 +27,12 @@ pub const Export = packed struct(u8) { weak: bool, tls: bool, _: u6 = 0 };
 
 pub const Error = error{ OutOfMemory, InvalidDylib };
 
-pub fn parse(arena: Allocator, path: []const u8, file: []const u8) Error!Dylib {
+pub fn parse(arena: Allocator, path: []const u8, file: []const u8) Error!MachODylib {
     const bytes = try thinSlice(file);
     if (bytes.len < @sizeOf(macho.mach_header_64)) return error.InvalidDylib;
     const mh = std.mem.bytesToValue(macho.mach_header_64, bytes[0..@sizeOf(macho.mach_header_64)]);
     if (mh.magic != macho.MH_MAGIC_64 or mh.cputype != macho.CPU_TYPE_ARM64 or mh.filetype != macho.MH_DYLIB) return error.InvalidDylib;
-    var d: Dylib = .{ .path = path, .install_name = "", .current_version = 0, .compatibility_version = 0 };
+    var d: MachODylib = .{ .path = path, .install_name = "", .current_version = 0, .compatibility_version = 0 };
     var trie: []const u8 = &.{};
     var at: usize = @sizeOf(macho.mach_header_64);
     for (0..mh.ncmds) |_| {
@@ -76,7 +76,7 @@ fn range(bytes: []const u8, off: u32, len: u32) Error![]const u8 {
 }
 
 /// Collects the names below the node at `node`, whose path spells `name`.
-fn walk(d: *Dylib, arena: Allocator, trie: []const u8, node: usize, name: *std.ArrayList(u8), depth: u32) Error!void {
+fn walk(d: *MachODylib, arena: Allocator, trie: []const u8, node: usize, name: *std.ArrayList(u8), depth: u32) Error!void {
     // Edges only lengthen names, and a trie deeper than any name is bad.
     if (depth > 4096) return error.InvalidDylib;
     var at = node;

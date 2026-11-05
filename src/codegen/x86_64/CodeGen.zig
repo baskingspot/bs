@@ -111,7 +111,7 @@ trace_slot: ?i32 = null,
 /// The callee-saved registers the function's values use (`alloc_regs`
 /// bits), which the prologue saves below rbp and every return restores.
 saved: u32 = 0,
-/// From `planRegisters`: per position (as `Ssa.Func.clobbers`), how many
+/// From `planRegisters`: per position (as `Ssa.clobbers`), how many
 /// values and terminators before it may write r11 (`usesR11`).
 r11_clobbers: std.ArrayList(u32) = .empty,
 /// A lowering named r11 (`r11`) since the value or terminator being
@@ -2268,7 +2268,7 @@ fn planSplits(cg: *CodeGen) Error!void {
     defer gpa.free(ws.uses);
     @memset(ws.uses, 0);
     // Prefix sums of the clobber points' weights by position, as
-    // `Ssa.Func.clobbers` counts them.
+    // `Ssa.clobbers` counts them.
     const wcl = try gpa.alloc(u64, cl.len);
     defer gpa.free(wcl);
     wcl[0] = 0;

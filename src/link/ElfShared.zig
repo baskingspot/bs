@@ -7,7 +7,7 @@ const std = @import("std");
 const elf = std.elf;
 const Allocator = std.mem.Allocator;
 
-const Shared = @This();
+const ElfShared = @This();
 
 path: []const u8,
 /// DT_SONAME, or for a library without one the name `parse` was given.
@@ -45,7 +45,7 @@ pub const Error = error{ OutOfMemory, InvalidShared };
 /// DT_NEEDED name if it has no DT_SONAME: as upstream's linkers name
 /// such a library, the file name of one `-l` found, else its path as
 /// given.
-pub fn parse(arena: Allocator, path: []const u8, needed_name: []const u8, bytes: []const u8, arch: @import("Atom.zig").Unwind.Arch) Error!Shared {
+pub fn parse(arena: Allocator, path: []const u8, needed_name: []const u8, bytes: []const u8, arch: @import("Atom.zig").Unwind.Arch) Error!ElfShared {
     if (bytes.len < @sizeOf(elf.Elf64_Ehdr) or !std.mem.eql(u8, bytes[0..4], elf.MAGIC)) return error.InvalidShared;
     const eh = std.mem.bytesToValue(elf.Elf64_Ehdr, bytes[0..@sizeOf(elf.Elf64_Ehdr)]);
     if (eh.e_ident[elf.EI.CLASS] != elf.ELFCLASS64 or eh.e_ident[elf.EI.DATA] != elf.ELFDATA2LSB) return error.InvalidShared;
@@ -103,7 +103,7 @@ pub fn parse(arena: Allocator, path: []const u8, needed_name: []const u8, bytes:
         at += vd.next;
     }
 
-    var lib: Shared = .{ .path = path, .soname = needed_name };
+    var lib: ElfShared = .{ .path = path, .soname = needed_name };
     for (dynamic) |d| if (d.d_tag == elf.DT_SONAME) {
         lib.soname = str(strtab, d.d_val);
     };
@@ -141,7 +141,7 @@ pub fn parse(arena: Allocator, path: []const u8, needed_name: []const u8, bytes:
 
 /// The library's other data objects at `value`: the aliases of a copied
 /// object, which its own code may use instead.
-pub fn aliases(lib: *const Shared, arena: Allocator, value: u64) Allocator.Error![]const []const u8 {
+pub fn aliases(lib: *const ElfShared, arena: Allocator, value: u64) Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var it = lib.symbols.iterator();
     while (it.next()) |e| if (e.value_ptr.object and e.value_ptr.value == value) try out.append(arena, e.key_ptr.*);

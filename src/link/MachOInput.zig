@@ -20,7 +20,7 @@ const Archive = @import("Archive.zig");
 const Elf = @import("Elf.zig");
 const ElfDynamic = @import("ElfDynamic.zig");
 
-const Inputs = @This();
+const MachOInput = @This();
 
 arena: Allocator,
 objects: std.ArrayList(Object) = .empty,
@@ -283,17 +283,17 @@ pub fn parseObject(arena: Allocator, path: []const u8, file: []const u8) Error!O
 }
 
 /// Adds an object given on the command line.
-pub fn addObject(in: *Inputs, path: []const u8, bytes: []const u8) Error!void {
+pub fn addObject(in: *MachOInput, path: []const u8, bytes: []const u8) Error!void {
     try in.load(try parseObject(in.arena, path, bytes));
 }
 
 /// Adds an archive, whose members load when they define a name the
 /// inputs or the caller need (`pull`).
-pub fn addArchive(in: *Inputs, path: []const u8, bytes: []const u8) Error!void {
+pub fn addArchive(in: *MachOInput, path: []const u8, bytes: []const u8) Error!void {
     try in.archives.append(in.arena, .{ .path = path, .reader = try .init(in.arena, bytes) });
 }
 
-fn load(in: *Inputs, o: Object) Error!void {
+fn load(in: *MachOInput, o: Object) Error!void {
     const index: u32 = @intCast(in.objects.items.len);
     try in.objects.append(in.arena, o);
     const obj = &in.objects.items[index];
@@ -333,7 +333,7 @@ fn load(in: *Inputs, o: Object) Error!void {
 /// Records where each of `o`'s thread-local descriptors' initial values
 /// are: the descriptor's symbol resolves there, since the writer makes
 /// its own descriptors.
-fn readTlvs(in: *Inputs, o: *Object) Error!void {
+fn readTlvs(in: *MachOInput, o: *Object) Error!void {
     const inits = try in.arena.alloc([]const ?Target, o.sects.len);
     for (inits, o.sects, 0..) |*t, s, i| {
         t.* = &.{};
@@ -357,7 +357,7 @@ fn readTlvs(in: *Inputs, o: *Object) Error!void {
 /// Pulls the archive members that define a name the loaded objects or
 /// `wanted` need and nothing defines yet, until nothing changes (see
 /// `ElfInput.pull`). Returns the index of the first object it loaded.
-pub fn pull(in: *Inputs, wanted: []const []const u8, ctx: anytype) !usize {
+pub fn pull(in: *MachOInput, wanted: []const []const u8, ctx: anytype) !usize {
     const first = in.objects.items.len;
     for (wanted) |name| if (!in.defs.contains(name)) try in.undefs.put(in.arena, name, {});
     var changed = true;
@@ -385,7 +385,7 @@ pub fn pull(in: *Inputs, wanted: []const []const u8, ctx: anytype) !usize {
 
 /// The names objects `first..` reference that neither the objects nor
 /// COMMON define, for the caller to request from compiler_rt.
-pub fn undefinedSince(in: *const Inputs, first: usize, out: *std.ArrayList([]const u8), gpa: Allocator) Allocator.Error!void {
+pub fn undefinedSince(in: *const MachOInput, first: usize, out: *std.ArrayList([]const u8), gpa: Allocator) Allocator.Error!void {
     for (in.objects.items[first..]) |*o| for (o.syms) |sym| {
         if (sym.isStab() or !sym.isExternal() or sym.kind() != macho.N_UNDF or sym.n_value != 0) continue;
         const name = o.linkName(sym);
@@ -403,7 +403,7 @@ pub const Target = struct {
 };
 
 /// The definition objects give `name`, or null.
-pub fn lookup(in: *Inputs, name: []const u8) Allocator.Error!?Target {
+pub fn lookup(in: *MachOInput, name: []const u8) Allocator.Error!?Target {
     if (in.defs.get(name)) |d| {
         const o = &in.objects.items[d.object];
         const sym = o.syms[d.sym];
@@ -418,7 +418,7 @@ pub fn lookup(in: *Inputs, name: []const u8) Allocator.Error!?Target {
 /// The objects' external definitions a dylib exports, sorted by name:
 /// every N_EXT symbol but private externals (N_PEXT) and the names
 /// `skip.zigExport` claims, and the COMMON symbols, as ld64 exports them.
-pub fn dynamicExports(in: *Inputs, skip: anytype) ![]ElfDynamic.Export {
+pub fn dynamicExports(in: *MachOInput, skip: anytype) ![]ElfDynamic.Export {
     var out: std.ArrayList(ElfDynamic.Export) = .empty;
     var it = in.defs.iterator();
     while (it.next()) |d| {
@@ -567,7 +567,7 @@ pub const Converted = struct {
 /// `zigExport(name) !?SymbolKey`, `rtExport(name) !?SymbolKey` and
 /// `importSym(name, weak) !?SymbolKey` (libSystem). Undefined strong
 /// names and unsupported relocations go to `errors`.
-pub fn convert(in: *Inputs, ctx: anytype) !Converted {
+pub fn convert(in: *MachOInput, ctx: anytype) !Converted {
     const arena = in.arena;
     var atoms: std.ArrayList(Atom) = .empty;
     var values: std.ArrayList(Elf.Value) = .empty;
@@ -629,7 +629,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
 
 fn Converter(comptime Ctx: type) type {
     return struct {
-        in: *Inputs,
+        in: *MachOInput,
         ctx: Ctx,
         o: *const Object = undefined,
         atoms: *std.ArrayList(Atom),
@@ -970,7 +970,7 @@ test "objects and a Darwin archive from upstream's Clang and llvm-ar" {
     // test/link_input/macho_*.c, compiled for aarch64-macos by build.zig's
     // `addMachOInputs`; Archive.zig's tests check the archive itself.
     const lib = @embedFile("macho_input_lib.a");
-    var in: Inputs = .{ .arena = arena };
+    var in: MachOInput = .{ .arena = arena };
     try in.addObject("main.o", @embedFile("macho_input_main.o"));
     try in.addArchive("lib.a", lib);
     const Ctx = struct {
@@ -1067,7 +1067,7 @@ test "Objective-C sections keep their names, and the image infos merge into one"
     defer arena_state.deinit();
     // test/link_input/macho_objc_{a,b}.m, two root classes compiled by
     // build.zig's `addMachOInputs`.
-    var in: Inputs = .{ .arena = arena_state.allocator() };
+    var in: MachOInput = .{ .arena = arena_state.allocator() };
     try in.addObject("a.o", @embedFile("macho_input_objc_a.o"));
     try in.addObject("b.o", @embedFile("macho_input_objc_b.o"));
     const Ctx = struct {

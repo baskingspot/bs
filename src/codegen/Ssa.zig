@@ -9,7 +9,7 @@
 //! memory, written by each `br`. Later steps add real ops, type classes,
 //! operands, and phis.
 //!
-//! A `Func` is reused for every function a worker compiles: `build` clears
+//! An `Ssa` is reused for every function a worker compiles: `build` clears
 //! it and keeps its capacity, so building allocates only while it grows.
 
 const std = @import("std");
@@ -20,7 +20,7 @@ const Inst = Ir.Inst;
 const InternPool = @import("../InternPool.zig");
 const Type = @import("../Type.zig");
 
-const Func = @This();
+const Ssa = @This();
 
 values: std.MultiArrayList(Value) = .empty,
 blocks: std.ArrayList(Block) = .empty,
@@ -236,7 +236,7 @@ pub const Term = struct {
     };
 };
 
-pub fn deinit(f: *Func, gpa: Allocator) void {
+pub fn deinit(f: *Ssa, gpa: Allocator) void {
     f.values.deinit(gpa);
     f.blocks.deinit(gpa);
     f.layout.deinit(gpa);
@@ -260,12 +260,12 @@ pub fn deinit(f: *Func, gpa: Allocator) void {
     f.fills.deinit(gpa);
 }
 
-pub fn blockInsts(f: *const Func, block: Block.Index) []const Inst.Index {
+pub fn blockInsts(f: *const Ssa, block: Block.Index) []const Inst.Index {
     const b = f.blocks.items[@backingInt(block)];
     return f.values.items(.inst)[b.start..][0..b.len];
 }
 
-pub fn switchCases(f: *const Func, term: Term, len: usize) []const Block.Index {
+pub fn switchCases(f: *const Ssa, term: Term, len: usize) []const Block.Index {
     return f.extra.items[term.succ[0]..][0..len];
 }
 
@@ -277,7 +277,7 @@ pub fn branchCond(ir: *const Ir, term: Term) Inst.Ref {
 }
 
 /// Builds `f` from `ir`, replacing what it held.
-pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
+pub fn build(f: *Ssa, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
     f.values.clearRetainingCapacity();
     f.blocks.clearRetainingCapacity();
     f.layout.clearRetainingCapacity();
@@ -317,7 +317,7 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
 /// that Sema marked (`Ir.CondBr.cover`, the branches the user wrote) and
 /// that is not cold. Switch cases get none, as upstream's. A covered block
 /// is not bypassed.
-pub fn place(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, cover: bool) Allocator.Error!void {
+pub fn place(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, cover: bool) Allocator.Error!void {
     const n = f.blocks.items.len;
     f.order.clearRetainingCapacity();
     try f.order.ensureTotalCapacity(gpa, f.layout.items.len);
@@ -383,7 +383,7 @@ pub fn place(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, cov
 /// nothing reads (after jump threading, a constant for a bool the code
 /// only branched on) only jumps, so branches to it go where it goes, as
 /// for the blocks `place` bypasses, and it is not emitted.
-pub fn bypassUnread(f: *Func, ir: *const Ir) void {
+pub fn bypassUnread(f: *Ssa, ir: *const Ir) void {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
     const uses = f.live.items(.uses);
@@ -433,7 +433,7 @@ pub fn bypassUnread(f: *Func, ir: *const Ir) void {
 /// Values are IR instructions with one register each, so a jump may skip
 /// only blocks whose values nothing past them reads; liveness then
 /// follows the new edges, which stay within the loops of the old ones.
-fn thread(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Allocator.Error!void {
+fn thread(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Allocator.Error!void {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
     const insts = f.values.items(.inst);
@@ -499,7 +499,7 @@ fn thread(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Alloca
 
 /// Whether loop header `h` (one load and a switch on it, `thread`) loads
 /// a local that is not volatile, and nothing but the switch reads the load.
-fn dispatches(f: *const Func, ir: *const Ir, ip: *const InternPool, h: u32) bool {
+fn dispatches(f: *const Ssa, ir: *const Ir, ip: *const InternPool, h: u32) bool {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
     const hb = f.blocks.items[h];
@@ -532,7 +532,7 @@ fn dispatches(f: *const Func, ir: *const Ir, ip: *const InternPool, h: u32) bool
 }
 
 /// The block switch `term` goes to for constant `val`.
-fn switchTarget(f: *const Func, ir: *const Ir, ip: *const InternPool, term: Term, val: InternPool.Index) u32 {
+fn switchTarget(f: *const Ssa, ir: *const Ir, ip: *const InternPool, term: Term, val: InternPool.Index) u32 {
     const payload = ir.instructions.items(.data)[@backingInt(term.inst)].pl_op.payload;
     const x = ir.extraData(Ir.SwitchBr, payload);
     var it = ir.switchCases(payload);
@@ -553,13 +553,13 @@ fn switchTarget(f: *const Func, ir: *const Ir, ip: *const InternPool, term: Term
 
 /// Whether the `i`th block of the layout, `block`, has code: it is the
 /// entry, or neither bypassed nor unreached.
-pub fn emits(f: *const Func, i: usize, block: Block.Index) bool {
+pub fn emits(f: *const Ssa, i: usize, block: Block.Index) bool {
     return i == 0 or (f.fwd.items[@backingInt(block)] == block and !f.unreached.items[@backingInt(block)]);
 }
 
 /// Whether block `index` ends with a call of a noreturn function (a
 /// failing check's panic, `@panic`).
-fn endsCold(f: *const Func, ir: *const Ir, index: u32) bool {
+fn endsCold(f: *const Ssa, ir: *const Ir, index: u32) bool {
     const b = f.blocks.items[index];
     return b.len != 0 and (b.term.tag == .noreturn or b.term.tag == .unreach) and
         ir.instructions.items(.tag)[@backingInt(f.values.items(.inst)[b.start + b.len - 1])] == .call;
@@ -578,7 +578,7 @@ fn endsCold(f: *const Func, ir: *const Ir, index: u32) bool {
 /// clobber point that lies after its definition and at or before its last
 /// use, except one in a block that does not continue, which matters only
 /// to the uses in that block after it.
-pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.Error!void {
+pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.Error!void {
     assert(f.live.len == ir.instructions.len);
     const s = f.live.slice();
     @memset(s.items(.uses), 0);
@@ -673,7 +673,7 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
 ///   variable's register (`Live.share`).
 /// With inline assembly only pass 2 runs. `ctx.inGpr(ty)` says whether
 /// an overflow operation on `ty` runs in general-purpose registers.
-pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: anytype) Allocator.Error!void {
+pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: anytype) Allocator.Error!void {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
     const insts = f.values.items(.inst);
@@ -947,7 +947,7 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
 /// `v` if load `load` of promoted variable `v` may share its register
 /// (`Live.share`), else `no_tie`. A store of the load itself writes back
 /// what the register holds.
-fn shareable(f: *const Func, ir: *const Ir, load: Inst.Index, v: Inst.Index) u32 {
+fn shareable(f: *const Ssa, ir: *const Ir, load: Inst.Index, v: Inst.Index) u32 {
     const live = f.live.slice();
     const def = live.items(.def);
     const end = live.items(.end);
@@ -972,7 +972,7 @@ fn shareable(f: *const Func, ir: *const Ir, load: Inst.Index, v: Inst.Index) u32
 /// Lets value `w` share `v`'s register (`Live.share`), and so the chain
 /// of tied operands that compute it from position `start` on, each read
 /// only by the next, while nothing between reads the register.
-fn shareTies(f: *Func, ir: *const Ir, w: Inst.Index, v: Inst.Index, start: u32) void {
+fn shareTies(f: *Ssa, ir: *const Ir, w: Inst.Index, v: Inst.Index, start: u32) void {
     const live = f.live.slice();
     const share = live.items(.share);
     const uses = live.items(.uses);
@@ -1005,7 +1005,7 @@ fn shareTies(f: *Func, ir: *const Ir, w: Inst.Index, v: Inst.Index, start: u32) 
 /// `w`'s lowering reads before writing its result (its tied operand, a
 /// call's arguments, an overflow operation's operands for its fields).
 /// The terminators on the way are the caller's.
-fn storeShares(f: *const Func, ir: *const Ir, w: Inst.Index, v: Inst.Index, store: usize) bool {
+fn storeShares(f: *const Ssa, ir: *const Ir, w: Inst.Index, v: Inst.Index, store: usize) bool {
     const live = f.live.slice();
     const def = live.items(.def);
     const fate = live.items(.fate);
@@ -1042,7 +1042,7 @@ fn storeShares(f: *const Func, ir: *const Ir, w: Inst.Index, v: Inst.Index, stor
 
 /// Whether terminator `term` reads a load that shares promoted variable
 /// `v`'s register.
-fn termReadsShared(f: *const Func, ir: *const Ir, term: Term, v: Inst.Index) bool {
+fn termReadsShared(f: *const Ssa, ir: *const Ir, term: Term, v: Inst.Index) bool {
     const data = ir.instructions.items(.data)[@backingInt(term.inst)];
     var c: SharedReads = .{ .f = f, .ir = ir, .v = v, .tie = no_tie };
     switch (term.tag) {
@@ -1058,7 +1058,7 @@ fn termReadsShared(f: *const Func, ir: *const Ir, term: Term, v: Inst.Index) boo
 /// For `forEachOperand`: finds operands that are loads sharing promoted
 /// variable `v`'s register, other than `tie`.
 const SharedReads = struct {
-    f: *const Func,
+    f: *const Ssa,
     ir: *const Ir,
     v: Inst.Index,
     tie: u32,
@@ -1575,7 +1575,7 @@ fn fillBase(ir: *const Ir, ip: *const InternPool, ptr: Inst.Ref) ?u32 {
 /// it touches. A load reads its value's bytes, not its padding, which
 /// holds no value in Zig. Removing one dead fill keeps the others dead:
 /// the bytes it fills are written again before any read on every path.
-fn deadFills(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Allocator.Error!void {
+fn deadFills(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Allocator.Error!void {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
     const insts = f.values.items(.inst);
@@ -1799,7 +1799,7 @@ fn deadFills(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool) All
 /// The chunks every path from the end of `block` writes before reading
 /// them, per candidate: what holds at the start of all its successors,
 /// everything at an end of the function.
-fn fillsOut(f: *const Func, ir: *const Ir, block: u32, n: usize, out: *[max_fill_allocs]u64) void {
+fn fillsOut(f: *const Ssa, ir: *const Ir, block: u32, n: usize, out: *[max_fill_allocs]u64) void {
     const ok = f.fills.ok.items;
     for (out[0..n]) |*o| o.* = ~@as(u64, 0);
     const term = f.blocks.items[block].term;
@@ -2032,7 +2032,7 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// `clobbers`), `restricted_clobbers` counts those lowerings so far, and
 /// a value takes such a register only if none lies in its interval, at
 /// its definition, or at its last use. Returns the mask of registers used.
-pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.bit_set.Dynamic, restricted: u32, restricted_clobbers: []const u32) u32 {
+pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.bit_set.Dynamic, restricted: u32, restricted_clobbers: []const u32) u32 {
     const total = n + n_float;
     assert(total <= max_regs);
     const gprs: u32 = (@as(u32, 1) << @intCast(n)) - 1;
@@ -2227,7 +2227,7 @@ pub fn slotClass(size: u64, alignment: u64) ?SlotClass {
 /// A free slot of `class` for value `inst`, reusing one whose value's
 /// interval ended before `inst`'s definition, or null if there is none
 /// (the caller then allocates one and records it with `holdSlot`).
-pub fn takeSlot(f: *Func, gpa: Allocator, inst: Inst.Index, class: SlotClass) Allocator.Error!?i32 {
+pub fn takeSlot(f: *Ssa, gpa: Allocator, inst: Inst.Index, class: SlotClass) Allocator.Error!?i32 {
     const pos = f.live.items(.def)[@backingInt(inst)];
     const s = &f.slots;
     while (s.active.items.len != 0 and s.active.items[0].end < pos) {
@@ -2253,7 +2253,7 @@ pub fn takeSlot(f: *Func, gpa: Allocator, inst: Inst.Index, class: SlotClass) Al
 
 /// Records that value `inst` holds the slot at `off` until its interval
 /// ends.
-pub fn holdSlot(f: *Func, gpa: Allocator, inst: Inst.Index, off: i32, class: SlotClass) Allocator.Error!void {
+pub fn holdSlot(f: *Ssa, gpa: Allocator, inst: Inst.Index, off: i32, class: SlotClass) Allocator.Error!void {
     const s = &f.slots;
     const end = f.live.items(.end)[@backingInt(inst)];
     try s.active.append(gpa, undefined);
@@ -2269,7 +2269,7 @@ pub fn holdSlot(f: *Func, gpa: Allocator, inst: Inst.Index, off: i32, class: Slo
 }
 
 const Builder = struct {
-    f: *Func,
+    f: *Ssa,
     gpa: Allocator,
     ir: *const Ir,
     /// The block being filled, if any: after a terminator, the next value
@@ -2413,7 +2413,7 @@ test "blocks follow the structured IR's layout" {
     try insts.append(gpa, .{ .tag = .repeat, .data = .{ .repeat = .{ .loop_inst = @fromBackingInt(2) } } });
     try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = .void_value } });
     const ir: Ir = .{ .instructions = insts.slice(), .extra = &extra, .func = .none, .main_block = 9 };
-    var f: Func = .{};
+    var f: Ssa = .{};
     defer f.deinit(gpa);
     try f.build(gpa, &ir);
 
@@ -2422,7 +2422,7 @@ test "blocks follow the structured IR's layout" {
     const L = f.layout.items;
     try std.testing.expectEqual(5, L.len);
     const term = struct {
-        fn of(fp: *const Func, blk: Block.Index) Term {
+        fn of(fp: *const Ssa, blk: Block.Index) Term {
             return fp.blocks.items[@backingInt(blk)].term;
         }
     }.of;
@@ -2449,7 +2449,7 @@ test "an empty body falls through" {
     try insts.append(gpa, .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = .void_type, .payload = 0 } } });
     try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = .void_value } });
     const ir: Ir = .{ .instructions = insts.slice(), .extra = &extra, .func = .none, .main_block = 1 };
-    var f: Func = .{};
+    var f: Ssa = .{};
     defer f.deinit(gpa);
     try f.build(gpa, &ir);
 
@@ -2488,7 +2488,7 @@ test "liveness extends over loops and ignores clobbers on paths that end" {
     try insts.append(gpa, .{ .tag = .trap, .data = .{ .no_op = {} } });
     try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = .void_value } });
     const ir: Ir = .{ .instructions = insts.slice(), .extra = &extra, .func = .none, .main_block = 11 };
-    var f: Func = .{};
+    var f: Ssa = .{};
     defer f.deinit(gpa);
     try f.build(gpa, &ir);
     try f.live.resize(gpa, ir.instructions.len);

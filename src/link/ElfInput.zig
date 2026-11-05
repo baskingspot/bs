@@ -5,7 +5,7 @@
 //! one per entry for mergeable sections, so the link stays one pass over
 //! atoms and nothing downstream knows an atom came from C.
 //!
-//! `Inputs` resolves names across the objects, pulls archive members on
+//! `ElfInput` resolves names across the objects, pulls archive members on
 //! demand, and converts the loaded objects into atoms. The caller (Emit)
 //! supplies the Zig side of resolution: the compilation's exports, which
 //! come first, and compiler_rt, which comes after the inputs.
@@ -20,7 +20,7 @@ const ElfShared = @import("ElfShared.zig");
 const Elf = @import("Elf.zig");
 const ElfDynamic = @import("ElfDynamic.zig");
 
-const Inputs = @This();
+const ElfInput = @This();
 
 arena: Allocator,
 objects: std.ArrayList(Object) = .empty,
@@ -204,7 +204,7 @@ pub fn parseObjectFor(arena: Allocator, path: []const u8, bytes: []const u8, arc
 }
 
 /// Adds an object given on the command line.
-pub fn addObject(in: *Inputs, path: []const u8, bytes: []const u8) Error!void {
+pub fn addObject(in: *ElfInput, path: []const u8, bytes: []const u8) Error!void {
     try in.load(try parseObjectFor(in.arena, path, bytes, in.arch));
 }
 
@@ -213,11 +213,11 @@ pub fn addObject(in: *Inputs, path: []const u8, bytes: []const u8) Error!void {
 /// `runtime` marks an archive the link adds after every input, as
 /// upstream's linker sees libc++, libc++abi, libunwind and
 /// libc_nonshared.a (`shared_libs`).
-pub fn addArchive(in: *Inputs, path: []const u8, bytes: []const u8, runtime: bool) Error!void {
+pub fn addArchive(in: *ElfInput, path: []const u8, bytes: []const u8, runtime: bool) Error!void {
     try in.archives.append(in.arena, .{ .path = path, .reader = try .init(in.arena, bytes), .runtime = runtime });
 }
 
-fn load(in: *Inputs, o: Object) Error!void {
+fn load(in: *ElfInput, o: Object) Error!void {
     const index: u32 = @intCast(in.objects.items.len);
     try in.objects.append(in.arena, o);
     const obj = &in.objects.items[index];
@@ -273,7 +273,7 @@ fn load(in: *Inputs, o: Object) Error!void {
 /// archive order and cycles do not matter. `ctx.zigExport(name)` names
 /// what the compilation itself defines, which no member replaces. Returns
 /// the index of the first object it loaded.
-pub fn pull(in: *Inputs, wanted: []const []const u8, ctx: anytype) !usize {
+pub fn pull(in: *ElfInput, wanted: []const []const u8, ctx: anytype) !usize {
     const first = in.objects.items.len;
     for (wanted) |name| if (!in.defs.contains(name)) try in.undefs.put(in.arena, name, {});
     var changed = true;
@@ -303,7 +303,7 @@ pub fn pull(in: *Inputs, wanted: []const []const u8, ctx: anytype) !usize {
 
 /// The names objects `first..` reference that neither the objects nor
 /// COMMON define, for the caller to request from compiler_rt.
-pub fn undefinedSince(in: *const Inputs, first: usize, out: *std.ArrayList([]const u8), gpa: Allocator) Allocator.Error!void {
+pub fn undefinedSince(in: *const ElfInput, first: usize, out: *std.ArrayList([]const u8), gpa: Allocator) Allocator.Error!void {
     for (in.objects.items[first..]) |*o| for (o.syms[o.first_global..]) |sym| {
         if (sym.st_shndx != elf.SHN_UNDEF) continue;
         const name = o.symName(sym);
@@ -323,13 +323,13 @@ pub const Target = struct {
 };
 
 /// Whether symbol `s` of `o` is the definition the link keeps for `name`.
-fn isKept(in: *const Inputs, o: *const Object, s: u32, name: []const u8) bool {
+fn isKept(in: *const ElfInput, o: *const Object, s: u32, name: []const u8) bool {
     const d = in.defs.get(name) orelse return false;
     return &in.objects.items[d.object] == o and d.sym == s;
 }
 
 /// The definition objects give `name`, or null.
-pub fn lookup(in: *Inputs, name: []const u8) Allocator.Error!?Target {
+pub fn lookup(in: *ElfInput, name: []const u8) Allocator.Error!?Target {
     if (in.defs.get(name)) |d| {
         const o = &in.objects.items[d.object];
         const sym = o.syms[d.sym];
@@ -363,7 +363,7 @@ pub const undefined_weak_key: SymbolKey = .fromName("obj:undefined-weak");
 /// Where local or defined symbol `s` of `o` points, `addend` bytes on (an
 /// addend only moves a section symbol's target, as lld's), or null for an
 /// absolute symbol.
-fn symTarget(in: *Inputs, o: *const Object, s: u32, addend: i64) Allocator.Error!?Target {
+fn symTarget(in: *ElfInput, o: *const Object, s: u32, addend: i64) Allocator.Error!?Target {
     const sym = o.syms[s];
     const shndx = sym.st_shndx;
     if (shndx == elf.SHN_ABS or shndx >= elf.SHN_LORESERVE or shndx == elf.SHN_UNDEF) return null;
@@ -386,7 +386,7 @@ fn symTarget(in: *Inputs, o: *const Object, s: u32, addend: i64) Allocator.Error
 /// `adrp x16, slot; ldr x16, [x16, :lo12:slot]; br x16`) that stands for
 /// the function. Content-addressed, so the symbols of one resolver share
 /// them.
-fn ifuncAtoms(in: *Inputs, o: *const Object, s: u32) Allocator.Error!struct { slot: Atom, stub: Atom } {
+fn ifuncAtoms(in: *ElfInput, o: *const Object, s: u32) Allocator.Error!struct { slot: Atom, stub: Atom } {
     const sym = o.syms[s];
     const a64 = in.arch == .aarch64;
     const zeros: []const u8 = &@as([8]u8, @splat(0));
@@ -508,7 +508,7 @@ pub const Converted = struct {
 /// compilation's exports, which come before the objects') and
 /// `rtExport(name) !?SymbolKey` (compiler_rt, after them). Undefined
 /// strong names and unsupported relocations go to `errors`.
-pub fn convert(in: *Inputs, ctx: anytype) !Converted {
+pub fn convert(in: *ElfInput, ctx: anytype) !Converted {
     const arena = in.arena;
     var atoms: std.ArrayList(Atom) = .empty;
     var values: std.ArrayList(Elf.Value) = .empty;
@@ -602,7 +602,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
 /// with default or protected visibility that the Zig code does not
 /// define (`skip`), at their place in their sections' atoms, sorted by
 /// name.
-pub fn dynamicExports(in: *Inputs, skip: anytype) ![]ElfDynamic.Export {
+pub fn dynamicExports(in: *ElfInput, skip: anytype) ![]ElfDynamic.Export {
     var out: std.ArrayList(ElfDynamic.Export) = .empty;
     var it = in.defs.iterator();
     while (it.next()) |d| {
@@ -669,7 +669,7 @@ fn sortArrays(arena: Allocator, atoms: []Atom, arrays: []const ArrayAtom) !void 
 
 fn Converter(comptime Ctx: type) type {
     return struct {
-        in: *Inputs,
+        in: *ElfInput,
         ctx: Ctx,
         o: *const Object = undefined,
         atoms: *std.ArrayList(Atom),
@@ -1378,7 +1378,7 @@ fn Converter(comptime Ctx: type) type {
         }
 
         /// Whether symbol `s`, which the shared object defines, is one it
-        /// exports with default visibility (`Inputs.dynamicExports`),
+        /// exports with default visibility (`ElfInput.dynamicExports`),
         /// which an executable may preempt. Indirect functions and the Zig
         /// code's exports bind locally.
         fn preemptible(c: *C, s: u32) !bool {
