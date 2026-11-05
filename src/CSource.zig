@@ -76,6 +76,17 @@ pub const Flags = struct {
         return r;
     }
 
+    /// The sanitizer mode, as upstream's `Module.create` defaults it:
+    /// full in Debug, trapping in ReleaseSafe, none in ReleaseFast and
+    /// ReleaseSmall.
+    pub fn sanitizeC(f: Flags) std.zig.SanitizeC {
+        return f.sanitize_c orelse switch (f.optimize orelse .debug) {
+            .debug => .full,
+            .safe => .trap,
+            .fast, .small => .off,
+        };
+    }
+
     /// Takes a module option of the command line; false if `arg` is none.
     pub fn parse(f: *Flags, arg: []const u8) bool {
         const eql = std.mem.eql;
@@ -612,6 +623,10 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         if (found) {
             runtime.shrinkRetainingCapacity(first);
             try archives.append(ra, .{ .path = path });
+        } else if (is_nonshared and sources.len == 0 and !o.cxx_runtime and try checkZig(s, io, zig.found.?) != null) {
+            // A build of Zig only does not fail for want of upstream zig
+            // 0.17.1; it links without libc_nonshared.a, as before.
+            runtime.shrinkRetainingCapacity(first);
         } else {
             var rand: [8]u8 = undefined;
             io.random(&rand);
@@ -641,11 +656,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .optimize = src.flags.optimize orelse .debug,
             // As upstream's `Module.create`: trapping in ReleaseSafe, none
             // in ReleaseFast and ReleaseSmall.
-            .sanitize_c = src.flags.sanitize_c orelse @as(std.zig.SanitizeC, switch (src.flags.optimize orelse .debug) {
-                .debug => .full,
-                .safe => .trap,
-                .fast, .small => .off,
-            }),
+            .sanitize_c = src.flags.sanitizeC(),
             .red_zone = src.flags.red_zone orelse true,
             .no_builtin = src.flags.no_builtin orelse false,
             .stack_protector = o.link_libc and (src.flags.stack_protector orelse o.stack_protector),

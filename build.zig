@@ -1588,18 +1588,36 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         test_step.dependOn(&preempt.step);
     }
     // An executable of C only, as upstream builds one: its main is C's.
-    {
+    // Without UBSan, std's panic handler and its I/O stay out, as
+    // upstream's crt1.o has none, so it links against glibc 2.12, which
+    // lacks functions std's I/O calls.
+    for ([_][]const []const u8{ &.{"x86_64-linux-gnu"}, &.{ "x86_64-linux-gnu.2.12", "-fno-sanitize-c" } }) |args| {
         const cexe = b.addRunArtifact(bs);
-        cexe.setName("bs build-exe -lc with only C sources");
-        cexe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+        cexe.setName(b.fmt("bs build-exe -lc with only C sources ({s})", .{args[0]}));
+        cexe.addArgs(&.{ "build-exe", "-lc", "-target" });
+        cexe.addArgs(args);
         cexe.addFileArg(b.path("test/link_input/cmain.c"));
         cexe.setEnvironmentVariable("BS_ZIG", zig);
-        const cexe_run = std.Build.Step.Run.create(b, "run bs -lc build of only C sources");
+        const cexe_run = std.Build.Step.Run.create(b, b.fmt("run bs -lc build of only C sources ({s})", .{args[0]}));
         cexe_run.addFileArg(cexe.addPrefixedOutputFileArg("-femit-bin=", "cmain"));
         cexe_run.addArg("5");
         cexe_run.addCheck(.{ .expect_stdout_exact = "argc=2 q=478165905515354922\n" });
         cexe_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
         test_step.dependOn(&cexe_run.step);
+    }
+    // A Zig executable calling libc_nonshared.a's functions: atexit, and
+    // stat and fstatat, which glibc before 2.33 has only there.
+    {
+        const nexe = b.addRunArtifact(bs);
+        nexe.setName("bs build-exe -lc calling libc_nonshared.a from Zig");
+        nexe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu.2.17" });
+        nexe.addFileArg(b.path("test/link_input/nonshared_main.zig"));
+        nexe.setEnvironmentVariable("BS_ZIG", zig);
+        const nexe_run = std.Build.Step.Run.create(b, "run bs -lc build calling libc_nonshared.a from Zig");
+        nexe_run.addFileArg(nexe.addPrefixedOutputFileArg("-femit-bin=", "nonshared"));
+        nexe_run.addCheck(.{ .expect_stdout_exact = "stat -1 -1\nbye\n" });
+        nexe_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&nexe_run.step);
     }
     // A C-only executable's weak references to names nothing defines,
     // which a library preloaded at run time defines.

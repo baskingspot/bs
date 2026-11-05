@@ -493,7 +493,14 @@ pub const Job = struct {
         }
         var job_opts = opts;
         job_opts.modules = modules;
-        if (opts.c_root) job_opts.root_src_path = try Builtin.writeCMain(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }));
+        if (opts.c_root) {
+            // Objects and archives may call ubsan_rt, which reports through
+            // the panic handler.
+            const ubsan = opts.link_inputs.len != 0 or for (opts.c_sources) |s| {
+                if (s.flags.sanitizeC() == .full) break true;
+            } else false;
+            job_opts.root_src_path = try Builtin.writeCMain(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }), !ubsan);
+        }
         // A test that fuzzes links the fuzzer, whose module family has a
         // builtin of its own, as upstream's separate compilation of it (a
         // static library) does. Only the test runner references the
@@ -960,12 +967,11 @@ fn cxxRuntime(opts: *const Options) bool {
 }
 
 /// Whether the build links glibc's libc_nonshared.a: an executable or
-/// shared library linking glibc with C inputs, which may call its
-/// functions (`atexit`, `__stack_chk_fail_local`), as upstream links it into
-/// both; Zig code calls none of them.
+/// shared library linking glibc, as upstream links it into both. C and
+/// Zig externs call its functions (`atexit`, `__stack_chk_fail_local`,
+/// and before glibc 2.33 `stat` and `fstatat`, which std's I/O calls).
 fn libcNonshared(opts: *const Options) bool {
-    return opts.link_libc and opts.glibc_version != null and opts.command != .build_obj and (opts.command != .build_lib or opts.dynamic) and
-        (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp);
+    return opts.link_libc and opts.glibc_version != null and opts.command != .build_obj and (opts.command != .build_lib or opts.dynamic);
 }
 
 /// Starts compiling the job's C sources (CSource.zig).

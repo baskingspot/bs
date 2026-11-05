@@ -7020,9 +7020,8 @@ Options:
      2.32. std references none of them; C objects may. *As built*
      (C++ milestone): bs compiles libc_nonshared.a from upstream's own
      glibc sources with upstream `zig cc`, as it does libc++, and links
-     it only when a glibc executable has C inputs (see "Runtime
-     libraries" in the C++ section). Programs without C inputs need no
-     Clang and get none of these functions, as before.
+     it into every glibc executable and shared library, as upstream (see
+     "Runtime libraries" in the C++ section).
    - **Headers** for translate-c and C sources: `lib/libc/include` for the
      target (`std.zig.LibCDirs.detectFromBuilding`, which bs calls as it
      is) and `-D__GLIBC_MINOR__=N`, as upstream's bundled glibc. System
@@ -7470,8 +7469,15 @@ libraries as inputs. To be agreed with that thread.
   which declares `_start` so that std's start code exports neither
   `_start` nor `main`. glibc_start.zig calls C's `main`, and the build
   roots compiler_rt and ubsan_rt as any executable with C does, and
-  caches like one. Without `-lc` it stays `[unsupported]`, since C has
-  no `_start` of its own.
+  caches like one. Without `-fsanitize-c=full` C sources and without
+  object inputs, nothing reports through a panic handler, so the root
+  sets `panic = std.debug.no_panic`: upstream's crt1.o and compiler_rt
+  (built with no safety) have none either. Otherwise compiler_rt's
+  `__stack_chk_fail` and the std functions it shares with the program
+  reach std's default handler, whose I/O imports glibc functions that
+  glibc before 2.16 lacks (`accept4`, `sendmmsg`), and the program
+  grows from 275 KB to 2.4 MB. Without `-lc` it stays `[unsupported]`,
+  since C has no `_start` of its own.
 - **Clang's arguments** (`CSource.zig`) are upstream's `addCCArgs` for
   bs's target and the baseline CPU, in Debug: the triple from the glibc
   version (native: detected, with or without `-lc`, as upstream's native
@@ -7638,12 +7644,16 @@ diagnostics.
   `__stack_chk_fail_local`, and for older glibc the stat and mknod
   wrappers (≤ 2.32) and `__libc_csu_init`/`__libc_csu_fini` (≤ 2.33),
   compiled from `lib/libc/glibc` with upstream's flags and include
-  directories, built and cached like the runtime libraries above. A glibc
-  executable or shared library links it when it has C inputs (C or C++
-  sources, objects, archives, `-lc++`); upstream links it into every
-  glibc executable and shared library, but
-  Zig code calls none of its functions, so a pure Zig `-lc` program keeps
-  needing no Clang. SDL's `libSDL3.a` calls `atexit`;
+  directories, built and cached like the runtime libraries above. Every
+  glibc executable and shared library links it, as upstream: Zig externs
+  name its functions too (`atexit`, and before glibc 2.33 `stat` and
+  `fstatat`; upstream's test/standalone/glibc_compat). A build of Zig
+  only whose upstream zig is missing or not 0.17.1 links without it
+  rather than failing. It is a link input, so a first build that
+  replays a donor does so eagerly and records in full (`beginReplay`):
+  hello with `-lc` from a fresh local cache takes about 100 ms instead
+  of 25; edit builds about 2 ms more (built 2026-11-05). SDL's
+  `libSDL3.a` calls `atexit`;
   a shared library whose C calls `atexit` imported it unversioned
   before, which no loader resolves (test/link_input/so_libc.c).
 - **Exceptions** need the objects' `.eh_frame` and `.gcc_except_table`
