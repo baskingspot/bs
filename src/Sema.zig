@@ -2391,6 +2391,20 @@ fn validateRuntimeValue(sema: *Sema, block: *Block, src: Src, val: Ref) CompileE
     return err;
 }
 
+/// Fails if `val` refers to a comptime variable where it outlives the
+/// analysis that declares the variable: in a type (a sentinel, a field's
+/// default value, a capture), as upstream's
+/// `failWithContainsReferenceToComptimeVar`. `what` names the value in
+/// the error, `name` in the note.
+fn checkNoComptimeVarRef(sema: *Sema, block: *Block, src: Src, val: Index, what: []const u8, name: []const u8) CompileError!void {
+    // The comptime evaluator's lowering runs at comptime, as in
+    // `validateRuntimeValue`.
+    if (sema.bc != null or !sema.refersToComptimeAlloc(val)) return;
+    const err = sema.fail(block, src, "{s} contains reference to comptime var", .{what});
+    try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "'{s}' points to a comptime var, which is not available after the analysis that declares it", .{name});
+    return err;
+}
+
 /// The source of argument `i` of the call at `src` (a method call's
 /// receiver is argument 0), or `src` itself when the call has no such
 /// argument node. Resolved only when rendered.
@@ -4863,6 +4877,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const sentinel_src: Src = .{ .base = src.base, .loc = .{ .sentinel = data.pl_node.src_node } };
             const sentinel = try sema.resolveConstValue(block, sentinel_src, try sema.coerce(block, elem, sema.resolveInst(extra.sentinel), sentinel_src), "array sentinel value must be comptime-known");
             try sema.checkSentinelType(block, sentinel_src, elem);
+            try sema.checkNoComptimeVarRef(block, sentinel_src, sentinel, "sentinel", "sentinel");
             break :blk .fromInterned(try sema.intern(.{ .array_type = .{ .len = len, .child = elem, .sentinel = sentinel } }));
         },
         .optional_type => blk: {
@@ -5660,6 +5675,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                     const init = try sema.coerce(block, t.*, sema.resolveInst(refs[2 * k + 1]), src);
                     v.* = (try sema.resolveDefinedValue(block, src, init)) orelse
                         return sema.failNeededComptime(block, src, "tuple field default value must be comptime-known");
+                    try sema.checkNoComptimeVarRef(block, src.fieldSrc(k, .value), v.*, "field default value", try std.fmt.allocPrint(sema.arena, "{d}", .{k}));
                 }
             }
             break :blk .fromInterned(try sema.intern(.{ .tuple_type = .{ .types = types, .values = values } }));
@@ -7961,12 +7977,7 @@ fn zirContainerDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index, kind: Zcu.
         // As upstream, a type outlives the comptime variables of the
         // analysis that creates it.
         switch (cap.unwrap()) {
-            .instruction, .instruction_load => if (sema.bc == null and sema.refersToComptimeAlloc(out.*)) {
-                const err = sema.fail(block, src, "captured value contains reference to comptime var", .{});
-                const name = sema.zirString(capture_names[out - captures.ptr]);
-                try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "'{s}' points to a comptime var, which is not available after the analysis that declares it", .{name});
-                return err;
-            },
+            .instruction, .instruction_load => try sema.checkNoComptimeVarRef(block, src, out.*, "captured value", sema.zirString(capture_names[out - captures.ptr])),
             else => {},
         }
     }
@@ -8200,6 +8211,7 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
         const sentinel_src: Src = .{ .base = src.base, .loc = .{ .sentinel = extra.data.src_node } };
         sentinel = try sema.resolveConstValue(block, sentinel_src, try sema.coerce(block, elem, ref, sentinel_src), "pointer sentinel value must be comptime-known");
         try sema.checkSentinelType(block, sentinel_src, elem);
+        try sema.checkNoComptimeVarRef(block, sentinel_src, sentinel, "sentinel", "sentinel");
     }
     var alignment: u6 = 0;
     if (data.flags.has_align) {
@@ -14862,7 +14874,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     const comptime_vals = try sema.arena.alloc(Index, n);
     var any_align = false;
     var any_comptime = false;
-    for (attrs, types, defaults, align_vals, comptime_vals) |a, ft, *d, *av, *cv| {
+    for (attrs, types, defaults, align_vals, comptime_vals, names) |a, ft, *d, *av, *cv, field_name| {
         if (sema.isUndef(ft)) return sema.fail(block, types_src, "use of undefined value here causes illegal behavior", .{});
         if (sema.isUndef(a)) return sema.fail(block, attrs_src, "use of undefined value here causes illegal behavior", .{});
         av.* = try sema.structFieldValue(a, "align");
@@ -14883,6 +14895,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
             p.ty = try sema.ptrType(.{ .child = ft, .flags = .{ .is_const = true } });
             d.* = (try sema.comptimeLoadOrNull(block, src, try sema.intern(.{ .ptr = p }))) orelse
                 return sema.failNeededComptime(block, src, "default value must be comptime-known");
+            try sema.checkNoComptimeVarRef(block, attrs_src, d.*, "field default value", ip.stringSlice(field_name));
         }
     }
     // The captures are the canonical arguments: no pointers into comptime
@@ -15068,7 +15081,10 @@ fn zirReifyPointer(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) 
     if (sema.isUndef(sentinel_opt)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
     const sentinel = ip.keyPayload(.opt, sentinel_opt).val;
     if (sentinel != .none and (size == .one or size == .c)) return sema.fail(block, sema.callArgSrc(src, false, 3), "sentinels are only allowed on slices and unknown-length pointers", .{});
-    if (sentinel != .none) try sema.checkSentinelType(block, sema.callArgSrc(src, false, 3), elem_ty);
+    if (sentinel != .none) {
+        try sema.checkSentinelType(block, sema.callArgSrc(src, false, 3), elem_ty);
+        try sema.checkNoComptimeVarRef(block, sema.callArgSrc(src, false, 3), sentinel, "sentinel", "sentinel");
+    }
     return .fromInterned(try sema.ptrType(.{
         .child = elem_ty,
         .sentinel = sentinel,

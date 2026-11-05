@@ -2062,7 +2062,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "comptime variable is not accessible here", .@"comptime-var-escape" },
     .{ "store to comptime variable depends on runtime condition", .@"comptime-var-escape" },
     .{ "cannot store to comptime variable in non-inline loop", .@"comptime-var-escape" },
-    .{ "captured value contains reference to comptime var", .@"comptime-var-escape" },
+    .{ "{s} contains reference to comptime var", .@"comptime-var-escape" },
     .{ "global variable contains reference to comptime var", .@"comptime-var-escape" },
     .{ "runtime value contains reference to comptime var", .@"comptime-var-escape" },
     .{ "dependency loop detected", .@"dependency-loop" },
