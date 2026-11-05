@@ -6,5 +6,6 @@ zig-out/
 __pycache__/
 /tools/corpus/.work/
 /tools/mchunt/.work/
+/tools/cthunt/.work/
 .direnv/
 .envrc.local
