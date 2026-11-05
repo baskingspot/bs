@@ -1689,8 +1689,12 @@ build, the passes, and the debug info treat them as Sema's inline calls
   twice that for a call inside a loop of the caller (`loop_factor`: its
   cost is paid each iteration, its code once). A function whose callees are
   not all inlined is not inlinable itself, so only leaves and functions
-  that become leaves inline, and every decision reads the callee's own
-  IR, the same in every build and schedule.
+  that become leaves inline, but for calls of `std.lang.returnError` (an
+  error return trace's push): the address it records is in the inlined
+  copy, which maps to the callee's line and name as before (see "What
+  users see"), so `std.math.add`, `sub` and ArrayList's `addOrOom`
+  inline; every decision reads the callee's own IR, the same in every
+  build and schedule.
 - **Variants.** *Full*, the default, inlines any such callee; synthetic
   panic frames (below) keep its panic traces complete. *Safe* also
   requires that the callee can start no panic: no call of a cold
@@ -1810,6 +1814,13 @@ build, the passes, and the debug info treat them as Sema's inline calls
   (zig), binaries +1.8% and +2.7%. At budget 30 the same measure adds
   hash and zig fmt −0.5% more, vaxis −0.6% and zls +1.9% for binaries
   +4.5% / +7%; at 20 sort loses its loop inlines (+7.5%).
+- **Error-returning helpers** (against the measure above): letting a
+  `returnError` call stay in an inlined body inlines `std.math.add` and
+  `sub` (size 12) and `addOrOom` (14): the zls tests −3.3%, vaxis −1.3%,
+  zig fmt −0.7%, the runtime benchmarks 0; std's test build +0.6% and
+  the zig workload −0.1%, IR +0.8% / +0.5%, binaries +1.3% / +0.7%.
+  `test/run/error_inlined.zig` compares the error return trace with
+  `BS_INLINE=0`'s.
 - **What users see.** std 0.17's stack traces print one frame per return
   address, named after the innermost inline range (`Dwarf.getSymbols`
   ignores inline callers, and `resolve_inline_callers` cannot help on

@@ -43,7 +43,7 @@ pub const Scan = struct {
     /// Whether the function could be spliced into a caller once its
     /// candidate calls are inlined: an `.auto`, non-`noinline` function
     /// whose IR uses only instructions `splice` maps, and that calls
-    /// nothing else but cold `noreturn` functions.
+    /// nothing else but cold `noreturn` functions and `returnError`.
     inlinable: bool = true,
     /// Whether the function can start a panic: it calls a cold `noreturn`
     /// function (a safety check's handler, `unreachable`, `@panic`) or
@@ -56,7 +56,7 @@ pub const Scan = struct {
 /// whether `ir`'s function could be inlined.
 pub fn scan(gpa: Allocator, zcu: *const Zcu, ir: *const Ir, sites: *std.ArrayList(Site)) Allocator.Error!Scan {
     const start = sites.items.len;
-    var s: Scanner = .{ .gpa = gpa, .ip = &zcu.ip, .ir = ir, .sites = sites };
+    var s: Scanner = .{ .gpa = gpa, .ip = &zcu.ip, .ir = ir, .sites = sites, .return_error = zcu.return_error };
     s.out.inlinable = selfInlinable(zcu, ir.func);
     try s.body(ir.mainBody(), false);
     if (sites.items.len != start) {
@@ -99,6 +99,8 @@ const Scanner = struct {
     ip: *const InternPool,
     ir: *const Ir,
     sites: *std.ArrayList(Site),
+    /// `Zcu.return_error`.
+    return_error: Index,
     out: Scan = .{},
     /// `loop`s the scan is inside.
     loops: u32 = 0,
@@ -224,6 +226,12 @@ const Scanner = struct {
             s.out.inlinable = false;
             return;
         };
+        // An error return trace's push stays a call and does not keep its
+        // caller from inlining: the address it records is in the inlined
+        // copy, which maps to the callee's line and name as before
+        // (docs/slop/architecture.md, "What users see"), and nothing
+        // unwinds through it.
+        if (callee == s.return_error) return;
         if (cold or extra.flags.never_inline or ip.keyTag(callee) != .func or
             ip.keyPayload(.func_type, ip.typeOf(callee)).cc != .auto)
         {

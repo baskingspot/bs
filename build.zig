@@ -530,9 +530,10 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 same.addFileArg(serial_bin);
                 test_step.dependOn(&same.step);
             }
-            // A panic in inlined code has the stack trace of the program
-            // built without inlining (docs/slop/architecture.md, "Synthetic
-            // panic frames"), addresses aside.
+            // A panic or an error return in inlined code has the stack or
+            // error return trace of the program built without inlining
+            // (docs/slop/architecture.md, "Synthetic panic frames"),
+            // addresses aside.
             if (!upstream and host_runs_bs_output and isTraceChecked(file)) {
                 const plain = b.addRunArtifact(bs);
                 plain.setName(b.fmt("compile {s} (BS_INLINE=0)", .{name}));
@@ -613,7 +614,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
 }
 
 fn isTraceChecked(file: []const u8) bool {
-    for ([_][]const u8{ "panic_inlined.zig", "panic_trace.zig" }) |f| {
+    for ([_][]const u8{ "error_inlined.zig", "panic_inlined.zig", "panic_trace.zig" }) |f| {
         if (std.mem.eql(u8, file, f)) return true;
     }
     return false;

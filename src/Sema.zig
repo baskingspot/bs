@@ -4747,6 +4747,7 @@ fn maybePushErrorTrace(sema: *Sema, block: *Block, src: Src, operand: Ref) Compi
 
 fn callReturnError(sema: *Sema, block: *Block, src: Src) CompileError!void {
     const info = try sema.traceInfo(block, src);
+    sema.zcu.return_error = info.return_error;
     if (!info.return_error_called) {
         info.return_error_called = true;
         _ = try sema.analyzeCall(block, src, .fromInterned(info.return_error), .none, .{ .resolved = &.{} }, .never_tail);

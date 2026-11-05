@@ -105,6 +105,10 @@ inline_results: std.AutoHashMapUnmanaged(InternPool.Index, InlineResult) = .empt
 /// The `func_inline` result of a function that is not inlinable is this
 /// `^ 1`: the inlining variant (`Emit.inlineSalt`).
 inline_salt: cache.Hash = 0,
+/// `std.lang.returnError` once Sema has emitted a call to it (`.none`
+/// before): a body whose only kept call is to it still inlines
+/// (`codegen/inline.zig`).
+return_error: InternPool.Index = .none,
 /// Function bodies analyzed out of queue order (to resolve an inferred
 /// error set), waiting to be passed to the sink.
 ready_irs: std.ArrayList(Ir) = .empty,
