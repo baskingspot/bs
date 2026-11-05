@@ -962,9 +962,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // Section placement, as file offsets (for .bss, address - base).
     // An executable's imports have no PLT stubs or GOT slots: its extern
     // slots are its GOT.
-    const plt_size = if (exe_dyn) 0 else n_imports * ElfDynamic.plt_entry_size;
+    // An executable's imports' stand-ins are 8 bytes apart on either arch.
+    const plt_entry: u64 = if (exe_dyn) 8 else ElfDynamic.pltEntrySize(options.arch);
+    const plt_size = if (exe_dyn) 0 else n_imports * plt_entry;
     const has_rx = sizes[text] > 0 or plt_size > 0;
     const has_tls = sizes[tdata] > 0 or sizes[tbss] > 0;
+    // A shared object's GOT pair for x86_64's local-dynamic TLS (aarch64
+    // code reaches thread-locals through descriptors, which are atoms).
+    const tls_pair = has_tls and options.arch == .x86_64;
     const has_sancov = sizes[cntrs] > 0 or sizes[pcs] > 0;
     const has_relro = sizes[data_rel_ro] > 0;
     const n_arrays = @as(u64, @intFromBool(sizes[preinit] > 0)) + @intFromBool(sizes[init] > 0) + @intFromBool(sizes[fini] > 0);
@@ -993,7 +998,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const interp_size: u64 = if (exe_dyn) dyn_opts.?.interp.?.len + 1 else 0;
     var r_tables_end = headers_end;
     if (dyn) |*t| {
-        n_rela += if (exe_dyn) n_copies else @intFromBool(has_tls) + n_imports;
+        n_rela += if (exe_dyn) n_copies else @intFromBool(tls_pair) + n_imports;
         dynsym_off = std.mem.alignForward(u64, interp_off + interp_size, 8);
         dynstr_off = dynsym_off + t.dynsymSize();
         hash_off = std.mem.alignForward(u64, dynstr_off + t.dynstr.len, 8);
@@ -1051,7 +1056,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     if (dyn) |*t| {
         dynamic_off = std.mem.alignForward(u64, relro_end, 8);
         got_off = dynamic_off + ElfDynamic.dynamicCount(t, dyn_opts.?.*, n_arrays) * @sizeOf(elf.Elf64_Dyn);
-        got_size = if (exe_dyn) 0 else 16 * @as(u64, @intFromBool(has_tls)) + 8 * n_imports;
+        got_size = if (exe_dyn) 0 else 16 * @as(u64, @intFromBool(tls_pair)) + 8 * n_imports;
         data_floor = std.mem.alignForward(u64, got_off + got_size, page_size);
     }
     starts[data] = aligns[data].forward(data_floor);
@@ -1101,7 +1106,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         // tell them apart (an absolute relocation to one becomes a symbol
         // relocation; a PC-relative one overflows).
         l.plt_start = if (exe_dyn) exe_import_base else base + plt_off;
-        l.plt_end = l.plt_start + n_imports * ElfDynamic.plt_entry_size;
+        l.plt_entry = plt_entry;
+        l.plt_end = l.plt_start + n_imports * plt_entry;
         if (exe_dyn) {
             l.tls.imports_start = l.plt_start;
             l.tls.imports_end = l.plt_end;
@@ -1114,14 +1120,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
                 if (n >= addrs.len) return error.InvalidSymbols;
                 // An executable's stand-ins lie outside the image, so not
                 // at offsets from its base.
-                addrs[n] = if (exe_dyn) @intCast(import_tag + i) else @intCast(plt_off + i * ElfDynamic.plt_entry_size);
+                addrs[n] = if (exe_dyn) @intCast(import_tag + i) else @intCast(plt_off + i * plt_entry);
             }
             if (s.dynamic != no_bound) {
                 if (s.dynamic >= addrs.len) return error.InvalidSymbols;
                 addrs[s.dynamic] = @intCast(dynamic_off);
             }
         } else {
-            for (d.imports, 0..) |imp, i| values.getOrPut(imp.key).* = .{ .key = imp.key, .value = l.plt_start + i * ElfDynamic.plt_entry_size, .used = true };
+            for (d.imports, 0..) |imp, i| values.getOrPut(imp.key).* = .{ .key = imp.key, .value = l.plt_start + i * plt_entry, .used = true };
             values.getOrPut(ElfDynamic.dynamic_key).* = .{ .key = ElfDynamic.dynamic_key, .value = base + dynamic_off, .used = true };
         }
     }
@@ -1287,7 +1293,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             try l.put(versym_off, t.versym);
             try l.put(verneed_off, t.verneed);
         }
-        const tail = try a.alloc(elf.Elf64.Rela, if (exe_dyn) n_copies else @intFromBool(has_tls) + n_imports);
+        const tail = try a.alloc(elf.Elf64.Rela, if (exe_dyn) n_copies else @intFromBool(tls_pair) + n_imports);
         var k: usize = 0;
         // An executable's copies of library data, which the loader fills.
         if (n_copies != 0) for (t.exports, dyn_exports, 0..) |i, atom, pos| {
@@ -1296,17 +1302,17 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             tail[k] = .{ .offset = l.atomAddr(atom), .info = .{ .type = if (l.arch == .aarch64) @backingInt(elf.R_AARCH64.COPY) else @backingInt(elf.R_X86_64.COPY), .sym = @intCast(1 + n_imports + pos) }, .addend = 0 };
             k += 1;
         };
-        if (has_tls and !exe_dyn) {
+        if (tls_pair and !exe_dyn) {
             tail[0] = .{ .offset = base + got_off, .info = .{ .type = @backingInt(elf.R_X86_64.DTPMOD64), .sym = 0 }, .addend = 0 };
             k = 1;
         }
-        const slots = got_off + 16 * @as(u64, @intFromBool(has_tls));
+        const slots = got_off + 16 * @as(u64, @intFromBool(tls_pair));
         const plt = try a.alloc(u8, plt_size);
         for (0..if (exe_dyn) 0 else n_imports) |i| {
             const slot = base + slots + 8 * i;
-            tail[k + i] = .{ .offset = slot, .info = .{ .type = @backingInt(elf.R_X86_64.GLOB_DAT), .sym = @intCast(1 + i) }, .addend = 0 };
-            const stub = l.plt_start + i * ElfDynamic.plt_entry_size;
-            plt[i * ElfDynamic.plt_entry_size ..][0..ElfDynamic.plt_entry_size].* = ElfDynamic.pltEntry(stub, slot);
+            tail[k + i] = .{ .offset = slot, .info = .{ .type = if (l.arch == .aarch64) @backingInt(elf.R_AARCH64.GLOB_DAT) else @backingInt(elf.R_X86_64.GLOB_DAT), .sym = @intCast(1 + i) }, .addend = 0 };
+            const stub = l.plt_start + i * plt_entry;
+            ElfDynamic.pltEntry(l.arch, plt[i * plt_entry ..][0..plt_entry], stub, slot);
         }
         try l.put(rela_off + (n_rela - tail.len) * @sizeOf(elf.Elf64.Rela), std.mem.sliceAsBytes(tail));
         try l.put(plt_off, plt);
@@ -1638,6 +1644,8 @@ fn LinkOf(comptime Input: type) type {
         /// and .rela.dyn's file offset.
         plt_start: u64 = 0,
         plt_end: u64 = 0,
+        /// The distance between two imports' PLT stubs or stand-ins.
+        plt_entry: u64 = 8,
         /// In a shared object: the .dynsym index of each export with
         /// default visibility, by address, for relocations against
         /// its own exports (`symType`).
@@ -1806,7 +1814,7 @@ fn LinkOf(comptime Input: type) type {
         fn numberedAddr(l: *const Link, e: u32) ?u64 {
             if (e < value_tag) return l.base + e;
             if (e == unset) return null;
-            if (e >= import_tag) return l.plt_start + (e - import_tag) * ElfDynamic.plt_entry_size;
+            if (e >= import_tag) return l.plt_start + (e - import_tag) * l.plt_entry;
             return l.numbered.?.values[e - value_tag].value;
         }
 
@@ -2017,15 +2025,13 @@ fn LinkOf(comptime Input: type) type {
         /// and an executable's thread-pointer offsets of imports.
         fn needsDynamicReloc(l: *const Link, a: *const Atom, r: Atom.Reloc) bool {
             switch (r.info.kind) {
-                .x86_64_abs64 => {},
-                // An aarch64 executable's addresses of imports.
-                .aarch64_abs64 => return isImport(l.exe_imports orelse return false, a.targets[r.info.target]),
+                .x86_64_abs64, .aarch64_abs64 => {},
                 .x86_64_tpoff64, .aarch64_tprel64 => return isImport(l.exe_imports orelse return false, a.targets[r.info.target]),
                 // A shared object's module ID, for `__tls_get_addr`, and
                 // its TLS descriptors.
-                .x86_64_dtpmod64, .x86_64_tlsdesc, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym, .x86_64_tlsdesc_sym => return l.exe_imports == null,
+                .x86_64_dtpmod64, .x86_64_tlsdesc, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym, .x86_64_tlsdesc_sym, .aarch64_tlsdesc, .aarch64_tlsdesc_sym => return l.exe_imports == null,
                 // A shared object's references to its own exports.
-                .x86_64_abs64_sym => return l.exe_imports == null,
+                .x86_64_abs64_sym, .aarch64_abs64_sym => return l.exe_imports == null,
                 // Every image's indirect functions.
                 .x86_64_irelative, .aarch64_irelative => return true,
                 else => return false,
@@ -2349,12 +2355,14 @@ fn LinkOf(comptime Input: type) type {
                             // Against the export, which the loader may
                             // bind to another module's definition.
                             const sym = l.export_syms.get(v) orelse return l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name, .target = a.targets[r.info.target] });
-                            const addend = if (ty == .@"64") std.mem.readInt(i64, a.bytes[r.offset..][0..8], .little) else 0;
-                            break :rec .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(ty), .sym = sym }, .addend = addend };
+                            const addend = if (r.info.kind == .x86_64_abs64_sym or r.info.kind == .aarch64_abs64_sym) std.mem.readInt(i64, a.bytes[r.offset..][0..8], .little) else 0;
+                            break :rec .{ .offset = addr + r.offset, .info = .{ .type = ty, .sym = sym }, .addend = addend };
                         } else if (r.info.kind == .x86_64_dtpmod64)
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.DTPMOD64), .sym = 0 }, .addend = 0 }
                         else if (r.info.kind == .x86_64_tlsdesc)
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.TLSDESC), .sym = 0 }, .addend = @bitCast(v -% l.tls.start) }
+                        else if (r.info.kind == .aarch64_tlsdesc)
+                            .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_AARCH64.TLSDESC), .sym = 0 }, .addend = @bitCast(v -% l.tls.start) }
                         else if (r.info.kind == .x86_64_irelative)
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.IRELATIVE), .sym = 0 }, .addend = @bitCast(v) }
                         else if (r.info.kind == .aarch64_irelative)
@@ -2365,9 +2373,9 @@ fn LinkOf(comptime Input: type) type {
                                 .aarch64_abs64 => @backingInt(elf.R_AARCH64.ABS64),
                                 .aarch64_tprel64 => @backingInt(elf.R_AARCH64.TLS_TPREL),
                                 else => @backingInt(elf.R_X86_64.@"64"),
-                            }, .sym = @intCast(1 + (t - l.plt_start) / ElfDynamic.plt_entry_size) }, .addend = r.addend }
+                            }, .sym = @intCast(1 + (t - l.plt_start) / l.plt_entry) }, .addend = r.addend }
                         else
-                            .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.RELATIVE), .sym = 0 }, .addend = @bitCast(v) };
+                            .{ .offset = addr + r.offset, .info = .{ .type = if (l.arch == .aarch64) @backingInt(elf.R_AARCH64.RELATIVE) else @backingInt(elf.R_X86_64.RELATIVE), .sym = 0 }, .addend = @bitCast(v) };
                         writeStruct(out[rela][rela_at..], rec);
                         rela_at += @sizeOf(elf.Elf64.Rela);
                     };
@@ -2642,15 +2650,15 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
             .x86_64_tpoff32 => try tpoff32(a, r, dst, s, tls, diag),
             .x86_64_tpoff64, .aarch64_tprel64 => try tpoff64(a, r, dst, s, tls, diag),
             // The loader's (`needsDynamicReloc`).
-            .x86_64_dtpmod64, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym, .x86_64_abs64_sym => @memset(try relocField(a, dst, r.offset, 8, diag), 0),
-            .x86_64_tlsdesc_sym => @memset(try relocField(a, dst, r.offset, 16, diag), 0),
-            .x86_64_tlsdesc => {
+            .x86_64_dtpmod64, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym, .x86_64_abs64_sym, .aarch64_abs64_sym => @memset(try relocField(a, dst, r.offset, 8, diag), 0),
+            .x86_64_tlsdesc_sym, .aarch64_tlsdesc_sym => @memset(try relocField(a, dst, r.offset, 16, diag), 0),
+            .x86_64_tlsdesc, .aarch64_tlsdesc => {
                 if (s < tls.start or s >= tls.end) return invalidReloc(a, diag);
                 @memset(try relocField(a, dst, r.offset, 16, diag), 0);
             },
             .x86_64_tlsld, .x86_64_dtpoff32 => try tlsDynamic(a, r, dst, p_base, s, tls, diag),
             // Only objects reach another module's thread-locals.
-            .x86_64_gottpoff, .x86_64_tlsgd => if (!tls.object) return invalidReloc(a, diag),
+            .x86_64_gottpoff, .x86_64_tlsgd, .aarch64_tlsdesc_page21, .aarch64_tlsdesc_ld64_lo12, .aarch64_tlsdesc_add_lo12, .aarch64_tlsdesc_call, .aarch64_gottprel_page21, .aarch64_gottprel_lo12 => if (!tls.object) return invalidReloc(a, diag),
             .value32 => {
                 const f = try relocField(a, dst, r.offset, 4, diag);
                 std.mem.writeInt(u32, f, std.math.cast(u32, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
@@ -2760,12 +2768,14 @@ noinline fn aarch64Reloc(a: *const Atom, r: Atom.Reloc, dst: []u8, p_base: u64, 
 /// image's loader must write.
 /// The dynamic relocation type of a relocation against an export, or null
 /// for another kind.
-fn symType(kind: Atom.Reloc.Kind) ?elf.R_X86_64 {
+fn symType(kind: Atom.Reloc.Kind) ?u32 {
     return switch (kind) {
-        .x86_64_dtpmod64_sym => .DTPMOD64,
-        .x86_64_dtpoff64_sym => .DTPOFF64,
-        .x86_64_tlsdesc_sym => .TLSDESC,
-        .x86_64_abs64_sym => .@"64",
+        .x86_64_dtpmod64_sym => @backingInt(elf.R_X86_64.DTPMOD64),
+        .x86_64_dtpoff64_sym => @backingInt(elf.R_X86_64.DTPOFF64),
+        .x86_64_tlsdesc_sym => @backingInt(elf.R_X86_64.TLSDESC),
+        .x86_64_abs64_sym => @backingInt(elf.R_X86_64.@"64"),
+        .aarch64_tlsdesc_sym => @backingInt(elf.R_AARCH64.TLSDESC),
+        .aarch64_abs64_sym => @backingInt(elf.R_AARCH64.ABS64),
         else => null,
     };
 }
@@ -2778,7 +2788,10 @@ fn listedAtom(a: *const Atom) bool {
 }
 
 fn hasAbs(a: *const Atom) bool {
-    for (a.relocs) |r| if (r.info.kind == .x86_64_abs64 or r.info.kind == .x86_64_abs64_sym) return true;
+    for (a.relocs) |r| switch (r.info.kind) {
+        .x86_64_abs64, .x86_64_abs64_sym, .aarch64_abs64, .aarch64_abs64_sym, .aarch64_tlsdesc, .aarch64_tlsdesc_sym => return true,
+        else => {},
+    };
     return false;
 }
 

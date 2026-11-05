@@ -18,6 +18,7 @@ const std = @import("std");
 const elf = std.elf;
 const Allocator = std.mem.Allocator;
 const Atom = @import("Atom.zig");
+const a64 = @import("aarch64.zig");
 const SymbolKey = Atom.SymbolKey;
 
 /// A symbol the output defines for other modules: the atom `key` (or a
@@ -100,8 +101,12 @@ pub const Options = struct {
 /// defines (std.dynamic_library reads it through a weak hidden extern).
 pub const dynamic_key: SymbolKey = .fromName("link._DYNAMIC");
 
-/// One PLT stub per import: `jmp [rip + slot]` and a 2-byte nop.
-pub const plt_entry_size = 8;
+/// One PLT stub per import: on x86_64 `jmp [rip + slot]` and a 2-byte
+/// nop; on aarch64 `adrp x16, slot; ldr x17, [x16, :lo12:slot]; br x17;
+/// nop`, as lld's entries use x16 and x17.
+pub fn pltEntrySize(arch: Atom.Unwind.Arch) u32 {
+    return if (arch == .aarch64) 16 else 8;
+}
 
 pub const Tables = struct {
     /// Indices in `Options.exports` of the exports in .dynsym, in .dynsym
@@ -342,11 +347,24 @@ pub fn writeSymbols(out: []u8, t: *const Tables, o: Options, defined: []const De
     }
 }
 
-/// PLT stub `i`, at `stub`, jumping through the GOT slot at `slot`.
-pub fn pltEntry(stub: u64, slot: u64) [plt_entry_size]u8 {
-    var e: [plt_entry_size]u8 = .{ 0xff, 0x25, 0, 0, 0, 0, 0x66, 0x90 };
-    std.mem.writeInt(i32, e[2..6], @intCast(@as(i64, @bitCast(slot -% (stub + 6)))), .little);
-    return e;
+/// The PLT stub at `stub` into `e` (`pltEntrySize(arch)` bytes), jumping
+/// through the GOT slot at `slot`.
+pub fn pltEntry(arch: Atom.Unwind.Arch, e: []u8, stub: u64, slot: u64) void {
+    switch (arch) {
+        .x86_64 => {
+            e[0..8].* = .{ 0xff, 0x25, 0, 0, 0, 0, 0x66, 0x90 };
+            std.mem.writeInt(i32, e[2..6], @intCast(@as(i64, @bitCast(slot -% (stub + 6)))), .little);
+        },
+        .aarch64 => {
+            const insns = [4]u32{
+                a64.patchAdrp(0x90000010, a64.pageDelta(slot, stub)), // adrp x16
+                a64.patchImm12(0xf9400211, @intCast((slot & 0xfff) / 8)), // ldr x17, [x16, #lo12]
+                0xd61f0220, // br x17
+                0xd503201f, // nop
+            };
+            for (insns, 0..) |insn, k| std.mem.writeInt(u32, e[4 * k ..][0..4], insn, .little);
+        },
+    }
 }
 
 /// The addresses .dynamic points at.

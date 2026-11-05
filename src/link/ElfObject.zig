@@ -392,6 +392,12 @@ fn aarch64Type(a: *const Atom, r: Atom.Reloc, image: []u8, file_offset: u64, dia
         },
         .aarch64_tprel_hi12 => .TLSLE_ADD_TPREL_HI12,
         .aarch64_tprel_lo12_nc => .TLSLE_ADD_TPREL_LO12_NC,
+        .aarch64_tlsdesc_page21 => .TLSDESC_ADR_PAGE21,
+        .aarch64_tlsdesc_ld64_lo12 => .TLSDESC_LD64_LO12,
+        .aarch64_tlsdesc_add_lo12 => .TLSDESC_ADD_LO12,
+        .aarch64_tlsdesc_call => .TLSDESC_CALL,
+        .aarch64_gottprel_page21 => .TLSIE_ADR_GOTTPREL_PAGE21,
+        .aarch64_gottprel_lo12 => .TLSIE_LD64_GOTTPREL_LO12_NC,
         else => badReloc(a, diag),
     };
 }

@@ -2080,17 +2080,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .extern_pcrel => return cg.fail("@extern with '.relocation = .pcrel' on aarch64-macos", .{}),
         .extern_tls => {
             if (cg.ip.target != .aarch64_linux) return cg.fail("thread-local externs on aarch64-macos", .{});
-            // A C object's, in the executable's own TLS block, which
-            // local-exec reaches; a shared library's through the slot of
-            // its offset, which the loader writes (initial-exec).
-            const t = try cg.emit.tlsTarget(ip.stringSlice(@fromBackingInt(data.ty_pl.payload)));
-            if (t.slot) {
-                try cg.loadMem(.x9, .sym(t.key, 0), .usize_type);
-                try cg.e.raw(Encoder.System.mrs_tpidr_el0 | 10); // mrs x10, tpidr_el0
-                try cg.e.addSub(.add, .x, .x9, .x10, .{ .reg = .{ .reg = .x9 } });
-            } else if (!t.local) {
-                return cg.fail("thread-local externs in aarch64-linux objects", .{});
-            } else try cg.e.threadLocalOffset(.x9, t.key);
+            try cg.linuxThreadLocal(try cg.emit.tlsTarget(ip.stringSlice(@fromBackingInt(data.ty_pl.payload))));
             try cg.setResult(inst, data.ty_pl.ty, .x9);
         },
         .c_va_start => {
@@ -2127,7 +2117,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .tls_ptr => {
             const key = try cg.emit.navKey(@fromBackingInt(data.ty_pl.payload));
             if (cg.ip.target == .aarch64_linux) {
-                try cg.e.threadLocalOffset(.x9, key);
+                try cg.linuxThreadLocal(.{ .key = key, .local = true });
                 return cg.setResult(inst, data.ty_pl.ty, .x9);
             }
             try cg.e.threadLocalAddr(key);
@@ -3222,6 +3212,32 @@ fn loadTrace(cg: *CodeGen, reg: Reg) Error!void {
     } else {
         try cg.e.movImm(.x, reg, 0);
     }
+}
+
+/// x9 = the address of thread-local `t` on aarch64-linux. An executable
+/// has its own in its static block (local-exec) and a shared library's
+/// through the slot of its offset, which the loader writes
+/// (initial-exec); so does other code than position-independent code for
+/// its own, and an object reaches another module's initial-exec.
+/// Position-independent code calls the variable's TLS descriptor, which
+/// a shared object holds itself (`aarch64_tlsdesc`) and a pic object
+/// leaves to the final link, as upstream's code does. The descriptor
+/// call clobbers only x0, x1 and lr, which hold no values.
+fn linuxThreadLocal(cg: *CodeGen, t: Emit.TlsTarget) Error!void {
+    const emit = cg.emit;
+    if (t.slot) {
+        try cg.loadMem(.x9, .sym(t.key, 0), .usize_type);
+    } else if (emit.pic == .pic) {
+        if (emit.shared) {
+            const zeros: [16]u8 = @splat(0);
+            try cg.e.threadLocalDesc(try emit.contentAtom(8, &zeros, &.{t.key}, &.{.init(0, .aarch64_tlsdesc, 0, 0)}), false);
+        } else try cg.e.threadLocalDesc(t.key, true);
+        try cg.e.mov(.x, .x9, .x0);
+    } else if (t.local) {
+        return cg.e.threadLocalOffset(.x9, t.key);
+    } else try cg.e.threadLocalInitial(.x9, t.key);
+    try cg.e.raw(Encoder.System.mrs_tpidr_el0 | 10); // mrs x10, tpidr_el0
+    try cg.e.addSub(.add, .x, .x9, .x10, .{ .reg = .{ .reg = .x9 } });
 }
 
 /// Calls the function in extern slot `name` (`Emit.useExtern`), which the

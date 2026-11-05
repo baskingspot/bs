@@ -958,7 +958,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   Vector-typed asm operands load and store through memory, since
   vector values themselves stay scalarized.
 - aarch64-linux (started 2026-11-05) runs the same CodeGen and links
-  static, non-PIE executables with the ELF linker (`Elf.Options.arch`).
+  static, non-PIE executables with the ELF linker (`Elf.Options.arch`),
+  and position-independent objects and shared objects ("Position-
+  independent code and shared libraries").
   What differs from aarch64-macos is keyed on `ip.target ==
   .aarch64_linux` or on the CPU's features, so aarch64-macos output
   does not change. `.c` is Linux's AAPCS64: f128, which is `long double`
@@ -967,7 +969,7 @@ comptime arguments are run-time values in the lowered code (uucode's
   variadic arguments go where named ones would (`va_list` is a struct
   there, but std's `VaList` is a compile error with upstream's LLVM
   backend on this target, so `@cVaStart` never reaches CodeGen); `char`
-  is unsigned. Thread-locals are local-exec: `mrs xN, tpidr_el0` and two
+  is unsigned. An executable's thread-locals are local-exec: `mrs xN, tpidr_el0` and two
   adds with the `aarch64_tprel_hi12`/`lo12_nc` relocations. Frames are
   not probed (upstream's LLVM probes only on x86 off Darwin). The CPU is
   upstream's baseline for `-target aarch64-linux`, the generic ARMv8.0
@@ -3179,7 +3181,7 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
 
 ### Position-independent code and shared libraries (milestone 8; designed and built 2026-11-03)
 
-Scope: x86_64-linux. `build-obj -fPIC`/`-fPIE` and `build-lib -fPIC`
+Scope: x86_64-linux (aarch64-linux at the end of this section). `build-obj -fPIC`/`-fPIE` and `build-lib -fPIC`
 (archives) produce objects that link into PIEs and shared objects with
 upstream zig, `cc` and `ld`; `build-lib -dynamic` produces a shared
 object that a C program and an upstream-built program load. `build-exe`
@@ -3466,6 +3468,46 @@ CodeGen edits (`tls_ptr`'s lowering and `clobbers`) are written here and
 reviewed by the hello thread, which owns CodeGen; the Sema thread
 reviews export linkage; the cache thread is consulted on the relocation
 kinds.
+
+**aarch64-linux** (built 2026-11-05): `build-obj -fPIC`/`-fPIE`,
+`build-lib -fPIC`, `build-lib -dynamic`, and `-lc` objects and
+libraries (PIC, as on x86_64), with C sources, objects, archives and
+`-lc++`. Code already reaches every symbol PC-relative (`adrp` with an
+add or a load) and externs through slots, so as on x86_64 only
+thread-locals change in code (`CodeGen.linuxThreadLocal`):
+- Position-independent code calls the variable's TLS descriptor, as
+  LLVM's aarch64 code does for every dynamic model (it turns
+  local-dynamic into general-dynamic): `adrp x0, desc; ldr x1, [x0,
+  :lo12:desc]; add x0, x0, :lo12:desc; blr x1`, then `mrs` and an add.
+  The descriptor's function preserves every register but x0 (and lr,
+  which every frame saves), so no value is disturbed: values live in
+  slots or x19-x28. In a shared object the descriptor is an atom of the
+  image (`Emit.contentAtom` with `aarch64_tlsdesc`, R_AARCH64_TLSDESC
+  with no symbol and the offset in the block as addend, in
+  `.data.rel.ro`), reached with plain page relocations; a pic object
+  names the variable with the TLSDESC relocations (`aarch64_tlsdesc_*`,
+  objects only), which the final link relaxes or completes.
+- Other code keeps local-exec for its own thread-locals; an object
+  reaches another module's initial-exec (`aarch64_gottprel_*`,
+  R_AARCH64_TLSIE_*), which non-PIC objects could not do before.
+- The shared object's layout is x86_64's with the arch's relocation
+  types (RELATIVE, ABS64, GLOB_DAT, TLSDESC) and 16-byte PLT stubs
+  (`adrp x16; ldr x17; br x17; nop`, `ElfDynamic.pltEntry`); there is
+  no module TLS GOT pair, which only x86_64's local-dynamic code uses.
+- C inputs (`ElfInput.relocA64`) in a shared object: TLS descriptor
+  sequences address the variable's descriptor (`tlsPair` with
+  `aarch64_tlsdesc`, or `_sym` for an export an executable may preempt)
+  and keep their call; initial-exec and local-exec relocations are
+  refused ("recompile with -fPIC"), as x86_64's; absolute addresses,
+  calls and GOT loads of exports with default visibility go through the
+  loader (`aarch64_abs64_sym`, as `preemptReloc`).
+- Checked under qemu (`addAarch64LinuxSharedTests` in build.zig): the
+  x86_64 tests' programs, linked by upstream for aarch64-linux-gnu,
+  load bs's shared objects (Zig; -lc; C sources, objects and an archive
+  with TLS descriptors, preempted by an executable; libc++, versioned)
+  and dlopen one; upstream links -fPIC and -lc objects into PIEs and a
+  -fPIC object into a shared object; and an extern thread-local works in
+  all three models. pic builds skip the cache, as on x86_64.
 
 ### Object, archive and shared-library inputs (milestone 9, linker side; designed 2026-11-04, for review)
 

@@ -1394,8 +1394,8 @@ fn Converter(comptime Ctx: type) type {
 
         /// A shared object's 16-byte pair for its thread-local `t`, which
         /// the loader completes: with `.x86_64_dtpmod64`, the (module,
-        /// offset) pair `__tls_get_addr` takes; with `.x86_64_tlsdesc`,
-        /// its TLS descriptor. Relative to the symbol if `preempt`, so
+        /// offset) pair `__tls_get_addr` takes; with `.x86_64_tlsdesc` or
+        /// `.aarch64_tlsdesc`, its TLS descriptor. Relative to the symbol if `preempt`, so
         /// that an executable's definition wins as upstream's; else the
         /// module's own, whose offset in its block is known.
         /// Content-addressed, so references to one variable share it.
@@ -1408,6 +1408,8 @@ fn Converter(comptime Ctx: type) type {
             };
             const relocs = if (kind == .x86_64_tlsdesc)
                 try arena.dupe(Atom.Reloc, &.{.init(0, if (preempt) .x86_64_tlsdesc_sym else .x86_64_tlsdesc, 0, off)})
+            else if (kind == .aarch64_tlsdesc)
+                try arena.dupe(Atom.Reloc, &.{.init(0, if (preempt) .aarch64_tlsdesc_sym else .aarch64_tlsdesc, 0, off)})
             else if (preempt)
                 try arena.dupe(Atom.Reloc, &.{ .init(0, .x86_64_dtpmod64_sym, 0, off), .init(8, .x86_64_dtpoff64_sym, 0, off) })
             else
@@ -1437,8 +1439,8 @@ fn Converter(comptime Ctx: type) type {
             try c.fail("{s}: bs does not link relocation {s}{s} ({d}) in section '{s}' yet", .{ c.o.path, prefix, name, ty, c.o.sectionName(index) });
         }
 
-        /// Converts aarch64 relocation `r` of section `index`, in a static
-        /// executable, where every target is the image's own: GOT loads
+        /// Converts aarch64 relocation `r` of section `index`. In an
+        /// executable every target but imports is the image's own: GOT loads
         /// keep their kinds, which the linker relaxes to the target's
         /// address (`Elf.aarch64Reloc`), and thread-locals reached through
         /// TLS descriptors or the GOT (initial-exec) become local-exec,
@@ -1454,6 +1456,21 @@ fn Converter(comptime Ctx: type) type {
             const ty = std.enums.fromInt(R, r.r_type()) orelse return c.unsupported(index, r.r_type());
             const at: usize = @intCast(r.r_offset);
             const insn = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            // In a shared object, as x86_64's (`reloc`): a TLS descriptor
+            // sequence addresses the variable's descriptor (`tlsPair`),
+            // which the loader completes, and the call stays; models that
+            // need the executable's static block are refused.
+            if (c.in.shared) switch (ty) {
+                .TLSDESC_CALL => return,
+                .TLSDESC_ADR_PAGE21, .TLSDESC_LD64_LO12, .TLSDESC_ADD_LO12 => {
+                    const t = try c.target(r.r_sym(), r.r_addend) orelse return;
+                    if (try c.sharedTlsImport(r, t)) return;
+                    const desc: Target = .{ .key = try c.tlsPair(t, .aarch64_tlsdesc, try c.preemptible(r.r_sym())), .offset = 0 };
+                    return c.add(r.r_offset, if (ty == .TLSDESC_ADR_PAGE21) .aarch64_page21 else .aarch64_pageoff12, desc, 0);
+                },
+                .TLSIE_ADR_GOTTPREL_PAGE21, .TLSIE_LD64_GOTTPREL_LO12_NC, .TLSLE_ADD_TPREL_HI12, .TLSLE_ADD_TPREL_LO12, .TLSLE_ADD_TPREL_LO12_NC, .TLSLE_MOVW_TPREL_G1, .TLSLE_MOVW_TPREL_G0_NC => return c.fail("{s}: relocation R_AARCH64_{s} in section '{s}' cannot be used in a shared object; recompile with -fPIC", .{ o.path, @tagName(ty), o.sectionName(index) }),
+                else => {},
+            };
             switch (ty) {
                 .TLSDESC_ADR_PAGE21, .TLSDESC_LD64_LO12, .TLSDESC_ADD_LO12, .TLSDESC_CALL, .TLSIE_ADR_GOTTPREL_PAGE21, .TLSIE_LD64_GOTTPREL_LO12_NC => {
                     const t = try c.target(r.r_sym(), r.r_addend) orelse return;
@@ -1494,6 +1511,24 @@ fn Converter(comptime Ctx: type) type {
                 return c.fail("{s}: GOT relocation with addend {d} in section '{s}'", .{ o.path, r.r_addend, o.sectionName(index) });
             const t = try c.target(r.r_sym(), r.r_addend) orelse return;
             if (t.import) return c.importA64(index, r, kind, .{ .key = t.key, .offset = 0 });
+            // A shared object's exports with default visibility, through
+            // the loader, as x86_64's (`preemptReloc`).
+            if (c.in.shared) switch (kind) {
+                .aarch64_abs64, .aarch64_branch26, .aarch64_got_load_page21, .aarch64_got_load_pageoff12 => if (try c.preemptible(r.r_sym())) {
+                    switch (kind) {
+                        .aarch64_abs64 => {
+                            if (r.r_offset + 8 > bytes.len) return c.unsupported(index, r.r_type());
+                            std.mem.writeInt(i64, (try c.writable(bytes, copy))[at..][0..8], r.r_addend, .little);
+                            try c.add(r.r_offset, .aarch64_abs64_sym, t, 0);
+                        },
+                        .aarch64_branch26 => try c.add(r.r_offset, .aarch64_branch26, .{ .key = try c.stubA64(t, .aarch64_abs64_sym), .offset = 0 }, r.r_addend),
+                        .aarch64_got_load_page21 => try c.add(r.r_offset, .aarch64_page21, .{ .key = try c.slot(t, .aarch64_abs64_sym), .offset = 0 }, 0),
+                        else => try c.add(r.r_offset, .aarch64_pageoff12, .{ .key = try c.slot(t, .aarch64_abs64_sym), .offset = 0 }, 0),
+                    }
+                    return;
+                },
+                else => {},
+            };
             // A weak name nothing defines, as x86_64's (`reloc`): GOT loads
             // and calls of a C-only executable go through an import.
             if (t.key == undefined_weak_key and c.in.dynamic and !c.in.shared) switch (kind) {
@@ -1515,7 +1550,7 @@ fn Converter(comptime Ctx: type) type {
             const sym = o.syms[r.r_sym()];
             switch (kind) {
                 .aarch64_abs64 => try c.add(r.r_offset, .aarch64_abs64, t, r.r_addend),
-                .aarch64_branch26 => try c.add(r.r_offset, .aarch64_branch26, .{ .key = try c.stubA64(t), .offset = 0 }, r.r_addend),
+                .aarch64_branch26 => try c.add(r.r_offset, .aarch64_branch26, .{ .key = try c.stubA64(t, .aarch64_abs64), .offset = 0 }, r.r_addend),
                 .aarch64_got_load_page21 => try c.add(r.r_offset, .aarch64_page21, .{ .key = try c.slot(t, .aarch64_abs64), .offset = 0 }, 0),
                 .aarch64_got_load_pageoff12 => try c.add(r.r_offset, .aarch64_pageoff12, .{ .key = try c.slot(t, .aarch64_abs64), .offset = 0 }, 0),
                 .aarch64_page21, .aarch64_pageoff12 => try c.add(r.r_offset, kind, .{ .key = try c.copied(index, sym) orelse return, .offset = 0 }, r.r_addend),
@@ -1547,10 +1582,10 @@ fn Converter(comptime Ctx: type) type {
         }
 
         /// `stub` for aarch64: `adrp x16, slot; ldr x16, [x16, :lo12:slot];
-        /// br x16`, as lld's PLT entries use x16.
-        fn stubA64(c: *C, t: Target) Allocator.Error!SymbolKey {
+        /// br x16`, as lld's PLT entries use x16. `kind` is the slot's.
+        fn stubA64(c: *C, t: Target, kind: Atom.Reloc.Kind) Allocator.Error!SymbolKey {
             const arena = c.in.arena;
-            const s = try c.slot(t, .aarch64_abs64);
+            const s = try c.slot(t, kind);
             const targets = try arena.dupe(SymbolKey, &.{s});
             const relocs = try arena.dupe(Atom.Reloc, &.{ .init(0, .aarch64_page21, 0, 0), .init(4, .aarch64_pageoff12, 0, 0) });
             const code: []const u8 = &.{ 0x10, 0x00, 0x00, 0x90, 0x10, 0x02, 0x40, 0xf9, 0x00, 0x02, 0x1f, 0xd6 };

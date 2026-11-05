@@ -785,6 +785,39 @@ pub fn threadLocalOffset(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
     e.word(0x91000000 | dst.zrEnc() << 5 | dst.zrEnc()); // add dst, dst, #0
 }
 
+/// x0 = thread-local S's offset from the thread pointer, through a TLS
+/// descriptor: `adrp x0, desc; ldr x1, [x0, :lo12:desc]; add x0, x0,
+/// :lo12:desc; blr x1`. The descriptor's function preserves every
+/// register but x0 (and lr, which the call writes). With `object`, `sym`
+/// is the variable and the relocations are the TLSDESC ones the final
+/// link resolves; else `sym` is the descriptor itself, in the image.
+pub fn threadLocalDesc(e: *Encoder, sym: SymbolKey, object: bool) !void {
+    try e.reserve();
+    try e.reloc(if (object) .aarch64_tlsdesc_page21 else .aarch64_page21, sym, 0);
+    e.word(0x90000000); // adrp x0
+    try e.reserve();
+    try e.reloc(if (object) .aarch64_tlsdesc_ld64_lo12 else .aarch64_pageoff12, sym, 0);
+    e.word(0xf9400001); // ldr x1, [x0]
+    try e.reserve();
+    try e.reloc(if (object) .aarch64_tlsdesc_add_lo12 else .aarch64_pageoff12, sym, 0);
+    e.word(0x91000000); // add x0, x0, #0
+    try e.reserve();
+    if (object) try e.reloc(.aarch64_tlsdesc_call, sym, 0);
+    e.word(0xd63f0020); // blr x1
+}
+
+/// `dst` = another module's thread-local S's offset from the thread
+/// pointer, initial-exec, in an object: `adrp dst, :gottprel:S; ldr dst,
+/// [dst, :gottprel_lo12:S]`.
+pub fn threadLocalInitial(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
+    try e.reserve();
+    try e.reloc(.aarch64_gottprel_page21, sym, 0);
+    e.word(0x90000000 | dst.zrEnc());
+    try e.reserve();
+    try e.reloc(.aarch64_gottprel_lo12, sym, 0);
+    e.word(0xf9400000 | dst.zrEnc() << 5 | dst.zrEnc());
+}
+
 // ---------------------------------------------------------------- moves
 
 /// `mov dst, src`: orr with zr, or `add dst, src, #0` when either is sp.

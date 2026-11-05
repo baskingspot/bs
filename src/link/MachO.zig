@@ -2010,7 +2010,7 @@ fn LinkOf(comptime Input: type) type {
                             std.mem.writeInt(u32, field[0..4], insn | @as(u32, @intCast(t.v & 0xfff)) << 10, .little);
                         }
                     },
-                    .aarch64_tprel_hi12, .aarch64_tprel_lo12_nc, .aarch64_prel32, .aarch64_prel64, .aarch64_tprel64, .aarch64_irelative, .aarch64_abs32, .aarch64_tprel_g1, .aarch64_tprel_g0_nc => return invalid,
+                    .aarch64_tprel_hi12, .aarch64_tprel_lo12_nc, .aarch64_prel32, .aarch64_prel64, .aarch64_tprel64, .aarch64_irelative, .aarch64_abs32, .aarch64_tprel_g1, .aarch64_tprel_g0_nc, .aarch64_tlsdesc, .aarch64_tlsdesc_sym, .aarch64_abs64_sym, .aarch64_tlsdesc_page21, .aarch64_tlsdesc_ld64_lo12, .aarch64_tlsdesc_add_lo12, .aarch64_tlsdesc_call, .aarch64_gottprel_page21, .aarch64_gottprel_lo12 => return invalid,
                     .x86_64_abs64, .x86_64_pc32, .x86_64_tpoff32, .x86_64_tlsld, .x86_64_dtpoff32, .x86_64_gottpoff, .x86_64_tlsgd, .x86_64_abs32, .x86_64_abs32s, .x86_64_tpoff64, .x86_64_dtpmod64, .x86_64_tlsdesc, .x86_64_irelative, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym, .x86_64_tlsdesc_sym, .x86_64_abs64_sym => return invalid,
                 }
             }

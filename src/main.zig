@@ -2320,15 +2320,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
         opts.link_libc = false;
     } else if (opts.bs_target == .aarch64_linux) {
-        // Executables and tests, static or linking glibc (and libc++)
-        // dynamically, and static objects and libraries without libc, with
-        // C sources, objects, archives, and shared libraries, so far.
-        if (opts.link_libc and (command.isObj() or command == .build_lib))
-            setUnsupported(&opts, arena, "bs does not build objects or libraries linking libc for aarch64-linux yet ('-lc'); build this step with upstream zig", .{})
-        else if (opts.fuzz)
-            setUnsupported(&opts, arena, "bs does not instrument code for fuzzing on aarch64-linux yet ('-ffuzz'); build this step with upstream zig", .{})
-        else if (opts.pic or opts.pie or (link_mode == .dynamic and !opts.link_libc))
-            setUnsupported(&opts, arena, "bs links only non-PIE executables for aarch64-linux so far, static unless they link glibc; build this step with upstream zig", .{});
+        if (opts.fuzz)
+            setUnsupported(&opts, arena, "bs does not instrument code for fuzzing on aarch64-linux yet ('-ffuzz'); build this step with upstream zig", .{});
         // Code is generated for the generic ARMv8-A CPU, the target's
         // baseline, as `-target aarch64-linux` gives upstream.
         if (mcpu) |text| if (!std.mem.eql(u8, text, "baseline") and !std.mem.eql(u8, text, "native") and !std.mem.eql(u8, text, "generic"))

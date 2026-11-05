@@ -310,6 +310,35 @@ pub const Reloc = extern struct {
         /// An aarch64 GNU indirect function's slot, as `x86_64_irelative`
         /// (ELF R_AARCH64_IRELATIVE).
         aarch64_irelative,
+        /// aarch64 TLS descriptors in a shared object, as
+        /// `x86_64_tlsdesc` and `x86_64_tlsdesc_sym`: S's 16-byte
+        /// descriptor, written by the loader (ELF R_AARCH64_TLSDESC, with
+        /// no symbol and addend S + A minus the start of the TLS segment
+        /// for the module's own S, else against export S), which code
+        /// reads and calls with `adrp x0, desc; ldr x1, [x0, :lo12:desc];
+        /// add x0, x0, :lo12:desc; blr x1`, leaving S's offset from the
+        /// thread pointer in x0.
+        aarch64_tlsdesc,
+        aarch64_tlsdesc_sym,
+        /// A shared object's 64-bit address of its exported S, as
+        /// `x86_64_abs64_sym` (ELF R_AARCH64_ABS64 against S, addend the
+        /// field's contents).
+        aarch64_abs64_sym,
+        /// aarch64 TLS in objects only, against S, which the final link
+        /// resolves; an image's link rejects them. The descriptor sequence
+        /// above with S's own descriptor: its adrp, ldr, add and blr (ELF
+        /// R_AARCH64_TLSDESC_ADR_PAGE21, TLSDESC_LD64_LO12,
+        /// TLSDESC_ADD_LO12, TLSDESC_CALL), in position-independent code;
+        /// and initial-exec's `adrp xd, :gottprel:S; ldr xd, [xd,
+        /// :gottprel_lo12:S]` (TLSIE_ADR_GOTTPREL_PAGE21,
+        /// TLSIE_LD64_GOTTPREL_LO12_NC), for another module's S in other
+        /// code. A must be 0.
+        aarch64_tlsdesc_page21,
+        aarch64_tlsdesc_ld64_lo12,
+        aarch64_tlsdesc_add_lo12,
+        aarch64_tlsdesc_call,
+        aarch64_gottprel_page21,
+        aarch64_gottprel_lo12,
     };
 };
 
