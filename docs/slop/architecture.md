@@ -4099,6 +4099,10 @@ thread's abilists imports. No bytes come from it.
   the import is unversioned, as ld writes zlib's), type, size and value.
   `aliases` finds the objects at one address. The soname falls back to
   the name main.zig gives (below). A linker script (`libc.so`-style text) is an error.
+  main.zig and `loadShared` map the library unpopulated, never read it
+  whole, so the parse faults in only the headers, `.dynsym`, `.dynstr`,
+  the version sections and `.dynamic`: 4.4 MB of LLVM 15's 117 MB
+  (2026-11-05; reading it whole cost 60–90 ms of a 0.3 s build).
 - Resolution order: Zig exports, then objects, then compiler_rt, then
   the shared libraries in input order, then glibc (`Emit.libraryDefines`
   answers for the last two; `exportTarget`, `InputResolver.importSym`
@@ -4201,7 +4205,15 @@ thread's abilists imports. No bytes come from it.
   its slot, whose atom the link writes, so this holds by construction.
 - Objects and archives are link-only manifest inputs: hashed by
   content, with the same stat and racy-mtime rule as source files, and
-  no node depends on them. Changing one invalidates nothing, but it
+  no node depends on them. A link-only input of 1 MiB or more
+  (objects, archives and shared libraries alike) is recorded by a hash
+  of its stat instead (inode, size, mtime: `Incremental.hashedByStat`),
+  unless it is racy, so a build never reads a large library whole to
+  hash it (2026-11-05: LLVM 15's 117 MB cost 89 ms per full record).
+  That is as sound as the stat check, which trusts a matching stat
+  anyway; a stat-hashed input whose stat changed counts as changed even
+  if only touched (`sameContents` tells the two kinds apart by the
+  recorded size and racy mtime). A racy one is hashed by content. Changing one invalidates nothing, but it
   blocks the skip-the-link fast path and forces a relink (built: see
   below).
 - The conversion reruns on every build and relink: it is a scan plus

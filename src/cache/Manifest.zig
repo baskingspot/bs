@@ -491,17 +491,21 @@ pub const Input = extern struct {
             in.mtime == stat.mtime.toNanoseconds();
     }
 
+    /// Whether a file of `stat` is too new to trust: modified within 2 s
+    /// of the build's start, it could change again within the timestamp
+    /// granularity without changing its stat, so it is recorded to be
+    /// rehashed next time.
+    pub fn racy(stat: Io.File.Stat, build_start: Io.Timestamp) bool {
+        return stat.mtime.toNanoseconds() >= build_start.toNanoseconds() - 2 * std.time.ns_per_s;
+    }
+
     fn init(stat: Io.File.Stat, content_hash: Hash, build_start: Io.Timestamp, path: StrRef, key: StrRef) Input {
-        // A file modified within 2 s of the build's start could change again
-        // within the timestamp granularity without changing its stat, so it
-        // is recorded to be rehashed next time.
         const mtime: i64 = @intCast(stat.mtime.toNanoseconds());
-        const racy = mtime >= build_start.toNanoseconds() - 2 * std.time.ns_per_s;
         return .{
             .content_hash = content_hash,
             .inode = @intCast(stat.inode),
             .size = stat.size,
-            .mtime = if (racy) racy_mtime else mtime,
+            .mtime = if (racy(stat, build_start)) racy_mtime else mtime,
             .path = path,
             .key = key,
         };

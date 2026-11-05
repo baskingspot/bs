@@ -322,6 +322,26 @@ if BS_CACHE_TIMING=1 BS_CACHE_CHECK=1 "$bs" $args --cache-dir local --global-cac
 fi
 grep -qF "shared_twice" log || fail ".so: the error does not name the dropped symbol"
 ! grep -qiE "panic|unreachable" log || fail ".so: a dropped symbol crashed bs"
+# A library of 1 MiB or more, older than the racy window, is recorded by
+# its stat, unread: touching it is a change, and so is a new library.
+cp "$src"/shared.c "$src"/shared.map .
+echo 'char shared_pad[1 << 21] = {1};' >pad.c
+big() {
+    "$zig" cc -shared -fPIC shared.c pad.c -Wl,--version-script=shared.map -Wl,-soname,libshared.so -o libshared.so
+    touch -d '-1 min' libshared.so
+}
+big
+build "inputs changed, first $work/libshared.so" "42 46"
+build "not relinking" "42 46"
+touch -d '-30 sec' libshared.so
+build "inputs changed, first $work/libshared.so" "42 46"
+eager ".so by its stat: the library was touched"
+sed -i 's/^int shared_twice.*$//; s/global: shared_twice;//' shared.c shared.map
+big
+if BS_CACHE_TIMING=1 BS_CACHE_CHECK=1 "$bs" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1; then
+    fail ".so by its stat: a dropped symbol linked"
+fi
+grep -qF "shared_twice" log || fail ".so by its stat: the error does not name the dropped symbol"
 ;;
 
 shared-objects)

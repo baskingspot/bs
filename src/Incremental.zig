@@ -340,18 +340,25 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     var objects_changed: usize = 0;
     for (changed.items) |i| {
         const in, const path = m.input(i);
-        const hash = try inc.contentHash(path);
-        if (hash != in.content_hash) {
+        const same = try inc.sameContents(m, i);
+        if (!same) {
             if (!objects_may_change or inc.output != .exe or !inc.isLinkObject(m.inputKey(i))) {
                 if (inc.timing) std.debug.print("cache: {d} inputs changed, first {s}\n", .{ changed.items.len, path });
                 return false;
             }
-            if (hash == null) return inc.noRelink("{s}: unreadable", .{path});
             objects_changed += 1;
         }
         const stat = Io.Dir.cwd().statFile(io, path, .{}) catch |err| return inc.noRelink("{s}: {t}", .{ path, err });
+        // An unchanged input's recorded hash is of its contents (one
+        // recorded by its stat, which changed, is not unchanged).
+        const hash = if (isLinkInput(m.inputKey(i)) and inc.hashedByStat(stat))
+            statHash(stat)
+        else if (same)
+            in.content_hash
+        else
+            try inc.contentHash(path) orelse return inc.noRelink("{s}: unreadable", .{path});
         if (restat == null) restat = .init(gpa, m);
-        try restat.?.setInput(i, path, m.inputKey(i), stat, hash.?, inc.build_start);
+        try restat.?.setInput(i, path, m.inputKey(i), stat, hash, inc.build_start);
     }
     // Only lazy edit builds fold the log: a session of C edits alone
     // builds eagerly, writing a new base, once the log is twice the fold
@@ -427,10 +434,33 @@ pub fn onlyLinkInputsMayChange(inc: *const Incremental) !bool {
     return true;
 }
 
+/// Link-only inputs this large are recorded by their stat (`hashedByStat`).
+const hashed_by_stat_min = 1 << 20;
+
+/// Whether the manifest records a link-only input of `stat` by a hash of
+/// the stat (`statHash`) rather than of its contents: when it is large and
+/// not too new to trust (`Manifest.Input.racy`), so that a build linking a
+/// large shared library or archive does not read all of it to hash it.
+/// That is as sound as the manifest's stat check, which never rehashes an
+/// input whose stat matches; one whose stat changed counts as changed,
+/// even if it was only touched. A racy one is hashed by content, so that
+/// a write within the timestamp granularity is still seen.
+fn hashedByStat(inc: *const Incremental, stat: Io.File.Stat) bool {
+    return stat.size >= hashed_by_stat_min and !Manifest.Input.racy(stat, inc.build_start);
+}
+
+fn statHash(stat: Io.File.Stat) Hash {
+    const words = [3]u64{ @intCast(stat.inode), stat.size, @bitCast(@as(i64, @intCast(stat.mtime.toNanoseconds()))) };
+    return cache.hash(0x7374_6174, std.mem.asBytes(&words));
+}
+
 /// Whether manifest `m`'s input `i`, whose stat changed, still has the
 /// contents the manifest records.
 fn sameContents(inc: *const Incremental, m: *const Manifest, i: u32) !bool {
     const in, const path = m.input(i);
+    // Recorded by its stat (`hashedByStat`, whose rule `Input.init`
+    // applies to the same stat), which changed.
+    if (isLinkInput(m.inputKey(i)) and in.size >= hashed_by_stat_min and in.mtime != Manifest.Input.racy_mtime) return false;
     const src = Io.Dir.cwd().readFileAlloc(inc.io, path, inc.gpa, .unlimited) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => return false,
@@ -672,7 +702,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             defer gpa.free(obj);
             const inputs = try arena.alloc(ElfMerge.Input, 1 + inc.link_objects.len);
             inputs[0] = .{ .path = sub_path, .bytes = obj };
-            for (inputs[1..], inc.link_objects) |*in_obj, path| in_obj.* = .{ .path = path, .bytes = try inc.mapInput(arena, &maps, path) orelse return null };
+            for (inputs[1..], inc.link_objects) |*in_obj, path| in_obj.* = .{ .path = path, .bytes = try inc.mapInput(arena, &maps, path, true) orelse return null };
             var why: []const u8 = "";
             const merged = ElfMerge.merge(gpa, arena, inputs, inc.arch, &why) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
@@ -690,7 +720,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             members[0] = .{ .name = try arena.print("{s}.o", .{inc.archive_stem}), .bytes = obj };
             for (members[1..], inc.link_objects) |*member, path| member.* = .{
                 .name = Io.Dir.path.basename(path),
-                .bytes = try inc.mapInput(arena, &maps, path) orelse return null,
+                .bytes = try inc.mapInput(arena, &maps, path, true) orelse return null,
             };
             break :lib Archive.write(gpa, io, out_dir, sub_path, members);
         },
@@ -711,8 +741,9 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
 
 const Linked = struct { atoms: usize, gathered: Io.Timestamp };
 
-/// Maps link input `path` into `maps`, or returns null after saying why.
-fn mapInput(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io.File.MemoryMap), path: []const u8) !?[]const u8 {
+/// Maps link input `path` into `maps`, its pages read ahead if `populate`,
+/// or returns null after saying why.
+fn mapInput(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io.File.MemoryMap), path: []const u8, populate: bool) !?[]const u8 {
     const io = inc.io;
     const mapped = map: {
         const f = Io.Dir.cwd().openFile(io, path, .{}) catch |err| break :map err;
@@ -720,7 +751,7 @@ fn mapInput(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io.F
         const len = f.length(io) catch |err| break :map err;
         if (len == 0) break :map error.EmptyFile;
         try maps.ensureUnusedCapacity(arena, 1);
-        break :map cache.mapOpenFile(io, f, len, true);
+        break :map cache.mapOpenFile(io, f, len, populate);
     } catch |err| {
         _ = inc.noRelink("{s}: {t}", .{ path, err });
         return null;
@@ -734,7 +765,8 @@ fn mapInput(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io.F
 fn loadShared(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io.File.MemoryMap)) !?[]const ElfShared {
     const shared = try arena.alloc(ElfShared, inc.link_shared.len);
     for (shared, inc.link_shared, inc.link_shared_names) |*lib, path, name| {
-        const bytes = try inc.mapInput(arena, maps, path) orelse return null;
+        // Not populated: the parse reads only the dynamic tables.
+        const bytes = try inc.mapInput(arena, maps, path, false) orelse return null;
         lib.* = ElfShared.parse(arena, path, name, bytes, inc.arch) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             _ = inc.noRelink("{s}: {t}", .{ path, err });
@@ -802,7 +834,7 @@ fn linkWithInputs(
     const io = inc.io;
     var objects: ElfInput = .{ .arena = arena, .dynamic = glibc != null, .shared_libs = shared, .lld = inc.lld, .arch = inc.arch };
     for (inc.link_objects, 0..) |path, n| {
-        const bytes = try inc.mapInput(arena, maps, path) orelse return null;
+        const bytes = try inc.mapInput(arena, maps, path, true) orelse return null;
         const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");
         (if (is_archive) objects.addArchive(path, bytes, n >= inc.link_runtime_from) else objects.addObject(path, bytes)) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
@@ -3827,12 +3859,15 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     // Link-only inputs, by the same rule.
     for (0..inc.link_objects.len + inc.link_shared.len) |n| {
         const path = inc.linkPath(n);
-        const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
-        defer gpa.free(bytes);
         key_buf.clearRetainingCapacity();
         try key_buf.print(gpa, "{s}{s}", .{ link_input_prefix, path });
         const stat = try Io.Dir.cwd().statFile(io, path, .{});
-        try b.addInput(path, key_buf.items, stat, @bitCast(Frontend.hashSource(bytes)), inc.build_start);
+        const hash = if (inc.hashedByStat(stat)) statHash(stat) else hash: {
+            const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+            defer gpa.free(bytes);
+            break :hash @as(Hash, @bitCast(Frontend.hashSource(bytes)));
+        };
+        try b.addInput(path, key_buf.items, stat, hash, inc.build_start);
     }
     const t4 = now(io);
     // Every atom is in a store pack, so the pack's own records, which

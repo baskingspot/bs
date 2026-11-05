@@ -1380,8 +1380,16 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     }
     const shared_libs = try arena.alloc(ElfShared, if (macos) 0 else opts.shared_libs.len);
     for (shared_libs, opts.shared_libs[0..shared_libs.len], opts.shared_names[0..shared_libs.len]) |*lib, path, name| {
-        const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
-            fatal("unable to read '{s}': {t}", .{ path, err });
+        // Mapped, not read, for the rest of the process: the parse touches
+        // only the headers and the dynamic tables, a few pages of a large
+        // library, and the symbols' names point into the mapping.
+        const bytes: []const u8 = map: {
+            const f = Io.Dir.cwd().openFile(init.io, path, .{}) catch |err| break :map err;
+            defer f.close(init.io);
+            const len = f.length(init.io) catch |err| break :map err;
+            if (len == 0) break :map "";
+            break :map (cache.mapOpenFile(init.io, f, len, false) catch |err| break :map err).memory;
+        } catch |err| fatal("unable to read '{s}': {t}", .{ path, err });
         lib.* = ElfShared.parse(arena, path, name, bytes, if (opts.bs_target.arch() == .aarch64) .aarch64 else .x86_64) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.InvalidShared => if (!std.mem.startsWith(u8, bytes, std.elf.MAGIC))
