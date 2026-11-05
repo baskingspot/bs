@@ -1423,9 +1423,10 @@ pub fn inPair(cg: *CodeGen, ty: Index) bool {
     const ip = cg.ip;
     return switch (Type.class(ip, ty)) {
         .pointer => Type.isSlice(ip, ty),
+        // Not an optional `allowzero` slice, whose flag follows the slice.
         .optional => blk: {
             const child = Type.childType(ip, ty);
-            break :blk Type.class(ip, child) == .pointer and Type.isSlice(ip, child);
+            break :blk Type.class(ip, child) == .pointer and Type.isSlice(ip, child) and Type.abiSize(ip, ty) == 16;
         },
         // The payload at offset 8 makes the error union 16 bytes.
         .error_union => blk: {
