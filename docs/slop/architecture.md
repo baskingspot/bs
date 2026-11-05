@@ -926,8 +926,15 @@ comptime arguments are run-time values in the lowered code (uucode's
   operand (results it writes through `resultMem` go to a scratch slot
   and are moved to the register after the instruction), so a result may
   take the register of an operand that dies there (`tiedOperand`).
-  Pairs (slices) and block results stay in slots for now (`inPair` says
-  no). A value that meets an inline assembly statement (an operand,
+  Slices, optional slices, and error unions with an 8-byte payload
+  (`inPair`) take two of x19-x28 (`want_pair`, `Home.regs`) when
+  computed by a load, `slice`, an element or field read, an optional's
+  or error union's wrapping or unwrapping, an `.auto` argument or call
+  result (`pairResult`), or a promoted variable; their users that read
+  memory get a copy (`valMem`), and a `slice_ptr` or `slice_len` of a
+  slice in registers takes none of its own but reads the slice's
+  (`lengthenIntervals`, as x86_64's `pairFoldable`). Block results
+  stay in slots. A value that meets an inline assembly statement (an operand,
   its result, or a value live across it) takes none of the x19-x28 and
   v8-v15 an assembly statement in the function names in its template,
   pins or clobbers (`asmRegs`, an `Ssa.allocate` restriction); the
