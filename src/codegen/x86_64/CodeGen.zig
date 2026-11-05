@@ -109,6 +109,9 @@ rotates: std.AutoHashMapUnmanaged(u32, Rotate) = .empty,
 /// From `planMulWide`: factors of 128-bit products computed with one
 /// `mul` that `planMulWide` stopped computing (`Home.dead`), by value.
 mul_dead: std.AutoHashMapUnmanaged(u32, void) = .empty,
+/// From `planMulWide`, which walks the values anyway: integer casts read
+/// once that want a register, which `planCasts` considers.
+casts: std.ArrayList(u32) = .empty,
 /// rbp offset of the slot holding the error return trace pointer: an
 /// `.auto` function's from r9, another's from `set_err_return_trace`.
 /// Null in a function that has none, whose `.auto` calls pass null.
@@ -341,6 +344,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.in_place.deinit(gpa);
         cg.rotates.deinit(gpa);
         cg.mul_dead.deinit(gpa);
+        cg.casts.deinit(gpa);
         cg.cold_starts.deinit(gpa);
         cg.cold_open.deinit(gpa);
         cg.stub_chains.deinit(gpa);
@@ -1548,6 +1552,28 @@ fn intFits(src: Type.IntInfo, dst: Type.IntInfo) bool {
     return src.signedness == .unsigned and src.bits < dst.bits;
 }
 
+/// The bits integer value `ref` of type `info` can have set: fewer than its
+/// type's when it is an unsigned value shifted right by a constant or
+/// masked with a constant, as in `@truncate(x >> 32)`.
+fn valueBits(cg: *CodeGen, ref: Ref, info: Type.IntInfo) Type.IntInfo {
+    if (info.signedness != .unsigned) return info;
+    const i = ref.toIndex() orelse return info;
+    const datas = cg.ir.instructions.items(.data);
+    const bits: u16 = switch (cg.ir.instructions.items(.tag)[@backingInt(i)]) {
+        .shr => info.bits -| @as(u16, @intCast(@min(cg.shiftAmount(datas[@backingInt(i)].bin_op.rhs) orelse return info, info.bits))),
+        .bit_and => blk: {
+            const m = datas[@backingInt(i)].bin_op.rhs.toInterned() orelse return info;
+            if (cg.ip.keyTag(m) != .int) return info;
+            break :blk switch (cg.ip.keyPayload(.int, m).storage) {
+                .u64 => |u| 64 - @clz(u),
+                else => return info,
+            };
+        },
+        else => return info,
+    };
+    return .{ .signedness = .unsigned, .bits = @min(bits, info.bits) };
+}
+
 /// Truncates the 64-bit value in `reg` to integer type `ty` and extends it
 /// back, so it is normalized.
 pub fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
@@ -1939,6 +1965,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
     try cg.planRotates();
     try cg.planMulWide();
     try int128.plan(cg);
+    try cg.planCasts();
     @memset(live.items(.hint), .{ Ssa.no_reg, Ssa.no_reg });
     for (cg.arg_hints.items) |h| live.items(.hint)[h.v][0] = h.r;
     if (cg.fn_ty.cc == .auto) {
@@ -3071,6 +3098,7 @@ fn planMulWide(cg: *CodeGen) Error!void {
                     try cg.mul_dead.put(cg.gpa, ci, {});
                 }
             },
+            .intcast => if (reg[vi] == Ssa.want_reg and uses[vi] == 1) try cg.casts.append(cg.gpa, vi),
             .trunc => {
                 if (reg[vi] != Ssa.want_reg) continue;
                 const part = cg.mulPart(v) orelse continue;
@@ -3083,6 +3111,64 @@ fn planMulWide(cg: *CodeGen) Error!void {
                 cg.homes[sh] = .dead;
             },
             else => {},
+        }
+    }
+}
+
+/// Before allocation: a widening of an integer in a register to a wider
+/// one is the same register contents, since registers hold integers
+/// extended by their type. A widening read once, by a user that does not
+/// compute in its register, shares its operand's register (`Live.share`)
+/// and emits nothing, instead of copying it (`mov r9,r15 ; imul r12,r9`).
+/// The operand then lives as long as the widening, as a promoted
+/// variable outlives the loads that share it.
+fn planCasts(cg: *CodeGen) Error!void {
+    if (cg.casts.items.len == 0) return;
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const f = cg.ssa;
+    const datas = ir.instructions.items(.data);
+    const live = f.live.slice();
+    const fate = live.items(.fate);
+    const reg = live.items(.reg);
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const crosses = live.items(.crosses);
+    const share = live.items(.share);
+    const tie = live.items(.tie);
+    const cl = f.clobbers.items;
+    // Widenings that may share.
+    var n: usize = 0;
+    for (cg.casts.items) |vi| {
+        if (fate[vi] != .normal or reg[vi] != Ssa.want_reg or crosses[vi] or share[vi] != Ssa.no_tie) continue;
+        const o = datas[vi].ty_op.operand.toIndex() orelse continue;
+        const oi = @backingInt(o);
+        if (fate[oi] != .normal or reg[oi] != Ssa.want_reg or share[oi] != Ssa.no_tie or end[oi] <= def[vi]) continue;
+        const ty = datas[vi].ty_op.ty;
+        const src_ty = cg.typeOf(datas[vi].ty_op.operand);
+        if (!Type.isInt(ip, ty) or !Type.isInt(ip, src_ty) or !cg.passInRegs(ty) or !cg.passInRegs(src_ty)) continue;
+        if (!intFits(Type.intInfo(ip, src_ty), Type.intInfo(ip, ty))) continue;
+        cg.casts.items[n] = vi;
+        n += 1;
+    }
+    if (n == 0) return;
+    var tied: std.bit_set.Dynamic = try .initEmpty(cg.gpa, ir.instructions.len);
+    defer tied.deinit(cg.gpa);
+    for (f.values.items(.inst)) |u| {
+        const ui = @backingInt(u);
+        if (fate[ui] != .normal or reg[ui] != Ssa.want_reg) continue;
+        const t = tie[ui];
+        if (t != Ssa.no_tie and end[t] == def[ui]) tied.set(t);
+    }
+    for (cg.casts.items[0..n]) |vi| {
+        // Its user computes over another operand, so it does not take the
+        // widening's register, which is its operand's.
+        if (tied.isSet(vi)) continue;
+        const oi = @backingInt(datas[vi].ty_op.operand.toIndex().?);
+        share[vi] = oi;
+        if (end[vi] > end[oi]) {
+            end[oi] = end[vi];
+            crosses[oi] = crosses[oi] or cl[end[vi]][0] != cl[def[oi]][0] or cl[end[vi]][1] != cl[def[oi]][1];
         }
     }
 }
@@ -4847,7 +4933,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             if (cg.passInRegs(ty) and cg.passInRegs(cg.typeOf(data.ty_op.operand))) {
                 const d = cg.destReg(inst);
                 const src_ty = cg.typeOf(data.ty_op.operand);
-                if (!Type.isInt(ip, ty) or (Type.isInt(ip, src_ty) and intFits(Type.intInfo(ip, src_ty), Type.intInfo(ip, ty)))) {
+                if (!Type.isInt(ip, ty) or (Type.isInt(ip, src_ty) and intFits(cg.valueBits(data.ty_op.operand, Type.intInfo(ip, src_ty)), Type.intInfo(ip, ty)))) {
                     try cg.load(d, data.ty_op.operand);
                     // A bool from an i1 (a lane of a vector bitcast): its
                     // register holds -1 as all ones.
