@@ -610,7 +610,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
         const path = try std.fs.path.join(arena, &.{ inc.glibc_lib_dir, Glibc.abilists_path });
         const contents = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err|
             return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
-        glibc_loaded = Glibc.load(gpa, contents, inc.glibc_version.?) catch |err|
+        glibc_loaded = Glibc.load(gpa, contents, inc.glibc_version.?, inc.arch) catch |err|
             return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
         break :g &glibc_loaded.?;
     };
@@ -738,7 +738,7 @@ fn loadShared(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io
     const shared = try arena.alloc(ElfShared, inc.link_shared.len);
     for (shared, inc.link_shared, inc.link_shared_names) |*lib, path, name| {
         const bytes = try inc.mapInput(arena, maps, path) orelse return null;
-        lib.* = ElfShared.parse(arena, path, name, bytes) catch |err| {
+        lib.* = ElfShared.parse(arena, path, name, bytes, inc.arch) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             _ = inc.noRelink("{s}: {t}", .{ path, err });
             return null;

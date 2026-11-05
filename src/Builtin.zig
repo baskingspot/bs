@@ -107,6 +107,60 @@ pub const glibc_start =
     \\
 ;
 
+/// `glibc_start` for aarch64, as glibc's sysdeps/aarch64/start.S: the
+/// loader passes the destructors' function in x0.
+pub const glibc_start_aarch64 =
+    \\//! bs's start code for executables that link glibc, in place of
+    \\//! glibc's crt1.o: `_start` calls `__libc_start_main` with the `main`
+    \\//! that std's start code exports, as glibc's sysdeps/aarch64/start.S
+    \\//! does. glibc 2.34 and later run the init arrays themselves when
+    \\//! `init` is null, as their own crt1.o passes it.
+    \\
+    \\comptime {
+    \\    @export(&_start, .{ .name = "_start" });
+    \\    @export(&_IO_stdin_used, .{ .name = "_IO_stdin_used" });
+    \\}
+    \\
+    \\/// The stdio ABI version, which glibc's crt1.o defines.
+    \\const _IO_stdin_used: c_int = 0x20001;
+    \\
+    \\extern fn main(argc: c_int, argv: [*]?[*:0]u8, envp: [*]?[*:0]u8) callconv(.c) c_int;
+    \\extern fn __libc_start_main(
+    \\    main: *const fn (c_int, [*]?[*:0]u8, [*]?[*:0]u8) callconv(.c) c_int,
+    \\    argc: c_int,
+    \\    argv: [*]?[*:0]u8,
+    \\    init: ?*const fn () callconv(.c) void,
+    \\    fini: ?*const fn () callconv(.c) void,
+    \\    rtld_fini: ?*const fn () callconv(.c) void,
+    \\    stack_end: *anyopaque,
+    \\) callconv(.c) noreturn;
+    \\
+    \\fn _start() callconv(.naked) noreturn {
+    \\    asm volatile (".cfi_undefined lr");
+    \\    asm volatile (
+    \\        \\ mov fp, #0
+    \\        \\ mov lr, #0
+    \\        \\ mov x1, x0
+    \\        \\ mov x0, sp
+    \\        \\ and sp, x0, #-16
+    \\        \\ b %[startMain]
+    \\        :
+    \\        : [startMain] "X" (&startMain),
+    \\    );
+    \\}
+    \\
+    \\fn startMain(sp: [*]usize, rtld_fini: ?*const fn () callconv(.c) void) callconv(.c) noreturn {
+    \\    @setRuntimeSafety(false);
+    \\    __libc_start_main(&main, @intCast(sp[0]), @ptrCast(sp + 1), null, null, rtld_fini, sp);
+    \\}
+    \\
+;
+
+/// The start code `glibc_start` names for `arch`.
+pub fn glibcStart(arch: std.Target.Cpu.Arch) []const u8 {
+    return if (arch == .aarch64) glibc_start_aarch64 else glibc_start;
+}
+
 /// The root file of an executable whose main is C's (a module of C sources
 /// only, linking glibc) or of a shared library of C only. Upstream analyzes
 /// no Zig for them; bs's need a Zig root for the start code, compiler_rt
@@ -443,7 +497,7 @@ pub fn writeToCache(gpa: Allocator, io: Io, cache_dir: []const u8, opts: Options
     var hash: [16]u8 = undefined;
     var hasher: std.crypto.hash.Blake3 = .init(.{});
     hasher.update(source);
-    if (opts.glibc != null) hasher.update(glibc_start);
+    if (opts.glibc != null) hasher.update(glibcStart(opts.cpu.arch));
     hasher.final(&hash);
     const dir = try std.fmt.allocPrint(gpa, "{s}/builtin/{x}", .{ cache_dir, &hash });
     errdefer gpa.free(dir);
@@ -458,7 +512,7 @@ pub fn writeToCache(gpa: Allocator, io: Io, cache_dir: []const u8, opts: Options
         defer gpa.free(start_path);
         var atomic = try cwd.createFileAtomic(io, start_path, .{ .make_path = true, .replace = true });
         defer atomic.deinit(io);
-        try atomic.file.writeStreamingAll(io, glibc_start);
+        try atomic.file.writeStreamingAll(io, glibcStart(opts.cpu.arch));
         try atomic.replace(io);
     }
     // Atomic, so concurrent builds never see a partial file.

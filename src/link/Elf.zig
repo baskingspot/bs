@@ -1291,7 +1291,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         if (n_copies != 0) for (t.exports, dyn_exports, 0..) |i, atom, pos| {
             const cp = d.exports[i].copy orelse continue;
             if (cp.alias) continue;
-            tail[k] = .{ .offset = l.atomAddr(atom), .info = .{ .type = @backingInt(elf.R_X86_64.COPY), .sym = @intCast(1 + n_imports + pos) }, .addend = 0 };
+            tail[k] = .{ .offset = l.atomAddr(atom), .info = .{ .type = if (l.arch == .aarch64) @backingInt(elf.R_AARCH64.COPY) else @backingInt(elf.R_X86_64.COPY), .sym = @intCast(1 + n_imports + pos) }, .addend = 0 };
             k += 1;
         };
         if (has_tls and !exe_dyn) {
@@ -2013,6 +2013,8 @@ fn LinkOf(comptime Input: type) type {
         fn needsDynamicReloc(l: *const Link, a: *const Atom, r: Atom.Reloc) bool {
             switch (r.info.kind) {
                 .x86_64_abs64 => {},
+                // An aarch64 executable's addresses of imports.
+                .aarch64_abs64 => return isImport(l.exe_imports orelse return false, a.targets[r.info.target]),
                 .x86_64_tpoff64 => return isImport(l.exe_imports orelse return false, a.targets[r.info.target]),
                 // A shared object's module ID, for `__tls_get_addr`, and
                 // its TLS descriptors.
@@ -2032,7 +2034,11 @@ fn LinkOf(comptime Input: type) type {
         fn hasImportAbs(l: *const Link, a: *const Atom) bool {
             const imports = l.exe_imports orelse return false;
             for (a.relocs) |r| {
-                if ((r.info.kind == .x86_64_abs64 or r.info.kind == .x86_64_tpoff64) and isImport(imports, a.targets[r.info.target])) return true;
+                const abs = switch (r.info.kind) {
+                    .x86_64_abs64, .x86_64_tpoff64, .aarch64_abs64 => true,
+                    else => false,
+                };
+                if (abs and isImport(imports, a.targets[r.info.target])) return true;
             }
             return false;
         }
@@ -2347,7 +2353,11 @@ fn LinkOf(comptime Input: type) type {
                         else if (r.info.kind == .x86_64_irelative)
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.IRELATIVE), .sym = 0 }, .addend = @bitCast(v) }
                         else if (t >= l.plt_start and t < l.plt_end)
-                            .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(if (r.info.kind == .x86_64_tpoff64) elf.R_X86_64.TPOFF64 else elf.R_X86_64.@"64"), .sym = @intCast(1 + (t - l.plt_start) / ElfDynamic.plt_entry_size) }, .addend = r.addend }
+                            .{ .offset = addr + r.offset, .info = .{ .type = switch (r.info.kind) {
+                                .x86_64_tpoff64 => @backingInt(elf.R_X86_64.TPOFF64),
+                                .aarch64_abs64 => @backingInt(elf.R_AARCH64.ABS64),
+                                else => @backingInt(elf.R_X86_64.@"64"),
+                            }, .sym = @intCast(1 + (t - l.plt_start) / ElfDynamic.plt_entry_size) }, .addend = r.addend }
                         else
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.RELATIVE), .sym = 0 }, .addend = @bitCast(v) };
                         writeStruct(out[rela][rela_at..], rec);

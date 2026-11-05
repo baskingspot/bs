@@ -349,7 +349,7 @@ fn symTarget(in: *Inputs, o: *const Object, s: u32, addend: i64) Allocator.Error
     if (shndx == elf.SHN_ABS or shndx >= elf.SHN_LORESERVE or shndx == elf.SHN_UNDEF) return null;
     // An indirect function is its stub, the address calls and pointers
     // use, as upstream's canonical PLT entry.
-    if (sym.st_type() == elf.STT_GNU_IFUNC and in.dynamic) return .{ .key = (try in.ifuncAtoms(o, s)).stub.key, .offset = 0 };
+    if (sym.st_type() == elf.STT_GNU_IFUNC and in.dynamic and in.arch == .x86_64) return .{ .key = (try in.ifuncAtoms(o, s)).stub.key, .offset = 0 };
     const sh = o.shdrs[shndx];
     const offset: u64 = sym.st_value;
     if (sh.sh_flags & elf.SHF_MERGE != 0) {
@@ -518,6 +518,10 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
         {
             if (!in.dynamic) {
                 try in.errors.append(arena, try std.fmt.allocPrint(arena, "{s}: bs links GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) only into executables that link libc and shared libraries, whose loader calls their resolvers: {s}", .{ o.path, o.symName(sym) }));
+                continue;
+            }
+            if (in.arch == .aarch64) {
+                try in.errors.append(arena, try std.fmt.allocPrint(arena, "{s}: bs does not link GNU indirect functions (STT_GNU_IFUNC) for aarch64-linux yet: {s}", .{ o.path, o.symName(sym) }));
                 continue;
             }
             const ifunc = try in.ifuncAtoms(o, @intCast(s_index));
@@ -1463,9 +1467,41 @@ fn Converter(comptime Ctx: type) type {
             if ((kind == .aarch64_got_load_page21 or kind == .aarch64_got_load_pageoff12) and r.r_addend != 0)
                 return c.fail("{s}: GOT relocation with addend {d} in section '{s}'", .{ o.path, r.r_addend, o.sectionName(index) });
             const t = try c.target(r.r_sym(), r.r_addend) orelse return;
-            if (t.import) return c.fail("{s}: bs does not link aarch64 objects against shared libraries yet ('{s}')", .{ o.path, o.symName(o.syms[r.r_sym()]) });
+            if (t.import) return c.importA64(index, r, kind);
             if (relaxed) |v| std.mem.writeInt(u32, (try c.writable(bytes, copy))[at..][0..4], v, .little);
             try c.add(r.r_offset, kind, t, r.r_addend);
+        }
+
+        /// aarch64 relocation `r` of `kind` to a shared library's
+        /// symbol, as `importReloc`: an absolute address stays one, which
+        /// the loader writes; a call or jump goes through a stub that
+        /// branches through the symbol's slot; a GOT load reads the slot;
+        /// and PC-relative data references use the executable's copy.
+        fn importA64(c: *C, index: u32, r: elf.Elf64_Rela, kind: Atom.Reloc.Kind) !void {
+            const o = c.o;
+            const sym = o.syms[r.r_sym()];
+            const t: Target = .{ .key = (try c.target(r.r_sym(), r.r_addend)).?.key, .offset = 0 };
+            switch (kind) {
+                .aarch64_abs64 => try c.add(r.r_offset, .aarch64_abs64, t, r.r_addend),
+                .aarch64_branch26 => try c.add(r.r_offset, .aarch64_branch26, .{ .key = try c.stubA64(t), .offset = 0 }, r.r_addend),
+                .aarch64_got_load_page21 => try c.add(r.r_offset, .aarch64_page21, .{ .key = try c.slot(t, .aarch64_abs64), .offset = 0 }, 0),
+                .aarch64_got_load_pageoff12 => try c.add(r.r_offset, .aarch64_pageoff12, .{ .key = try c.slot(t, .aarch64_abs64), .offset = 0 }, 0),
+                .aarch64_page21, .aarch64_pageoff12 => try c.add(r.r_offset, kind, .{ .key = try c.copied(index, sym) orelse return, .offset = 0 }, r.r_addend),
+                else => try c.fail("{s}: bs does not link relocation R_AARCH64_{s} against {s}, which a shared library defines, yet", .{ o.path, @tagName(@as(elf.R_AARCH64, @fromBackingInt(r.r_type()))), o.symName(sym) }),
+            }
+        }
+
+        /// `stub` for aarch64: `adrp x16, slot; ldr x16, [x16, :lo12:slot];
+        /// br x16`, as lld's PLT entries use x16.
+        fn stubA64(c: *C, t: Target) Allocator.Error!SymbolKey {
+            const arena = c.in.arena;
+            const s = try c.slot(t, .aarch64_abs64);
+            const targets = try arena.dupe(SymbolKey, &.{s});
+            const relocs = try arena.dupe(Atom.Reloc, &.{ .init(0, .aarch64_page21, 0, 0), .init(4, .aarch64_pageoff12, 0, 0) });
+            const code: []const u8 = &.{ 0x10, 0x00, 0x00, 0x90, 0x10, 0x02, 0x40, 0xf9, 0x00, 0x02, 0x1f, 0xd6 };
+            const key: SymbolKey = .fromContents(.text, .@"4", code, targets, relocs);
+            try c.atoms.append(arena, .{ .key = key, .name = "", .section = .text, .alignment = .@"4", .bytes = code, .targets = targets, .relocs = relocs });
+            return key;
         }
 
         fn writable(c: *C, bytes: []const u8, copy: *?[]u8) Allocator.Error![]u8 {

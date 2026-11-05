@@ -41,15 +41,15 @@ pub const Symbol = struct {
 
 pub const Error = error{ OutOfMemory, InvalidShared };
 
-/// Parses `bytes`, an ELF64 x86_64 ET_DYN, kept in place. `needed_name` is the
+/// Parses `bytes`, an ELF64 ET_DYN for `arch`, kept in place. `needed_name` is the
 /// DT_NEEDED name if it has no DT_SONAME: as upstream's linkers name
 /// such a library, the file name of one `-l` found, else its path as
 /// given.
-pub fn parse(arena: Allocator, path: []const u8, needed_name: []const u8, bytes: []const u8) Error!Shared {
+pub fn parse(arena: Allocator, path: []const u8, needed_name: []const u8, bytes: []const u8, arch: @import("Atom.zig").Unwind.Arch) Error!Shared {
     if (bytes.len < @sizeOf(elf.Elf64_Ehdr) or !std.mem.eql(u8, bytes[0..4], elf.MAGIC)) return error.InvalidShared;
     const eh = std.mem.bytesToValue(elf.Elf64_Ehdr, bytes[0..@sizeOf(elf.Elf64_Ehdr)]);
     if (eh.e_ident[elf.EI.CLASS] != elf.ELFCLASS64 or eh.e_ident[elf.EI.DATA] != elf.ELFDATA2LSB) return error.InvalidShared;
-    if (eh.e_type != .DYN or eh.e_machine != .X86_64 or eh.e_shentsize != @sizeOf(elf.Elf64_Shdr)) return error.InvalidShared;
+    if (eh.e_type != .DYN or eh.e_machine != @as(elf.EM, if (arch == .aarch64) .AARCH64 else .X86_64) or eh.e_shentsize != @sizeOf(elf.Elf64_Shdr)) return error.InvalidShared;
     const shdrs_end = std.math.add(u64, eh.e_shoff, @as(u64, eh.e_shnum) * @sizeOf(elf.Elf64_Shdr)) catch return error.InvalidShared;
     if (shdrs_end > bytes.len) return error.InvalidShared;
     const shdrs = std.mem.bytesAsSlice(elf.Elf64_Shdr, bytes[@intCast(eh.e_shoff)..@intCast(shdrs_end)]);

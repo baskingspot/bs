@@ -1219,12 +1219,12 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     for (shared_libs, opts.shared_libs[0..shared_libs.len], opts.shared_names[0..shared_libs.len]) |*lib, path, name| {
         const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
             fatal("unable to read '{s}': {t}", .{ path, err });
-        lib.* = ElfShared.parse(arena, path, name, bytes) catch |err| switch (err) {
+        lib.* = ElfShared.parse(arena, path, name, bytes, if (opts.bs_target.arch() == .aarch64) .aarch64 else .x86_64) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.InvalidShared => if (!std.mem.startsWith(u8, bytes, std.elf.MAGIC))
                 fatal("bs does not read linker scripts ('{s}') yet", .{path})
             else
-                fatal("'{s}' is not an x86_64 ELF shared library", .{path}),
+                fatal("'{s}' is not an {t} ELF shared library", .{ path, opts.bs_target.arch() }),
         };
     }
     emit.shared_libs = shared_libs;
@@ -2294,16 +2294,17 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
         opts.link_libc = false;
     } else if (opts.bs_target == .aarch64_linux) {
-        // Static executables, tests, objects, and static libraries, with C
-        // sources, objects, and archives but no libc, so far.
-        if (opts.link_libc or opts.link_libcpp)
-            setUnsupported(&opts, arena, "bs does not link libc or libc++ for aarch64-linux yet; build this step with upstream zig", .{})
-        else if (for (link_inputs.items) |p| (if (isSharedLib(p)) break true) else false)
-            setUnsupported(&opts, arena, "bs does not link shared libraries for aarch64-linux yet; build this step with upstream zig", .{})
+        // Executables and tests, static or linking glibc dynamically, and
+        // static objects and libraries without libc, with C sources,
+        // objects, and archives, so far.
+        if (opts.link_libcpp)
+            setUnsupported(&opts, arena, "bs does not link libc++ for aarch64-linux yet; build this step with upstream zig", .{})
+        else if (opts.link_libc and (command.isObj() or command == .build_lib))
+            setUnsupported(&opts, arena, "bs does not build objects or libraries linking libc for aarch64-linux yet ('-lc'); build this step with upstream zig", .{})
         else if (opts.fuzz)
             setUnsupported(&opts, arena, "bs does not instrument code for fuzzing on aarch64-linux yet ('-ffuzz'); build this step with upstream zig", .{})
-        else if (opts.pic or opts.pie or link_mode == .dynamic)
-            setUnsupported(&opts, arena, "bs links only static, non-PIE executables for aarch64-linux so far; build this step with upstream zig", .{});
+        else if (opts.pic or opts.pie or (link_mode == .dynamic and !opts.link_libc))
+            setUnsupported(&opts, arena, "bs links only non-PIE executables for aarch64-linux so far, static unless they link glibc; build this step with upstream zig", .{});
         // Code is generated for the generic ARMv8-A CPU, the target's
         // baseline, as `-target aarch64-linux` gives upstream.
         if (mcpu) |text| if (!std.mem.eql(u8, text, "baseline") and !std.mem.eql(u8, text, "native") and !std.mem.eql(u8, text, "generic"))
@@ -2579,7 +2580,7 @@ fn loadGlibc(init: std.process.Init, job: *const Job) !Glibc {
         fatal("unable to read glibc's symbols from '{s}': {t}", .{ path, err });
     defer init.gpa.free(contents);
     const want = job.opts.glibc_version.?;
-    const g = Glibc.load(init.gpa, contents, want) catch |err| switch (err) {
+    const g = Glibc.load(init.gpa, contents, want, if (job.opts.bs_target.arch() == .aarch64) .aarch64 else .x86_64) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         error.UnsupportedVersion => fatal("bs cannot link glibc {f}: '{s}' does not list it", .{ want, path }),
         error.InvalidAbilists => fatal("unable to read glibc's symbols from '{s}': the file is damaged", .{path}),
@@ -2667,10 +2668,10 @@ pub fn resolveGlibc(opts: *Options, arena: std.mem.Allocator) void {
     if (opts.glibc_version != null) return;
     const target = opts.target orelse "native";
     if (!std.mem.eql(u8, target, "native")) {
-        setUnsupported(opts, arena, "bs links only glibc ('-lc' with target '{s}', whose libc is musl or none); pass -target x86_64-linux-gnu or no target", .{target});
+        setUnsupported(opts, arena, "bs links only glibc ('-lc' with target '{s}', whose libc is musl or none); pass -target {s}-linux-gnu or no target", .{ target, if (std.mem.startsWith(u8, target, "aarch64")) "aarch64" else "x86_64" });
     } else {
         const abi: std.Target.Abi = if (opts.linux) |t| t.abi else .none;
-        setUnsupported(opts, arena, "bs links only glibc ('-lc'), and this system's libc is not glibc ({t}); pass -target x86_64-linux-gnu", .{abi});
+        setUnsupported(opts, arena, "bs links only glibc ('-lc'), and this system's libc is not glibc ({t}); pass -target {t}-linux-gnu", .{ abi, builtin.cpu.arch });
     }
 }
 

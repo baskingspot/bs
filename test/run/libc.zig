@@ -1,5 +1,6 @@
 //! exit: 3
 //! libc: true
+//! targets: x86_64-linux aarch64-linux
 //! stdout: "fputs\nprintf 42 str 1.41\nsorted 1 3 5 9\nenviron set, tl 8, thread tl 27\n"
 //! A program linked against glibc (`-lc`): functions, a variadic one, libm,
 //! data imports (`environ`, `stdout`), a callback from libc, glibc's

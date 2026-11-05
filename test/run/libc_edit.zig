@@ -1,5 +1,6 @@
 //! exit: 0
 //! libc: true
+//! targets: x86_64-linux aarch64-linux
 //! stdout: "sum 15 len 5 sorted 1 2 4 8\n"
 //! rebuild-replace: "sum %d len" "total %d len"
 //! An edit build of a program linked against glibc: the cache relinks it

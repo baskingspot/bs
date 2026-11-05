@@ -3951,11 +3951,34 @@ as lld does: the descriptor's `adrp` and `ldr` become nops, its `add`
 and `blr` `movz x0, #g1, lsl #16; movk x0, #g0_nc`
 (`aarch64_tprel_g1`/`g0_nc`), and the initial-exec `adrp` and `ldr` the
 same pair into their register. `.eh_frame`'s FDEs are PREL32, and the
-debug sections' ABS32/ABS64 map onto the input-section kinds. Shared
-libraries, `-lc`, and objects with other relocations are refused or
-reported by name. Checked by `addLinkInputTests` under qemu: upstream
-`zig cc` objects, non-PIC and -fPIC, and the same files as sources
-print what the x86_64 link prints.
+debug sections' ABS32/ABS64 map onto the input-section kinds. Objects
+with other relocations are reported by name. Checked by
+`addLinkInputTests` under qemu: upstream `zig cc` objects, non-PIC and
+-fPIC, and the same files as sources print what the x86_64 link prints.
+
+**aarch64-linux-gnu** (built 2026-11-05): `-lc` with `-target
+aarch64-linux-gnu[.version]` links executables and tests against glibc
+as x86_64-linux-gnu's: abilists' aarch64-linux-gnu symbols (`Glibc.arch`;
+the oldest version is 2.17), the loader `/lib/ld-linux-aarch64.so.1` as
+interpreter and DT_NEEDED soname, bs's start code
+(`Builtin.glibc_start_aarch64`, sysdeps/aarch64/start.S: the
+destructors' function arrives in x0), and libc_nonshared.a built with
+glibc's aarch64 include directories. The Zig code's extern slots to
+imports become R_AARCH64_ABS64 against the symbol, and copies
+R_AARCH64_COPY. C objects' references to imports (`importA64`): ABS64
+stays one; CALL26/JUMP26 go through a stub `adrp x16; ldr x16; br x16`
+of the import's slot; GOT loads read the slot (page21 and pageoff12
+relocations of the `adrp` and `ldr`); PC-relative data references use
+the executable's copy. Shared library inputs (`-l<name>`, `.so`) are
+read for EM_AARCH64 (`ElfShared.parse`'s `arch`). Not yet: imported
+thread-locals, GNU indirect functions, undefined weak names imported
+for preloading, `-lc++`, objects and libraries with `-lc`, and bs's own
+shared libraries. Checked under
+qemu with the aarch64 glibc as sysroot (`qemu-aarch64 -L
+/usr/aarch64-linux-gnu`, libc6-arm64-cross from .agents/setup): libc.zig
+and libc_edit.zig in test/run, the -fPIC C object and source of
+link_input/libc.c, a C-only executable, a shared library that Zig calls
+and a non-PIC object copies data from, and std's tests with `--libc`.
 
 ### Comptime pointers to extern data (built 2026-11-04)
 
@@ -7439,9 +7462,9 @@ libraries as inputs. To be agreed with that thread.
   the cache and lib directories; `-O` is ignored (headers see Debug's
   macros, as the code they go into), `-cflags ... --` too, as upstream.
   Targets: an x86_64-linux host only, since bs builds the translate-c
-  binary with its x86_64 backend; it translates for x86_64-linux and,
-  without `-lc`, for aarch64-linux (`aarch64-linux-none`, the generic
-  CPU), whose output matches upstream's.
+  binary with its x86_64 backend; it translates for x86_64-linux and
+  aarch64-linux (`aarch64-linux-none`, or `aarch64-linux-gnu` with
+  `-lc`; the generic CPU), whose output matches upstream's.
 - **Aro's arguments** are upstream's (`Compilation.translateC`, read from
   the argv upstream's zig passes its translate-c binary) for bs's
   target: `-mcpu` is bs's CPU (the baseline unless `-mcpu` says
@@ -7892,7 +7915,9 @@ and `zig build -Dtarget=aarch64-macos`.
   runs aarch64-linux binaries under qemu's user-mode emulator as a
   Cortex-A53, an ARMv8.0 core like the generic baseline, so instructions
   past it trap; `zig build test` does the same for the run tests that list
-  aarch64-linux, when qemu is on PATH.
+  aarch64-linux, when qemu is on PATH. Binaries linking glibc (`--libc`,
+  run tests with `libc: true`) run with the aarch64 glibc as qemu's
+  sysroot (`-L /usr/aarch64-linux-gnu`), and are not run without it.
 - Each file `behavior.zig` imports is its own unit: one `bs test` compile and
   one run, in parallel with the others, so a compile error, crash, or timeout
   costs only that file. The root is a generated `behavior.zig` wrapper next to

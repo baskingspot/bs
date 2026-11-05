@@ -152,12 +152,10 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         if (opts.link_libc and opts.unsupported == null) main.resolveGlibc(&opts, arena);
     } else {
         main.checkTarget(&opts, arena, io, target);
-        if (opts.bs_target == .aarch64_linux and opts.link_libc)
-            main.setUnsupported(&opts, arena, "bs does not translate C against libc for aarch64-linux yet ('-lc'); build this step with upstream zig", .{});
         // The target's baseline CPU, as its compilations' (`-mcpu` there
         // takes only the baseline).
         if (opts.bs_target == .aarch64_linux) opts.cpu = std.Target.aarch64.cpu.generic.toCpu(.aarch64);
-        if (opts.link_libc and opts.unsupported == null and opts.bs_target == .x86_64_linux) main.resolveGlibc(&opts, arena);
+        if (opts.link_libc and opts.unsupported == null and opts.bs_target != .aarch64_macos) main.resolveGlibc(&opts, arena);
     }
     // As the code bs compiles the headers into: apple_m1, whatever the
     // host (`-mcpu native` included).

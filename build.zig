@@ -237,12 +237,24 @@ fn aarch64LinuxRunner(b: *std.Build) ?[]const []const u8 {
     return b.allocator.dupe([]const u8, &.{ qemu, "-cpu", "cortex-a53" }) catch @panic("OOM");
 }
 
+/// `aarch64LinuxRunner` for executables linking glibc: under qemu, with
+/// the aarch64 glibc that .agents/setup installs (libc6-arm64-cross) as
+/// the emulator's sysroot; null when that is missing too.
+fn aarch64LinuxGlibcRunner(b: *std.Build) ?[]const []const u8 {
+    const runner = aarch64LinuxRunner(b) orelse return null;
+    if (runner.len == 0) return runner;
+    const sysroot = "/usr/aarch64-linux-gnu";
+    std.Io.Dir.cwd().access(b.graph.io, sysroot ++ "/lib/ld-linux-aarch64.so.1", .{}) catch return null;
+    return std.mem.concat(b.allocator, []const u8, &.{ runner, &.{ "-L", sysroot } }) catch @panic("OOM");
+}
+
 fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     const io = b.graph.io;
     const host = b.graph.host.result;
     const host_runs_bs_output = host.cpu.arch == .x86_64 and host.os.tag == .linux;
     const host_runs_macos_output = host.cpu.arch == .aarch64 and host.os.tag == .macos;
     const aarch64_linux_runner = aarch64LinuxRunner(b);
+    const aarch64_linux_glibc_runner = aarch64LinuxGlibcRunner(b);
     // The headers are read here, while configuring.
     b.dependOnDirectoryContents(b.path("test/run"));
     var dir = b.root.openDir(io, "test/run", .{ .iterate = true }) catch |err|
@@ -614,7 +626,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
         }
         if (expect.aarch64_linux) for ([_]bool{ false, true }) |upstream| {
             const rebuild = !upstream and expect.rebuild_without.items.len != 0;
-            if (rebuild and (expect.lib_edit != null or expect.libc)) std.debug.panic("{s}: aarch64-linux rebuilds take neither lib edits nor -lc", .{src_path});
+            if (rebuild and expect.lib_edit != null) std.debug.panic("{s}: aarch64-linux rebuilds take no lib edits", .{src_path});
             const compile = if (rebuild) blk: {
                 // The earlier version, then this one as an edit build
                 // checked against a full build, then a relink that must
@@ -629,7 +641,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                         \\mkdir -p "$out.d"
                         \\cp "$3" "$out.d/rt.zig"
                         \\cp "$1" "$out.d/{[file]s}"
-                        \\bs() {{ "$compiler" build-exe -target aarch64-linux "$out.d/{[file]s}" -femit-bin="$1" 2>"$out.d/log" || {{ cat "$out.d/log" >&2; exit 1; }}; }}
+                        \\bs() {{ "$compiler" build-exe {[target]s} "$out.d/{[file]s}" -femit-bin="$1" 2>"$out.d/log" || {{ cat "$out.d/log" >&2; exit 1; }}; }}
                         \\bs "$out"
                         \\cp "$2" "$out.d/{[file]s}"
                         \\BS_CACHE_VERIFY=1 BS_CACHE_CHECK=1 bs "$out"
@@ -637,7 +649,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                         \\bs "$out"
                         \\BS_CACHE=off bs "$out.d/full"
                         \\cmp "$out" "$out.d/full" >&2
-                    , .{ .file = file }),
+                    , .{ .file = file, .target = if (expect.libc) "-target aarch64-linux-gnu -lc" else "-target aarch64-linux" }),
                     "sh",
                 });
                 r.addFileArg(before);
@@ -651,11 +663,11 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 compile.addArtifactArg(bs);
                 break :blk out;
             } else blk: {
-                compile.addArgs(&.{ "build-exe", "-target", "aarch64-linux" });
+                compile.addArgs(if (expect.libc) &.{ "build-exe", "-target", "aarch64-linux-gnu", "-lc" } else &.{ "build-exe", "-target", "aarch64-linux" });
                 compile.addFileArg(b.path(src_path));
                 break :blk compile.addPrefixedOutputFileArg("-femit-bin=", name);
             };
-            const runner = aarch64_linux_runner orelse {
+            const runner = (if (expect.libc) aarch64_linux_glibc_runner else aarch64_linux_runner) orelse {
                 if (!upstream) test_step.dependOn(&compile.step);
                 continue;
             };
@@ -1560,6 +1572,69 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     src_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&src_run.step);
+    // The same for aarch64-linux-gnu, as an -fPIC object and a source, and
+    // an executable of C only, run under qemu with aarch64 glibc.
+    if (aarch64LinuxGlibcRunner(b)) |runner| {
+        const a64c = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux-gnu", "-fPIC", "-c" });
+        a64c.addFileArg(b.path("test/link_input/libc.c"));
+        const a64_o = a64c.addPrefixedOutputFileArg("-o", "libc.o");
+        for ([_]bool{ false, true }) |source| {
+            const what = if (source) "a C source" else "a C object";
+            const a64_exe = b.addRunArtifact(bs);
+            a64_exe.setName(b.fmt("bs build-exe -lc -target aarch64-linux-gnu with {s}", .{what}));
+            a64_exe.addArgs(&.{ "build-exe", "-lc", "-target", "aarch64-linux-gnu" });
+            a64_exe.addFileArg(b.path("test/link_input/libc_main.zig"));
+            if (source) a64_exe.addFileArg(b.path("test/link_input/libc.c")) else a64_exe.addFileArg(a64_o);
+            a64_exe.setEnvironmentVariable("BS_CACHE", "off");
+            a64_exe.setEnvironmentVariable("BS_ZIG", zig);
+            const a64_run = std.Build.Step.Run.create(b, b.fmt("run bs aarch64-linux -lc link of {s}", .{what}));
+            a64_run.addArgs(runner);
+            a64_run.addFileArg(a64_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            a64_run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
+            a64_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
+            a64_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+            test_step.dependOn(&a64_run.step);
+        }
+        const a64_cexe = b.addRunArtifact(bs);
+        a64_cexe.setName("bs build-exe -lc -target aarch64-linux-gnu with only C sources");
+        a64_cexe.addArgs(&.{ "build-exe", "-lc", "-target", "aarch64-linux-gnu" });
+        a64_cexe.addFileArg(b.path("test/link_input/cmain.c"));
+        a64_cexe.setEnvironmentVariable("BS_ZIG", zig);
+        const a64_cexe_run = std.Build.Step.Run.create(b, "run bs aarch64-linux -lc build of only C sources");
+        a64_cexe_run.addArgs(runner);
+        a64_cexe_run.addFileArg(a64_cexe.addPrefixedOutputFileArg("-femit-bin=", "cmain"));
+        a64_cexe_run.addArg("5");
+        a64_cexe_run.addCheck(.{ .expect_stdout_exact = "argc=2 q=478165905515354922\n" });
+        a64_cexe_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
+        test_step.dependOn(&a64_cexe_run.step);
+        // A shared library upstream built, which Zig calls and whose data
+        // a non-PIC C object copies (R_AARCH64_COPY).
+        const so = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux-gnu", "-shared", "-fPIC" });
+        so.addFileArg(b.path("test/link_input/shared.c"));
+        so.addPrefixedFileArg("-Wl,--version-script=", b.path("test/link_input/shared.map"));
+        so.addArg("-Wl,-soname,libshared.so");
+        const lib_dir = so.addPrefixedOutputFileArg("-o", "libshared.so").dirname();
+        const user = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux-gnu", "-c" });
+        user.addFileArg(b.path("test/link_input/shared_user.c"));
+        const so_exe = b.addRunArtifact(bs);
+        so_exe.setName("bs build-exe -lc -target aarch64-linux-gnu with a shared library");
+        so_exe.addArgs(&.{ "build-exe", "-lc", "-target", "aarch64-linux-gnu", "-lshared" });
+        so_exe.addPrefixedDirectoryArg("-L", lib_dir);
+        so_exe.addFileArg(b.path("test/link_input/shared_main.zig"));
+        so_exe.addFileArg(user.addPrefixedOutputFileArg("-o", "shared_user.o"));
+        so_exe.setEnvironmentVariable("BS_CACHE", "off");
+        // The loader under qemu finds the library through the emulated
+        // program's LD_LIBRARY_PATH (QEMU_SET_ENV); a cross build has no
+        // DT_RUNPATH, as upstream's.
+        const so_run = b.addSystemCommand(&.{ "sh", "-c", "d=$1; shift; LD_LIBRARY_PATH=$d QEMU_SET_ENV=LD_LIBRARY_PATH=$d exec \"$@\"", "sh" });
+        so_run.setName("run bs aarch64-linux link of a shared library");
+        so_run.addDirectoryArg(lib_dir);
+        so_run.addArgs(runner);
+        so_run.addFileArg(so_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        so_run.addCheck(.{ .expect_stderr_exact = "42 143 42 143\n" });
+        so_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&so_run.step);
+    }
     // Thread-locals through TLS descriptors (-mtls-dialect=gnu2), which
     // the link relaxes to local-exec: Clang's, with _TLS_MODULE_BASE_
     // (upstream's own linker cannot link those; LLD's output prints the

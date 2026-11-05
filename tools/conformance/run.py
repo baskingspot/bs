@@ -111,11 +111,13 @@ TARGETS = {
     # ARMv8.0 core like the target's generic baseline, so newer instructions
     # trap. The emulator is whichever of the names is on PATH, as in
     # build.zig: .agents/setup installs qemu-aarch64-static, the Nix shell
-    # qemu-aarch64.
+    # qemu-aarch64. Binaries linking glibc load it from the emulator's
+    # sysroot, which .agents/setup installs (libc6-arm64-cross).
     "aarch64-linux": {
         "zig_target": "aarch64-linux-none",
         "host": ("Linux", "aarch64"),
         "emulated": {("Linux", "x86_64"): (("qemu-aarch64-static", "qemu-aarch64"), ["-cpu", "cortex-a53"])},
+        "emulated_glibc": "/usr/aarch64-linux-gnu",
     },
 }
 
@@ -1052,8 +1054,15 @@ def std_target(compiler, cfg, args, workdir):
     With --libc, linked against glibc: `-lc` and the target's gnu ABI,
     upstream's test-matrix entry for std with libc (`x86_64-linux-gnu`).
     With --c-abi, upstream's test/c_abi instead, linked against glibc."""
+    global exec_prefix
     suite = "c-abi" if args.c_abi else "std"
     gnu = args.libc or args.c_abi
+    if gnu and exec_prefix:
+        sysroot = cfg.get("emulated_glibc")
+        if not sysroot or not Path(sysroot, "lib").is_dir():
+            print(f"{cfg['name']} {suite}: not run (the emulator needs {cfg['name']}'s glibc at {sysroot})")
+            return
+        exec_prefix = exec_prefix + ["-L", sysroot]
     if gnu:
         cfg = dict(cfg, zig_target=cfg["zig_target"].rsplit("-", 1)[0] + "-gnu")
     if args.libc:

@@ -40,7 +40,22 @@ pub const lib_c: u8 = 1;
 pub const lib_ld: u8 = 2;
 
 pub const abilists_path = "libc/glibc/abilists";
-pub const interp = "/lib64/ld-linux-x86-64.so.2";
+
+/// The dynamic loader of `arch`: its path, the executable's interpreter,
+/// and its soname, abilists' library `ld`.
+pub fn interp(arch: Arch) []const u8 {
+    return switch (arch) {
+        .x86_64 => "/lib64/ld-linux-x86-64.so.2",
+        .aarch64 => "/lib/ld-linux-aarch64.so.1",
+    };
+}
+
+fn soname(arch: Arch, lib: u8) []const u8 {
+    if (lib == lib_ld) return std.fs.path.basename(interp(arch));
+    return libs[lib].soname;
+}
+
+pub const Arch = @import("Atom.zig").Unwind.Arch;
 
 /// The names glibc gives the data object `name` names, at one address, or
 /// none. abilists does not say which names share one, so an executable
@@ -76,6 +91,7 @@ pub const Symbol = struct {
 };
 
 arena: std.heap.ArenaAllocator,
+arch: Arch = .x86_64,
 versions: []const Version,
 symbols: std.StringHashMapUnmanaged(Symbol),
 
@@ -86,9 +102,9 @@ pub fn newest(g: *const Glibc) Version {
     return g.versions[g.versions.len - 1];
 }
 
-/// Reads `contents` (abilists) for x86_64-linux-gnu at glibc `target`.
-pub fn load(gpa: Allocator, contents: []const u8, target: Version) Error!Glibc {
-    var g: Glibc = .{ .arena = .init(gpa), .versions = &.{}, .symbols = .empty };
+/// Reads `contents` (abilists) for `<arch>-linux-gnu` at glibc `target`.
+pub fn load(gpa: Allocator, contents: []const u8, target: Version, arch: Arch) Error!Glibc {
+    var g: Glibc = .{ .arena = .init(gpa), .arch = arch, .versions = &.{}, .symbols = .empty };
     errdefer g.arena.deinit();
     const arena = g.arena.allocator();
     var r: Reader = .{ .bytes = contents };
@@ -114,7 +130,10 @@ pub fn load(gpa: Allocator, contents: []const u8, target: Version) Error!Glibc {
     const n_targets = try r.byte();
     var target_index: ?u6 = null;
     for (0..n_targets) |i| {
-        if (std.mem.eql(u8, try r.string(), "x86_64-linux-gnu")) target_index = @intCast(i);
+        if (std.mem.eql(u8, try r.string(), switch (arch) {
+            .x86_64 => "x86_64-linux-gnu",
+            .aarch64 => "aarch64-linux-gnu",
+        })) target_index = @intCast(i);
     }
     const ti = target_index orelse return error.InvalidAbilists;
 
@@ -254,9 +273,9 @@ fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copie
     var lib_index: [libs.len]u32 = undefined;
     for (0..2) |pass| {
         if ((pass == 0) == glibc_first) {
-            for (libs, used, &lib_index) |lib, u, *index| if (u) {
+            for (used, &lib_index, 0..) |u, *index, i| if (u) {
                 index.* = @intCast(needed.items.len);
-                try needed.append(arena, lib.soname);
+                try needed.append(arena, soname(g.arch, @intCast(i)));
             };
         } else for (shared, alive, shared_index) |lib, a, *index| if (a) {
             index.* = @intCast(needed.items.len);
@@ -307,7 +326,7 @@ fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copie
             } else false) try exports.append(arena, x);
         }
     }
-    return .{ .exports = exports.items, .imports = imports, .interp = if (executable) interp else null, .needed = needed.items };
+    return .{ .exports = exports.items, .imports = imports, .interp = if (executable) interp(g.arch) else null, .needed = needed.items };
 }
 
 /// The first of `shared` that defines `name`, as the link resolves it.
@@ -375,16 +394,16 @@ test load {
 
     // As upstream's stubs bind them (readelf -V of `zig build-exe -lc
     // -target x86_64-linux-gnu.<v>`).
-    var g231 = try load(gpa, contents, .{ .major = 2, .minor = 31, .patch = 0 });
+    var g231 = try load(gpa, contents, .{ .major = 2, .minor = 31, .patch = 0 }, .x86_64);
     defer g231.deinit();
-    var g236 = try load(gpa, contents, .{ .major = 2, .minor = 36, .patch = 0 });
+    var g236 = try load(gpa, contents, .{ .major = 2, .minor = 36, .patch = 0 }, .x86_64);
     defer g236.deinit();
     var buf: [1024]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buf);
     const expect = struct {
         fn f(g: *const Glibc, a: Allocator, name: []const u8, lib: []const u8, version: []const u8) !void {
             const s = g.get(name) orelse return error.TestUnexpectedResult;
-            try std.testing.expectEqualStrings(lib, libs[s.lib].soname);
+            try std.testing.expectEqualStrings(lib, soname(g.arch, s.lib));
             try std.testing.expectEqualStrings(version, try g.versionName(a, s.version));
         }
     }.f;
@@ -405,11 +424,18 @@ test load {
     try std.testing.expect(g231.get("pthread_attr_setsigmask_np") == null);
     try std.testing.expect(g236.get("pthread_attr_setsigmask_np") != null);
     // Newer than abilists' newest: that one, as upstream.
-    var g99 = try load(gpa, contents, .{ .major = 2, .minor = 99, .patch = 0 });
+    var g99 = try load(gpa, contents, .{ .major = 2, .minor = 99, .patch = 0 }, .x86_64);
     defer g99.deinit();
     try std.testing.expect(g99.newest().order(.{ .major = 2, .minor = 99, .patch = 0 }) == .lt);
     try expect(&g99, fba.allocator(), "__libc_start_main", "libc.so.6", "GLIBC_2.34");
-    try std.testing.expectError(error.UnsupportedVersion, load(gpa, contents, .{ .major = 2, .minor = 0, .patch = 5 }));
+    try std.testing.expectError(error.UnsupportedVersion, load(gpa, contents, .{ .major = 2, .minor = 0, .patch = 5 }, .x86_64));
+    // aarch64's start at 2.17 (readelf -V of `zig build-exe -lc -target
+    // aarch64-linux-gnu`), and its loader is ld-linux-aarch64.so.1.
+    var a231 = try load(gpa, contents, .{ .major = 2, .minor = 31, .patch = 0 }, .aarch64);
+    defer a231.deinit();
+    try expect(&a231, fba.allocator(), "__libc_start_main", "libc.so.6", "GLIBC_2.17");
+    try expect(&a231, fba.allocator(), "getrandom", "libc.so.6", "GLIBC_2.25");
+    try expect(&a231, fba.allocator(), "__tls_get_addr", "ld-linux-aarch64.so.1", "GLIBC_2.17");
 
     // A live library's strong imports keep glibc's libraries needed too,
     // as upstream's: its `__tls_get_addr` needs ld-linux-x86-64.so.2, a

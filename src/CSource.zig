@@ -1072,7 +1072,7 @@ const unwind_files = [_][]const u8{
 };
 
 /// glibc's libc_nonshared.a, as upstream's `src/libs/glibc.zig` builds it
-/// for x86_64-linux-gnu: the functions glibc's libc.so leaves to every
+/// for x86_64-linux-gnu and aarch64-linux-gnu: the functions glibc's libc.so leaves to every
 /// executable (`atexit` calls `__cxa_atexit` with its `__dso_handle`).
 /// Upstream builds and links it with every glibc executable; bs only
 /// with C inputs, since Zig code references none of its functions.
@@ -1102,32 +1102,35 @@ fn nonsharedJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), comm
     const g = try join(arena, &.{ lib, "libc", "glibc" });
     const sd = try join(arena, &.{ g, "sysdeps" });
     const linux = try join(arena, &.{ sd, "unix", "sysv", "linux" });
-    // `add_include_dirs` for x86_64-linux-gnu.
+    // `add_include_dirs` for x86_64-linux-gnu and aarch64-linux-gnu: the
+    // architecture's directories, then x86's for x86_64.
+    const a64 = o.cpu.arch == .aarch64;
+    const arch: []const u8 = if (a64) "aarch64" else "x86_64";
     var includes: std.ArrayList([]const u8) = .empty;
     for ([_][]const u8{
         try join(arena, &.{ g, "include" }),
-        try join(arena, &.{ linux, "x86_64" }),
-        try join(arena, &.{ linux, "x86" }),
-        try join(arena, &.{ sd, "x86_64", "nptl" }),
-        try join(arena, &.{ sd, "x86", "nptl" }),
+        try join(arena, &.{ linux, arch }),
+        if (a64) "" else try join(arena, &.{ linux, "x86" }),
+        try join(arena, &.{ sd, arch, "nptl" }),
+        if (a64) "" else try join(arena, &.{ sd, "x86", "nptl" }),
         try join(arena, &.{ linux, "generic" }),
         try join(arena, &.{ linux, "include" }),
         linux,
         try join(arena, &.{ sd, "nptl" }),
         try join(arena, &.{ sd, "pthread" }),
         try join(arena, &.{ sd, "unix", "sysv" }),
-        try join(arena, &.{ sd, "unix", "x86_64" }),
-        try join(arena, &.{ sd, "unix", "x86" }),
+        try join(arena, &.{ sd, "unix", arch }),
+        if (a64) "" else try join(arena, &.{ sd, "unix", "x86" }),
         try join(arena, &.{ sd, "unix" }),
-        try join(arena, &.{ sd, "x86_64" }),
-        try join(arena, &.{ sd, "x86" }),
+        try join(arena, &.{ sd, arch }),
+        if (a64) "" else try join(arena, &.{ sd, "x86" }),
         try join(arena, &.{ sd, "generic" }),
         g,
-        try join(arena, &.{ lib, "libc", "include", "x86_64-linux-gnu" }),
+        try join(arena, &.{ lib, "libc", "include", if (a64) "aarch64-linux-gnu" else "x86_64-linux-gnu" }),
         try join(arena, &.{ lib, "libc", "include", "generic-glibc" }),
-        try join(arena, &.{ lib, "libc", "include", "x86_64-linux-any" }),
+        try join(arena, &.{ lib, "libc", "include", if (a64) "aarch64-linux-any" else "x86_64-linux-any" }),
         try join(arena, &.{ lib, "libc", "include", "any-linux-any" }),
-    }) |d| try includes.appendSlice(arena, &.{ "-I", d });
+    }) |d| if (d.len != 0) try includes.appendSlice(arena, &.{ "-I", d });
     for ([3][]const []const u8{ nonshared_lib.files, if (old_stat) &nonshared_stat_files else &.{}, if (old_init) &.{"csu/elf-init-2.33.c"} else &.{} }) |files| for (files) |file| {
         var argv: std.ArrayList([]const u8) = .empty;
         const dep_at = try appendArgs(arena, &argv, common, try join(arena, &.{ g, file }), .{
