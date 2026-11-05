@@ -1937,8 +1937,10 @@ fn LinkOf(comptime Input: type) type {
                 };
                 c.sizes[s] = off + a.size();
                 c.aligns[s] = c.aligns[s].max(a.alignment);
-                c.n_syms += 1;
-                if (a.name.len > 0) c.str_len += @intCast(a.name.len + 1);
+                if (listed(a)) {
+                    c.n_syms += 1;
+                    c.str_len += @intCast(a.name.len + 1);
+                }
                 c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
                 c.n_long_fdes += @intFromBool(a.unwind.epilogue > 1);
                 if (dynamic) {
@@ -2294,13 +2296,11 @@ fn LinkOf(comptime Input: type) type {
                         rela_at += @sizeOf(elf.Elf64.Rela);
                     };
                 }
-                var name: u32 = 0;
-                if (a.name.len > 0) {
-                    name = c.str + @as(u32, @intCast(str_off));
-                    @memcpy(out[strtab][str_off..][0..a.name.len], a.name);
-                    out[strtab][str_off + a.name.len] = 0;
-                    str_off += a.name.len + 1;
-                }
+                if (!listed(a)) continue;
+                const name = c.str + @as(u32, @intCast(str_off));
+                @memcpy(out[strtab][str_off..][0..a.name.len], a.name);
+                out[strtab][str_off + a.name.len] = 0;
+                str_off += a.name.len + 1;
                 writeStruct(out[symtab][sym_off..], elf.Elf64.Sym{
                     .name = name,
                     // Local, as upstream writes them: names can repeat
@@ -2623,6 +2623,13 @@ fn symType(kind: Atom.Reloc.Kind) ?elf.R_X86_64 {
     };
 }
 
+/// Whether atom `a` has a symbol-table entry: not if it has no name or a
+/// section's (`.data`), as `ElfInput` names a C object's section that no
+/// one symbol covers, whose symbols it lists instead (`local_symbols`).
+fn listed(a: *const Atom) bool {
+    return a.name.len > 0 and a.name[0] != '.';
+}
+
 fn hasAbs(a: *const Atom) bool {
     for (a.relocs) |r| if (r.info.kind == .x86_64_abs64 or r.info.kind == .x86_64_abs64_sym) return true;
     return false;
@@ -2869,6 +2876,23 @@ test "links and runs a program that writes from rodata and exits with 42" {
     try std.testing.expectEqualSlices(u8, bytes[text_sh.offset..][0..text_sh.size], local_bytes[text_sh.offset..][0..text_sh.size]);
     with_locals.local_symbols = &.{.{ .name = "past_end", .atom = status, .offset = 5, .size = 0 }};
     try std.testing.expectError(error.InvalidSymbols, emit(gpa, io, &atoms, with_locals));
+
+    // An atom named after its C section, or not at all, has no symbol of
+    // its own; the symbols within it do.
+    const sect: SymbolKey = .fromName("sect");
+    const unnamed = atoms ++ [_]Atom{
+        .{ .key = sect, .name = ".data", .section = .data, .bytes = "abcdefgh" },
+        .{ .key = .fromName("anon"), .name = "", .section = .rodata, .bytes = "z" },
+    };
+    with_locals.local_symbols = &.{.{ .name = "in_sect", .atom = sect, .offset = 4, .size = 4 }};
+    const unnamed_bytes = try emit(gpa, io, &unnamed, with_locals);
+    defer gpa.free(unnamed_bytes);
+    try std.testing.expectEqual(null, testSymbolAddr(unnamed_bytes, ".data"));
+    const symtab = testSection(unnamed_bytes, ".symtab").?;
+    // The null symbol, the five distinct named atoms, and `in_sect`.
+    try std.testing.expectEqual(7 * @sizeOf(elf.Elf64.Sym), symtab.size);
+    const in_sect = testSymbolAddr(unnamed_bytes, "in_sect").?;
+    try std.testing.expectEqualStrings("efgh", unnamed_bytes[in_sect - testSectionAddr(unnamed_bytes, ".data") + testSection(unnamed_bytes, ".data").?.offset ..][0..4]);
 }
 
 test "a shared object links the same with numbered symbols" {

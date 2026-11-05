@@ -468,7 +468,10 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
         while (s > o.first_global) {
             s -= 1;
             const sym = o.syms[s];
-            if (sym.st_value == 0 and sym.st_shndx != elf.SHN_UNDEF and sym.st_shndx < o.shdrs.len) c.names[sym.st_shndx] = @intCast(s);
+            // A global names its section's atom when it covers the whole
+            // section, so that the atom's symbol has the symbol's size.
+            if (sym.st_value == 0 and sym.st_shndx != elf.SHN_UNDEF and sym.st_shndx < o.shdrs.len and
+                sym.st_size == o.shdrs[sym.st_shndx].sh_size) c.names[sym.st_shndx] = @intCast(s);
         }
         c.whole = try arena.realloc(c.whole, o.shdrs.len);
         @memset(c.whole, false);

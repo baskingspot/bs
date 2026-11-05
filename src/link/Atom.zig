@@ -17,7 +17,8 @@ key: SymbolKey,
 /// "array_list.Aligned(u8,null).append", with `__func_` and a hash for a
 /// generic function's instance); names may repeat, as upstream's do. The
 /// key, not the name, is the atom's identity. Content-addressed atoms may
-/// use any name.
+/// use any name. An empty name, or one starting with `.` (a C object's
+/// section, named for diagnostics), writes no symbol.
 name: []const u8,
 section: Section,
 alignment: std.mem.Alignment = .@"1",

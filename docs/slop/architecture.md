@@ -3190,8 +3190,12 @@ calls its static functions with no relocation, so a section cannot be
 split, and it is the unit. Upstream's Debug C flags include
 `-fno-function-sections -fno-data-sections` (checked with
 `--verbose-cc`), so an object's `.text` is one atom holding all of the
-translation unit's functions. The atom is named after the section's
-first global symbol, else after the section. Every function and object
+translation unit's functions. The atom is named after a global symbol
+at its start that covers the whole section, else after the section; an
+atom named after its section, or with no name, has no .symtab entry of
+its own (2026-11-04: `.text` and `.data` entries overlapped the
+functions and objects, and a `.data` named after its first object had
+the section's size). Every function and object
 symbol of the input still gets its own entry in the output's .symtab,
 which debuggers and profilers read: through a side list in
 `Elf.Options` (name, atom key, offset, size, type), not through `Atom`,
@@ -3615,10 +3619,10 @@ differs from the design above:
   upstream, a static executable's std.start runs the init array and
   nothing runs the fini array; with `-lc`, ld.so runs both. `.ctors` and
   `.dtors` are an error.
-- .symtab: each input function, object and thread-local symbol gets an
-  entry (`Elf.Options.local_symbols`: name, atom key, offset, size; type
-  and section from the atom's place), except the one that names its
-  atom. Keyed links only; a numbered link rejects them until the cache
+- .symtab: each input function, object, thread-local and assembly
+  label (STT_NOTYPE, without `.L` labels) gets an entry
+  (`Elf.Options.local_symbols`: name, atom key, offset, size; type and
+  section from the atom's place), except the one that names its atom. Keyed links only; a numbered link rejects them until the cache
   relinks inputs.
 - `-l<name>`/`-L<dir>` find `lib<name>.so` or `lib<name>.a` in the `-L`
   directories (and the native ones; see stage C above) by upstream's
