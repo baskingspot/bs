@@ -2601,6 +2601,7 @@ test {
     _ = @import("codegen/rewrite.zig");
     _ = @import("codegen/prove.zig");
     _ = @import("InternPool.zig");
+    _ = @import("link/MachOObject.zig");
     _ = Zcu;
     _ = @import("Sema.zig");
     _ = @import("diag.zig");

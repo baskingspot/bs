@@ -84,6 +84,133 @@ pub fn write(gpa: Allocator, io: Io, dir: Io.Dir, ar_path: []const u8, members: 
     try atomic.replace(io);
 }
 
+/// Writes a Darwin archive of arm64 Mach-O `members`, in order, to
+/// `ar_path`, as upstream's `zig build-lib` writes one for aarch64-macos
+/// (`src/link/MachO/relocatable.zig`): a `__.SYMDEF` index of 32-bit
+/// (name offset, member offset) pairs over the members' defined external
+/// symbols, sorted by name offset, then the members, each named with BSD
+/// `#1/<n>` and its name padded so that its contents start 8-aligned.
+pub fn writeDarwin(gpa: Allocator, io: Io, dir: Io.Dir, ar_path: []const u8, members: []const Input) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The index's strings and, per symbol, its member.
+    var strings: std.ArrayList(u8) = .empty;
+    const Entry = struct { off: u32, member: u32 };
+    var entries: std.ArrayList(Entry) = .empty;
+    for (members, 0..) |m, i| {
+        var it = try machoDefined(m.bytes);
+        while (try it.next()) |name| {
+            try entries.append(arena, .{ .off = @intCast(strings.items.len), .member = @intCast(i) });
+            try strings.appendSlice(arena, name);
+            try strings.append(arena, 0);
+        }
+    }
+    while (strings.items.len % 4 != 0) try strings.append(arena, 0);
+    const symdef_size = 4 + 8 * entries.items.len + 4 + strings.items.len;
+    // Member offsets, after the index.
+    var pos: u64 = 8 + darwinMemberSize("__.SYMDEF", 8, symdef_size);
+    const member_off = try arena.alloc(u32, members.len);
+    for (members, member_off) |m, *o| {
+        pos = std.mem.alignForward(u64, pos, 2);
+        o.* = @intCast(pos);
+        pos += darwinMemberSize(m.name, pos, m.bytes.len);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, "!<arch>\n");
+    try darwinHeader(arena, &out, "__.SYMDEF", symdef_size);
+    try appendU32(arena, &out, @intCast(8 * entries.items.len));
+    for (entries.items) |e| {
+        try appendU32(arena, &out, e.off);
+        try appendU32(arena, &out, member_off[e.member]);
+    }
+    try appendU32(arena, &out, @intCast(strings.items.len));
+    try out.appendSlice(arena, strings.items);
+    for (members, member_off) |m, o| {
+        while (out.items.len < o) try out.append(arena, 0);
+        try darwinHeader(arena, &out, m.name, m.bytes.len);
+        try out.appendSlice(arena, m.bytes);
+    }
+    var atomic = try dir.createFileAtomic(io, ar_path, .{ .replace = true });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, out.items);
+    try atomic.replace(io);
+}
+
+/// The bytes of a Darwin member at offset `at`: its header, its name,
+/// NUL-padded so that the contents start 8-aligned, and the contents.
+fn darwinMemberSize(name: []const u8, at: u64, size: u64) u64 {
+    const name_start = at + 60;
+    const contents = std.mem.alignForward(u64, name_start + name.len + 1, 8);
+    return contents - at + size;
+}
+
+fn darwinHeader(gpa: Allocator, out: *std.ArrayList(u8), name: []const u8, size: u64) !void {
+    const name_start = out.items.len + 60;
+    const name_len = std.mem.alignForward(u64, name_start + name.len + 1, 8) - name_start;
+    var buf: [16]u8 = undefined;
+    const field = try std.fmt.bufPrint(&buf, "#1/{d}", .{name_len});
+    try out.print(gpa, "{s: <16}{s: <12}{s: <6}{s: <6}{s: <8}{d: <10}`\n", .{ field, "0", "0", "0", "0", size + name_len });
+    try out.appendSlice(gpa, name);
+    try out.appendNTimes(gpa, 0, name_len - name.len);
+}
+
+fn appendU32(gpa: Allocator, out: *std.ArrayList(u8), v: u32) !void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    try out.appendSlice(gpa, &b);
+}
+
+/// The names of a Mach-O object's defined external symbols that other
+/// objects can bind to (not private externals), as the index lists them.
+const MachODefined = struct {
+    obj: []const u8,
+    syms: u64 = 0,
+    n: u32 = 0,
+    strs: u64 = 0,
+    strsize: u32 = 0,
+    i: u32 = 0,
+
+    fn next(it: *MachODefined) !?[]const u8 {
+        while (it.i < it.n) {
+            const at = it.syms + @as(u64, it.i) * 16;
+            it.i += 1;
+            if (at + 16 > it.obj.len) return error.InvalidObject;
+            const strx = std.mem.readInt(u32, it.obj[at..][0..4], .little);
+            const n_type = it.obj[at + 4];
+            // N_EXT, not N_PEXT or a stab, and N_SECT.
+            if (n_type & 0xe0 != 0 or n_type & 0x01 == 0 or n_type & 0x10 != 0 or n_type & 0x0e != 0x0e) continue;
+            if (strx >= it.strsize or it.strs + it.strsize > it.obj.len) return error.InvalidObject;
+            return std.mem.sliceTo(it.obj[it.strs + strx .. it.strs + it.strsize], 0);
+        }
+        return null;
+    }
+};
+
+fn machoDefined(obj: []const u8) !MachODefined {
+    if (obj.len < 32 or std.mem.readInt(u32, obj[0..4], .little) != 0xfeedfacf) return error.InvalidObject;
+    const ncmds = std.mem.readInt(u32, obj[16..20], .little);
+    var at: u64 = 32;
+    for (0..ncmds) |_| {
+        if (at + 8 > obj.len) return error.InvalidObject;
+        const cmd = std.mem.readInt(u32, obj[at..][0..4], .little);
+        const size = std.mem.readInt(u32, obj[at + 4 ..][0..4], .little);
+        if (cmd == 0x2) {
+            if (at + 24 > obj.len) return error.InvalidObject;
+            return .{
+                .obj = obj,
+                .syms = std.mem.readInt(u32, obj[at + 8 ..][0..4], .little),
+                .n = std.mem.readInt(u32, obj[at + 12 ..][0..4], .little),
+                .strs = std.mem.readInt(u32, obj[at + 16 ..][0..4], .little),
+                .strsize = std.mem.readInt(u32, obj[at + 20 ..][0..4], .little),
+            };
+        }
+        if (size == 0) return error.InvalidObject;
+        at += size;
+    }
+    return .{ .obj = obj };
+}
+
 /// A member header: name, mtime, uid, gid, mode, size, all space-padded.
 fn header(gpa: Allocator, out: *std.ArrayList(u8), name: []const u8, size: u64) !void {
     try out.print(gpa, "{s: <16}{s: <12}{s: <6}{s: <6}{s: <8}{d: <10}`\n", .{ name, "0", "0", "0", "0", size });

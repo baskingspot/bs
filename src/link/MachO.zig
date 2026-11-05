@@ -1067,7 +1067,7 @@ const UnwindPage = struct { count: u32, off: u64, first: u32 };
 /// unwind defines them. The others have none (0), so unwinders fall back
 /// to the frame chain; dyld calls `main`, so no frame of the executable's
 /// is the outermost one.
-fn unwindEncoding(u: Atom.Unwind) u32 {
+pub fn unwindEncoding(u: Atom.Unwind) u32 {
     return switch (u.kind) {
         .frame_pointer => 0x0400_0000 | @as(u32, u.saved & Atom.Unwind.savedBits(.aarch64)),
         .none, .outermost => 0,
