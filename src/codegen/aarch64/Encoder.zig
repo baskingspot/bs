@@ -622,6 +622,21 @@ pub fn stlr(e: *Encoder, size: Size, src: Reg, base: Reg) !void {
     e.word(0x089ffc00 | (@as(u32, @backingInt(size)) << 30) | (base.spEnc() << 5) | src.zrEnc());
 }
 
+/// `ldaxr{b,h}`: a load-acquire exclusive of `size` bytes from `[base]`,
+/// zero-extended (ARMv8.0).
+pub fn ldaxr(e: *Encoder, size: Size, dst: Reg, base: Reg) !void {
+    try e.reserve();
+    e.word(0x085ffc00 | (@as(u32, @backingInt(size)) << 30) | (base.spEnc() << 5) | dst.zrEnc());
+}
+
+/// `stlxr{b,h}`: a store-release exclusive of the low `size` bytes of
+/// `src` to `[base]`; `status` gets 0 if it stored, 1 if not.
+pub fn stlxr(e: *Encoder, size: Size, status: Reg, src: Reg, base: Reg) !void {
+    assert(status != src and status != base);
+    try e.reserve();
+    e.word(0x0800fc00 | (@as(u32, @backingInt(size)) << 30) | (status.zrEnc() << 16) | (base.spEnc() << 5) | src.zrEnc());
+}
+
 /// `cas{a}{l}{b,h}`: compares `size` bytes at `[base]` with `expected`
 /// and, if equal, stores `new`. `expected` receives the old value either
 /// way (LSE, ARMv8.1, which every Apple Silicon core has).

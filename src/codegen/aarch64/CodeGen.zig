@@ -1505,7 +1505,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             // cas zero-extends the value it loads: compare at its width.
             if (bytes < 8) try cg.e.uxt(size, .x9, .x9);
             try cg.e.mov(.x, .x11, .x9);
-            try cg.e.cas(size, .acq_rel, .x9, .x10, .x12);
+            try cg.atomicCas(size, .x9, .x10, .x12);
             try cg.e.cmp(.x, .x9, .r(.x11));
             const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
             if (Type.optionalReprIsPtr(ip, elem_ty)) {
@@ -2288,24 +2288,24 @@ fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             if (ty == .bool_type) try e.logic(.@"and", .x, .x11, .x11, .{ .imm = 1 });
         }
         try e.mov(.x, .x13, .x9);
-        try e.cas(size, .acq_rel, .x9, .x11, .x12);
+        try cg.atomicCas(size, .x9, .x11, .x12);
         try e.cmp(if (bytes == 8) .x else .w, .x9, .r(.x13));
         try e.bcond(.ne, top);
     } else switch (x.operation()) {
-        .Xchg => try e.atomic(.swp, size, .acq_rel, .x10, .x9, .x12),
-        .Add => try e.atomic(.add, size, .acq_rel, .x10, .x9, .x12),
+        .Xchg => try cg.atomicOp(.swp, size, .x10, .x9, .x12),
+        .Add => try cg.atomicOp(.add, size, .x10, .x9, .x12),
         .Sub => {
             try e.addSub(.sub, .x, .x10, .zr, .r(.x10));
-            try e.atomic(.add, size, .acq_rel, .x10, .x9, .x12);
+            try cg.atomicOp(.add, size, .x10, .x9, .x12);
         },
         .And => {
             try e.mvn(.x, .x10, .x10);
-            try e.atomic(.clr, size, .acq_rel, .x10, .x9, .x12);
+            try cg.atomicOp(.clr, size, .x10, .x9, .x12);
         },
-        .Or => try e.atomic(.set, size, .acq_rel, .x10, .x9, .x12),
-        .Xor => try e.atomic(.eor, size, .acq_rel, .x10, .x9, .x12),
-        .Max => try e.atomic(if (is_signed) .smax else .umax, size, .acq_rel, .x10, .x9, .x12),
-        .Min => try e.atomic(if (is_signed) .smin else .umin, size, .acq_rel, .x10, .x9, .x12),
+        .Or => try cg.atomicOp(.set, size, .x10, .x9, .x12),
+        .Xor => try cg.atomicOp(.eor, size, .x10, .x9, .x12),
+        .Max => try cg.atomicOp(if (is_signed) .smax else .umax, size, .x10, .x9, .x12),
+        .Min => try cg.atomicOp(if (is_signed) .smin else .umin, size, .x10, .x9, .x12),
         .Nand => unreachable,
     }
     try cg.setResult(inst, ty, .x9);
@@ -2433,6 +2433,72 @@ fn atomicRmw16(cg: *CodeGen, inst: Inst.Index, ty: Index, x: Ir.AtomicRmw) Error
     try e.bcond(.ne, top);
     const dst = try cg.resultMem(inst, ty) orelse return;
     try cg.storePair16(dst, .x10, .x11);
+}
+
+/// Whether the CPU has the ARMv8.1 atomics (LSE). aarch64-linux's
+/// baseline, ARMv8.0, does not: its atomics are exclusive load and
+/// store loops, as upstream's LLVM backend emits for it.
+fn hasLse(cg: *const CodeGen) bool {
+    return cg.emit.zcu.cpu.has(.aarch64, .lse);
+}
+
+/// `cas` acquire-release: compares the `size` bytes at `[base]` with
+/// `expected`, zero-extended, stores `new` if they are equal, and leaves
+/// the old value in `expected`. Without LSE, a loop that uses x14 and x17.
+fn atomicCas(cg: *CodeGen, size: Size, expected: Reg, new: Reg, base: Reg) Error!void {
+    const e = &cg.e;
+    if (cg.hasLse()) return e.cas(size, .acq_rel, expected, new, base);
+    const width: Encoder.Width = if (size == .dword) .x else .w;
+    const top = try e.newLabel();
+    const done = try e.newLabel();
+    try e.mov(.x, .x14, expected);
+    e.bind(top);
+    try e.ldaxr(size, expected, base);
+    try e.cmp(width, expected, .r(.x14));
+    try e.bcond(.ne, done);
+    try e.stlxr(size, .x17, new, base);
+    try e.cbz(true, .w, .x17, top);
+    e.bind(done);
+}
+
+/// The LSE read-modify-write `op` acquire-release (`Encoder.atomic`):
+/// `dst` gets the old `size` bytes at `[base]`, zero-extended, and memory
+/// gets `old op src`, where `src` is extended as its type loads. Without
+/// LSE, a loop that uses x11, x13, and x17.
+fn atomicOp(cg: *CodeGen, op: Encoder.AtomicOp, size: Size, src: Reg, dst: Reg, base: Reg) Error!void {
+    const e = &cg.e;
+    if (cg.hasLse()) return e.atomic(op, size, .acq_rel, src, dst, base);
+    assert(dst != .x11 and dst != .x13 and src != .x11 and src != .x13);
+    const width: Encoder.Width = if (size == .dword) .x else .w;
+    const top = try e.newLabel();
+    e.bind(top);
+    try e.ldaxr(size, dst, base);
+    switch (op) {
+        .swp => try e.mov(.x, .x11, src),
+        .add => try e.addSub(.add, .x, .x11, dst, .r(src)),
+        .clr => try e.logic(.bic, .x, .x11, dst, .r(src)),
+        .eor => try e.logic(.eor, .x, .x11, dst, .r(src)),
+        .set => try e.logic(.orr, .x, .x11, dst, .r(src)),
+        .smax, .smin, .umax, .umin => {
+            const is_signed = op == .smax or op == .smin;
+            // The old value is zero-extended and `src` sign-extended: a
+            // signed byte or halfword compares sign-extended.
+            if (is_signed and (size == .byte or size == .half)) {
+                try e.sxt(size, .x, .x13, dst);
+                try e.cmp(.x, .x13, .r(src));
+            } else try e.cmp(width, dst, .r(src));
+            const keep_old: Cond = switch (op) {
+                .smax => .gt,
+                .smin => .lt,
+                .umax => .hi,
+                .umin => .lo,
+                else => unreachable,
+            };
+            try e.csel(.csel, .x, .x11, dst, src, keep_old);
+        },
+    }
+    try e.stlxr(size, .x17, .x11, base);
+    try e.cbz(true, .w, .x17, top);
 }
 
 fn ret(cg: *CodeGen, operand: Ref) Error!void {
@@ -3390,9 +3456,20 @@ fn isFloat(cg: *CodeGen, ty: Index) bool {
 }
 
 /// The scalar register type of f16, f32, and f64; other floats go through
-/// compiler_rt.
+/// compiler_rt, and so does f16 on a CPU without half-precision
+/// arithmetic (FEAT_FP16, which aarch64-linux's baseline lacks).
 fn fpType(cg: *CodeGen, ty: Index) ?Float {
     return switch (Type.floatBits(cg.ip, ty)) {
+        16 => if (cg.emit.zcu.cpu.has(.aarch64, .fullfp16)) .f16 else null,
+        32 => .f32,
+        64 => .f64,
+        else => null,
+    };
+}
+
+/// The register type `fcvt` converts floats of `bits` bits to and from.
+fn cvtType(bits: u16) ?Float {
+    return switch (bits) {
         16 => .f16,
         32 => .f32,
         64 => .f64,
@@ -3413,7 +3490,9 @@ fn loadFp(cg: *CodeGen, v: VReg, val: Val) Error!void {
     };
     if (val.loc == .mem) return cg.e.ldrFp(ft, v, try cg.access(val.loc.mem, @intCast(size), .x16));
     try cg.loadVal(.x9, val);
-    try cg.e.fmovFromGpr(ft, v, if (size == 8) .x else .w, .x9);
+    // `fmov h, w` needs FEAT_FP16; `fmov s, w` sets the h register too.
+    const via: Float = if (ft == .f16 and cg.fpType(val.ty) == null) .f32 else ft;
+    try cg.e.fmovFromGpr(via, v, if (size == 8) .x else .w, .x9);
 }
 
 /// Stores the low `size` bytes of `v`. Uses x16.
@@ -3675,9 +3754,10 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
             const from = Type.floatBits(ip, src_ty);
             const to = Type.floatBits(ip, ty);
             if (from == to) return cg.copyTo(dst, data.ty_op.operand);
-            if (cg.fpType(ty) != null and cg.fpType(src_ty) != null) {
+            // fcvt converts halves without FEAT_FP16.
+            if (cvtType(to) != null and cvtType(from) != null) {
                 try cg.loadFp(.v0, operand);
-                try e.fcvt(cg.fpType(ty).?, .v0, cg.fpType(src_ty).?, .v0);
+                try e.fcvt(cvtType(to).?, .v0, cvtType(from).?, .v0);
                 return cg.storeFp(dst, .v0, Type.abiSize(ip, ty));
             }
             const widen = to > from;
