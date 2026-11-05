@@ -4981,6 +4981,28 @@ or objects into its output, and `-lc++`.
 - Consequence: bs binaries contain only the compiler_rt symbols they use.
   Code that calls compiler_rt or `memcpy` by name gets them through the same
   lazy reference, so it still links.
+- x86_64's runtime-length `@memcpy` dispatch is about 120 bytes at each
+  site (1335 in std's test binary), most of the copy lowering's .text growth
+  (std's test binary +305 KB, +1.4%; the zig workload +363 KB, +0.8%).
+  An out-of-line routine, one content-addressed .text atom per output
+  that each site calls (rsi, rdi, rcx in; rax and xmm0 clobbered; no
+  frame), was measured and parked. Runtime copies through it, known
+  sizes inline: std +151 KB, zig +93 KB. Everything from 257 bytes
+  through it, with a 64-byte loop up to 1 KB for runtime lengths too:
+  std +17 KB, zig +16 KB. Ir without capture tied (zigsema −3.44%
+  inline, −3.46% and −3.37%; zls within 0.05 points) and wall was within
+  noise; the routine cost known-size copies 1–2 ns (257 bytes 2.9 →
+  5.1 ns) and tiny runtime ones 0.2–0.6 ns, and saved runtime copies of
+  64 bytes to 1 KB 3–6 ns (257 bytes 11.4 → 5.6). The blocker is
+  unwinding: on x86_64 std's unwinder ends the trace at a pc without an
+  FDE (frame-pointer unwinding is unsafe there), so a fault in the
+  routine, such as a copy from a bad slice, would lose its caller. The
+  linkers write FDEs only for debug entries, so the routine would need a
+  frameless `Atom.Unwind` kind and a debug entry carried with its content
+  atom through the cache (`Replay` drops content atoms' debug entries,
+  `knowsDebugPaths` wants a real file, and `Emit.mergeOut` skips a
+  deduplicated content atom without its entry), a linker and cache
+  change for a size-only win.
 
 ## The on-disk cache (milestone 6, designed now)
 
