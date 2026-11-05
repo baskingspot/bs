@@ -61,7 +61,9 @@ given build.
   (`scan rename`, which also renames `.name` member accesses and refuses
   names that are also fields); move a file-private declaration that
   names nothing else of its file but `std` and `builtin` to another file
-  of its directory, imported back under its name.
+  of its directory, imported back under its name; add container-level
+  assembly (`comptime { asm (...); }`, a function nothing references),
+  add or remove an extra `ret` in it (bs assembles few instructions), or remove it.
 - No-ops for the program: a blank line (which moves every line below,
   so debug info and source locations change), a comment line, a touch.
 - Breaks: an unused local constant (an AstGen error), a syntax error, or

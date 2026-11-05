@@ -292,6 +292,9 @@ class Editor:
         "const_int": 3,
         "inline": 2,
         "pub": 1,
+        "asm_add": 1,
+        "asm_edit": 2,
+        "asm_remove": 1,
         # No-ops for the program: they move lines, or nothing.
         "blank_line": 3,
         "comment": 2,
@@ -522,6 +525,44 @@ class Editor:
         fn = f"\nfn bsEh{n}(x: u32) u32 {{\n    return @truncate(x +% {k2});\n}}\n"
         # The call's insertion is before the end of the file.
         return [op(rel, end, end, fn), call], f"{rel}: adds fn bsEh{n}, called from {where}"
+
+    # Container-level assembly (`Zcu.global_asm`): a unit effect that
+    # defines a function the code does not reference.
+    ASM_RE = rb"\ncomptime \{\n    asm \(\"\.globl (bsEhAsm[0-9_]+)\\n\1:\\n((?:    ret\\n)*)    ret\\n\"\);\n\}\n"
+
+    def _asm_blocks(self):
+        for rel in self.rng.sample(self.files, min(len(self.files), 30)):
+            ms = list(re.finditer(self.ASM_RE, self.read(rel)))
+            if ms:
+                return rel, ms
+        return None, None
+
+    def e_asm_add(self):
+        rel, _ = self.pick_file(lambda i: bool(self._bodies(i)))
+        if not rel:
+            return None
+        n = self.name()
+        end = len(self.read(rel))
+        rets = "    ret\\n" * self.rng.randrange(3)
+        block = f'\ncomptime {{\n    asm (".globl bsEhAsm{n}\\nbsEhAsm{n}:\\n{rets}    ret\\n");\n}}\n'
+        return [op(rel, end, end, block)], f"{rel}: adds container-level asm bsEhAsm{n}"
+
+    def e_asm_edit(self):
+        rel, ms = self._asm_blocks()
+        if not rel:
+            return None
+        m = self.rng.choice(ms)
+        name = m.group(1).decode()
+        if m.group(2) and self.rng.random() < 0.5:
+            return [op(rel, m.start(2), m.start(2) + len(b"    ret\\n"), "")], f"{rel}: removes a ret from {name}"
+        return [op(rel, m.start(2), m.start(2), "    ret\\n")], f"{rel}: adds a ret to {name}"
+
+    def e_asm_remove(self):
+        rel, ms = self._asm_blocks()
+        if not rel:
+            return None
+        m = self.rng.choice(ms)
+        return [op(rel, m.start(), m.end(), "")], f"{rel}: removes container-level asm {m.group(1).decode()}"
 
     def e_fn_remove(self):
         for rel in self.rng.sample(self.files, min(len(self.files), 30)):
