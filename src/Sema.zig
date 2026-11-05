@@ -13732,6 +13732,15 @@ fn comptimeStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) C
             if (key.byte_offset != 0) return sema.reinterpretStore(block, src, ptr, val);
             const parent = (try sema.comptimeLoadStructural(block, src, e.base)) orelse return sema.fail(block, src, "unable to evaluate comptime expression: memory is runtime-known", .{});
             const parent_ty = sema.ip.typeOf(parent);
+            // The index counts the base pointer's elements: through a
+            // cast (`*[4]u8` over a `[2]u16`) it is not an index into
+            // the value, so the store writes the bytes it covers, as
+            // `comptimeLoadStructuralKey` reads them.
+            const base_child = Type.ptrInfo(sema.ip, sema.ip.typeOf(e.base)).child;
+            if (parent_ty != base_child) switch (sema.ip.keyTag(parent_ty)) {
+                .array_type, .vector_type => return sema.reinterpretStore(block, src, ptr, val),
+                else => {},
+            };
             if (sema.ip.keyTag(parent_ty) == .vector_type) {
                 const v = sema.ip.keyPayload(.vector_type, parent_ty);
                 if (e.index >= v.len or sema.ip.typeOf(val) != v.child) return sema.reinterpretStore(block, src, ptr, val);

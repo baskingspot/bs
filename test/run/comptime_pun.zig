@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "4294967295\n4294967294\n5\n120\n18\n1069547520\n1\n43971\n2751\n9\n4294967296\n200\n0\n52\n3\n9\n131071\n1\n1\n"
+//! stdout: "4294967295\n4294967294\n5\n120\n18\n1069547520\n1\n43971\n2751\n9\n4294967296\n200\n0\n52\n3\n9\n131071\n1\n1\n2049\n95\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -107,5 +107,16 @@ fn main() callconv(.c) noreturn {
     // whatever the size.
     const one: []const void = @ptrCast(&{});
     rt.printInt(one.len);
+    // A store through an element of a byte view of a `[2]u16`, cast to an
+    // unaligned `u16`, writes the bytes it covers, not element 1.
+    const unaligned = comptime blk: {
+        var x: [2]u16 = .{ 1, 8 };
+        const q: *[4]u8 = @ptrCast(&x);
+        const w: *align(1) u16 = @ptrCast(&q[1]);
+        w.* = 0x5f08;
+        break :blk x;
+    };
+    rt.printInt(unaligned[0]);
+    rt.printInt(unaligned[1]);
     rt.exit(0);
 }
