@@ -6018,7 +6018,10 @@ analyzing everything.
   module in each) then has that file as a changed input with no new ZIR
   whose key does not hold, and its units are analyzed again however
   their sources compare (`Replay.rebound`): before, they loaded green
-  and named the donor's module by its name. In an eager replay, a function's atom is loaded only if its debug
+  and named the donor's module by its name. Its embedded files' input
+  keys carry the same tag (`Incremental.embedKey`); without it, every
+  edit build took them for a donor's, changed, and a donor of the same
+  program replayed eagerly (test/run/edit_embed_dep_key.sh). In an eager replay, a function's atom is loaded only if its debug
   info names paths this build's would (`Replay.debug_paths`): source paths
   are as the compiler opened them, so with relative paths a worktree's
   functions load, and with absolute ones only std's do.

@@ -1310,6 +1310,19 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &sj.step, 10);
         test_step.dependOn(&sj.step);
     }
+    // An edit to a module with `--dep`s that embeds a file:
+    // test/run/edit_embed_dep_key.sh.
+    {
+        const ek = b.addSystemCommand(&.{"sh"});
+        ek.setName("bs edit of a module with --deps that embeds a file");
+        ek.addFileArg(b.path("test/run/edit_embed_dep_key.sh"));
+        ek.addArtifactArg(bs);
+        _ = ek.addOutputDirectoryArg("work");
+        ek.addDirectoryArg(std_zir);
+        ek.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &ek.step, 10);
+        test_step.dependOn(&ek.step);
+    }
     // An edit to a compiler_rt helper's requester: test/run/edit_rt_request.sh.
     {
         const rq = b.addSystemCommand(&.{"sh"});

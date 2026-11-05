@@ -2547,13 +2547,14 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     for (zcu.embed_files.values(), embed_inputs) |f, *ei| {
         try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
         const content_hash: Hash = @bitCast(Frontend.hashSource(f.bytes));
-        const known = embedInput(m, rp, path_buf.items, f.key);
+        try embedKey(gpa, &key_buf, fe, f);
+        const known = embedInput(m, rp, path_buf.items, key_buf.items);
         ei.* = known orelse n_inputs;
         if (known) |in| {
             if (m.input(in)[0].content_hash == content_hash) continue;
         } else n_inputs += 1;
         const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch return inc.lazyFallback("{s} is gone", .{path_buf.items});
-        try d.setInput(known, path_buf.items, f.key, stat, content_hash, inc.build_start);
+        try d.setInput(known, path_buf.items, key_buf.items, stat, content_hash, inc.build_start);
     }
 
     // Results, with this build's items after the manifest's: those it
@@ -3778,10 +3779,11 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     for (zcu.embed_files.values()) |f| {
         try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
         const content_hash: Hash = @bitCast(Frontend.hashSource(f.bytes));
+        try embedKey(gpa, &key_buf, fe, f);
         if (Io.Dir.cwd().statFile(io, path_buf.items, .{})) |stat|
-            try b.addInput(path_buf.items, f.key, stat, content_hash, inc.build_start)
+            try b.addInput(path_buf.items, key_buf.items, stat, content_hash, inc.build_start)
         else |_|
-            try b.addUnstattedInput(path_buf.items, f.key, content_hash);
+            try b.addUnstattedInput(path_buf.items, key_buf.items, content_hash);
     }
     // Link-only inputs, by the same rule.
     for (0..inc.link_objects.len + inc.link_shared.len) |n| {
@@ -4180,6 +4182,16 @@ pub fn inputKey(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, mo
     try buf.print(gpa, "{s}{s}:{s}", .{ mod.name, std.mem.sliceTo(&tag, 0), if (std.mem.eql(u8, sub_path, mod.root_file)) "" else sub_path });
 }
 
+/// `Manifest.Input.key` of an embedded file: its `Zcu.EmbedFile.key` with
+/// the module's `--dep`s after its name, as a file's (`inputKey`), so
+/// that `inputKeyHolds` finds it this build's too.
+fn embedKey(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, f: Zcu.EmbedFile) !void {
+    const mod = fe.module(f.module);
+    buf.clearRetainingCapacity();
+    const tag = depsTag(fe, mod);
+    try buf.print(gpa, "{s}{s}:{s}", .{ mod.name, std.mem.sliceTo(&tag, 0), f.sub_path });
+}
+
 /// `#` and a hash of the names a module's `--dep`s give and the modules
 /// they name, in any order; empty without `--dep`s, so std's and
 /// compiler_rt's keys are their unit-key prefixes.
@@ -4270,8 +4282,9 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
         gop.value_ptr.* = .{ .file = @fromBackingInt(@as(u32, @intCast(i))), .hash = @bitCast(f.content_hash) };
     }
     for (r.zcu.embed_files.values()) |f| {
-        const gop = try now_inputs.getOrPut(gpa, f.key);
-        if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, f.key);
+        try embedKey(gpa, &path_buf, fe, f);
+        const gop = try now_inputs.getOrPut(gpa, path_buf.items);
+        if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, path_buf.items);
         gop.value_ptr.* = .{ .file = null, .hash = @bitCast(Frontend.hashSource(f.bytes)) };
     }
     var changed: std.ArrayList(seeds.Changed) = .empty;

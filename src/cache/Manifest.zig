@@ -477,7 +477,8 @@ pub const Input = extern struct {
     path: StrRef,
     /// The file's unit-key prefix, `<module name>:<path within it>`
     /// (`Zcu.fileKey`), with the module's `--dep`s after its name
-    /// (`Incremental.inputKey`): what the nodes' keys name the file by. A build
+    /// (`Incremental.inputKey`; an embedded file's the same way,
+    /// `Incremental.embedKey`): what the nodes' keys name the file by. A build
     /// whose modules map the key to another file must not take the
     /// nodes as its own (a donor's, see `Replay.create`).
     key: StrRef,
@@ -509,7 +510,7 @@ pub const Input = extern struct {
 const Section = enum { nodes, table, edges, redges, rref_starts, rref_nodes, reached_bits, stale_nodes, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, type_names, type_name_starts, type_name_index, atom_names, atom_name_bytes, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN17".*;
+const magic = "ZAPMAN18".*;
 const log_magic = "ZAPMLG08".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
