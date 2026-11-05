@@ -1228,6 +1228,28 @@ pub const System = struct {
     pub const mrs_tpidr_el0: u32 = 0xd53bd040;
     /// `msr tpidr_el0, xt`: or in the register.
     pub const msr_tpidr_el0: u32 = 0xd51bd040;
+
+    /// `mrs xt, <name>` for the system registers EL0 code reads (the
+    /// thread pointers, the cache type, and the ID registers that Linux
+    /// emulates for std's CPU detection), case-insensitive: or in the
+    /// register. Null for another name.
+    pub fn mrs(name: []const u8) ?u32 {
+        const regs = [_]struct { []const u8, [5]u32 }{
+            .{ "tpidr_el0", .{ 3, 3, 13, 0, 2 } },       .{ "tpidrro_el0", .{ 3, 3, 13, 0, 3 } },
+            .{ "ctr_el0", .{ 3, 3, 0, 0, 1 } },          .{ "midr_el1", .{ 3, 0, 0, 0, 0 } },
+            .{ "id_aa64pfr0_el1", .{ 3, 0, 0, 4, 0 } },  .{ "id_aa64pfr1_el1", .{ 3, 0, 0, 4, 1 } },
+            .{ "id_aa64dfr0_el1", .{ 3, 0, 0, 5, 0 } },  .{ "id_aa64dfr1_el1", .{ 3, 0, 0, 5, 1 } },
+            .{ "id_aa64afr0_el1", .{ 3, 0, 0, 5, 4 } },  .{ "id_aa64afr1_el1", .{ 3, 0, 0, 5, 5 } },
+            .{ "id_aa64isar0_el1", .{ 3, 0, 0, 6, 0 } }, .{ "id_aa64isar1_el1", .{ 3, 0, 0, 6, 1 } },
+            .{ "id_aa64mmfr0_el1", .{ 3, 0, 0, 7, 0 } }, .{ "id_aa64mmfr1_el1", .{ 3, 0, 0, 7, 1 } },
+            .{ "id_aa64mmfr2_el1", .{ 3, 0, 0, 7, 2 } },
+        };
+        for (regs) |r| if (std.ascii.eqlIgnoreCase(name, r[0])) {
+            const f = r[1];
+            return 0xd5200000 | f[0] << 19 | f[1] << 16 | f[2] << 12 | f[3] << 8 | f[4] << 5;
+        };
+        return null;
+    }
 };
 
 /// The stack probe before allocating a frame of `size` bytes, needed when
@@ -1568,6 +1590,11 @@ test "atomics, bit ops, and other step-5 encodings match the system assembler" {
     try e.raw(System.isb); // isb
     try e.raw(System.dsb | (@as(u32, @backingInt(Barrier.ish)) << 8)); // dsb ish
     try e.raw(System.mrs_tpidrro_el0 | 3); // mrs x3, tpidrro_el0
+    try e.raw(System.mrs("MIDR_EL1").? | 3); // mrs x3, MIDR_EL1
+    try e.raw(System.mrs("id_aa64mmfr2_el1").? | 3); // mrs x3, ID_AA64MMFR2_EL1
+    try e.raw(System.msr_tpidr_el0 | 5); // msr tpidr_el0, x5
+    try e.ldaxr(.byte, .x9, .x12); // ldaxrb w9, [x12]
+    try e.stlxr(.dword, .x17, .x11, .x12); // stlxr w17, x11, [x12]
     try e.stackProbe(0x186b0, chkstk); // mov x9, #0x86b0; movk x9, #1, lsl #16; bl ___chkstk_darwin
     try e.adr(.x16, table); // adr x16, table
     e.bind(case);
@@ -1576,10 +1603,10 @@ test "atomics, bit ops, and other step-5 encodings match the system assembler" {
     try e.finish();
     const want = hex("241845fa" ++ "40b0433a" ++ "2008c05a" ++ "2008c0da" ++ "c514c0da" ++ "0058200e" ++ "00b8310e" ++
         "208c621f" ++ "0410381e" ++ "05f0671e" ++ "e1ffe008" ++ "067d6448" ++ "628021f8" ++ "7f706178" ++ "20fcdf08" ++
-        "ffff9fc8" ++ "bf3b03d5" ++ "e10bc03d" ++ "0280803c" ++ "e827bfad" ++ "34120000" ++ "20001fba" ++ "6200045a" ++ "df3f03d5" ++ "9f3b03d5" ++ "63d03bd5" ++ "09d690d2" ++ "2900a0f2" ++
+        "ffff9fc8" ++ "bf3b03d5" ++ "e10bc03d" ++ "0280803c" ++ "e827bfad" ++ "34120000" ++ "20001fba" ++ "6200045a" ++ "df3f03d5" ++ "9f3b03d5" ++ "63d03bd5" ++ "030038d5" ++ "430738d5" ++ "45d01bd5" ++ "89fd5f08" ++ "8bfd11c8" ++ "09d690d2" ++ "2900a0f2" ++
         "00000094" ++ "30000010" ++ "00000000");
     try std.testing.expectEqualSlices(u8, &want, e.code.items);
-    try std.testing.expectEqualDeep(&[_]Atom.Reloc{.init(0x70, .aarch64_branch26, 0, 0)}, e.refs.relocs.items);
+    try std.testing.expectEqualDeep(&[_]Atom.Reloc{.init(0x84, .aarch64_branch26, 0, 0)}, e.refs.relocs.items);
 }
 
 test "bitmask immediates" {

@@ -3300,7 +3300,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
     if (eql(u8, mnemonic, "mrs")) {
         const rt = reg(ops, 0) orelse return cg.asmUnsupported(line);
         if (ops.len != 2 or ops[1] != .name) return cg.asmUnsupported(line);
-        const base: u32 = if (eql(u8, ops[1].name, "tpidrro_el0")) System.mrs_tpidrro_el0 else if (eql(u8, ops[1].name, "tpidr_el0")) System.mrs_tpidr_el0 else return cg.asmUnsupported(line);
+        const base = System.mrs(ops[1].name) orelse return cg.asmUnsupported(line);
         return e.raw(base | @backingInt(rt.reg));
     }
     if (eql(u8, mnemonic, "msr")) {
