@@ -10,6 +10,11 @@ default:
 build *ARGS:
     zig build {{ ARGS }}
 
+[doc("A ReleaseFast bs for TARGET (such as x86_64-linux-musl, aarch64-linux-musl, or aarch64-macos), cross-compiled and installed to DIR/bin. The release workflow ships it")]
+[group("build")]
+release-build TARGET DIR:
+    zig build install -Doptimize=ReleaseFast -Dtarget={{ TARGET }} --prefix {{ DIR }}
+
 [doc("Unit tests, run tests, and the end-to-end checks in build.zig")]
 [group("test")]
 test *ARGS:

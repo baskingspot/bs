@@ -1,0 +1,4 @@
+# What .github/workflows/release.yml ships on a v* tag: bs for the org's
+# default platforms (linux-x64, linux-arm64, macos-arm64), each built by
+# `just release-build`.
+binary: bs

@@ -11,7 +11,27 @@ bs compiles exactly one Zig release, 0.17.1, and the std library that ships with
 
 Its compile errors are written for coding agents: an exact location, the facts needed to fix the error, and the fix when bs knows it, in a form a program can parse.
 
-bs is incubating. There are no releases yet, so build it from source.
+bs is incubating.
+
+## Install
+
+bs needs upstream Zig 0.17.1 on `PATH`: it compiles that release's std library, and hands C and C++ sources to its `zig cc`. Without it, or with another version, bs stops and says so. `--zig-lib-dir` or `ZIG_LIB_DIR` point it at a lib directory instead.
+
+With Homebrew, on macOS or Linux:
+
+```sh
+brew install --cask baskingspot/tap/bs
+```
+
+With [mise](https://mise.jdx.dev), next to the zig it needs, in a project's `mise.toml`:
+
+```toml
+[tools]
+zig = "0.17.1"
+"github:baskingspot/bs" = "latest"
+```
+
+Or download `bs-<version>-<platform>.tar.gz` for `linux-x64`, `linux-arm64`, or `macos-arm64` from [the releases](https://github.com/baskingspot/bs/releases), check it against `SHA256SUMS`, and put `bs` on `PATH`.
 
 ## Build it
 
