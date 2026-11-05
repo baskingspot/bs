@@ -2033,7 +2033,9 @@ A `switch_br` whose case values are constants (`src/codegen/switch_br.zig`,
 shared; built 2026-11-05) is lowered from its cases sorted by value, with
 neighbors that go to one block merged: a greedy scan picks dense runs (at
 least 4 cases covering at least 40% of a span of under 4096 values,
-LLVM's thresholds) as jump tables, and a binary search over the runs
+LLVM's thresholds, and at most 64 entries per block the table reaches,
+so wide ranges to few blocks, as in Aro's `codepointWidth`, are searched
+instead of filling kilobytes of table) as jump tables, and a binary search over the runs
 reaches them, ending in compares with immediates when 3 or fewer runs are
 left. The search tracks the values still possible, from the operand's ABI
 size (an undefined `u4` is 0xaa) and the compares made, so a case at an

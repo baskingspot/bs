@@ -17,10 +17,13 @@ pub const Case = struct { lo: u64, hi: u64, label: u32 };
 const linear_max = 3;
 /// A jump table needs at least this many cases, covering at least this
 /// share (in percent) of its span, LLVM's thresholds, and at most
-/// `table_max` entries.
+/// `table_max` entries, and at most `table_per_target` per block it goes
+/// to: a big table of few targets (wide ranges to one block) is code a
+/// search over the ranges does in a few compares.
 const table_min = 4;
 const table_density = 40;
 const table_max = 4096;
+const table_per_target = 64;
 
 /// Sorts `cases` by key and merges neighbors that go to the same label;
 /// returns the cases left.
@@ -83,12 +86,21 @@ pub fn lower(gpa: std.mem.Allocator, ctx: anytype, cases: []const Case, lo: u64,
     while (i < cases.len) {
         var best = i;
         var covered: u64 = 0;
+        // The run's distinct labels, up to as many as `table_max` needs.
+        var labels: [table_max / table_per_target]u32 = undefined;
+        var distinct: usize = 0;
         var j = i;
         while (j < cases.len) : (j += 1) {
             const span = cases[j].hi - cases[i].lo;
             if (span >= table_max) break;
             covered += cases[j].hi - cases[j].lo + 1;
-            if (j - i + 1 >= table_min and covered * 100 >= (span + 1) * table_density) best = j;
+            if (distinct < labels.len and std.mem.indexOfScalar(u32, labels[0..distinct], cases[j].label) == null) {
+                labels[distinct] = cases[j].label;
+                distinct += 1;
+            }
+            // Keys between the cases go to the else block.
+            const targets = distinct + @intFromBool(covered != span + 1);
+            if (j - i + 1 >= table_min and covered * 100 >= (span + 1) * table_density and span + 1 <= targets * table_per_target) best = j;
         }
         const table = best - i + 1 >= table_min;
         runs.appendAssumeCapacity(.{ .start = i, .end = best + 1, .table = table });
