@@ -793,6 +793,8 @@ fn linkWithInputs(
         /// The imports the objects ask for, as a full build's link
         /// requests them (`Emit.InputResolver.importSym`).
         requested_imports: *std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void),
+        /// `Incremental.lld`, for `weakImport`.
+        lld: bool,
 
         pub fn zigExport(r: @This(), name: []const u8) !?Atom.SymbolKey {
             return r.exports.get(name);
@@ -809,6 +811,12 @@ fn linkWithInputs(
             _ = weak;
             const g = r.glibc orelse return null;
             if (Glibc.sharedSymbol(r.shared, name) == null and g.get(name) == null) return null;
+            try r.requested_imports.put(r.arena, Emit.importKey(name), {});
+            return Emit.importKey(name);
+        }
+
+        pub fn weakImport(r: @This(), name: []const u8) !?Atom.SymbolKey {
+            if (!r.lld or r.glibc == null) return null;
             try r.requested_imports.put(r.arena, Emit.importKey(name), {});
             return Emit.importKey(name);
         }
@@ -838,6 +846,7 @@ fn linkWithInputs(
         .copies = &copies,
         .arena = arena,
         .requested_imports = &requested_imports,
+        .lld = inc.lld,
     };
     // The archive members the Zig code's externs pull: those of the
     // linked nodes and the link's own atoms.

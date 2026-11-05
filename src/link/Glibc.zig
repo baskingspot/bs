@@ -236,8 +236,9 @@ fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copie
         try work.append(arena, s.lib);
     };
     for ([_][]const ElfObject.Import{ imports, copies }) |list| for (list) |imp| {
+        // A weak import nothing defines needs no library (`weakImport`).
         if (sharedSymbol(shared, imp.name) == null) used[
-            (g.get(imp.name) orelse if (executable) return error.NotInGlibc else continue).lib
+            (g.get(imp.name) orelse if (executable and !imp.weak) return error.NotInGlibc else continue).lib
         ] = true;
     };
     // Upstream's own linker needs libm, libc and ld-linux-x86-64.so.2 in

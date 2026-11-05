@@ -3247,8 +3247,16 @@ resolve externs by name. Rules, as ld's:
 - Then compiler_rt, as upstream links libcompiler_rt after the inputs.
 - Then shared libraries (abilists for `-lc`, `.so` inputs in stage C),
   which give imports.
-- An undefined weak name is 0. A strong name still undefined is the
-  usual "undefined symbol" error, now saying which input referenced it.
+- An undefined weak name is 0. In a C-only executable the loader
+  relocates (upstream links it with lld), GOT loads and calls of one
+  import it instead, weak and unversioned with no library needed
+  (`weakImport`, in `Emit.InputResolver` and Incremental's resolver), so
+  a library loaded at run time such as an LD_PRELOAD one defines it;
+  its absolute addresses in data stay 0, as lld resolves them
+  (test/link_input/weak_main.c; 2026-11-05). Upstream's own linker,
+  which links programs with Zig code, imports none. A strong name still
+  undefined is the usual "undefined symbol" error, now saying which
+  input referenced it.
 
 Zig externs keep their 8-byte slots. A slot's target becomes the object
 symbol's (atom key, offset), with the offset in the addend.

@@ -1506,6 +1506,28 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         cexe_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
         test_step.dependOn(&cexe_run.step);
     }
+    // A C-only executable's weak references to names nothing defines,
+    // which a library preloaded at run time defines.
+    {
+        const wexe = b.addRunArtifact(bs);
+        wexe.setName("bs build-exe -lc with weak references nothing defines");
+        wexe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+        wexe.addFileArg(b.path("test/link_input/weak_main.c"));
+        wexe.setEnvironmentVariable("BS_ZIG", zig);
+        const weak_exe = wexe.addPrefixedOutputFileArg("-femit-bin=", "weak_main");
+        const plain = std.Build.Step.Run.create(b, "run weak_main");
+        plain.addFileArg(weak_exe);
+        plain.addCheck(.{ .expect_stdout_exact = "fn=-1 data=-1 ptr=0\n" });
+        test_step.dependOn(&plain.step);
+        const def = b.addSystemCommand(&.{ zig, "cc", "-shared", "-fPIC" });
+        def.addFileArg(b.path("test/link_input/weak_def.c"));
+        const preload = b.addSystemCommand(&.{ "sh", "-c", "LD_PRELOAD=\"$1\" exec \"$2\"", "sh" });
+        preload.setName("run weak_main with weak_def preloaded");
+        preload.addFileArg(def.addPrefixedOutputFileArg("-o", "libweak_def.so"));
+        preload.addFileArg(weak_exe);
+        preload.addCheck(.{ .expect_stdout_exact = "fn=42 data=7 ptr=0\n" });
+        test_step.dependOn(&preload.step);
+    }
     // compiler_rt for C: f128 and f16 conversions, comparisons and
     // arithmetic, 128-bit division, lock-based atomics and the CPU model
     // of function multiversioning (data as well as functions), which bs

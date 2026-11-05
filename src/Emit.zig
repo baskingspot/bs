@@ -963,6 +963,14 @@ const InputResolver = struct {
     /// The executable's copy of a shared library's data object `name`, an
     /// import already (`importSym`), or null if it is not one. The copy
     /// takes the import's key, so every reference to the import uses it.
+    /// A weak name that nothing defines, which a C-only executable
+    /// imports for its GOT loads and calls, as lld does; null where it
+    /// resolves to 0, as in upstream's own links of Zig code.
+    pub fn weakImport(r: InputResolver, name: []const u8) !?SymbolKey {
+        if (!r.emit.lld or r.emit.shared) return null;
+        return try r.emit.useImport(name, .{ .weak = true });
+    }
+
     pub fn copySym(r: InputResolver, name: []const u8) !?SymbolKey {
         // A shared object copies nothing: its data references to another
         // module's symbols go through the GOT.

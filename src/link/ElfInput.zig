@@ -1080,6 +1080,19 @@ fn Converter(comptime Ctx: type) type {
                 else => {},
             };
             if (t.import) return c.importReloc(index, relas, k, bytes, copy);
+            // A weak name nothing defines: a C-only executable that the
+            // loader relocates imports it for its GOT loads and calls, as
+            // lld does, so that a library loaded at run time (LD_PRELOAD)
+            // may define it; its other references stay 0.
+            if (t.key == undefined_weak_key and c.in.dynamic and !c.in.shared) switch (@as(R, @fromBackingInt(@intCast(ty)))) {
+                .PLT32, .GOTPCREL, .GOTPCRELX, .REX_GOTPCRELX => |rt| if (try c.ctx.weakImport(c.o.symName(c.o.syms[r.r_sym()]))) |key| {
+                    const imp: Target = .{ .key = key, .offset = 0, .import = true };
+                    const via = if (rt == .PLT32) try c.stub(imp, .x86_64_abs64) else try c.slot(imp, .x86_64_abs64);
+                    try c.add(off, .x86_64_pc32, .{ .key = via, .offset = 0 }, r.r_addend);
+                    return 0;
+                },
+                else => {},
+            };
             // A shared object reaches its exports with default visibility
             // through the loader, so that a definition in the executable
             // or an earlier library preempts them, as upstream's: -fPIC
