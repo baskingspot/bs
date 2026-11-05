@@ -3,7 +3,9 @@
 //! its fields' pointers and whole loads and stores, becomes one local per
 //! field, which CodeGen then keeps in registers. Inlining makes most of
 //! them: a callee's struct parameters and result become the caller's
-//! temporaries (nbody's `Vec` arithmetic).
+//! temporaries (nbody's `Vec` arithmetic). A local array indexed only at
+//! constant indices (`inline for`) is split the same way, its elements as
+//! fields.
 //!
 //! A field pointer becomes its field's local (through the rewrite walk's
 //! substitutions); a whole load becomes the fields' loads and an
@@ -29,7 +31,11 @@ const Type = @import("../Type.zig");
 const Ssa = @import("Ssa.zig");
 
 /// The most fields a split struct has.
-const max_fields = 8;
+const max_struct_fields = 8;
+/// The most elements a split array has: one indexed only by constants
+/// (BLAKE3's `v: [16]Vec`, after `inline for`) is as cheap to split as a
+/// struct, and promotion spills what does not fit in registers.
+const max_fields = 16;
 
 /// An instruction the rewrite walk replaces with another value.
 pub const Seed = struct { inst: Inst.Index, ref: Inst.Ref };
@@ -157,11 +163,12 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
                 s.fields[ii] = first;
                 s.agg[ii] = agg;
             },
-            .struct_field_ptr => {
+            .struct_field_ptr, .ptr_elem_ptr => {
                 const r = s.root[ii];
                 if (s.fields[r] == 0) continue;
-                // `StructField.index` follows the operand.
-                const f = e.extra.items[data.ty_pl.payload + 1];
+                // `StructField.index`, or `Bin.rhs` (a constant index,
+                // `elemIndex`), follows the operand.
+                const f: u32 = if (tag == .struct_field_ptr) e.extra.items[data.ty_pl.payload + 1] else elemIndex(ip, @fromBackingInt(e.extra.items[data.ty_pl.payload + 1])).?;
                 try scratch.seeds.append(gpa, .{ .inst = inst, .ref = fieldLocal(&s, r, f).toRef() });
                 // Its uses take the field's local; it would point past it.
                 e.group[ii][0] = dropped;
@@ -176,7 +183,7 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
                     const k = s.fields[ii];
                     try e.begin(inst);
                     for (0..k) |f| {
-                        const fp = try e.add(.{ .tag = .struct_field_ptr, .data = .{ .ty_pl = .{ .ty = try fieldPtr(ip, tid, agg, f, true), .payload = try fieldPayload(&e, ptr, f) } } });
+                        const fp = try e.add(try partPtr(&e, ip, tid, agg, ptr, f, true));
                         refs[f] = (try e.add(.{ .tag = .load, .data = .{ .ty_op = .{ .ty = Type.fieldType(ip, agg, f), .operand = fp.toRef() } } })).toRef();
                     }
                     break :blk .{ agg, k };
@@ -200,8 +207,10 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
                 e.insts.set(ii, .{ .tag = .aggregate_init, .data = .{ .ty_pl = .{ .ty = agg, .payload = payload } } });
             },
             .store => {
-                const r = s.rootOf(@backingInt(data.bin_op.lhs.toIndex().?));
-                if (s.root[r] != r) {
+                // A global's address is a constant.
+                const lhs = data.bin_op.lhs.toIndex();
+                const r = if (lhs) |l| s.rootOf(@backingInt(l)) else 0;
+                if (lhs == null or s.root[r] != r) {
                     // A store to other memory of a split struct's load.
                     const l = s.fields[ii];
                     // 0 if the struct was not split.
@@ -211,7 +220,7 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
                     const k = Type.fieldCount(ip, agg);
                     try e.begin(inst);
                     for (0..k) |f| {
-                        const fp = try e.add(.{ .tag = .struct_field_ptr, .data = .{ .ty_pl = .{ .ty = try fieldPtr(ip, tid, agg, f, false), .payload = try fieldPayload(&e, data.bin_op.lhs, f) } } });
+                        const fp = try e.add(try partPtr(&e, ip, tid, agg, data.bin_op.lhs, f, false));
                         const store: Inst = .{ .tag = .store, .data = .{ .bin_op = .{ .lhs = fp.toRef(), .rhs = @as(Inst.Index, @fromBackingInt(first + @as(u32, @intCast(f)))).toRef() } } };
                         if (f + 1 < k) _ = try e.add(store) else e.insts.set(ii, store);
                     }
@@ -230,7 +239,7 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
                     const fv: Inst.Ref = if (undef)
                         .fromInterned(try ip.get(tid, .{ .undef = fty }))
                     else
-                        (try e.add(.{ .tag = .struct_field_val, .data = .{ .ty_pl = .{ .ty = fty, .payload = try fieldPayload(&e, v, f) } } })).toRef();
+                        (try e.add(try partVal(&e, ip, tid, agg, v, f))).toRef();
                     const store: Inst = .{ .tag = .store, .data = .{ .bin_op = .{ .lhs = fieldLocal(&s, r, @intCast(f)).toRef(), .rhs = fv } } };
                     if (f + 1 < k) _ = try e.add(store) else e.insts.set(ii, store);
                 }
@@ -248,7 +257,7 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
         try e.begin(x);
         for (0..k) |f| {
             const fv = try e.add(.{ .tag = .load, .data = .{ .ty_op = .{ .ty = Type.fieldType(ip, agg, f), .operand = fieldLocal(&s, r, @intCast(f)).toRef() } } });
-            const fp = try e.add(.{ .tag = .struct_field_ptr, .data = .{ .ty_pl = .{ .ty = try fieldPtr(ip, tid, agg, f, false), .payload = try fieldPayload(&e, orig, f) } } });
+            const fp = try e.add(try partPtr(&e, ip, tid, agg, orig, f, false));
             _ = try e.add(.{ .tag = .store, .data = .{ .bin_op = .{ .lhs = fp.toRef(), .rhs = fv.toRef() } } });
         }
         // ...and load them back after it, before the next instruction
@@ -260,7 +269,7 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
         if (y == none) continue;
         try e.begin(@fromBackingInt(y));
         for (0..k) |f| {
-            const fp = try e.add(.{ .tag = .struct_field_ptr, .data = .{ .ty_pl = .{ .ty = try fieldPtr(ip, tid, agg, f, true), .payload = try fieldPayload(&e, orig, f) } } });
+            const fp = try e.add(try partPtr(&e, ip, tid, agg, orig, f, true));
             const fv = try e.add(.{ .tag = .load, .data = .{ .ty_op = .{ .ty = Type.fieldType(ip, agg, f), .operand = fp.toRef() } } });
             _ = try e.add(.{ .tag = .store, .data = .{ .bin_op = .{ .lhs = fieldLocal(&s, r, @intCast(f)).toRef(), .rhs = fv.toRef() } } });
         }
@@ -275,6 +284,30 @@ fn fieldPayload(e: *Editor, operand: Inst.Ref, f: usize) Allocator.Error!u32 {
     const payload: u32 = @intCast(e.extra.items.len);
     try e.extra.appendSlice(e.gpa, &.{ @backingInt(operand), @intCast(f) });
     return payload;
+}
+
+/// A pointer to field or element `f` of the struct or array of type `agg`
+/// that `base` points to.
+fn partPtr(e: *Editor, ip: *InternPool, tid: InternPool.Tid, agg: Index, base: Inst.Ref, f: usize, is_const: bool) Allocator.Error!Inst {
+    const ty = try fieldPtr(ip, tid, agg, f, is_const);
+    if (ip.keyTag(agg) != .array_type) return .{ .tag = .struct_field_ptr, .data = .{ .ty_pl = .{ .ty = ty, .payload = try fieldPayload(e, base, f) } } };
+    const payload: u32 = @intCast(e.extra.items.len);
+    try e.extra.appendSlice(e.gpa, &.{ @backingInt(base), @backingInt(Inst.Ref.fromInterned(try ip.getInt(tid, .usize_type, @as(u64, f)))) });
+    return .{ .tag = .ptr_elem_ptr, .data = .{ .ty_pl = .{ .ty = ty, .payload = payload } } };
+}
+
+/// Field or element `f` of struct or array value `v` of type `agg`.
+fn partVal(e: *Editor, ip: *InternPool, tid: InternPool.Tid, agg: Index, v: Inst.Ref, f: usize) Allocator.Error!Inst {
+    if (ip.keyTag(agg) != .array_type) return .{ .tag = .struct_field_val, .data = .{ .ty_pl = .{ .ty = Type.fieldType(ip, agg, f), .payload = try fieldPayload(e, v, f) } } };
+    return .{ .tag = .array_elem_val, .data = .{ .bin_op = .{ .lhs = v, .rhs = .fromInterned(try ip.getInt(tid, .usize_type, @as(u64, f))) } } };
+}
+
+/// The element a `ptr_elem_ptr` with index `index` points to, when the
+/// index is a constant.
+fn elemIndex(ip: *const InternPool, index: Inst.Ref) ?u32 {
+    const i = index.toInterned() orelse return null;
+    if (ip.keyTag(i) != .int) return null;
+    return std.math.cast(u32, ip.intValue(u64, i) orelse return null);
 }
 
 /// Field `f`'s local of the split struct allocated by `r`.
@@ -310,24 +343,25 @@ fn candidateType(ip: *const InternPool, agg: Index) u32 {
             if (si.layout == .@"packed" or si.status != .have_layout or si.field_aligns.len != 0) return 0;
         },
         .tuple_type => {},
+        .array_type => {
+            // Elements as fields, also 16-byte vectors, which promotion
+            // keeps in XMM registers.
+            const arr = ip.keyPayload(.array_type, agg);
+            if (arr.sentinel != .none or arr.len == 0 or arr.len > max_fields) return 0;
+            const ety = arr.child;
+            const ok = switch (Type.class(ip, ety)) {
+                .vector => Type.abiSize(ip, ety) == 16,
+                else => scalarField(ip, ety),
+            };
+            return if (ok) @intCast(arr.len) else 0;
+        },
         else => return 0,
     }
     const k = Type.fieldCount(ip, agg);
-    if (k == 0 or k > max_fields) return 0;
+    if (k == 0 or k > max_struct_fields) return 0;
     for (0..k) |f| {
         if (Type.comptimeFieldValue(ip, agg, f) != .none) return 0;
-        const fty = Type.fieldType(ip, agg, f);
-        switch (Type.class(ip, fty)) {
-            .bool => {},
-            .int => if (Type.intInfo(ip, fty).bits > 64 or Type.intInfo(ip, fty).bits == 0) return 0,
-            .@"enum" => if (Type.abiSize(ip, fty) == 0 or Type.abiSize(ip, fty) > 8) return 0,
-            .float => if (fty != .f32_type and fty != .f64_type) return 0,
-            .pointer => {
-                const pi = Type.ptrInfo(ip, fty);
-                if (pi.flags.size == .c or pi.packed_offset.host_size != 0) return 0;
-            },
-            else => return 0,
-        }
+        if (!scalarField(ip, Type.fieldType(ip, agg, f))) return 0;
     }
     return @intCast(k);
 }
@@ -347,6 +381,22 @@ fn wholeLoad(ir: *const Ir, v: Inst.Ref) ?u32 {
         i = @backingInt(ir.refSlice(x.end, x.data.len)[sf.index].toIndex() orelse return null);
     }
     return if (tags[i] == .load) i else null;
+}
+
+/// Whether a field of type `fty` is a runtime scalar a split struct's
+/// local may hold.
+fn scalarField(ip: *const InternPool, fty: Index) bool {
+    return switch (Type.class(ip, fty)) {
+        .bool => true,
+        .int => Type.intInfo(ip, fty).bits <= 64 and Type.intInfo(ip, fty).bits != 0,
+        .@"enum" => Type.abiSize(ip, fty) != 0 and Type.abiSize(ip, fty) <= 8,
+        .float => fty == .f32_type or fty == .f64_type,
+        .pointer => blk: {
+            const pi = Type.ptrInfo(ip, fty);
+            break :blk pi.flags.size != .c and pi.packed_offset.host_size == 0;
+        },
+        else => false,
+    };
 }
 
 /// `Scan.root` of a load from other memory than a candidate's.
@@ -420,6 +470,8 @@ const Scan = struct {
             .store => s.operand == 0 or (itself and s.aliasStore(r)),
             // Of the struct itself; a field's own fields are not split.
             .struct_field_ptr => itself,
+            // Of the array itself, at a constant index.
+            .ptr_elem_ptr => itself and s.operand == 0 and s.constElem(r),
             // As an argument (`Sync`), or in a tuple of an inline call's
             // arguments.
             .call => itself and s.operand != 0 and s.passed_len < s.passed.len,
@@ -448,6 +500,17 @@ const Scan = struct {
         if (!info.flags.is_const or info.child != ir.instructions.items(.data)[r].ty) return false;
         s.alias[p] = r;
         return true;
+    }
+
+    /// Whether the `ptr_elem_ptr` being scanned indexes candidate `r`, an
+    /// array, at a constant index within it.
+    fn constElem(s: *const Scan, r: u32) bool {
+        const ir = s.ir;
+        const agg = Type.ptrInfo(s.ip, ir.instructions.items(.data)[r].ty).child;
+        if (s.ip.keyTag(agg) != .array_type) return false;
+        const bin = ir.extraData(Ir.Bin, ir.instructions.items(.data)[s.cur].ty_pl.payload).data;
+        const k = elemIndex(s.ip, bin.rhs) orelse return false;
+        return k < Type.fieldCount(s.ip, agg);
     }
 
     /// The candidate `i` is, itself or as a load of its `alias`.
@@ -501,9 +564,11 @@ const Scan = struct {
                     s.fields[i] = k;
                     try s.events.append(s.gpa, inst);
                 },
-                .struct_field_ptr => {
+                .struct_field_ptr, .ptr_elem_ptr => {
                     const p = @backingInt(@as(Inst.Ref, @fromBackingInt(ir.extra[data.ty_pl.payload])).toIndex() orelse continue);
                     if (s.root[p] != p and s.same[p] == 0) continue;
+                    // `use` ruled out the alloc if the index is not constant.
+                    if (s.fields[s.rootOf(p)] == 0) continue;
                     s.root[i] = s.rootOf(p);
                     try s.events.append(s.gpa, inst);
                 },
@@ -654,7 +719,7 @@ const Sync = struct {
             const a = f[0];
             var saved: u64 = 0;
             for (0..n) |i| {
-                if (tags[i] == .struct_field_ptr and s.root[i] == a and sy.pos[i] != none) saved += sy.weight[i];
+                if ((tags[i] == .struct_field_ptr or tags[i] == .ptr_elem_ptr) and s.root[i] == a and sy.pos[i] != none) saved += sy.weight[i];
             }
             var cost: u64 = 0;
             for (scratch.syncs.items) |x| {
