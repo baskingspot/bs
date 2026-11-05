@@ -9980,9 +9980,9 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
         if (s.flags.size == .one and ip.keyTag(d.child) == .array_type) {
             const b = ip.keyPayload(.array_type, d.child);
             // `*[N:s]T` to `*[N]T`.
-            if (s_array) |a| return a.len == b.len and b.sentinel == .none and
-                (a.child == b.child or sema.pointeeCoercible(a.child, b.child, d.flags.is_const));
-            // `*T` to `*[1]T`.
+            if (s_array) |a| if (a.len == b.len and b.sentinel == .none and
+                (a.child == b.child or sema.pointeeCoercible(a.child, b.child, d.flags.is_const))) return true;
+            // `*T` to `*[1]T`, arrays included (`*[3]u8` to `*[1][3]u8`).
             return b.len == 1 and b.child == s.child and b.sentinel == .none;
         }
         return false;

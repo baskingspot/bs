@@ -27,9 +27,11 @@ fn name(comptime e: E) [*:0]const u8 {
 
 fn main() callconv(.c) noreturn {
     var byte: u8 = 4;
-    // `*T` to `*[1]T`, and `[N:0]T` to `[N]T`.
+    // `*T` to `*[1]T`, arrays too (`*[1]u8` to `*[1][1]u8`), and `[N:0]T`
+    // to `[N]T`.
     const one: *[1]u8 = &byte;
-    rt.printInt(one[0]);
+    const nested: *[1][1]u8 = one;
+    rt.printInt(nested[0][0]);
     var s: S = .{ .data = "abcd".*, .f = seven };
     _ = &s;
     rt.print(&s.data);
