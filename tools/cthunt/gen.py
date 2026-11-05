@@ -2229,6 +2229,44 @@ class Gen:
         out.append("}")
         return out, "call"
 
+    def t_parent_ptr(self, name):
+        """@fieldParentPtr at comptime of field pointers derived in
+        different ways: the field's address, its first element cast back
+        to the field's type, many-pointer arithmetic back to element 0, and
+        a nested struct's field, then writes through the parent."""
+        sn = self.fresh("FP")
+        n = self.r.randint(2, 4)
+        et = self.ch(["u8", "u16", "u32", "i64"])
+        layout = self.ch(["", "extern "])
+        out = [
+            f"const {sn}_In = {layout}struct {{ k: u8, arr: [{n}]{et} }};",
+            f"const {sn} = {layout}struct {{ w: u16, inner: {sn}_In, tail: u8 }};",
+            f"const {name} = blk: {{",
+            f"    var o: {sn} = .{{ .w = 1, .inner = .{{ .k = 2, .arr = @splat(3) }}, .tail = 4 }};",
+        ]
+        how = self.ch(
+            [
+                "&o.inner.arr",
+                "@ptrCast(&o.inner.arr[0])",
+                "@ptrCast(o.inner.arr[1..].ptr - 1)",
+                f"@ptrCast(@as([*]{et}, &o.inner.arr))",
+                "o.inner.arr[0..]",
+            ]
+        )
+        out.append(f"    const ap: *[{n}]{et} = {how};")
+        out.append(f'    const ip: *{sn}_In = @fieldParentPtr("arr", ap);')
+        out.append(f"    ip.k += {self.r.randint(1, 9)};")
+        if self.p(0.6):
+            out.append(f'    const op: *{sn} = @alignCast(@fieldParentPtr("inner", ip));')
+            out.append("    op.tail += op.inner.k;")
+            out.append("    op.w = @intCast(op.inner.arr.len);")
+        else:
+            out.append(f'    const kp: *{sn}_In = @alignCast(@fieldParentPtr("k", &ip.k));')
+            out.append("    kp.arr[0] += 1;")
+        out.append("    break :blk .{ o.w, o.inner.k + @as(u32, @intCast(o.inner.arr[0])), o.tail };")
+        out.append("};")
+        return out, "any"
+
     def t_target(self, name):
         """Target-dependent layout and C types: sizes, alignments and
         offsets of extern and packed structs holding C integer types,
@@ -2326,6 +2364,7 @@ class Gen:
         (t_destructure, 3),
         (t_target, 3),
         (t_zeroed, 2),
+        (t_parent_ptr, 2),
     )
 
     def test(self, i):
