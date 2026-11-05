@@ -2136,7 +2136,7 @@ const CandidateNames = enum {
 /// what replaced the name if 0.17 removed it (`diag.migrationHint`).
 /// Declarations of another file count only if `pub`.
 fn withCandidates(sema: *Sema, err: CompileError, ty: Index, name: []const u8, which: CandidateNames) CompileError {
-    sema.addCandidates(ty, name, which) catch |e| return e;
+    try sema.addCandidates(ty, name, which);
     return err;
 }
 
