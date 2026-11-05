@@ -56,6 +56,20 @@ pub fn lowers(cg: *CodeGen, inst: Inst.Index) ?enum { pair, gpr } {
     };
 }
 
+/// The pair operand whose registers `inst`'s pair may take when the
+/// operand dies there (`Live.tie`): the first operand of the operations
+/// that `Out.pick` lets compute in it, all but multiplication.
+pub fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    const ref: Ref = switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .add_wrap, .sub_wrap, .bit_and, .bit_or, .xor, .shl, .shr => data.bin_op.lhs,
+        .not, .intcast, .trunc, .bitcast => data.ty_op.operand,
+        else => return Ssa.no_tie,
+    };
+    const i = ref.toIndex() orelse return Ssa.no_tie;
+    return if (lowers(cg, inst) == .pair and is128(cg.ip, cg.typeOf(ref))) @backingInt(i) else Ssa.no_tie;
+}
+
 /// Whether `inst` is an overflow operation on 128-bit integers that
 /// `overflow` computes: addition, subtraction, and unsigned
 /// multiplication.

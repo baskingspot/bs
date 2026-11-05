@@ -724,7 +724,7 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
     } else if (cg.inPair(ty) and cg.pairResult(inst)) {
         live.items(.reg)[@backingInt(inst)] = Ssa.want_pair;
-        live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
+        live.items(.tie)[@backingInt(inst)] = int128.tiedOperand(cg, inst);
     }
     return !cg.callFree(inst);
 }
