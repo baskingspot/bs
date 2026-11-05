@@ -1717,12 +1717,29 @@ SSE4.2 and adds `*` and `@reduce(.Mul)` on 8-bit lanes;
 `src/codegen/aarch64/vector.zig` lowers them behind one check at the top
 of `genInst` (`vector.lowers`, `vector.gen`) and the branch-fusion hooks
 (`fusable`, `condFlags`). The IR and memory layout are the same as on
-x86_64; bool vectors are bits in memory or a general register. Every
-value still lives in a stack slot there, and vectors stay memory class,
-so each operation loads its operands' 16-byte chunks into scratch V
-registers (v0–v7, v16–v19) with `ldr q` (a shorter vector with the load
-of its size, which zeroes the rest of the register), computes, and
-stores the result's chunks. Lanes: `add`, `sub`, `mul` (no 64-bit),
+x86_64. Vectors of at most 16 bytes may keep one of v20-v29 (see the
+aarch64-macos allocation note above); the rest, and those that cross a
+call, live in slots, and each operation loads their 16-byte chunks into
+scratch V registers (v0–v7, v16–v19) with `ldr q` (a shorter vector
+with the load of its size, which zeroes the rest of the register),
+computes, and stores the result's chunks.
+
+A bool vector is bits (as in memory) in a slot, or a lane mask in its V
+register: `vector.planMasks`, before allocation, picks as masks the
+compares of at most 16 bytes of lanes, and the bitwise ops on them,
+whose every user reads a mask (`@reduce`, a select's predicate, bitwise
+ops, a bitcast to an integer; a block result or a returned value is
+bits); such a value is a mask only if it then gets a register
+(`maskLane`), since a slot holds bits. Masks never reach generic CodeGen: compares write them
+in place, `and`/`orr`/`eor`/`mvn` combine them, `@reduce(.Or/.And)`
+reads up to 8 bytes in x9 (`fmov`) and more with `umaxv`/`uminv`,
+selects at another lane width convert them with `ext`, `sxtl` or `xtn`
+(`maskChunk`), `firstTrue`/`lastTrue` narrow them (`shrn #4` for bytes,
+`xtn` for wider lanes) before `rbit`/`clz`, and a bitcast or a bits
+user gathers them as compares' results are (`bitsOf`). An operand that
+is bits where a mask is needed is spread with `dup` and `cmtst`.
+
+Lanes: `add`, `sub`, `mul` (no 64-bit),
 `and`/`orr`/`eor`/`mvn`, `smin`/`umin` and `smax`/`umax` (64-bit lanes
 through `cmgt`/`cmhi` and `bsl`), `fadd` ... `fdiv`, `fneg`, `fabs`,
 `fsqrt`, and `fminnm`/`fmaxnm` (the scalar lowering's NaN rule).
@@ -1742,8 +1759,7 @@ between): `@reduce(.Or/.And)` of a compare reads the lane masks with
 `umaxv`/`uminv` and makes no bits, and the select of `firstTrue` and
 `lastTrue` (below) becomes `rbit`/`clz` of the predicate's bits. A
 reduce of bits that only its block's branch reads is fused into the
-branch, as on x86_64. Not yet: deferred (in-place) loads, and keeping
-vectors in V registers, which waits for register allocation there.
+branch, as on x86_64. Not yet: deferred (in-place) loads.
 
 Measured on a Mac satellite (Apple M-series, mac.medium; ReleaseFast bs
 against the scalarizing parent, 64 MiB inputs, best of 5;

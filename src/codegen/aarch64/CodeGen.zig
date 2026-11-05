@@ -110,6 +110,9 @@ tmp_slots: std.ArrayList(Mem) = .empty,
 tmp_next: u32 = 0,
 /// Some value lives in v20-v29 (`allocateRegs`).
 vregs: bool = false,
+/// Per instruction, the lane width in bytes of a bool vector that may
+/// live as a lane mask (`vector.planMasks`), or 0; empty when none may.
+mask_lanes: []u8 = &.{},
 /// As `tmp_slots`, of 16 bytes (`tempSlot16`).
 tmp16_slots: std.ArrayList(Mem) = .empty,
 tmp16_next: u32 = 0,
@@ -250,6 +253,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.e.deinit();
         gpa.free(cg.homes);
         gpa.free(cg.labels);
+        gpa.free(cg.mask_lanes);
         cg.dbg_inlines.deinit(gpa);
         cg.dbg_inline_names.deinit(gpa);
         cg.dbg_inline_callees.deinit(gpa);
@@ -272,6 +276,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         // preserve_none passes arguments in x20-x28, where values live, and
         // its callee clobbers them all, so such functions get no registers.
         if (cg.fn_ty.cc == .aarch64_preserve_none or cg.callsPreserveNone()) f.no_regs = true;
+        if (!f.no_regs) try vector.planMasks(&cg);
         // `clobbers` marks the values that want a register.
         try f.liveness(gpa, ir, &cg);
         try f.plan(gpa, ir, ip, &cg);
@@ -675,7 +680,7 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
     if (cg.inGpr(ty) or cg.inFloat(ty)) {
         live.items(.reg)[@backingInt(inst)] = if (cg.inGpr(ty)) Ssa.want_reg else Ssa.want_float;
         live.items(.tie)[@backingInt(inst)] = cg.tiedOperand(inst);
-    } else if (cg.inVec(ty)) {
+    } else if (cg.inVec(ty) or vector.wantsMask(cg, inst)) {
         live.items(.reg)[@backingInt(inst)] = Ssa.want_vec;
         live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
     }

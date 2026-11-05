@@ -13,7 +13,8 @@
 //! register holds anything past its bytes.
 //! Bool vectors of up to 64 elements are their bits in memory or a
 //! general-purpose register (element `i` is bit `i`; bits above the
-//! length are 0), as on x86_64. Lanes past a vector's length (the padding
+//! length are 0), as on x86_64, except those that live as lane masks in
+//! a V register ("Lane masks" below). Lanes past a vector's length (the padding
 //! of a `@Vector(3, u32)`) hold anything; compares and reductions ignore
 //! them.
 //!
@@ -29,6 +30,7 @@ const Ref = Inst.Ref;
 const Type = @import("../../Type.zig");
 const Encoder = @import("Encoder.zig");
 const CodeGen = @import("CodeGen.zig");
+const Ssa = @import("../Ssa.zig");
 const shared = @import("../vector.zig");
 const Lane = shared.Lane;
 const Reg = Encoder.Reg;
@@ -102,7 +104,7 @@ pub fn lowers(cg: *CodeGen, inst: Inst.Index) bool {
         .neg_float, .abs_float, .sqrt => ip.keyTag(cg.typeOf(data.un_op)) == .vector_type,
         .not, .intcast, .trunc => ip.keyTag(data.ty_op.ty) == .vector_type,
         .aggregate_init => isSplat(cg, data),
-        .bitcast => storedBitcast(cg, inst),
+        .bitcast => storedBitcast(cg, inst) or maskLane(cg, data.ty_op.operand) != null,
         .load => loadedBitcast(cg, inst) != null,
         else => false,
     };
@@ -122,12 +124,21 @@ fn isSplat(cg: *CodeGen, data: Inst.Data) bool {
 pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error!void {
     const ip = cg.ip;
     switch (tag) {
-        .bitcast => {}, // the store after it stores the operand (`stored`)
+        // A mask's bits, or nothing: the store after it stores the
+        // operand (`stored`).
+        .bitcast => if (maskLane(cg, data.ty_op.operand) != null) {
+            try bitsOf(cg, .x10, data.ty_op.operand);
+            try cg.setResult(inst, data.ty_op.ty, .x10);
+        },
         .load => {}, // the bitcast after it loads (`loaded`)
         .intcast, .trunc => try cast(cg, inst, data.ty_op.ty, data.ty_op.operand),
         .cmp_vector => {
             if (absorbed(cg, inst)) return; // computed by its reduce
             const x = cg.ir.extraData(Ir.VectorCmp, data.ty_pl.payload).data;
+            if (maskLane(cg, inst.toRef()) != null) {
+                const src_ty = cg.typeOf(x.lhs);
+                return compareMask(cg, shape(ip, src_ty).?, isSigned(cg, src_ty), x.operator(), x.lhs, x.rhs, 0, cg.homes[@backingInt(inst)].vreg);
+            }
             try compare(cg, inst, data.ty_pl.ty, x.operator(), x.lhs, x.rhs);
         },
         .reduce => {
@@ -174,8 +185,12 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
         .not => {
             const ty = data.ty_op.ty;
             if (isBits(ip, ty)) {
+                if (maskLane(cg, inst.toRef())) |w| {
+                    const a = try maskChunk(cg, data.ty_op.operand, 0, w, .v0);
+                    return emit(cg, misc(1, 0, 0b00101, cg.homes[@backingInt(inst)].vreg, a));
+                }
                 const len = ip.keyPayload(.vector_type, ty).len;
-                try cg.load(.x9, data.ty_op.operand);
+                try bitsOf(cg, .x9, data.ty_op.operand);
                 if (len == 64) try cg.e.mvn(.x, .x9, .x9) else try cg.e.logic(.eor, .x, .x9, .x9, .{ .imm = lenMask(len) });
                 return cg.setResult(inst, ty, .x9);
             }
@@ -190,8 +205,18 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
         else => {
             const ty = cg.typeOf(data.bin_op.lhs);
             if (isBits(ip, ty)) {
-                try cg.load(.x9, data.bin_op.lhs);
-                try cg.load(.x10, data.bin_op.rhs);
+                if (maskLane(cg, inst.toRef())) |w| {
+                    const a = try maskChunk(cg, data.bin_op.lhs, 0, w, .v0);
+                    const b = try maskChunk(cg, data.bin_op.rhs, 0, w, .v1);
+                    return bitwise(cg, switch (tag) {
+                        .bit_and => .@"and",
+                        .bit_or => .orr,
+                        .xor => .eor,
+                        else => unreachable,
+                    }, cg.homes[@backingInt(inst)].vreg, a, b);
+                }
+                try bitsOf(cg, .x9, data.bin_op.lhs);
+                try bitsOf(cg, .x10, data.bin_op.rhs);
                 try cg.e.logic(switch (tag) {
                     .bit_and => .@"and",
                     .bit_or => .orr,
@@ -356,6 +381,10 @@ pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
 pub fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
     const x = cg.ir.extraData(Ir.Reduce, cg.ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload).data;
     if (fusedCmp(cg, inst)) |c| return cmpFlags(cg, c, x.operation());
+    if (maskLane(cg, x.operand)) |w| if (x.operation() != .xor) {
+        const len = cg.ip.keyPayload(.vector_type, cg.typeOf(x.operand)).len;
+        return maskFlags(cg, x.operation(), (try cg.locOf(x.operand)).vreg, len * w);
+    };
     return reduceBitsFlags(cg, x.operation(), x.operand);
 }
 
@@ -370,9 +399,13 @@ fn cmpFlags(cg: *CodeGen, inst: Inst.Index, op: Ir.ReduceOp) Error!Encoder.Cond 
     const any = op == .@"or";
     const chunks = s.chunks();
     const tail = s.len * s.lane.bytes() - (chunks - 1) * 16;
+    if (chunks == 1) {
+        try compareMask(cg, s, isSigned(cg, src_ty), x.operator(), x.lhs, x.rhs, 0, .v0);
+        return maskFlags(cg, op, .v0, tail);
+    }
     for (0..chunks) |kk| {
         const k: u32 = @intCast(kk);
-        try compareMask(cg, s, isSigned(cg, src_ty), x.operator(), x.lhs, x.rhs, k);
+        try compareMask(cg, s, isSigned(cg, src_ty), x.operator(), x.lhs, x.rhs, k, .v0);
         if (k == chunks - 1 and tail != 16) {
             var keep: [16]u8 = @splat(0);
             @memset(keep[0..tail], 0xff);
@@ -439,10 +472,32 @@ fn reduceIndex(cg: *CodeGen, inst: Inst.Index, ty: Index, op: Ir.ReduceOp, si: I
     const len = ip.keyPayload(.vector_type, cg.typeOf(sel.pred)).len;
     const m = ip.intValue(u64, ip.keyPayload(.aggregate, sel.b.toInterned().?).storage.repeated_elem).?;
     const e = &cg.e;
-    try cg.load(.x9, sel.pred);
-    // Bits above the length may be padding read from memory, unless the
-    // bits fill the bytes the load reads.
-    if (len != 8 and len != 16 and len != 32 and len != 64) try e.logic(.@"and", .x, .x9, .x9, .{ .imm = lenMask(len) });
+    // Each lane's bits in x9: one, or for a mask, the lane narrowed to a
+    // byte (four bits of each byte lane, shrn)
+    var lane_shift: u6 = 0;
+    if (maskLane(cg, sel.pred)) |w| {
+        const v = (try cg.locOf(sel.pred)).vreg;
+        if (w == 1) {
+            try emit(cg, shiftImm(0, 0, 0b10000, 12, .v0, v)); // shrn v0.8b, v.8h, #4
+        } else {
+            try emit(cg, xtn(laneSize(intLane(w / 2)), .v0, v));
+        }
+        try cg.e.fmovToGpr(.x, .x9, .f64, .v0);
+        lane_shift = switch (w) {
+            1 => 2,
+            2 => 3,
+            4 => 4,
+            8 => 5,
+            else => unreachable,
+        };
+        const used = @as(u64, len) << lane_shift;
+        if (used < 64) try e.logic(.@"and", .x, .x9, .x9, .{ .imm = lenMask(@intCast(used)) });
+    } else {
+        try cg.load(.x9, sel.pred);
+        // Bits above the length may be padding read from memory, unless the
+        // bits fill the bytes the load reads.
+        if (len != 8 and len != 16 and len != 32 and len != 64) try e.logic(.@"and", .x, .x9, .x9, .{ .imm = lenMask(len) });
+    }
     if (op == .min) {
         try e.bitOp(.rbit, .x, .x10, .x9);
         try e.bitOp(.clz, .x, .x10, .x10);
@@ -453,9 +508,222 @@ fn reduceIndex(cg: *CodeGen, inst: Inst.Index, ty: Index, op: Ir.ReduceOp, si: I
         try e.addSub(.sub, .x, .x10, .x11, .r(.x10));
         try e.movImm(.x, .x11, 0);
     }
+    if (lane_shift != 0) try e.shiftImm(.lsr, .x, .x10, .x10, lane_shift);
     try e.cmp(.x, .x9, .{ .imm = 0 });
     try e.csel(.csel, .x, .x10, .x11, .x10, .eq);
     try cg.setResult(inst, ty, .x10);
+}
+
+// ---------------------------------------------------------------------------
+// Lane masks
+//
+// A bool vector that a compare of one register's lanes computes, or a
+// bitwise operation on such, may live as its lane mask in a V register:
+// each lane all ones or all zeros, at the compare's lane width, so that
+// reductions (umaxv, uminv), selects (bsl) and bitwise operations read it
+// directly, and only a bitcast to an integer, firstTrue or a user of the
+// bits pays for them. `planMasks` picks the candidates, whose every user
+// reads a mask; those the allocator gives a V register are masks
+// (`maskLane`), the rest bits. Lanes past the length hold anything.
+
+/// Marks the mask candidates in `cg.mask_lanes` with their lane width in
+/// bytes: compares of at most 16 bytes of lanes, and bitwise operations
+/// on bool vectors with a candidate operand (whose width they take), that
+/// only `readsMask` users read.
+pub fn planMasks(cg: *CodeGen) Error!void {
+    const ir = cg.ir;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const values = cg.ssa.values.items(.inst);
+    for (values) |inst| {
+        if (cmpLane(cg, inst) != 0) break;
+    } else return;
+    const lanes = try cg.gpa.alloc(u8, ir.instructions.len);
+    @memset(lanes, 0);
+    cg.mask_lanes = lanes;
+    // 0xff marks a value some user reads as bits.
+    const Reads = struct {
+        cg: *CodeGen,
+        user: ?Inst.Index,
+        pub fn use(r: @This(), ref: Ref) void {
+            const i = ref.toIndex() orelse return;
+            if (r.user == null or !readsMask(r.cg, r.user.?, ref)) r.cg.mask_lanes[@backingInt(i)] = 0xff;
+        }
+    };
+    for (values) |inst| Ssa.forEachOperand(ir, inst, Reads{ .cg = cg, .user = inst });
+    const term_reads: Reads = .{ .cg = cg, .user = null };
+    for (cg.ssa.blocks.items) |b| switch (b.term.tag) {
+        .jump, .branch => if (tags[@backingInt(b.term.inst)] == .br) term_reads.use(datas[@backingInt(b.term.inst)].br.operand),
+        .ret => term_reads.use(datas[@backingInt(b.term.inst)].un_op),
+        else => {},
+    };
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (values) |inst| {
+            const i = @backingInt(inst);
+            if (lanes[i] != 0) continue;
+            lanes[i] = cmpLane(cg, inst);
+            if (lanes[i] == 0 and isBoolOp(cg, inst)) {
+                const Find = struct {
+                    lanes: []const u8,
+                    w: u8 = 0,
+                    pub fn use(f: *@This(), ref: Ref) void {
+                        const x = ref.toIndex() orelse return;
+                        const l = f.lanes[@backingInt(x)];
+                        if (f.w == 0 and l != 0 and l != 0xff) f.w = l;
+                    }
+                };
+                var find: Find = .{ .lanes = lanes };
+                Ssa.forEachOperand(ir, inst, &find);
+                lanes[i] = find.w;
+            }
+            changed = changed or lanes[i] != 0;
+        }
+    }
+    for (lanes) |*l| if (l.* == 0xff) {
+        l.* = 0;
+    };
+}
+
+/// The lane width of compare `inst` when its lanes fill at most one
+/// register, else 0.
+fn cmpLane(cg: *CodeGen, inst: Inst.Index) u8 {
+    if (cg.ir.instructions.items(.tag)[@backingInt(inst)] != .cmp_vector) return 0;
+    const x = cg.ir.extraData(Ir.VectorCmp, cg.ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload).data;
+    const s = shape(cg.ip, cg.typeOf(x.lhs)) orelse return 0;
+    return if (s.size <= 16) @intCast(s.lane.bytes()) else 0;
+}
+
+fn isBoolOp(cg: *CodeGen, inst: Inst.Index) bool {
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    return switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .bit_and, .bit_or, .xor => isBits(cg.ip, cg.typeOf(data.bin_op.lhs)),
+        .not => isBits(cg.ip, data.ty_op.ty),
+        else => false,
+    };
+}
+
+/// Whether `user` reads bool vector operand `ref` as a mask when it is
+/// one: reductions, a select's predicate, bitwise operations, and bitcasts
+/// to an integer.
+fn readsMask(cg: *CodeGen, user: Inst.Index, ref: Ref) bool {
+    const data = cg.ir.instructions.items(.data)[@backingInt(user)];
+    return switch (cg.ir.instructions.items(.tag)[@backingInt(user)]) {
+        .reduce => true,
+        .select => cg.ir.extraData(Ir.Select, data.ty_pl.payload).data.pred == ref,
+        .bitcast => Type.class(cg.ip, data.ty_op.ty) == .int,
+        else => isBoolOp(cg, user),
+    };
+}
+
+/// For `CodeGen.clobbers`: whether `inst` wants a V register for its lane
+/// mask.
+pub fn wantsMask(cg: *CodeGen, inst: Inst.Index) bool {
+    return cg.mask_lanes.len != 0 and cg.mask_lanes[@backingInt(inst)] != 0;
+}
+
+/// The lane width in bytes of bool vector `ref`'s mask when it is one,
+/// else null: it is its bits.
+fn maskLane(cg: *CodeGen, ref: Ref) ?u32 {
+    const i = ref.toIndex() orelse return null;
+    if (!wantsMask(cg, i) or cg.homes[@backingInt(i)] != .vreg) return null;
+    return cg.mask_lanes[@backingInt(i)];
+}
+
+fn intLane(bytes: u32) Lane {
+    return switch (bytes) {
+        1 => .i8,
+        2 => .i16,
+        4 => .i32,
+        8 => .i64,
+        else => unreachable,
+    };
+}
+
+/// Sets the flags for `@reduce(.Or)` (any lane true) or `@reduce(.And)`
+/// (all lanes true) of the lane mask in `v`, whose first `bytes` bytes
+/// are its lanes; returns the condition that holds when the result is
+/// true. Up to 8 bytes are tested in x9; more, with the rest set to the
+/// identity, by umaxv or uminv.
+fn maskFlags(cg: *CodeGen, op: Ir.ReduceOp, v: VReg, bytes: u32) Error!Encoder.Cond {
+    const any = op == .@"or";
+    if (bytes <= 8) {
+        try cg.e.fmovToGpr(.x, .x9, .f64, v);
+        if (any) {
+            if (bytes == 8) try cg.e.cmp(.x, .x9, .{ .imm = 0 }) else try cg.e.tst(.x, .x9, .{ .imm = lenMask(bytes * 8) });
+            return .ne;
+        }
+        // All of the lanes' bits set: with the rest set too, plus one is 0.
+        if (bytes != 8) try cg.e.logic(.orr, .x, .x9, .x9, .{ .imm = ~lenMask(bytes * 8) });
+        try cg.e.addSub(.add, .x, .x9, .x9, .{ .imm = 1 });
+        try cg.e.cmp(.x, .x9, .{ .imm = 0 });
+        return .eq;
+    }
+    var r = v;
+    if (bytes != 16) {
+        var keep: [16]u8 = @splat(0);
+        @memset(keep[0..bytes], 0xff);
+        if (!any) for (&keep) |*b| {
+            b.* = ~b.*;
+        };
+        try loadConst(cg, .v6, keep);
+        try bitwise(cg, if (any) .@"and" else .orr, .v0, v, .v6);
+        r = .v0;
+    }
+    try emit(cg, across(1, 0, if (any) 0b01010 else 0b11010, .v0, r));
+    try cg.e.fmovToGpr(.w, .x9, .f32, .v0);
+    try cg.e.cmp(.w, .x9, .{ .imm = 0 });
+    return .ne;
+}
+
+/// The register holding the lane mask of bool vector `ref`'s lanes from
+/// `first` on, at lanes of `to` bytes: `ref`'s own when it is a mask of
+/// that width, else `scratch`, converted (ext, then sxtl or xtn) or, from
+/// bits, each lane's bit tested (cmtst). Uses v3, v7 and x9-x11.
+fn maskChunk(cg: *CodeGen, ref: Ref, first: u32, to: u32, scratch: VReg) Error!VReg {
+    if (maskLane(cg, ref)) |w| {
+        var r = (try cg.locOf(ref)).vreg;
+        if (first != 0) {
+            try emit(cg, ext(scratch, r, r, @intCast(first * w)));
+            r = scratch;
+        }
+        var b = w;
+        while (b < to) : (b *= 2) {
+            try emit(cg, shiftImm(0, 0, 0b10100, @as(u7, 8) << laneSize(intLane(b)), scratch, r)); // sxtl
+            r = scratch;
+        }
+        while (b > to) : (b /= 2) {
+            try emit(cg, xtn(laneSize(intLane(b / 2)), scratch, r));
+            r = scratch;
+        }
+        return r;
+    }
+    try bitsOf(cg, .x11, ref);
+    if (first != 0) try cg.e.shiftImm(.lsr, .x, .x11, .x11, @intCast(first));
+    if (to == 1) {
+        // The low byte to lanes 0-7, the next to lanes 8-15.
+        try emit(cg, dupGpr(0, scratch, .x11));
+        try cg.e.shiftImm(.lsr, .x, .x10, .x11, 8);
+        try emit(cg, dupGpr(0, .v3, .x10));
+        try emit(cg, 0x6e180400 | vn(.v3) << 5 | vn(scratch)); // ins scratch.d[1], v3.d[0]
+    } else {
+        try emit(cg, dupGpr(laneSize(intLane(to)), scratch, .x11));
+    }
+    try loadConst(cg, .v7, bitWeights(to));
+    try emit(cg, same(0, laneSize(intLane(to)), 0b10001, scratch, scratch, .v7)); // cmtst
+    return scratch;
+}
+
+/// Loads bool vector `ref`'s bits into `d`: a mask's, weighted and
+/// summed (`toBits`), with the bits past its length cleared. Uses v0, v7.
+fn bitsOf(cg: *CodeGen, d: Reg, ref: Ref) Error!void {
+    const w = maskLane(cg, ref) orelse return cg.load(d, ref);
+    const len = cg.ip.keyPayload(.vector_type, cg.typeOf(ref)).len;
+    try loadConst(cg, .v7, bitWeights(w));
+    try move(cg, .v0, (try cg.locOf(ref)).vreg);
+    try toBits(cg, .{ .lane = intLane(w), .len = len, .size = 16 }, d);
+    if (len < 16 / w) try cg.e.logic(.@"and", .x, d, d, .{ .imm = lenMask(len) });
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +781,12 @@ fn ext(d: VReg, n: VReg, m: VReg, imm: u4) u32 {
 /// `tbl`/`tbx vd.16b, {vn.16b - vn+regs-1}, vm.16b`.
 fn tbl(extend: bool, regs: u32, d: VReg, n: VReg, m: VReg) u32 {
     return 0x4e000000 | vn(m) << 16 | (regs - 1) << 13 | @as(u32, @intFromBool(extend)) << 12 | vn(n) << 5 | vn(d);
+}
+
+/// `xtn vd.Tb, vn.Ta`: each lane's low half, into the low 64 bits; `size`
+/// is the narrow lanes' element size.
+fn xtn(size: u2, d: VReg, n: VReg) u32 {
+    return 0x0e212800 | @as(u32, size) << 22 | vn(n) << 5 | vn(d);
 }
 
 /// `uzp1 vd.T, vn.T, vm.T`: the even lanes of `n` then of `m`.
@@ -847,8 +1121,9 @@ fn shift(cg: *CodeGen, inst: Inst.Index, left: bool, ty: Index, lhs: Ref, rhs: R
 // ---------------------------------------------------------------------------
 // Compares, selects, and reductions
 
-/// Computes in v0 the lane mask of `lhs op rhs` for chunk `k`. Uses v1.
-fn compareMask(cg: *CodeGen, s: Shape, signed: bool, op: std.math.CompareOperator, lhs: Ref, rhs: Ref, k: u32) Error!void {
+/// Computes in `d` the lane mask of `lhs op rhs` for chunk `k`. Uses v0
+/// and v1.
+fn compareMask(cg: *CodeGen, s: Shape, signed: bool, op: std.math.CompareOperator, lhs: Ref, rhs: Ref, k: u32, d: VReg) Error!void {
     const a = try srcChunk(cg, lhs, k, .v0);
     const b = try srcChunk(cg, rhs, k, .v1);
     const swap = op == .lt or op == .lte;
@@ -856,20 +1131,20 @@ fn compareMask(cg: *CodeGen, s: Shape, signed: bool, op: std.math.CompareOperato
     if (s.lane.isFloat()) {
         const sz: u2 = s.sz();
         try emit(cg, switch (op) {
-            .eq, .neq => same(0, sz, 0b11100, .v0, n, m),
-            .gt, .lt => same(1, 0b10 | sz, 0b11100, .v0, n, m),
-            .gte, .lte => same(1, sz, 0b11100, .v0, n, m),
+            .eq, .neq => same(0, sz, 0b11100, d, n, m),
+            .gt, .lt => same(1, 0b10 | sz, 0b11100, d, n, m),
+            .gte, .lte => same(1, sz, 0b11100, d, n, m),
         });
     } else {
         const es = s.esize();
         const u: u1 = @intFromBool(!signed);
         try emit(cg, switch (op) {
-            .eq, .neq => same(1, es, 0b10001, .v0, n, m),
-            .gt, .lt => same(u, es, 0b00110, .v0, n, m),
-            .gte, .lte => same(u, es, 0b00111, .v0, n, m),
+            .eq, .neq => same(1, es, 0b10001, d, n, m),
+            .gt, .lt => same(u, es, 0b00110, d, n, m),
+            .gte, .lte => same(u, es, 0b00111, d, n, m),
         });
     }
-    if (op == .neq) try emit(cg, misc(1, 0, 0b00101, .v0, .v0));
+    if (op == .neq) try emit(cg, misc(1, 0, 0b00101, d, d));
 }
 
 /// The bits of lane mask v0 (shape `s`), weighted by v7 (`bitWeights`),
@@ -908,7 +1183,7 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
     const per = s.perReg();
     for (0..s.chunks()) |kk| {
         const k: u32 = @intCast(kk);
-        try compareMask(cg, s, signed, op, lhs, rhs, k);
+        try compareMask(cg, s, signed, op, lhs, rhs, k, .v0);
         try toBits(cg, s, if (k == 0) .x10 else .x9);
         if (k != 0) try cg.e.logic(.orr, .x, .x10, .x10, .{ .reg = .{ .reg = .x9, .amount = @intCast(k * per) } });
     }
@@ -923,9 +1198,18 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
 fn select(cg: *CodeGen, inst: Inst.Index, ty: Index, pred: Ref, a: Ref, b: Ref) Error!void {
     const s = shape(cg.ip, ty).?;
     const dst = try dest(cg, inst, ty) orelse return;
+    const per = s.perReg();
+    if (maskLane(cg, pred) != null) {
+        for (0..s.chunks()) |kk| {
+            const k: u32 = @intCast(kk);
+            try move(cg, .v2, try maskChunk(cg, pred, k * per, s.lane.bytes(), .v2));
+            try bitwise(cg, .bsl, .v2, try srcChunk(cg, a, k, .v0), try srcChunk(cg, b, k, .v1));
+            try storeChunk(cg, dst, .v2, s, k);
+        }
+        return;
+    }
     try loadConst(cg, .v7, bitWeights(s.lane.bytes()));
     try cg.load(.x11, pred);
-    const per = s.perReg();
     for (0..s.chunks()) |kk| {
         const k: u32 = @intCast(kk);
         const bits: Reg = if (k == 0) .x11 else .x9;
@@ -949,7 +1233,7 @@ fn select(cg: *CodeGen, inst: Inst.Index, ty: Index, pred: Ref, a: Ref, b: Ref) 
 /// returns the condition that holds when the result is true.
 fn reduceBitsFlags(cg: *CodeGen, op: Ir.ReduceOp, operand: Ref) Error!Encoder.Cond {
     const len = cg.ip.keyPayload(.vector_type, cg.typeOf(operand)).len;
-    try cg.load(.x9, operand);
+    try bitsOf(cg, .x9, operand);
     // Bits above the length may be padding read from memory, unless the
     // bits fill the bytes the load reads.
     const exact = len == 8 or len == 16 or len == 32 or len == 64;
