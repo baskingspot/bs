@@ -16970,8 +16970,11 @@ fn switchItem(sema: *Sema, block: *Block, src: Src, switch_inst: Zir.Inst.Index,
             const body = sema.code.bodySlice(extra_index.*, len);
             extra_index.* += len;
             // The result type of item bodies is `.{ .coerce_ty = switch_inst }`.
+            // A switch on an error union's error maps `switch_inst` to the
+            // error for its prongs; that mapping comes back after.
+            const prev = sema.inst_map.get(switch_inst) orelse .none;
             try sema.inst_map.put(sema.gpa, switch_inst, .fromInterned(operand_ty));
-            defer sema.inst_map.remove(switch_inst);
+            defer sema.inst_map.items[@backingInt(switch_inst) - sema.inst_map.start] = prev;
             break :blk try sema.resolveInlineBody(block, body, switch_inst);
         },
         // A declaration of the operand type, else an enum literal.
