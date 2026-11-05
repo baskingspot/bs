@@ -2404,6 +2404,8 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         .content, .link, .input => {},
     };
 
+    rp.dropGoneComptime();
+
     var g: Graph = .{ .r = .{ .gpa = gpa, .zcu = zcu } };
     defer g.deinit();
     const r = &g.r;

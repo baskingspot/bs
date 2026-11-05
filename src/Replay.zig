@@ -1329,6 +1329,19 @@ fn namespaceOutdated(r: *Replay, n: u32) bool {
     return false;
 }
 
+/// `comptime` declarations an edit reached that analysis never ran: the
+/// walk made their namespaces again (an outdated root does that,
+/// `namespaceOutdated`), whose scans queue every `comptime` declaration
+/// they have, so these are gone, with their effects (container-level
+/// assembly, `@export`s). Not those in compiler_rt files not loaded.
+pub fn dropGoneComptime(r: *Replay) void {
+    for (r.unvisited.items) |n| {
+        if (r.m.node(n).tag != @backingInt(Tag.comptime_decl) or r.state[n] != .unknown) continue;
+        if (r.inUnloadedCompilerRt(n)) continue;
+        r.die(n);
+    }
+}
+
 fn die(r: *Replay, n: u32) void {
     r.dead.set(n);
     r.state[n] = .red;

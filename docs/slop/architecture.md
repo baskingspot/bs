@@ -1167,7 +1167,12 @@ into the module's code, on all three targets.
   assembly ran again"). A lazy build that leaves the unit green takes its
   atom from the pack. Checked by test/run/global_asm.zig on x86_64-linux
   and aarch64-linux (edit builds with the block green, a relink equal to
-  a full build) and run on a Mac satellite for aarch64-macos.
+  a full build) and run on a Mac satellite for aarch64-macos. A removed
+  block's unit is outdated but never analyzed again (its namespace's
+  scan no longer makes it), so a lazy build takes such `comptime`
+  units for gone (`Replay.dropGoneComptime`), with their effects;
+  before, it linked the assembly still (test/run/edit_global_asm_gone.zig,
+  found by tools/edithunt's assembly edits).
 
 ### Optimizing backend (designed 2026-11-03, accepted by the owner; being built)
 
