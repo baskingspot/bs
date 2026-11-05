@@ -2,19 +2,22 @@
 //! NEON (Advanced SIMD) on V registers, 16 bytes of lanes at a time
 //! (docs/slop/architecture.md, "Vectors").
 //!
-//! Values: every value lives in a stack slot (`CodeGen`), so each
-//! operation loads its operands' 16-byte chunks into scratch V registers,
-//! computes, and stores the result's chunks. A vector of less than 16
-//! bytes (its size is a power of two, `Type.abiSize`) is loaded with the
-//! load of its size, which zeroes the rest of the register; lane-wise
-//! operations run on the whole register and store the vector's bytes.
+//! Values: a vector of at most 16 bytes may live in one of v20-v29
+//! (`inVreg`, `CodeGen.allocateRegs`); others live in stack slots. Each
+//! operation reads its operands' 16-byte chunks from their registers or
+//! loads them into scratch V registers, computes, and writes the result's
+//! chunks to its register or slot. A vector of less than 16 bytes (its
+//! size is a power of two, `Type.abiSize`) is loaded with the load of its
+//! size, which zeroes the rest of the register; lane-wise operations run
+//! on the whole register and store the vector's bytes, so a vector's own
+//! register holds anything past its bytes.
 //! Bool vectors of up to 64 elements are their bits in memory or a
 //! general-purpose register (element `i` is bit `i`; bits above the
 //! length are 0), as on x86_64. Lanes past a vector's length (the padding
 //! of a `@Vector(3, u32)`) hold anything; compares and reductions ignore
 //! them.
 //!
-//! Scratch: v0-v7 and v16-v19 (no value lives in a register), x9-x14 as
+//! Scratch: v0-v7, v16-v19, v30 and v31 (no value lives there), x9-x14 as
 //! the scalar lowerings use them, and x16 and x17 for addresses.
 
 const std = @import("std");
@@ -99,6 +102,8 @@ pub fn lowers(cg: *CodeGen, inst: Inst.Index) bool {
         .neg_float, .abs_float, .sqrt => ip.keyTag(cg.typeOf(data.un_op)) == .vector_type,
         .not, .intcast, .trunc => ip.keyTag(data.ty_op.ty) == .vector_type,
         .aggregate_init => isSplat(cg, data),
+        .bitcast => storedBitcast(cg, inst),
+        .load => loadedBitcast(cg, inst) != null,
         else => false,
     };
 }
@@ -117,6 +122,8 @@ fn isSplat(cg: *CodeGen, data: Inst.Data) bool {
 pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error!void {
     const ip = cg.ip;
     switch (tag) {
+        .bitcast => {}, // the store after it stores the operand (`stored`)
+        .load => {}, // the bitcast after it loads (`loaded`)
         .intcast, .trunc => try cast(cg, inst, data.ty_op.ty, data.ty_op.operand),
         .cmp_vector => {
             if (absorbed(cg, inst)) return; // computed by its reduce
@@ -147,7 +154,7 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
         .neg_float, .abs_float, .sqrt => {
             const ty = cg.typeOf(data.un_op);
             const s = shape(ip, ty).?;
-            const dst = try cg.resultMem(inst, ty) orelse return;
+            const dst = try dest(cg, inst, ty) orelse return;
             const u: u1, const op: u5 = switch (tag) {
                 .neg_float => .{ 1, 0b01111 },
                 .abs_float => .{ 0, 0b01111 },
@@ -155,9 +162,9 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
                 else => unreachable,
             };
             for (0..s.chunks()) |k| {
-                try loadChunk(cg, .v0, data.un_op, @intCast(k));
-                try emit(cg, misc(u, 0b10 | @as(u2, s.sz()), op, .v0, .v0));
-                try storeChunk(cg, dst, .v0, s, @intCast(k));
+                const r = destReg(dst, .v0);
+                try emit(cg, misc(u, 0b10 | @as(u2, s.sz()), op, r, try srcChunk(cg, data.un_op, @intCast(k), .v0)));
+                try storeChunk(cg, dst, r, s, @intCast(k));
             }
         },
         .aggregate_init => {
@@ -173,11 +180,11 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
                 return cg.setResult(inst, ty, .x9);
             }
             const s = shape(ip, ty).?;
-            const dst = try cg.resultMem(inst, ty) orelse return;
+            const dst = try dest(cg, inst, ty) orelse return;
             for (0..s.chunks()) |k| {
-                try loadChunk(cg, .v0, data.ty_op.operand, @intCast(k));
-                try emit(cg, misc(1, 0, 0b00101, .v0, .v0));
-                try storeChunk(cg, dst, .v0, s, @intCast(k));
+                const r = destReg(dst, .v0);
+                try emit(cg, misc(1, 0, 0b00101, r, try srcChunk(cg, data.ty_op.operand, @intCast(k), .v0)));
+                try storeChunk(cg, dst, r, s, @intCast(k));
             }
         },
         else => {
@@ -204,7 +211,9 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
 // A compare or select whose only user is the reduce right after it in its
 // block is not emitted (`absorbed`): the reduce computes from its operands,
 // which nothing between overwrites, since no value is defined between
-// (and, for a reduce its branch computes, none after it either).
+// (and, for a reduce its branch computes, none after it either). A
+// bitcast of a vector whose only user is the store right after it is not
+// emitted either (`storedBitcast`).
 
 fn isDbg(tag: Inst.Tag) bool {
     return tag == .dbg_stmt or tag == .dbg_inline_begin or tag == .dbg_inline_end;
@@ -262,6 +271,76 @@ fn fusedCmp(cg: *CodeGen, inst: Inst.Index) ?Inst.Index {
     if (cg.ir.instructions.items(.tag)[@backingInt(c)] != .cmp_vector) return null;
     if (absorber(cg, c) != inst) return null;
     return c;
+}
+
+/// Whether bitcast `inst`, of a vector of lanes to an array or vector of
+/// its size (the coercion before storing a vector into an array), is not
+/// emitted: its only user is the store right after it, which stores the
+/// operand instead (`stored`), saving a copy of the vector.
+fn storedBitcast(cg: *CodeGen, inst: Inst.Index) bool {
+    const insts = fromHere(cg, inst) orelse return false;
+    const ip = cg.ip;
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op;
+    const src_ty = cg.typeOf(data.operand);
+    if (shape(ip, src_ty) == null) return false;
+    if (ip.keyTag(data.ty) != .array_type and ip.keyTag(data.ty) != .vector_type) return false;
+    if (Type.abiSize(ip, data.ty) != Type.abiSize(ip, src_ty)) return false;
+    const live = cg.ssa.live.slice();
+    if (live.items(.uses)[@backingInt(inst)] != 1 or live.items(.fate)[@backingInt(inst)] != .normal) return false;
+    const tags = cg.ir.instructions.items(.tag);
+    for (insts[1..]) |x| {
+        if (isDbg(tags[@backingInt(x)])) continue;
+        return tags[@backingInt(x)] == .store and cg.ir.instructions.items(.data)[@backingInt(x)].bin_op.rhs == inst.toRef();
+    }
+    return false;
+}
+
+/// The bitcast that loads for load `inst`, which is not emitted: the
+/// load's only user, right after it, converting an array or vector to a
+/// vector of its size in a register.
+fn loadedBitcast(cg: *CodeGen, inst: Inst.Index) ?Inst.Index {
+    const insts = fromHere(cg, inst) orelse return null;
+    const live = cg.ssa.live.slice();
+    if (live.items(.uses)[@backingInt(inst)] != 1 or live.items(.fate)[@backingInt(inst)] != .normal) return null;
+    const tags = cg.ir.instructions.items(.tag);
+    // Not a load of a variable, which `Ssa.plan` may forward or promote
+    // so that it has no memory.
+    const ptr = cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op.operand;
+    if (ptr.toIndex()) |p| if (tags[@backingInt(p)] == .alloc) return null;
+    for (insts[1..]) |x| {
+        if (isDbg(tags[@backingInt(x)])) continue;
+        // A bitcast a store absorbs is not emitted to load either.
+        if (tags[@backingInt(x)] != .bitcast or !bitcastToVreg(cg, x) or storedBitcast(cg, x)) return null;
+        if (cg.ir.instructions.items(.data)[@backingInt(x)].ty_op.operand != inst.toRef()) return null;
+        return x;
+    }
+    return null;
+}
+
+/// Whether bitcast `inst` loads its result's vector register from its
+/// operand, an array or vector of the same size outside general-purpose
+/// registers (`CodeGen` lowers the rest).
+pub fn bitcastToVreg(cg: *CodeGen, inst: Inst.Index) bool {
+    if (cg.homes[@backingInt(inst)] != .vreg) return false;
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op;
+    const src_ty = cg.typeOf(data.operand);
+    return !cg.inGpr(src_ty) and Type.abiSize(cg.ip, data.ty) == Type.abiSize(cg.ip, src_ty);
+}
+
+/// For a bitcast to a vector register: the pointer to load from, when
+/// its operand is a load it absorbs (`loadedBitcast`).
+pub fn loaded(cg: *CodeGen, operand: Ref) ?Ref {
+    const i = operand.toIndex() orelse return null;
+    if (cg.ir.instructions.items(.tag)[@backingInt(i)] != .load or loadedBitcast(cg, i) == null) return null;
+    return cg.ir.instructions.items(.data)[@backingInt(i)].ty_op.operand;
+}
+
+/// The value store operand `val` stands for: the vector a bitcast before
+/// the store converts (`storedBitcast`), else `val`.
+pub fn stored(cg: *CodeGen, val: Ref) Ref {
+    const i = val.toIndex() orelse return val;
+    if (cg.ir.instructions.items(.tag)[@backingInt(i)] != .bitcast or !storedBitcast(cg, i)) return val;
+    return cg.ir.instructions.items(.data)[@backingInt(i)].ty_op.operand;
 }
 
 /// For `CodeGen.fusable`: whether `inst` is an `@reduce(.Or)` or
@@ -470,12 +549,59 @@ fn loadChunk(cg: *CodeGen, r: VReg, ref: Ref, k: u32) Error!void {
             try cg.e.fmovFromGpr(.f64, r, .x, .x9);
         },
         .none => try zero(cg, r),
+        .vreg => |v| try move(cg, r, v),
         // Vectors have no general register (`CodeGen.inGpr`).
-        .addr, .err, .reg, .freg => unreachable,
+        .addr, .err, .reg => unreachable,
     }
 }
 
-fn loadMem(cg: *CodeGen, r: VReg, m: Mem, bytes: u32) Error!void {
+/// The register holding 16-byte chunk `k` of vector `ref`: its own, or
+/// `scratch` loaded with it (`loadChunk`). Only reads of the result may
+/// follow.
+fn srcChunk(cg: *CodeGen, ref: Ref, k: u32, scratch: VReg) Error!VReg {
+    if (try cg.locOf(ref) == .vreg) return (try cg.locOf(ref)).vreg;
+    try loadChunk(cg, scratch, ref, k);
+    return scratch;
+}
+
+/// The register to compute a chunk of `dst` in: its own, or `scratch`
+/// for `storeChunk` to store.
+fn destReg(dst: Dst, scratch: VReg) VReg {
+    return switch (dst) {
+        .reg => |r| r,
+        .mem => scratch,
+    };
+}
+
+/// Loads vector `ref`, of at most 16 bytes, into `r`.
+pub fn loadVec(cg: *CodeGen, r: VReg, ref: Ref) Error!void {
+    try loadChunk(cg, r, ref, 0);
+}
+
+/// `mov d.16b, s.16b`.
+pub fn move(cg: *CodeGen, d: VReg, s: VReg) Error!void {
+    if (d != s) try bitwise(cg, .orr, d, s, s);
+}
+
+/// Whether vectors of type `ty` live in a vector register when the
+/// allocator gives them one (`CodeGen.inVreg`): those of at most 16 bytes
+/// of lanes, which are one chunk.
+pub fn inVreg(ip: *const InternPool, ty: Index) bool {
+    const s = shape(ip, ty) orelse return false;
+    return s.size <= 16;
+}
+
+/// Where an instruction's vector result goes: its register, or memory.
+const Dst = union(enum) { mem: Mem, reg: VReg };
+
+/// The destination of vector result `inst`, or null when it has no bits.
+fn dest(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Dst {
+    if (cg.homes[@backingInt(inst)] == .vreg) return .{ .reg = cg.homes[@backingInt(inst)].vreg };
+    return .{ .mem = try cg.resultMem(inst, ty) orelse return null };
+}
+
+/// Loads the `bytes` bytes (1 to 16, a power of two) at `m` into `r`.
+pub fn loadMem(cg: *CodeGen, r: VReg, m: Mem, bytes: u32) Error!void {
     const a = try cg.access(m, bytes, .x16);
     switch (bytes) {
         16 => try cg.e.ldrQ(r, a),
@@ -491,9 +617,19 @@ fn loadMem(cg: *CodeGen, r: VReg, m: Mem, bytes: u32) Error!void {
 }
 
 /// Stores `r` as chunk `k` of a vector of shape `s` at `dst`.
-fn storeChunk(cg: *CodeGen, dst: Mem, r: VReg, s: Shape, k: u32) Error!void {
-    const bytes = @min(s.size, 16);
-    const a = try cg.access(dst.plus(16 * k), bytes, .x17);
+fn storeChunk(cg: *CodeGen, dst: Dst, r: VReg, s: Shape, k: u32) Error!void {
+    switch (dst) {
+        .reg => |h| {
+            std.debug.assert(k == 0);
+            try move(cg, h, r);
+        },
+        .mem => |m| try storeMem(cg, m.plus(16 * k), r, @min(s.size, 16)),
+    }
+}
+
+/// Stores the low `bytes` bytes (1 to 16, a power of two) of `r` at `m`.
+pub fn storeMem(cg: *CodeGen, m: Mem, r: VReg, bytes: u32) Error!void {
+    const a = try cg.access(m, bytes, .x17);
     switch (bytes) {
         16 => try cg.e.strQ(r, a),
         8 => try cg.e.strFp(.f64, r, a),
@@ -562,43 +698,43 @@ fn elemValue(ip: *const InternPool, val: Index, i: usize) Index {
 fn arith(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void {
     const s = shape(cg.ip, ty).?;
     const signed = isSigned(cg, ty);
-    const dst = try cg.resultMem(inst, ty) orelse return;
+    const dst = try dest(cg, inst, ty) orelse return;
     const sz: u2 = s.sz();
     const es = s.esize();
     for (0..s.chunks()) |kk| {
         const k: u32 = @intCast(kk);
-        try loadChunk(cg, .v0, lhs, k);
-        try loadChunk(cg, .v1, rhs, k);
-        var r: VReg = .v0;
+        const a = try srcChunk(cg, lhs, k, .v0);
+        const b = try srcChunk(cg, rhs, k, .v1);
+        var r = destReg(dst, .v0);
         switch (tag) {
-            .add_wrap => try emit(cg, same(0, es, 0b10000, .v0, .v0, .v1)),
-            .sub_wrap => try emit(cg, same(1, es, 0b10000, .v0, .v0, .v1)),
-            .mul_wrap => try emit(cg, same(0, es, 0b10011, .v0, .v0, .v1)),
-            .bit_and => try bitwise(cg, .@"and", .v0, .v0, .v1),
-            .bit_or => try bitwise(cg, .orr, .v0, .v0, .v1),
-            .xor => try bitwise(cg, .eor, .v0, .v0, .v1),
-            .min_int, .max_int => r = try minMax(cg, tag == .max_int, es, signed, .v0, .v1),
-            .add_float => try emit(cg, same(0, sz, 0b11010, .v0, .v0, .v1)),
-            .sub_float => try emit(cg, same(0, 0b10 | sz, 0b11010, .v0, .v0, .v1)),
-            .mul_float => try emit(cg, same(1, sz, 0b11011, .v0, .v0, .v1)),
-            .div_float => try emit(cg, same(1, sz, 0b11111, .v0, .v0, .v1)),
+            .add_wrap => try emit(cg, same(0, es, 0b10000, r, a, b)),
+            .sub_wrap => try emit(cg, same(1, es, 0b10000, r, a, b)),
+            .mul_wrap => try emit(cg, same(0, es, 0b10011, r, a, b)),
+            .bit_and => try bitwise(cg, .@"and", r, a, b),
+            .bit_or => try bitwise(cg, .orr, r, a, b),
+            .xor => try bitwise(cg, .eor, r, a, b),
+            .min_int, .max_int => r = try minMax(cg, tag == .max_int, es, signed, r, a, b),
+            .add_float => try emit(cg, same(0, sz, 0b11010, r, a, b)),
+            .sub_float => try emit(cg, same(0, 0b10 | sz, 0b11010, r, a, b)),
+            .mul_float => try emit(cg, same(1, sz, 0b11011, r, a, b)),
+            .div_float => try emit(cg, same(1, sz, 0b11111, r, a, b)),
             // fmaxnm and fminnm, as the scalar lowering: a NaN operand
             // yields the other.
-            .max_float => try emit(cg, same(0, sz, 0b11000, .v0, .v0, .v1)),
-            .min_float => try emit(cg, same(0, 0b10 | sz, 0b11000, .v0, .v0, .v1)),
+            .max_float => try emit(cg, same(0, sz, 0b11000, r, a, b)),
+            .min_float => try emit(cg, same(0, 0b10 | sz, 0b11000, r, a, b)),
             else => unreachable,
         }
         try storeChunk(cg, dst, r, s, k);
     }
 }
 
-/// `@min` or `@max` of integer lanes in `a` and `b`; returns the register
-/// holding it. Clobbers v2.
-fn minMax(cg: *CodeGen, max: bool, es: u2, signed: bool, a: VReg, b: VReg) Error!VReg {
+/// `@min` or `@max` of integer lanes in `a` and `b`, into `d` or v2;
+/// returns the register holding it. Clobbers v2.
+fn minMax(cg: *CodeGen, max: bool, es: u2, signed: bool, d: VReg, a: VReg, b: VReg) Error!VReg {
     const u: u1 = @intFromBool(!signed);
     if (es != 3) {
-        try emit(cg, same(u, es, if (max) 0b01100 else 0b01101, a, a, b));
-        return a;
+        try emit(cg, same(u, es, if (max) 0b01100 else 0b01101, d, a, b));
+        return d;
     }
     // No 64-bit smax: a > b (cmgt or cmhi), then a bit select.
     try emit(cg, same(u, 3, 0b00110, .v2, a, b));
@@ -608,10 +744,11 @@ fn minMax(cg: *CodeGen, max: bool, es: u2, signed: bool, a: VReg, b: VReg) Error
 
 fn splat(cg: *CodeGen, inst: Inst.Index, ty: Index, elem: Ref) Error!void {
     const s = shape(cg.ip, ty).?;
-    const dst = try cg.resultMem(inst, ty) orelse return;
+    const dst = try dest(cg, inst, ty) orelse return;
     try cg.load(.x9, elem);
-    try emit(cg, dupGpr(s.esize(), .v0, .x9));
-    for (0..s.chunks()) |k| try storeChunk(cg, dst, .v0, s, @intCast(k));
+    const r = destReg(dst, .v0);
+    try emit(cg, dupGpr(s.esize(), r, .x9));
+    for (0..s.chunks()) |k| try storeChunk(cg, dst, r, s, @intCast(k));
 }
 
 /// `@intCast` that widens, or `@truncate`, between integer lanes.
@@ -620,7 +757,7 @@ fn cast(cg: *CodeGen, inst: Inst.Index, ty: Index, operand: Ref) Error!void {
     const src_ty = cg.typeOf(operand);
     const s = shape(ip, src_ty).?;
     const d = shape(ip, ty).?;
-    const dst = try cg.resultMem(inst, ty) orelse return;
+    const dst = try dest(cg, inst, ty) orelse return;
     const widen = d.lane.bytes() > s.lane.bytes();
     const ratio = if (widen) d.lane.bytes() / s.lane.bytes() else s.lane.bytes() / d.lane.bytes();
     const u: u1 = @intFromBool(!isSigned(cg, src_ty));
@@ -673,7 +810,7 @@ fn shift(cg: *CodeGen, inst: Inst.Index, left: bool, ty: Index, lhs: Ref, rhs: R
     const ip = cg.ip;
     const s = shape(ip, ty).?;
     const signed = isSigned(cg, ty);
-    const dst = try cg.resultMem(inst, ty) orelse return;
+    const dst = try dest(cg, inst, ty) orelse return;
     const es = s.esize();
     const bits: u32 = s.lane.bytes() * 8;
     const amount: ?u32 = if (rhs.toInterned()) |v| @intCast(CodeGen.intBits(ip, elemValue(ip, v, 0))) else null;
@@ -681,6 +818,10 @@ fn shift(cg: *CodeGen, inst: Inst.Index, left: bool, ty: Index, lhs: Ref, rhs: R
         switch (try cg.locOf(rhs)) {
             .mem => |m| try cg.e.ldr(.byte, .x9, try cg.access(m, 1, .x16)),
             .imm => |x| try cg.e.movImm(.x, .x9, x & 0xff),
+            .vreg => |v| {
+                try cg.e.fmovToGpr(.w, .x9, .f32, v);
+                try cg.e.logic(.@"and", .w, .x9, .x9, .{ .imm = 0xff });
+            },
             else => unreachable,
         }
         if (!left) try cg.e.addSub(.sub, .x, .x9, .zr, .r(.x9));
@@ -688,17 +829,18 @@ fn shift(cg: *CodeGen, inst: Inst.Index, left: bool, ty: Index, lhs: Ref, rhs: R
     }
     for (0..s.chunks()) |kk| {
         const k: u32 = @intCast(kk);
-        try loadChunk(cg, .v0, lhs, k);
+        const a = try srcChunk(cg, lhs, k, .v0);
+        var r = destReg(dst, .v0);
         if (amount) |n| {
             if (left) {
-                try emit(cg, shiftImm(1, 0, 0b01010, @intCast(bits + n), .v0, .v0));
+                try emit(cg, shiftImm(1, 0, 0b01010, @intCast(bits + n), r, a));
             } else if (n != 0) {
-                try emit(cg, shiftImm(1, @intFromBool(!signed), 0b00000, @intCast(2 * bits - n), .v0, .v0));
-            }
+                try emit(cg, shiftImm(1, @intFromBool(!signed), 0b00000, @intCast(2 * bits - n), r, a));
+            } else r = a;
         } else {
-            try emit(cg, same(@intFromBool(left or !signed), es, 0b01000, .v0, .v0, .v1));
+            try emit(cg, same(@intFromBool(left or !signed), es, 0b01000, r, a, .v1));
         }
-        try storeChunk(cg, dst, .v0, s, k);
+        try storeChunk(cg, dst, r, s, k);
     }
 }
 
@@ -707,10 +849,10 @@ fn shift(cg: *CodeGen, inst: Inst.Index, left: bool, ty: Index, lhs: Ref, rhs: R
 
 /// Computes in v0 the lane mask of `lhs op rhs` for chunk `k`. Uses v1.
 fn compareMask(cg: *CodeGen, s: Shape, signed: bool, op: std.math.CompareOperator, lhs: Ref, rhs: Ref, k: u32) Error!void {
-    try loadChunk(cg, .v0, lhs, k);
-    try loadChunk(cg, .v1, rhs, k);
+    const a = try srcChunk(cg, lhs, k, .v0);
+    const b = try srcChunk(cg, rhs, k, .v1);
     const swap = op == .lt or op == .lte;
-    const n: VReg, const m: VReg = if (swap) .{ .v1, .v0 } else .{ .v0, .v1 };
+    const n: VReg, const m: VReg = if (swap) .{ b, a } else .{ a, b };
     if (s.lane.isFloat()) {
         const sz: u2 = s.sz();
         try emit(cg, switch (op) {
@@ -780,7 +922,7 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
 /// tested against each lane's bit (cmtst), then a bit select.
 fn select(cg: *CodeGen, inst: Inst.Index, ty: Index, pred: Ref, a: Ref, b: Ref) Error!void {
     const s = shape(cg.ip, ty).?;
-    const dst = try cg.resultMem(inst, ty) orelse return;
+    const dst = try dest(cg, inst, ty) orelse return;
     try loadConst(cg, .v7, bitWeights(s.lane.bytes()));
     try cg.load(.x11, pred);
     const per = s.perReg();
@@ -798,9 +940,7 @@ fn select(cg: *CodeGen, inst: Inst.Index, ty: Index, pred: Ref, a: Ref, b: Ref) 
             try emit(cg, dupGpr(s.esize(), .v2, bits));
         }
         try emit(cg, same(0, s.esize(), 0b10001, .v2, .v2, .v7)); // cmtst
-        try loadChunk(cg, .v0, a, k);
-        try loadChunk(cg, .v1, b, k);
-        try bitwise(cg, .bsl, .v2, .v0, .v1);
+        try bitwise(cg, .bsl, .v2, try srcChunk(cg, a, k, .v0), try srcChunk(cg, b, k, .v1));
         try storeChunk(cg, dst, .v2, s, k);
     }
 }
@@ -876,8 +1016,9 @@ fn reduce(cg: *CodeGen, inst: Inst.Index, ty: Index, op: Ir.ReduceOp, operand: R
             while (i < 16) : (i += lb) {
                 for (0..lb) |j| fill[i + j] = @truncate(identity >> @intCast(8 * j));
             }
-            // A short vector's load zeroed the register past its bytes.
-            if (tail < @min(s.size, 16)) {
+            // A short vector's load zeroed the register past its bytes; its
+            // own register holds anything there.
+            if (tail < @min(s.size, 16) or (tail < 16 and try cg.locOf(operand) == .vreg)) {
                 try loadConst(cg, .v6, keep);
                 try bitwise(cg, .@"and", r, r, .v6);
             }
@@ -896,7 +1037,7 @@ fn reduce(cg: *CodeGen, inst: Inst.Index, ty: Index, op: Ir.ReduceOp, operand: R
         .add => if (es == 3) try emit(cg, 0x5ef1b800) else try emit(cg, across(0, es, 0b11011, .v0, .v0)),
         .min, .max => if (es == 3) {
             try emit(cg, ext(.v1, .v0, .v0, 8));
-            const c = try minMax(cg, op == .max, 3, signed, .v0, .v1);
+            const c = try minMax(cg, op == .max, 3, signed, .v0, .v0, .v1);
             if (c != .v0) try bitwise(cg, .orr, .v0, c, c);
         } else {
             try emit(cg, across(u, es, if (op == .max) 0b01010 else 0b11010, .v0, .v0));
@@ -923,7 +1064,7 @@ fn combine(cg: *CodeGen, op: Ir.ReduceOp, es: u2, signed: bool, a: VReg, b: VReg
         .xor => try bitwise(cg, .eor, a, a, b),
         .add => try emit(cg, same(0, es, 0b10000, a, a, b)),
         .mul => try emit(cg, same(0, es, 0b10011, a, a, b)),
-        .min, .max => return minMax(cg, op == .max, es, signed, a, b),
+        .min, .max => return minMax(cg, op == .max, es, signed, a, a, b),
     }
     return a;
 }
@@ -936,7 +1077,7 @@ fn shuffle(cg: *CodeGen, inst: Inst.Index, ty: Index, a: Ref, b: Ref, mask: Inde
     const lb = s.lane.bytes();
     const a_chunks = shape(ip, cg.typeOf(a)).?.chunks();
     const b_shape = shape(ip, cg.typeOf(b));
-    const dst = try cg.resultMem(inst, ty) orelse return;
+    const dst = try dest(cg, inst, ty) orelse return;
     // Each result byte's source byte, counting a's chunks then b's, or
     // null for an undefined lane or padding.
     var src: [shared.max_bytes]?u32 = @splat(null);
