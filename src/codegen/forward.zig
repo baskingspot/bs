@@ -23,27 +23,40 @@ const Type = @import("../Type.zig");
 const Ssa = @import("Ssa.zig");
 
 const none = std.math.maxInt(u32);
+/// `run`'s mark of a local stored more than once, a `Ref` no function has.
+const multi = none - 1;
 
 /// Forwards the copies or the loads that qualify; returns how many.
 pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayList(u32)) Allocator.Error!u32 {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
-    // A function with nothing to forward costs one pass to find that.
+    // A function with nothing to forward costs two passes to find that.
     // There is no load to forward unless a load goes through the same
-    // base pointer as an earlier load or store, or the same local's
-    // pointer reloaded (`self.x`); a hash of each base finds that, also
-    // when two bases share a hash. Loads and stores straight through a
-    // local are left to `Ssa.plan`.
+    // base pointer as another load or store, or the same pointer stored
+    // once into a local and reloaded (`self.x`, also through an inline
+    // call's copy of `self`); a hash of each base finds that, also when
+    // two bases share a hash, in any order, so the decision does not
+    // depend on how instructions or interned values are numbered. Loads
+    // and stores straight through a local are left to `Ssa.plan`.
+    const n = ir.instructions.len;
+    scratch.clearRetainingCapacity();
+    const words = try scratch.addManyAsSlice(gpa, 12 * n + 1);
+    const stored_once = words[0..n];
+    @memset(stored_once, none);
+    for (tags, datas) |tag, data| if (tag == .store) if (data.bin_op.lhs.toIndex()) |a| if (tags[@backingInt(a)] == .alloc) {
+        const v = &stored_once[@backingInt(a)];
+        v.* = if (v.* == none) @backingInt(data.bin_op.rhs) else multi;
+    };
     var copies = false;
     var loaded: u256 = 0;
+    var loaded_twice: u256 = 0;
     var stored: u256 = 0;
-    var reloads = false;
     for (tags, datas) |tag, data| switch (tag) {
-        .load => if (baseHash(ir, data.ty_op.operand)) |h| {
-            reloads = reloads or (loaded | stored) & h != 0;
+        .load => if (baseHash(ir, stored_once, data.ty_op.operand)) |h| {
+            loaded_twice |= loaded & h;
             loaded |= h;
         },
-        .store => if (baseHash(ir, data.bin_op.lhs)) |h| {
+        .store => if (baseHash(ir, stored_once, data.bin_op.lhs)) |h| {
             stored |= h;
         } else if (!copies) {
             // A copy: a store of a load, or of a field of an inline
@@ -58,11 +71,9 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
         },
         else => {},
     };
+    const reloads = loaded_twice | (loaded & stored) != 0;
     if (!copies and !reloads) return 0;
 
-    const n = ir.instructions.len;
-    scratch.clearRetainingCapacity();
-    const words = try scratch.addManyAsSlice(gpa, 12 * n + 1);
     var w: Walk = .{
         .ir = ir,
         .ip = ip,
@@ -111,7 +122,7 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
 /// One bit of 256 for the memory a load or store through `ptr` reaches,
 /// by its base pointer (what `Walk.keyOf` reads, before `Walk.canon`), or
 /// null for a local's own memory, which `Ssa.plan` forwards.
-fn baseHash(ir: *const Ir, ptr: Inst.Ref) ?u256 {
+fn baseHash(ir: *const Ir, stored_once: []const u32, ptr: Inst.Ref) ?u256 {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
     var base = ptr;
@@ -122,12 +133,26 @@ fn baseHash(ir: *const Ir, ptr: Inst.Ref) ?u256 {
             else => {},
         }
     }
-    if (base.toIndex()) |i| if (tags[@backingInt(i)] == .load) {
-        if (datas[@backingInt(i)].ty_op.operand.toIndex()) |a| if (tags[@backingInt(a)] == .alloc) {
+    // A pointer loaded from a local: the pointer stored there, when it
+    // was stored once (`Walk.canon` folds no other), else the local.
+    while (base.toIndex()) |i| {
+        if (tags[@backingInt(i)] != .load) break;
+        const a = datas[@backingInt(i)].ty_op.operand.toIndex() orelse break;
+        if (tags[@backingInt(a)] != .alloc) break;
+        const v = stored_once[@backingInt(a)];
+        if (v == none or v == multi) {
             base = a.toRef();
-        };
-    };
+            break;
+        }
+        base = @fromBackingInt(v);
+    }
     return @as(u256, 1) << @intCast(std.hash.int(@backingInt(base)) % 256);
+}
+
+/// Whether `ref` is a local's own pointer.
+fn isAlloc(ir: *const Ir, ref: Inst.Ref) bool {
+    const i = ref.toIndex() orelse return false;
+    return ir.instructions.items(.tag)[@backingInt(i)] == .alloc;
 }
 
 /// A `const` local of an aggregate, which CodeGen keeps in memory.
@@ -319,7 +344,10 @@ const Walk = struct {
             switch (tags[i]) {
                 .load => {
                     const ty = data.ty_op.ty;
-                    if (w.direct(data.ty_op.operand) or !scalar(ip, ty)) continue;
+                    // A load straight through a local is left alone:
+                    // `Ssa.plan` forwards one whose address does not
+                    // escape, and `run`'s filter looks for no other.
+                    if (isAlloc(ir, data.ty_op.operand) or !scalar(ip, ty)) continue;
                     const key = w.keyOf(data.ty_op.operand) orelse continue;
                     if (w.promoted(key)) continue;
                     const match: ?Known = for (known[0..len]) |k| {

@@ -2112,10 +2112,17 @@ unwinder.
 
 Built on the IR, on the CodeGen workers before proving checks
 (`src/codegen/forward.zig`, from `Emit.generateFunction`), so its cost
-is off the Sema thread. A first pass over the tags skips functions with
+is off the Sema thread. Two passes over the tags skip functions with
 neither a copy (a store of a load, or of an inline call's argument, into
-a `const` aggregate local) nor a load through the base pointer of an
-earlier load or store (by a 256-bit hash of bases). One walk numbers the
+a `const` aggregate local) nor two accesses through one base pointer, one
+of them a load, by a 256-bit hash of bases. A pointer loaded from a local
+stored once hashes as the pointer stored there, as the walk folds it
+(each inline call's copy of `self` is such a local), and the order of the
+accesses does not matter: the filter passes every function the walk
+would forward a load in, so hash collisions, which depend on how
+instructions and interned values are numbered, cost only a walk and
+never change the output (a build that walks every function writes the
+same std and zig binaries). One walk numbers the
 instructions in body order and records, per local, whether its address
 escapes (is used other than to load, store, or derive a field or element
 pointer), its stores and its last use. Dominance is by position: an
@@ -2146,10 +2153,13 @@ rewrites use it:
   overlap, two locals never overlap, a local whose address does not
   escape overlaps nothing reached otherwise, and a returning call forgets
   all but those locals. Panics do not return, so safety checks forget
-  nothing. Values do not flow around loop back edges. Scalar locals whose
-  address does not escape are left alone: `Ssa.plan` forwards and
-  promotes their loads, and forwarding them first only lengthened
-  intervals (fmt +3%).
+  nothing. Values do not flow around loop back edges. Loads straight
+  through a local are left alone: `Ssa.plan` forwards and promotes those
+  of scalar locals whose address does not escape (forwarding them first
+  only lengthened intervals, fmt +3%), and the filter does not look for
+  those of locals whose address escapes, which would walk nearly every
+  function (96% of the zig workload's IR against 66%) for about 200
+  loads.
 
 `BS_FORWARD=off` turns the pass off (its own cache entries, as
 `+noforward`), to compare a program's behavior with and without it;
