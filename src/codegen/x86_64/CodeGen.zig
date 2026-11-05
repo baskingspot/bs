@@ -5122,7 +5122,8 @@ fn memDest(cg: *CodeGen, ptr: Reg, len: Reg, dest: Ref) Error!u64 {
     const ip = cg.ip;
     const p = Type.ptrInfo(ip, cg.typeOf(dest));
     if (p.flags.size == .slice) {
-        try cg.loadQwords(ptr, len, try cg.memOf(dest));
+        // From its registers if it has them, not through a copy in memory.
+        try cg.loadRegs(.{ .lo = ptr, .hi = len }, dest);
         return Type.abiSize(ip, p.child);
     }
     const a = ip.keyPayload(.array_type, p.child);
