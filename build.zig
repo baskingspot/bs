@@ -1721,6 +1721,19 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     src_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&src_run.step);
+    // A C source's strong definition replaces a weak export of the Zig
+    // code, for the Zig code's references too, as in ld.
+    const wdef_exe = b.addRunArtifact(bs);
+    wdef_exe.setName("bs build-exe with a C definition over a weak Zig export");
+    wdef_exe.addArg("build-exe");
+    wdef_exe.addFileArg(b.path("test/link_input/weak_export_main.zig"));
+    wdef_exe.addFileArg(b.path("test/link_input/weak_export.c"));
+    wdef_exe.setEnvironmentVariable("BS_ZIG", zig);
+    const wdef_run = std.Build.Step.Run.create(b, "run bs build with a C definition over a weak Zig export");
+    wdef_run.addFileArg(wdef_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    wdef_run.addCheck(.{ .expect_stderr_exact = "2 20\n" });
+    wdef_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&wdef_run.step);
     // The same for aarch64-linux-gnu, as an -fPIC object and a source, and
     // an executable of C only, run under qemu with aarch64 glibc.
     if (aarch64LinuxGlibcRunner(b)) |runner| {

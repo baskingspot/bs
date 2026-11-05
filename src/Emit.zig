@@ -1868,6 +1868,7 @@ fn findExports(emit: *Emit) !void {
             },
             .uav => |v| try emit.uavKey(v, 0),
         };
+        if (x.linkage == .weak and emit.objectsDefineStrong(name)) continue;
         const entry: ElfObject.Export = .{ .key = key, .name = name, .weak = x.linkage == .weak, .visibility = x.visibility };
         const gop = try seen.getOrPut(emit.gpa, name);
         if (gop.found_existing) {
@@ -2066,6 +2067,16 @@ pub const ptrTarget = CodeGen.ptrTarget;
 /// The symbol the compilation exports as `name`, or null. Of several
 /// exports of one name, the last strong one wins, else the first, as
 /// upstream 0.17.1's linker (a weak export after a definition is ignored).
+/// Whether an input object defines `name` strongly, which then wins
+/// over a weak export of the Zig code, as in ld: a C library's own
+/// `bsearch` over zigc's.
+fn objectsDefineStrong(emit: *const Emit, name: []const u8) bool {
+    const in = emit.inputs orelse return false;
+    return switch (in) {
+        inline else => |p| if (p.defs.get(name)) |d| !d.weak else false,
+    };
+}
+
 pub fn userExport(emit: *Emit, name: []const u8) !?SymbolKey {
     const ip = &emit.zcu.ip;
     const view = emit.exportsView();
@@ -2076,6 +2087,7 @@ pub fn userExport(emit: *Emit, name: []const u8) !?SymbolKey {
         if (pick == null or x.linkage != .weak) pick = i;
     }
     const x = view.list[pick orelse return null];
+    if (x.linkage == .weak and emit.objectsDefineStrong(name)) return null;
     const x_nav = switch (x.target) {
         .nav => |n| n,
         .uav => |v| return try emit.uavKey(v, 0),
