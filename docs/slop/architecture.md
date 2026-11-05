@@ -1117,6 +1117,36 @@ comptime arguments are run-time values in the lowered code (uucode's
   fused multiply-add, every fmov immediate, q-register loads and stores,
   udf, adr, and a 1 MiB relaxation case).
 
+#### x86_64 inline assembly (built 2026-11-05)
+
+Templates are taken as upstream's self-hosted assembler takes them
+(`airAsm`), so that a template assembles with both or neither, to the
+same bytes. The general-purpose instructions go through
+`codegen/x86_64/asm_insn.zig`, a table of instruction kinds:
+
+- An Intel mnemonic with an optional AT&T size suffix (b, w, l, q),
+  which sizes every operand: a register must have that size, a
+  `%[name]` register takes it, and a memory operand needs it unless the
+  instruction's size is fixed (`clflush`, `stmxcsr`, `fnstcw`).
+- `lock` (on a memory destination of an instruction that takes it) and
+  `rep`, `repe` or `repne` (on string instructions), on the
+  instruction's line, emitted before 0x66 as upstream does.
+- Condition families (`setcc`, `cmovcc`, `jcc`) with upstream's
+  condition names, and instructions of CPU features (`popcnt`,
+  `lzcnt`, `rdrand`, ...) only when `-mcpu` has them.
+- Where encodings differ, upstream's: the accumulator forms of `xchg`
+  and the ALU instructions, `d1` for a shift by 1, `cd 03` for
+  `int $3`.
+
+GNU as names upstream does not take (`movzbl`, `cltq`) and unsized
+memory operands are refused with the name or suffix to use. bs also
+refuses what upstream accepts but would fault or silently drop: `lock`
+on a register destination or a `mov`, and a prefix alone on its line.
+`test/run/asm_x86_insns.zig` assembles 241 forms with both compilers
+and compares each with upstream's bytes. `mov`, `lea`, `push`, `pop`,
+branches, `crc32` and the SSE and AES instructions stay in CodeGen's
+`asmInst`.
+
 #### Container-level assembly (built 2026-11-05)
 
 `comptime { asm (...); }` at container level, which upstream's
@@ -9415,9 +9445,12 @@ Where upstream supports more than bs generates code for, bs narrows
 the choice instead of failing:
 
 - *CPU models and features.* bs accepts x86_64 CPU models and features
-  up to x86-64-v2 (SSE4.2, `src/cpu.zig`), plus aes and pclmul, whose
-  instructions inline assembly may use (in their SSE and VEX forms; bs's
-  own code is SSE only), puts them in `builtin.cpu` as upstream does,
+  up to x86-64-v2 (SSE4.2, `src/cpu.zig`), plus aes, pclmul,
+  clflushopt, lzcnt, movbe, prfchw, rdpid, rdrnd and rdseed, whose
+  instructions only inline assembly uses (aes and pclmul in their SSE
+  and VEX forms; bs's own code is SSE only, and neither std nor bs's
+  code generation tests the others), puts them in `builtin.cpu` as
+  upstream does,
   and keys the cache on them. std's AES and GHASH take their asm paths
   only with AVX as well, so they stay on their software ones. As
   upstream, no `-mcpu` means the host's CPU for the native target (also

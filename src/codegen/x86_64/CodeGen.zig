@@ -41,6 +41,8 @@ const Emit = @import("../../Emit.zig");
 const Atom = @import("../../link/Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
+const asm_insn = @import("asm_insn.zig");
+const cpu_mod = @import("../../cpu.zig");
 const Ssa = @import("../Ssa.zig");
 const switch_br = @import("../switch_br.zig");
 const vector = @import("vector.zig");
@@ -6505,7 +6507,9 @@ fn regConstraint(c: []const u8) ?[]const u8 {
     return c[1 .. c.len - 1];
 }
 
-const ParsedReg = struct { reg: Reg, size: Size };
+/// `named` for a `%[name]` operand's register, which a size suffix resizes
+/// (`asm_insn`).
+const ParsedReg = struct { reg: Reg, size: Size, named: bool = false };
 
 fn parseReg(name: []const u8) ?ParsedReg {
     const n = if (name.len > 0 and name[0] == '%') name[1..] else name;
@@ -6610,14 +6614,23 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
         }
         return cg.fail("bs does not support the assembler directive '{s}' yet", .{line});
     }
-    const sp = std.mem.findAny(u8, line, " \t") orelse line.len;
-    const mnemonic = line[0..sp];
-    const arg = std.mem.trim(u8, line[sp..], " \t");
-    if (mnemonic[0] == 'j' and isLocalLabelRef(arg)) {
+    var sp = std.mem.findAny(u8, line, " \t") orelse line.len;
+    // A `lock` or `rep` prefix, on the instruction's line (upstream drops
+    // a prefix alone on its line).
+    const prefix = std.meta.stringToEnum(asm_insn.Prefix, line[0..sp]) orelse .none;
+    var insn = line;
+    if (prefix != .none) {
+        insn = std.mem.trimStart(u8, line[sp..], " \t");
+        if (insn.len == 0) return cg.fail("asm prefix '{s}' without an instruction: put it on the instruction's line ('{s} <instruction>')", .{ line, line });
+        sp = std.mem.findAny(u8, insn, " \t") orelse insn.len;
+    }
+    const mnemonic = insn[0..sp];
+    const arg = std.mem.trim(u8, insn[sp..], " \t");
+    if (prefix == .none and mnemonic[0] == 'j' and isLocalLabelRef(arg)) {
         // A jump to a local label.
         const label = try cg.localLabel(locals, arg, line);
         if (std.mem.eql(u8, mnemonic, "jmp")) return cg.e.jmp(.{ .label = label });
-        const cond = asmCond(mnemonic[1..]) orelse return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
+        const cond = asm_insn.cond(mnemonic[1..]) orelse return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
         return cg.e.jcc(cond, .{ .label = label });
     }
     // The address of a local label: `leaq 0f(%rip), %rdx`.
@@ -6637,7 +6650,7 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
     var operands: [4]AsmOperand = undefined;
     var n: usize = 0;
     // Split at commas outside a memory operand's parentheses.
-    const rest = line[sp..];
+    const rest = insn[sp..];
     var depth: u32 = 0;
     var start: usize = 0;
     for (rest, 0..) |c, k| {
@@ -6655,7 +6668,7 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
         operands[n] = try cg.asmOperand(tok, names, line);
         n += 1;
     }
-    try cg.asmInst(mnemonic, operands[0..n], line);
+    try cg.asmInst(prefix, mnemonic, operands[0..n], line);
 }
 
 /// `1f` or `1b`: a reference to the next or the previous local label `1:`.
@@ -6672,16 +6685,6 @@ fn localLabel(cg: *CodeGen, locals: *LocalLabels, ref: []const u8, line: []const
     return l;
 }
 
-fn asmCond(name: []const u8) ?Encoder.Cond {
-    const conds = [_]struct { []const u8, Encoder.Cond }{
-        .{ "z", .e },   .{ "e", .e },   .{ "nz", .ne }, .{ "ne", .ne }, .{ "b", .b }, .{ "c", .b },
-        .{ "ae", .ae }, .{ "nc", .ae }, .{ "be", .be }, .{ "a", .a },   .{ "l", .l }, .{ "ge", .ge },
-        .{ "le", .le }, .{ "g", .g },   .{ "s", .s },   .{ "ns", .ns }, .{ "o", .o }, .{ "no", .no },
-    };
-    for (conds) |c| if (std.mem.eql(u8, name, c[0])) return c[1];
-    return null;
-}
-
 fn asmOperand(cg: *CodeGen, tok_in: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg), line: []const u8) Error!AsmOperand {
     // `*` marks an indirect call or jump target.
     const tok = if (tok_in.len > 1 and tok_in[0] == '*') tok_in[1..] else tok_in;
@@ -6693,7 +6696,7 @@ fn asmOperand(cg: *CodeGen, tok_in: []const u8, names: *const std.StringHashMapU
         return switch (arg) {
             .imm => |v| .{ .imm = v },
             .sym => |s| .{ .sym = .{ .key = s.key, .off = s.off } },
-            .reg => |r| .{ .reg = r },
+            .reg => |r| .{ .reg = .{ .reg = r.reg, .size = r.size, .named = true } },
             .xmm => |x| .{ .xmm = x },
         };
     }
@@ -6821,23 +6824,50 @@ fn asmSimd(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
     return true;
 }
 
-fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []const u8) Error!void {
-    if (try cg.asmSimd(mnemonic, ops, line)) return;
-    for (ops) |op| if (op == .xmm) return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
-    if (ops.len > 2) return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
+/// One instruction: the general-purpose ones `asm_insn` takes, SSE ones
+/// (`asmSimd`), and `mov`, `lea`, `push`, `pop`, `call`, `jmp` and `crc32`.
+fn asmInst(cg: *CodeGen, prefix: asm_insn.Prefix, mnemonic: []const u8, ops: []const AsmOperand, line: []const u8) Error!void {
+    if (prefix == .none and try cg.asmSimd(mnemonic, ops, line)) return;
+    gpr: {
+        var gpr_ops: [4]asm_insn.Operand = undefined;
+        for (ops, gpr_ops[0..ops.len]) |op, *g| g.* = switch (op) {
+            .reg => |r| .{ .reg = .{ .reg = r.reg, .size = r.size, .named = r.named } },
+            .mem => |m| .{ .mem = .{ .mem = m.mem, .fs = m.fs } },
+            .imm => |v| .{ .imm = v },
+            .xmm, .sym => break :gpr,
+        };
+        const why = try asm_insn.assemble(&cg.e, cg.emit.zcu.cpu, prefix, mnemonic, gpr_ops[0..ops.len]) orelse return;
+        switch (why) {
+            .unknown => {},
+            .alias => |name| return cg.fail("'{s}' is GNU as's name for an instruction that upstream zig's assembler calls '{s}' (it takes Intel mnemonics, with an optional b, w, l or q size suffix): '{s}'", .{ mnemonic, name, line }),
+            .unknown_size => |k| return cg.fail("asm memory operand {d} has no size: give '{s}' a size suffix (b, w, l or q), as upstream zig requires: '{s}'", .{ k + 1, mnemonic, line }),
+            .register_size => |k| return cg.fail("asm register operand {d} does not have the size of the suffix of '{s}': '{s}'", .{ k + 1, mnemonic, line }),
+            .invalid_size => return cg.fail("'{s}' has a fixed operand size; drop the size suffix: '{s}'", .{ mnemonic, line }),
+            .operands => return cg.fail("wrong operands for '{s}': '{s}'", .{ mnemonic, line }),
+            .prefix => return cg.fail("'{t}' cannot prefix this instruction: '{s}'", .{ prefix, line }),
+            .feature => |f| return if (cpu_mod.accepts(f))
+                cg.fail("'{s}' needs the CPU feature {t} (-mcpu=native on a CPU that has it, or -mcpu=x86_64_v2+{t}): '{s}'", .{ mnemonic, f, f, line })
+            else
+                cg.fail("'{s}' needs the CPU feature {t}, which bs does not support: '{s}'", .{ mnemonic, f, line }),
+        }
+    }
+    const unsupported = "bs does not support this inline assembly instruction yet: '{s}'";
+    if (prefix != .none or ops.len > 2) return cg.fail(unsupported, .{line});
+    for (ops) |op| if (op == .xmm) return cg.fail(unsupported, .{line});
     const e = &cg.e;
     const eql = std.mem.eql;
-    // Memory operands of `mov`.
-    if (ops.len == 2 and (ops[0] == .mem or ops[1] == .mem) and std.mem.startsWith(u8, mnemonic, "mov")) {
+    // `mov` (or `movabs`) with an optional size suffix.
+    const is_mov = eql(u8, mnemonic, "mov") or eql(u8, mnemonic, "movabs") or
+        (mnemonic.len == 4 and std.mem.startsWith(u8, mnemonic, "mov") and std.mem.findScalar(u8, "bwlq", mnemonic[3]) != null);
+    const suffix_size: ?Size = if (is_mov and mnemonic.len == 4) switch (mnemonic[3]) {
+        'b' => .byte,
+        'w' => .word,
+        'l' => .dword,
+        else => .qword,
+    } else null;
+    if (is_mov and ops.len == 2 and (ops[0] == .mem or ops[1] == .mem)) {
         const m = if (ops[0] == .mem) ops[0].mem else ops[1].mem;
         const other = if (ops[0] == .mem) ops[1] else ops[0];
-        const suffix_size: ?Size = if (mnemonic.len == 4) switch (mnemonic[3]) {
-            'b' => .byte,
-            'w' => .word,
-            'l' => .dword,
-            'q' => .qword,
-            else => null,
-        } else null;
         if (m.fs) try e.raw(&.{0x64});
         switch (other) {
             .reg => |r| {
@@ -6848,17 +6878,9 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             .imm => |v| if (ops[1] == .mem) return e.mov(suffix_size orelse return cg.fail("asm 'mov' needs a size suffix: '{s}'", .{line}), .{ .mem = m.mem }, .{ .imm = v }),
             else => {},
         }
-        return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
+        return cg.fail(unsupported, .{line});
     }
-    if (ops.len == 0) {
-        if (eql(u8, mnemonic, "syscall")) return e.syscall();
-        if (eql(u8, mnemonic, "ud2")) return e.ud2();
-        if (eql(u8, mnemonic, "int3")) return e.int3();
-        if (eql(u8, mnemonic, "pause")) return e.raw(&.{ 0xf3, 0x90 });
-        if (eql(u8, mnemonic, "cpuid")) return e.raw(&.{ 0x0f, 0xa2 });
-        if (eql(u8, mnemonic, "xgetbv")) return e.raw(&.{ 0x0f, 0x01, 0xd0 });
-        if (eql(u8, mnemonic, "ret") or eql(u8, mnemonic, "retq")) return e.ret();
-    } else if (ops.len == 1) {
+    if (ops.len == 1) {
         if (eql(u8, mnemonic, "call") or eql(u8, mnemonic, "callq") or eql(u8, mnemonic, "jmp") or eql(u8, mnemonic, "jmpq")) switch (ops[0]) {
             .sym => |s| {
                 if (s.off != 0) return cg.fail("asm call with an offset: '{s}'", .{line});
@@ -6874,96 +6896,39 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             .imm => |v| if (std.math.cast(i32, v)) |imm| return e.pushImm(imm),
             .sym, .mem, .xmm => {},
         };
-        if (ops[0] == .reg) {
-            const unary_ops = [_]struct { []const u8, Encoder.UnaryOp }{
-                .{ "div", .div }, .{ "idiv", .idiv }, .{ "mul", .mul }, .{ "neg", .neg }, .{ "not", .not },
-            };
-            for (unary_ops) |op| {
-                const suffixed = mnemonic.len == op[0].len + 1 and std.mem.findScalar(u8, "bwlq", mnemonic[op[0].len]) != null;
-                if (std.mem.startsWith(u8, mnemonic, op[0]) and (mnemonic.len == op[0].len or suffixed))
-                    return e.unary(op[1], ops[0].reg.size, .{ .reg = ops[0].reg.reg });
-            }
-        }
         if ((eql(u8, mnemonic, "pop") or eql(u8, mnemonic, "popq")) and ops[0] == .reg) return e.pop(ops[0].reg.reg);
-    } else if (ops[1] == .reg and ops[0] == .mem and !ops[0].mem.fs and (eql(u8, mnemonic, "lea") or eql(u8, mnemonic, "leaq"))) {
+    } else if (ops.len == 2 and ops[1] == .reg and ops[0] == .mem and !ops[0].mem.fs and (eql(u8, mnemonic, "lea") or eql(u8, mnemonic, "leaq"))) {
         return e.lea(ops[1].reg.size, ops[1].reg.reg, ops[0].mem.mem);
-    } else if (ops[1] == .reg) {
+    } else if (ops.len == 2 and ops[1] == .reg) {
         // AT&T order: source, destination.
         const dst = ops[1].reg;
         // std's Crc32c with SSE4.2 (`-mcpu`): `crc32b %[byte], %[crc]`.
         if (mnemonic.len == 6 and std.mem.startsWith(u8, mnemonic, "crc32")) {
+            if (!cg.emit.zcu.cpu.has(.x86, .crc32)) return cg.fail("'{s}' needs the CPU feature crc32 (-mcpu=native on a CPU that has it, or -mcpu=x86_64_v2): '{s}'", .{ mnemonic, line });
             const src_size: Size = switch (mnemonic[5]) {
                 'b' => .byte,
                 'w' => .word,
                 'l' => .dword,
                 'q' => .qword,
-                else => return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line}),
+                else => return cg.fail(unsupported, .{line}),
             };
             const src: Encoder.Rm = switch (ops[0]) {
                 .reg => |r| .{ .reg = r.reg },
-                .mem => |m| if (m.fs) return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line}) else .{ .mem = m.mem },
-                .imm, .sym, .xmm => return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line}),
+                .mem => |m| if (m.fs) return cg.fail(unsupported, .{line}) else .{ .mem = m.mem },
+                .imm, .sym, .xmm => return cg.fail(unsupported, .{line}),
             };
             return e.crc32(dst.size, src_size, dst.reg, src);
         }
-        // A size suffix, unless it is part of the name (`shl`, `sub`).
-        const known = [_][]const u8{ "mov", "add", "or", "and", "sub", "xor", "cmp", "test", "rol", "ror", "shl", "sal", "shr", "sar", "xchg" };
-        const base = for (known) |k| {
-            if (mnemonic.len == k.len + 1 and std.mem.startsWith(u8, mnemonic, k) and std.mem.findScalar(u8, "bwlq", mnemonic[k.len]) != null) break k;
-        } else mnemonic;
-        const suffix_size: ?Size = if (mnemonic.len > base.len) switch (mnemonic[mnemonic.len - 1]) {
-            'b' => .byte,
-            'w' => .word,
-            'l' => .dword,
-            'q' => .qword,
-            else => null,
-        } else null;
-        const size = suffix_size orelse dst.size;
-        const src: Encoder.Operand = switch (ops[0]) {
-            .reg => |r| .{ .reg = r.reg },
-            .imm => |v| .{ .imm = v },
-            .mem => |m| if (m.fs) return cg.fail("symbol or memory operand in '{s}'", .{line}) else .{ .mem = m.mem },
-            .sym, .xmm => return cg.fail("symbol or memory operand in '{s}'", .{line}),
-        };
-        if (eql(u8, base, "mov") or eql(u8, mnemonic, "movabs")) return e.mov(size, .{ .reg = dst.reg }, src);
-        const alu_ops = [_]struct { []const u8, Encoder.AluOp }{
-            .{ "add", .add }, .{ "or", .@"or" }, .{ "and", .@"and" }, .{ "sub", .sub }, .{ "xor", .xor }, .{ "cmp", .cmp },
-        };
-        for (alu_ops) |op| if (eql(u8, base, op[0])) return e.alu(op[1], size, .{ .reg = dst.reg }, src);
-        if (eql(u8, base, "test")) return e.@"test"(size, .{ .reg = dst.reg }, src);
-        const shift_ops = [_]struct { []const u8, Encoder.ShiftOp }{
-            .{ "rol", .rol }, .{ "ror", .ror }, .{ "shl", .shl }, .{ "sal", .shl }, .{ "shr", .shr }, .{ "sar", .sar },
-        };
-        for (shift_ops) |op| if (eql(u8, base, op[0])) switch (ops[0]) {
-            .imm => |v| return e.shift(op[1], size, .{ .reg = dst.reg }, @truncate(@as(u64, @bitCast(v)))),
-            .reg => |r| if (r.reg == .rcx) return e.shift(op[1], size, .{ .reg = dst.reg }, null),
-            .sym, .mem, .xmm => {},
-        };
-        if (eql(u8, base, "xchg") and ops[0] == .reg) return e.xchg(size, .{ .reg = dst.reg }, ops[0].reg.reg);
-    } else if (ops[1] == .mem and !ops[1].mem.fs and ops[0] != .sym and ops[0] != .mem) {
-        // An ALU operation on memory: compiler_rt's `__zig_probe_stack`
-        // touches each page with `orl $0,16(%rsp)`.
-        const alu_ops = [_]struct { []const u8, Encoder.AluOp }{
-            .{ "add", .add }, .{ "or", .@"or" }, .{ "and", .@"and" }, .{ "sub", .sub }, .{ "xor", .xor }, .{ "cmp", .cmp },
-        };
-        for (alu_ops) |op| {
-            if (!std.mem.startsWith(u8, mnemonic, op[0])) continue;
-            const size: Size = if (mnemonic.len == op[0].len + 1) switch (mnemonic[op[0].len]) {
-                'b' => .byte,
-                'w' => .word,
-                'l' => .dword,
-                'q' => .qword,
-                else => continue,
-            } else if (mnemonic.len == op[0].len and ops[0] == .reg) ops[0].reg.size else continue;
+        if (is_mov) {
             const src: Encoder.Operand = switch (ops[0]) {
                 .reg => |r| .{ .reg = r.reg },
                 .imm => |v| .{ .imm = v },
-                .sym, .mem, .xmm => unreachable,
+                .mem, .sym, .xmm => return cg.fail("symbol or memory operand in '{s}'", .{line}),
             };
-            return e.alu(op[1], size, .{ .mem = ops[1].mem.mem }, src);
+            return e.mov(suffix_size orelse dst.size, .{ .reg = dst.reg }, src);
         }
     }
-    return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
+    return cg.fail(unsupported, .{line});
 }
 
 // ---------------------------------------------------------------------------

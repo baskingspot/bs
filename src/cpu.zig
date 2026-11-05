@@ -1,7 +1,8 @@
 //! The CPU bs generates code for (`-mcpu`): by default the host's,
 //! clamped, for the native target and x86_64's baseline for an explicit
 //! one, as upstream; or a CPU model and features up to x86-64-v2
-//! (SSE4.2), plus AES-NI and PCLMULQDQ, which only inline assembly uses.
+//! (SSE4.2), plus features only inline assembly uses (AES-NI, PCLMULQDQ,
+//! LZCNT, MOVBE, RDRAND and others).
 //! AVX changes the vector ABI and is refused; the host's CPU is clamped
 //! to the supported subset (docs/slop/architecture.md, "Where upstream
 //! supports more").
@@ -13,10 +14,17 @@ const x86 = std.Target.x86;
 /// x86_64's baseline CPU, the default for an explicit target.
 pub const baseline: Cpu = x86.cpu.x86_64.toCpu(.x86_64);
 
-/// The instruction set features bs accepts: x86-64-v2's, and aes and
-/// pclmul for inline assembly (std's `crypto.aes` and
+/// The instruction set features bs accepts: x86-64-v2's, and for inline
+/// assembly (`codegen/x86_64/asm_insn.zig`) aes, pclmul, clflushopt,
+/// lzcnt, movbe, prfchw, rdpid, rdrnd and rdseed, which neither std nor
+/// bs's code generation tests (std's `crypto.aes` and
 /// `crypto.ghash_polyval` take their asm paths only with AVX too).
-const isa = [_]x86.Feature{ .@"64bit", .aes, .cmov, .crc32, .cx16, .cx8, .fxsr, .mmx, .nopl, .pclmul, .popcnt, .sahf, .sse, .sse2, .sse3, .sse4_1, .sse4_2, .ssse3, .x87 };
+const isa = [_]x86.Feature{ .@"64bit", .aes, .clflushopt, .cmov, .crc32, .cx16, .cx8, .fxsr, .lzcnt, .mmx, .movbe, .nopl, .pclmul, .popcnt, .prfchw, .rdpid, .rdrnd, .rdseed, .sahf, .sse, .sse2, .sse3, .sse4_1, .sse4_2, .ssse3, .x87 };
+
+/// Whether bs accepts instruction set feature `f` (`-mcpu`).
+pub fn accepts(f: x86.Feature) bool {
+    return std.mem.findScalar(x86.Feature, &isa, f) != null;
+}
 
 /// Whether feature `name` only tunes code generation (LLVM's tuning
 /// features), which bs ignores and so accepts.
@@ -106,7 +114,7 @@ test resolve {
     const io = std.testing.io;
     try std.testing.expect(resolve(arena, io, "baseline").cpu.model == baseline.model);
     // Models and features up to x86-64-v2, with their tuning features.
-    for ([_][]const u8{ "x86_64_v2", "nehalem", "penryn", "baseline+sse4_1", "x86_64+popcnt-sse3", "westmere", "x86_64_v2+aes+pclmul" }) |ok| {
+    for ([_][]const u8{ "x86_64_v2", "nehalem", "penryn", "baseline+sse4_1", "x86_64+popcnt-sse3", "westmere", "x86_64_v2+aes+pclmul", "x86_64_v2+lzcnt+movbe+prfchw+rdrnd+rdseed+clflushopt+rdpid" }) |ok| {
         try std.testing.expectEqual(null, resolve(arena, io, ok).refused);
     }
     try std.testing.expect(resolve(arena, io, "nehalem").cpu.has(.x86, .sse4_2));

@@ -721,6 +721,39 @@ fn lock0f(e: *Encoder, size: Size, op8: u8, op: u8, dst: Mem, src: Reg) !void {
     }, &.{ 0x0f, if (size == .byte) op8 else op }, @backingInt(src), rmGpr(.{ .mem = dst }), 0);
 }
 
+/// An instruction from inline assembly (`asm_insn.zig`, which picks the
+/// form): legacy prefix `prefix` (0xf2, 0xf3, 0x66 or 0, after the
+/// operand-size override), `opcode`, ModRM with `reg` (a register or an
+/// opcode extension) and `rm`, then an immediate of `imm_len` bytes.
+/// `size` sets the operand-size override (word) and REX.W (qword); null
+/// for instructions whose size is fixed. spl, bpl, sil and dil as byte
+/// operands get a REX prefix.
+pub fn asmModRm(e: *Encoder, size: ?Size, prefix: u8, opcode: []const u8, reg: RegField, rm: Rm, imm: i64, imm_len: u8) !void {
+    try e.reserve();
+    const byte_regs = size == .byte and ((reg == .reg and reg.reg.needsRexAsByte()) or (rm == .reg and rm.reg.needsRexAsByte()));
+    const reg_num: u4 = switch (reg) {
+        .reg => |r| @backingInt(r),
+        .ext => |n| n,
+    };
+    try e.modRm(.{ .prefix = prefix, .op16 = size == .word, .w = size == .qword, .force_rex = byte_regs }, opcode, reg_num, rmGpr(rm), imm_len);
+    switch (imm_len) {
+        0 => {},
+        1 => e.int(u8, @truncate(@as(u64, @bitCast(imm)))),
+        2 => e.int(u16, @truncate(@as(u64, @bitCast(imm)))),
+        4 => e.int(u32, @truncate(@as(u64, @bitCast(imm)))),
+        else => unreachable,
+    }
+}
+
+/// An inline assembly instruction that adds register `r` to its last
+/// opcode byte (`bswap`, the accumulator `xchg`); `size` as `asmModRm`'s.
+pub fn asmO(e: *Encoder, size: Size, opcode: []const u8, r: Reg) !void {
+    try e.reserve();
+    e.prefixes(.{ .w = size == .qword, .b = ext(@backingInt(r)) }, .{ .op16 = size == .word });
+    e.bytes(opcode[0 .. opcode.len - 1]);
+    e.byte(opcode[opcode.len - 1] | r.low());
+}
+
 // ---------------------------------------------------------------- strings
 
 /// `rep movsb`: copies rcx bytes from [rsi] to [rdi], backwards if DF is set.
@@ -1308,7 +1341,7 @@ fn prefixes(e: *Encoder, rex: Rex, o: Opts) void {
     if (bits != 0 or o.force_rex) e.byte(0x40 | bits);
 }
 
-const RegField = union(enum) { reg: Reg, ext: u3 };
+pub const RegField = union(enum) { reg: Reg, ext: u3 };
 
 /// A GPR instruction whose opcode is `op8` for byte operands and `op`
 /// otherwise, with ModRM.reg = `reg` and ModRM.rm = `rm`.
