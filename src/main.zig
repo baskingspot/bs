@@ -1329,6 +1329,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         emit.inputs = target_inputs;
     }
     try zcu.analyzeAll(&emit);
+    try zcu.checkExportCollisions();
     if (bench_runs != 0) try emit.benchCodegen(bench_runs);
     stages.markSplit("sema", "codegen", emit.codegen_ns);
     sema_node.end();

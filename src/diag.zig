@@ -1943,6 +1943,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "export target cannot be slice", .@"bad-export" },
     .{ "export target cannot be extern", .@"bad-export" },
     .{ "exported symbol name cannot be empty", .@"bad-export" },
+    .{ "exported symbol collision: {s}", .@"bad-export" },
     .{ "unable to export type '{f}'", .@"bad-export" },
     .{ "extern variable cannot have type '{f}'", .@"bad-export" },
     .{ "extern symbol cannot have type '{f}'", .@"bad-export" },

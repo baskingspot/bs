@@ -226,6 +226,18 @@ pub const Export = struct {
     /// "Position-independent code" in docs/slop/architecture.md).
     linkage: std.lang.GlobalLinkage = .strong,
     visibility: std.lang.SymbolVisibility = .default,
+    /// Where the export is made, for a collision's error: the `@export`
+    /// call, or the `export` keyword of the declaration, token `keyword`
+    /// of `node` (after `pub`), as upstream.
+    file: u32,
+    node: Ast.Node.Index,
+    keyword: ?u1 = null,
+
+    fn span(x: Export, zcu: *Zcu) !Ast.Span {
+        const tree = try zcu.fe.tree(@fromBackingInt(x.file));
+        const k = x.keyword orelse return tree.nodeToSpan(x.node);
+        return tree.tokenToSpan(tree.firstToken(x.node) + k);
+    }
 };
 
 pub const FuncState = enum { queued, in_progress, done, failed };
@@ -645,6 +657,25 @@ pub fn addDeclNote(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []c
     try zcu.appendNote(.{ .file = file_index, .span = span, .msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args), .decl = true });
 }
 
+/// Fails on two strong exports of one name, as upstream's
+/// `processExports`: an error at the later export, with a note at the
+/// first.
+pub fn checkExportCollisions(zcu: *Zcu) !void {
+    var first: std.AutoHashMapUnmanaged(InternPool.String, usize) = .empty;
+    defer first.deinit(zcu.gpa);
+    for (zcu.exports.items, 0..) |x, i| {
+        if (x.linkage != .strong) continue;
+        const gop = try first.getOrPut(zcu.gpa, x.name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = i;
+            continue;
+        }
+        const other = zcu.exports.items[gop.value_ptr.*];
+        try zcu.addError(x.file, try x.span(zcu), "exported symbol collision: {s}", .{zcu.ip.stringSlice(x.name)});
+        try zcu.addNote(other.file, try other.span(zcu), "other symbol here", .{});
+    }
+}
+
 /// Adds a call-site frame of the comptime or inline call chain to the most
 /// recent error.
 pub fn addCallFrame(zcu: *Zcu, file_index: u32, span: Ast.Span, kind: diag.CallKind) !void {
@@ -1007,7 +1038,7 @@ pub fn createContainerType(
                 try ns.decl_insts.append(zcu.gpa, decl_inst);
                 if (d.linkage == .@"export") {
                     const nav = try zcu.declNav(ns_index, ns.decls.count() - 1);
-                    try zcu.exports.append(zcu.gpa, .{ .target = .{ .nav = nav }, .name = decl_name, .unit = null });
+                    try zcu.exports.append(zcu.gpa, .{ .target = .{ .nav = nav }, .name = decl_name, .unit = null, .file = file_index, .node = zir.instructions.items(.data)[@backingInt(decl_inst)].declaration.src_node, .keyword = @intFromBool(d.is_pub) });
                 }
                 continue;
             },

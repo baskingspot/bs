@@ -7147,7 +7147,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
         .nav => |n| n,
         .uav => |v| {
             if (ip.keyTag(v.val) == .extern_var) return sema.fail(block, src, "export target cannot be extern", .{});
-            try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .uav = v.val }, .name = try sema.getString(name), .unit = sema.owner, .linkage = linkage, .visibility = visibility });
+            try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .uav = v.val }, .name = try sema.getString(name), .unit = sema.owner, .linkage = linkage, .visibility = visibility, .file = sema.file, .node = data.src_node.toAbsolute(block.src_base) });
             return;
         },
         else => return sema.fail(block, src, "export target must be a global variable or a comptime-known constant", .{}),
@@ -7164,7 +7164,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
         else => nav_index,
     };
     if (ip.keyTag(val) == .func) try sema.queueFuncRef(src, val);
-    try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .nav = export_nav }, .name = try sema.getString(name), .unit = sema.owner, .linkage = linkage, .visibility = visibility });
+    try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .nav = export_nav }, .name = try sema.getString(name), .unit = sema.owner, .linkage = linkage, .visibility = visibility, .file = sema.file, .node = data.src_node.toAbsolute(block.src_base) });
 }
 
 /// `@extern(T, .{ .name = ... })`: the address of a symbol defined
