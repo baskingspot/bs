@@ -123,7 +123,8 @@ pub const Live = struct {
     /// From `plan`, for a load of a promoted variable: the variable (an IR
     /// instruction index, or `no_tie`), whose register the load may share
     /// for its whole interval: the variable's interval contains it, and no
-    /// store to the variable lies in it.
+    /// store to the variable lies in it. The variable then crosses a
+    /// clobber point if the load does.
     share: u32,
     /// From `plan`, for a load of a constant that is forwarded: the value
     /// it reads (an IR instruction index), whose home the load shares;
@@ -871,7 +872,11 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
     // After forwarding, which lengthens the intervals of values stored.
     for (f.var_loads.items) |l| {
         const v = datas[l].ty_op.operand.toIndex().?;
-        if (reg[@backingInt(v)] == reg[l] and wants(reg[l])) share[l] = f.shareable(ir, @fromBackingInt(l), v);
+        if (reg[@backingInt(v)] != reg[l] or !wants(reg[l])) continue;
+        share[l] = f.shareable(ir, @fromBackingInt(l), v);
+        // The load may cross a clobber point the variable does not: one in
+        // a block that does not continue, with the load read after it.
+        if (share[l] != no_tie and crosses[l]) crosses[@backingInt(v)] = true;
     }
     // A value whose only use stores it to a promoted variable may be
     // computed in the variable's register (`Live.share`), so the store is
