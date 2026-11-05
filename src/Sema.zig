@@ -17648,8 +17648,12 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     };
     if (else_case) |e| if (e.is_inline) {
         // `inline else` becomes one inline prong per value no other prong
-        // handles.
-        const all = try sema.switchAllValues(parent, else_src, operand_ty, under_prong != null or is_union);
+        // handles. With a comptime-known operand, only its value: as
+        // upstream, only the matching prong is analyzed, so the type need
+        // not be enumerable (a non-exhaustive enum, a wide integer). Not
+        // in a switch loop, whose `continue` dispatches other values.
+        const known: ?Index = if (sb.has_continue) null else if (sema.resolveValue(cond)) |v| if (sema.isUndef(v)) null else v else null;
+        const all = if (known) |*v| v[0..1] else try sema.switchAllValues(parent, else_src, operand_ty, under_prong != null or is_union);
         for (all) |v| {
             for (cases.items) |c| {
                 if (try sema.switchCaseMatches(c, v)) break;
