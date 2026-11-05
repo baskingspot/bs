@@ -1,11 +1,14 @@
 //! exit: 0
-//! stderr: "10 2468acf13579bdfffffffffffffffd0 fdb97530eca864200000000000000030 369d0369d0369cfffffffffffffffe00 20 123456789abcdefffffffffffffffff 8123456676543211fedcba987654321f 7edcba9a7654320e0123456789abcdff \n10 fdb97530eca864200000000000000030 2468acf13579bdfffffffffffffffd0 369d0369d0369cfffffffffffffffe00 20 fedcba9876543210000000000000002f 7edcba9989abcdee0123456789abcdcf 8123456989abcdee0123456789abcdcf \n123456789abcdeffffffffffffffff1 123456789abcdeefffffffffffffff1 8acf135789abcdefffffffeffffffff0 ddc927501a9e732fedcba98765432110 123456789abcdf0fffffffffffffff0 7edcba987654320f8000000000000010 \nfdb97530eca864200000000000000040 100000000000000000 200000000000000000 400000000000000000 0 7f6e5d4c3b2a19080000000000000010 fedcba9876543210 fedcba9 fffffffff6e5d4c3b2a19087f6e5d4c4 ffffffffffffffffffffffffdb97530e ffffffffffffffffffffffffedcba987 ffffffffffffffffffffffffffffffff \n110001110001 110001110001 001101001100 010110010111 \n123456789abcdeffffffffffffffff0 deadbeefcafebabe ffffffffffffffffffffffffffffffb3 ffffffffedcba9876543210fedcba988 ffffffff 19400000000000000000 ffffffffffffffffffffffffffffff88 \n84eea2ede509f5e59223703b7d266e40\n11 2468acf13579bdfffffffffffffffd1 a3d70a3d70a3d6fffffffffffffffa01 1 ffffffffdb97530eca86421fdb97530f de 0 1 2 90fd0056bbeb9f92d0546341327b60 \nff0123456789abce000000000000001e feb851eb851eb8520000000000000022 147ae147ae147adfffffffffffffff41 1 2468acf13579bde02468acf1 6f 0 0 2 121fa00ad77d73f25a0a8c68264f6c \n39f7e3b890d7814b79825911e87d70b6\n369d0369d0369cfffffffffffffffe00 2468acf13579bdfffffffffffffffd0\n6a23bb3dcede7315 6a23bb3dcede7315\n"
+//! stderr: "10 2468acf13579bdfffffffffffffffd0 fdb97530eca864200000000000000030 369d0369d0369cfffffffffffffffe00 20 123456789abcdefffffffffffffffff 8123456676543211fedcba987654321f 7edcba9a7654320e0123456789abcdff \n10 fdb97530eca864200000000000000030 2468acf13579bdfffffffffffffffd0 369d0369d0369cfffffffffffffffe00 20 fedcba9876543210000000000000002f 7edcba9989abcdee0123456789abcdcf 8123456989abcdee0123456789abcdcf \n123456789abcdeffffffffffffffff1 123456789abcdeefffffffffffffff1 8acf135789abcdefffffffeffffffff0 ddc927501a9e732fedcba98765432110 123456789abcdf0fffffffffffffff0 7edcba987654320f8000000000000010 \nfdb97530eca864200000000000000040 100000000000000000 200000000000000000 400000000000000000 0 7f6e5d4c3b2a19080000000000000010 fedcba9876543210 fedcba9 fffffffff6e5d4c3b2a19087f6e5d4c4 ffffffffffffffffffffffffdb97530e ffffffffffffffffffffffffedcba987 ffffffffffffffffffffffffffffffff \n110001110001 110001110001 001101001100 010110010111 \n123456789abcdeffffffffffffffff0 deadbeefcafebabe ffffffffffffffffffffffffffffffb3 ffffffffedcba9876543210fedcba988 ffffffff 19400000000000000000 ffffffffffffffffffffffffffffff88 \n84eea2ede509f5e59223703b7d266e40\n11 2468acf13579bdfffffffffffffffd1 a3d70a3d70a3d6fffffffffffffffa01 1 ffffffffdb97530eca86421fdb97530f de 0 1 2 90fd0056bbeb9f92d0546341327b60 \nff0123456789abce000000000000001e feb851eb851eb8520000000000000022 147ae147ae147adfffffffffffffff41 1 2468acf13579bde02468acf1 6f 0 0 2 121fa00ad77d73f25a0a8c68264f6c \n39f7e3b890d7814b79825911e87d70b6\ndeadbeefcafeba71 ffffffffffffffffffffffd7468acf13 c1b1cd138292fa18b295b2eef140a504 123456789abcdef01234562b 123456789abcdefffffffff789abcd1 3 c1b1cd138292fa18 123456 ffb72ea6 ffffffffedcba987 ffffffffffffffff 1 \n215241103501458e e7 4564f33ec95849c6ff130ce873e1a81 ffffffffedcba9876543210fedcba9d4 fedcba98765432100000000000000023 1 4564f33ec95849c fedcba9 48d159 12345678 0 1 \n369d0369d0369cfffffffffffffffe00 2468acf13579bdfffffffffffffffd0\n6a23bb3dcede7315 6a23bb3dcede7315\n"
+//! targets: x86_64-linux aarch64-macos aarch64-linux
 //! 128-bit integers in register pairs (`int128`): each operation with
 //! register, memory and constant operands, constants whose halves do
 //! not fit an immediate, carries and borrows across the halves, shifts
 //! on both sides of 64, signed and unsigned comparisons that differ only
 //! in the high half or only in the low one, enough live values that
 //! some stay in memory, and a truncation in a loop of a shift before it.
+//! On aarch64 also: widened operands that take their source's register,
+//! and truncations of right shifts by 64 or more, signed and unsigned.
 const std = @import("std");
 
 const big: u128 = 0x8000_0001_ffff_fffe_0123_4567_89ab_cdef;
@@ -104,6 +107,27 @@ noinline fn dot(l: [3]u64, r: [3]u64) u128 {
     return acc;
 }
 
+/// Operands widened from 64 bits or fewer, read by each kind of
+/// operation, and the high halves of products read through shifts.
+noinline fn widen(w: u64, v: i64, u: u32, a: u128, x: i128) [12]u128 {
+    const sw: i128 = @as(i128, v) +% w;
+    const p = @as(i128, v) *% @as(i128, u);
+    return .{
+        @bitCast(sw),
+        @bitCast(p),
+        @as(u128, w) *% w,
+        @bitCast(@as(i128, v) -% x),
+        @as(u128, u) ^ a,
+        @intFromBool(@as(u128, w) < a) | @as(u128, @intFromBool(@as(i128, v) >= x)) << 1 | @as(u128, @intFromBool(@as(u128, u) == @as(u128, @truncate(a)))) << 2,
+        @as(u64, @truncate((@as(u128, w) * w) >> 64)),
+        @as(u64, @truncate(a >> 100)),
+        @as(u32, @truncate(@as(u128, @bitCast(x >> 70)))),
+        @as(u64, @bitCast(@as(i64, @truncate(x >> 64)))),
+        @as(u64, @bitCast(@as(i64, @truncate(p >> 96)))),
+        if (@as(u128, w) +% a > a) 1 else 2,
+    };
+}
+
 /// A truncation inside a loop of a right shift before it: the shifted
 /// value lives through the loop, also when it is a variable's (which
 /// `Ssa.plan` forwards).
@@ -175,6 +199,10 @@ pub fn main() void {
     std.debug.print("\n", .{});
     for (ovf(b, a >> 3, y, x)) |r| std.debug.print("{x} ", .{r});
     std.debug.print("\n{x}\n", .{dot(.{ w, ~w, 3 }, .{ ~w, w, w })});
+    for (widen(w, v, 0x8765_4321, a, x)) |r| std.debug.print("{x} ", .{r});
+    std.debug.print("\n", .{});
+    for (widen(~w, -v, 3, b, y)) |r| std.debug.print("{x} ", .{r});
+    std.debug.print("\n", .{});
     const p: Pair = .{ .x = a, .y = b };
     var q: Pair = undefined;
     fields(&p, &q);
