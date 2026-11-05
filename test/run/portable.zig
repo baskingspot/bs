@@ -1,6 +1,6 @@
 //! exit: 0
 //! stderr: "sum=103658747345780558405425396738333792356 wide=-1180591620717411303424 div=-1180591620717411304\narea 6.75\narea 7\nf16: 2.5 2.5 -0\nf32: 1.5 -2.5 0\nf64: 1.25 1.25 -0\nf80: 1 -2 0\nf128: 1.5 1.5 -0\nf16 4.5 f128 3000000000000000000000000000000 true\nparse 123 Empty\nlist 1000 332833500 3b456bc8\n"
-//! targets: x86_64-linux aarch64-macos
+//! targets: x86_64-linux aarch64-macos aarch64-linux
 
 // std programs that run unchanged on every target: integers wider than a
 // register, floats of every width (soft-float compiler_rt calls for f80 and

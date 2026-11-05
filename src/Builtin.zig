@@ -1,9 +1,10 @@
 //! The generated `builtin` module: `@import("builtin")`.
 //!
 //! The text follows upstream Zig 0.17.1's `src/Builtin.zig` output for
-//! bs's two targets, Debug or ReleaseSafe: x86_64-linux-none with the
+//! bs's targets, Debug or ReleaseSafe: x86_64-linux-none with the
 //! self-hosted x86_64 backend, linked statically unless it links glibc,
-//! and aarch64-macos (CPU `apple_m1`, macOS 15.0 to 27.0, as
+//! aarch64-linux-none (CPU `generic`) with LLVM, linked statically, and
+//! aarch64-macos (CPU `apple_m1`, macOS 15.0 to 27.0, as
 //! `-target aarch64-macos` gives) with LLVM, linked against libSystem.
 //! `zig_backend` is upstream's Debug default for the target, so std takes
 //! the code paths it takes with upstream.
@@ -274,6 +275,10 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     // code, as upstream's (`--show-builtin`).
     const exe_libc = libc and opts.output_mode == .Exe;
     const glibc = opts.glibc orelse std.SemanticVersion{ .major = 2, .minor = 31, .patch = 0 };
+    const cpu_ns = switch (opts.cpu.arch) {
+        .x86_64 => "x86",
+        else => @tagName(opts.cpu.arch),
+    };
     // As upstream: every enabled feature, in the feature list's order.
     var features: std.ArrayList(u8) = .empty;
     defer features.deinit(gpa);
@@ -284,7 +289,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\const std = @import("std");
         \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
         \\pub const zig_version_string = "0.17.1";
-        \\pub const zig_backend = std.lang.CompilerBackend.stage2_x86_64;
+        \\pub const zig_backend = std.lang.CompilerBackend.{s};
         \\
         \\pub const output_mode: std.lang.OutputMode = .{s};
         \\pub const link_mode: std.lang.LinkMode = .{s};
@@ -295,9 +300,9 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\pub const abi: std.Target.Abi = .{s};
         \\/// Deprecated; to be removed in 0.18.0. Use `target.cpu` instead.
         \\pub const cpu: std.Target.Cpu = .{{
-        \\    .arch = .x86_64,
-        \\    .model = &std.Target.x86.cpu.{f},
-        \\    .features = std.Target.x86.featureSet(&.{{
+        \\    .arch = .{s},
+        \\    .model = &std.Target.{s}.cpu.{f},
+        \\    .features = std.Target.{s}.featureSet(&.{{
         \\{s}    }}),
         \\}};
         \\/// Deprecated; to be removed in 0.18.0. Use `target.os` instead.
@@ -350,13 +355,19 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
         \\{s}
     , .{
+        // Upstream's Debug default: its own backend on x86_64-linux, LLVM
+        // on aarch64-linux.
+        if (opts.target == .x86_64_linux) "stage2_x86_64" else "stage2_llvm",
         @tagName(opts.output_mode),
         if (opts.dynamic or exe_libc) "dynamic" else "static",
         @tagName(opts.unwind_tables),
         if (opts.is_test) "true" else "false",
         if (opts.single_threaded) "true" else "false",
         if (libc) "gnu" else "none",
+        @tagName(opts.cpu.arch),
+        cpu_ns,
         std.zig.fmtIdPU(opts.cpu.model.name),
+        cpu_ns,
         features.items,
         glibc.major,
         glibc.minor,

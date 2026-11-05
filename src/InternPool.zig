@@ -63,18 +63,27 @@ pub const Hash = u128;
 pub const Target = enum {
     x86_64_linux,
     aarch64_macos,
+    aarch64_linux,
 
     pub fn name(t: Target) []const u8 {
         return switch (t) {
             .x86_64_linux => "x86_64-linux",
             .aarch64_macos => "aarch64-macos",
+            .aarch64_linux => "aarch64-linux",
         };
     }
 
     pub fn arch(t: Target) std.Target.Cpu.Arch {
         return switch (t) {
             .x86_64_linux => .x86_64,
-            .aarch64_macos => .aarch64,
+            .aarch64_macos, .aarch64_linux => .aarch64,
+        };
+    }
+
+    pub fn os(t: Target) std.Target.Os.Tag {
+        return switch (t) {
+            .x86_64_linux, .aarch64_linux => .linux,
+            .aarch64_macos => .macos,
         };
     }
 };
@@ -553,7 +562,8 @@ pub const Int = struct {
 };
 
 /// A float value. The storage is fixed by the type: `f16`, `f32`, `f64`,
-/// `f80` (also `c_longdouble`), and `f128` (also `comptime_float`), so the
+/// `f80`, and `f128` (also `comptime_float`), with `c_longdouble` stored as
+/// the target's `long double` (`Type.floatBits`), so the
 /// canonical encoding, hash, and equality are the exact bits: `-0.0` and
 /// `0.0` are distinct values, and so are NaNs with different payloads, as
 /// upstream interns them.
@@ -2308,8 +2318,13 @@ pub fn getFloat(ip: *InternPool, tid: Tid, ty: Index, value: anytype) !Index {
                 .f32 => .{ .f32 = @floatCast(value) },
                 .f64 => .{ .f64 = @floatCast(value) },
                 .f80 => .{ .f80 = @floatCast(value) },
-                // `long double` is `double` on aarch64-macos.
-                .c_longdouble => if (ip.target == .aarch64_macos) .{ .f64 = @floatCast(value) } else .{ .f80 = @floatCast(value) },
+                // `long double` is `double` on aarch64-macos and IEEE
+                // quad precision on aarch64-linux.
+                .c_longdouble => switch (ip.target) {
+                    .x86_64_linux => .{ .f80 = @floatCast(value) },
+                    .aarch64_macos => .{ .f64 = @floatCast(value) },
+                    .aarch64_linux => .{ .f128 = @floatCast(value) },
+                },
                 .f128, .comptime_float => .{ .f128 = @floatCast(value) },
                 else => unreachable,
             },

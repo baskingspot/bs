@@ -6466,6 +6466,7 @@ fn ccName(target: InternPool.Target, cc: InternPool.CallingConvention) []const u
         .c => switch (target) {
             .x86_64_linux => "x86_64_sysv",
             .aarch64_macos => "aarch64_aapcs_darwin",
+            .aarch64_linux => "aarch64_aapcs",
         },
         .naked => "naked",
         .@"inline" => "inline",
@@ -7080,7 +7081,7 @@ fn atomicElemType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!
     if (!ok) return sema.fail(block, src, "expected bool, integer, float, enum, packed struct, or pointer type; found '{f}'", .{sema.fmtType(ty)});
     // As upstream's `atomicPtrAlignment`: aarch64 has 128-bit atomics,
     // x86_64 with cx16 (`-mcpu`; cmpxchg16b), else 64-bit ones at most.
-    const max_bits: u16 = if (ip.target == .aarch64_macos or sema.zcu.cpu.has(.x86, .cx16)) 128 else 64;
+    const max_bits: u16 = if (ip.target.arch() == .aarch64 or sema.zcu.cpu.has(.x86, .cx16)) 128 else 64;
     switch (Type.class(ip, ty)) {
         .float => if (Type.floatBits(ip, ty) > max_bits)
             return sema.fail(block, src, "expected {d}-bit float type or smaller; found {d}-bit float type", .{ max_bits, Type.floatBits(ip, ty) }),
@@ -8508,7 +8509,7 @@ fn internCallconv(sema: *Sema, block: *Block, src: Src, cc: Callconv) CompileErr
             return switch (target) {
                 .x86_64_linux => sema.fail(block, src, "calling convention '{s}' not supported by compiler backend 'stage2_x86_64'", .{@tagName(cc.tag)}),
                 // Upstream's LLVM backend has the other aarch64 conventions.
-                .aarch64_macos => sema.fail(block, src, "bs does not support calling convention '{s}' on aarch64-macos yet", .{@tagName(cc.tag)}),
+                .aarch64_macos, .aarch64_linux => sema.fail(block, src, "bs does not support calling convention '{s}' on {s} yet", .{ @tagName(cc.tag), target.name() }),
             };
         },
     };
@@ -14950,7 +14951,7 @@ fn failVarArgsCc(sema: *Sema, block: *Block, src: Src, tag: std.lang.CallingConv
     const err = sema.fail(block, src, "variadic function does not support '{s}' calling convention", .{@tagName(tag)});
     try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "supported calling conventions: {s}", .{switch (sema.ip.target) {
         .x86_64_linux => "'x86_64_sysv', 'x86_64_x32', 'x86_64_win'",
-        .aarch64_macos => "'aarch64_aapcs', 'aarch64_aapcs_darwin', 'aarch64_aapcs_win', 'aarch64_vfabi', 'aarch64_vfabi_sve'",
+        .aarch64_macos, .aarch64_linux => "'aarch64_aapcs', 'aarch64_aapcs_darwin', 'aarch64_aapcs_win', 'aarch64_vfabi', 'aarch64_vfabi_sve'",
     }});
     return err;
 }
@@ -15298,11 +15299,11 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
             .child = field_ty,
             .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .address_space = p.flags.address_space, .alignment = alignment },
             .packed_offset = .{
-                // As upstream's `fieldPtrType`, by backend: LLVM (aarch64-macos)
+                // As upstream's `fieldPtrType`, by backend: LLVM (aarch64)
                 // hosts the bytes the bits need, the x86_64 backend the struct.
                 .host_size = if (p.packed_offset.host_size != 0) p.packed_offset.host_size else switch (ip.target) {
                     .x86_64_linux => @intCast(Type.abiSize(ip, p.child)),
-                    .aarch64_macos => @intCast((@as(u32, Type.packedBits(ip, p.child).?) + 7) / 8),
+                    .aarch64_macos, .aarch64_linux => @intCast((@as(u32, Type.packedBits(ip, p.child).?) + 7) / 8),
                 },
                 .bit_offset = bit_offset,
             },
@@ -19695,7 +19696,7 @@ fn analyzeCall(
         };
         try sema.requireRuntime(block, src);
         if (modifier == .always_tail) try sema.bcRefuse();
-        if (modifier == .always_tail and ip.target != .aarch64_macos) return sema.failTailCall(block, src);
+        if (modifier == .always_tail and ip.target.arch() != .aarch64) return sema.failTailCall(block, src);
         if (fn_ty.cc == .auto) sema.has_error_trace = true;
         // As upstream, a function pointer or extern function that does not
         // return panics if it does: the call returns void, then panics.
@@ -19786,7 +19787,7 @@ fn analyzeCall(
         }
     }
     if (modifier == .always_tail) try sema.bcRefuse();
-    if (modifier == .always_tail and ip.target != .aarch64_macos) return sema.failTailCall(block, src);
+    if (modifier == .always_tail and ip.target.arch() != .aarch64) return sema.failTailCall(block, src);
     if (callee_fn_ty.cc == .auto) sema.has_error_trace = true;
     const payload = try sema.addExtra(Ir.Call{ .ret_ty = call_ret_ty, .args_len = @intCast(call_args.len), .flags = .{ .never_inline = modifier == .never_inline, .always_tail = modifier == .always_tail } });
     try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(call_args));

@@ -136,7 +136,7 @@ pub const Width = enum(u1) {
     fn sf(w: Width) u32 {
         return @as(u32, @backingInt(w)) << 31;
     }
-    fn bits(w: Width) u7 {
+    pub fn bits(w: Width) u7 {
         return if (w == .x) 64 else 32;
     }
 };
@@ -757,6 +757,19 @@ pub fn threadLocalAddr(e: *Encoder, sym: SymbolKey) !void {
     try e.blr(.x16);
 }
 
+/// `dst` = the address of thread-local `sym` for the calling thread, ELF
+/// local-exec: `mrs dst, tpidr_el0; add dst, dst, #:tprel_hi12:sym, lsl
+/// #12; add dst, dst, #:tprel_lo12_nc:sym`.
+pub fn threadLocalOffset(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
+    try e.raw(System.mrs_tpidr_el0 | dst.zrEnc());
+    try e.reserve();
+    try e.reloc(.aarch64_tprel_hi12, sym, 0);
+    e.word(0x91400000 | dst.zrEnc() << 5 | dst.zrEnc()); // add dst, dst, #0, lsl #12
+    try e.reserve();
+    try e.reloc(.aarch64_tprel_lo12_nc, sym, 0);
+    e.word(0x91000000 | dst.zrEnc() << 5 | dst.zrEnc()); // add dst, dst, #0
+}
+
 // ---------------------------------------------------------------- moves
 
 /// `mov dst, src`: orr with zr, or `add dst, src, #0` when either is sp.
@@ -1213,6 +1226,8 @@ pub const System = struct {
     /// `mrs xt, tpidrro_el0` / `tpidr_el0`: or in the register.
     pub const mrs_tpidrro_el0: u32 = 0xd53bd060;
     pub const mrs_tpidr_el0: u32 = 0xd53bd040;
+    /// `msr tpidr_el0, xt`: or in the register.
+    pub const msr_tpidr_el0: u32 = 0xd51bd040;
 };
 
 /// The stack probe before allocating a frame of `size` bytes, needed when

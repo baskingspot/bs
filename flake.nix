@@ -95,7 +95,10 @@
               inputs.mattware.packages.${system}.ziglint
               pkgs.python3
               pkgs.ruff
-            ];
+            ]
+            # Runs aarch64-linux test binaries on x86_64-linux, as
+            # .agents/setup's qemu-user-static does in orbs.
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.qemu-user ];
             env.ZIG_SRC = zigSrc;
             shellHook = ''
               if [ ! -e upstream ] || [ -L upstream ]; then

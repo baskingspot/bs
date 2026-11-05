@@ -6,10 +6,10 @@ not track upstream: it compiles exactly one pinned Zig release (currently
 
 ## Scope
 
-- Targets: `x86_64-linux` (static ELF first) and `aarch64-macos` (Mach-O,
-  dynamically linked against libSystem, ad-hoc code signed). `aarch64-linux`
-  is queued as the third target once the aarch64 backend lands: it reuses
-  that backend and the ELF linker.
+- Targets: `x86_64-linux` (static ELF first), `aarch64-macos` (Mach-O,
+  dynamically linked against libSystem, ad-hoc code signed), and
+  `aarch64-linux` (static ELF, reusing the aarch64 backend and the ELF
+  linker; started 2026-11-05).
 - One optimization level, as in Go: no `-O` modes. Every build has Debug
   semantics (safety checks on, `builtin.mode == .debug`) and always-on
   optimization sized to compile fast (SSA, register allocation, inlining

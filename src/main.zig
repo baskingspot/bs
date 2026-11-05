@@ -1162,7 +1162,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     const inl = inlining(job.environ_map);
     // The aarch64 backend has no synthetic panic frames yet, so it inlines
     // only callees that cannot panic, which keeps panic traces complete.
-    if (inl.budget != 0) emit.enableInlining(inl.budget, inl.safe or opts.bs_target == .aarch64_macos);
+    if (inl.budget != 0) emit.enableInlining(inl.budget, inl.safe or opts.bs_target.arch() == .aarch64);
     // `BS_THREADS=n`: analysis and CodeGen on n threads, Sema on one and
     // CodeGen on the others; 1 generates on the Sema thread. The output
     // is the same for every n.
@@ -2186,6 +2186,21 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             setUnsupported(&opts, arena, "bs generates code only for apple_m1 on aarch64-macos ('-mcpu {s}'); drop -mcpu or build this step with upstream zig", .{text});
         opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
         opts.link_libc = false;
+    } else if (opts.bs_target == .aarch64_linux) {
+        // Static executables and tests of Zig only, so far.
+        if (command == .build_obj or command == .build_lib)
+            setUnsupported(&opts, arena, "bs builds only executables and tests for aarch64-linux so far; build this step with upstream zig", .{})
+        else if (c_files.items.len != 0 or link_inputs.items.len != 0 or opts.link_libc or opts.link_libcpp)
+            setUnsupported(&opts, arena, "bs does not link C sources, objects, or libraries for aarch64-linux yet; build this step with upstream zig", .{})
+        else if (opts.fuzz)
+            setUnsupported(&opts, arena, "bs does not instrument code for fuzzing on aarch64-linux yet ('-ffuzz'); build this step with upstream zig", .{})
+        else if (opts.pic or opts.pie or link_mode == .dynamic)
+            setUnsupported(&opts, arena, "bs links only static, non-PIE executables for aarch64-linux so far; build this step with upstream zig", .{});
+        // Code is generated for the generic ARMv8-A CPU, the target's
+        // baseline, as `-target aarch64-linux` gives upstream.
+        if (mcpu) |text| if (!std.mem.eql(u8, text, "baseline") and !std.mem.eql(u8, text, "native") and !std.mem.eql(u8, text, "generic"))
+            setUnsupported(&opts, arena, "bs generates code only for the generic CPU on aarch64-linux ('-mcpu {s}'); drop -mcpu or build this step with upstream zig", .{text});
+        opts.cpu = std.Target.aarch64.cpu.generic.toCpu(.aarch64);
     } else if (mcpu) |text| {
         const r = cpu_mod.resolve(arena, io, text);
         opts.cpu = r.cpu;
@@ -2404,7 +2419,9 @@ pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8)
             opts.bs_target = .x86_64_linux;
         } else if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
             opts.bs_target = .aarch64_macos;
-        } else setUnsupported(opts, arena, "bs does not support the native target; pass -target x86_64-linux or -target aarch64-macos", .{});
+        } else if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .linux) {
+            opts.bs_target = .aarch64_linux;
+        } else setUnsupported(opts, arena, "bs does not support the native target; pass -target x86_64-linux, -target aarch64-linux, or -target aarch64-macos", .{});
     } else if (std.mem.eql(u8, target, "x86_64-linux") or std.mem.eql(u8, target, "x86_64-linux-none")) {
         opts.bs_target = .x86_64_linux;
     } else if (std.mem.startsWith(u8, target, "x86_64-linux-gnu")) {
@@ -2421,12 +2438,14 @@ pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8)
                 };
                 break :parse v;
             };
-        } else setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux and aarch64-macos", .{target});
+        } else setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", .{target});
         if (opts.glibc_version != null and !opts.link_libc)
             setUnsupported(opts, arena, "bs supports '{s}' only with -lc; drop the ABI or add -lc", .{target});
     } else if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none")) {
         opts.bs_target = .aarch64_macos;
-    } else setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux and aarch64-macos", .{target});
+    } else if (std.mem.eql(u8, target, "aarch64-linux") or std.mem.eql(u8, target, "aarch64-linux-none")) {
+        opts.bs_target = .aarch64_linux;
+    } else setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux, aarch64-linux, and aarch64-macos", .{target});
 }
 
 /// glibc's symbols at the build's version, from the zig lib directory.

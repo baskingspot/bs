@@ -1028,7 +1028,7 @@ fn generateFunction(emit: *Emit, ir: *const Ir) Allocator.Error!void {
     emit.codegen_stats.proven += st.proven;
     const generate = switch (emit.zcu.ip.target) {
         .x86_64_linux => &CodeGen.generate,
-        .aarch64_macos => &CodeGenA64.generate,
+        .aarch64_macos, .aarch64_linux => &CodeGenA64.generate,
     };
     generate(emit, ir) catch |err| switch (err) {
         error.CodegenFail => emit.failed = true,
@@ -1402,7 +1402,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         };
         return true;
     }
-    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none, .local_symbols = emit.input_symbols, .input_sections = emit.input_sections, .aliases = emit.aliases.items };
+    const options: Elf.Options = .{ .entry = emit.entry, .arch = if (emit.zcu.ip.target.arch() == .aarch64) .aarch64 else .x86_64, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none, .local_symbols = emit.input_symbols, .input_sections = emit.input_sections, .aliases = emit.aliases.items };
     const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
     defer emit.gpa.free(imports);
     for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls };
@@ -1837,7 +1837,7 @@ fn rtExport(emit: *Emit, name: []const u8) !?SymbolKey {
 pub fn abs64Kind(emit: *const Emit) Atom.Reloc.Kind {
     return switch (emit.zcu.ip.target) {
         .x86_64_linux => .x86_64_abs64,
-        .aarch64_macos => .aarch64_abs64,
+        .aarch64_macos, .aarch64_linux => .aarch64_abs64,
     };
 }
 

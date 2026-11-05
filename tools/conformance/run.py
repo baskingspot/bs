@@ -97,7 +97,25 @@ FORMAT = 1
 TARGETS = {
     "x86_64-linux": {"zig_target": "x86_64-linux-none", "host": ("Linux", "x86_64")},
     "aarch64-macos": {"zig_target": "aarch64-macos-none", "host": ("Darwin", "arm64")},
+    # LLVM is upstream's Debug default here too. An x86_64-linux host runs
+    # the binaries under qemu's user-mode emulator (.agents/setup installs
+    # it) as a Cortex-A53, an ARMv8.0 core like the target's generic
+    # baseline, so newer instructions trap.
+    "aarch64-linux": {
+        "zig_target": "aarch64-linux-none",
+        "host": ("Linux", "aarch64"),
+        "emulated": {("Linux", "x86_64"): ["qemu-aarch64-static", "-cpu", "cortex-a53"]},
+    },
 }
+
+# The emulator command that runs the current target's binaries on this host,
+# if they do not run natively (set per target by main).
+exec_prefix = []
+
+
+def exec_argv(bin_path, *args):
+    return exec_prefix + [str(bin_path), *args]
+
 
 ROOT_UNIT = "behavior.zig"
 ROOT_TEST_RE = re.compile(r"^behavior\.(test\.|test_\d+$)")
@@ -314,7 +332,7 @@ def run_unit(bin_path, owns, args, workdir):
     log = None
     start = 0
     while True:
-        code, out, err, timed_out = run_process([str(bin_path), f"--start={start}"], workdir, args.run_timeout)
+        code, out, err, timed_out = run_process(exec_argv(bin_path, f"--start={start}"), workdir, args.run_timeout)
         current = None
         first_start = None
         count = None
@@ -407,7 +425,7 @@ class ServerSession:
 
     def __init__(self, bin_path, workdir):
         self.proc = subprocess.Popen(
-            [str(bin_path), "--listen=-"],
+            exec_argv(bin_path, "--listen=-"),
             cwd=workdir,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -533,7 +551,7 @@ def run_unit_default(bin_path, owns, args, workdir):
             "tests": {},
         }
     by_index = {}
-    code, _out, err, timed_out = run_process([str(bin_path)], workdir, args.run_timeout)
+    code, _out, err, timed_out = run_process(exec_argv(bin_path), workdir, args.run_timeout)
     parsed = parse_terminal(err, names)
     for i, (outcome, detail) in parsed.items():
         by_index[i] = [outcome, detail]
@@ -1516,6 +1534,7 @@ def cases_target(compiler, cfg, args, workdir):
 
 
 def main():
+    global exec_prefix
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument(
         "--upstream", action="store_true", help="compute the upstream baseline with zig instead of running bs"
@@ -1593,7 +1612,7 @@ def main():
         sys.exit(f"error: {UPSTREAM_TEST} is missing; run .agents/setup")
 
     host = (platform.system(), platform.machine())
-    runnable = [t for t in targets if TARGETS[t]["host"] == host]
+    runnable = [t for t in targets if TARGETS[t]["host"] == host or host in TARGETS[t].get("emulated", {})]
     compiler = None
     if runnable:
         if args.upstream:
@@ -1603,6 +1622,7 @@ def main():
     try:
         for name in targets:
             cfg = dict(TARGETS[name], name=name)
+            exec_prefix = [] if cfg["host"] == host else cfg.get("emulated", {}).get(host, [])
             if name not in runnable:
                 print(f"{name}: not run (needs an {name} host)")
             elif args.compile_errors:

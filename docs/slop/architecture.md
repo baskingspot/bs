@@ -854,7 +854,10 @@ comptime arguments are run-time values in the lowered code (uucode's
   there, a vector is aligned to its bits in bytes rounded up to a power
   of two, at most 16, and its size rounds up to a power of two bytes
   (vectors of f80 or f128, soft floats there, are aligned and sized as
-  arrays; f80 and f128 themselves are 8-byte aligned). LLVM also
+  arrays; f80 and f128 themselves are 8-byte aligned). aarch64-linux
+  follows the same rules, except that f128 is not a soft float there
+  (`long double`): it is 16-byte aligned and its vectors round up as
+  the others do; f80 stays 8-byte aligned. LLVM also
   bit-packs the elements of integer vectors whose width is not a whole
   number of bytes (`@Vector(4, u7)`), so those sizes still differ.
 - aarch64-macos (`src/codegen/aarch64/CodeGen.zig`) lowers the same SSA
@@ -906,6 +909,25 @@ comptime arguments are run-time values in the lowered code (uucode's
   output's register.
   Vector-typed asm operands load and store through memory, since
   vector values themselves stay scalarized.
+- aarch64-linux (started 2026-11-05) runs the same CodeGen and links
+  static, non-PIE executables with the ELF linker (`Elf.Options.arch`).
+  What differs from aarch64-macos is keyed on `ip.target ==
+  .aarch64_linux` or on the CPU's features, so aarch64-macos output
+  does not change. `.c` is Linux's AAPCS64: f128, which is `long double`
+  there, travels in a q register; each stack argument takes its own slot
+  of a multiple of 8 bytes, aligned to 8 (16 for 16-byte aligned values);
+  variadic arguments go where named ones would (`va_list` is a struct
+  there, but std's `VaList` is a compile error with upstream's LLVM
+  backend on this target, so `@cVaStart` never reaches CodeGen); `char`
+  is unsigned. Thread-locals are local-exec: `mrs xN, tpidr_el0` and two
+  adds with the `aarch64_tprel_hi12`/`lo12_nc` relocations. Frames are
+  not probed (upstream's LLVM probes only on x86 off Darwin). The CPU is
+  upstream's baseline for `-target aarch64-linux`, the generic ARMv8.0
+  core, so atomics without LSE are `ldaxr`/`stlxr` loops (`atomicCas`,
+  `atomicOp`), as LLVM emits for it, and f16 arithmetic without
+  FEAT_FP16 calls compiler_rt (`fpType`), where `fcvt` still converts
+  halves. The cache is not used yet. The inline assembly std's Linux code
+  needs adds `msr tpidr_el0`, the shifts, and the extension aliases.
 - Panics are calls, as upstream: `@panic` and each failed safety check
   call the matching function of `std.lang.panic` (`integerOverflow`,
   `outOfBounds(index, len)`, `call(msg, null)`, ...), then `unreach`.
@@ -964,7 +986,10 @@ comptime arguments are run-time values in the lowered code (uucode's
   instruction), and their GOT forms, which reach an import's GOT slot and
   are relaxed to the symbol itself when it is defined in the image, and
   tlvp page21/pageoff12, which reach a thread-local's descriptor (Mach-O
-  TLV, whose thunk returns the variable's address). aarch64
+  TLV, whose thunk returns the variable's address), and for
+  aarch64-linux's ELF output tprel hi12/lo12, a thread-local's offset
+  from the thread pointer in two `add` immediates (local-exec, TLS
+  variant 1). aarch64
   link-time values that fit 16 bits, such as error codes, go into a `movz`
   or `movk` imm16 field (`aarch64_movw_value16`, Mach-O only, since bs
   links its own output); wider ones are loaded from a constant Atom.
@@ -2384,7 +2409,18 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
 - Take the set of Atoms, lay out sections, resolve relocations, and write the
   output file once. No incremental patching of output files; a full relink is
   a memcpy-dominated pass over cached Atoms.
-- x86_64-linux: static ELF first. aarch64-macos: Mach-O against libSystem,
+- x86_64-linux: static ELF first. aarch64-linux: static ELF, from the
+  same linker (`Options.arch = .aarch64`): EM_AARCH64; segments aligned to
+  64 KiB, the largest page an aarch64 Linux kernel may use, as lld's
+  aarch64 output; zero padding in .text; TLS variant 1 (the thread pointer
+  is 16 bytes, rounded up to the TLS alignment, below the TLS segment);
+  the aarch64 instruction relocations patched with the Mach-O linker's
+  helpers (`src/link/aarch64.zig`), GOT loads relaxed to the symbol, since
+  every target is defined; and an aarch64 CIE (return address x30, CFA
+  sp) with FDEs for the frame record (`stp x29, x30, [sp, #-16]!; mov
+  x29, sp`) or the outermost frame. The aarch64 code saves no other
+  registers and records no epilogue yet, so the FDEs describe neither.
+  aarch64-macos: Mach-O against libSystem,
   ad-hoc code signature. The Mach-O linker (`src/link/MachO.zig`) has the
   same phases as the ELF linker and shares its thread pool, symbol table,
   and output buffers. Atom names are platform-neutral; the Mach-O linker
@@ -7456,12 +7492,13 @@ and `zig build -Dtarget=aarch64-macos`.
 - bs generates the `builtin` module itself (`src/Builtin.zig`).
   `zig_backend` is upstream's Debug default for the target, whatever
   `-fllvm` says: `.stage2_x86_64` on x86_64-linux, `.stage2_llvm` on
-  aarch64-macos (decided 2026-11-03). std and `test/behavior` then take
+  aarch64-macos (decided 2026-11-03) and aarch64-linux. std and `test/behavior` then take
   the paths they take upstream, and the conformance baseline stays
   comparable. Where upstream's semantics depend on the backend, Sema
   follows the target's (a packed field pointer's host size, for one); the
   rest of aarch64-macos's `builtin` is upstream's `--show-builtin` for
-  `-target aarch64-macos` (apple_m1, macOS 15.0, libc linked, PIE).
+  `-target aarch64-macos` (apple_m1, macOS 15.0, libc linked, PIE), and
+  aarch64-linux's is x86_64-linux's with upstream's generic aarch64 CPU.
 - Conformance is measured per test: the number of `upstream/test/behavior`
   tests bs compiles and passes, divided by the number upstream 0.17.1 passes
   on the same target with the same backend.
@@ -7470,8 +7507,12 @@ and `zig build -Dtarget=aarch64-macos`.
   `.zig-cache/conformance/<target>.json`. `run.py --upstream` recomputes the
   committed upstream baseline, `tools/conformance/baseline/<target>.json`.
   The `-target` is upstream's test-matrix entry: `x86_64-linux-none` (no libc,
-  baseline CPU, self-hosted backend) and `aarch64-macos-none` (Debug default
-  there is LLVM).
+  baseline CPU, self-hosted backend), `aarch64-macos-none` and
+  `aarch64-linux-none` (Debug default there is LLVM). An x86_64-linux host
+  runs aarch64-linux binaries under qemu's user-mode emulator as a
+  Cortex-A53, an ARMv8.0 core like the generic baseline, so instructions
+  past it trap; `zig build test` does the same for the run tests that list
+  aarch64-linux, when qemu is on PATH.
 - Each file `behavior.zig` imports is its own unit: one `bs test` compile and
   one run, in parallel with the others, so a compile error, crash, or timeout
   costs only that file. The root is a generated `behavior.zig` wrapper next to

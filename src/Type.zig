@@ -90,7 +90,8 @@ pub fn intInfo(ip: *const InternPool, ty: Index) IntInfo {
         .simple_type => switch (ip.simpleType(ty)) {
             .usize => .{ .signedness = .unsigned, .bits = ptr_bits },
             .isize => .{ .signedness = .signed, .bits = ptr_bits },
-            .c_char => .{ .signedness = .signed, .bits = 8 },
+            // `char` is unsigned in Linux's AAPCS64, signed on Apple's.
+            .c_char => .{ .signedness = if (ip.target == .aarch64_linux) .unsigned else .signed, .bits = 8 },
             .c_short => .{ .signedness = .signed, .bits = 16 },
             .c_ushort => .{ .signedness = .unsigned, .bits = 16 },
             .c_int => .{ .signedness = .signed, .bits = 32 },
@@ -116,8 +117,13 @@ pub fn floatBits(ip: *const InternPool, ty: Index) u16 {
         .f32 => 32,
         .f64 => 64,
         .f80 => 80,
-        // `long double` is `double` on aarch64-macos.
-        .c_longdouble => if (ip.target == .aarch64_macos) 64 else 80,
+        // `long double` is `double` on aarch64-macos and IEEE quad
+        // precision on aarch64-linux.
+        .c_longdouble => switch (ip.target) {
+            .x86_64_linux => 80,
+            .aarch64_macos => 64,
+            .aarch64_linux => 128,
+        },
         .f128, .comptime_float => 128,
         else => unreachable,
     };
@@ -135,7 +141,7 @@ pub fn floatSignificandBits(ip: *const InternPool, ty: Index) u16 {
     };
 }
 
-/// The float type of `bits` bits (`c_longdouble` becomes `f80`).
+/// The float type of `bits` bits (`c_longdouble` becomes its bits' type).
 pub fn floatOfBits(bits: u16) Index {
     return switch (bits) {
         16 => .f16_type,
@@ -361,9 +367,9 @@ pub fn abiSize(ip: *const InternPool, ty: Index) u64 {
             // elements are laid out like an array.
             const v = ip.keyPayload(.vector_type, ty);
             var bytes = if (v.child == .bool_type) (v.len + 7) / 8 else v.len * abiSize(ip, v.child);
-            // As LLVM on aarch64-macos, a vector rounds up to a power of
-            // two bytes, except one of f80 or f128, soft floats there.
-            if (ip.target == .aarch64_macos and bytes != 0 and v.child != .f80_type and v.child != .f128_type)
+            // As LLVM on aarch64, a vector rounds up to a power of two
+            // bytes, except one of soft floats (`softFloat`).
+            if (ip.target.arch() == .aarch64 and bytes != 0 and !softFloat(ip, v.child))
                 bytes = std.math.ceilPowerOfTwoAssert(u64, bytes);
             break :blk std.mem.alignForward(u64, bytes, abiAlignment(ip, ty));
         },
@@ -389,27 +395,38 @@ pub fn abiSize(ip: *const InternPool, ty: Index) u64 {
     };
 }
 
+/// Whether LLVM lays `ty` out as a soft float on aarch64: f80 on both
+/// targets, and f128 on aarch64-macos (`long double` is IEEE quad on
+/// aarch64-linux).
+fn softFloat(ip: *const InternPool, ty: Index) bool {
+    return switch (ip.target) {
+        .x86_64_linux => false,
+        .aarch64_macos => ty == .f80_type or ty == .f128_type,
+        .aarch64_linux => ty == .f80_type,
+    };
+}
+
 pub fn abiAlignment(ip: *const InternPool, ty: Index) u64 {
     return switch (class(ip, ty)) {
         .void, .noreturn, .type, .comptime_int, .comptime_float, .enum_literal, .null, .undefined, .special, .@"opaque" => 1,
         // The target's minimum function alignment, as upstream.
-        .@"fn" => if (ip.target == .aarch64_macos) 4 else 1,
+        .@"fn" => if (ip.target.arch() == .aarch64) 4 else 1,
         .bool => 1,
         .int, .error_set, .@"enum" => intAbiAlignment(intInfo(ip, ty).bits),
-        // f80 and f128 are soft floats on aarch64-macos, 8-byte aligned
-        // there, as LLVM lays them out.
-        .float => if (ip.target == .aarch64_macos) @min(abiSize(ip, ty), 8) else @min(abiSize(ip, ty), 16),
+        // Soft floats are 8-byte aligned on aarch64, as LLVM lays them
+        // out; f128 is not one on aarch64-linux, where it is `long double`.
+        .float => if (softFloat(ip, ty)) 8 else @min(abiSize(ip, ty), 16),
         .pointer, .@"anyframe" => 8,
         .array => abiAlignment(ip, childType(ip, ty)),
         .vector => blk: {
             const v = ip.keyPayload(.vector_type, ty);
             if (v.len == 0) break :blk 1;
-            if (ip.target == .aarch64_macos) {
-                // LLVM's, as upstream's aarch64-macos build: the vector's
-                // bits in bytes, rounded up to a power of two and capped at
-                // the stack alignment; a vector of soft floats (f80, f128)
-                // is aligned as its elements.
-                if (v.child == .f80_type or v.child == .f128_type) break :blk abiAlignment(ip, v.child);
+            if (ip.target.arch() == .aarch64) {
+                // LLVM's, as upstream's aarch64 builds: the vector's bits
+                // in bytes, rounded up to a power of two and capped at the
+                // stack alignment; a vector of soft floats is aligned as
+                // its elements.
+                if (softFloat(ip, v.child)) break :blk abiAlignment(ip, v.child);
                 const elem_bits: u64 = switch (class(ip, v.child)) {
                     .bool => 1,
                     .int, .@"enum" => intInfo(ip, v.child).bits,

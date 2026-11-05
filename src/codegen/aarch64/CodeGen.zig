@@ -265,13 +265,15 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
 }
 
 /// Writes the frame allocation at `frame_at`: `sub sp` of the frame size.
-/// A frame over 4 KiB probes its pages first, as clang does, out of line:
+/// On macOS, a frame over 4 KiB probes its pages first, as clang does, out of line:
 /// the prologue branches to `mov x9, #size; blr ___chkstk_darwin; sub sp`
 /// after the body, which branches back to `body`.
 fn allocFrame(cg: *CodeGen, frame_at: u32, body: Encoder.Label) Error!void {
     const frame = std.mem.alignForward(u32, cg.out_args_size + cg.slots_size, 16);
     if (frame >= 1 << 24) return cg.fail("stack frame of {d} bytes is too large", .{frame});
-    if (frame <= 4096) {
+    // Upstream's LLVM backend probes the stack only on x86 off Darwin
+    // (`supportsStackProbing`), so aarch64-linux frames are not probed.
+    if (frame <= 4096 or cg.ip.target == .aarch64_linux) {
         var tmp: Encoder = .init(cg.gpa);
         defer tmp.deinit();
         try subSp(&tmp, frame);
@@ -565,13 +567,14 @@ fn autoArgs(cg: *CodeGen, tys: []const Index, locs: ?[]ArgLoc) u32 {
     return stack;
 }
 
-// ---------------------------------------------------------------- C (AAPCS64, Apple)
+// ---------------------------------------------------------------- C (AAPCS64: Apple's, and Linux's)
 
-/// How Apple's arm64 C convention passes a value: integers, pointers, and
+/// How the C convention passes a value: integers, pointers, and
 /// aggregates of at most 8 bytes in a general register; of at most 16 in
 /// two; f16, f32, and f64 in a vector register; larger aggregates by the
-/// address of a copy (and results through x8). f80 and f128, which C does
-/// not have here, go as 16 bytes in two registers.
+/// address of a copy (and results through x8). f128 is Linux's `long
+/// double`, in a q register there; on Apple's, where C does not have it,
+/// it goes as 16 bytes in two general registers, and so does f80 on both.
 /// Homogeneous float aggregates and vectors, which go in vector
 /// registers, are not supported yet.
 const CClass = enum { none, int, int_pair, fpr, indirect, unsupported };
@@ -582,6 +585,7 @@ fn cClass(cg: *CodeGen, ty: Index) CClass {
     switch (Type.class(ip, ty)) {
         .float => return switch (Type.floatBits(ip, ty)) {
             16, 32, 64 => .fpr,
+            128 => if (ip.target == .aarch64_linux) .fpr else .int_pair,
             // No C type here (`long double` is a double): compiler_rt's
             // soft-float ABI takes these as 16-byte structs
             // (`compilerRtFloatAbi`).
@@ -614,10 +618,14 @@ fn isFloatAggregate(cg: *CodeGen, ty: Index) bool {
 
 /// Where the C convention passes each argument; returns the stack bytes
 /// used. Arguments from index `var_from` on are variadic, which Apple
-/// passes on the stack in 8-byte slots. Other stack arguments are packed
-/// at their natural alignment (aggregates at 8). `locs` may be null.
+/// passes on the stack in 8-byte slots. Apple packs other stack arguments
+/// at their natural alignment (aggregates at 8). Linux passes variadic
+/// arguments as named ones, and each stack argument in its own slot of a
+/// multiple of 8 bytes, aligned to 8 or to 16 for 16-byte aligned values.
+/// `locs` may be null.
 fn cArgs(cg: *CodeGen, tys: []const Index, var_from: ?usize, locs: ?[]ArgLoc) u32 {
     const ip = cg.ip;
+    const linux = ip.target == .aarch64_linux;
     var gp: u8 = 0;
     var fp: u8 = 0;
     var stack: u32 = 0;
@@ -626,7 +634,37 @@ fn cArgs(cg: *CodeGen, tys: []const Index, var_from: ?usize, locs: ?[]ArgLoc) u3
         const size: u32 = @intCast(Type.abiSize(ip, ty));
         const alignment: u32 = @intCast(Type.abiAlignment(ip, ty));
         var l: ArgLoc = .none;
-        if (var_from != null and i >= var_from.?) {
+        if (linux) {
+            const slot = std.mem.alignForward(u32, stack, @max(8, @min(alignment, 16)));
+            switch (class) {
+                .none, .unsupported => {},
+                .int, .indirect => if (gp < 8) {
+                    l = if (class == .int) .{ .gpr = gp } else .{ .gpr_indirect = gp };
+                    gp += 1;
+                } else {
+                    l = if (class == .int) .{ .stack = slot } else .{ .stack_indirect = slot };
+                    stack = slot + if (class == .int) std.mem.alignForward(u32, size, 8) else 8;
+                },
+                .int_pair => {
+                    if (alignment == 16 and Type.class(ip, ty) != .float) gp = std.mem.alignForward(u8, gp, 2);
+                    if (gp + 2 <= 8) {
+                        l = .{ .gpr_pair = gp };
+                        gp += 2;
+                    } else {
+                        gp = 8;
+                        l = .{ .stack = slot };
+                        stack = slot + 16;
+                    }
+                },
+                .fpr => if (fp < 8) {
+                    l = .{ .fpr = fp };
+                    fp += 1;
+                } else {
+                    l = .{ .stack = slot };
+                    stack = slot + std.mem.alignForward(u32, size, 8);
+                },
+            }
+        } else if (var_from != null and i >= var_from.?) {
             if (class != .none) {
                 const slot_size: u32 = if (class == .indirect) 8 else size;
                 stack = std.mem.alignForward(u32, stack, @max(8, @min(alignment, 16)));
@@ -1569,6 +1607,10 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .tls_ptr => {
             const key = try cg.emit.navKey(@fromBackingInt(data.ty_pl.payload));
+            if (cg.ip.target == .aarch64_linux) {
+                try cg.e.threadLocalOffset(.x9, key);
+                return cg.setResult(inst, data.ty_pl.ty, .x9);
+            }
             try cg.e.threadLocalAddr(key);
             try cg.setResult(inst, data.ty_pl.ty, .x0);
         },
@@ -3261,6 +3303,11 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         const base: u32 = if (eql(u8, ops[1].name, "tpidrro_el0")) System.mrs_tpidrro_el0 else if (eql(u8, ops[1].name, "tpidr_el0")) System.mrs_tpidr_el0 else return cg.asmUnsupported(line);
         return e.raw(base | @backingInt(rt.reg));
     }
+    if (eql(u8, mnemonic, "msr")) {
+        if (ops.len != 2 or ops[0] != .name or !eql(u8, ops[0].name, "tpidr_el0")) return cg.asmUnsupported(line);
+        const rt = reg(ops, 1) orelse return cg.asmUnsupported(line);
+        return e.raw(System.msr_tpidr_el0 | @backingInt(rt.reg));
+    }
     if (eql(u8, mnemonic, "ret")) {
         const r = reg(ops, 0) orelse return cg.asmUnsupported(line);
         if (r.reg != Reg.lr) return cg.asmUnsupported(line);
@@ -3346,6 +3393,23 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         };
         return if (mnemonic[2] == 'p') e.cmp(n.width, n.reg, rhs) else e.cmn(n.width, n.reg, rhs);
     }
+    if (std.meta.stringToEnum(Encoder.Shift, mnemonic)) |op| {
+        const d = reg(ops, 0) orelse return cg.asmUnsupported(line);
+        const n = reg(ops, 1) orelse return cg.asmUnsupported(line);
+        if (ops.len != 3) return cg.asmUnsupported(line);
+        return switch (ops[2]) {
+            .reg => |m| e.shiftReg(op, d.width, d.reg, n.reg, m.reg),
+            .imm => |v| if (v >= 0 and v < d.width.bits()) e.shiftImm(op, d.width, d.reg, n.reg, @intCast(v)) else cg.asmUnsupported(line),
+            else => cg.asmUnsupported(line),
+        };
+    }
+    const extends = [_]struct { []const u8, Size, bool }{ .{ "uxtb", .byte, false }, .{ "uxth", .half, false }, .{ "uxtw", .word, false }, .{ "sxtb", .byte, true }, .{ "sxth", .half, true }, .{ "sxtw", .word, true } };
+    for (extends) |x| if (eql(u8, mnemonic, x[0])) {
+        const d = reg(ops, 0) orelse return cg.asmUnsupported(line);
+        const n = reg(ops, 1) orelse return cg.asmUnsupported(line);
+        if (ops.len != 2) return cg.asmUnsupported(line);
+        return if (x[2]) e.sxt(x[1], d.width, d.reg, n.reg) else e.uxt(x[1], d.reg, n.reg);
+    };
     const logic = [_]struct { []const u8, Encoder.LogicOp }{ .{ "and", .@"and" }, .{ "orr", .orr }, .{ "eor", .eor }, .{ "ands", .ands } };
     for (logic) |l| if (eql(u8, mnemonic, l[0])) {
         const d = reg(ops, 0) orelse return cg.asmUnsupported(line);

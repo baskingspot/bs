@@ -8,7 +8,7 @@
 //! stderr-contains: " in inl (error_trace.zig)\n"
 //! stderr-contains: "error_trace.zig:76:9: 0x"
 //! stderr-contains: " in main (error_trace.zig)\n    _ = try inl(10);\n        ^\n"
-//! targets: x86_64-linux aarch64-macos
+//! targets: x86_64-linux aarch64-macos aarch64-linux
 
 // Error return traces, as upstream: each `.auto` function shares its
 // caller's trace, returning an error pushes the return address, and handling
