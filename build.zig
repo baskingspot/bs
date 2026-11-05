@@ -935,6 +935,35 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         lc_so_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&lc_so_run.step);
     }
+    // A shared library that links another shared library, given as an
+    // input: DT_NEEDED names it and its functions are imports, as
+    // upstream's.
+    {
+        const so_base = b.addRunArtifact(bs);
+        so_base.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", "x86_64-linux-gnu", "--name", "so_base" });
+        so_base.addFileArg(b.path("test/link_input/so_libc.c"));
+        so_base.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+        const base_file = so_base.addPrefixedOutputFileArg("-femit-bin=", "libso_base.so");
+        const chain = b.addRunArtifact(bs);
+        chain.setName("bs build-lib -dynamic -lc with a shared library input");
+        chain.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", "x86_64-linux-gnu", "--name", "so_chain" });
+        chain.addFileArg(b.path("test/link_input/so_chain.c"));
+        chain.addFileArg(base_file);
+        chain.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+        const chain_file = chain.addPrefixedOutputFileArg("-femit-bin=", "libso_chain.so");
+        const chain_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc" });
+        chain_host.addFileArg(b.path("test/link_input/so_chain_main.zig"));
+        chain_host.addFileArg(chain_file);
+        chain_host.addFileArg(base_file);
+        const chain_run = b.addSystemCommand(&.{ "sh", "-c", "d=$(mktemp -d) && cp \"$1\" \"$2\" \"$d\" && LD_LIBRARY_PATH=$d \"$3\"; r=$?; rm -rf \"$d\"; exit $r", "sh" });
+        chain_run.setName("run so_chain_main.zig (bs shared library linking another)");
+        chain_run.addFileArg(chain_file);
+        chain_run.addFileArg(base_file);
+        chain_run.addFileArg(chain_host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        chain_run.addCheck(.{ .expect_stderr_exact = "chain c50:1\nc bye\n" });
+        chain_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&chain_run.step);
+    }
 
     // The same object built -fPIC, linked by upstream into a static PIE
     // (which relaxes local-dynamic TLS) and into a shared object that a
@@ -974,7 +1003,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     test_step.dependOn(&so_run.step);
     // As upstream's `Config.resolve`: a static library finds its `-l`
     // shared libraries and leaves them out; without `-static` linking one
-    // makes the library shared, which bs does not build yet.
+    // makes the library shared, which bs links only with glibc.
     for ([_]bool{ true, false }) |static| {
         const lsys = b.addSystemCommand(&.{ "sh", "-c", "set -e; z=$(realpath \"$1\") so=$(realpath \"$2\") src=$(realpath \"$4\"); cd \"$5\"; \"$z\" build-lib -L\"$(dirname \"$so\")\" -lbspic $3 -femit-bin=liblsys.a \"$src\"; ar t liblsys.a", "sh" });
         lsys.setName(b.fmt("bs build-lib -lbspic{s}", .{if (static) " -static" else ""}));
@@ -987,7 +1016,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             lsys.addCheck(.{ .expect_stdout_exact = "lib.o\n" });
             lsys.addCheck(.{ .expect_term = .{ .exited = 0 } });
         } else {
-            lsys.addCheck(.{ .expect_stderr_match = "bs does not link libraries into shared libraries yet ('-lbspic')" });
+            lsys.addCheck(.{ .expect_stderr_match = "bs links shared libraries only into executables and shared libraries that link libc (" });
             lsys.addCheck(.{ .expect_term = .{ .exited = 1 } });
         }
         test_step.dependOn(&lsys.step);

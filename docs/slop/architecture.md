@@ -7605,7 +7605,11 @@ libraries as inputs. To be agreed with that thread.
   objects are converted and linked as an executable's are
   (`ElfInput.Inputs.shared`), archive members pulled as for an
   executable, C sources compiled `-fPIC` (`CSource.Options.pic`), and
-  ubsan_rt linked in for them. The objects' default and protected
+  ubsan_rt linked in for them. Shared library inputs, given as paths or
+  `-l` names, are linked as an executable links them (pcre2's
+  libpcre2-posix.so links libpcre2-8.so; test/link_input/so_chain.c):
+  DT_NEEDED by soname and their definitions imported; a library given
+  one without `-static` or `-dynamic` is shared, as upstream's. The objects' default and protected
   globals and commons are exported next to the Zig code's
   (`ElfInput.dynamicExports`, at their offsets in their sections'
   atoms), and names nothing defines are imported, as the Zig code's

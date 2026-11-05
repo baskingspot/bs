@@ -2261,7 +2261,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             const ext = std.fs.path.extension(arg);
             if (CSource.Lang.ofPath(arg)) |lang| {
                 try c_files.append(arena, .{ .path = arg, .extra_flags = extra_cflags, .cc_argv = &.{}, .flags = .{}, .lang = lang });
-            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or (isSharedLib(arg) and !command.isObj() and command != .build_lib)) {
+            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or (isSharedLib(arg) and !command.isObj())) {
                 try link_inputs.append(arena, arg);
             } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.indexOf(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib") or std.mem.eql(u8, ext, ".dylib") or std.mem.eql(u8, ext, ".tbd"))
                 setUnsupported(&opts, arena, "bs does not link object files or libraries ('{s}'); build this step with upstream zig", .{arg})
@@ -2387,8 +2387,6 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             opts.dynamic = true;
             opts.pic = true;
         };
-        if (opts.dynamic and libs.items.len != 0)
-            setUnsupported(&opts, arena, "bs does not link libraries into shared libraries yet ('-l{s}'); build this step with upstream zig", .{libs.items[0].name});
         var kept: usize = 0;
         for (link_inputs.items) |path| {
             if (!opts.dynamic and (std.mem.eql(u8, std.fs.path.extension(path), ".a") or isSharedLib(path))) {
@@ -2412,7 +2410,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     opts.shared_libs = shared.items;
     opts.shared_names = shared_names.items;
     if (shared.items.len != 0 and !opts.link_libc and opts.bs_target != .aarch64_macos)
-        setUnsupported(&opts, arena, "bs links shared libraries only into executables that link libc ('{s}'); add -lc or build this step with upstream zig", .{shared.items[0]});
+        setUnsupported(&opts, arena, "bs links shared libraries only into executables and shared libraries that link libc ('{s}'); add -lc or build this step with upstream zig", .{shared.items[0]});
     // DT_RUNPATH: as upstream's `rpath_list`, deduplicated.
     if (native) try rpaths.appendSlice(arena, search_dirs.items[0..n_explicit_dirs]);
     var unique_rpaths: std.StringArrayHashMapUnmanaged(void) = .empty;
