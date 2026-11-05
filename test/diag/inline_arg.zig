@@ -28,6 +28,5 @@ pub fn main() !void {
 //   | else => @compileError("Unable to compare non floating point values"),
 //   note inline_arg.zig:13:48: this argument is an optional; consider using '.?' or 'orelse' here: try std.testing.expectApproxEqAbs(2.0, mean(xs), 0.01);
 //   fix? inline_arg.zig:13:52-13:52: ".?"
-//   call: inline_arg.zig:13:38 inline, +3 std
 //   ref: main inline_arg.zig:17:14 (+4 std frames)
 // 2 errors

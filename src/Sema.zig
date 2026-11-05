@@ -2379,7 +2379,11 @@ fn noteCallSite(sema: *Sema, block: *Block, src: Src, n_errors: usize, err: Comp
 /// `noteCallSite` for a call in `file`, which is not the file being
 /// analyzed while the callee's parameter or return types are.
 fn noteCallSiteIn(sema: *Sema, file: u32, src: Src, n_errors: usize, err: CompileError, kind: @import("diag.zig").CallKind) CompileError {
-    if (err == error.AnalysisFail and sema.zcu.errors.items.len > n_errors) {
+    // Only for an error of this unit's analysis: a function body analyzed
+    // meanwhile on its own (for its inferred error set) reports its errors
+    // without the frames that happened to reach it, as upstream.
+    const errors = sema.zcu.errors.items;
+    if (err == error.AnalysisFail and errors.len > n_errors and sema.ownError(errors[errors.len - 1])) {
         const tree = try sema.zcu.fe.tree(@fromBackingInt(file));
         try sema.zcu.addCallFrame(file, src.span(tree), kind);
     }
