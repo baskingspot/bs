@@ -35,6 +35,10 @@
           # release's official build, checked by sha256 as .agents/setup
           # checks it, not nixpkgs' zig. Keep the two in step.
           version = "0.17.1";
+          # The org's pull-through cache in front of the Zig community mirrors.
+          # The sha256 below still checks the bytes, so the mirror is not a
+          # trust anchor.
+          mirror = "https://zig.baskingspot.dev";
           host =
             {
               x86_64-linux = {
@@ -54,7 +58,7 @@
             pname = "zig";
             inherit version;
             src = pkgs.fetchurl {
-              url = "https://ziglang.org/download/${version}/zig-${host.name}-${version}.tar.xz";
+              url = "${mirror}/zig-${host.name}-${version}.tar.xz";
               inherit (host) sha256;
             };
             dontConfigure = true;
@@ -73,7 +77,7 @@
             pname = "zig-src";
             inherit version;
             src = pkgs.fetchurl {
-              url = "https://ziglang.org/download/${version}/zig-${version}.tar.xz";
+              url = "${mirror}/zig-${version}.tar.xz";
               sha256 = "1e89bf06610b769a8c77676c6c8d54b093a0db60f4891f2f91014829012f0e24";
             };
             dontConfigure = true;

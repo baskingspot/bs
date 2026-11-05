@@ -7,6 +7,9 @@ set -euo pipefail
 
 ZIG_VERSION=0.17.1
 ZIG_SRC_SHA=1e89bf06610b769a8c77676c6c8d54b093a0db60f4891f2f91014829012f0e24
+# The org's pull-through cache in front of the Zig community mirrors. The
+# sha256 below still checks the bytes, so the mirror is not a trust anchor.
+MIRROR=https://zig.baskingspot.dev
 
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)
@@ -55,9 +58,9 @@ fetch() { # url sha dest_dir
 bin_dir="$cache/zig-$ZIG_VERSION"
 [ "$ZIG_HOST" = x86_64-linux ] || bin_dir="$cache/zig-$ZIG_HOST-$ZIG_VERSION"
 
-time fetch "https://ziglang.org/download/$ZIG_VERSION/zig-$ZIG_HOST-$ZIG_VERSION.tar.xz" \
+time fetch "$MIRROR/zig-$ZIG_HOST-$ZIG_VERSION.tar.xz" \
   "$ZIG_BIN_SHA" "$bin_dir"
-time fetch "https://ziglang.org/download/$ZIG_VERSION/zig-$ZIG_VERSION.tar.xz" \
+time fetch "$MIRROR/zig-$ZIG_VERSION.tar.xz" \
   "$ZIG_SRC_SHA" "$cache/zig-$ZIG_VERSION-src"
 
 # Orbs are disposable, so zig goes on PATH there. A Mac satellite is the
