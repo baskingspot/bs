@@ -41,10 +41,12 @@ build() {
     "./$d/t" 2>out || fail "the program built in $d"
     [ "$(cat out)" = "hello 42" ] || fail "the program built in $d printed $(cat out)"
 }
-build a
+# An explicit target on every build: with none, bs builds for the host's
+# CPU, and a donor only serves a build for the same CPU.
+build a -target x86_64-linux
 build b -target x86_64-linux-musl -lc
 grep -q "replaying donor .*another program's" log || fail "the musl -lc build replayed no donor"
 # And back: a build without libc from the musl one's donor.
 rm -rf a/local
-build c
+build c -target x86_64-linux
 grep -q "replaying donor .*another program's" log || fail "the build without libc replayed no donor"
