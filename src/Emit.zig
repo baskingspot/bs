@@ -369,7 +369,7 @@ const no_body = std.math.maxInt(u32);
 /// cycle of calls reached a function being decided (which makes every
 /// function on the cycle not inlinable) or because analysis is busy with
 /// the function (an edit build's check, which then analyzes its caller).
-const FateResult = union(enum) { fate: Fate, cycle, busy };
+pub const FateResult = union(enum) { fate: Fate, cycle, busy };
 
 const Job = struct {
     ir: Ir,

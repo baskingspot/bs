@@ -875,7 +875,7 @@ const Shard = struct {
     string_map: std.HashMapUnmanaged(StringEntry, void, StringContext, 80) = .empty,
 };
 
-const Entry = struct { hash: u64, index: Index };
+pub const Entry = struct { hash: u64, index: Index };
 
 const EntryContext = struct {
     pub fn hash(_: EntryContext, e: Entry) u64 {
@@ -903,7 +903,7 @@ const KeyAdapter = struct {
     }
 };
 
-const StringEntry = struct { hash: u32, string: String };
+pub const StringEntry = struct { hash: u32, string: String };
 
 /// Spreads a string's 32-bit hash over the 64 bits the map reads (bucket
 /// from the low bits, fingerprint from the top 7).

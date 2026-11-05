@@ -257,7 +257,7 @@ const Home = union(enum) {
 const Regs = struct { lo: Reg, hi: Reg };
 
 /// Where an operand's value can be read.
-const Loc = union(enum) {
+pub const Loc = union(enum) {
     none,
     /// The value is in a register, extended to 64 bits.
     reg: Reg,
@@ -6969,7 +6969,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
 // ---------------------------------------------------------------------------
 // Constants
 
-const PtrTarget = struct {
+pub const PtrTarget = struct {
     key: SymbolKey,
     off: i64,
     /// For an external symbol (`extern_var`, `extern_func`), its name, and
@@ -7289,7 +7289,7 @@ fn fmtType(cg: *CodeGen, ty: Index) FmtType {
 // libm's names: `__sinh` (f16), `sinf`, `sin`, `__sinx` (f80), `sinq`.
 
 /// A value as an operand: its type and where it can be read.
-const Val = struct { ty: Index, loc: Loc };
+pub const Val = struct { ty: Index, loc: Loc };
 
 pub fn valOf(cg: *CodeGen, ref: Ref) Error!Val {
     if (cg.xmmOf(ref)) |x| return .{ .ty = cg.typeOf(ref), .loc = .{ .xmm = x } };
