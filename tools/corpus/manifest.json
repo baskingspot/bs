@@ -1500,6 +1500,404 @@
      "note": "bs bug, open: bs reports 'runtime value contains reference to comptime var' for a runtime index into a field of a comptime-built anonymous struct (const t = blk: { var exp: [512]u8 = ...; break :blk .{ .exp = exp }; }; t.exp[i]). Upstream accepts it."
     }
    ]
+  },
+  {
+   "name": "zwasm",
+   "url": "https://github.com/zwasm/zwasm",
+   "commit": "99ce67ef34ea704d2a6a55f2597988e587553dcc",
+   "ref": "main",
+   "license": "Apache-2.0",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zwasm",
+     "run": [
+      "--version"
+     ],
+     "note": "bs bug, open: bs refuses inline asm whose template uses a register-pinned input indirectly (`callq *%[callee]` with `[callee] \"{rax}\" (f)`): 'asm operand 'callee' is not an 'X' input' (src/engine/codegen/shared/entry.zig:484)."
+    },
+    {
+     "name": "test:src/zwasm.zig",
+     "note": "bs bug, open: bs refuses inline asm whose template uses a register-pinned input indirectly (`callq *%[callee]` with `[callee] \"{rax}\" (f)`): 'asm operand 'callee' is not an 'X' input' (src/engine/codegen/shared/entry.zig:484)."
+    },
+    {
+     "name": "test:src/cli/main.zig",
+     "note": "bs bug, open: bs refuses inline asm whose template uses a register-pinned input indirectly (`callq *%[callee]` with `[callee] \"{rax}\" (f)`): 'asm operand 'callee' is not an 'X' input' (src/engine/codegen/shared/entry.zig:484)."
+    },
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "astroz",
+   "url": "https://github.com/ATTron/astroz",
+   "commit": "c4aed01077028c6e4db279d9ad50aaf626f71a57",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "astroz"
+    },
+    {
+     "name": "test",
+     "note": "bs bug, open: bs refuses `&p` (`*?*T`) for a translated `[*c][*c]T` parameter; upstream coerces it. (cfitsio's fits_open_file, dependency.zig:3267)"
+    }
+   ]
+  },
+  {
+   "name": "zigcli",
+   "url": "https://github.com/jiacai2050/zigcli",
+   "commit": "ae972e756c378310b1e737621998d0e7041b7e6e",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "note": "bs bug, open: peer type resolution of `[]const [:0]const u8` and `*[1][:0]u8` (std.testing.expectEqualDeep in src/structargs.zig:1128) fails in bs; upstream resolves to the slice. Also hits the error-switch bug in gitignore.zig (see loc)."
+    },
+    {
+     "name": "loc",
+     "run": [
+      "{zig_lib}/std"
+     ],
+     "note": "bs bug, open: in `f() catch |e| switch (e) { E.A => ..., else => return e }`, naming the error through a declared set (`E.A`, not `error.A`) makes bs type the else prong's `e` as 'type' (src/gitignore.zig:332)."
+    },
+    {
+     "name": "hexdump",
+     "run": [
+      "{zig_lib}/std/zig/Ast.zig"
+     ]
+    },
+    {
+     "name": "pretty-csv"
+    },
+    {
+     "name": "tree",
+     "note": "bs bug, open: in `f() catch |e| switch (e) { E.A => ..., else => return e }`, naming the error through a declared set (`E.A`, not `error.A`) makes bs type the else prong's `e` as 'type' (src/gitignore.zig:332)."
+    },
+    {
+     "name": "cowsay"
+    },
+    {
+     "name": "zfetch",
+     "note": "bs bug, open: bs refuses `&p` (`*?*T`) for a translated `[*c][*c]T` parameter; upstream coerces it. (getifaddrs, src/bin/zfetch/common.zig:204)"
+    }
+   ]
+  },
+  {
+   "name": "zig-interface",
+   "url": "https://github.com/nilslice/zig-interface",
+   "commit": "d521b416c57044d1fb0595914c25cbc6001e9b2f",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "nanoui",
+   "url": "https://github.com/justrach/nanoui",
+   "commit": "09d674e0f7a37efc6f82e886e6ea2031a322dfbe",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "note": "bs bug, open (regression on main bc17b7d; 2094f45 was right): returning a global's array field (`return cache.m`, [4]f64) from an early-return path copies nothing into the result, so src/ui/motion/spring.zig's cached matrix comes back as garbage and four motion and scroll-bar tests fail."
+    },
+    {
+     "name": "nui"
+    },
+    {
+     "name": "hello"
+    },
+    {
+     "name": "todo"
+    },
+    {
+     "name": "browser"
+    }
+   ]
+  },
+  {
+   "name": "dhi",
+   "url": "https://github.com/justrach/dhi",
+   "commit": "1ab751d4ac791c20d4d6a89ab0b93c3af4e7f9d9",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    },
+    {
+     "name": "dhi"
+    },
+    {
+     "name": "dhi-zig"
+    }
+   ]
+  },
+  {
+   "name": "merjs",
+   "url": "https://github.com/justrach/merjs",
+   "commit": "28b53d82c9f5a0eea2dcf00e8a19bdec9216e86e",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    },
+    {
+     "name": "merjs"
+    },
+    {
+     "name": "codegen"
+    }
+   ]
+  },
+  {
+   "name": "ziex",
+   "url": "https://github.com/ziex-dev/ziex",
+   "commit": "55f905fbcabfc36411538a19a5e626f72a4297a8",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "note": "bs bug, open: a bool from a short-circuit `and`, live across a call, is left in rax and clobbered (Router.tryExtractParams returns true for '/search.json' vs '/search.json/extra'); the test 'routing > params > static route does not match extra segments' fails."
+    },
+    {
+     "name": "zx",
+     "run": [
+      "--help"
+     ]
+    },
+    {
+     "name": "zls_gen"
+    }
+   ]
+  },
+  {
+   "name": "fizzy",
+   "url": "https://github.com/fizzyedit/fizzy",
+   "commit": "1026c0736b766f514e8b478b1e7ef19396dd1edc",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "fizzy",
+     "note": "bs bug, open: calling a comptime struct's `fn () anyerror!T` field holding a function with an inferred error set fails with 'reinterpreting memory at comptime' (backend/src/SDLBackend.zig:4107); then dvui's @alignCast of a `?[]u8` (see fizzy-glass-tests)."
+    },
+    {
+     "name": "fake-fizzy"
+    },
+    {
+     "name": "text",
+     "note": "bs refuses `--export=<symbol>` (a dynamic plugin library's exported ABI fingerprint); upstream's linker flag."
+    },
+    {
+     "name": "fizzy-textcore-tests"
+    },
+    {
+     "name": "fizzy-fuzzy-tests"
+    },
+    {
+     "name": "fizzy-diff-tests"
+    },
+    {
+     "name": "fizzy-lsp-protocol-tests"
+    },
+    {
+     "name": "fizzy-keymap-tests"
+    },
+    {
+     "name": "fizzy-glass-tests",
+     "note": "bs bug, open: `@ptrCast(@alignCast(x))` with x a `?[]u8` and a `?*T` result fails ('expected pointer type, found ?[]u8', dvui src/Data.zig:97); upstream casts the optional slice's pointer."
+    },
+    {
+     "name": "backend-gpu-tests"
+    },
+    {
+     "name": "fizzy-control-json-tests"
+    },
+    {
+     "name": "fizzy-md-supermd-tests"
+    },
+    {
+     "name": "fizzy-remote-tests"
+    },
+    {
+     "name": "fizzy-tape-tests"
+    },
+    {
+     "name": "fizzy-plugin-loader-tests"
+    },
+    {
+     "name": "fizzy-liquid-tests"
+    }
+   ]
+  },
+  {
+   "name": "revo",
+   "url": "https://github.com/if-not-nil/revo",
+   "commit": "7b91491e7d0b0b8f164ff80ebd4b750ec5322f99",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "revo",
+     "run": [
+      "bench/fib_recursive.rv"
+     ],
+     "note": "bs bug, open: bs refuses `-target x86_64-native-gnu`, which upstream reads as the host (x86_64-linux-gnu). With that target spelled x86_64-linux-gnu, bs then refuses `*[2]c_int` for std.c.pipe's `*[2]fd_t` (i32) at src/vm/VM.zig:256; upstream coerces it."
+    },
+    {
+     "name": "test",
+     "note": "bs bug, open: bs refuses `-target x86_64-native-gnu`, which upstream reads as the host (x86_64-linux-gnu). With that target spelled x86_64-linux-gnu, bs then refuses `*[2]c_int` for std.c.pipe's `*[2]fd_t` (i32) at src/vm/VM.zig:256; upstream coerces it."
+    },
+    {
+     "name": "test:src/vm/root.zig",
+     "note": "bs bug, open: bs refuses `-target x86_64-native-gnu`, which upstream reads as the host (x86_64-linux-gnu). With that target spelled x86_64-linux-gnu, bs then refuses `*[2]c_int` for std.c.pipe's `*[2]fd_t` (i32) at src/vm/VM.zig:256; upstream coerces it."
+    },
+    {
+     "name": "test:src/lang/tests/root.zig",
+     "note": "bs bug, open: bs refuses `-target x86_64-native-gnu`, which upstream reads as the host (x86_64-linux-gnu). With that target spelled x86_64-linux-gnu, bs then refuses `*[2]c_int` for std.c.pipe's `*[2]fd_t` (i32) at src/vm/VM.zig:256; upstream coerces it."
+    },
+    {
+     "name": "test:src/root.zig",
+     "note": "bs bug, open: bs refuses `-target x86_64-native-gnu`, which upstream reads as the host (x86_64-linux-gnu). With that target spelled x86_64-linux-gnu, bs then refuses `*[2]c_int` for std.c.pipe's `*[2]fd_t` (i32) at src/vm/VM.zig:256; upstream coerces it."
+    },
+    {
+     "name": "test:src/cli.zig",
+     "note": "bs bug, open: bs refuses `-target x86_64-native-gnu`, which upstream reads as the host (x86_64-linux-gnu). With that target spelled x86_64-linux-gnu, bs then refuses `*[2]c_int` for std.c.pipe's `*[2]fd_t` (i32) at src/vm/VM.zig:256; upstream coerces it."
+    },
+    {
+     "name": "test:src/capi/root.zig",
+     "note": "bs bug, open: bs refuses `-target x86_64-native-gnu`, which upstream reads as the host (x86_64-linux-gnu). With that target spelled x86_64-linux-gnu, bs then refuses `*[2]c_int` for std.c.pipe's `*[2]fd_t` (i32) at src/vm/VM.zig:256; upstream coerces it."
+    }
+   ]
+  },
+  {
+   "name": "zig-extras",
+   "url": "https://github.com/nektro/zig-extras",
+   "commit": "0326254300a934d918c6ac98e29727d38bc11e3b",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "StaticHttpFileServer",
+   "url": "https://github.com/andrewrk/StaticHttpFileServer",
+   "commit": "a034da55798706120cc9622d1e4836cbdcf57243",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
   }
  ],
  "excluded": [

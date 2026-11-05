@@ -95,7 +95,13 @@ The 15 projects after tokamak in the manifest (zig-sqlite through
 zig-libs, all MIT) were added on 2026-11-04 to find what bs still cannot
 build; their open bs bugs and upstream's own failures (buzz's tail calls,
 zmath's vector rounding on upstream's self-hosted backend) are in each
-target's `note`.
+target's `note`. The 12 after zig-libs (zwasm through
+StaticHttpFileServer; zwasm is Apache-2.0, the rest MIT) were added on
+2026-11-05 the same way: a WebAssembly runtime, a text editor (fizzy), web
+frameworks (ziex, merjs), a GPU UI toolkit (nanoui), a scripting language
+(revo) and smaller libraries. A step name a build uses twice (zwasm's and
+revo's several `test`s) is recorded as `<name>:<root file>` after the
+first.
 
 ## Scoreboard
 
