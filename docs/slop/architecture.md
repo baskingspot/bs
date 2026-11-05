@@ -1685,7 +1685,7 @@ compare against a constant that splits the lanes at their sign bit
 bits themselves, one `pmovmskb` or `movmskps`. Upstream's Debug backend scalarizes compares, selects and
 shuffles; doing them here keeps results bit for bit (the same lanes,
 padding never observable). Still scalarized: shifts by per-lane amounts
-(AVX2's `vpsllvd`, beyond the `-mcpu` limit), overflow and
+(AVX2's `vpsllvd`, past the SSE4.2 bs generates), overflow and
 saturating arithmetic, division and remainder of integers, 64-bit
 `@min`/`@max`, float reductions (a left fold, in element order, as
 upstream; a tree would change the rounding and which zero `@min`
@@ -1699,9 +1699,11 @@ constant byte mask, `por`ed); SSE4.1 `pmulld`, the byte, word and dword
 `@min`/`@max` SSE2 lacks (`pminsb`, `pminuw`, `pminsd`, `pminud` and
 their `max`), so no sign flipping, and `pcmpeqq`; SSE4.2 `pcmpgtq`,
 which makes 64-bit ordering compares, `@min`/`@max` and their
-reductions native (`vector.native` answers by `cpu`). AVX changes the
-vector ABI and is a separate decision. Results are the same bits at
-every level; `-mcpu` is part of the cache key (`cacheTarget`).
+reductions native (`vector.native` answers by `cpu`). Features past
+SSE4.2 (an explicit AVX CPU) change nothing here: the code stays SSE,
+and the C ABI cases AVX would change are refused ("Where upstream
+supports more"). Results are the same bits at every level; `-mcpu` is
+part of the cache key (`cacheTarget`).
 
 Compare bs with upstream bit for bit at a pinned CPU: `zig run
 -fno-llvm -mcpu=baseline` (or `x86_64_v2`) against bs at the same
@@ -7354,6 +7356,11 @@ state. Built for step 1:
   make std's start code relocate a binary that has no relocations). On
   `build-obj` and `build-lib` they produce position-independent code, as
   upstream (see "Position-independent code and shared libraries").
+  `-fomit-frame-pointer` (fastmem's modules ask for it) is accepted and
+  bs keeps frame pointers, as it always does: omitting them frees a
+  register and changes no result. `builtin.omit_frame_pointer` stays
+  false, which describes the code (std's stack iterator may then walk
+  the frames, which are there).
   `-funwind-tables`,
   `-fasync-unwind-tables` and `-fno-unwind-tables` set
   `builtin.unwind_tables` as upstream does (ghostty asks for `.sync`);
@@ -9481,25 +9488,42 @@ computes the right one instead of copying the bug:
 Where upstream supports more than bs generates code for, bs narrows
 the choice instead of failing:
 
-- *CPU models and features.* bs accepts x86_64 CPU models and features
-  up to x86-64-v2 (SSE4.2, `src/cpu.zig`), plus aes, pclmul,
-  clflushopt, lzcnt, movbe, prfchw, rdpid, rdrnd and rdseed, whose
-  instructions only inline assembly uses (aes and pclmul in their SSE
-  and VEX forms; bs's own code is SSE only, and neither std nor bs's
-  code generation tests the others), puts them in `builtin.cpu` as
-  upstream does,
-  and keys the cache on them. std's AES and GHASH take their asm paths
-  only with AVX as well, so they stay on their software ones. As
-  upstream, no `-mcpu` means the host's CPU for the native target (also
-  what `zig build` passes for its native default) and the baseline for
-  an explicit `-target`, which tools/conformance and the hunters pass
-  (tools/mchunt pins `-mcpu=baseline` without one). An explicit AVX
-  feature or a model that has one (`haswell`, `x86_64_v3`), or any other
-  feature past those (`sha`), is refused with a message naming the
-  features. The host's CPU (`-mcpu=native`, or no `-mcpu` natively) is
-  clamped instead: its model becomes `x86_64_v2` when the host has all
-  of its instructions, else `x86_64`, plus the host's features bs
-  accepts; std takes its SSE paths, as upstream's on a CPU without AVX.
+- *CPU models and features.* bs's own x86_64 code uses instructions up
+  to x86-64-v2 (SSE4.2, `src/cpu.zig`'s `isa`); inline assembly
+  (`codegen/x86_64/asm_insn.zig`) may also use aes and pclmul (in their
+  SSE and VEX forms), clflushopt, lzcnt, movbe, prfchw, rdpid, rdrnd,
+  rdseed, and any other instruction it encodes whose feature the CPU
+  has. An explicit CPU (`-mcpu`, a model and features) is resolved as
+  upstream resolves it, whatever its instruction sets, and is what
+  `builtin.cpu` reports and the cache keys on: a program's comptime
+  choices are the ones upstream makes for that CPU, and bs's SSE code
+  runs on it. Per-CPU kernel objects need this: baskingspot/fastmem
+  (through siv's image decoders) and astroz build objects with `-mcpu
+  x86_64_v3`, `x86_64_v4`, `sapphirerapids` or `znver5`, whose roots
+  `@compileError` without AVX2 in `builtin.cpu` and whose kernels (with
+  `builtin.zig_backend` the self-hosted one) are `@Vector` code, which
+  bs lowers to SSE at the same bits. What would change meaning is
+  refused: a C-convention function passing or returning a vector of
+  over 16 bytes on a CPU with AVX (Clang and upstream put it in YMM or
+  ZMM registers; `checkCVectors`), an asm `x` operand of over 16 bytes
+  (std's AES with vaes), and instructions the inline assembler does not
+  encode (std's SHA-256 with sha and AVX2, so far). Features no x86 CPU
+  model has (`retpoline`, `lvi_cfi`, `seses`), and `soft_float`, change
+  how code is generated rather than add instructions and are refused
+  with a message naming them. As upstream, no `-mcpu` means the host's
+  CPU for the native target (also what `zig build` passes for its
+  native default) and the baseline for an explicit `-target`, which
+  tools/conformance and the hunters pass (tools/mchunt pins
+  `-mcpu=baseline` without one). The host's CPU (`-mcpu=native`, or no
+  `-mcpu` natively) is clamped instead: its model becomes `x86_64_v2`
+  when the host has all of its instructions, else `x86_64`, plus the
+  host's features bs accepts; std takes its SSE paths, as upstream's on
+  a CPU without AVX. Clamping keeps native builds off std's asm paths
+  that need YMM registers or instructions the assembler lacks (vaes,
+  sha); nothing asked for that CPU, unlike an explicit one. A build
+  script that looks at the host's features sees the unclamped CPU;
+  fastmem's agrees with its module because it passes its decision in
+  an options module rather than recomputing it.
   aarch64 follows upstream the same way: no `-mcpu` means the host's
   CPU for the native target and the target's default for an explicit
   one (`apple_m1` on aarch64-macos, the generic ARMv8.0 core on

@@ -22,6 +22,8 @@ Changes a user of bs notices, newest first, in the
 
 ### Changed
 
+- An explicit x86_64 CPU past x86-64-v2 (`-mcpu x86_64_v3`, `haswell`, `znver5`, and the like, as per-CPU kernel objects ask for) is accepted instead of refused: `builtin.cpu` is that CPU, so the program's comptime choices match upstream's, and bs's own code stays SSE4.2. A C-convention function that passes a vector over 16 bytes by value on a CPU with AVX, and an asm `x` operand over 16 bytes, are `[unsupported]`, since AVX would put them in YMM or ZMM registers. Features no CPU model has (`soft_float`, `retpoline`) stay refused. siv builds and passes its tests under `bs build` with its image decoders' fastmem kernels.
+- `-fomit-frame-pointer` (`.omit_frame_pointer = true`) is accepted; bs still keeps frame pointers.
 - bs finds Zig 0.17.1's lib directory when it runs, not where it was built: `--zig-lib-dir`, then `ZIG_LIB_DIR`, then the lib directory of upstream zig (`BS_ZIG`, else `zig` on `PATH`), which must be 0.17.1. Without one, bs fails with an error that names the version it needs.
 - C sources for `-target x86_64-linux` and `aarch64-linux` compile for the musl ABI those targets resolve to, as upstream's do, and `bs translate-c` uses it in the target triple.
 - On aarch64, a call whose target is beyond the ±128 MiB branch range is an `error[branch-range]` that names the caller and the target (bs adds no range-extension thunks), instead of `link failed: RelocationOverflow`.
@@ -38,6 +40,7 @@ Changes a user of bs notices, newest first, in the
 - On aarch64-macos, `__unwind_info`'s second-level pages are at most 4 KiB, as ld64 writes them, so `objdump --unwind-info` and lldb read them without "attempt to read past end of buffer" warnings.
 - On ELF targets, a global absolute symbol an object defines (`.globl sym; .set sym, 0x1234`) binds from other objects and from Zig `extern` declarations, as upstream's, instead of being an undefined symbol.
 - On aarch64-macos, a global absolute symbol an object defines (`.globl _sym; .set _sym, 0x1234`) binds from other objects and from Zig `extern` declarations instead of becoming a libSystem import that dyld cannot find, and pointers to it hold the value unslid, as ld64 links them.
+- x86_64 inline assembly accepts inputs tied to an output (`[_] "0" (a)`) and early-clobber register outputs (`"=&r"`).
 - x86_64 inline assembly accepts memory operands with an index register, such as `lea (%rdi,%rsi,1), %eax`.
 - On aarch64, functions with stack frames of 16 MiB or more compile, and a large `@splat` (such as `std.mem.zeroes` of a big array) is written by one copy loop instead of one store per element, which made such a function hundreds of times larger than upstream's.
 - A pointer to an array coerces to a pointer to a one-element array of it, such as `*[3]u8` to `*[1][3]u8`, as upstream allows.

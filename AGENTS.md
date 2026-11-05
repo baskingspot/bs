@@ -14,7 +14,8 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   semantics (safety checks on, `builtin.mode == .debug`) and always-on
   optimization sized to compile fast (SSA, register allocation, inlining
   within a budget). Output stays debuggable: line tables, frame pointers,
-  inlined frames. LLVM-class optimization (auto-vectorization, scheduling,
+  inlined frames; a request to omit frame pointers (`-fomit-frame-pointer`)
+  is accepted and changes nothing. LLVM-class optimization (auto-vectorization, scheduling,
   heavy loop work) stays upstream's job; users run upstream
   `zig` for ReleaseFast and friends. Explicit `@Vector` code is lowered to
   SIMD registers (SSE/NEON), as upstream's Debug backend does, not
@@ -24,6 +25,13 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   proven, and never move across source lines. Loop unrolling is allowed
   where its measured run-time gain on real programs justifies its
   compile-time and code-size cost (owner, 2026-11-05); report both.
+- bs's x86_64 code uses instructions up to x86-64-v2 (SSE4.2). An explicit
+  `-mcpu` past that (AVX models, which per-CPU kernel objects ask for) is
+  accepted as upstream resolves it: `builtin.cpu` reports it, so the
+  program's comptime choices are upstream's, and bs's SSE code runs on that
+  CPU. What AVX would change in meaning is refused: vectors over 16 bytes
+  passed by value in the C ABI, and YMM or ZMM operands in inline assembly
+  (2026-11-05). The native target's host CPU stays clamped to x86-64-v2.
 - One exception: `-OReleaseSafe` (which `zig build` steps such as Ghostty's
   tool executables pass) is accepted and compiled with the same code
   generation, with `builtin.mode == .safe` and upstream's

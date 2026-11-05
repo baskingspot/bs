@@ -94,8 +94,9 @@ pub const Options = struct {
     /// `-femit-docs[=path]`: the autodocs directory (Docs.zig).
     emit_docs: union(enum) { default, path: []const u8, none } = .none,
     target: ?[]const u8 = null,
-    /// `-mcpu`, resolved (`cpu.resolve`); without it the clamped host CPU
-    /// for the native target, else the baseline.
+    /// `-mcpu`, resolved (`cpu.resolve`), as `builtin.cpu` reports it;
+    /// without it the clamped host CPU for the native target, else the
+    /// baseline.
     cpu: std.Target.Cpu = cpu_mod.baseline,
     /// The target `target` names (`checkTarget`).
     bs_target: InternPool.Target = .x86_64_linux,
@@ -2033,7 +2034,7 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"-fentry"},                        .{"-fno-emit-asm"},
     .{"-fstack-check"},                  .{"-fno-stack-check"},
     .{"-fstack-protector"},              .{"-fno-stack-protector"},
-    .{"-fno-omit-frame-pointer"},        .{"-fno-sanitize-thread"},
+    .{"-fomit-frame-pointer"},           .{"-fno-omit-frame-pointer"},
     .{"-fno-PIC"},                       .{"-fno-PIE"},
     .{"-fbuiltin"},                      .{"-fno-builtin"},
     .{"-mred-zone"},                     .{"-mno-red-zone"},
@@ -2059,6 +2060,7 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"-fincremental"},                  .{"-fno-incremental"},
     .{"--debug-rt"},                     .{"-femit-bin"},
     .{"--compress-debug-sections=none"}, .{"-fno-dll-export-fns"},
+    .{"-fno-sanitize-thread"},
 });
 
 /// Ignored options that take a parameter.
@@ -2089,7 +2091,6 @@ fn addInclude(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), seen: 
 /// message.
 const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-fno-entry", "bs does not build executables without an entry point yet ('-fno-entry')" },
-    .{ "-fomit-frame-pointer", "bs always keeps frame pointers ('-fomit-frame-pointer'); remove '.omit_frame_pointer = true'" },
     .{ "-fsanitize-thread", "bs has no ThreadSanitizer ('-fsanitize-thread'); build this step with upstream zig" },
     .{ "-femit-implib", "bs does not emit import libraries ('-femit-implib')" },
     .{ "-femit-llvm-bc", "bs has no LLVM backend ('-femit-llvm-bc')" },

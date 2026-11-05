@@ -1547,11 +1547,11 @@
    "targets": [
     {
      "name": "astroz",
-     "note": "Out of scope (AGENTS.md: bs generates code up to x86-64-v2 and does not support AVX): astroz's build also compiles its SIMD kernels as objects with -mcpu x86_64_v3 and x86_64_v4 (oma_x86_64_v3, oma_x86_64_v4), which bs refuses with its 'does not support AVX' diagnostic, so `bs build install` and `bs build test` fail where `zig build` passes."
+     "note": "astroz's build also compiles its SIMD kernels as objects with -mcpu x86_64_v3 and x86_64_v4 (oma_x86_64_v3, oma_x86_64_v4), which bs accepts as upstream resolves them and compiles with its SSE code (AGENTS.md); `bs build install` matches `zig build`."
     },
     {
      "name": "test",
-     "note": "Out of scope: the -mcpu x86_64_v3/x86_64_v4 kernel objects, as the astroz target's note says; `bs build test` fails on them."
+     "note": "bs bug: `bs build test` crashes in Screening.refine (src/Screening.zig:355, index out of bounds with a stack address as the slice start) where `zig build test` passes; bs miscompiles the loop that fills each job's two subslices."
     }
    ]
   },

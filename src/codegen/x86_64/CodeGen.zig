@@ -890,6 +890,7 @@ fn loadQwords(cg: *CodeGen, lo: Reg, hi: Reg, m: Mem) Error!void {
 
 fn setupParams(cg: *CodeGen) Error!void {
     const ip = cg.ip;
+    if (cg.fn_ty.cc == .c or cg.fn_ty.cc == .x86_64_win) try cg.checkCVectors(cg.fn_ty, &.{});
     if (cg.fn_ty.cc == .c) return cg.setupCParams();
     if (cg.fn_ty.cc == .x86_64_win) return cg.setupWinParams();
     const ir = cg.ir;
@@ -6182,6 +6183,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     // A variadic callee learns from al how many vector registers hold
     // arguments.
     var va_sse: u8 = 0;
+    if (is_c or is_win) try cg.checkCVectors(callee_ty, args);
     if (is_c) {
         const vals = try cg.gpa.alloc(Val, args.len);
         defer cg.gpa.free(vals);
@@ -6431,6 +6433,7 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         // `&` (early clobber) holds: no two operands share a register.
         if (full.len < 2 or !std.mem.eql(u8, asmAlternative(std.mem.trimStart(u8, full[1..], "&")), "x")) continue;
         if (next_xmm == 8) return cg.fail("asm with too many 'x' operands", .{});
+        try cg.asmXmmFits(if (out.operand == .none) data.ty_pl.ty else Type.ptrInfo(ip, cg.typeOf(out.operand)).child);
         const x: Encoder.Xmm = @fromBackingInt(next_xmm);
         next_xmm += 1;
         out_xmm.* = x;
@@ -6442,8 +6445,16 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         }
     }
     for (inputs) |in| {
+        // A digit ties the input to that output: it starts in the
+        // output's register.
+        if (tiedOutput(ip.stringSlice(in.constraint), outputs.len)) |k| if (out_xmms[k]) |x| {
+            try cg.loadXmm(x, try cg.valOf(in.operand));
+            try names.put(cg.gpa, ip.stringSlice(in.name), .{ .xmm = x });
+            continue;
+        };
         if (!std.mem.eql(u8, asmAlternative(ip.stringSlice(in.constraint)), "x")) continue;
         if (next_xmm == 8) return cg.fail("asm with too many 'x' operands", .{});
+        try cg.asmXmmFits(cg.typeOf(in.operand));
         const x: Encoder.Xmm = @fromBackingInt(next_xmm);
         next_xmm += 1;
         try cg.loadXmm(x, try cg.valOf(in.operand));
@@ -6458,7 +6469,7 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         const full = ip.stringSlice(out.constraint);
         if (full.len == 0 or (full[0] != '=' and full[0] != '+')) return cg.fail("asm output constraint '{s}'", .{full});
         const read = full[0] == '+';
-        const constraint = asmAlternative(full[1..]);
+        const constraint = asmAlternative(std.mem.trimStart(u8, full[1..], "&"));
         const ty = if (out.operand == .none) data.ty_pl.ty else Type.ptrInfo(ip, cg.typeOf(out.operand)).child;
         if (std.mem.eql(u8, constraint, "r")) {
             const reg = for (asm_pool ++ asm_fallback) |r| {
@@ -6484,6 +6495,14 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     for (inputs) |in| {
         const constraint = asmAlternative(ip.stringSlice(in.constraint));
         if (std.mem.eql(u8, constraint, "x")) continue;
+        if (tiedOutput(constraint, outputs.len)) |k| {
+            if (out_xmms[k] != null) continue;
+            try cg.load(out_regs[k], in.operand);
+            const in_size = Type.abiSize(ip, cg.typeOf(in.operand));
+            if (in_size == 1 or in_size == 2 or in_size == 4 or in_size == 8)
+                try names.put(cg.gpa, ip.stringSlice(in.name), .{ .reg = .{ .reg = out_regs[k], .size = sizeOf(in_size) } });
+            continue;
+        }
         const is_r = std.mem.eql(u8, constraint, "r") or (std.mem.eql(u8, constraint, "rm") and cg.passInRegs(cg.typeOf(in.operand)));
         if (is_r) {
             const in_size = Type.abiSize(ip, cg.typeOf(in.operand));
@@ -6539,6 +6558,13 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     }
 }
 
+/// Fails for an `x` operand wider than an XMM register: with AVX it
+/// would be a YMM or ZMM register, which bs's inline assembly lacks.
+fn asmXmmFits(cg: *CodeGen, ty: Index) Error!void {
+    const size = Type.abiSize(cg.ip, ty);
+    if (size > 16) return cg.fail("asm 'x' operand of {d} bytes: bs's inline assembly has XMM registers only, not YMM or ZMM", .{size});
+}
+
 /// Of comma-separated alternative constraints, the register one if there
 /// is one, else the first.
 fn asmAlternative(c: []const u8) []const u8 {
@@ -6546,6 +6572,12 @@ fn asmAlternative(c: []const u8) []const u8 {
     var it = std.mem.splitScalar(u8, c, ',');
     while (it.next()) |alt| if (std.mem.eql(u8, alt, "r")) return alt;
     return c[0..std.mem.findScalar(u8, c, ',').?];
+}
+
+/// The output an input constraint of digits (`"0"`) ties the input to.
+fn tiedOutput(c: []const u8, outputs_len: usize) ?usize {
+    const k = std.fmt.parseInt(usize, c, 10) catch return null;
+    return if (k < outputs_len) k else null;
 }
 
 fn regConstraint(c: []const u8) ?[]const u8 {
@@ -6898,7 +6930,7 @@ fn asmInst(cg: *CodeGen, prefix: asm_insn.Prefix, mnemonic: []const u8, ops: []c
             .feature => |f| return if (cpu_mod.accepts(f))
                 cg.fail("'{s}' needs the CPU feature {t} (-mcpu=native on a CPU that has it, or -mcpu=x86_64_v2+{t}): '{s}'", .{ mnemonic, f, f, line })
             else
-                cg.fail("'{s}' needs the CPU feature {t}, which bs does not support: '{s}'", .{ mnemonic, f, line }),
+                cg.fail("'{s}' needs the CPU feature {t}, which the native CPU leaves out (bs clamps it to x86-64-v2); pass -mcpu with a model that has it or -mcpu=x86_64_v2+{t}: '{s}'", .{ mnemonic, f, f, line }),
         }
     }
     const unsupported = "bs does not support this inline assembly instruction yet: '{s}'";
@@ -7467,6 +7499,32 @@ fn cVectorClass(cg: *CodeGen, ty: Index, is_ret: bool) CClass {
         if (bytes == 32 or bytes == 64) return .{ .xwords = @intCast(bytes / 16) };
     }
     return .memory;
+}
+
+/// Fails if a function of type `fn_ty`, called with `args` (variadic
+/// ones included), passes or returns a value that the C conventions put
+/// in YMM or ZMM registers on a CPU with AVX, as upstream and Clang do:
+/// a vector of over 16 bytes (a bool vector of over 128 elements; extern
+/// aggregates cannot hold vectors). bs's code is SSE only, so it would
+/// pass them as it does without AVX, which a C or upstream caller or
+/// callee does not expect.
+fn checkCVectors(cg: *CodeGen, fn_ty: InternPool.FuncType, args: []const Ref) Error!void {
+    if (!cg.emit.zcu.cpu.has(.x86, .avx)) return;
+    for (fn_ty.param_types) |ty| if (cg.wideVector(ty)) return cg.failCVector(ty);
+    for (args) |a| if (cg.wideVector(cg.typeOf(a))) return cg.failCVector(cg.typeOf(a));
+    if (cg.wideVector(fn_ty.return_type)) return cg.failCVector(fn_ty.return_type);
+}
+
+fn failCVector(cg: *CodeGen, ty: Index) Error {
+    return cg.fail("a C-convention function passes '{f}' by value, which the target CPU's AVX puts in YMM or ZMM registers ('-mcpu'); bs generates SSE code only; pass it by pointer, or build this step with upstream zig", .{cg.fmtType(ty)});
+}
+
+fn wideVector(cg: *CodeGen, ty: Index) bool {
+    const ip = cg.ip;
+    if (Type.class(ip, ty) != .vector) return false;
+    const v = ip.keyPayload(.vector_type, ty);
+    if (v.child == .bool_type) return v.len > 128;
+    return Type.abiSize(ip, v.child) * v.len > 16;
 }
 
 /// Merges the classes of the bytes `ty` covers at offset `off` into
