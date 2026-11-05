@@ -16446,6 +16446,8 @@ fn elemPtrOfManyPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref) 
             return .fromInterned(try sema.ptrElemPtrVal(pv, sema.ip.intValue(u64, iv).?));
     };
     try sema.requireRuntime(block, src);
+    // CodeGen scales the index by the element's size.
+    try sema.resolveLayout(block, src, p.child);
     if (sema.escapesComptimeVar(ptr)) try sema.validateRuntimeValue(block, sema.indexableSrc(src), ptr);
     return sema.addTyPlBin(block, .ptr_elem_ptr, result_ty, ptr, index);
 }

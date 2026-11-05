@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n42\n12\n42\nb\n4\n42\n7\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n42\n12\n42\nb\n4\n42\n7\n24\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -416,6 +416,14 @@ fn ValueHolder(n: u64) type {
     };
 }
 
+// knoedel (std's hash_map `Iterator.next` over `ScheduleID` keys): indexing
+// a many-pointer resolves the element's layout, which CodeGen scales the
+// index by, when nothing else needs it.
+const Elem = struct { id: u32, value: u32 };
+fn elemOffset(p: [*]Elem, i: usize) usize {
+    return @intFromPtr(&p[i]) - @intFromPtr(p);
+}
+
 // zigdown (plutosvg.zig): a function taking and returning `i32` coerces to
 // a pointer to one with `c_int`, the same integer in memory.
 const CIntCb = ?*const fn (c_int) callconv(.c) c_int;
@@ -557,5 +565,8 @@ fn main() callconv(.c) noreturn {
     const cint_cb: CIntCb = twiceI32;
     rt.printInt(@intCast(cint_cb.?(21)));
     rt.printInt(externLanguage("x"));
+    var elems: [*]Elem = undefined;
+    _ = &elems;
+    rt.printInt(elemOffset(elems, 3));
     rt.exit(0);
 }
