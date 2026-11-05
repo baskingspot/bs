@@ -1987,6 +1987,49 @@ like every other check and fold only where the constant proves them.
 case that matters: zig fmt −2.9%, the zls tests −4.1% outside std's
 unwinder.
 
+#### Forwarding
+
+Built on the IR, on the CodeGen workers before proving checks
+(`src/codegen/forward.zig`, from `Emit.generateFunction`), so its cost
+is off the Sema thread. A first pass over the tags skips functions with
+neither a copy (a store of a load, or of an inline call's argument, into
+a `const` aggregate local) nor a load through the base pointer of an
+earlier load or store (by a 256-bit hash of bases). One walk numbers the
+instructions in body order and records, per local, whether its address
+escapes (is used other than to load, store, or derive a field or element
+pointer), its stores and its last use. Dominance is by position: an
+instruction reaches the end of the body holding it, and a `block` left
+only by the `br` ending its body passes that reach to its body. Two
+rewrites use it:
+
+- Copies. A `const` local of an aggregate, stored once with a whole load
+  `p.*` (also through Sema's inline-call argument tuple) and only read,
+  becomes `p` itself when the load dominates the local in the same loop
+  and nothing may write `*p` from the load to the local's last read:
+  no store through an escaped or unknown pointer, no returning call,
+  atomic or assembly, and when `p` points into a local, no store into it.
+  This removes the frame copy of `const x = p.*`, `const x = buf[i]`, and
+  by-value parameters of inline calls whose callee only reads them.
+  Scalar replacement leaves such copies of other memory whole for this
+  (see Rewrite rules); splitting them loaded every field at the copy,
+  which lengthened intervals (nbody +12% Ir).
+- Loads. A load of a scalar (an integer or enum of at most 8 bytes,
+  `f32`, `f64`, an error code, `bool`, or a pointer, slices included) through an ordinary pointer
+  reads the value of a dominating store or load in the same loop through
+  the same address: the same pointer value, or the same field of it,
+  where a pointer loaded from a `const` local stored once counts as the
+  pointer stored (each `self.x` reloads `self` from its parameter's
+  slot). Positions are scanned in order, so any write in between, also
+  in a branch not taken, forgets what it may overlap: a store forgets
+  other fields of the same struct only if the struct's fields do not
+  overlap, two locals never overlap, a local whose address does not
+  escape overlaps nothing reached otherwise, and a returning call forgets
+  all but those locals. Panics do not return, so safety checks forget
+  nothing. Values do not flow around loop back edges. Scalar locals whose
+  address does not escape are left alone: `Ssa.plan` forwards and
+  promotes their loads, and forwarding them first only lengthened
+  intervals (fmt +3%).
+
 #### Rewrite rules
 
 Built on the IR, after inlining (`src/codegen/rewrite.zig`): a table of
@@ -2040,6 +2083,9 @@ split structs' values flow without memory: a load of such a struct from
 other memory, used only by field reads and stores, becomes its fields'
 loads; and a store of a split struct's load to other memory (directly, or
 as the result of an inlined call's block) becomes a store per field. A
+`const` local stored with a whole load of other memory (or Sema's
+inline-call argument holding one) is not split: forwarding (above)
+reads that memory instead. A
 block exited by one `br` that ends it is that `br`'s value, and its `br`
 then writes nothing. Instructions are inserted by appending them and
 rebuilding the bodies once, only in functions with something to split.

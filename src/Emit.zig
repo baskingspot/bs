@@ -40,6 +40,7 @@ const rewrite = @import("codegen/rewrite.zig");
 const prove = @import("codegen/prove.zig");
 const sroa = @import("codegen/sroa.zig");
 const unroll = @import("codegen/unroll.zig");
+const forward = @import("codegen/forward.zig");
 const Sema = @import("Sema.zig");
 const cache = @import("cache.zig");
 
@@ -209,6 +210,8 @@ rewrite_scratch: rewrite.Scratch = .{},
 sroa_scratch: sroa.Scratch = .{},
 /// `prove.run`'s arrays, on a worker, reused for the next function.
 prove_scratch: prove.Scratch = .{},
+/// `forward.run`'s arrays, on a worker, reused for the next function.
+forward_scratch: std.ArrayList(u32) = .empty,
 /// Whether `prove.run` removes the checks it proves (`BS_PROVE=off`
 /// turns it off, to compare a program's behavior with and without).
 prove_on: bool = true,
@@ -403,6 +406,10 @@ pub const CodeGenStats = struct {
     /// instructions and branches they folded.
     rewrite_ns: u64 = 0,
     folds: u64 = 0,
+    /// Forwarding copies and loads (`forward.run`, on the workers), and
+    /// the copies and loads forwarded.
+    forward_ns: u64 = 0,
+    forwarded: u64 = 0,
     /// Proving checks (`prove.run`, on the workers), and the checks
     /// proven.
     prove_ns: u64 = 0,
@@ -436,7 +443,7 @@ pub const CodeGenStats = struct {
                 return @as(f64, @floatFromInt(ns)) / 1e6;
             }
         }.f;
-        std.debug.print("{s}: {d} functions, {d} IR instructions; rewrite {d:.1} ms ({d:.1} ns/IR, {d} folds), sroa {d:.1} ms ({d:.1} ns/IR, {d} splits), prove {d:.1} ms ({d:.1} ns/IR, {d} of {d} checks proven), ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
+        std.debug.print("{s}: {d} functions, {d} IR instructions; rewrite {d:.1} ms ({d:.1} ns/IR, {d} folds), sroa {d:.1} ms ({d:.1} ns/IR, {d} splits), forward {d:.1} ms ({d:.1} ns/IR, {d} forwarded), prove {d:.1} ms ({d:.1} ns/IR, {d} of {d} checks proven), ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
             label,
             s.functions,
             s.ir_insts,
@@ -446,6 +453,9 @@ pub const CodeGenStats = struct {
             ms(s.sroa_ns),
             per(s.sroa_ns, s.ir_insts),
             s.splits,
+            ms(s.forward_ns),
+            per(s.forward_ns, s.ir_insts),
+            s.forwarded,
             ms(s.prove_ns),
             per(s.prove_ns, s.ir_insts),
             s.proven,
@@ -525,6 +535,7 @@ pub fn deinit(emit: *Emit) void {
     emit.ssa.deinit(gpa);
     emit.rewrite_scratch.deinit(gpa);
     emit.prove_scratch.deinit(gpa);
+    emit.forward_scratch.deinit(gpa);
     emit.sroa_scratch.deinit(gpa);
     if (emit.bench_irs) |*irs| {
         for (irs.items) |*ir| ir.deinit(gpa);
@@ -1131,8 +1142,11 @@ fn generateFunction(emit: *Emit, ir: *const Ir) Allocator.Error!void {
     const t0 = std.Io.Timestamp.now(io, .awake);
     defer emit.codegen_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
     // The IR is this job's own.
+    emit.codegen_stats.forwarded += try forward.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.forward_scratch);
+    const t1 = std.Io.Timestamp.now(io, .awake);
+    emit.codegen_stats.forward_ns += @intCast(t0.durationTo(t1).nanoseconds);
     const st: prove.Stats = if (!emit.prove_on) .{} else try prove.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.prove_scratch, emit.fuzz);
-    emit.codegen_stats.prove_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
+    emit.codegen_stats.prove_ns += @intCast(t1.durationTo(.now(io, .awake)).nanoseconds);
     emit.codegen_stats.checks += st.checks;
     emit.codegen_stats.proven += st.proven;
     const generate = switch (emit.zcu.ip.target) {

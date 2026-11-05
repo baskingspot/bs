@@ -261,6 +261,23 @@ fn candidateType(ip: *const InternPool, agg: Index) u32 {
     return @intCast(k);
 }
 
+/// The load whose value `v` is, directly or as an argument of Sema's
+/// inline call (a field of an `aggregate_init`).
+fn wholeLoad(ir: *const Ir, v: Inst.Ref) ?u32 {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    var i = @backingInt(v.toIndex() orelse return null);
+    if (tags[i] == .struct_field_val) {
+        const sf = ir.extraData(Ir.StructField, datas[i].ty_pl.payload).data;
+        const agg = @backingInt(sf.operand.toIndex() orelse return null);
+        if (tags[agg] != .aggregate_init) return null;
+        const x = ir.extraData(Ir.Aggregate, datas[agg].ty_pl.payload);
+        if (sf.index >= x.data.len) return null;
+        i = @backingInt(ir.refSlice(x.end, x.data.len)[sf.index].toIndex() orelse return null);
+    }
+    return if (tags[i] == .load) i else null;
+}
+
 /// `Scan.root` of a load from other memory than a candidate's.
 const load_bit: u32 = 1 << 31;
 
@@ -361,6 +378,14 @@ const Scan = struct {
                     try s.events.append(s.gpa, inst);
                 },
                 .store => if (isRoot(s, data.bin_op.lhs)) {
+                    // A `const` copy of other memory than a candidate's is
+                    // left whole: when nothing writes that memory while
+                    // the copy is read, `forward` reads it there instead.
+                    const r = @backingInt(data.bin_op.lhs.toIndex().?);
+                    if (wholeLoad(ir, data.bin_op.rhs)) |l| if (!isRoot(s, datas[l].ty_op.operand) and Type.ptrInfo(s.ip, datas[r].ty).flags.is_const) {
+                        s.fields[r] = 0;
+                        if (s.root[l] == l | load_bit) s.fields[l] = 0;
+                    };
                     try s.events.append(s.gpa, inst);
                 } else if (data.bin_op.rhs.toIndex()) |v| switch (tags[@backingInt(v)]) {
                     .block, .load => try stores.append(s.gpa, inst),
