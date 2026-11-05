@@ -3834,7 +3834,7 @@ fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
     // A by-reference argument's register holds its address (`Home.ind`),
     // whose memory the lowering may still read after writing the result.
     if (ir.instructions.items(.tag)[@backingInt(i)] == .arg and cg.fn_ty.cc == .auto and
-        cg.autoClass(ir.instructions.items(.data)[@backingInt(i)].arg.ty) == .memory) return Ssa.no_tie;
+        cg.autoClass(ir.instructions.items(.data)[@backingInt(i)].arg.ty) == .memory) return Ssa.no_tie; // ziglint-ignore: Z010 -- a u32 constant of Ssa, which `.no_tie` cannot name
     return @backingInt(i);
 }
 

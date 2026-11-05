@@ -1091,7 +1091,7 @@ const InputResolver = struct {
             const result = try r.emit.useImport(name, .{ .weak = weak });
             return result;
         }
-        if (r.emit.shared and std.mem.eql(u8, name, "_DYNAMIC")) return ElfDynamic.dynamic_key;
+        if (r.emit.shared and std.mem.eql(u8, name, "_DYNAMIC")) return ElfDynamic.dynamic_key; // ziglint-ignore: Z010 -- a declaration of ElfDynamic, not of SymbolKey
         if (!r.emit.shared and !r.emit.libraryDefines(name)) return null;
         const result = try r.emit.useImport(name, .{ .weak = weak, .tls = r.emit.sharedTls(name) });
         return result;
@@ -1969,7 +1969,7 @@ pub fn tlsTarget(emit: *Emit, name: []const u8) !TlsTarget {
 /// PC-relative.
 pub fn pcrelTarget(emit: *Emit, name: []const u8, weak: bool) !?SymbolKey {
     if (emit.obj and !emit.shared) return try emit.userExport(name) orelse try emit.useImport(name, .{ .weak = weak, .hidden = true });
-    if (emit.shared and std.mem.eql(u8, name, "_DYNAMIC")) return ElfDynamic.dynamic_key;
+    if (emit.shared and std.mem.eql(u8, name, "_DYNAMIC")) return ElfDynamic.dynamic_key; // ziglint-ignore: Z010 -- a declaration of ElfDynamic, not of SymbolKey
     // Analyzes the compiler_rt function, for the unit's cached references.
     _ = try emit.requestCompilerRtExport(name);
     if (try emit.userExport(name) orelse try emit.rtExport(name)) |key| return key;
