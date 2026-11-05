@@ -1,12 +1,13 @@
 //! exit: 0
-//! stdout: "1\n1\n1\n0\n1\n97\n111\n1\n1\n1\n1\n1\n1\n25\n23\n7\n"
+//! stdout: "1\n1\n1\n0\n1\n97\n111\n1\n1\n1\n1\n1\n1\n25\n23\n7\n1\n"
 //! C pointers compared with integers and in order, unwrapped like
 //! optionals, and read in place of optional pointers; slices of allowzero
 //! pointers; comptime pointer differences and equality by layout; C
 //! pointer peers; pointer arithmetic narrowing an explicit alignment;
 //! differences of array pointers; many-pointers to whole arrays; C
 //! pointers to and from differently named integers of the same bits
-//! (raylib-zig passes `[*c]i32` for `[*c]c_int`).
+//! (raylib-zig passes `[*c]i32` for `[*c]c_int`); a null optional pointer
+//! cast to a C or allowzero pointer (ghostty's oniguruma binding).
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -83,6 +84,15 @@ fn main() callconv(.c) noreturn {
     _ = &cint;
     const back: *c_int = cint;
     rt.printInt(@intCast(cInts(&int, @as([*c]i32, &ints)) + back.*));
+    var no_s: ?*S = null;
+    var c_zero: [*c]S = null;
+    _ = .{ &no_s, &c_zero };
+    const c_null: [*c]u32 = @ptrCast(no_s);
+    const c_null_ct: [*c]u32 = comptime @ptrCast(@as(?*S, null));
+    const az_ct: *allowzero u32 = comptime @ptrCast(@as(?*S, null));
+    const opt_null: ?*u32 = @ptrCast(c_zero);
+    const opt_null_ct: ?*u32 = comptime @ptrCast(@as([*c]S, null));
+    rt.printInt(@intFromBool(c_null == null and c_null_ct == null and @intFromPtr(az_ct) == 0 and opt_null == null and opt_null_ct == null));
     rt.exit(0);
 }
 

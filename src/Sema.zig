@@ -19672,8 +19672,10 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
         if (sema.resolveValue(child)) |cv| return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = cv } }));
         return sema.addTyOp(block, .bitcast, dest_ty, child);
     }
+    // A C pointer allows zero, as an allowzero one does.
+    const dest_az = Type.class(ip, dest_ty) == .pointer and (Type.ptrInfo(ip, dest_ty).flags.is_allowzero or Type.ptrInfo(ip, dest_ty).flags.size == .c);
     if (opt_slice and Type.class(ip, dest_ty) == .pointer and Type.ptrInfo(ip, dest_ty).flags.size != .slice) {
-        const az = Type.ptrInfo(ip, dest_ty).flags.is_allowzero;
+        const az = dest_az;
         if (sema.resolveValue(operand)) |v| {
             if (!sema.isUndef(v) and ip.keyPayload(.opt, v).val == .none) {
                 if (!az) return sema.fail(block, src.castOperand(), "null pointer casted to type '{f}'", .{sema.fmtType(dest_ty)});
@@ -19695,8 +19697,11 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
             return sema.addTyOp(block, .bitcast, dest_ty, operand);
         }
         if (sema.resolveValue(operand)) |v| {
-            if (!sema.isUndef(v) and ip.keyPayload(.opt, v).val == .none) return sema.fail(block, src.castOperand(), "null pointer casted to type '{f}'", .{sema.fmtType(dest_ty)});
-        } else if (block.want_safety and Type.class(ip, dest_ty) == .pointer and !Type.ptrInfo(ip, dest_ty).flags.is_allowzero) {
+            if (!sema.isUndef(v) and ip.keyPayload(.opt, v).val == .none) {
+                if (!dest_az) return sema.fail(block, src.castOperand(), "null pointer casted to type '{f}'", .{sema.fmtType(dest_ty)});
+                return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .int, .byte_offset = 0 } }));
+            }
+        } else if (block.want_safety and Type.class(ip, dest_ty) == .pointer and !dest_az) {
             try sema.requireRuntime(block, src);
             const ok = try sema.addUnOp(block, .is_non_null, operand);
             try sema.addSafetyCheck(block, ok, .cast_to_null, .none, .none);
@@ -19719,6 +19724,14 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
         }
         return sema.addTyOp(block, .bitcast, dest_ty, child);
     }
+    // A C or allowzero pointer that is comptime-known zero has no place in
+    // a pointer that does not allow zero, as upstream.
+    if (Type.class(ip, dest_ty) == .pointer and !dest_az and Type.class(ip, sema.typeOf(operand)) == .pointer) if (sema.resolveValue(operand)) |v| {
+        if (!sema.isUndef(v) and ip.keyTag(v) == .ptr) {
+            const p = ip.keyPayload(.ptr, v);
+            if (p.base == .int and p.byte_offset == 0) return sema.fail(block, src.castOperand(), "null pointer casted to type '{f}'", .{sema.fmtType(dest_ty)});
+        }
+    };
     return sema.ptrCastInner(block, src, flags, dest_ty, operand);
 }
 
