@@ -17,6 +17,7 @@ const Archive = @import("link/Archive.zig");
 const ElfMerge = @import("link/ElfMerge.zig");
 const ElfInput = @import("link/ElfInput.zig");
 const MachOInput = @import("link/MachOInput.zig");
+const Tbd = @import("link/Tbd.zig");
 const MachODylib = @import("link/MachODylib.zig");
 const ElfShared = @import("link/ElfShared.zig");
 const Docs = @import("Docs.zig");
@@ -1214,9 +1215,19 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     };
     if (glibc != null) emit.runpath = opts.runpath;
     emit.lld = opts.c_root;
-    emit.libc_first = glibc != null and plain;
     // aarch64-macos links against Mach-O dylibs, with LC_RPATHs.
     const macos = opts.bs_target == .aarch64_macos;
+    emit.libc_first = plain and (glibc != null or macos);
+    // Plain C binds the names libSystem exports to it before compiler_rt,
+    // from the stub upstream links against.
+    var libsystem: std.StringHashMapUnmanaged(void) = .empty;
+    if (plain and macos) {
+        const tbd_path = try std.fs.path.join(arena, &.{ job.zig_lib_dir, "libc", "darwin", "libSystem.tbd" });
+        const text = Io.Dir.cwd().readFileAlloc(init.io, tbd_path, arena, .unlimited) catch |err|
+            fatal("unable to read '{s}': {t}", .{ tbd_path, err });
+        try Tbd.exports(arena, text, &libsystem);
+        emit.libsystem = &libsystem;
+    }
     if (macos) {
         emit.runpath = opts.runpath;
         const libs = try arena.alloc(MachODylib, opts.shared_libs.len);
@@ -2723,6 +2734,7 @@ test {
     _ = @import("link/MachO.zig");
     _ = @import("link/MachOInput.zig");
     _ = @import("link/MachOObject.zig");
+    _ = @import("link/Tbd.zig");
     _ = @import("codegen/aarch64/Encoder.zig");
     _ = @import("codegen/Ssa.zig");
     _ = @import("codegen/rewrite.zig");

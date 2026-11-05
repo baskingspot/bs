@@ -120,10 +120,13 @@ runpath: ?[]const u8 = null,
 /// The program is C only, which upstream links with lld rather than its
 /// own linker (`Glibc.dynamicOptions`).
 lld: bool = false,
-/// Plain C against glibc (`main.plainC`): names glibc defines resolve to
-/// it before compiler_rt, as upstream's compiler_rt archive after libc
-/// leaves them (`memset`, `memcpy`, libm's functions).
+/// Plain C against glibc or libSystem (`main.plainC`): names the libc
+/// defines resolve to it before compiler_rt, as upstream's compiler_rt
+/// archive after libc leaves them (`memset`, `memcpy`, libm's functions).
 libc_first: bool = false,
+/// With `libc_first` on aarch64-macos: the names libSystem's stub exports
+/// to arm64, without the leading underscore (link/Tbd.zig).
+libsystem: ?*const std.StringHashMapUnmanaged(void) = null,
 /// An executable's object and archive inputs, which `sync` pulls archive
 /// members for and `finish` converts into atoms.
 inputs: ?Inputs = null,
@@ -1935,8 +1938,10 @@ fn sharedTls(emit: *const Emit, name: []const u8) bool {
 }
 
 /// Whether an executable that links glibc imports `name`: one of its
-/// shared libraries or glibc defines it.
+/// shared libraries or glibc defines it. On aarch64-macos, whether
+/// `libsystem` has it.
 fn libraryDefines(emit: *const Emit, name: []const u8) bool {
+    if (emit.libsystem) |set| return set.contains(name);
     const g = emit.glibc orelse return false;
     return Glibc.sharedSymbol(emit.shared_libs, name) != null or g.get(name) != null;
 }

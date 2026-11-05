@@ -7719,8 +7719,11 @@ libraries as inputs. To be agreed with that thread.
   only by a reference). On aarch64-macos such plain C roots neither
   ubsan_rt nor ssp either (libSystem has `__stack_chk_fail`): hello
   is 33 KB instead of 1.29 MB, a dylib of `sin` and `cos` 34 KB instead
-  of 1.31 MB; its names still bind to compiler_rt before libSystem,
-  where upstream imports libSystem's (2026-11-05). The root then
+  of 1.31 MB. Its names bind to libSystem before compiler_rt as glibc's
+  do (`Emit.libsystem`: the names lib/libc/darwin/libSystem.tbd, upstream's
+  stub, exports to arm64, read by link/Tbd.zig; matched as spelled, so
+  `reallocarray$DARWIN_EXTSN` and not `reallocarray`), so the dylib
+  imports `_sin` and `_cos` as upstream's does (2026-11-05). The root then
   sets `panic = std.debug.no_panic`: upstream's crt1.o and compiler_rt
   (built with no safety) have none either. Otherwise compiler_rt's
   `__stack_chk_fail` and the std functions it shares with the program
