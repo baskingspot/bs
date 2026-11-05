@@ -1440,7 +1440,10 @@ fn setupParams(cg: *CodeGen) Error!void {
         // The error return trace pointer arrives in x15; a function that
         // neither reads it nor calls drops it.
         const needs_trace = for (cg.ssa.values.items(.inst)) |inst| switch (tags[@backingInt(inst)]) {
-            .call, .err_return_trace, .save_err_return_trace_index => break true,
+            .call, .err_return_trace => break true,
+            // Sema marks every trace index it may restore later; one no
+            // restore uses has no type and no code.
+            .save_err_return_trace_index => if (ir.instructions.items(.data)[@backingInt(inst)].ty_pl.ty != .none) break true,
             else => {},
         } else false;
         if (needs_trace) {
