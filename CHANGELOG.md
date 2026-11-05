@@ -34,6 +34,7 @@ Changes a user of bs notices, newest first, in the
 ### Fixed
 
 - On aarch64-macos, the libraries a linked stub re-exports are looked up by name in the `-F` and `-L` directories before the SDK the stub is in, as upstream does, so a vendored SDK passed with `-F` (zine's) links. bs failed with "re-exports ... whose stub ... cannot be read".
+- Without runtime safety (ReleaseFast and ReleaseSmall `bs build` steps, or `@setRuntimeSafety(false)`), `@memset(x, undefined)` and stores of `undefined` write nothing, as upstream's do, instead of filling 0xaa; Debug and ReleaseSafe still fill. Memory fresh from mmap stays zero after std's allocator marks it undefined, which Ghostty's terminal pages rely on: its `terminal-stream`, `terminal-formatter` and `screen-clone` bench tools crashed.
 - On x86_64, a slice or other value a function returns through its result pointer, read back through a local after it is written, no longer clobbers a value the register allocator kept in r11: astroz's `Screening.refine` got a stack address as a slice bound and failed its bounds check.
 - In `bs build`, the first build after a cold one no longer compiles shared libraries and `-fPIC` objects again when they link other steps' outputs, nor reruns every step that depends on them.
 - In `bs build`, the first build after a cold one no longer compiles shared libraries and `-fPIC` objects again when their C sources include a header another step generated, nor reruns every step that depends on them.

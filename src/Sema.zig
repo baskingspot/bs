@@ -3714,6 +3714,18 @@ fn isUndef(sema: *Sema, val: Index) bool {
     return sema.ip.keyTag(val) == .undef;
 }
 
+/// Whether a runtime store or `@memset` of `operand` writes nothing: an
+/// `undefined` one in a block without runtime safety, as upstream's
+/// backends make an `undefined` `store` and `memset` (not `store_safe` and
+/// `memset_safe`) no-ops. With safety on, the backends fill 0xaa. The
+/// comptime evaluator's lowered code keeps the store, which makes the
+/// memory undefined.
+fn dropsUndefStore(sema: *Sema, block: *Block, operand: Ref) bool {
+    if (block.want_safety or sema.bc != null) return false;
+    const v = sema.resolveValue(operand) orelse return false;
+    return sema.isUndef(v);
+}
+
 fn analyzeAsType(sema: *Sema, block: *Block, src: Src, ref: Ref) CompileError!Index {
     const coerced = try sema.coerce(block, .type_type, ref, src);
     const val = try sema.resolveConstValue(block, src, coerced, "types must be comptime-known");
@@ -13265,6 +13277,7 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
     try sema.checkAddressSpace(block, src, info.flags.address_space);
     try sema.validateRuntimeValue(block, operand_src, operand);
     if (!Type.hasRuntimeBits(ip, info.child)) return;
+    if (sema.dropsUndefStore(block, operand)) return;
     // The comptime evaluator stores through bit pointers as the walker does.
     if (info.packed_offset.host_size != 0 and sema.bc == null) {
         // Read, modify, and write the host integer.
@@ -15956,6 +15969,7 @@ fn zirMemset(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     try sema.validateRuntimeValue(block, sema.callArgSrc(src, false, 0), dest);
     try sema.validateRuntimeValue(block, sema.callArgSrc(src, false, 1), elem);
     if ((try sema.isComptimeOnlyResolved(block, src, d.elem))) return sema.fail(block, src, "cannot store comptime-only element '{f}' at runtime", .{sema.fmtType(d.elem)});
+    if (sema.dropsUndefStore(block, elem)) return .void_value;
     _ = try sema.addBinOp(block, .memset, dest, elem);
     return .void_value;
 }

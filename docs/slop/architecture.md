@@ -1382,6 +1382,9 @@ leaves the loop (after the last `repeat`). In the same walk:
   variable: each store defines it, each load reads it, and phis appear at
   merges. A store of `undefined` defines it as the 0xaa pattern, so a
   read of an undefined variable still sees what Debug semantics promise.
+  (Without runtime safety Sema emits no store or `memset` of `undefined`
+  at all, as upstream's backends make an unsafe one a no-op, so such a
+  read sees whatever the variable held.)
   Which allocs qualify is found by one scan of the IR before the walk
   (per alloc: any use other than load/store address disqualifies it).
   Other allocs keep their frame slot, as today.
