@@ -2962,6 +2962,72 @@
      "note": "As evmz:tools/main.zig: guaranteed tail calls, which bs refuses and upstream's self-hosted backend crashes on."
     }
    ]
+  },
+  {
+   "name": "monstar",
+   "url": "https://github.com/rockorager/monstar",
+   "commit": "406c48eb938a065997bf5378457d7ca24fbfcea5",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/Pty.zig",
+      "    self.releaseChild();"
+     ],
+     "note": "Needs the system's wayland-client, wayland-cursor, fontconfig, freetype2, harfbuzz and xkbcommon headers and libraries (pkg-config), wayland 1.25 and wayland-protocols 1.49 (.agents/setup). The tests run headless; no compositor is needed. Links libc and libc++ (ghostty's simd sources, simdutf, highway), compiles two C sources and translates src/c.h."
+    },
+    {
+     "name": "monstar",
+     "edit": [
+      "src/Pty.zig",
+      "    self.releaseChild();"
+     ],
+     "note": "Not run: the terminal needs a Wayland compositor. Under weston (x11 backend) the window bs's build draws for `-e sh -c 'printf ...; ls'` matched upstream's pixel for pixel apart from the pointer (2026-11-05)."
+    }
+   ]
+  },
+  {
+   "name": "Avalanche",
+   "url": "https://github.com/SnowballSH/Avalanche",
+   "commit": "a61cfd2c6b47608bb7ece3d31156bba8718b3307",
+   "ref": "master",
+   "license": "GPL-3.0",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/main.zig",
+      "    const startup_commands = args[@min(1, args.len)..];"
+     ],
+     "note": "Links libc. Needs bs's `*T` to `*[1]T` coercion for array T (large_memory.destroy). The suite takes about 2 minutes in Debug."
+    },
+    {
+     "name": "Avalanche",
+     "edit": [
+      "src/main.zig",
+      "    const startup_commands = args[@min(1, args.len)..];"
+     ],
+     "note": "Not run: the engine reads UCI commands from stdin and `go` searches asynchronously, so an argument list ends before the search; `bench` takes minutes in Debug. A UCI session's `go depth 7` printed the same lines under bs and upstream (2026-11-05)."
+    }
+   ]
   }
  ],
  "excluded": [
@@ -2975,10 +3041,6 @@
    "reason": "MPL-2.0, not MIT-compatible; it also links libc and BearSSL (C) in every artifact"
   },
   {
-   "name": "Avalanche",
-   "reason": "links libc"
-  },
-  {
    "name": "zware",
    "url": "https://github.com/malcolmstill/zware",
    "reason": "its interpreter requires the LLVM backend (`.always_tail` calls); upstream's self-hosted backend rejects it, and its spec tests need wabt (C++)"
@@ -2987,11 +3049,6 @@
    "name": "zig-yaml",
    "url": "https://github.com/kubkon/zig-yaml",
    "reason": "master (e5cf8ac) declares 0.16.0 and its build.zig does not build with 0.17.0"
-  },
-  {
-   "name": "monstar",
-   "url": "https://github.com/rockorager/monstar",
-   "reason": "C acceptance target (406c48eb, 2026-10-31): links libc and the system's wayland-client and wayland-cursor (.so, pkg-config), compiles two C sources, translates fontconfig, freetype2, harfbuzz and xkbcommon headers; needs wayland 1.25 and wayland-protocols 1.49 (.agents/setup). Its exe and test compile C++ (ghostty's simd sources, simdutf, highway, -lc++), and its terminfo generator builds ReleaseSafe"
   },
   {
    "name": "zig-json (nektro)",
