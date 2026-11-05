@@ -2010,6 +2010,8 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "@atomicRmw with float only allowed with .Xchg, .Add, .Sub, .Max, and .Min", .@"bad-operands" },
     .{ "@byteSwap requires the number of bits to be evenly divisible by 8, but '{f}' has {d} bits", .@"bad-operands" },
     .{ "@reduce operation '{s}' requires integer or boolean operand; found '{f}'", .@"bad-operands" },
+    .{ "@reduce operation '{s}' requires integer or float operand; found '{f}'", .@"bad-operands" },
+    .{ "@reduce operation '{s}' requires integer or {s} operand; found '{f}'", .@"bad-operands" },
     .{ "@reduce operation requires a vector with nonzero length", .@"bad-operands" },
     .{ "bit shifting operation expected integer type, found '{f}'", .@"bad-operands" },
     .{ "comparison of union and enum literal is only valid for tagged union types", .@"bad-operands" },

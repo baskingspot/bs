@@ -5079,8 +5079,8 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .vector_type => blk: {
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const len = try sema.resolveInt(block, src, extra.lhs, .u32_type, "vector length must be comptime-known");
-            const child = try sema.resolveType(block, src, extra.rhs);
+            const len = try sema.resolveInt(block, sema.callArgSrc(src, false, 0), extra.lhs, .u32_type, "vector length must be comptime-known");
+            const child = try sema.resolveType(block, sema.callArgSrc(src, false, 1), extra.rhs);
             const ok = switch (Type.class(sema.ip, child)) {
                 .int, .float, .bool => true,
                 .pointer => !Type.isSlice(sema.ip, child),
@@ -15085,13 +15085,25 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
                     const cp = Type.ptrInfo(ip, p.child);
                     if (cp.flags.size == .one and ip.keyTag(cp.child) == .array_type and std.mem.eql(u8, name, "len"))
                         return .fromInterned(try sema.intValue(.usize_type, ip.keyPayload(.array_type, cp.child).len));
+                    // As upstream, only one pointer is followed to a type
+                    // without fields: the error names the pointer type.
+                    const follow = switch (cp.flags.size) {
+                        .slice => true,
+                        .one => switch (Type.class(ip, cp.child)) {
+                            .array, .tuple, .@"struct", .@"union", .type => true,
+                            .pointer => Type.isSlice(ip, cp.child),
+                            else => false,
+                        },
+                        else => false,
+                    };
+                    if (!follow) return sema.failInvalidFieldAccess(block, src, p.child, name);
                     return sema.fieldVal(block, src, try sema.analyzeLoad(block, src, lhs), name);
                 },
                 .type => return sema.fieldVal(block, src, try sema.analyzeLoad(block, src, lhs), name),
                 else => {},
             }
-            if (Type.class(ip, p.child) == .optional or Type.class(ip, p.child) == .error_union) return sema.failInvalidFieldAccess(block, src, p.child, name);
-            return sema.fail(block, src, "no member named '{s}' in '{f}'", .{ name, sema.fmtType(p.child) });
+            if (Type.class(ip, p.child) == .@"opaque") return sema.fail(block, src, "no member named '{s}' in '{f}'", .{ name, sema.fmtType(p.child) });
+            return sema.failInvalidFieldAccess(block, src, p.child, name);
         },
         .@"struct", .tuple => {
             if (ip.keyTag(ty) == .tuple_type and ip.keyPayload(.tuple_type, ty).names.len == 0 and std.mem.eql(u8, name, "len"))
@@ -16437,7 +16449,9 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
         },
         .vector_type => |v| {
             const index = try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1));
-            if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, v.len)), false, .array);
+            // A comptime-known vector is read as an array, as upstream's
+            // elemValArray; a runtime one names the vector.
+            if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, v.len)), false, if (sema.resolveValue(lhs) != null) .array else .vector);
             if (Type.isInt(ip, v.child) and Type.intInfo(ip, v.child).bits == 0) return .fromInterned(try sema.intValue(v.child, 0));
             if (sema.resolveValue(lhs)) |val| if (sema.resolveValue(index)) |iv| return .fromInterned(try sema.elemValue(val, ip.intValue(u64, iv).?));
             try sema.requireRuntime(block, src);
@@ -20603,11 +20617,12 @@ fn analyzeCall(
 /// lowered for the comptime evaluator refuse tail calls, so the walker
 /// runs them as comptime calls, which upstream's are.
 fn tailRet(sema: *Sema, block: *Block, src: Src, callee_ty: Index, call: Ref) CompileError!Ref {
+    if (block.inlining != null) try sema.checkTailResult(block, src, call);
+    try sema.recordInferredErrors(block, src, call);
+    const result = try sema.coerceCtx(block, sema.fn_ret_ty, call, src, .{ .ret = sema.func });
     const owner_ty = try sema.typeOfWithIes(.fromInterned(sema.func));
     if (callee_ty != owner_ty)
         return sema.fail(block, src, "unable to perform tail call: type of function being called '{f}' does not match type of calling function '{f}'", .{ sema.fmtType(callee_ty), sema.fmtType(owner_ty) });
-    try sema.recordInferredErrors(block, src, call);
-    const result = try sema.coerceCtx(block, sema.fn_ret_ty, call, src, .{ .ret = sema.func });
     _ = try sema.addUnOp(block, .ret, result);
     return .unreachable_value;
 }
@@ -20616,13 +20631,18 @@ fn tailRet(sema: *Sema, block: *Block, src: Src, callee_ty: Index, call: Ref) Co
 /// backends support no tail calls (`target_util.supportsTailCall`), while
 /// LLVM, aarch64-macos's Debug backend, does; comptime and inline calls are
 /// not tail calls and get here only at runtime.
-/// As upstream, the call's result is first coerced to the return type,
-/// so a mismatch reports that instead (`ret_ty` is the call's).
 fn failTailCall(sema: *Sema, block: *Block, src: Src, ret_ty: Index) CompileError {
+    try sema.checkTailResult(block, src, try sema.runtimeDummy(ret_ty));
+    return sema.fail(block, src, "unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags", .{});
+}
+
+/// As upstream, a tail call's result `result` is coerced to the return
+/// type (of the function inlined into, inside one) before the call itself
+/// is checked, so a mismatch reports that.
+fn checkTailResult(sema: *Sema, block: *Block, src: Src, result: Ref) CompileError!void {
     const dest_ty, const func = if (block.inlining) |inl| .{ inl.ret_ty, inl.func } else .{ sema.fn_ret_ty, sema.func };
     const ies = sema.ip.keyTag(dest_ty) == .error_union_type and sema.ip.keyPayload(.error_union_type, dest_ty).error_set_type == .adhoc_inferred_error_set_type;
-    if (!ies) _ = try sema.coerceCtx(block, dest_ty, try sema.runtimeDummy(ret_ty), src, .{ .ret = func });
-    return sema.fail(block, src, "unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags", .{});
+    if (!ies) _ = try sema.coerceCtx(block, dest_ty, result, src, .{ .ret = func });
 }
 
 /// A call whose return type has no possible value other than `noreturn`
@@ -23133,10 +23153,19 @@ fn zirReduce(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     const op = sema.enumTagName(op_val).?;
     const operand = sema.resolveInst(extra.rhs);
     const ty = sema.typeOf(operand);
-    const len = sema.vectorLen(ty) orelse return sema.fail(block, src, "expected vector, found '{f}'", .{sema.fmtType(ty)});
-    if (len == 0) return sema.fail(block, src, "@reduce operation requires a vector with nonzero length", .{});
+    // Checked as upstream: the operand, its element type, then its length.
+    const operand_src = sema.callArgSrc(src, false, 1);
+    const len = sema.vectorLen(ty) orelse return sema.fail(block, operand_src, "expected vector, found '{f}'", .{sema.fmtType(ty)});
     const elem_ty = Type.childType(sema.ip, ty);
     const is_float = Type.class(sema.ip, elem_ty) == .float;
+    const bitwise = std.mem.eql(u8, op, "And") or std.mem.eql(u8, op, "Or") or std.mem.eql(u8, op, "Xor");
+    switch (Type.class(sema.ip, elem_ty)) {
+        .int => {},
+        .bool => if (!bitwise) return sema.fail(block, operand_src, "@reduce operation '{s}' requires integer or float operand; found '{f}'", .{ op, sema.fmtType(ty) }),
+        .float => if (bitwise) return sema.fail(block, operand_src, "@reduce operation '{s}' requires integer or boolean operand; found '{f}'", .{ op, sema.fmtType(ty) }),
+        else => return sema.fail(block, operand_src, "@reduce operation '{s}' requires integer or {s} operand; found '{f}'", .{ op, if (bitwise) "boolean" else "float", sema.fmtType(ty) }),
+    }
+    if (len == 0) return sema.fail(block, operand_src, "@reduce operation requires a vector with nonzero length", .{});
     const tag: Zir.Inst.Tag = if (std.mem.eql(u8, op, "And"))
         .bit_and
     else if (std.mem.eql(u8, op, "Or"))
@@ -23153,8 +23182,6 @@ fn zirReduce(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         (if (is_float) .mul else .mulwrap)
     else
         unreachable;
-    if (is_float and (tag == .bit_and or tag == .bit_or or tag == .xor))
-        return sema.fail(block, src, "@reduce operation '{s}' requires integer or boolean operand; found '{f}'", .{ op, sema.fmtType(ty) });
     const red_op: Ir.ReduceOp = switch (tag) {
         .bit_and => .@"and",
         .bit_or => .@"or",
