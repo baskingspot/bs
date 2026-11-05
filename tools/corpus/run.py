@@ -391,6 +391,7 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
                 # A generated file names the directory it is in.
                 cwd = os.path.dirname(cwd)
             run = run_binary(run_path, run_args, cwd, tgt.get("timeout", 600))
+            os.remove(run_path)
             r["run"] = summarize_run(run, is_test)
         r["run_exit"] = run["exit"]
         r["stdout_sha"] = hashlib.sha256(run["stdout"].encode()).hexdigest()
@@ -427,6 +428,8 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
                 r["edit_error"] = first_error(output)
                 r["edit_output"] = output[-20000:]
         result[which] = r
+        # The build cache is done with; dozens of targets' caches fill a disk.
+        shutil.rmtree(cache, ignore_errors=True)
     return result
 
 
@@ -522,6 +525,15 @@ def write_scoreboard(results, manifest, path, tool_secs=None):
         f.write("\n".join(lines) + "\n")
 
 
+def save_results(old, manifest, path):
+    order = [(p["name"], t["name"]) for p in manifest["projects"] for t in p["targets"]]
+    results = [old[k] for k in order if k in old]
+    with open(path + ".tmp", "w") as f:
+        json.dump(results, f, indent=1)
+    os.replace(path + ".tmp", path)
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--projects", help="comma-separated project names (default: all)")
@@ -590,12 +602,12 @@ def main():
             res["verdict"] = compare(res, tgt)
             log(f"  => {res['verdict']}")
             old[(proj["name"], tgt["name"])] = res
+            # After every target: a run that dies (a full disk, an OOM
+            # kill) keeps what it measured.
+            results = save_results(old, manifest, results_path)
     if args.list:
         return
-    order = [(p["name"], t["name"]) for p in manifest["projects"] for t in p["targets"]]
-    results = [old[k] for k in order if k in old]
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=1)
+    results = save_results(old, manifest, results_path)
     write_scoreboard(results, manifest, scoreboard_path, tool_secs)
     with open(scoreboard_path) as f:
         print(f.read())
