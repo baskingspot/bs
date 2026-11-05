@@ -456,6 +456,11 @@ pub fn bypassUnread(f: *Ssa, ir: *const Ir) void {
 ///   result, which is then dead unless something else reads it, and the
 ///   block after the body, which nothing reaches any more, is not emitted
 ///   (`unreached`).
+/// - A block whose result is an error union that the code after it only
+///   tests (`try` of an inlined call, `std.math.add`): a `br` to it with
+///   a result known to hold an error or a payload goes to the side the
+///   test selects. The block after the body is not emitted when every
+///   `br` to it was threaded.
 /// - A loop whose header only loads a local and switches on it (a labeled
 ///   switch's dispatch, `continue :sw .x`): a `repeat` right after a store
 ///   of a constant to the local goes to the case holding it, when nothing
@@ -470,6 +475,47 @@ fn thread(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Allocat
     // Loop headers checked for the switch dispatch, and whether they have it.
     var headers: std.AutoHashMapUnmanaged(u32, bool) = .empty;
     defer headers.deinit(gpa);
+    // Blocks after an error union's body that only test it: whether every
+    // `br` to them is threaded, and whether the test is `is_non_err`.
+    var tests: std.AutoHashMapUnmanaged(u32, struct { all: bool, non_err: bool }) = .empty;
+    defer tests.deinit(gpa);
+    // Their tests' reads, which must be only their branches'.
+    var reads: std.AutoHashMapUnmanaged(Inst.Ref, u32) = .empty;
+    defer reads.deinit(gpa);
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        if (b.term.tag != .jump or tags[@backingInt(b.term.inst)] != .br) continue;
+        const br = datas[@backingInt(b.term.inst)].br;
+        const x = @backingInt(f.targets.items[@backingInt(br.block_inst)]);
+        const known = errKnown(ir, ip, br.operand) != null;
+        if (tests.getPtr(x)) |t| {
+            t.all = t.all and known;
+        } else if (f.testsResult(ir, x, br.block_inst)) |non_err| {
+            try tests.put(gpa, x, .{ .all = known, .non_err = non_err });
+            try reads.put(gpa, branchCond(ir, f.blocks.items[x].term), 0);
+        }
+    }
+    if (reads.count() != 0) {
+        const Count = struct {
+            reads: *std.AutoHashMapUnmanaged(Inst.Ref, u32),
+            const Self = @This();
+            pub fn use(c: *Self, ref: Inst.Ref) void {
+                if (c.reads.getPtr(ref)) |n| n.* += 1;
+            }
+        };
+        var count: Count = .{ .reads = &reads };
+        for (insts) |v| forEachOperand(ir, v, &count);
+        for (f.layout.items) |block| {
+            const b = f.blocks.items[@backingInt(block)];
+            switch (b.term.tag) {
+                .jump => if (tags[@backingInt(b.term.inst)] == .br) count.use(datas[@backingInt(b.term.inst)].br.operand),
+                .branch => count.use(branchCond(ir, b.term)),
+                .switch_br => count.use(datas[@backingInt(b.term.inst)].pl_op.operand),
+                .ret => count.use(datas[@backingInt(b.term.inst)].un_op),
+                .fallthrough, .noreturn, .unreach => {},
+            }
+        }
+    }
     for (f.layout.items) |block| {
         const b = &f.blocks.items[@backingInt(block)];
         if (b.term.tag != .jump) continue;
@@ -478,6 +524,15 @@ fn thread(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Allocat
             .br => {
                 const br = datas[ti].br;
                 const blk = @backingInt(br.block_inst);
+                const tested = @backingInt(f.targets.items[blk]);
+                if (tests.get(tested)) |t| {
+                    const is_err = errKnown(ir, ip, br.operand) orelse continue;
+                    const tb = f.blocks.items[tested];
+                    if (reads.get(branchCond(ir, tb.term)).? != 1) continue;
+                    b.term.succ[0] = if (is_err == t.non_err) tb.term.succ[1] else tb.term.succ[0];
+                    if (t.all) f.unreached.items[tested] = true;
+                    continue;
+                }
                 if (tags[blk] != .block or datas[blk].ty_pl.ty != .bool_type) continue;
                 const x = f.targets.items[blk];
                 const xb = &f.blocks.items[@backingInt(x)];
@@ -525,6 +580,43 @@ fn thread(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool) Allocat
     for (f.layout.items) |block| {
         if (f.unreached.items[@backingInt(block)]) f.blocks.items[@backingInt(block)].term.tag = .unreach;
     }
+}
+
+/// Whether `ref`, a `br`'s result, is known to hold an error (true) or a
+/// payload (false).
+fn errKnown(ir: *const Ir, ip: *const InternPool, ref: Inst.Ref) ?bool {
+    if (ref.toInterned()) |v| {
+        if (ip.keyTag(v) != .error_union) return null;
+        return ip.indexToKey(v).error_union.val == .err_name;
+    }
+    return switch (ir.instructions.items(.tag)[@backingInt(ref.toIndex().?)]) {
+        .wrap_errunion_err => true,
+        .wrap_errunion_payload => false,
+        else => null,
+    };
+}
+
+/// If block `x` only tests error union `result` and branches on the test
+/// (`thread`), whether the test is `is_non_err`.
+fn testsResult(f: *const Ssa, ir: *const Ir, x: u32, result: Inst.Index) ?bool {
+    const tags = ir.instructions.items(.tag);
+    const xb = f.blocks.items[x];
+    if (xb.term.tag != .branch or tags[@backingInt(xb.term.inst)] != .cond_br) return null;
+    const cond = branchCond(ir, xb.term).toIndex() orelse return null;
+    const non_err = switch (tags[@backingInt(cond)]) {
+        .is_non_err => true,
+        .is_err => false,
+        else => return null,
+    };
+    if (ir.instructions.items(.data)[@backingInt(cond)].un_op != result.toRef()) return null;
+    // Besides the test, only the start of the block the `try` branches
+    // in, which emits nothing; no statement, whose line a `br` that skips
+    // it would skip.
+    for (f.values.items(.inst)[xb.start..][0..xb.len]) |v| {
+        if (v == cond) continue;
+        if (tags[@backingInt(v)] != .block or ir.instructions.items(.data)[@backingInt(v)].ty_pl.ty != .void_type) return null;
+    }
+    return non_err;
 }
 
 /// Whether loop header `h` (one load and a switch on it, `thread`) loads
