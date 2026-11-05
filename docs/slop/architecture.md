@@ -2663,7 +2663,10 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    lowering leaves alone and calls preserve, or, when their interval
    contains no clobber point, of rsi, rdi, r8, r9 (the scalar lowerings use
    only rax, rcx, rdx, r10, r11 as scratch; calls, string instructions,
-   and the fallback clobber the rest). r11 is allocated too, to a value
+   and the fallback clobber the rest). A call of `std.lang.returnError`,
+   on every error path, is not a clobber point: that function gets no
+   registers, so it writes only the scalar scratch registers. A return in
+   registers is not one either. r11 is allocated too, to a value
    whose interval, definition and last use contain no lowering that may
    write it: `CodeGen.usesR11` and `termUsesR11` decide that before
    allocation (deferred loads and values in the function's result read
