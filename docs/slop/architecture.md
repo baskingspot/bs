@@ -2272,7 +2272,15 @@ user branches are coverage points and are only learned from.
   only by the `br` to it that ends its body). A load's term is taken
   where the walk reaches it, not when a later compare asks: by then the
   variable may hold a later store. A `*const` alloc stored once is its
-  value until paths merge, `slice_len` of equal slices are equal and of a
+  value until paths merge, and a load of one of its fields that field of
+  the value (numbered as `struct_field_val`, so whatever memory does in
+  between): a field pointer into it, or the alloc cast to its own type
+  (a copy forwarding turned into the memory it copied), reads it only
+  through its loads, and a store through one, or any other use, makes
+  it other memory. So each inlined helper's `self.metadata.?` on a
+  by-value `self` checks the same value, and the facts of the first
+  check that dominates decide the rest, in place: the checks that stay
+  keep their lines, as all checks do. `slice_len` of equal slices are equal and of a
   `slice` its length operand, and of a call's result (or its error
   union's payload) the argument at the call that every slice the callee
   returns has as its length (`Allocator.alloc(T, n)` returns `n`

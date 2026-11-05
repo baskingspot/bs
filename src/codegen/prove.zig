@@ -12,7 +12,8 @@
 //! its last store stored when that store is known, else the variable at a
 //! version that changes at each store, at each loop entry (a later store
 //! in the loop reaches the loop's start), and after each merge of paths
-//! that stored it. A `*const` alloc is the value stored to it, and
+//! that stored it. A `*const` alloc is the value stored to it, a load of
+//! one of its fields that field of the value, and
 //! `slice_len` of equal slices are equal. `BS_PROVE=off` turns the pass
 //! off. Each rule says next to it why it holds.
 //!
@@ -291,8 +292,9 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *Scratch, fu
 }
 
 /// Which allocs are variables (only loaded from and stored to, never
-/// volatile) and which `*const` allocs hold one value. Any other use of
-/// an alloc (an address taken, passed, cast, or stored) makes it `other`,
+/// volatile) and which `*const` allocs hold one value, read also through
+/// field pointers and casts to their own type (`allocOf`). Any other use
+/// of an alloc (an address taken, passed, cast, or stored) makes it `other`,
 /// so nothing but its own loads and stores can read or write a variable:
 /// no call, store through a pointer, or other thread reaches it.
 fn classify(ip: *const InternPool, ir: *const Ir, kind: []Kind) void {
@@ -306,21 +308,28 @@ fn classify(ip: *const InternPool, ir: *const Ir, kind: []Kind) void {
         k.* = if (p.flags.is_const) .constant else .variable;
     }
     const Escape = struct {
+        ir: *const Ir,
+        ip: *const InternPool,
         kind: []Kind,
-        tags: []const Inst.Tag,
         const Self = @This();
         pub fn use(e: Self, r: Inst.Ref) void {
-            const i = r.toIndex() orelse return;
-            if (e.tags[@backingInt(i)] == .alloc) e.kind[@backingInt(i)] = .other;
+            const a = allocOf(e.ir, e.ip, r, true) orelse return;
+            e.kind[a] = .other;
         }
     };
-    const e: Escape = .{ .kind = kind, .tags = tags };
+    const e: Escape = .{ .ir = ir, .ip = ip, .kind = kind };
     for (tags, datas, 0..) |tag, data, i| switch (tag) {
         .load => {},
         .store => {
             e.use(data.bin_op.rhs);
-            // A `*const` alloc stored twice (on two paths) is a variable.
             const p = data.bin_op.lhs.toIndex() orelse continue;
+            // A store into a field of a `*const` alloc (an initialization
+            // field by field) makes it `other`.
+            if (tags[@backingInt(p)] != .alloc) {
+                e.use(data.bin_op.lhs);
+                continue;
+            }
+            // A `*const` alloc stored twice (on two paths) is a variable.
             const k = &kind[@backingInt(p)];
             k.* = switch (k.*) {
                 .constant => .stored_once,
@@ -328,11 +337,62 @@ fn classify(ip: *const InternPool, ir: *const Ir, kind: []Kind) void {
                 else => k.*,
             };
         },
+        // A field pointer into a `*const` alloc, or the alloc cast to its
+        // own type (a copy `forward.run` forwarded), reads it only through
+        // its own loads; any other use of it is a use of the alloc.
+        .struct_field_ptr, .bitcast => if (allocOf(ir, ip, @as(Inst.Index, @fromBackingInt(@intCast(i))).toRef(), false) == null)
+            Ssa.forEachOperand(ir, @fromBackingInt(@intCast(i)), e),
         else => Ssa.forEachOperand(ir, @fromBackingInt(@intCast(i)), e),
     };
     for (kind) |*k| if (k.* == .stored_once) {
         k.* = .constant;
     };
+}
+
+/// The alloc `r` is, or a field pointer into, through casts to its own
+/// type: with `all`, of any kind, else only a `*const` one when `r` is
+/// derived from it (a variable's field pointer is a use of it).
+fn allocOf(ir: *const Ir, ip: *const InternPool, r: Inst.Ref, all: bool) ?u32 {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    var cur = r;
+    var derived = false;
+    while (cur.toIndex()) |idx| {
+        const i = @backingInt(idx);
+        switch (tags[i]) {
+            .alloc => {
+                if (derived and !Type.ptrInfo(ip, datas[i].ty).flags.is_const) return if (all) i else null;
+                return i;
+            },
+            .struct_field_ptr => cur = ir.extraData(Ir.StructField, datas[i].ty_pl.payload).data.operand,
+            .bitcast => {
+                if (datas[i].ty_op.ty != ir.typeOf(datas[i].ty_op.operand, ip)) return null;
+                cur = datas[i].ty_op.operand;
+            },
+            else => return null,
+        }
+        derived = true;
+    }
+    return null;
+}
+
+/// The alloc `r` is, through casts to its own type, but not a field
+/// pointer into one.
+fn allocCast(ir: *const Ir, ip: *const InternPool, r: Inst.Ref) ?u32 {
+    var cur = r;
+    while (cur.toIndex()) |idx| {
+        const i = @backingInt(idx);
+        const data = ir.instructions.items(.data)[i];
+        switch (ir.instructions.items(.tag)[i]) {
+            .alloc => return i,
+            .bitcast => {
+                if (data.ty_op.ty != ir.typeOf(data.ty_op.operand, ip)) return null;
+                cur = data.ty_op.operand;
+            },
+            else => return null,
+        }
+    }
+    return null;
 }
 
 const Walker = struct {
@@ -785,6 +845,12 @@ const Walker = struct {
             .slice_ptr, .optional_payload, .optional_payload_ptr, .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .bitcast, .trunc, .intcast, .not, .get_union_tag, .wrap_optional => {
                 // A widening `intcast` is its operand (`term`).
                 if (tag == .intcast and w.widens(inst.toRef(), data.ty_op.operand)) return;
+                // A `bitcast` to the operand's own type is the operand (a
+                // copy `forward.run` turned into the memory it copies).
+                if (tag == .bitcast and data.ty_op.ty == ir.typeOf(data.ty_op.operand, w.ip)) {
+                    w.s.canon.items[ii] = w.term(data.ty_op.operand);
+                    return;
+                }
                 key.ty = data.ty_op.ty;
                 key.a = w.term(data.ty_op.operand);
             },
@@ -1122,6 +1188,15 @@ const Walker = struct {
                     return if (v.tag != .none) v else own;
                 },
                 .other, .stored_once => {},
+            }
+            // A field of a `*const` alloc: that field of the value stored
+            // to it, as `struct_field_val` numbers it.
+            if (w.ir.instructions.items(.tag)[pi] == .struct_field_ptr) {
+                const sf = w.ir.extraData(Ir.StructField, w.ir.instructions.items(.data)[pi].ty_pl.payload).data;
+                if (allocCast(w.ir, w.ip, sf.operand)) |a| if (s.kind.items[a] == .constant) {
+                    const v = s.value.items[a];
+                    if (v.tag != .none) return w.numberOf(.{ .tag = .struct_field_val, .ty = data.ty_op.ty, .x = sf.index, .a = v, .b = .none }, own);
+                };
             }
         }
         // Other memory: a load of the same address and type from the same
