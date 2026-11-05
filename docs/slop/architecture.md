@@ -8129,6 +8129,15 @@ computes the right one instead of copying the bug:
   an out-of-bounds write; the corpus marks the step as expected to
   fail (tools/corpus/manifest.json).
 
+- *A payload pointer used after its optional became null, at
+  comptime.* In upstream's compile-error case
+  dereferencing_invalid_payload_ptr_at_comptime.zig, the first block
+  takes `&opt_ptr.?`, sets `opt_ptr = null` and loads through the
+  payload pointer. Upstream 0.17.1 accepts it (the case marks it as
+  regressed by #19630); bs reports "attempt to use null value" there, as
+  it and upstream do for the case's other two blocks, so the runner
+  counts the case as "different".
+
 Where upstream supports more than bs generates code for, bs narrows
 the choice instead of failing:
 

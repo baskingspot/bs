@@ -468,7 +468,10 @@ pub const PtrType = struct {
         /// `generic` is 0, so a pointer without an address space keeps the
         /// key, encoding and stable hash it had before this field.
         address_space: std.lang.AddressSpace = .generic,
-        _: u16 = 0,
+        /// A pointer to element `vector_index - 1` of a vector, 0 for any
+        /// other. As upstream, it holds the vector's address, and its
+        /// `host_size` is the vector's length (`Sema.vectorElemPtr`).
+        vector_index: u16 = 0,
     };
 
     pub const PackedOffset = packed struct(u32) {

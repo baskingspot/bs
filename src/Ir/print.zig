@@ -432,7 +432,9 @@ fn typeIn(cx: Ctx, ty: InternPool.Index, w: *Writer) Writer.Error!void {
             // as upstream.
             if (p.packed_offset.host_size != 0) {
                 const alignment = if (p.flags.alignment != 0) @as(u64, 1) << (p.flags.alignment - 1) else @import("../Type.zig").abiAlignment(cx.ip, p.child);
-                try w.print("align({d}:{d}:{d}) ", .{ alignment, p.packed_offset.bit_offset, p.packed_offset.host_size });
+                try w.print("align({d}:{d}:{d}", .{ alignment, p.packed_offset.bit_offset, p.packed_offset.host_size });
+                if (p.flags.vector_index != 0) try w.print(":{d}", .{p.flags.vector_index - 1});
+                try w.writeAll(") ");
             } else if (p.flags.alignment != 0) try w.print("align({d}) ", .{@as(u64, 1) << (p.flags.alignment - 1)});
             if (p.flags.address_space != .generic) try w.print("addrspace(.{t}) ", .{p.flags.address_space});
             if (p.flags.is_const) try w.writeAll("const ");

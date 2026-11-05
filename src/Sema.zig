@@ -12361,6 +12361,7 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
         try sema.noteOrigin(block, ptr_src, .root, .@"const");
         return err;
     }
+    if (info.flags.vector_index != 0) return sema.analyzeStore(block, src, try sema.vectorElemAccessPtr(block, src, ptr), uncasted);
     const operand_src = sema.storeOperandSrc(src);
     const operand = try sema.coerce(block, info.child, uncasted, operand_src);
     if (sema.resolveValue(ptr)) |pv| if (!sema.bcForeign(pv)) {
@@ -12421,6 +12422,7 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
     const ptr_ty = sema.typeOf(ptr);
     if (Type.class(ip, ptr_ty) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ptr_ty)});
     const info = Type.ptrInfo(ip, ptr_ty);
+    if (info.flags.vector_index != 0) return sema.analyzeLoad(block, src, try sema.vectorElemAccessPtr(block, src, ptr));
     if (Type.class(ip, info.child) == .@"opaque") return sema.fail(block, src, "cannot load opaque type '{f}'", .{sema.fmtType(info.child)});
     if (sema.resolveValue(ptr)) |pv| if (!sema.bcForeign(pv)) {
         // Under @TypeOf only the type matters, also through a generic
@@ -13043,6 +13045,8 @@ fn ptrRootBase(sema: *Sema, ptr: InternPool.Ptr) InternPool.Ptr.BaseAddr {
 /// only known at runtime (a global `var`, an address from an integer).
 fn comptimeLoadOrNull(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!?Index {
     const ip = sema.ip;
+    if (Type.ptrInfo(ip, ip.typeOf(ptr)).flags.vector_index != 0 and ip.keyTag(ptr) == .ptr)
+        return sema.comptimeLoadOrNull(block, src, try sema.vectorElemAccessPtrValue(ptr));
     const load_ty = Type.ptrInfo(ip, ip.typeOf(ptr)).child;
     // Even through an undefined pointer, a zero-bit type has its one value.
     if (sema.isUndef(ptr)) if (try sema.onePossibleValue(load_ty)) |v| return v;
@@ -13267,6 +13271,8 @@ fn comptimeLoad(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!I
 }
 
 fn comptimeStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) CompileError!void {
+    if (Type.ptrInfo(sema.ip, sema.ip.typeOf(ptr)).flags.vector_index != 0)
+        return sema.comptimeStore(block, src, try sema.vectorElemAccessPtrValue(ptr), val);
     const key = sema.ip.keyPayload(.ptr, ptr);
     switch (key.base) {
         .field, .elem => if (try sema.mutStore(ptr, val)) return,
@@ -15175,21 +15181,10 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
             if (v.len == 0) return sema.fail(block, src, "cannot index into empty vector", .{});
             if (sema.resolveValue(index) == null) return sema.fail(block, src.operandSrc(1), "vector index not comptime known", .{});
             try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, v.len)), false);
-            // Bool vectors are bit-packed; other vectors are laid out like arrays.
-            if (v.child == .bool_type and sema.resolveValue(ptr) == null) {
-                // A bit pointer into the vector's bytes, at its address.
-                try sema.requireRuntime(block, src);
-                const result_ty = try sema.ptrType(.{
-                    .child = .bool_type,
-                    .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .address_space = p.flags.address_space, .alignment = if (p.flags.alignment != 0) p.flags.alignment else @intCast(std.math.log2_int(u64, Type.abiAlignment(ip, child)) + 1) },
-                    .packed_offset = .{
-                        .host_size = @intCast(Type.abiSize(ip, child)),
-                        .bit_offset = @intCast(ip.intValue(u64, sema.resolveValue(index).?).?),
-                    },
-                });
-                return sema.addTyOp(block, .bitcast, result_ty, ptr);
-            }
-            return sema.elemPtrOfArrayPtr(block, src, ptr, index);
+            const i = ip.intValue(u64, sema.resolveValue(index).?).?;
+            // `vector_index` and `host_size` hold the index and length.
+            if (v.len < std.math.maxInt(u16)) return sema.vectorElemPtr(block, src, ptr, i);
+            return sema.vectorElemAccess(block, src, ptr, index);
         },
         .ptr_type => |cp| switch (cp.flags.size) {
             .one => return sema.elemPtr(block, src, try sema.analyzeLoad(block, src, ptr), uncasted_index, safety),
@@ -15265,6 +15260,102 @@ fn elemPtrOfSlice(sema: *Sema, block: *Block, src: Src, slice: Ref, uncasted_ind
     try sema.requireRuntime(block, src);
     if (sema.escapesComptimeVar(slice)) try sema.validateRuntimeValue(block, sema.indexableSrc(src), slice);
     return sema.addTyPlBin(block, .slice_elem_ptr, elem_ptr_ty, slice, index);
+}
+
+/// A pointer to element `index` of the vector `ptr` points to, of
+/// upstream's type for one: the vector's address, typed with the vector's
+/// length as `host_size` and the element as `vector_index`. Loads and
+/// stores go through `vectorElemAccessPtr`.
+fn vectorElemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: u64) CompileError!Ref {
+    const ip = sema.ip;
+    const p = Type.ptrInfo(ip, sema.typeOf(ptr));
+    const v = ip.keyPayload(.vector_type, p.child);
+    const result_ty = try sema.ptrType(.{
+        .child = v.child,
+        .flags = .{
+            .is_const = p.flags.is_const,
+            .is_volatile = p.flags.is_volatile,
+            .is_allowzero = p.flags.is_allowzero,
+            .address_space = p.flags.address_space,
+            .alignment = p.flags.alignment,
+            .vector_index = @intCast(index + 1),
+        },
+        .packed_offset = .{ .host_size = @intCast(v.len) },
+    });
+    if (sema.resolveValue(ptr)) |pv| return .fromInterned(try sema.retypePtrValue(pv, result_ty));
+    try sema.requireRuntime(block, src);
+    try sema.runtimeElemAccess(block, src, v.child);
+    if (sema.escapesComptimeVar(ptr)) try sema.validateRuntimeValue(block, sema.indexableSrc(src), ptr);
+    return sema.addTyOp(block, .bitcast, result_ty, ptr);
+}
+
+/// The vector pointer type a vector element pointer type `p`
+/// (`vectorElemPtr`) was made from.
+fn vectorElemPtrBase(sema: *Sema, p: InternPool.PtrType) !Index {
+    var flags = p.flags;
+    flags.vector_index = 0;
+    return sema.ptrType(.{ .child = try sema.vectorType(p.packed_offset.host_size, p.child), .flags = flags });
+}
+
+/// The pointer that loads and stores through vector element pointer `ptr`
+/// (`vectorElemPtr`) use: a bit pointer into a bool vector's bytes, else
+/// the element's address.
+fn vectorElemAccessPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref {
+    const p = Type.ptrInfo(sema.ip, sema.typeOf(ptr));
+    const vec_ptr_ty = try sema.vectorElemPtrBase(p);
+    const vec_ptr: Ref = if (sema.resolveValue(ptr)) |pv|
+        .fromInterned(try sema.retypePtrValue(pv, vec_ptr_ty))
+    else if (sema.bitcastOperand(ptr, vec_ptr_ty)) |operand|
+        // `vectorElemPtr`'s operand: as the element pointer bs made before,
+        // a store through it into a `const` local can still fold
+        // (`constAllocRoot`).
+        operand
+    else
+        try sema.addTyOp(block, .bitcast, vec_ptr_ty, ptr);
+    return sema.vectorElemAccess(block, src, vec_ptr, .fromInterned(try sema.intValue(.usize_type, p.flags.vector_index - 1)));
+}
+
+/// The operand of `ref` if it is a bitcast of a `ty`.
+fn bitcastOperand(sema: *Sema, ref: Ref, ty: Index) ?Ref {
+    const i = ref.toIndex() orelse return null;
+    if (sema.ir_insts.items(.tag)[@backingInt(i)] != .bitcast) return null;
+    const operand = sema.ir_insts.items(.data)[@backingInt(i)].ty_op.operand;
+    return if (sema.typeOf(operand) == ty) operand else null;
+}
+
+/// `vectorElemAccessPtr` of a comptime-known vector element pointer.
+fn vectorElemAccessPtrValue(sema: *Sema, ptr: Index) !Index {
+    const p = Type.ptrInfo(sema.ip, sema.ip.typeOf(ptr));
+    return sema.ptrElemPtrVal(try sema.retypePtrValue(ptr, try sema.vectorElemPtrBase(p)), p.flags.vector_index - 1);
+}
+
+/// A pointer to element `index` (comptime-known) of the vector `ptr`
+/// points to, as bs accesses it: bool vectors are bit-packed, so a bit
+/// pointer into the vector's bytes at its address, unless the vector is
+/// comptime-known memory, which is read element by element; other vectors
+/// are laid out like arrays.
+fn vectorElemAccess(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const p = Type.ptrInfo(ip, sema.typeOf(ptr));
+    const child = p.child;
+    const comptime_mem = if (sema.resolveValue(ptr)) |pv| ip.keyTag(pv) == .ptr and switch (sema.ptrRootBase(ip.keyPayload(.ptr, pv))) {
+        .comptime_alloc, .uav => true,
+        .nav => |n| ip.getNav(n).is_const,
+        else => false,
+    } else false;
+    if (ip.keyPayload(.vector_type, child).child == .bool_type and !comptime_mem) {
+        try sema.requireRuntime(block, src);
+        const result_ty = try sema.ptrType(.{
+            .child = .bool_type,
+            .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .address_space = p.flags.address_space, .alignment = if (p.flags.alignment != 0) p.flags.alignment else @intCast(std.math.log2_int(u64, Type.abiAlignment(ip, child)) + 1) },
+            .packed_offset = .{
+                .host_size = @intCast(Type.abiSize(ip, child)),
+                .bit_offset = @intCast(ip.intValue(u64, sema.resolveValue(index).?).?),
+            },
+        });
+        return sema.addTyOp(block, .bitcast, result_ty, ptr);
+    }
+    return sema.elemPtrOfArrayPtr(block, src, ptr, index);
 }
 
 fn elemPtrOfArrayPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref) CompileError!Ref {
