@@ -240,6 +240,11 @@ pub fn build(b: *std.Build) void {
 ///                               (paths from the repository root) they
 ///                               replace the program's path, which one of
 ///                               them names
+///   //! upstream-stderr: "<zig string>"
+///                               what the program writes to stderr when
+///                               upstream builds it for x86_64-linux, for
+///                               a program that checks something bs does
+///                               better than upstream (frame sizes)
 ///   //! upstream-llvm: true     upstream builds the program with LLVM,
 ///                               for a program its self-hosted backend
 ///                               miscompiles or whose container-level
@@ -334,6 +339,9 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             signal: ?std.posix.SIG = null,
             stdout: ?[]const u8 = null,
             stderr: ?[]const u8 = null,
+            /// `upstream-stderr`: what upstream's build writes instead,
+            /// where bs deliberately does better (smaller frames).
+            upstream_stderr: ?[]const u8 = null,
             stderr_contains: std.ArrayList([]const u8) = .empty,
             /// Each text, and what the earlier version has instead.
             rebuild_without: std.ArrayList([2][]const u8) = .empty,
@@ -399,6 +407,8 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                         expect.aarch64_linux = true;
                     } else if (!std.mem.eql(u8, t, "x86_64-linux")) std.debug.panic("{s}: unknown target '{s}'", .{ src_path, t });
                 }
+            } else if (std.mem.eql(u8, key, "upstream-stderr")) {
+                expect.upstream_stderr = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
             } else if (std.mem.eql(u8, key, "stdout") or std.mem.eql(u8, key, "stderr")) {
                 const bytes = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 if (key[3] == 'o') expect.stdout = bytes else expect.stderr = bytes;
@@ -644,7 +654,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             const run = std.Build.Step.Run.create(b, b.fmt("run {s}{s}", .{ name, if (upstream) " (upstream)" else "" }));
             run.addFileArg(bin);
             if (expect.stdout) |out| run.addCheck(.{ .expect_stdout_exact = out });
-            if (expect.stderr) |err| run.addCheck(.{ .expect_stderr_exact = err });
+            if (if (upstream) expect.upstream_stderr orelse expect.stderr else expect.stderr) |err| run.addCheck(.{ .expect_stderr_exact = err });
             for (expect.stderr_contains.items) |part| run.addCheck(.{ .expect_stderr_match = part });
             run.addCheck(.{ .expect_term = if (expect.signal) |sig| .{ .signal = sig } else .{ .exited = expect.exit.? } });
             (if (upstream) upstream_step else test_step).dependOn(&run.step);

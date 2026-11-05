@@ -194,6 +194,12 @@ const Home = union(enum) {
     /// The value is in this register: an f32 or f64 in one of d8-d15 or
     /// v20-v29, or a vector (`inVec`) in one of v20-v29.
     vreg: VReg,
+    /// The memory this many bytes into the function's own result, through
+    /// the pointer the caller passed, read through x8: a call whose result
+    /// a `ret` returns (`planRetCalls`) writes it there, and its users read
+    /// it there. Such values are larger than 16 bytes, which the lowerings
+    /// that use x8 as scratch (`atomicRmw16`) never read.
+    result: u32,
 };
 
 /// Where an operand's value can be read.
@@ -266,7 +272,10 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         try f.plan(gpa, ir, ip, &cg);
         f.bypassUnread(ir);
         cg.live = true;
-        if (!f.has_asm) try cg.allocateRegs();
+        if (!f.has_asm) {
+            try cg.allocateRegs();
+            try cg.planRetCalls();
+        }
     } else @memset(f.live.items(.fate), .normal);
 
     // The prologue belongs to the declaration's line.
@@ -804,6 +813,100 @@ fn outgoingArgsSize(cg: *CodeGen) u32 {
     return std.mem.alignForward(u32, max, 16);
 }
 
+/// The call whose result `ret` operand `v` is, as in the x86_64 backend's
+/// `retCall`: a call of an `.auto` function that returns it in memory, as
+/// it is, through bitcasts between error unions of one payload type, or as
+/// the payload of an error union.
+fn retCall(cg: *CodeGen, v0: Inst.Index) ?Inst.Index {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    var v = v0;
+    while (true) switch (tags[@backingInt(v)]) {
+        .call => {
+            const extra = ir.extraData(Ir.Call, datas[@backingInt(v)].pl_op.payload);
+            if (extra.data.flags.always_tail) return null;
+            if (cg.calleeType(datas[@backingInt(v)].pl_op.operand).cc != .auto or cg.autoClass(ir.typeOfIndex(v, ip)) != .memory) return null;
+            return v;
+        },
+        .bitcast => {
+            const src = datas[@backingInt(v)].ty_op.operand.toIndex() orelse return null;
+            const a = ir.typeOfIndex(src, ip);
+            const b = datas[@backingInt(v)].ty_op.ty;
+            if (a != b and (ip.keyTag(a) != .error_union_type or ip.keyTag(b) != .error_union_type or
+                ip.keyPayload(.error_union_type, a).payload_type != ip.keyPayload(.error_union_type, b).payload_type)) return null;
+            v = src;
+        },
+        // `return try f(x)`: the payload is unwrapped where it is wrapped.
+        .wrap_errunion_payload, .unwrap_errunion_payload => v = datas[@backingInt(v)].ty_op.operand.toIndex() orelse return null,
+        else => return null,
+    };
+}
+
+/// After allocation, in an `.auto` function that returns in memory: a
+/// call whose result a `ret` returns (`retCall`) gets the function's own
+/// result memory as its result (`Home.result`), and so do the values
+/// between them, as in the x86_64 backend's `planRetCalls`: each level of
+/// `return f(x)` held one more copy of a large result. The result's memory
+/// holds one such value at a time.
+fn planRetCalls(cg: *CodeGen) Error!void {
+    if (cg.fn_ty.cc != .auto or cg.autoClass(cg.fn_ty.return_type) != .memory) return;
+    const f = cg.ssa;
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const live = f.live.slice();
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const fates = live.items(.fate);
+    const Chain = struct { ret_val: Inst.Index, call: Inst.Index, lo: u32, hi: u32, ok: bool };
+    var chains: std.ArrayList(Chain) = .empty;
+    defer chains.deinit(cg.gpa);
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        if (b.term.tag != .ret) continue;
+        const o = datas[@backingInt(b.term.inst)].un_op.toIndex() orelse continue;
+        const c = cg.retCall(o) orelse continue;
+        var v = o;
+        var hi: u32 = 0;
+        var off: u32 = 0;
+        const ok = while (true) {
+            const vi = @backingInt(v);
+            if (tags[vi] == .wrap_errunion_payload) off += @intCast(Type.errorUnionLayout(ip, datas[vi].ty_op.ty).payload_offset);
+            if (tags[vi] == .unwrap_errunion_payload) {
+                const p: u32 = @intCast(Type.errorUnionLayout(ip, ir.typeOf(datas[vi].ty_op.operand, ip)).payload_offset);
+                if (off < p) break false;
+                off -= p;
+            }
+            if (fates[vi] != .normal or cg.homes[vi] != .none) break false;
+            hi = @max(hi, end[vi]);
+            if (v == c) break true;
+            v = datas[vi].ty_op.operand.toIndex().?;
+        };
+        if (ok) try chains.append(cg.gpa, .{ .ret_val = o, .call = c, .lo = def[@backingInt(c)], .hi = hi, .ok = true });
+    }
+    for (chains.items, 0..) |*x, i| for (chains.items[i + 1 ..]) |*y| {
+        if (x.call != y.call and x.lo <= y.hi and y.lo <= x.hi) {
+            x.ok = false;
+            y.ok = false;
+        }
+    };
+    for (chains.items) |x| {
+        if (!x.ok) continue;
+        var v = x.ret_val;
+        var off: u32 = 0;
+        while (true) {
+            cg.homes[@backingInt(v)] = .{ .result = off };
+            if (v == x.call) break;
+            if (tags[@backingInt(v)] == .wrap_errunion_payload) off += @intCast(Type.errorUnionLayout(ip, datas[@backingInt(v)].ty_op.ty).payload_offset);
+            if (tags[@backingInt(v)] == .unwrap_errunion_payload) off -= @intCast(Type.errorUnionLayout(ip, ir.typeOf(datas[@backingInt(v)].ty_op.operand, ip)).payload_offset);
+            v = datas[@backingInt(v)].ty_op.operand.toIndex().?;
+        }
+    }
+}
+
 fn calleeType(cg: *CodeGen, callee: Ref) InternPool.FuncType {
     const ip = cg.ip;
     const ty = cg.typeOf(callee);
@@ -1300,6 +1403,10 @@ pub fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
         .frame_addr => |m| .{ .addr = m },
         .reg => |r| .{ .reg = r },
         .vreg => |v| .{ .vreg = v },
+        .result => |off| blk: {
+            try cg.loadMem(.x8, cg.ret_ptr_slot.?, .usize_type);
+            break :blk .{ .mem = .at(.x8, @intCast(off)) };
+        },
     };
     return cg.constLoc(ref.toInterned().?);
 }
@@ -2403,6 +2510,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .intcast, .trunc, .bitcast, .ptr_from_int => {
             const ty = data.ty_op.ty;
             const src_ty = cg.typeOf(data.ty_op.operand);
+            // Its operand's memory (`Home.result`).
+            if (cg.homes[@backingInt(inst)] == .result) return;
             if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(src_ty)) and Type.isInt(ip, ty)) return cg.genWide(inst, tag, data);
             const size = Type.abiSize(ip, ty);
             const src_size = Type.abiSize(ip, src_ty);
@@ -2590,6 +2699,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             }
         },
         .unwrap_errunion_payload, .unwrap_errunion_err => {
+            // Read in place in the function's result (`planRetCalls`).
+            if (cg.homes[@backingInt(inst)] == .result) return;
             const ty = data.ty_op.ty;
             const layout = Type.errorUnionLayout(ip, cg.typeOf(data.ty_op.operand));
             const off = if (tag == .unwrap_errunion_err) layout.err_offset else layout.payload_offset;
@@ -2615,8 +2726,13 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .wrap_errunion_payload, .wrap_errunion_err => {
             const eu_ty = data.ty_op.ty;
-            const dst = try cg.resultMem(inst, eu_ty) orelse return;
             const layout = Type.errorUnionLayout(ip, eu_ty);
+            if (cg.homes[@backingInt(inst)] == .result) {
+                // Its payload is already there (`planRetCalls`).
+                const m = (try cg.locOf(inst.toRef())).mem;
+                return cg.storeReg(m.plus(layout.err_offset), .zr, 2);
+            }
+            const dst = try cg.resultMem(inst, eu_ty) orelse return;
             if (tag == .wrap_errunion_payload) {
                 try cg.storeReg(dst.plus(layout.err_offset), .zr, 2);
                 try cg.copyTo(dst.plus(layout.payload_offset), data.ty_op.operand);
@@ -3434,6 +3550,8 @@ fn ret(cg: *CodeGen, operand: Ref) Error!void {
         .gpr_pair => try cg.loadPair(.x0, .x1, try cg.valOf(operand)),
         .fpr => try cg.loadFp(.v0, try cg.valOf(operand)),
         .memory => {
+            // Already there (`planRetCalls`).
+            if (operand.toIndex()) |v| if (cg.homes[@backingInt(v)] == .result) return cg.epilogue();
             try cg.loadMem(.x12, cg.ret_ptr_slot.?, .usize_type);
             try cg.copyTo(.at(.x12, 0), operand);
         },
@@ -3678,7 +3796,12 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     // so is a vector returned in v0.
     const vec_in_v0 = cg.inVec(ret_ty) and (if (is_c) cg.cRetClass(ret_ty) == .fpr else cg.autoClass(ret_ty) == .fpr);
     const in_reg = !tail and (cg.homes[@backingInt(inst)] == .reg or (cg.homes[@backingInt(inst)] == .vreg and (vec_in_v0 or !cg.inVec(ret_ty))));
-    const dst = if (tail or in_reg) null else try cg.resultMem(inst, ret_ty);
+    // Written straight into this function's result (`planRetCalls`).
+    const to_result: ?u32 = switch (cg.homes[@backingInt(inst)]) {
+        .result => |off| off,
+        else => null,
+    };
+    const dst = if (tail or in_reg or to_result != null) null else try cg.resultMem(inst, ret_ty);
     var pn_save: ?Mem = null;
     var stack_args = false;
 
@@ -3710,6 +3833,10 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         };
         try cg.placeArgs(vals, locs, tail);
         if (cg.autoClass(ret_ty) == .memory) try cg.resultPtrTo(dst, tail);
+        if (to_result) |off| {
+            try cg.loadMem(.x8, cg.ret_ptr_slot.?, .usize_type);
+            if (off != 0) try cg.e.addSub(.add, .x, .x8, .x8, .{ .imm = @intCast(off) });
+        }
         try cg.loadTrace(.x15);
     }
     if (callee_val == null) try cg.load(.x16, callee_ref);

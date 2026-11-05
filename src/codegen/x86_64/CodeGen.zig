@@ -239,6 +239,10 @@ const Home = union(enum) {
     /// A load read in place by its only user (see `planDeferred`): the
     /// value is the memory its pointer points to.
     deferred,
+    /// The memory this many bytes into the function's own result, through
+    /// the pointer the caller passed: a call whose result a `ret` returns
+    /// (`planRetCalls`) writes it there, and its users read it there.
+    result: u32,
     /// Nothing reads the value and computing it has no effect: it is not
     /// emitted (pass 2).
     dead,
@@ -1033,6 +1037,10 @@ pub fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
         .regs => |p| .{ .mem = try cg.spillPair(inst, p) },
         .xmm => |x| .{ .mem = try cg.spillXmm(inst, x) },
         .deferred => .{ .mem = try cg.deferredMem(cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op.operand) },
+        .result => |off| blk: {
+            try cg.e.mov(.qword, .{ .reg = cg.r11() }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
+            break :blk .{ .mem = Mem.at(cg.r11(), @intCast(off)) };
+        },
         .fused, .pair, .view => unreachable, // read only by their users
         .dead => unreachable,
         .slot => |off| .{ .mem = Mem.at(.rbp, off) },
@@ -1505,13 +1513,17 @@ fn usesR11(cg: *CodeGen, inst: Inst.Index) bool {
     const tag = ir.instructions.items(.tag)[i];
     const data = ir.instructions.items(.data)[i];
     // A load deferred to its user reads its memory through r11 when the
-    // pointer has no register (`deferredMem`).
+    // pointer has no register (`deferredMem`), and a value in the
+    // function's result through r11 always (`Home.result`).
     const Deferred = struct {
         cg: *CodeGen,
         found: *bool,
         pub fn use(c: @This(), r: Ref) void {
             const x = r.toIndex() orelse return;
-            if (c.cg.homes[@backingInt(x)] == .deferred) c.found.* = true;
+            switch (c.cg.homes[@backingInt(x)]) {
+                .deferred, .result => c.found.* = true,
+                else => {},
+            }
         }
     };
     var deferred = false;
@@ -1564,7 +1576,11 @@ fn termUsesR11(cg: *CodeGen, block: Ssa.Block.Index) bool {
     const data = ir.instructions.items(.data)[@backingInt(term.inst)];
     const deferred = struct {
         fn f(c: *CodeGen, r: Ref) bool {
-            return if (r.toIndex()) |x| c.homes[@backingInt(x)] == .deferred else false;
+            const x = r.toIndex() orelse return false;
+            return switch (c.homes[@backingInt(x)]) {
+                .deferred, .result => true,
+                else => false,
+            };
         }
     }.f;
     return switch (term.tag) {
@@ -1857,6 +1873,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
     while (aliases.next()) |a| cg.split.unset(a.*);
     var consts = cg.const_alias.keyIterator();
     while (consts.next()) |a| cg.split.unset(a.*);
+    try cg.planRetCalls();
     try cg.planR11();
     cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split, r11_only, cg.r11_clobbers.items) & callee_saved;
     const reg2 = live.items(.reg2);
@@ -2303,6 +2320,8 @@ fn planCopies(cg: *CodeGen) Error!void {
             // An error in a slot of its own is copied as usual: it does not
             // overlap the result's memory.
             if (tags[@backingInt(l)] == .wrap_errunion_err) continue;
+            // A call's result that the callee writes there (`planRetCalls`).
+            if (cg.retCall(l) != null) continue;
             if (tags[@backingInt(l)] != .load) break :rvo;
             const a = datas[@backingInt(l)].ty_op.operand.toIndex() orelse break :rvo;
             if (tags[@backingInt(a)] != .alloc or datas[@backingInt(a)].ty == .none) break :rvo;
@@ -2933,6 +2952,109 @@ fn loadFactor(cg: *CodeGen, r: Reg, fa: Factor) Error!void {
     }
 }
 
+/// The call whose result `ret` operand `v` is: a call of an `.auto`
+/// function that returns it in memory, as it is, through bitcasts
+/// between error unions of one payload type (an inferred error set's),
+/// or as the payload of an error union (`wrap_errunion_payload`).
+fn retCall(cg: *CodeGen, v0: Inst.Index) ?Inst.Index {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    var v = v0;
+    while (true) switch (tags[@backingInt(v)]) {
+        .call => {
+            if (cg.calleeCc(datas[@backingInt(v)]) != .auto or cg.autoClass(ir.typeOfIndex(v, ip)) != .memory) return null;
+            return v;
+        },
+        .bitcast => {
+            const src = datas[@backingInt(v)].ty_op.operand.toIndex() orelse return null;
+            const a = ir.typeOfIndex(src, ip);
+            const b = datas[@backingInt(v)].ty_op.ty;
+            if (a != b and (ip.keyTag(a) != .error_union_type or ip.keyTag(b) != .error_union_type or
+                ip.keyPayload(.error_union_type, a).payload_type != ip.keyPayload(.error_union_type, b).payload_type)) return null;
+            v = src;
+        },
+        // `return try f(x)`: the payload is unwrapped where it is wrapped.
+        .wrap_errunion_payload, .unwrap_errunion_payload => v = datas[@backingInt(v)].ty_op.operand.toIndex() orelse return null,
+        else => return null,
+    };
+}
+
+/// Before allocation, in a function that returns in memory: a call whose
+/// result a `ret` returns (`retCall`) gets the function's own result
+/// memory as its result (`Home.result`), and so do the values between
+/// them, so the callee writes it there and nothing copies it. Upstream
+/// does the same; without it, each level of `return f(x)` with a large
+/// result held one more copy of it in its frame (sandopolis's 64 MiB test
+/// stack overflowed). The result's memory holds one such value at a time:
+/// calls whose values live at the same time as another's, or as the
+/// result's own alloc (`rvo_alloc`), keep their slots.
+fn planRetCalls(cg: *CodeGen) Error!void {
+    if (cg.fn_ty.cc != .auto or cg.autoClass(cg.fn_ty.return_type) != .memory) return;
+    const f = cg.ssa;
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const live = f.live.slice();
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const fate = live.items(.fate);
+    const Chain = struct { ret_val: Inst.Index, call: Inst.Index, lo: u32, hi: u32, ok: bool };
+    var chains: std.ArrayList(Chain) = .empty;
+    defer chains.deinit(cg.gpa);
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        if (b.term.tag != .ret) continue;
+        const o = datas[@backingInt(b.term.inst)].un_op.toIndex() orelse continue;
+        const c = cg.retCall(o) orelse continue;
+        var v = o;
+        var hi: u32 = 0;
+        var off: u32 = 0;
+        const ok = while (true) {
+            const vi = @backingInt(v);
+            if (tags[vi] == .wrap_errunion_payload) off += @intCast(Type.errorUnionLayout(ip, datas[vi].ty_op.ty).payload_offset);
+            if (tags[vi] == .unwrap_errunion_payload) {
+                const p: u32 = @intCast(Type.errorUnionLayout(ip, ir.typeOf(datas[vi].ty_op.operand, ip)).payload_offset);
+                if (off < p) break false;
+                off -= p;
+            }
+            if (fate[vi] != .normal or cg.homes[vi] != .none) break false;
+            hi = @max(hi, end[vi]);
+            if (v == c) break true;
+            v = datas[vi].ty_op.operand.toIndex().?;
+        };
+        // One `ret` may be reached from several blocks' values only
+        // through a block result, which is not a chain.
+        if (ok) try chains.append(cg.gpa, .{ .ret_val = o, .call = c, .lo = def[@backingInt(c)], .hi = hi, .ok = true });
+    }
+    for (chains.items, 0..) |*x, i| {
+        for (chains.items[i + 1 ..]) |*y| {
+            if (x.call == y.call) continue;
+            if (x.lo <= y.hi and y.lo <= x.hi) {
+                x.ok = false;
+                y.ok = false;
+            }
+        }
+        if (cg.rvo_alloc) |a| if (x.lo <= end[@backingInt(a)] and def[@backingInt(a)] <= x.hi) {
+            x.ok = false;
+        };
+    }
+    for (chains.items) |x| {
+        if (!x.ok) continue;
+        var v = x.ret_val;
+        var off: u32 = 0;
+        while (true) {
+            cg.homes[@backingInt(v)] = .{ .result = off };
+            if (v == x.call) break;
+            if (tags[@backingInt(v)] == .wrap_errunion_payload) off += @intCast(Type.errorUnionLayout(ip, datas[@backingInt(v)].ty_op.ty).payload_offset);
+            if (tags[@backingInt(v)] == .unwrap_errunion_payload) off -= @intCast(Type.errorUnionLayout(ip, ir.typeOf(datas[@backingInt(v)].ty_op.operand, ip)).payload_offset);
+            v = datas[@backingInt(v)].ty_op.operand.toIndex().?;
+        }
+    }
+}
+
 /// Whether pointers `a` and `b` to values of one type point to the same
 /// memory or to memory that does not overlap: elements of one array, or
 /// memory in different locals or global variables.
@@ -3066,7 +3188,10 @@ fn storeInPlace(cg: *CodeGen, st: Inst.Index, before: []const Inst.Index) Error!
     const bin = ir.instructions.items(.data)[@backingInt(st)].bin_op;
     const v = bin.rhs.toIndex() orelse return;
     const vi = @backingInt(v);
-    if (tags[vi] != .aggregate_init and tags[vi] != .union_init and !(tags[vi] == .bitcast and vector.bitcastInPlace(cg, v))) return;
+    // `x.* = try f()`: the payload of a call's result is copied straight
+    // to the store's memory; the call's own memory does not overlap it.
+    const unwrap = tags[vi] == .unwrap_errunion_payload and if (ir.instructions.items(.data)[vi].ty_op.operand.toIndex()) |c| tags[@backingInt(c)] == .call else false;
+    if (tags[vi] != .aggregate_init and tags[vi] != .union_init and !unwrap and !(tags[vi] == .bitcast and vector.bitcastInPlace(cg, v))) return;
     if (live.items(.uses)[vi] != 1 or live.items(.fate)[vi] != .normal) return;
     const prev = for (0..before.len) |j| {
         const x = before[before.len - 1 - j];
@@ -4539,7 +4664,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .intcast, .trunc, .bitcast, .ptr_from_int => {
             const ty = data.ty_op.ty;
-            if (cg.homes[@backingInt(inst)] == .view) return;
+            // Its operand's memory (`Home.result`).
+            if (cg.homes[@backingInt(inst)] == .view or cg.homes[@backingInt(inst)] == .result) return;
             if (tag == .trunc) if (cg.mulPart(inst)) |part| {
                 const d = cg.destReg(inst);
                 if (cg.pairOf(part.m.toRef())) |p| {
@@ -4822,6 +4948,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             }
         },
         .unwrap_errunion_payload, .unwrap_errunion_err => {
+            // Read in place in the function's result (`planRetCalls`).
+            if (cg.homes[@backingInt(inst)] == .result) return;
             const ty = data.ty_op.ty;
             const eu_ty = cg.typeOf(data.ty_op.operand);
             const layout = Type.errorUnionLayout(ip, eu_ty);
@@ -4897,8 +5025,13 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 }
                 return cg.setResult(inst, eu_ty, d);
             }
-            const dst = try cg.resultMem(inst, eu_ty) orelse return;
             const layout = Type.errorUnionLayout(ip, eu_ty);
+            if (cg.homes[@backingInt(inst)] == .result) {
+                // Its payload is already there (`planRetCalls`).
+                const m = (try cg.locOf(inst.toRef())).mem;
+                return cg.e.mov(errFieldSize(layout), .{ .mem = offsetMem(m, layout.err_offset) }, .{ .imm = 0 });
+            }
+            const dst = try cg.resultMem(inst, eu_ty) orelse return;
             if (tag == .wrap_errunion_payload) {
                 try cg.e.mov(errFieldSize(layout), .{ .mem = offsetMem(dst, layout.err_offset) }, .{ .imm = 0 });
                 try cg.copyTo(offsetMem(dst, layout.payload_offset), data.ty_op.operand);
@@ -5757,6 +5890,8 @@ fn ret(cg: *CodeGen, operand: Ref, next: Ssa.Block.Index) Error!void {
                 // Read in place from the result's own alloc (`planCopies`),
                 // not from a constant address when there is none.
                 .deferred => cg.rvo_alloc != null and cg.ir.instructions.items(.data)[@backingInt(l)].ty_op.operand.toIndex() == cg.rvo_alloc,
+                // Already there (`planRetCalls`).
+                .result => true,
                 else => false,
             } else false;
             if (!rvo) {
@@ -5800,7 +5935,12 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const in_rax = cg.passInRegs(ret_ty) and if (is_c) cg.cRetClass(ret_ty) == .int else if (is_win) cg.winClass(ret_ty, true) == .int else ret_class == .gpr;
     const in_pair = cg.pairOf(inst.toRef());
     const in_xmm = cg.xmmOf(inst.toRef());
-    const dst = if (in_rax or in_pair != null or in_xmm != null) null else try cg.resultMem(inst, ret_ty);
+    // Written straight into this function's result (`planRetCalls`).
+    const to_result: ?u32 = switch (cg.homes[@backingInt(inst)]) {
+        .result => |off| off,
+        else => null,
+    };
+    const dst = if (in_rax or in_pair != null or in_xmm != null or to_result != null) null else try cg.resultMem(inst, ret_ty);
     var stack_args = false;
     // A variadic callee learns from al how many vector registers hold
     // arguments.
@@ -5858,6 +5998,10 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         for (args, locs) |arg, l| if (l == .sse) try cg.loadXmm(xmm_args[l.sse], try cg.valOf(arg));
         try cg.loadArgRegs(args, tys, locs, refs);
         if (ret_class == .memory) if (dst) |m| try cg.e.lea(.qword, .rdi, m);
+        if (to_result) |off| {
+            try cg.e.mov(.qword, .{ .reg = .rdi }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
+            if (off != 0) try cg.e.lea(.qword, .rdi, Mem.at(.rdi, @intCast(off)));
+        }
     }
     if (!is_c and !is_win) try cg.loadTrace(.rax);
     if (callee_val) |f| {

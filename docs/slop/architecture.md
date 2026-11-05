@@ -2659,7 +2659,7 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    ns per IR instruction within noise (229–235 for both, allocation
    about +2); std's tests 6.65/6.39 → 6.68/6.51 s, allocation 69–75 →
    74–77 ns per IR instruction, binary −26 KB.
-   Copy elision, after it, in five parts:
+   Copy elision, after it, in six parts:
    - Forwarding (`Ssa.plan`, shared): a `*const` alloc whose uses are
      loads and one store of an instruction's value, which comes before
      the loads in the layout, is not emitted, nor is its store; each load
@@ -2710,7 +2710,19 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    - Stored aggregates (`planDeferred`): an `aggregate_init` or
      `union_init` in memory whose only user is the store right after it
      is built in the stored-to memory (`in_place`); no element is read
-     from memory lazily, so writing it early changes nothing.
+     from memory lazily, so writing it early changes nothing. So is the
+     payload of a call's error union (`p.* = try f()`), copied straight
+     from the call's result.
+   - Returned calls (`planRetCalls`, before allocation, both backends):
+     in a function returning through memory, a call of an `.auto`
+     function returning in memory whose value a `ret` returns, as it is,
+     through an inferred error set's bitcast, or as an error union's
+     payload (`return try f()` unwraps and rewraps it), gets the caller's
+     result pointer, and the values between them read the result in
+     place (`Home.result`). The result holds one such value at a time:
+     calls whose chains' intervals overlap another's, or the result
+     alloc's, keep their slots. Each level of `return f(x)` held one more
+     copy (sandopolis's 64 MiB test stack overflowed).
      With them, a `@splat` (an `aggregate_init` of one repeated element)
      over 128 bytes writes the element until it spans 64 bytes, doubles
      that by copies up to 512, and repeats it with one overlapping
