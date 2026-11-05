@@ -29,6 +29,9 @@ relaxed: std.ArrayList(u32) = .empty,
 /// rows' final offsets.
 lines: Atom.LineProgram = .{},
 line_events: std.ArrayList(LineEvent) = .empty,
+/// The calls (`bl`, `blr`) emitted, which the code generator checks
+/// against the instructions it expects to call.
+calls: u32 = 0,
 
 const LineEvent = struct { offset: u32, kind: enum { row, switch_to }, a: u32, b: u32 };
 
@@ -1188,6 +1191,7 @@ pub fn branchFrom(e: *Encoder, at: u32, label: Label) !void {
 
 /// `bl`, as `b`.
 pub fn bl(e: *Encoder, target: Target) !void {
+    e.calls += 1;
     try e.branch26(0x94000000, target);
 }
 
@@ -1218,6 +1222,7 @@ pub fn br(e: *Encoder, reg: Reg) !void {
 
 /// `blr reg`
 pub fn blr(e: *Encoder, reg: Reg) !void {
+    e.calls += 1;
     try e.reserve();
     e.word(0xd63f0000 | (reg.zrEnc() << 5));
 }

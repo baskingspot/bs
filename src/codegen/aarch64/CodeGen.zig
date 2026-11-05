@@ -6,13 +6,17 @@
 //! branch computes, and which overflow results write their fields
 //! directly. Scalars in general-purpose registers (`inGpr`), including
 //! promoted variables, get one of the callee-saved x19-x28 from linear
-//! scan (`Ssa.allocate`); the rest, and those the allocator leaves out,
-//! live in stack slots shared by lifetime (`Ssa.liveness`). Each
-//! instruction loads its operands into scratch registers, computes, and
-//! writes its result, to its register only after reading every operand
-//! (results through `resultMem` are moved there once the instruction's
-//! code is done). Calls and every lowering preserve x19-x28, so nothing
-//! clobbers a value's register and no value is spilled around a call.
+//! scan (`Ssa.allocate`); f32 and f64 (`inFloat`) one of d8-d15, whose
+//! low halves calls preserve, or of v20-v29; and vectors of up to 16
+//! bytes (`inVec`) one of v20-v29. Calls clobber v20-v29, so a value lives
+//! in one only when no instruction that may call (`callFree`) lies in its
+//! interval. The rest, and those the allocator leaves out, live in stack
+//! slots shared by lifetime (`Ssa.liveness`). Each instruction loads its
+//! operands into scratch registers, computes, and writes its result, to
+//! its register only after reading every operand (results through
+//! `resultMem` are moved there once the instruction's code is done). No
+//! lowering uses an allocated register as scratch, so no value is
+//! spilled around a call.
 //! Functions with inline assembly, which names registers itself, keep
 //! every value in a slot.
 //!
@@ -102,6 +106,11 @@ saved: u16 = 0,
 /// reused by each instruction from `tmp_next` on (`tempSlot`).
 tmp_slots: std.ArrayList(Mem) = .empty,
 tmp_next: u32 = 0,
+/// Some value lives in v20-v29 (`allocateRegs`).
+vregs: bool = false,
+/// As `tmp_slots`, of 16 bytes (`tempSlot16`).
+tmp16_slots: std.ArrayList(Mem) = .empty,
+tmp16_next: u32 = 0,
 /// Results in a register written to a scratch slot (`resultMem`), moved
 /// to the register when the instruction's code is done (`flushResults`).
 pending: std.ArrayList(Pending) = .empty,
@@ -166,8 +175,9 @@ const Home = union(enum) {
     /// The value is in this register; for an `alloc`, a promoted
     /// variable (`Ssa.plan`), the variable's value is.
     reg: Reg,
-    /// The same, for an f32 or f64 in one of d8-d15.
-    freg: VReg,
+    /// The value is in this register: an f32 or f64 in one of d8-d15 or
+    /// v20-v29, or a vector (`inVec`) in one of v20-v29.
+    vreg: VReg,
 };
 
 /// Where an operand's value can be read.
@@ -177,8 +187,8 @@ pub const Loc = union(enum) {
     mem: Mem,
     /// The value is in this register (x19-x28).
     reg: Reg,
-    /// The f32 or f64 is in this register (d8-d15).
-    freg: VReg,
+    /// The f32, f64 or vector is in this register (d8-d15, v20-v29).
+    vreg: VReg,
     /// The value is the address of this memory.
     addr: Mem,
     /// A scalar constant, already extended to 64 bits.
@@ -220,6 +230,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.cold_starts.deinit(gpa);
         cg.cold_open.deinit(gpa);
         cg.tmp_slots.deinit(gpa);
+        cg.tmp16_slots.deinit(gpa);
         cg.pending.deinit(gpa);
     }
     @memset(cg.homes, .none);
@@ -237,7 +248,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         try f.plan(gpa, ir, ip, &cg);
         f.bypassUnread(ir);
         cg.live = true;
-        if (!f.has_asm) cg.allocateRegs();
+        if (!f.has_asm) try cg.allocateRegs();
     } else @memset(f.live.items(.fate), .normal);
 
     // The prologue belongs to the declaration's line.
@@ -434,16 +445,29 @@ fn tempSlot(cg: *CodeGen) Error!Mem {
     return cg.tmp_slots.items[cg.tmp_next - 1];
 }
 
+/// As `tempSlot`, 16 bytes for a vector register's value.
+fn tempSlot16(cg: *CodeGen) Error!Mem {
+    if (cg.tmp16_next == cg.tmp16_slots.items.len) try cg.tmp16_slots.append(cg.gpa, try cg.allocSlot(16, 16));
+    cg.tmp16_next += 1;
+    return cg.tmp16_slots.items[cg.tmp16_next - 1];
+}
+
 /// Moves the results `resultMem` put in scratch slots to their registers,
 /// and frees the scratch slots for the next instruction.
 fn flushResults(cg: *CodeGen) Error!void {
     for (cg.pending.items) |p| switch (cg.homes[@backingInt(p.inst)]) {
         .reg => |r| try cg.loadMem(r, p.mem, cg.ir.typeOfIndex(p.inst, cg.ip)),
-        .freg => |v| try cg.loadFp(v, memVal(cg.ir.typeOfIndex(p.inst, cg.ip), p.mem)),
+        .vreg => |v| {
+            const ty = cg.ir.typeOfIndex(p.inst, cg.ip);
+            if (cg.inVec(ty)) {
+                try vector.loadMem(cg, v, p.mem, @intCast(Type.abiSize(cg.ip, ty)));
+            } else try cg.loadFp(v, memVal(ty, p.mem));
+        },
         else => unreachable,
     };
     cg.pending.clearRetainingCapacity();
     cg.tmp_next = 0;
+    cg.tmp16_next = 0;
 }
 
 fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
@@ -489,21 +513,32 @@ fn pairReg(k: usize, half: u1) Reg {
     return @fromBackingInt(@intCast(19 + 2 * k + half));
 }
 
+/// The registers the allocator hands out after `float_regs`, to vectors
+/// (`inVec`) and to floats that cross no call: v20-v29, which no lowering
+/// uses as scratch (vector.zig's are v0-v7, v16-v19, v30 and v31) but
+/// every call clobbers.
+const vreg_first = 20;
+const vreg_count = 10;
+
 /// Gives the values `clobbers` marked their registers (`Ssa.allocate`)
 /// and records the pairs the prologue saves: x19/x20 through x27/x28 in
 /// bits 0-4 and d8/d9 through d14/d15 in bits 8-11 of `saved`, compact
 /// unwind's frame-mode bits.
-fn allocateRegs(cg: *CodeGen) void {
+fn allocateRegs(cg: *CodeGen) Error!void {
     const f = &cg.emit.ssa;
     const live = f.live.slice();
     const reg = live.items(.reg);
     const fates = live.items(.fate);
     @memset(live.items(.hint), .{ Ssa.no_reg, Ssa.no_reg });
-    // Nothing clobbers x19-x28 or d8-d15, so no value crosses a clobber
-    // point and none is split.
-    const split: std.DynamicBitSetUnmanaged = .{};
-    const n = alloc_regs.len + float_regs.len;
-    const used = f.allocate(alloc_regs.len, float_regs.len, (1 << n) - 1, &.{}, &split, 0, &.{});
+    // x19-x28 and d8-d15 survive the clobber points, the instructions
+    // that may call (`callFree`); v20-v29 do not, so a value in one never
+    // crosses a clobber point, and a vector that crosses one stays in
+    // memory (`Ssa.want_vec`). None is split.
+    var split = try std.DynamicBitSetUnmanaged.initEmpty(cg.gpa, cg.ir.instructions.len);
+    defer split.deinit(cg.gpa);
+    const survive = alloc_regs.len + float_regs.len;
+    const n = survive + vreg_count;
+    const used = f.allocate(alloc_regs.len, float_regs.len + vreg_count, (1 << survive) - 1, &.{}, &split, 0, &.{});
     for (0..5) |k| if (used >> @intCast(2 * k) & 3 != 0) {
         cg.saved |= @as(u16, 1) << @intCast(k);
     };
@@ -513,17 +548,24 @@ fn allocateRegs(cg: *CodeGen) void {
     for (f.values.items(.inst)) |inst| {
         const i = @backingInt(inst);
         if (fates[i] != .normal or reg[i] >= n) continue;
-        cg.homes[i] = if (reg[i] < alloc_regs.len) .{ .reg = alloc_regs[reg[i]] } else .{ .freg = float_regs[reg[i] - alloc_regs.len] };
+        cg.homes[i] = if (reg[i] < alloc_regs.len)
+            .{ .reg = alloc_regs[reg[i]] }
+        else if (reg[i] < survive)
+            .{ .vreg = float_regs[reg[i] - alloc_regs.len] }
+        else
+            .{ .vreg = @fromBackingInt(@intCast(vreg_first + reg[i] - survive)) };
+        if (reg[i] >= survive) cg.vregs = true;
     }
 }
 
 // `Ssa.liveness` and `Ssa.plan` hooks.
 
 /// Whether value `inst`'s lowering may write a register a value holds:
-/// never, as only x19-x28 and d8-d15 hold values. Also marks the values
-/// that want a register: scalars in general-purpose registers and f32
-/// and f64 in floating-point ones, other than allocs (`Ssa.plan` promotes
-/// variables) and block results.
+/// one that may call (`callFree`), which clobbers v20-v29; nothing
+/// clobbers x19-x28 or d8-d15. Also marks the values that want a
+/// register: scalars in general-purpose registers, f32 and f64 in
+/// floating-point ones, and vectors in v20-v29 (`inVec`), other than
+/// allocs (`Ssa.plan` promotes variables) and block results.
 pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
     if (cg.emit.ssa.has_asm) return false;
     switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
@@ -531,11 +573,65 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         else => {},
     }
     const ty = cg.ir.typeOfIndex(inst, cg.ip);
-    const want = if (cg.inGpr(ty)) Ssa.want_reg else if (cg.inFloat(ty)) Ssa.want_float else return false;
     const live = cg.emit.ssa.live.slice();
-    live.items(.reg)[@backingInt(inst)] = want;
-    live.items(.tie)[@backingInt(inst)] = cg.tiedOperand(inst);
-    return false;
+    if (cg.inGpr(ty) or cg.inFloat(ty)) {
+        live.items(.reg)[@backingInt(inst)] = if (cg.inGpr(ty)) Ssa.want_reg else Ssa.want_float;
+        live.items(.tie)[@backingInt(inst)] = cg.tiedOperand(inst);
+    } else if (cg.inVec(ty)) {
+        live.items(.reg)[@backingInt(inst)] = Ssa.want_vec;
+        live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
+    }
+    return !cg.callFree(inst);
+}
+
+/// Whether `inst`'s lowering certainly makes no call (`bl`, `blr`), so
+/// values in v20-v29 survive it. Instructions not known to be call-free
+/// count as calls; `genBlock` asserts that the others call nothing.
+fn callFree(cg: *CodeGen, inst: Inst.Index) bool {
+    const ir = cg.ir;
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    if (vector.lowers(cg, inst)) return true;
+    return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .arg, .alloc, .block, .loop, .repeat, .br, .cond_br, .switch_br, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => true,
+        .load, .store, .struct_field_ptr, .struct_field_val, .ptr_elem_ptr, .slice_elem_ptr, .ptr_add => true,
+        .ptr_elem_val, .slice_elem_val, .array_elem_val, .slice_ptr, .slice_len, .slice, .vector_store_elem => true,
+        .is_null, .is_non_null, .is_err, .is_non_err, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set, .wrap_optional => true,
+        .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => true,
+        .wrap_errunion_payload, .wrap_errunion_err, .aggregate_init, .union_init, .get_union_tag, .set_union_tag => true,
+        .memcpy, .memmove, .memset, .int_from_bool, .int_from_ptr, .ret_addr, .frame_addr => true,
+        .save_err_return_trace_index, .err_return_trace, .set_err_return_trace => true,
+        // Integers in a register, and f32 and f64, have instructions.
+        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil => cg.nativeScalar(cg.typeOf(data.bin_op.lhs)),
+        // A float remainder calls fmod.
+        .rem, .mod => cg.inGpr(cg.typeOf(data.bin_op.lhs)),
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.nativeScalar(cg.typeOf(data.bin_op.lhs)),
+        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => cg.nativeScalar(cg.typeOf(data.bin_op.lhs)),
+        .neg_float, .abs_float, .sqrt => cg.nativeScalar(cg.typeOf(data.un_op)),
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => cg.nativeScalar(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)),
+        .not, .intcast, .trunc => cg.nativeScalar(data.ty_op.ty) and cg.nativeScalar(cg.typeOf(data.ty_op.operand)),
+        // Bitcasts copy.
+        .bitcast => true,
+        .floor, .ceil, .round, .trunc_float => cg.fpType(cg.typeOf(data.un_op)) != null,
+        .mul_add => cg.fpType(cg.typeOf(data.pl_op.operand)) != null,
+        .float_cast => cvtType(Type.floatBits(cg.ip, data.ty_op.ty)) != null and cvtType(Type.floatBits(cg.ip, cg.typeOf(data.ty_op.operand))) != null,
+        .float_from_int => cg.fpType(data.ty_op.ty) != null and Type.intInfo(cg.ip, cg.typeOf(data.ty_op.operand)).bits <= 64,
+        .int_from_float => cg.fpType(cg.typeOf(data.ty_op.operand)) != null and Type.intInfo(cg.ip, data.ty_op.ty).bits <= 64,
+        else => false,
+    };
+}
+
+/// Whether `ty`'s scalar operations lower to instructions (`callFree`):
+/// integers in a general-purpose register, f32, and f64.
+fn nativeScalar(cg: *CodeGen, ty: Index) bool {
+    if (cg.isFloat(ty)) return Type.floatBits(cg.ip, ty) == 32 or Type.floatBits(cg.ip, ty) == 64;
+    return cg.inGpr(ty);
+}
+
+/// As `inFloat`, for a vector only call-clobbered registers hold
+/// (`Ssa.want_vec`): 16 bytes or fewer of lanes (`vector.Shape`), not
+/// bool vectors, which are bits.
+pub fn inVec(cg: *CodeGen, ty: Index) bool {
+    return vector.inVreg(cg.ip, ty);
 }
 
 /// The operand whose register value `inst` may take when the operand dies
@@ -572,12 +668,6 @@ pub fn inFloat(cg: *CodeGen, ty: Index) bool {
     if (Type.class(cg.ip, ty) != .float) return false;
     const bits = Type.floatBits(cg.ip, ty);
     return bits == 32 or bits == 64;
-}
-
-/// As `inFloat`, for a vector only call-clobbered registers hold
-/// (`Ssa.want_vec`): none yet.
-pub fn inVec(_: *CodeGen, _: Index) bool {
-    return false;
 }
 
 /// `Ssa.plan`'s hook for intervals the architecture lengthens: none
@@ -622,9 +712,9 @@ pub fn ovfFlagsOnly(_: *CodeGen, tag: Inst.Tag, bits: u16) bool {
 /// that `flushResults` moves to the register when the instruction's code
 /// is done, after it read its operands.
 pub fn resultMem(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Mem {
-    if (cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .freg) {
+    if (cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .vreg) {
         if (!Type.hasRuntimeBits(cg.ip, ty)) return null;
-        const m = try cg.tempSlot();
+        const m = if (cg.homes[@backingInt(inst)] == .vreg) try cg.tempSlot16() else try cg.tempSlot();
         try cg.pending.append(cg.gpa, .{ .inst = inst, .mem = m });
         return m;
     }
@@ -1090,10 +1180,10 @@ fn setupParams(cg: *CodeGen) Error!void {
             },
             else => unreachable,
         };
-        if (cg.homes[@backingInt(inst)] == .freg) {
-            const v = cg.homes[@backingInt(inst)].freg;
+        if (cg.homes[@backingInt(inst)] == .vreg and !cg.inVec(ty)) {
+            const v = cg.homes[@backingInt(inst)].vreg;
             switch (l) {
-                .fpr => |a| try cg.loadFp(v, .{ .ty = ty, .loc = .{ .freg = argVReg(a) } }),
+                .fpr => |a| try cg.loadFp(v, .{ .ty = ty, .loc = .{ .vreg = argVReg(a) } }),
                 .gpr => |r| try cg.setResult(inst, ty, argReg(r)),
                 .stack => |off| try cg.loadFp(v, memVal(ty, .at(.fp, @intCast(16 + off)))),
                 else => unreachable,
@@ -1139,7 +1229,7 @@ pub fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
         .slot => |m| .{ .mem = m },
         .frame_addr => |m| .{ .addr = m },
         .reg => |r| .{ .reg = r },
-        .freg => |r| .{ .freg = r },
+        .vreg => |v| .{ .vreg = v },
     };
     return cg.constLoc(ref.toInterned().?);
 }
@@ -1335,7 +1425,12 @@ fn loadVal(cg: *CodeGen, reg: Reg, v: Val) Error!void {
         .err => |name| try cg.e.movWideValue(.movz, .x, reg, try cg.emit.useError(name), 0),
         .mem => |m| try cg.loadKnown(reg, m, v.ty),
         .reg => |r| if (r != reg) try cg.e.mov(.x, reg, r),
-        .freg => |r| if (Type.abiSize(cg.ip, v.ty) == 8) try cg.e.fmovToGpr(.x, reg, .f64, r) else try cg.e.fmovToGpr(.w, reg, .f32, r),
+        .vreg => |r| if (cg.inVec(v.ty))
+            try cg.loadMem(reg, try cg.valMem(v), v.ty)
+        else if (Type.abiSize(cg.ip, v.ty) == 8)
+            try cg.e.fmovToGpr(.x, reg, .f64, r)
+        else
+            try cg.e.fmovToGpr(.w, reg, .f32, r),
     }
 }
 
@@ -1426,7 +1521,7 @@ fn copyVal(cg: *CodeGen, dst: Mem, v: Val) Error!void {
         .none => {},
         .mem => |src| try cg.copyMem(dst, src, size),
         .reg => |r| try cg.storeReg(dst, r, size),
-        .freg => |r| try cg.storeFp(dst, r, size),
+        .vreg => |r| try vector.storeMem(cg, dst, r, @intCast(size)),
         .imm => |x| if (cg.passInRegs(v.ty)) {
             if (x == 0) return cg.storeReg(dst, .zr, size);
             try cg.e.movImm(.x, .x9, x);
@@ -1535,9 +1630,14 @@ pub fn memOf(cg: *CodeGen, ref: Ref) Error!Mem {
 
 fn valMem(cg: *CodeGen, v: Val) Error!Mem {
     if (v.loc == .mem) return v.loc.mem;
-    if (v.loc == .reg or v.loc == .freg) {
+    if (v.loc == .reg) {
         const m = try cg.tempSlot();
         try cg.copyVal(m, v);
+        return m;
+    }
+    if (v.loc == .vreg) {
+        const m = try cg.tempSlot16();
+        try vector.storeMem(cg, m, v.loc.vreg, @intCast(Type.abiSize(cg.ip, v.ty)));
         return m;
     }
     const m = try cg.allocSlot(Type.abiSize(cg.ip, v.ty), Type.abiAlignment(cg.ip, v.ty));
@@ -1559,8 +1659,8 @@ pub fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
 /// Stores value `inst` of type `ty`, computed in `reg`, to its slot, or
 /// moves it to its register, extended as a load of its type extends it.
 pub fn setResult(cg: *CodeGen, inst: Inst.Index, ty: Index, reg: Reg) Error!void {
-    if (cg.homes[@backingInt(inst)] == .freg) {
-        const v = cg.homes[@backingInt(inst)].freg;
+    if (cg.homes[@backingInt(inst)] == .vreg) {
+        const v = cg.homes[@backingInt(inst)].vreg;
         if (Type.abiSize(cg.ip, ty) == 8) return cg.e.fmovFromGpr(.f64, v, .x, reg);
         return cg.e.fmovFromGpr(.f32, v, .w, reg);
     }
@@ -1604,12 +1704,12 @@ fn promoted(cg: *CodeGen, ptr: Ref) ?Reg {
     };
 }
 
-/// As `promoted`, for a variable in a floating-point register.
-fn promotedFp(cg: *CodeGen, ptr: Ref) ?VReg {
+/// As `promoted`, for a variable in a floating-point or vector register.
+fn promotedV(cg: *CodeGen, ptr: Ref) ?VReg {
     const p = ptr.toIndex() orelse return null;
     if (cg.ir.instructions.items(.tag)[@backingInt(p)] != .alloc) return null;
     return switch (cg.homes[@backingInt(p)]) {
-        .freg => |r| r,
+        .vreg => |v| v,
         else => null,
     };
 }
@@ -1755,9 +1855,13 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
     cg.e.bind(cg.labels[@backingInt(block)]);
     cg.block = block;
     cg.tmp_next = 0;
+    cg.tmp16_next = 0;
     for (cg.ssa.blockInsts(block)) |inst| {
         if (cg.fate(inst) != .dead) {
+            const calls = cg.e.calls;
             try cg.genInst(inst);
+            // A call clobbers v20-v29: only clobber points may make one.
+            assert(!cg.vregs or cg.e.calls == calls or !cg.callFree(inst));
             try cg.flushResults();
         } else try cg.keepSymbols(inst);
     }
@@ -2020,7 +2124,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .dbg_inline_end => try cg.endInline(),
         .alloc => {
             // A promoted variable in a register needs no memory.
-            if (data.ty == .none or cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .freg) return;
+            if (data.ty == .none or cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .vreg) return;
             const info = Type.ptrInfo(ip, data.ty);
             const size = @max(Type.abiSize(ip, info.child), 1);
             const alignment = @max(Type.abiAlignment(ip, info.child), if (info.flags.alignment == 0) 1 else @as(u64, 1) << @intCast(info.flags.alignment - 1));
@@ -2050,18 +2154,24 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             }
             // A load of a promoted variable is a move, or nothing when it
             // shares the variable's register (`Live.share`).
+            if (cg.promotedV(data.ty_op.operand)) |v| {
+                if (cg.inVec(ty)) {
+                    if (cg.homes[@backingInt(inst)] == .vreg) return vector.move(cg, cg.homes[@backingInt(inst)].vreg, v);
+                    return vector.storeMem(cg, (try cg.resultMem(inst, ty)) orelse return, v, @intCast(Type.abiSize(ip, ty)));
+                }
+                if (cg.homes[@backingInt(inst)] == .vreg and cg.homes[@backingInt(inst)].vreg == v) return;
+                return cg.setFpResult(inst, ty, v);
+            }
             if (cg.promoted(data.ty_op.operand)) |v| {
                 if (cg.homes[@backingInt(inst)] == .reg and cg.homes[@backingInt(inst)].reg == v) return;
                 return cg.setResult(inst, ty, v);
             }
-            if (cg.promotedFp(data.ty_op.operand)) |v| {
-                if (cg.homes[@backingInt(inst)] == .freg and cg.homes[@backingInt(inst)].freg == v) return;
-                return cg.setFpResult(inst, ty, v);
-            }
+            if (cg.homes[@backingInt(inst)] == .vreg and cg.inVec(ty))
+                return vector.loadMem(cg, cg.homes[@backingInt(inst)].vreg, try cg.ptrMem(data.ty_op.operand), @intCast(Type.abiSize(ip, ty)));
             if (cg.passInRegs(ty)) {
                 const m = try cg.ptrMem(data.ty_op.operand);
                 if (cg.homes[@backingInt(inst)] == .reg) return cg.loadMem(cg.homes[@backingInt(inst)].reg, m, ty);
-                if (cg.homes[@backingInt(inst)] == .freg) return cg.loadFp(cg.homes[@backingInt(inst)].freg, memVal(ty, m));
+                if (cg.homes[@backingInt(inst)] == .vreg) return cg.loadFp(cg.homes[@backingInt(inst)].vreg, memVal(ty, m));
                 const d = cg.resultReg(inst, .x9);
                 try cg.loadMem(d, m, ty);
                 return cg.setResult(inst, ty, d);
@@ -2075,7 +2185,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const size = Type.abiSize(ip, cg.typeOf(val));
             if (size == 0) return;
             if (cg.promoted(data.bin_op.lhs)) |v| return cg.load(v, val);
-            if (cg.promotedFp(data.bin_op.lhs)) |v| return cg.loadFp(v, try cg.valOf(val));
+            if (cg.promotedV(data.bin_op.lhs)) |v| return if (cg.inVec(cg.typeOf(val))) vector.loadVec(cg, v, val) else cg.loadFp(v, try cg.valOf(val));
             const m = try cg.ptrMem(data.bin_op.lhs);
             if (val.toInterned()) |v| if (ip.keyTag(v) == .undef and !cg.passInRegs(cg.typeOf(val))) return cg.fillMem(m, size, 0xaa);
             try cg.copyTo(m, val);
@@ -2232,9 +2342,12 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 if (ty == .bool_type and src_ty != .bool_type) try cg.e.logic(.@"and", .x, .x9, .x9, .{ .imm = 1 });
                 return cg.setResult(inst, ty, .x9);
             }
-            const dst = try cg.resultMem(inst, ty) orelse return;
             const size = Type.abiSize(ip, ty);
             const src_size = Type.abiSize(ip, src_ty);
+            // A vector in a register from an array or vector of its size.
+            if (tag == .bitcast and cg.homes[@backingInt(inst)] == .vreg and src_size == size)
+                return vector.loadVec(cg, cg.homes[@backingInt(inst)].vreg, data.ty_op.operand);
+            const dst = try cg.resultMem(inst, ty) orelse return;
             if (src_size != size) {
                 // A bitcast between a vector and an array or integer
                 // without its padding: the low bytes.
@@ -3389,7 +3502,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const ret_ty = extra.data.ret_ty;
     const is_c = isC(callee_ty.cc);
     // A scalar result in a register is moved there from x0 (or v0).
-    const in_reg = !tail and (cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .freg);
+    const in_reg = !tail and (cg.homes[@backingInt(inst)] == .reg or (cg.homes[@backingInt(inst)] == .vreg and !cg.inVec(ret_ty)));
     const dst = if (tail or in_reg) null else try cg.resultMem(inst, ret_ty);
     var pn_save: ?Mem = null;
 
@@ -3429,7 +3542,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     if (pn_save) |save| for (0..10) |k| try cg.loadMem(@fromBackingInt(@intCast(19 + k)), save.plus(@intCast(8 * k)), .usize_type);
     if (in_reg) {
         // f32 and f64 results come back in v0 in every convention.
-        if (cg.homes[@backingInt(inst)] == .freg) return cg.setFpResult(inst, ret_ty, .v0);
+        if (cg.homes[@backingInt(inst)] == .vreg) return cg.setFpResult(inst, ret_ty, .v0);
         return cg.setResult(inst, ret_ty, .x0);
     }
     const m = dst orelse return;
@@ -4373,6 +4486,7 @@ fn cvtType(bits: u16) ?Float {
 /// x9 and x16.
 fn loadFp(cg: *CodeGen, v: VReg, val: Val) Error!void {
     const size = Type.abiSize(cg.ip, val.ty);
+    if (val.loc == .vreg) return vector.move(cg, v, val.loc.vreg);
     if (size == 16) return cg.e.ldrQ(v, try cg.access(try cg.valMem(val), 16, .x16));
     const ft: Float = switch (size) {
         2 => .f16,
@@ -4381,11 +4495,6 @@ fn loadFp(cg: *CodeGen, v: VReg, val: Val) Error!void {
         else => unreachable,
     };
     if (val.loc == .mem) return cg.e.ldrFp(ft, v, try cg.access(val.loc.mem, @intCast(size), .x16));
-    if (val.loc == .freg) {
-        // `fmov s` copies the h register's bits too.
-        if (val.loc.freg != v) try cg.e.fmov(if (size == 8) .f64 else .f32, v, val.loc.freg);
-        return;
-    }
     try cg.loadVal(.x9, val);
     // `fmov h, w` needs FEAT_FP16; `fmov s, w` sets the h register too.
     const via: Float = if (ft == .f16 and cg.fpType(val.ty) == null) .f32 else ft;
@@ -4395,7 +4504,7 @@ fn loadFp(cg: *CodeGen, v: VReg, val: Val) Error!void {
 /// The register holding float `val`: its own, or `scratch` loaded with
 /// it.
 fn fpUse(cg: *CodeGen, val: Val, scratch: VReg) Error!VReg {
-    if (val.loc == .freg) return val.loc.freg;
+    if (val.loc == .vreg) return val.loc.vreg;
     try cg.loadFp(scratch, val);
     return scratch;
 }
@@ -4404,7 +4513,7 @@ fn fpUse(cg: *CodeGen, val: Val, scratch: VReg) Error!VReg {
 /// `setFpResult` to store.
 fn fpResult(cg: *CodeGen, inst: Inst.Index, scratch: VReg) VReg {
     return switch (cg.homes[@backingInt(inst)]) {
-        .freg => |r| r,
+        .vreg => |r| r,
         else => scratch,
     };
 }
@@ -4413,7 +4522,7 @@ fn fpResult(cg: *CodeGen, inst: Inst.Index, scratch: VReg) VReg {
 /// moves it to its register.
 fn setFpResult(cg: *CodeGen, inst: Inst.Index, ty: Index, v: VReg) Error!void {
     switch (cg.homes[@backingInt(inst)]) {
-        .freg => |r| if (r != v) try cg.e.fmov(if (Type.abiSize(cg.ip, ty) == 8) .f64 else .f32, r, v),
+        .vreg => |r| if (r != v) try cg.e.fmov(if (Type.abiSize(cg.ip, ty) == 8) .f64 else .f32, r, v),
         else => {
             const m = try cg.resultMem(inst, ty) orelse return;
             try cg.storeFp(m, v, Type.abiSize(cg.ip, ty));

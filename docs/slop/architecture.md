@@ -882,12 +882,19 @@ comptime arguments are run-time values in the lowered code (uucode's
   form with the same per-instruction structure. It runs `Ssa.liveness`
   and `Ssa.plan` (dead values, fused branch conditions, overflow pairs
   and bits left in the flags, promoted variables), then `Ssa.allocate`
-  over the callee-saved x19-x28 and d8-d15 alone: scalars that fit a
-  general register (`inGpr`), f32 and f64 (`inFloat`, a `.freg` home)
-  and promoted variables of both get one, the rest live in stack slots
-  shared by lifetime. No lowering uses x19-x28 or d8-d15 as scratch and
-  every call preserves them (d8-d15 only their low 64 bits, all an f64
-  needs), so `clobbers` reports nothing, no value is spilled or split
+  over the callee-saved x19-x28 and d8-d15 and the caller-saved
+  v20-v29: scalars that fit a general register (`inGpr`) get one of
+  x19-x28; f32 and f64 (`inFloat`, `want_float`) one of d8-d15, or of
+  v20-v29 when they cross no call; vectors of at most 16 bytes
+  (`inVec`, `want_vec`, which takes only allocate's floats outside
+  `survives`) one of v20-v29; promoted variables likewise; the rest live
+  in stack slots shared by lifetime. Floats and vectors share one home,
+  `.vreg`. No lowering uses an allocated register as scratch. Calls
+  preserve x19-x28 and d8-d15 (only their low 64 bits, all an f64
+  needs) but clobber v20-v29, so every instruction not known to be
+  call-free (`callFree`, a conservative whitelist that genBlock checks
+  against the calls the encoder emits) is a clobber point, and a value
+  that crosses one keeps d8-d15 or memory; no value is spilled or split
   around a call, and both conventions (Apple's and Linux's AAPCS64) only
   move arguments into their homes at entry and results out of x0 or
   v0. Each lowering writes its result register after reading every
