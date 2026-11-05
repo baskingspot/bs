@@ -57,6 +57,18 @@ def sh(argv, cwd, env=None, timeout=None, check=True):
 
 def setup(proj, zig, refresh):
     """Clone, fetch, generate; return the recorded commands by target name."""
+    src = checkout(proj, zig)
+    if "copy" in proj:
+        return src, proj["commands"]
+    cmds_path = os.path.join(WORK, "commands", proj["name"] + ".json")
+    if os.path.exists(cmds_path) and not refresh:
+        with open(cmds_path) as f:
+            return src, json.load(f)
+    return src, record(proj, zig, src, cmds_path)
+
+
+def checkout(proj, zig):
+    """Clone the project at its pinned commit and fetch its data packages."""
     src = os.path.join(WORK, "src", proj["name"])
     proj["fetched"] = {
         "src": src,
@@ -75,7 +87,7 @@ def setup(proj, zig, refresh):
             os.makedirs(os.path.dirname(os.path.join(src, name)), exist_ok=True)
             with open(os.path.join(src, name), "w") as f:
                 f.write(text)
-        return src, proj["commands"]
+        return src
     if not os.path.isdir(os.path.join(src, ".git")):
         os.makedirs(os.path.dirname(src), exist_ok=True)
         sh(["git", "clone", "--quiet", "--filter=blob:none", proj["url"], src], WORK)
@@ -95,10 +107,12 @@ def setup(proj, zig, refresh):
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             sh(["tar", "xzf", tarball, "-C", os.path.dirname(dest)], WORK)
         proj["fetched"][name] = dest
-    cmds_path = os.path.join(WORK, "commands", proj["name"] + ".json")
-    if os.path.exists(cmds_path) and not refresh:
-        with open(cmds_path) as f:
-            return src, json.load(f)
+    return src
+
+
+def record(proj, zig, src, cmds_path):
+    """Run the project's build steps once with a fresh cache; return every
+    compile step's command line by target name."""
     # A fresh generation cache, so every compile step runs and prints its
     # command. Generated sources stay in it; the recorded commands use them.
     gen = os.path.join(WORK, "gen", proj["name"])
@@ -137,7 +151,7 @@ def setup(proj, zig, refresh):
     os.makedirs(os.path.dirname(cmds_path), exist_ok=True)
     with open(cmds_path, "w") as f:
         json.dump(cmds, f, indent=1)
-    return src, cmds
+    return cmds
 
 
 def strip_common(words, cache_dir, out):

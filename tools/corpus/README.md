@@ -26,6 +26,17 @@ donor build's, and a donor build that fails is a divergence),
 `.work/NAME.md` instead of `results.json` and `scoreboard.md`).
 `bench/scoreboard.py` runs it with `--no-run --donors --samples 3`.
 
+`tools/corpus/steps.py` checks whole builds instead: each project's
+`build` steps (install and test) under `zig build` and `bs build`, each
+with an empty local cache, its own install prefix and `--summary all`.
+A step list matches when the exit status, the step tree (statuses and
+test counts, without timings) and the installed files (paths, executable
+bits, and contents other than ELF files and archives) are the same. It
+takes `--projects`, `--bs`, `--zig`, `--bs-only`, `--timeout` and
+`--results` (default `steps`: `.work/steps.json` and `.work/steps.md`),
+skips anyzig unless named, and clones projects as run.py does, without
+recording their commands.
+
 ## How it works
 
 - [`manifest.json`](manifest.json) lists each project: repository, pinned
