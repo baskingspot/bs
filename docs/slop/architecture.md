@@ -1722,7 +1722,10 @@ aarch64-macos allocation note above); the rest, and those that cross a
 call, live in slots, and each operation loads their 16-byte chunks into
 scratch V registers (v0–v7, v16–v19) with `ldr q` (a shorter vector
 with the load of its size, which zeroes the rest of the register),
-computes, and stores the result's chunks.
+computes, and stores the result's chunks. Integer splat constants that
+`movi` or `mvni` encodes (a repeated byte, a 0x00/0xff bytemask, or a
+16- or 32-bit lane of one shifted byte, ones-filled with `msl` or not)
+are written with it instead of loaded (`splatImm`).
 
 A bool vector is bits (as in memory) in a slot, or a lane mask in its V
 register: `vector.planMasks`, before allocation, picks as masks the

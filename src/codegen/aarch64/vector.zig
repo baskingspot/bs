@@ -815,6 +815,7 @@ fn zero(cg: *CodeGen, d: VReg) Error!void {
 /// than 16 bytes fills the low bytes, zeroing the rest.
 fn loadChunk(cg: *CodeGen, r: VReg, ref: Ref, k: u32) Error!void {
     const size: u32 = @intCast(Type.abiSize(cg.ip, cg.typeOf(ref)));
+    if (ref.toInterned()) |v| if (splatImm(cg.ip, v, size)) |insn| return emit(cg, insn | vn(r));
     switch (try cg.locOf(ref)) {
         .mem => |m| try loadMem(cg, r, m.plus(16 * k), @min(size, 16)),
         .imm => |x| {
@@ -915,6 +916,68 @@ pub fn storeMem(cg: *CodeGen, m: Mem, r: VReg, bytes: u32) Error!void {
         },
         else => unreachable,
     }
+}
+
+/// The movi or mvni (Rd 0) that writes constant vector `val`, of `size`
+/// bytes, to a register when it is a splat such an instruction encodes:
+/// with Q set for 16 bytes, clear for 8 (the upper half zeroed, as an
+/// 8-byte load does). Null for other constants, which are loaded.
+fn splatImm(ip: *const InternPool, val: Index, size: u32) ?u32 {
+    if (size != 8 and size % 16 != 0) return null;
+    const ty = ip.typeOf(val);
+    const l = shared.lane(ip, ty) orelse return null;
+    if (l == .bool or l.isFloat() or ip.keyTag(val) != .aggregate) return null;
+    const len = ip.keyPayload(.vector_type, ty).len;
+    const bits = l.bytes() * 8;
+    var x: u64 = switch (ip.keyPayload(.aggregate, val).storage) {
+        // u8 lanes, stored as a string.
+        .bytes => |b| x: {
+            const s = ip.stringSlice(b)[0..len];
+            for (s[1..]) |c| if (c != s[0]) return null;
+            break :x s[0];
+        },
+        else => x: {
+            const first = elemValue(ip, val, 0);
+            for (1..len) |i| if (elemValue(ip, val, i) != first) return null;
+            if (ip.keyTag(first) != .int) return null;
+            break :x CodeGen.intBits(ip, first) & lenMask(bits);
+        },
+    };
+    // The lane's bits repeated over 64 bits.
+    var w = bits;
+    while (w < 64) : (w *= 2) x |= x << @intCast(w);
+    const q: u32 = @intFromBool(size != 8);
+    const enc = struct {
+        fn f(qq: u32, op: u1, cmode: u4, imm8: u64) u32 {
+            const b: u32 = @intCast(imm8);
+            return 0x0f000400 | qq << 30 | @as(u32, op) << 29 | (b >> 5) << 16 | @as(u32, cmode) << 12 | (b & 31) << 5;
+        }
+    }.f;
+    // Every byte the same: movi .16b.
+    if (x == (x & 0xff) * 0x0101010101010101) return enc(q, 0, 0b1110, x & 0xff);
+    // Every byte 0 or 0xff: movi .2d.
+    var mask8: u64 = 0;
+    for (0..8) |i| switch (x >> @intCast(8 * i) & 0xff) {
+        0 => {},
+        0xff => mask8 |= @as(u64, 1) << @intCast(i),
+        else => break,
+    } else return enc(q, 1, 0b1110, mask8);
+    for ([_]u1{ 0, 1 }) |op| {
+        // movi with op 0, mvni (the complement) with op 1.
+        const y = if (op == 0) x else ~x;
+        if (y == (y & 0xffff) * 0x0001000100010001) {
+            const h = y & 0xffff;
+            if (h >> 8 == 0) return enc(q, op, 0b1000, h);
+            if (h & 0xff == 0) return enc(q, op, 0b1010, h >> 8);
+        }
+        if (y == (y & 0xffffffff) * 0x0000000100000001) {
+            const v = y & 0xffffffff;
+            for (0..4) |sh| if (v & ~(@as(u64, 0xff) << @intCast(8 * sh)) == 0) return enc(q, op, @intCast(2 * sh), v >> @intCast(8 * sh));
+            if (v >> 16 == 0 and v & 0xff == 0xff) return enc(q, op, 0b1100, v >> 8);
+            if (v >> 24 == 0 and v & 0xffff == 0xffff) return enc(q, op, 0b1101, v >> 16);
+        }
+    }
+    return null;
 }
 
 /// Loads a 16-byte constant from read-only data into `r`.
