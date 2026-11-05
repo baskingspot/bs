@@ -147,6 +147,9 @@ pub const Options = struct {
     native_includes: []const []const u8 = &.{},
     /// `--verbose-cc`.
     verbose: bool = false,
+    /// aarch64-macos (apple_m1 and libSystem's headers, which every
+    /// compile sees, as Darwin always links libc), not x86_64-linux.
+    macos: bool = false,
 };
 
 /// The compiles of one build, running while it analyzes.
@@ -574,7 +577,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         const st = Io.Dir.cwd().statFile(io, p, .{}) catch break :id "";
         break :id try std.fmt.allocPrint(s, "{s}\x00{d}\x00{d}\x00{d}", .{ p, st.inode, st.size, st.mtime.toNanoseconds() });
     } else "";
-    const target = try cTarget(io, o.glibc_version, o.cpu);
+    const target = if (o.macos) try macosTarget(io) else try cTarget(io, o.glibc_version, o.cpu);
     const common = try commonArgs(ra, &target, lib, o);
 
     // The runtime libraries first, to know how many of their sources to
@@ -741,9 +744,19 @@ pub fn cTarget(io: Io, glibc_version: ?std.SemanticVersion, cpu: std.Target.Cpu)
     return target;
 }
 
+/// aarch64-macos, as `-target aarch64-macos` gives it (macOS 15.0 to
+/// 27.0, apple_m1), which bs's own code is generated for.
+pub fn macosTarget(io: Io) !std.Target {
+    const query = try std.Target.Query.parse(.{ .arch_os_abi = "aarch64-macos" });
+    return std.zig.system.resolveTargetQuery(io, query);
+}
+
 /// The arguments that depend only on the target and the lib directory.
 const Common = struct {
     triple: []const u8,
+    /// `-mmacos-version-min=<min>` and the flag that quiets Clang about
+    /// the triple's version too, as upstream passes on Darwin.
+    os_args: []const []const u8 = &.{},
     /// `-D__GLIBC_MINOR__=<n>` with `-lc`.
     glibc_minor: []const u8,
     lib: []const u8,
@@ -807,7 +820,12 @@ fn commonArgs(arena: std.mem.Allocator, target: *const std.Target, lib: []const 
     });
     // glibc 2.16 introduced aligned_alloc.
     if (o.glibc_version) |v| if (v.order(.{ .major = 2, .minor = 16, .patch = 0 }) == .lt) try cxx.append(arena, "-D_LIBCPP_HAS_LIBRARY_ALIGNED_ALLOCATION=0");
+    const os_args: []const []const u8 = if (o.macos) os: {
+        const min = target.os.version_range.semver.min;
+        break :os &.{ try std.fmt.allocPrint(arena, "-mmacos-version-min={d}.{d}.{d}", .{ min.major, min.minor, min.patch }), "-Wno-overriding-option" };
+    } else &.{};
     return .{
+        .os_args = os_args,
         .triple = try std.zig.llvm.Builder.tripleForTarget(arena, target),
         .glibc_minor = if (o.glibc_version) |v| try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{v.minor}) else "",
         .lib = lib,
@@ -853,7 +871,9 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
     const assembly = m.lang == .asm_cpp or m.lang == .assembly;
     if (!assembly) try argv.append(arena, "-fno-caret-diagnostics");
     try argv.appendSlice(arena, &.{ "-target", common.triple });
-    try argv.appendSlice(arena, &.{ if (m.pie) "-fPIE" else "-fno-PIE", if (m.pic) "-fPIC" else "-fno-PIC", "-gdwarf-4", "-gdwarf32", "-fno-lto" });
+    try argv.appendSlice(arena, &.{ if (m.pie) "-fPIE" else "-fno-PIE", if (m.pic) "-fPIC" else "-fno-PIC" });
+    try argv.appendSlice(arena, common.os_args);
+    try argv.appendSlice(arena, &.{ "-gdwarf-4", "-gdwarf32", "-fno-lto" });
     const dep_at = argv.items.len;
     // Assembly as is takes no preprocessor or code generation flags, only
     // the assembler's CPU features.
@@ -868,7 +888,7 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
         .safe => try argv.append(arena, "-D_FORTIFY_SOURCE=2"),
         .fast, .small => try argv.append(arena, "-DNDEBUG"),
     }
-    if (m.link_libc) try argv.append(arena, common.glibc_minor);
+    if (m.link_libc and common.glibc_minor.len != 0) try argv.append(arena, common.glibc_minor);
     if (m.libcpp) {
         try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libcxx", "include" }), "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libcxxabi", "include" }) });
         try argv.appendSlice(arena, common.cxx_defines);

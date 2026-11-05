@@ -4034,6 +4034,33 @@ design above:
   sections at their symbols (MH_SUBSECTIONS_VIA_SYMBOLS) would drop
   them, when output size matters.
 
+**Wired in (2026-11-05).** Emit's `inputs` is a union of an `ElfInput`
+and a `MachOInput`, picked by the target, so `pullInputs`, the
+resolver and `externTarget` serve both; on aarch64-macos every name
+nothing defines is a libSystem import, as ld64 binds it. C sources on
+aarch64-macos compile through upstream's Clang with upstream's flags
+(`CSource.Options.macos`: the `aarch64-macos` triple and apple_m1,
+`-mmacos-version-min`, `-fPIE -fPIC`, libSystem's headers from
+`any-darwin-any`, libc always on). A C `main` with no Zig entry is the
+executable's entry, through an alias when it sits inside its section's
+atom. translate-c takes aarch64-macos too (the same query, headers and
+`link_libc`); its output matches upstream's byte for byte.
+
+The other direction, bs's own relocatable output, is new:
+- `src/link/MachOObject.zig` writes MH_OBJECT for `build-obj` and
+  static libraries from the same Atoms as an executable (its header
+  comment has the sections, symbols and relocations). Objects carry no
+  DWARF yet, so Zig frames in a library linked from them have symbols
+  but no lines.
+- `Archive.writeDarwin` writes the static library as upstream's
+  `build-lib` does: a `__.SYMDEF` index and `#1/<n>` member names padded
+  so that every member's contents start 8-aligned, which ld64 requires.
+- ld64 (through clang), upstream zig and bs itself link both and run
+  the result on the Mac; libvaxis's `bs build test` runs all 48 steps
+  and the same 232 of 237 tests as upstream.
+Still refused on aarch64-macos: dynamic libraries, `build-obj` that
+would merge C sources or objects into its output, and `-lc++`.
+
 ### compiler_rt (decided 2026-11-02)
 
 - Upstream compiles all of `lib/compiler_rt.zig` as a separate compilation

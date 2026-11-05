@@ -26,11 +26,13 @@ const ElfObject = @import("link/ElfObject.zig");
 const ElfDynamic = @import("link/ElfDynamic.zig");
 const Glibc = @import("link/Glibc.zig");
 const ElfInput = @import("link/ElfInput.zig");
+const MachOInput = @import("link/MachOInput.zig");
 const ElfShared = @import("link/ElfShared.zig");
 const CSource = @import("CSource.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
 const CodeGenA64 = @import("codegen/aarch64/CodeGen.zig");
 const MachO = @import("link/MachO.zig");
+const MachOObject = @import("link/MachOObject.zig");
 const Ssa = @import("codegen/Ssa.zig");
 const inline_ir = @import("codegen/inline.zig");
 const rewrite = @import("codegen/rewrite.zig");
@@ -105,7 +107,7 @@ runpath: ?[]const u8 = null,
 lld: bool = false,
 /// An executable's object and archive inputs, which `sync` pulls archive
 /// members for and `finish` converts into atoms.
-inputs: ?*ElfInput = null,
+inputs: ?Inputs = null,
 /// A lazy edit build with link inputs, whose relink from the manifest
 /// converts them and binds the externs (`Incremental.linkFrom`): a
 /// declaration's data cannot bind to them here, so `externDataTarget` sets
@@ -909,7 +911,9 @@ pub fn sync(emit: *Emit, zcu: *Zcu) !void {
             else => try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{try std.fmt.allocPrint(emit.allocator(), "unable to link '{s}': {t}", .{ a.path, err })}),
         };
     }
-    if (emit.inputs) |in| try emit.pullInputs(in);
+    if (emit.inputs) |in| switch (in) {
+        inline else => |p| try emit.pullInputs(p),
+    };
     for (emit.rt_pending.keys()) |key| _ = try zcu.requestCompilerRtKey(key);
     emit.rt_pending.clearRetainingCapacity();
 }
@@ -917,7 +921,7 @@ pub fn sync(emit: *Emit, zcu: *Zcu) !void {
 /// Pulls the archive members the inputs and the Zig code's externs need so
 /// far, and requests the compiler_rt functions that the new objects call
 /// and nothing else defines, so that analysis generates them.
-fn pullInputs(emit: *Emit, in: *ElfInput) !void {
+fn pullInputs(emit: *Emit, in: anytype) !void {
     const ctx: InputResolver = .{ .emit = emit };
     // The symbols, not their offset slots' names.
     var wanted: std.ArrayList([]const u8) = .empty;
@@ -934,6 +938,27 @@ fn pullInputs(emit: *Emit, in: *ElfInput) !void {
     std.debug.assert(emit.owner == .link);
     for (names.items) |name| _ = try emit.requestCompilerRtExport(name);
 }
+
+/// Link inputs: ELF objects and archives on x86_64-linux, Mach-O ones on
+/// aarch64-macos, with the same entry points.
+pub const Inputs = union(enum) {
+    elf: *ElfInput,
+    macho: *MachOInput,
+
+    pub fn addObject(in: Inputs, path: []const u8, bytes: []const u8) !void {
+        switch (in) {
+            inline else => |p| try p.addObject(path, bytes),
+        }
+    }
+
+    /// `runtime`: ELF's runtime archives, which the link adds last.
+    pub fn addArchive(in: Inputs, path: []const u8, bytes: []const u8, runtime: bool) !void {
+        switch (in) {
+            .elf => |p| try p.addArchive(path, bytes, runtime),
+            .macho => |p| try p.addArchive(path, bytes),
+        }
+    }
+};
 
 /// How names the objects reference but do not define resolve on the Zig
 /// side (`ElfInput.convert`).
@@ -953,8 +978,10 @@ const InputResolver = struct {
 
     /// With `-lc`, the shared libraries' and glibc's symbols, imported. A
     /// shared object imports every name nothing in it defines, as its
-    /// Zig code does (`exportTarget`).
+    /// Zig code does (`exportTarget`). On aarch64-macos, every name is
+    /// libSystem's, as the Zig code's are.
     pub fn importSym(r: InputResolver, name: []const u8, weak: bool) !?SymbolKey {
+        if (r.emit.zcu.ip.target == .aarch64_macos) return try r.emit.useImport(name, .{ .weak = weak });
         if (r.emit.shared and std.mem.eql(u8, name, "_DYNAMIC")) return ElfDynamic.dynamic_key;
         if (!r.emit.shared and !r.emit.libraryDefines(name)) return null;
         return try r.emit.useImport(name, .{ .weak = weak, .tls = r.emit.sharedTls(name) });
@@ -989,7 +1016,11 @@ const InputResolver = struct {
 
 /// Converts the inputs into atoms, after the externs' slots took their
 /// definitions. Returns false after reporting what it could not link.
-fn convertInputs(emit: *Emit, in: *ElfInput) !bool {
+fn convertInputs(emit: *Emit, inputs: Inputs) !bool {
+    const in = switch (inputs) {
+        .elf => |p| p,
+        .macho => |p| return emit.convertMachOInputs(p),
+    };
     const converted = try in.convert(InputResolver{ .emit = emit });
     for (in.errors.items) |msg| try emit.zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{msg});
     if (in.errors.items.len != 0) return false;
@@ -1011,6 +1042,20 @@ fn convertInputs(emit: *Emit, in: *ElfInput) !bool {
     // A shared object exports the objects' globals too, as upstream's.
     if (emit.shared) try emit.exports.appendSlice(emit.gpa, try in.dynamicExports(InputResolver{ .emit = emit }));
     if (!emit.shared and emit.shared_libs.len != 0) emit.input_exports = try in.dynamicExports(InputResolver{ .emit = emit });
+    return true;
+}
+
+/// `convertInputs` for Mach-O inputs, which have no sections to copy and
+/// no shared libraries to copy data from or export to.
+fn convertMachOInputs(emit: *Emit, in: *MachOInput) !bool {
+    const converted = try in.convert(InputResolver{ .emit = emit });
+    for (in.errors.items) |msg| try emit.zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{msg});
+    if (in.errors.items.len != 0) return false;
+    emit.owner = .input;
+    defer emit.owner = .link;
+    for (converted.atoms) |atom| try emit.addAtom(atom);
+    try emit.error_values.appendSlice(emit.gpa, converted.values);
+    emit.input_symbols = converted.symbols;
     return true;
 }
 
@@ -1296,6 +1341,16 @@ pub fn finish(emit: *Emit) !bool {
         }
     }
     if (emit.failed) return false;
+    // An executable whose `main` is C's (`main.Options.c_root`): dyld
+    // calls it where its object defines it, at an alias when that is
+    // inside its section's atom.
+    if (entry == null and ip.target == .aarch64_macos) if (emit.inputs) |in| if (try in.macho.lookup("main")) |t| {
+        if (t.offset == 0) entry = t.key else {
+            const key: SymbolKey = .fromName("bs.c_main");
+            try emit.aliases.append(emit.gpa, .{ .key = key, .target = t.key, .addend = @intCast(t.offset) });
+            entry = key;
+        }
+    };
     emit.entry = entry;
     if (entry == null and !emit.obj) {
         try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "bs requires the root file to export '{s}' (std.start is not supported yet)", .{entry_name});
@@ -1392,11 +1447,21 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     // Source paths are as the compiler opened them, relative to the cwd.
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
+    if (emit.zcu.ip.target == .aarch64_macos and emit.obj) {
+        const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
+        defer emit.gpa.free(imports);
+        for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak };
+        MachOObject.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .values = emit.error_values.items, .exports = emit.exports.items, .imports = imports, .aliases = emit.aliases.items, .diag = &diag }) catch |err| {
+            std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
+            return false;
+        };
+        return true;
+    }
     if (emit.zcu.ip.target == .aarch64_macos) {
         const imports = try emit.gpa.alloc(MachO.Import, emit.imports.count());
         defer emit.gpa.free(imports);
         for (imports, emit.imports.keys()) |*imp, name| imp.* = .{ .key = importKey(name), .name = name };
-        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry.?, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .aliases = emit.aliases.items }) catch |err| {
+        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry.?, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .aliases = emit.aliases.items, .local_symbols = emit.input_symbols }) catch |err| {
             std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
             return false;
         };
@@ -1726,8 +1791,9 @@ pub const ExternTarget = struct { key: SymbolKey, addend: i64 = 0 };
 /// object, a symbol that is not exported is imported. Complete only once
 /// analysis is, and the inputs pulled.
 fn externTarget(emit: *Emit, name: []const u8, weak: bool) !?ExternTarget {
-    if (emit.inputs) |in| if (try emit.userExport(name) == null) if (try in.lookup(name)) |t|
-        return .{ .key = t.key, .addend = @intCast(t.offset) };
+    if (emit.inputs) |in| if (try emit.userExport(name) == null) switch (in) {
+        inline else => |p| if (try p.lookup(name)) |t| return .{ .key = t.key, .addend = @intCast(t.offset) },
+    };
     const key = if (emit.shared)
         try emit.userExport(name) orelse try emit.rtExport(name) orelse
             if (std.mem.eql(u8, name, "_DYNAMIC")) ElfDynamic.dynamic_key else try emit.useImport(name, .{ .weak = weak })

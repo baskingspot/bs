@@ -16,6 +16,7 @@ const Builtin = @import("Builtin.zig");
 const Archive = @import("link/Archive.zig");
 const ElfMerge = @import("link/ElfMerge.zig");
 const ElfInput = @import("link/ElfInput.zig");
+const MachOInput = @import("link/MachOInput.zig");
 const ElfShared = @import("link/ElfShared.zig");
 const Docs = @import("Docs.zig");
 const Glibc = @import("link/Glibc.zig");
@@ -172,6 +173,9 @@ pub const Options = struct {
     /// file name, as upstream's: `lib<name>.so`, with `version`
     /// `lib<name>.so.<major>`.
     soname: union(enum) { default, name: []const u8, none } = .default,
+    /// `-install_name <name>`: a Mach-O dylib's install name (its
+    /// LC_ID_DYLIB), which `zig build` passes as `@rpath/lib<name>.dylib`.
+    install_name: ?[]const u8 = null,
     /// `--version`: a shared library's version, which names its file
     /// (`lib<name>.so.<major>.<minor>.<patch>`) and its soname, as
     /// upstream's; `zig build` makes the symbolic links to it.
@@ -876,7 +880,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, batch: ?*CSource.Batch,
         var members: std.ArrayList(Archive.Input) = .empty;
         for (job.opts.link_inputs) |path| try members.append(arena, .{ .name = std.fs.path.basename(path), .bytes = try readInput(init, path) });
         for (c.objects) |o| try members.append(arena, .{ .name = o.member, .bytes = o.bytes });
-        Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, members.items) catch |err| {
+        (if (job.opts.bs_target == .aarch64_macos) Archive.writeDarwin(init.gpa, init.io, Io.Dir.cwd(), bin_path, members.items) else Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, members.items)) catch |err| {
             std.log.err("unable to write the archive '{s}': {t}", .{ bin_path, err });
             return .failed;
         };
@@ -959,20 +963,25 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         if (std.zig.system.resolveTargetQuery(init.io, .{})) |native| (if (native.abi.isGnu()) native.os.version_range.linux.glibc else null) else |_| null
     else
         null;
+    // On aarch64-macos every compile links libc (libSystem) and is
+    // position-independent, and upstream's Zig code goes through LLVM,
+    // so its C gets the stack protector, as upstream's `Module.create`.
+    const macos = opts.bs_target == .aarch64_macos;
     return CSource.start(init.gpa, init.io, init.environ_map, opts.c_sources, .{
         .zig_lib_dir = job.zig_lib_dir,
         .local_cache = job.cache_dirs.local,
-        .glibc_version = glibc_version,
+        .glibc_version = if (macos) null else glibc_version,
         .cpu = opts.cpu,
-        .link_libc = opts.link_libc,
+        .macos = macos,
+        .link_libc = opts.link_libc or macos,
         .link_libcpp = opts.link_libcpp,
         .cxx_runtime = cxxRuntime(opts),
         .libc_nonshared = libcNonshared(opts),
         .global_cache = job.cache_dirs.global,
         .single_threaded = opts.single_threaded,
-        .stack_protector = opts.c_only or opts.c_root or opts.use_llvm,
+        .stack_protector = opts.c_only or opts.c_root or opts.use_llvm or macos,
         .pic = opts.dynamic,
-        .pie = opts.c_pie,
+        .pie = opts.c_pie or macos,
         .function_sections = opts.function_sections,
         .data_sections = opts.data_sections,
         .unwind_tables = opts.unwind_tables,
@@ -1151,8 +1160,10 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     link_inputs.dynamic = glibc != null or emit.shared;
     link_inputs.shared_libs = shared_libs;
     link_inputs.lld = opts.c_root;
+    var macho_inputs: MachOInput = .{ .arena = arena };
+    const target_inputs: Emit.Inputs = if (opts.bs_target == .aarch64_macos) .{ .macho = &macho_inputs } else .{ .elf = &link_inputs };
     if (c_batch) |b| if (!emit.obj or emit.shared) {
-        emit.inputs = &link_inputs;
+        emit.inputs = target_inputs;
         emit.c_batch = b;
     };
     // `BS_BENCH_CODEGEN=n`: time the backend over this build's functions
@@ -1184,14 +1195,14 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
             const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
                 fatal("unable to read '{s}': {t}", .{ path, err });
             const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");
-            (if (is_archive) link_inputs.addArchive(path, bytes, false) else link_inputs.addObject(path, bytes)) catch |err| switch (err) {
+            (if (is_archive) target_inputs.addArchive(path, bytes, false) else target_inputs.addObject(path, bytes)) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
-                error.InvalidObject => fatal("'{s}' is not an x86_64 ELF relocatable object", .{path}),
+                error.InvalidObject => fatal("'{s}' is not an {s} relocatable object", .{ path, if (target_inputs == .macho) "arm64 Mach-O" else "x86_64 ELF" }),
                 error.InvalidArchive => fatal("'{s}' is not a valid archive", .{path}),
                 error.ThinArchive => fatal("bs does not link thin archives ('{s}') yet", .{path}),
             };
         }
-        emit.inputs = &link_inputs;
+        emit.inputs = target_inputs;
     }
     try zcu.analyzeAll(&emit);
     if (bench_runs != 0) try emit.benchCodegen(bench_runs);
@@ -1256,7 +1267,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
             .bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err| fatal("unable to read '{s}': {t}", .{ path, err }),
         });
         if (c_batch) |b| for ((try b.wait()).objects) |o| try members.append(arena, .{ .name = o.member, .bytes = o.bytes });
-        Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, members.items) catch |err| {
+        (if (opts.bs_target == .aarch64_macos) Archive.writeDarwin(init.gpa, init.io, Io.Dir.cwd(), bin_path, members.items) else Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, members.items)) catch |err| {
             std.log.err("unable to write the archive '{s}': {t}", .{ bin_path, err });
             linked = false;
         };
@@ -1800,10 +1811,11 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
 
 /// Ignored options that take a parameter.
 const ignored_flags_with_arg: std.StaticStringMap(void) = .initComptime(.{
-    .{"-iquote"},       .{"-iframework"},  .{"-iframeworkwithsysroot"},
-    .{"-rpath"},        .{"--libc"},       .{"--sysroot"},
-    .{"--error-limit"}, .{"--debug-log"},  .{"--dynamic-linker"},
-    .{"-z"},            .{"--image-base"},
+    .{"-iquote"},                .{"-iframework"},  .{"-iframeworkwithsysroot"},
+    .{"-rpath"},                 .{"--libc"},       .{"--sysroot"},
+    .{"--error-limit"},          .{"--debug-log"},  .{"--dynamic-linker"},
+    .{"-z"},                     .{"--image-base"}, .{"-current_version"},
+    .{"-compatibility_version"},
 });
 
 /// Include directory options of C, with their group's bit (upstream's
@@ -2077,6 +2089,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             try lib_dirs.append(arena, arg[2..]);
         } else if (std.mem.eql(u8, arg, "-rpath")) {
             try rpaths.append(arena, nextArg(args, &i, arg));
+        } else if (std.mem.eql(u8, arg, "-install_name")) {
+            // A parameter, not a response file, though it starts with `@`.
+            opts.install_name = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--sysroot")) {
             // Only its effect on library search: upstream searches no
             // native directories with one.
@@ -2169,14 +2184,16 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         }
     }
     checkTarget(&opts, arena, opts.target orelse "native");
-    // The aarch64-macos backend builds executables and tests of Zig
-    // only, linked against libSystem, which is macOS's libc: `-lc` asks
-    // for nothing more.
+    // The aarch64-macos backend builds executables and tests, linked
+    // against libSystem, which is macOS's libc (`-lc` asks for nothing
+    // more), with C sources, Mach-O objects and archives.
     if (opts.bs_target == .aarch64_macos) {
-        if (command == .build_obj or command == .build_lib)
-            setUnsupported(&opts, arena, "bs builds only executables and tests for aarch64-macos so far; build this step with upstream zig", .{})
-        else if (c_files.items.len != 0 or link_inputs.items.len != 0 or opts.link_libcpp)
-            setUnsupported(&opts, arena, "bs does not link C sources, objects, or libraries other than libSystem for aarch64-macos yet; build this step with upstream zig", .{})
+        if ((command == .build_obj or command == .build_lib) and link_mode == .dynamic)
+            setUnsupported(&opts, arena, "bs does not build dynamic libraries for aarch64-macos yet; build this step with upstream zig", .{})
+        else if (command == .build_obj and (c_files.items.len != 0 or link_inputs.items.len != 0))
+            setUnsupported(&opts, arena, "bs does not merge C sources or objects into aarch64-macos objects yet; build this step with upstream zig", .{})
+        else if (opts.link_libcpp)
+            setUnsupported(&opts, arena, "bs does not link libc++ for aarch64-macos yet; build this step with upstream zig", .{})
         else if (opts.fuzz)
             setUnsupported(&opts, arena, "bs does not instrument code for fuzzing on aarch64-macos yet ('-ffuzz'); build this step with upstream zig", .{});
         // Code is generated for Apple's M1 (`-target aarch64-macos`), the
@@ -2227,10 +2244,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     if (root == null and !rootless_root and command != .@"test" and
         (c_files.items.len != 0 or (link_inputs.items.len != 0 and (command == .build_lib or command == .build_obj)))) rootless_root = true;
     if (root == null and rootless_root) {
-        // An executable whose main is C's, as upstream's; bs needs glibc
-        // for its start code (`Builtin.glibc_start`). A shared library of
+        // An executable whose main is C's, as upstream's; on x86_64-linux
+        // bs needs glibc for its start code (`Builtin.glibc_start`), and
+        // on aarch64-macos dyld calls C's `main`. A shared library of
         // C is linked from bs's root too, for compiler_rt and ubsan_rt.
-        if ((command == .build_exe or command == .run) and opts.link_libc and c_files.items.len != 0)
+        if ((command == .build_exe or command == .run) and (opts.link_libc or opts.bs_target == .aarch64_macos) and c_files.items.len != 0)
             opts.c_root = true
         else if (command != .build_lib and command != .build_obj)
             setUnsupported(&opts, arena, "bs builds modules without a Zig root source file only into libraries and objects of C and executables of C that link glibc ('-M{s}'); build this step with upstream zig", .{opts.root_name})
