@@ -200,8 +200,9 @@ pub fn deinit(g: *Glibc) void {
 /// glibc's libraries are then needed only when imported from, after the
 /// given ones. Upstream's own linker, which links a program with Zig
 /// code, needs libm, libc and ld-linux-x86-64.so.2 always, before them.
-pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import, defined: []const ElfDynamic.Export, shared: []const ElfShared, lld: bool) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
-    return g.options(arena, imports, copies, defined, shared, .{ .executable = true, .lld = lld });
+/// With `rdynamic`, it exports every definition but hidden ones.
+pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import, defined: []const ElfDynamic.Export, shared: []const ElfShared, lld: bool, rdynamic: bool) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
+    return g.options(arena, imports, copies, defined, shared, .{ .executable = true, .lld = lld, .rdynamic = rdynamic });
 }
 
 /// The dynamic tables of a shared object that links glibc, as
@@ -216,7 +217,7 @@ pub fn sharedObjectOptions(g: *const Glibc, arena: Allocator, imports: []ElfObje
     };
 }
 
-fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import, defined: []const ElfDynamic.Export, shared: []const ElfShared, how: struct { executable: bool, lld: bool }) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
+fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import, defined: []const ElfDynamic.Export, shared: []const ElfShared, how: struct { executable: bool, lld: bool, rdynamic: bool = false }) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
     const executable = how.executable;
     std.mem.sortUnstable(ElfObject.Import, imports, {}, struct {
         fn lt(_: void, a: ElfObject.Import, b: ElfObject.Import) bool {
@@ -316,13 +317,13 @@ fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copie
         };
     }
     // The definitions a needed library names, defining or referencing
-    // them, which it binds to the executable's.
-    if (executable and own.count() != 0) {
+    // them, which it binds to the executable's; with -rdynamic, all.
+    if (executable and (how.rdynamic or own.count() != 0)) {
         var named: std.StringHashMapUnmanaged(void) = .empty;
         for (shared, alive) |lib, a| if (a) for (lib.undefs) |u| try named.put(arena, u.name, {});
         for (defined) |x| {
             if (x.visibility == .hidden) continue;
-            if (named.contains(x.name) or for (shared, alive) |lib, a| {
+            if (how.rdynamic or named.contains(x.name) or for (shared, alive) |lib, a| {
                 if (a and lib.symbols.contains(x.name)) break true;
             } else false) try exports.append(arena, x);
         }
@@ -448,14 +449,14 @@ test load {
     try lib_a.symbols.put(arena, "a", .{ .version = null, .object = false, .size = 0, .value = 0 });
     const lib_b: ElfShared = .{ .path = "libb.so", .soname = "libb.so", .undefs = &.{.{ .name = "cos", .weak = false }} };
     var imports = [_]ElfObject.Import{.{ .key = .fromName("a"), .name = "a" }};
-    const opts = try g236.dynamicOptions(arena, &imports, &.{}, &.{}, &.{ lib_a, lib_b }, true);
+    const opts = try g236.dynamicOptions(arena, &imports, &.{}, &.{}, &.{ lib_a, lib_b }, true, false);
     try std.testing.expectEqual(3, opts.needed.len);
     for (opts.needed, [_][]const u8{ "liba.so", "libc.so.6", "ld-linux-x86-64.so.2" }) |got, want| try std.testing.expectEqualStrings(want, got);
     // Upstream's own linker, for a program with Zig code, needs libm,
     // libc and ld-linux-x86-64.so.2 always, before the given libraries,
     // and the imports name those places.
     var imports2 = [_]ElfObject.Import{ .{ .key = .fromName("a"), .name = "a" }, .{ .key = .fromName("puts"), .name = "puts" }, .{ .key = .fromName("stderr"), .name = "stderr" } };
-    const own = try g236.dynamicOptions(arena, &imports2, &.{}, &.{}, &.{ lib_a, lib_b }, false);
+    const own = try g236.dynamicOptions(arena, &imports2, &.{}, &.{}, &.{ lib_a, lib_b }, false, false);
     try std.testing.expectEqual(4, own.needed.len);
     for (own.needed, [_][]const u8{ "libm.so.6", "libc.so.6", "ld-linux-x86-64.so.2", "liba.so" }) |got, want| try std.testing.expectEqualStrings(want, got);
     try std.testing.expectEqual(3, own.imports[0].library);

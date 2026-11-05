@@ -143,6 +143,8 @@ runpath: ?[]const u8 = null,
 /// The program is C only, which upstream links with lld rather than its
 /// own linker (`Glibc.dynamicOptions`).
 lld: bool = false,
+/// `-rdynamic`: a dynamic executable exports all its definitions.
+rdynamic: bool = false,
 /// Plain C against glibc or libSystem (`main.plainC`): names the libc
 /// defines resolve to it before compiler_rt, as upstream's compiler_rt
 /// archive after libc leaves them (`memset`, `memcpy`, libm's functions).
@@ -1171,7 +1173,7 @@ fn convertInputs(emit: *Emit, inputs: Inputs) !bool {
     emit.input_sections = converted.sections;
     // A shared object exports the objects' globals too, as upstream's.
     if (emit.shared) try emit.exports.appendSlice(emit.gpa, try in.dynamicExports(InputResolver{ .emit = emit }));
-    if (!emit.shared and emit.shared_libs.len != 0) emit.input_exports = try in.dynamicExports(InputResolver{ .emit = emit });
+    if (!emit.shared and (emit.shared_libs.len != 0 or emit.rdynamic)) emit.input_exports = try in.dynamicExports(InputResolver{ .emit = emit });
     return true;
 }
 
@@ -1665,7 +1667,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         const defined = try std.mem.concat(arena, ElfDynamic.Export, &.{ emit.exports.items, emit.input_exports });
-        var dynamic = g.dynamicOptions(arena, imports[0..n_imports], imports[n_imports..], defined, emit.shared_libs, emit.lld) catch |err| switch (err) {
+        var dynamic = g.dynamicOptions(arena, imports[0..n_imports], imports[n_imports..], defined, emit.shared_libs, emit.lld, emit.rdynamic) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             // Imports come from the shared libraries and glibc only
             // (`libraryDefines`), but a unit an edit build loaded may

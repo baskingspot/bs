@@ -4085,8 +4085,12 @@ thread's abilists imports. No bytes come from it.
   `SharedObject.markImportExports`, so the loader binds the library to
   it (fixed with the liveness: bs exported none, and a library
   calling back into the program failed at run time). glibc's libraries,
-  which bs knows only from abilists, name nothing here. `-rdynamic`,
-  which exports every definition, is still accepted and ignored.
+  which bs knows only from abilists, name nothing here. `-rdynamic`
+  exports every definition, Zig's and its objects' (crt1.o's `_start`
+  and `_IO_stdin_used` among them), unless hidden, as upstream's: the C
+  modules a Lua interpreter loads bind to it (siv's `lua`). Upstream
+  also exports ubsan_rt's weak handlers and crt1.o's `data_start`, which
+  bs keeps local or leaves out.
   `-needed-l`, which would keep a library regardless, is `[unsupported]`. Upstream's native link lists libm, libc
   and ld-linux first; its `-target x86_64-linux-gnu` link lists them
   last, as bs does.
@@ -7730,7 +7734,8 @@ on its slot: no PLT, no copy relocations. Slots, and any `.rodata` atom
 with an absolute relocation to an import, go to `.data.rel.ro` under
 RELRO, the `pic` branch's rule. `.dynsym` holds the imports (versioned
 through `.gnu.version`, `.gnu.version_r` per library) and no exports
-(upstream exports none without `-rdynamic`); `.dynamic` gets DT_NEEDED,
+(upstream exports none without `-rdynamic`, which exports all, as bs
+does); `.dynamic` gets DT_NEEDED,
 DT_VERSYM, DT_VERNEED(NUM), DT_DEBUG (for debuggers; upstream's
 self-hosted linker leaves it out), DT_FLAGS BIND_NOW, DT_FLAGS_1 NOW, and
 the tables `ElfDynamic` writes for shared objects (no DT_INIT/DT_FINI

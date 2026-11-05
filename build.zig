@@ -1195,6 +1195,18 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     dl_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
     dl_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&dl_run.step);
+    // The same host built by bs: -rdynamic exports its c_twice, which
+    // the library binds to.
+    const bs_dl_host = b.addRunArtifact(bs);
+    bs_dl_host.addArgs(&.{ "build-exe", "-lc", "-rdynamic" });
+    bs_dl_host.addFileArg(b.path("test/obj/dl.c"));
+    const bs_dl_bin = bs_dl_host.addPrefixedOutputFileArg("-femit-bin=", "dl");
+    const bs_dl_run = std.Build.Step.Run.create(b, "run dl.c (bs -rdynamic host, dlopen of bs shared object)");
+    bs_dl_run.addFileArg(bs_dl_bin);
+    bs_dl_run.addFileArg(zso_file);
+    bs_dl_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
+    bs_dl_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&bs_dl_run.step);
 
     // A -fPIE object with `main`, which upstream links into a static PIE:
     // std.pie relocates it, reading `_DYNAMIC` PC-relative before then.

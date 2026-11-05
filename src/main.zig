@@ -184,6 +184,10 @@ pub const Options = struct {
     link_libcpp: bool = false,
     /// `-dynamic` on an executable, which only `-lc` makes one.
     exe_dynamic: bool = false,
+    /// `-rdynamic`: a dynamic executable exports all its global
+    /// definitions, Zig's and the objects', for the shared objects it
+    /// loads (a Lua interpreter's C modules), as upstream's.
+    rdynamic: bool = false,
     /// ELF objects (`.o`) and archives (`.a`) to link into the executable,
     /// in command-line order (docs/slop/architecture.md, "Object, archive and
     /// shared-library inputs").
@@ -677,6 +681,7 @@ pub const Job = struct {
         i.link_shared = job.link_shared;
         i.link_shared_names = job.opts.shared_names;
         i.lld = job.opts.c_root;
+        i.rdynamic = job.opts.rdynamic;
         if (job.opts.link_libc and !job.opts.pic) {
             i.glibc_version = job.opts.glibc_version;
             i.glibc_lib_dir = job.zig_lib_dir;
@@ -1295,6 +1300,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         emit.allow_undefined_version = opts.allow_undefined_version;
     };
     emit.lld = opts.c_root;
+    emit.rdynamic = opts.rdynamic;
     // aarch64-macos links against Mach-O dylibs, with LC_RPATHs.
     const macos = opts.bs_target == .aarch64_macos;
     emit.libc_first = plain and (glibc != null or macos);
@@ -1998,13 +2004,12 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"--discard-all"},                  .{"-fcompiler-rt"},
     .{"-fno-compiler-rt"},               .{"-fubsan-rt"},
     .{"-fno-ubsan-rt"},                  .{"-fdll-export-fns"},
-    .{"-fno-dll-export-fns"},            .{"-rdynamic"},
     .{"--enable-new-dtags"},             .{"--disable-new-dtags"},
     .{"-feach-lib-rpath"},               .{"-fno-each-lib-rpath"},
     .{"-fno-lto"},                       .{"-fno-sanitize-coverage-trace-pc-guard"},
     .{"-fincremental"},                  .{"-fno-incremental"},
     .{"--debug-rt"},                     .{"-femit-bin"},
-    .{"--compress-debug-sections=none"},
+    .{"--compress-debug-sections=none"}, .{"-fno-dll-export-fns"},
 });
 
 /// Ignored options that take a parameter.
@@ -2143,6 +2148,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
                 opts.pic = true;
                 if (std.mem.eql(u8, arg, "-fPIE") and command.isObj()) opts.pie = true;
             }
+        } else if (std.mem.eql(u8, arg, "-rdynamic")) {
+            opts.rdynamic = true;
         } else if (std.mem.eql(u8, arg, "-dynamic")) {
             lib_search = .{ .strategy = .mode_first, .static = false };
             link_mode = .dynamic;
