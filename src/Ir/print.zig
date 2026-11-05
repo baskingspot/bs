@@ -220,25 +220,26 @@ const Printer = struct {
                 try p.braced(ir.bodySlice(cb.end + cb.data.then_body_len, cb.data.else_body_len), indent);
             },
             .switch_br => {
-                const sb = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
                 try p.ref(data.pl_op.operand);
-                var i = sb.end;
-                for (0..sb.data.cases_len) |_| {
-                    const items_len = ir.extra[i];
-                    const body_len = ir.extra[i + 1];
-                    i += 2;
+                var it = ir.switchCases(data.pl_op.payload);
+                while (it.next()) |c| {
                     try w.writeAll(", [");
-                    for (ir.refSlice(i, items_len), 0..) |item, j| {
+                    for (c.items, 0..) |item, j| {
                         if (j != 0) try w.writeAll(", ");
                         try p.ref(item);
                     }
-                    i += items_len;
+                    var k: usize = 0;
+                    while (k < c.ranges.len) : (k += 2) {
+                        if (k != 0 or c.items.len != 0) try w.writeAll(", ");
+                        try p.ref(c.ranges[k]);
+                        try w.writeAll("...");
+                        try p.ref(c.ranges[k + 1]);
+                    }
                     try w.writeAll("] => ");
-                    try p.braced(ir.bodySlice(i, body_len), indent);
-                    i += body_len;
+                    try p.braced(c.body, indent);
                 }
                 try w.writeAll(", else => ");
-                try p.braced(ir.bodySlice(i, sb.data.else_body_len), indent);
+                try p.braced(it.elseBody(), indent);
             },
             .call => {
                 const c = ir.extraData(Ir.Call, data.pl_op.payload);

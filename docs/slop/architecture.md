@@ -2018,6 +2018,16 @@ else block, which keeps a corrupt or out-of-range operand on the safety
 check's path. Items whose values the linker assigns (error codes) and
 integers over 64 bits keep a compare per item, in order.
 
+A case holds items and inclusive ranges (`Ir.SwitchBr`, read with
+`Ir.switchCases`; ranges since 2026-11-05). Sema keeps range prongs in
+the `switch_br` when the operand is an integer of at most 64 bits, and
+only wider operands become `cond_br` chains (`switchAsCondBrs`). The
+lowering takes a range as one case over its keys, so a range in a dense
+run fills table entries and a range elsewhere is one `branchIn` (x86_64
+`lea ecx, [rax - lo]; cmp ecx, hi - lo; jbe`) or one compare at an end
+of the possible values; `prove` learns `>= lo` and `<= hi` in a range's
+case like `==` in an item's.
+
 #### Proving checks
 
 Built on the IR, after the rewrite rules (`src/codegen/prove.zig`), as

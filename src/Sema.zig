@@ -3367,7 +3367,7 @@ fn inactiveUnionFieldMsg(sema: *Sema, block: *Block, active: Ref, accessed: Ref)
         var case = block.child();
         defer case.deinitInsts();
         _ = try sema.addInst(&case, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = try sema.coerce(&case, .slice_const_u8_type, .fromInterned(try sema.stringLiteral(msg)), block.nodeSrc(.zero)) } } });
-        try bodies.appendSlice(gpa, &.{ 1, @intCast(case.instructions.items.len), @backingInt(try sema.intValue(sema.typeOf(active), k)) });
+        try bodies.appendSlice(gpa, &.{ 1, 0, @intCast(case.instructions.items.len), @backingInt(try sema.intValue(sema.typeOf(active), k)) });
         try bodies.appendSlice(gpa, @ptrCast(case.instructions.items));
     }
     var else_block = block.child();
@@ -17397,19 +17397,22 @@ fn emitSwitchProngs(sema: *Sema, outer: *Block, src: Src, inst: Zir.Inst.Index, 
     } else {
         var any_ranges = false;
         for (cases) |c| any_ranges = any_ranges or c.ranges.len != 0;
-        if (any_ranges) {
+        // The backends compare ranges of integers in registers; wider ones
+        // become compares (`switchAsCondBrs`).
+        const cond_ty = sema.typeOf(cond);
+        if (any_ranges and (Type.class(sema.ip, cond_ty) != .int or Type.intInfo(sema.ip, cond_ty).bits > 64)) {
             try sema.switchAsCondBrs(outer, src, cases, else_case, cond, operand, capture_inst, inst);
         } else {
-            // switch_br: cases with items, then the else body.
+            // switch_br: cases with items and ranges, then the else body.
             var bodies: std.ArrayList(u32) = .empty;
             defer bodies.deinit(gpa);
             for (cases) |c| {
                 var prong = outer.condChild(src.operandSrc(0));
                 defer prong.deinitInsts();
                 try sema.analyzeProng(&prong, c, operand, capture_inst, inst);
-                try bodies.append(gpa, @intCast(c.items.len));
-                try bodies.append(gpa, @intCast(prong.instructions.items.len));
+                try bodies.appendSlice(gpa, &.{ @intCast(c.items.len), @intCast(c.ranges.len), @intCast(prong.instructions.items.len) });
                 for (c.items) |item| try bodies.append(gpa, @backingInt(item));
+                for (c.ranges) |r| try bodies.appendSlice(gpa, &.{ @backingInt(r[0]), @backingInt(r[1]) });
                 try bodies.appendSlice(gpa, @ptrCast(prong.instructions.items));
             }
             var else_block = outer.condChild(src.operandSrc(0));
@@ -20899,16 +20902,9 @@ fn bcMarkDeps(ir: *const Ir, body: []const Ir.Inst.Index, marked: *std.DynamicBi
                 bcMarkDeps(ir, ir.bodySlice(extra.end + extra.data.then_body_len, extra.data.else_body_len), marked, marked_effects);
             },
             .switch_br => {
-                const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
-                var at = extra.end;
-                for (0..extra.data.cases_len) |_| {
-                    const items_len = ir.extra[at];
-                    const body_len = ir.extra[at + 1];
-                    at += 2 + items_len;
-                    bcMarkDeps(ir, ir.bodySlice(at, body_len), marked, marked_effects);
-                    at += body_len;
-                }
-                bcMarkDeps(ir, ir.bodySlice(at, extra.data.else_body_len), marked, marked_effects);
+                var it = ir.switchCases(data.pl_op.payload);
+                while (it.next()) |c| bcMarkDeps(ir, c.body, marked, marked_effects);
+                bcMarkDeps(ir, it.elseBody(), marked, marked_effects);
             },
             else => {},
         }
@@ -21631,21 +21627,17 @@ fn bcExec(sema: *Sema, f: *BcFrame, body: []const Ir.Inst.Index) BcError!BcExit 
             .switch_br => {
                 const operand = f.get(data.pl_op.operand) catch |e| return bcErr(e);
                 if (sema.isUndef(operand)) return error.BcAbort;
-                const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
-                var at = extra.end;
-                for (0..extra.data.cases_len) |_| {
-                    const items_len = ir.extra[at];
-                    const body_len = ir.extra[at + 1];
-                    at += 2;
-                    const items = ir.refSlice(at, items_len);
-                    at += items_len;
-                    const case_body = ir.bodySlice(at, body_len);
-                    at += body_len;
+                var it = ir.switchCases(data.pl_op.payload);
+                while (it.next()) |c| {
                     // Interned values of the same type are equal when
                     // their indices are.
-                    for (items) |item| if (try f.val(item) == operand) return sema.bcExec(f, case_body);
+                    for (c.items) |item| if (try f.val(item) == operand) return sema.bcExec(f, c.body);
+                    var k: usize = 0;
+                    while (k < c.ranges.len) : (k += 2) {
+                        if (sema.intOrder(operand, try f.val(c.ranges[k])) != .lt and sema.intOrder(operand, try f.val(c.ranges[k + 1])) != .gt) return sema.bcExec(f, c.body);
+                    }
                 }
-                return sema.bcExec(f, ir.bodySlice(at, extra.data.else_body_len));
+                return sema.bcExec(f, it.elseBody());
             },
             .call => blk: {
                 const extra = ir.extraData(Ir.Call, data.pl_op.payload);

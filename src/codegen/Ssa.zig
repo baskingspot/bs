@@ -1376,17 +1376,15 @@ const Builder = struct {
                 try b.terminate(.{ .tag = .switch_br, .inst = inst, .succ = .{ cases_start, @backingInt(else_block) } });
                 // The else body comes first in the layout, then the cases
                 // in IR order.
-                var i = extra.end;
-                for (0..extra.data.cases_len) |_| i += 2 + ir.extra[i] + ir.extra[i + 1];
+                var it = ir.switchCases(data.pl_op.payload);
+                while (it.next()) |_| {}
                 try b.open(else_block);
-                try b.body(ir.bodySlice(i, extra.data.else_body_len));
-                i = extra.end;
-                for (0..extra.data.cases_len) |c| {
-                    const items_len = ir.extra[i];
-                    const body_len = ir.extra[i + 1];
+                try b.body(it.elseBody());
+                it = ir.switchCases(data.pl_op.payload);
+                var c: u32 = 0;
+                while (it.next()) |case| : (c += 1) {
                     try b.open(b.f.extra.items[cases_start + c]);
-                    try b.body(ir.bodySlice(i + 2 + items_len, body_len));
-                    i += 2 + items_len + body_len;
+                    try b.body(case.body);
                 }
             },
             .ret => try b.terminate(.{ .tag = .ret, .inst = inst }),

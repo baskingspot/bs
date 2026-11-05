@@ -177,15 +177,9 @@ const Nested = struct {
                     try it.body(ir.bodySlice(x.end, x.data.then_body_len + x.data.else_body_len));
                 },
                 .switch_br => {
-                    const x = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
-                    var at = x.end;
-                    for (0..x.data.cases_len) |_| {
-                        const items_len = ir.extra[at];
-                        const body_len = ir.extra[at + 1];
-                        try it.body(ir.bodySlice(at + 2 + items_len, body_len));
-                        at += 2 + items_len + body_len;
-                    }
-                    try it.body(ir.bodySlice(at, x.data.else_body_len));
+                    var cases = ir.switchCases(data.pl_op.payload);
+                    while (cases.next()) |c| try it.body(c.body);
+                    try it.body(cases.elseBody());
                 },
                 else => {},
             }
@@ -219,15 +213,9 @@ const Finder = struct {
                     try f.body(ir.bodySlice(x.end + x.data.then_body_len, x.data.else_body_len));
                 },
                 .switch_br => {
-                    const x = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
-                    var at = x.end;
-                    for (0..x.data.cases_len) |_| {
-                        const items_len = ir.extra[at];
-                        const body_len = ir.extra[at + 1];
-                        try f.body(ir.bodySlice(at + 2 + items_len, body_len));
-                        at += 2 + items_len + body_len;
-                    }
-                    try f.body(ir.bodySlice(at, x.data.else_body_len));
+                    var cases = ir.switchCases(data.pl_op.payload);
+                    while (cases.next()) |c| try f.body(c.body);
+                    try f.body(cases.elseBody());
                 },
                 else => {},
             }

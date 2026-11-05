@@ -141,18 +141,9 @@ const Scanner = struct {
                     try s.body(else_body, cold or isCold(ir, else_body));
                 },
                 .switch_br => {
-                    const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
-                    var i = extra.end;
-                    for (0..extra.data.cases_len) |_| {
-                        const items_len = ir.extra[i];
-                        const body_len = ir.extra[i + 1];
-                        i += 2 + items_len;
-                        const case = ir.bodySlice(i, body_len);
-                        try s.body(case, cold or isCold(ir, case));
-                        i += body_len;
-                    }
-                    const else_body = ir.bodySlice(i, extra.data.else_body_len);
-                    try s.body(else_body, cold or isCold(ir, else_body));
+                    var it = ir.switchCases(data.pl_op.payload);
+                    while (it.next()) |c| try s.body(c.body, cold or isCold(ir, c.body));
+                    try s.body(it.elseBody(), cold or isCold(ir, it.elseBody()));
                 },
                 .call => try s.call(inst, cold),
                 // A big array literal or `@splat` has an operand per element
@@ -451,26 +442,19 @@ pub const Copier = struct {
                 try c.body(insts);
             },
             .switch_br => {
-                const extra = from.extraData(Ir.SwitchBr, data.pl_op.payload);
-                data.pl_op = .{ .operand = c.ref(data.pl_op.operand), .payload = try c.payload(Ir.SwitchBr, data.pl_op.payload) };
-                var at = extra.end;
-                for (0..extra.data.cases_len) |_| {
-                    const items_len = from.extra[at];
-                    const body_len = from.extra[at + 1];
-                    try c.extra.appendSlice(c.gpa, &.{ items_len, body_len });
-                    try c.refs(from.refSlice(at + 2, items_len));
-                    try c.bodyIndices(from.bodySlice(at + 2 + items_len, body_len));
-                    at += 2 + items_len + body_len;
+                const old = data.pl_op.payload;
+                data.pl_op = .{ .operand = c.ref(data.pl_op.operand), .payload = try c.payload(Ir.SwitchBr, old) };
+                var it = from.switchCases(old);
+                while (it.next()) |case| {
+                    try c.extra.appendSlice(c.gpa, from.extra[case.at..][0..3]);
+                    try c.refs(case.items);
+                    try c.refs(case.ranges);
+                    try c.bodyIndices(case.body);
                 }
-                try c.bodyIndices(from.bodySlice(at, extra.data.else_body_len));
-                at = extra.end;
-                for (0..extra.data.cases_len) |_| {
-                    const items_len = from.extra[at];
-                    const body_len = from.extra[at + 1];
-                    try c.body(from.bodySlice(at + 2 + items_len, body_len));
-                    at += 2 + items_len + body_len;
-                }
-                try c.body(from.bodySlice(at, extra.data.else_body_len));
+                try c.bodyIndices(it.elseBody());
+                it = from.switchCases(old);
+                while (it.next()) |case| try c.body(case.body);
+                try c.body(it.elseBody());
             },
         }
         c.insts.set(@backingInt(c.index(i)), .{ .tag = tag, .data = data });
@@ -655,18 +639,17 @@ const Hasher = struct {
                 try h.body(ir.bodySlice(extra.end + extra.data.then_body_len, extra.data.else_body_len));
             },
             .switch_br => {
-                const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
                 try h.ref(data.pl_op.operand);
                 try h.payload(Ir.SwitchBr, data.pl_op.payload);
-                var at = extra.end;
-                for (0..extra.data.cases_len) |_| {
-                    const items_len = ir.extra[at];
-                    const body_len = ir.extra[at + 1];
-                    try h.refs(ir.refSlice(at + 2, items_len));
-                    try h.body(ir.bodySlice(at + 2 + items_len, body_len));
-                    at += 2 + items_len + body_len;
+                var it = ir.switchCases(data.pl_op.payload);
+                while (it.next()) |c| {
+                    try h.word(@intCast(c.items.len));
+                    try h.word(@intCast(c.ranges.len));
+                    try h.refs(c.items);
+                    try h.refs(c.ranges);
+                    try h.body(c.body);
                 }
-                try h.body(ir.bodySlice(at, extra.data.else_body_len));
+                try h.body(it.elseBody());
             },
             .assembly, .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect, .comptime_exit => unreachable,
         }

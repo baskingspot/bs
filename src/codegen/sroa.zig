@@ -491,12 +491,14 @@ const Editor = struct {
                     const cases_len = e.extra.items[old];
                     const else_len = e.extra.items[old + 1];
                     var any = false;
+                    // Each case: `items_len`, `ranges_len`, `body_len`,
+                    // the items and ranges' values, the body (`Ir.SwitchBr`).
                     var at = old + 2;
                     for (0..cases_len) |_| {
-                        const items_len = e.extra.items[at];
-                        const body_len = e.extra.items[at + 1];
-                        if (try e.nested(at + 2 + items_len, body_len)) any = true;
-                        at += 2 + items_len + body_len;
+                        const values_len = e.extra.items[at] + 2 * e.extra.items[at + 1];
+                        const body_len = e.extra.items[at + 2];
+                        if (try e.nested(at + 3 + values_len, body_len)) any = true;
+                        at += 3 + values_len + body_len;
                     }
                     if (try e.nested(at, else_len)) any = true;
                     if (!any) continue;
@@ -504,14 +506,14 @@ const Editor = struct {
                     try e.extra.appendSlice(e.gpa, &.{ cases_len, 0 });
                     at = old + 2;
                     for (0..cases_len) |_| {
-                        const items_len = e.extra.items[at];
-                        const body_len = e.extra.items[at + 1];
+                        const values_len = e.extra.items[at] + 2 * e.extra.items[at + 1];
+                        const body_len = e.extra.items[at + 2];
                         const h: u32 = @intCast(e.extra.items.len);
-                        try e.extra.appendSlice(e.gpa, &.{ items_len, 0 });
-                        for (0..items_len) |j| try e.extra.append(e.gpa, e.extra.items[at + 2 + j]);
-                        const body_new = try e.list(at + 2 + items_len, body_len);
-                        e.extra.items[h + 1] = body_new;
-                        at += 2 + items_len + body_len;
+                        try e.extra.appendSlice(e.gpa, &.{ e.extra.items[at], e.extra.items[at + 1], 0 });
+                        for (0..values_len) |j| try e.extra.append(e.gpa, e.extra.items[at + 3 + j]);
+                        const body_new = try e.list(at + 3 + values_len, body_len);
+                        e.extra.items[h + 2] = body_new;
+                        at += 3 + values_len + body_len;
                     }
                     const else_new = try e.list(at, else_len);
                     e.extra.items[p + 1] = else_new;

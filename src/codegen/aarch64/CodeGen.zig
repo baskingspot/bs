@@ -1606,18 +1606,22 @@ fn switchBr(cg: *CodeGen, data: Inst.Data, term: Ssa.Term) Error!bool {
         var cases: std.ArrayList(switch_br.Case) = .empty;
         defer cases.deinit(cg.gpa);
         const flip: u64 = if (cg.signed(op_ty)) @as(u64, 1) << 63 else 0;
-        var i = extra.end;
+        var it = ir.switchCases(data.pl_op.payload);
         for (blocks) |case_block| {
-            const items_len = ir.extra[i];
-            const items = ir.refSlice(i + 2, items_len);
-            i += 2 + items_len + ir.extra[i + 1];
+            const c = it.next().?;
             const label = cg.blockLabel(@backingInt(case_block));
-            for (items) |item| {
+            for (c.items) |item| {
                 const v = switch (try cg.locOf(item)) {
                     .imm => |v| v,
                     else => break :sorted,
                 };
                 try cases.append(cg.gpa, .{ .lo = v ^ flip, .hi = v ^ flip, .label = @backingInt(label) });
+            }
+            var k: usize = 0;
+            while (k < c.ranges.len) : (k += 2) {
+                const lo = (try cg.locOf(c.ranges[k])).imm;
+                const hi = (try cg.locOf(c.ranges[k + 1])).imm;
+                try cases.append(cg.gpa, .{ .lo = lo ^ flip, .hi = hi ^ flip, .label = @backingInt(label) });
             }
         }
         try cg.load(.x9, data.pl_op.operand);
@@ -1627,13 +1631,12 @@ fn switchBr(cg: *CodeGen, data: Inst.Data, term: Ssa.Term) Error!bool {
         return switch_br.lower(cg.gpa, em, switch_br.prepare(cases.items), b[0], b[1], @backingInt(else_label));
     }
     if (!wide) try cg.load(.x9, data.pl_op.operand);
-    var i = extra.end;
+    // Ranges only on integers of at most 64 bits, sorted above.
+    var it = ir.switchCases(data.pl_op.payload);
     for (blocks) |case_block| {
-        const items_len = ir.extra[i];
-        const items = ir.refSlice(i + 2, items_len);
-        i += 2 + items_len + ir.extra[i + 1];
+        const c = it.next().?;
         const label = cg.blockLabel(@backingInt(case_block));
-        for (items) |item| {
+        for (c.items) |item| {
             if (wide) {
                 try cg.wideEq(data.pl_op.operand, item);
                 try cg.e.cbz(false, .x, .x9, label);

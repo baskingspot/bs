@@ -631,27 +631,56 @@ const Walker = struct {
                 w.mergeMem(clock);
             },
             // Each case, like each side of a `cond_br`, sees neither the
-            // facts nor the stores of the others.
+            // facts nor the stores of the others. A case of one item or one
+            // range knows the operand is it or in it; the else body, that
+            // it is none of the items and outside the ranges that reach an
+            // end of its type.
             .switch_br => {
-                const x = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
-                const depth = s.facts.items.len;
                 const from = s.stored.items.len;
+                const depth = s.facts.items.len;
                 const mem = w.mem;
                 const clock = w.clock;
                 const log = s.vlog.items.len;
                 const nlen = s.nlog.items.len;
-                var i = x.end;
-                for (0..x.data.cases_len) |_| {
-                    const items_len = ir.extra[i];
-                    const body_len = ir.extra[i + 1];
-                    try w.side(ir.bodySlice(i + 2 + items_len, body_len));
+                const op = data.pl_op.operand;
+                // A switch on an undefined value decides nothing.
+                const info = if (w.isUndef(op)) null else w.intInfo(op);
+                const t = w.term(op);
+                var it = ir.switchCases(data.pl_op.payload);
+                while (it.next()) |c| {
+                    if (info != null) if (c.items.len + c.ranges.len / 2 == 1) {
+                        if (c.items.len == 1) {
+                            try s.facts.append(w.gpa, fact(.cmp_eq, t, w.term(c.items[0]), info.?));
+                        } else {
+                            try s.facts.append(w.gpa, fact(.cmp_gte, t, w.term(c.ranges[0]), info.?));
+                            try s.facts.append(w.gpa, fact(.cmp_lte, t, w.term(c.ranges[1]), info.?));
+                        }
+                    };
+                    try w.side(c.body);
                     s.facts.shrinkRetainingCapacity(depth);
                     w.dropNumbers(nlen);
                     w.rollback(log);
                     w.mem = mem;
-                    i += 2 + items_len + body_len;
                 }
-                try w.side(ir.bodySlice(i, x.data.else_body_len));
+                if (info) |i| {
+                    const signed = i.signedness == .signed;
+                    const min: i128 = if (signed) -(@as(i128, 1) << @intCast(i.bits - 1)) else 0;
+                    const max: i128 = (@as(i128, 1) << @intCast(i.bits - @intFromBool(signed))) - 1;
+                    var cases = ir.switchCases(data.pl_op.payload);
+                    // At most 16, as few as an `else` usually needs.
+                    while (cases.next()) |c| {
+                        if (s.facts.items.len - depth >= 16) break;
+                        for (c.items[0..@min(c.items.len, 16)]) |item| try s.facts.append(w.gpa, fact(.cmp_neq, t, w.term(item), i));
+                        var k: usize = 0;
+                        while (k < c.ranges.len) : (k += 2) {
+                            const lo = w.term(c.ranges[k]);
+                            const hi = w.term(c.ranges[k + 1]);
+                            if (lo.isConst() and lo.value() == min) try s.facts.append(w.gpa, fact(.cmp_gt, t, hi, i));
+                            if (hi.isConst() and hi.value() == max) try s.facts.append(w.gpa, fact(.cmp_lt, t, lo, i));
+                        }
+                    }
+                }
+                try w.side(it.elseBody());
                 s.facts.shrinkRetainingCapacity(depth);
                 w.dropNumbers(nlen);
                 try w.merge(from);
@@ -1303,15 +1332,9 @@ const Walker = struct {
                     if (!w.shrinks(ir.bodySlice(x.end, x.data.then_body_len + x.data.else_body_len), v, hi)) return false;
                 },
                 .switch_br => {
-                    const x = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
-                    var i = x.end;
-                    for (0..x.data.cases_len) |_| {
-                        const items_len = ir.extra[i];
-                        const body_len = ir.extra[i + 1];
-                        if (!w.shrinks(ir.bodySlice(i + 2 + items_len, body_len), v, hi)) return false;
-                        i += 2 + items_len + body_len;
-                    }
-                    if (!w.shrinks(ir.bodySlice(i, x.data.else_body_len), v, hi)) return false;
+                    var it = ir.switchCases(data.pl_op.payload);
+                    while (it.next()) |c| if (!w.shrinks(c.body, v, hi)) return false;
+                    if (!w.shrinks(it.elseBody(), v, hi)) return false;
                 },
                 else => {},
             }

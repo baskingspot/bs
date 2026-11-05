@@ -474,11 +474,59 @@ pub const CondBr = struct {
     };
 };
 
-/// Trailing: for each case: `items_len`, `body_len`, items (`Ref`, comptime
-/// known), body; then the else body.
+/// Trailing: for each case: `items_len`, `ranges_len`, `body_len`, items
+/// (`Ref`, comptime known), ranges (two `Ref`s each, comptime known: the
+/// first and last value, on integers of at most 64 bits), body; then the
+/// else body. `switchCases` walks them.
 pub const SwitchBr = struct {
     cases_len: u32,
     else_body_len: u32,
+};
+
+/// The cases of the `switch_br` whose `SwitchBr` is at `payload`, in order;
+/// `elseBody` after the last.
+pub fn switchCases(ir: *const Ir, payload: u32) SwitchCases {
+    const x = ir.extraData(SwitchBr, payload);
+    return .{ .ir = ir, .at = x.end, .left = x.data.cases_len, .else_len = x.data.else_body_len };
+}
+
+pub const SwitchCases = struct {
+    ir: *const Ir,
+    at: usize,
+    left: u32,
+    else_len: u32,
+
+    pub const Case = struct {
+        /// Where the case starts in `extra`.
+        at: usize,
+        items: []const Inst.Ref,
+        /// First and last value of each range, in pairs.
+        ranges: []const Inst.Ref,
+        body: []const Inst.Index,
+    };
+
+    pub fn next(it: *SwitchCases) ?Case {
+        if (it.left == 0) return null;
+        it.left -= 1;
+        const ir = it.ir;
+        const items_len = ir.extra[it.at];
+        const ranges_len = 2 * ir.extra[it.at + 1];
+        const body_len = ir.extra[it.at + 2];
+        const c: Case = .{
+            .at = it.at,
+            .items = ir.refSlice(it.at + 3, items_len),
+            .ranges = ir.refSlice(it.at + 3 + items_len, ranges_len),
+            .body = ir.bodySlice(it.at + 3 + items_len + ranges_len, body_len),
+        };
+        it.at += 3 + items_len + ranges_len + body_len;
+        return c;
+    }
+
+    /// The else body, once `next` returned every case.
+    pub fn elseBody(it: *const SwitchCases) []const Inst.Index {
+        std.debug.assert(it.left == 0);
+        return it.ir.bodySlice(it.at, it.else_len);
+    }
 };
 
 /// Trailing: `args_len` `Ref`s.

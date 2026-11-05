@@ -265,15 +265,9 @@ const Walker = struct {
                 try w.body(else_body);
             },
             .switch_br => {
-                const x = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
-                var i = x.end;
-                for (0..x.data.cases_len) |_| {
-                    const items_len = ir.extra[i];
-                    const body_len = ir.extra[i + 1];
-                    try w.body(ir.bodySlice(i + 2 + items_len, body_len));
-                    i += 2 + items_len + body_len;
-                }
-                try w.body(ir.bodySlice(i, x.data.else_body_len));
+                var it = ir.switchCases(data.pl_op.payload);
+                while (it.next()) |c| try w.body(c.body);
+                try w.body(it.elseBody());
             },
             else => if (try w.match(inst, tag, data)) |r| {
                 w.info[@backingInt(inst)].subst = r;
