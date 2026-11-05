@@ -1570,12 +1570,17 @@ identity is in every cache key):
   of the parameter is that memory too). Parameters are immutable, so this
   is the same as a copy: the caller passes a constant's own memory (a
   comptime table passed by value is not copied at all), a by-reference
-  parameter's pointer, or a value's slot (values have no address anything
-  could write through, and a slot is reused only after the call), and
-  copies anything else, such as a load whose memory the callee might
+  parameter's pointer (also when a method call reloads it from the
+  `*const` copy Sema makes), a value's slot (values have no address anything
+  could write through, and a slot is reused only after the call), or the
+  memory of a `*const` local read in place (a method call's `last.eql(x)`
+  receiver) whose address nothing but its initializing store and loads,
+  directly or through field and element pointers, uses, so the callee
+  cannot reach it otherwise (`sealedRef`), and copies anything else, such as a load whose memory the callee might
   write, to its outgoing area. A parameter that gets no register is
   copied in at entry. `test/run/byref.zig` checks the aliasing cases
-  (`f(g.*)` writing `g`, `s = f(s)`) against upstream's ReleaseSafe.
+  (`f(g.*)` writing `g`, `s = f(s)`) against upstream's ReleaseSafe, and
+  `test/run/arg_sealed.zig` a callee writing a `const` local's source.
 - Results: scalars and pairs in rax/rdx (x0/x1), floats and those
   vectors in xmm0 (v0);
   others through a result pointer passed in rdi (x8, the indirect result
