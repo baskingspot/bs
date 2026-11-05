@@ -838,7 +838,9 @@ fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Envi
     if (o.glibc_version) |v| if (v.order(.{ .major = 2, .minor = 16, .patch = 0 }) == .lt) try cxx.append(arena, "-D_LIBCPP_HAS_LIBRARY_ALIGNED_ALLOCATION=0");
     const os_args: []const []const u8 = if (o.macos) os: {
         const min = target.os.version_range.semver.min;
-        break :os &.{ try std.fmt.allocPrint(arena, "-mmacos-version-min={d}.{d}.{d}", .{ min.major, min.minor, min.patch }), "-Wno-overriding-option" };
+        // In the arena: a literal with a runtime element would be a
+        // temporary that dies with this block.
+        break :os try arena.dupe([]const u8, &.{ try std.fmt.allocPrint(arena, "-mmacos-version-min={d}.{d}.{d}", .{ min.major, min.minor, min.patch }), "-Wno-overriding-option" });
     } else &.{};
     return .{
         .os_args = os_args,
