@@ -9565,7 +9565,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             // std's `std.lang.assembly.Clobbers`: a named constant's
             // clobbers. As upstream, no other struct coerces.
             if (src_ty != try sema.stdLangType(block, src, "assembly.Clobbers")) return null;
-            const v = val orelse return null;
+            const v = val orelse return sema.failNeededComptime(block, src, "clobber must be comptime-known");
             if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
             const info = ip.structInfo(src_ty);
             var mask: u32 = 0;
@@ -18256,12 +18256,10 @@ fn zirStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
         if (ty == .none) ty = try sema.structInitType(block, src, try sema.resolveType(block, src, ft.container_type));
         item.* = .{ .name = sema.zirString(ft.name_start), .name_start = ft.name_start, .init = sema.resolveInst(e.data.init), .src = .{ .base = block.src_base, .loc = .{ .init_field = ft_data.src_node } } };
     }
+    // Through std's type, which checks the fields as upstream.
     if (ty == .clobbers_type) {
-        var mask: u32 = 0;
-        for (items) |item| if (sema.resolveValue(item.init) == .bool_true) {
-            mask |= clobberBit(item.name);
-        };
-        return .fromInterned(try sema.clobbersValue(mask));
+        const std_ty = try sema.stdLangType(block, src, "assembly.Clobbers");
+        return sema.coerce(block, ty, try sema.structInitTyped(block, src, std_ty, items), src);
     }
     if (ty == .generic_poison_type) {
         // No result type: an anonymous struct literal.
@@ -19617,8 +19615,8 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
 /// A value of `std.lang.Clobbers` (`clobbers_type`), which bs gives no
 /// fields of its own: it keeps only what CodeGen reads, the callee-saved
 /// registers clobbered, as one bool per `Ir.Asm.callee_saved_names`
-/// entry. A literal (`zirStructInit`) and std's
-/// `std.lang.assembly.Clobbers` (`coerceInner`) both make it.
+/// entry. std's `std.lang.assembly.Clobbers` coerces to it
+/// (`coerceInner`), a literal through that type (`zirStructInit`).
 fn clobbersValue(sema: *Sema, mask: u32) !Index {
     var elems: [Ir.Asm.callee_saved_names.len]Index = undefined;
     for (&elems, 0..) |*e, bit| e.* = if (mask >> @intCast(bit) & 1 != 0) .bool_true else .bool_false;
