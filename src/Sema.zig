@@ -9043,6 +9043,21 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 // `?T` to `??T`: wrapped like any payload.
                 if (Type.class(ip, child) != .optional) return null;
             }
+            // `[*c]T` to `?*T` at run time: the optional pointer is the C
+            // pointer's representation, so a null C pointer is null, not a
+            // failed cast, as upstream's coerceCompatiblePtrs. (Upstream
+            // makes a comptime-known null one a non-null optional, which
+            // bs refuses: "null pointer casted".)
+            if (sc == .pointer and Type.ptrInfo(ip, src_ty).flags.size == .c and isOptionalNonC(ip, child)) c_opt: {
+                const s = Type.ptrInfo(ip, src_ty);
+                const d = ip.keyPayload(.ptr_type, child);
+                if (s.flags.alignment != d.flags.alignment) {
+                    try sema.resolveLayoutIfIdle(block, src, s.child);
+                    try sema.resolveLayoutIfIdle(block, src, d.child);
+                }
+                if (val != null or !sema.ptrCoercibleInPlace(src_ty, child)) break :c_opt;
+                return try sema.addTyOp(block, .bitcast, dest_ty, inst);
+            }
             try sema.checkIntPayload(block, src, dest_ty, src_ty, child, val);
             const payload = (try sema.coerceInner(block, child, inst, src)) orelse return null;
             if (sema.resolveValue(payload)) |pv| return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = pv } }));
@@ -9618,7 +9633,8 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
         if (s.flags.size == .one and ip.keyTag(d.child) == .array_type) {
             const b = ip.keyPayload(.array_type, d.child);
             // `*[N:s]T` to `*[N]T`.
-            if (s_array) |a| return a.len == b.len and a.child == b.child and b.sentinel == .none;
+            if (s_array) |a| return a.len == b.len and b.sentinel == .none and
+                (a.child == b.child or sema.pointeeCoercible(a.child, b.child, d.flags.is_const));
             // `*T` to `*[1]T`.
             return b.len == 1 and b.child == s.child and b.sentinel == .none;
         }
