@@ -128,5 +128,6 @@ pub fn main() void {
 // branch_quota_generic.zig:11:41: error[eval-limit]: evaluation exceeded 1000 backwards branches
 //   | noinline fn create(comptime n: u32, d: F(n)) void {
 //   note branch_quota_generic.zig:11:41: use @setEvalBranchQuota() to raise the branch limit from 1000
+//   call: branch_quota_generic.zig:117:11 generic
 //   ref: main branch_quota_generic.zig:124:12 (+3 std frames)
 // 1 error

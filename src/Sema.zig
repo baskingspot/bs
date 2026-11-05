@@ -2373,9 +2373,15 @@ fn inLib(sema: *Sema, file: u32) bool {
 
 fn noteCallSite(sema: *Sema, block: *Block, src: Src, n_errors: usize, err: CompileError, kind: @import("diag.zig").CallKind) CompileError {
     _ = block;
+    return sema.noteCallSiteIn(sema.file, src, n_errors, err, kind);
+}
+
+/// `noteCallSite` for a call in `file`, which is not the file being
+/// analyzed while the callee's parameter or return types are.
+fn noteCallSiteIn(sema: *Sema, file: u32, src: Src, n_errors: usize, err: CompileError, kind: @import("diag.zig").CallKind) CompileError {
     if (err == error.AnalysisFail and sema.zcu.errors.items.len > n_errors) {
-        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
-        try sema.zcu.addCallFrame(sema.file, src.span(tree), kind);
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(file));
+        try sema.zcu.addCallFrame(file, src.span(tree), kind);
     }
     return err;
 }
@@ -20519,7 +20525,7 @@ fn mapCalleeParams(sema: *Sema, callee_block: *Block, caller: *Block, src: Src, 
             .param, .param_comptime => if (fn_ty.param_types[i] == .generic_poison_type) {
                 const extra = sema.code.extraData(Zir.Inst.Param, data.pl_tok.payload_index);
                 const body = sema.code.bodySlice(extra.end, extra.data.type.body_len);
-                const ty = try sema.analyzeAsType(callee_block, src, try sema.resolveInlineBody(callee_block, body, inst));
+                const ty = try sema.analyzeAsType(callee_block, paramSrc(callee_block, i), try sema.resolveInlineBody(callee_block, body, inst));
                 args[i] = try sema.coerce(caller, ty, args[i], src);
             },
             .param_anytype, .param_anytype_comptime => {},
@@ -20581,7 +20587,7 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref, h
                 const data = sema.code.instructions.items(.data)[@backingInt(inst)];
                 const extra = sema.code.extraData(Zir.Inst.Param, data.pl_tok.payload_index);
                 const body = sema.code.bodySlice(extra.end, extra.data.type.body_len);
-                const ty = try sema.analyzeAsType(&ct_block, src, try sema.resolveInlineBody(&ct_block, body, inst));
+                const ty = try sema.analyzeAsType(&ct_block, paramSrc(&ct_block, i), try sema.resolveInlineBody(&ct_block, body, inst));
                 args[i] = try sema.coerce(caller, ty, args[i], src);
             },
             .param_anytype, .param_anytype_comptime => {},
@@ -20692,7 +20698,11 @@ fn genericParamType(sema: *Sema, caller: *Block, src: Src, func: Index, prior: [
                 const data = sema.code.instructions.items(.data)[@backingInt(inst)];
                 const extra = sema.code.extraData(Zir.Inst.Param, data.pl_tok.payload_index);
                 const body = sema.code.bodySlice(extra.end, extra.data.type.body_len);
-                return sema.analyzeAsType(&callee_block, src, try sema.resolveInlineBody(&callee_block, body, inst));
+                // As upstream, an error in the type names the call that
+                // instantiates it; the type is at the callee's.
+                const n = sema.zcu.errors.items.len;
+                const ty = sema.resolveInlineBody(&callee_block, body, inst) catch |err| return sema.noteCallSiteIn(saved.file, src, n, err, .generic);
+                return sema.analyzeAsType(&callee_block, paramSrc(&callee_block, i), ty) catch |err| return sema.noteCallSiteIn(saved.file, src, n, err, .generic);
             },
             .param_anytype, .param_anytype_comptime => if (i == prior.len) return .generic_poison_type,
             else => continue,
@@ -20705,10 +20715,15 @@ fn genericParamType(sema: *Sema, caller: *Block, src: Src, func: Index, prior: [
     unreachable;
 }
 
+/// Parameter `i` of the function whose signature `callee_block` analyzes.
+fn paramSrc(callee_block: *const Block, i: usize) Src {
+    return .{ .base = callee_block.src_base, .loc = .{ .fn_param = .{ .node = .zero, .index = @intCast(i) } } };
+}
+
 /// `instance` is the call instantiating generic `func`, which an error
 /// in the return type expression names (not one about the type it gives,
 /// as upstream).
-fn calleeRetTy(sema: *Sema, callee_block: *Block, func: Index, instance: ?struct { caller: *Block, src: Src }) CompileError!Index {
+fn calleeRetTy(sema: *Sema, callee_block: *Block, func: Index, instance: ?struct { file: u32, src: Src }) CompileError!Index {
     const ip = sema.ip;
     const f = ip.keyPayload(.func, func);
     const ret = ip.keyPayload(.func_type, f.ty).return_type;
@@ -20719,7 +20734,7 @@ fn calleeRetTy(sema: *Sema, callee_block: *Block, func: Index, instance: ?struct
     const n = sema.zcu.errors.items.len;
     var ty = sema.calleeRetTyExpr(callee_block, ret_src, f.zir_inst, fn_info) catch |err| {
         const i = instance orelse return err;
-        return sema.noteCallSite(i.caller, i.src, n, err, .generic);
+        return sema.noteCallSiteIn(i.file, i.src, n, err, .generic);
     };
     // As for a declared return type, at the callee's.
     if (Type.class(ip, ty) == .@"opaque")
@@ -22397,8 +22412,8 @@ fn instantiate(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref, 
         // As upstream, an error in the parameter or return types names
         // the call that instantiates them.
         const n = sema.zcu.errors.items.len;
-        sema.mapCalleeParams(&callee_block, caller, src, func, args, true) catch |err| return sema.noteCallSite(caller, src, n, err, .generic);
-        break :blk try sema.calleeRetTy(&callee_block, func, .{ .caller = caller, .src = src });
+        sema.mapCalleeParams(&callee_block, caller, src, func, args, true) catch |err| return sema.noteCallSiteIn(saved.file, src, n, err, .generic);
+        break :blk try sema.calleeRetTy(&callee_block, func, .{ .file = saved.file, .src = src });
     };
     for (args, comptime_args, 0..) |a, *ca, k| {
         // An `anytype` argument of a comptime-only type is comptime.
