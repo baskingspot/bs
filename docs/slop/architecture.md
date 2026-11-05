@@ -4583,8 +4583,11 @@ or objects into its output, and `-lc++`.
   which read `Frontend.files`. `Zcu.analyzeAll` resolves each new request
   (the file's root type, the declaration by name, its value) and queues
   the function like any other. A recorded unit that requested a helper
-  also reaches the helper's function and its file's root namespace
-  (`addRtReach`). Replay skips those two references while the helper's
+  also reaches the helper's declaration (a `root` reference: the request
+  analyzes it, and a lazy build that requests again visits it, so a
+  full build must reach it too, or the lazy build fell back), its
+  function, and its file's root namespace (`addRtReach`). Replay skips
+  the function and namespace references while the helper's
   file is not loaded yet, since only analysis may load it: the replayed
   request brings them back. A lazy edit build does the same for kept
   units: a helper node that the edit outdates (or whose file is a changed
@@ -5660,7 +5663,14 @@ records only what changed, and links from the manifest.
   reached nodes, or in a donor's build, it walks everything as before.
   `BS_CACHE_CHECK` walks the graph the build leaves in full
   (`checkLiveReach`) and requires the same `reached` flags and linked
-  nodes.
+  nodes, and fails the build, as for an eager one, if they differ. It
+  checks only a delta the record will write, after `checkLinkInputs`;
+  a lazy attempt that falls back clears what its checks found, since
+  the eager build checks itself. (Until 2026-11-05 a lazy build that
+  recorded such gaps succeeded, and a later fallback failed the eager
+  build with the lazy attempt's finding: the edit hunter's first sign of
+  compiler_rt declarations a lazy build visited but a full build did not
+  reach, see `addRtReach`.)
 - *Touching only the cone's part of the manifest* (2026-11-04). The
   setup and the record around the cone walk cost per edit, not per
   node: the overlay keeps a bitset of the nodes the log touched, so

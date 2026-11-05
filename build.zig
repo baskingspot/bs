@@ -1225,6 +1225,18 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &sj.step, 10);
         test_step.dependOn(&sj.step);
     }
+    // An edit to a compiler_rt helper's requester: test/run/edit_rt_request.sh.
+    {
+        const rq = b.addSystemCommand(&.{"sh"});
+        rq.setName("bs compiler_rt requester edit");
+        rq.addFileArg(b.path("test/run/edit_rt_request.sh"));
+        rq.addArtifactArg(bs);
+        _ = rq.addOutputDirectoryArg("work");
+        rq.addDirectoryArg(std_zir);
+        rq.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &rq.step, 10);
+        test_step.dependOn(&rq.step);
+    }
 
     const bs_run = b.addRunArtifact(bs);
     bs_run.setName("bs run args");

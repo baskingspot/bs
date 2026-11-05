@@ -353,7 +353,9 @@ pub const Ref = extern struct {
         effects,
         /// On a `namespace` node: a `comptime`, exported or test
         /// declaration's unit (`value`), which a build that makes the
-        /// container analyzes.
+        /// container analyzes. On a compiler_rt function's requester: the
+        /// function's `nav_val` (`Incremental.addRtReach`), which the
+        /// request analyzes.
         root,
         /// In an object, a symbol another object defines, which the unit's
         /// code refers to (`Emit.useImport`).

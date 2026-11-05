@@ -2275,6 +2275,14 @@ pub fn finishLazy(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *cons
         error.Fallback => return inc.fallBack(),
         else => return err,
     };
+    if (inc.check_failed.load(.monotonic)) {
+        // As `finishRecord` does for an eager build; the gaps are printed
+        // above.
+        inc.dropLog(old_log);
+        inc.dropDonorBase();
+        std.debug.print("error: BS_CACHE_CHECK found gaps in the recorded dependencies or references\n", .{});
+        std.process.exit(1);
+    }
     const t1 = now(io);
     // The manifest with the record applied.
     var now_m = (try Manifest.open(gpa, io, inc.dir)) orelse return error.ManifestGone;
@@ -2353,6 +2361,9 @@ fn dropLog(inc: *Incremental, len: u64) void {
 fn fallBack(inc: *Incremental) error{LazyFallback} {
     inc.dropDonorBase();
     inc.endReplay();
+    // The eager build checks itself; what the lazy one's checks found
+    // was about a record it will not write.
+    inc.check_failed.store(false, .monotonic);
     return error.LazyFallback;
 }
 
@@ -2595,7 +2606,6 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         live.set(f);
         for (n.deps) |e| live.set(final[Manifest.Edge.nodeOf(e)]);
     };
-    if (inc.check) try inc.checkLiveReach(rp, nodes, final, write, node_refs.items, ref_starts, &live, &reached);
     // The nodes this build's graph has: decided, written or not.
     var in_graph = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
     defer in_graph.deinit(gpa);
@@ -2625,6 +2635,8 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     // The link's inputs must not change: the symbols it resolves outside
     // the atoms, and the error name table.
     try inc.checkLinkInputs(rp, &live, &check, nodes, final, write, node_refs.items, ref_starts, &d);
+    // Checked only for a delta that will be recorded: a fallback drops it.
+    if (inc.check) try inc.checkLiveReach(rp, nodes, final, write, node_refs.items, ref_starts, &live, &reached);
 
     // The nodes.
     var deps_buf: std.ArrayList(u32) = .empty;
@@ -3147,7 +3159,7 @@ const ReachItem = struct {
 };
 
 /// `from` requested compiler_rt helper `key`: it reaches the helper's
-/// function or variable and its file's roots.
+/// declaration, its function or variable, and its file's roots.
 fn addRtReach(r: *Recorder, items: *std.ArrayList(ReachItem), from: @FieldType(ReachItem, "from"), key: []const u8) !void {
     const zcu = r.zcu;
     const ip = &zcu.ip;
@@ -3158,6 +3170,9 @@ fn addRtReach(r: *Recorder, items: *std.ArrayList(ReachItem), from: @FieldType(R
     if (root != .none) try items.append(r.gpa, .{ .from = from, .kind = .effects, .to = try r.addDependee(.{ .namespace = ip.structInfo(root).namespace }) });
     if (nav.status != .resolved) return;
     if (ip.keyTag(nav.val) == .func) {
+        // `resolveCompilerRt` analyzes the declaration too, which a lazy
+        // build then visits: reached, as in a full build.
+        try items.append(r.gpa, .{ .from = from, .kind = .root, .to = .{ .unit = try r.addUnit(.{ .nav_val = nav_index }) } });
         try items.append(r.gpa, .{ .from = from, .kind = .func, .to = .{ .unit = try r.addUnit(.{ .func = nav.val }) } });
     } else {
         // A variable's data (`Emit.finish`).
