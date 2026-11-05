@@ -98,15 +98,26 @@ TARGETS = {
     "x86_64-linux": {"zig_target": "x86_64-linux-none", "host": ("Linux", "x86_64")},
     "aarch64-macos": {"zig_target": "aarch64-macos-none", "host": ("Darwin", "arm64")},
     # LLVM is upstream's Debug default here too. An x86_64-linux host runs
-    # the binaries under qemu's user-mode emulator (.agents/setup installs
-    # it) as a Cortex-A53, an ARMv8.0 core like the target's generic
-    # baseline, so newer instructions trap.
+    # the binaries under qemu's user-mode emulator as a Cortex-A53, an
+    # ARMv8.0 core like the target's generic baseline, so newer instructions
+    # trap. The emulator is whichever of the names is on PATH, as in
+    # build.zig: .agents/setup installs qemu-aarch64-static, the Nix shell
+    # qemu-aarch64.
     "aarch64-linux": {
         "zig_target": "aarch64-linux-none",
         "host": ("Linux", "aarch64"),
-        "emulated": {("Linux", "x86_64"): ["qemu-aarch64-static", "-cpu", "cortex-a53"]},
+        "emulated": {("Linux", "x86_64"): (("qemu-aarch64-static", "qemu-aarch64"), ["-cpu", "cortex-a53"])},
     },
 }
+
+
+def emulator(cfg, host):
+    """The command prefix that runs cfg's binaries on host under emulation,
+    or None when host has no emulator for it or none is installed."""
+    names, args = cfg.get("emulated", {}).get(host, ((), []))
+    path = next(filter(None, map(shutil.which, names)), None)
+    return [path, *args] if path else None
+
 
 # The emulator command that runs the current target's binaries on this host,
 # if they do not run natively (set per target by main).
@@ -1612,7 +1623,7 @@ def main():
         sys.exit(f"error: {UPSTREAM_TEST} is missing; run .agents/setup")
 
     host = (platform.system(), platform.machine())
-    runnable = [t for t in targets if TARGETS[t]["host"] == host or host in TARGETS[t].get("emulated", {})]
+    runnable = [t for t in targets if TARGETS[t]["host"] == host or emulator(TARGETS[t], host)]
     compiler = None
     if runnable:
         if args.upstream:
@@ -1622,9 +1633,9 @@ def main():
     try:
         for name in targets:
             cfg = dict(TARGETS[name], name=name)
-            exec_prefix = [] if cfg["host"] == host else cfg.get("emulated", {}).get(host, [])
+            exec_prefix = [] if cfg["host"] == host else emulator(cfg, host) or []
             if name not in runnable:
-                print(f"{name}: not run (needs an {name} host)")
+                print(f"{name}: not run (needs an {name} host or its emulator)")
             elif args.compile_errors:
                 compile_errors_target(compiler, cfg, args, args.workdir)
             elif args.cases:
