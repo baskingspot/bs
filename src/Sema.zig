@@ -19490,9 +19490,21 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
         }
         operand = try sema.optionalPayload(block, src, operand, false);
     } else if (Type.class(ip, dest_ty) == .optional and Type.class(ip, Type.childType(ip, dest_ty)) == .pointer and Type.class(ip, sema.typeOf(operand)) == .pointer) {
-        // Into an optional pointer or slice: cast to the payload and wrap.
-        const child = try sema.ptrCastInner(block, src, flags, Type.childType(ip, dest_ty), operand);
-        return sema.coerce(block, dest_ty, child, src);
+        // Into an optional pointer or slice: the cast payload, reinterpreted,
+        // so address zero is null, as upstream. The payload allows zero, so
+        // a C pointer is not checked for null.
+        var info = Type.ptrInfo(ip, Type.childType(ip, dest_ty));
+        if (info.flags.size != .slice) info.flags.is_allowzero = true;
+        const child = try sema.ptrCastInner(block, src, flags, try sema.ptrType(info), operand);
+        if (sema.resolveValue(child)) |cv| {
+            if (sema.isUndef(cv)) return .fromInterned(try sema.undefValue(dest_ty));
+            if (ip.keyTag(cv) != .ptr) return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = cv } }));
+            var p = ip.keyPayload(.ptr, cv);
+            if (p.base == .int and p.byte_offset == 0) return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = .none } }));
+            p.ty = Type.childType(ip, dest_ty);
+            return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = try sema.intern(.{ .ptr = p }) } }));
+        }
+        return sema.addTyOp(block, .bitcast, dest_ty, child);
     }
     return sema.ptrCastInner(block, src, flags, dest_ty, operand);
 }
