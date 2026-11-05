@@ -1,8 +1,7 @@
-# x86_64 Linux is first class: tests and lint block. The macOS lane runs the
-# same tests on a real Apple Silicon Mac and does not block until it passes.
-# ziglint and the conformance measure show their results and never block:
-# ziglint has findings to work down, and conformance reports a share, not a
-# pass.
+# x86_64 Linux is first class: tests, lint, and ziglint block. The macOS lane
+# runs the same tests on a real Apple Silicon Mac and does not block until it
+# passes. The conformance measure shows its results and never blocks: it
+# reports a share, not a pass.
 jobs:
   - recipe: test
   - recipe: lint
@@ -10,7 +9,6 @@ jobs:
     runners: [macos-26]
     blocking: false
   - recipe: ziglint
-    blocking: false
   - recipe: conformance
     runners: [ubuntu-26.04, macos-26]
     blocking: false

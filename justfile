@@ -44,7 +44,7 @@ lint:
     zizmor .
     just --fmt --check
 
-[doc("ziglint with the rules in .ziglint.zon. CI shows it without blocking until its findings are worked down")]
+[doc("ziglint with the rules in .ziglint.zon. CI blocks on it")]
 [group("lint")]
 ziglint:
     ziglint
@@ -64,6 +64,6 @@ fmt:
     oxfmt README.md AGENTS.md CHANGELOG.md .github
     just --fmt
 
-[doc("What CI blocks on: the tests and lint")]
+[doc("What CI blocks on: the tests, lint, and ziglint")]
 [group("ci")]
-ci: test lint
+ci: test lint ziglint

@@ -141,8 +141,8 @@ exceptions, which are deliberate:
 - It does not use the org's `zig` Nix module, because bs pins one exact Zig
   release and nixpkgs may not carry it.
 - The org's ast-grep house rules (`baskingspot-lint`) are library-API rules
-  and do not run here. ziglint runs with line length (Z024) off, and CI shows
-  it without blocking until its findings are worked down.
+  and do not run here. ziglint runs with line length (Z024) off, and CI
+  blocks on it.
 
 The rest is the org's:
 
