@@ -2496,7 +2496,17 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     defer gpa.free(write);
     @memset(write, false);
     for (r.unit_list.items, r.unit_info) |u, info| {
-        if (zcu.deps.contains(u)) write[info.node] = true;
+        if (zcu.deps.contains(u)) {
+            write[info.node] = true;
+            continue;
+        }
+        // A layout no unit analyzes: a union's generated tag type, which
+        // the union's layout makes whole (`Graph.collect`). Its source is
+        // the union's, so an edit there changes its source hash, and a
+        // field its result, without it being analyzed again.
+        if (u != .type_layout or info.node == Recorder.no_node or final[info.node] >= n_prev or !isGeneratedTag(zcu, u.type_layout)) continue;
+        const old = m.node(final[info.node]);
+        if (old.src_hash != info.src_hash or old.result_hash != info.result_hash) write[info.node] = true;
     }
     for (nodes, final, write, 0..) |n, f, *w, ni| {
         if (n.tag == .link) {
@@ -3139,6 +3149,17 @@ fn rewriteKept(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32, final
     });
 }
 
+/// Whether `ty` is the enum a `union(enum)` declares for its tag
+/// (`Sema`'s union layout), which shares the union's instruction.
+fn isGeneratedTag(zcu: *const Zcu, ty: InternPool.Index) bool {
+    const ip = &zcu.ip;
+    if (ip.indexToKey(ty) != .enum_type) return false;
+    const c = ip.containerType(ty).?;
+    const zir = &zcu.file(c.file).zir;
+    return zir.instructions.items(.tag)[@backingInt(c.zir_inst)] == .extended and
+        zir.instructions.items(.data)[@backingInt(c.zir_inst)].extended.opcode == .union_decl;
+}
+
 /// Whether subject words `old` (the manifest's) and `new` (encoded by
 /// `enc`, after the manifest's items) name the same thing: their items by
 /// stable hash, since `new` names an item the build did not decode by a
@@ -3358,6 +3379,14 @@ const Graph = struct {
             }
             if (unit == .func) try g.addOwnNav(zcu, u.*, unit.func, dependees);
         }
+        // A union's generated tag type, which the union's layout makes
+        // whole, so that no unit analyzes its own: a node whether or not
+        // anything reads it, so that an edit build that analyzes the union
+        // again compares it with the manifest's (`recordDelta`).
+        for (zcu.deps.keys()) |unit| if (unit == .type_layout and ip.indexToKey(unit.type_layout) == .union_type) {
+            const tag = ip.structInfo(unit.type_layout).tag_type;
+            if (tag != .none and isGeneratedTag(zcu, tag)) try g.node_items.append(gpa, try r.addDependee(.{ .type_layout = tag }));
+        };
         // A function depends on its declaration's value, which is the
         // function: a new type makes it another item under the same key,
         // and its body may read the type (a return value coerced to a

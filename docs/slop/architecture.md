@@ -6285,6 +6285,13 @@ records only what changed, and links from the manifest.
   `record` (`Graph`), from this build's analysis only, and appends one log
   record. It holds the nodes of the units analyzed, every new node, and
   the dependees whose results, references or subjects changed. A
+  union's generated tag enum has a `type_layout` node that no unit
+  analyzes: the union's layout makes the enum whole, and the node takes
+  the union's source hash. Every graph gives it a node beside an
+  analyzed union (`Graph.collect`), and the record writes it when its
+  source or result hash moved (until 2026-11-06 it was never written
+  again: an edit to the union left it stale, which `BS_CACHE_VERIFY`
+  reported; the edit hunter, test/run/edit_union_tag.zig). A
   subject is compared by its item's stable hash (`sameSubject`): a
   function whose type changes keeps its dependees' keys, and a subject
   left naming the old function item, its instruction remapped to the
