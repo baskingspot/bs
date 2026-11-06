@@ -1403,6 +1403,14 @@ callgrind Ir +0.6% on `zig fmt --check std` (Token.Tag is a u7 enum),
 +0.16% on bench/runtime's fmt, within 0.02% on the others. x86_64 may use
 8- and 16-bit forms where they give the same result.
 
+aarch64 leaves out the `ubfx` after an unsigned operation or narrowing
+cast whose result `Ssa.rawBits` bounds within its type (`rawFits`), by
+x86_64's rule: a shift right, a shift left, sum or product of values
+with few enough bits, a narrowing cast of such a value or past its
+emitted safety check, with `Ssa.heldBits` bounding a load by the bytes
+it reads; signed values are always normalized. On the zig compiler's
+source, 188,049 → 159,994 `ubfx`.
+
 The position is the IR's statement position (line, column) and the
 innermost open inline call (an index into the function's inline table),
 copied from the last `dbg_stmt` and `dbg_inline_begin`/`end` seen.

@@ -1,7 +1,7 @@
 //! exit: 0
 //! stderr: "garbage 103020201 607030303\nfp 7f 70787d7e fp 0 0 fp 40 40004000 \nm true 7a m true 7f m true 0 m false 7f \nunchecked 13 checked 13\nshifts 1f50a3ffff1fffc0 ffffe02468a8d140\ncarries 3 2 0\n"
 //! upstream-llvm: true
-//! targets: x86_64-linux aarch64-linux
+//! targets: x86_64-linux aarch64-macos aarch64-linux
 
 // An unsigned narrow integer is normalized only when its value may have
 // bits above its type, and with one `and` when narrower than 32 bits. A

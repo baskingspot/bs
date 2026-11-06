@@ -2931,7 +2931,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             if (cg.isFloat(ty)) return cg.genFloat(inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
             const d = cg.resultReg(inst, .x9);
-            try cg.binOp(tag, ty, data.bin_op.lhs, data.bin_op.rhs, d);
+            try cg.binOp(inst, tag, ty, data.bin_op.lhs, data.bin_op.rhs, d);
             try cg.setResult(inst, ty, d);
         },
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => try cg.overflowOp(inst, tag, data),
@@ -3103,7 +3103,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                     // A bool from an i1 (a lane of a vector bitcast): its
                     // register holds -1 as all ones.
                     try cg.e.logic(.@"and", .x, d, s, .{ .imm = 1 });
-                } else if (Type.isInt(ip, ty)) {
+                } else if (Type.isInt(ip, ty) and !cg.rawFits(inst, ty)) {
                     try cg.normalizeFrom(d, s, ty);
                 } else if (d != s) try cg.e.mov(.x, d, s);
                 return cg.setResult(inst, ty, d);
@@ -3706,12 +3706,14 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Cond {
     }
 }
 
-/// Computes `lhs op rhs` on 64-bit extended operands into `d`, normalized
-/// to `ty`, writing `d` after reading both. Uses x9, x10, x11, x13, and
-/// x14; `d` is x9 or none of those.
-fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref, d: Reg) Error!void {
+/// Computes `lhs op rhs`, value `inst`, on 64-bit extended operands into
+/// `d`, normalized to `ty` unless that changes nothing (`rawFits`),
+/// writing `d` after reading both. Uses x9, x10, x11, x13, and x14; `d`
+/// is x9 or none of those.
+fn binOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref, d: Reg) Error!void {
     const e = &cg.e;
     const s = cg.signed(ty);
+    const norm = !cg.rawFits(inst, ty);
     const a = try cg.use(lhs, .x9);
     // Immediate forms of the operations that have them.
     const imm: ?u64 = switch (try cg.locOf(rhs)) {
@@ -3721,7 +3723,8 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref, d: Reg) Err
     switch (tag) {
         .add_wrap, .sub_wrap => if (imm) |v| if (v < 4096) {
             try e.addSub(if (tag == .add_wrap) .add else .sub, .x, d, a, .{ .imm = @intCast(v) });
-            return cg.normalize(d, ty);
+            if (norm) try cg.normalize(d, ty);
+            return;
         },
         .bit_and, .bit_or, .xor => if (imm) |v| if (Encoder.bitmaskImm(.x, v) != null) {
             return e.logic(switch (tag) {
@@ -3732,7 +3735,8 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref, d: Reg) Err
         },
         .shl, .shr => if (imm) |v| {
             try e.shiftImm(if (tag == .shl) .lsl else if (s) .asr else .lsr, .x, d, a, @intCast(v & 63));
-            return cg.normalize(d, ty);
+            if (norm) try cg.normalize(d, ty);
+            return;
         },
         // The results are at most the dividend: they stay normalized.
         .div_trunc, .div_floor, .div_ceil, .rem, .mod => if (imm) |v| {
@@ -3755,7 +3759,19 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref, d: Reg) Err
         .div_trunc, .div_floor, .div_ceil, .rem, .mod => try cg.divide(tag, s, a, b, d),
         else => unreachable,
     }
-    try cg.normalize(d, ty);
+    if (norm) try cg.normalize(d, ty);
+}
+
+/// Whether unsigned `inst`'s result already has no bits above `ty` before
+/// its lowering would normalize it (`Ssa.rawBits`), as in the x86_64
+/// backend: a shift right, or a narrowing cast of a value with no bits
+/// above the type or past its emitted safety check. Signed values are
+/// always normalized.
+fn rawFits(cg: *CodeGen, inst: Inst.Index, ty: Index) bool {
+    if (!Type.isInt(cg.ip, ty)) return false;
+    const info = Type.intInfo(cg.ip, ty);
+    if (info.signedness == .signed or info.bits >= 64) return false;
+    return cg.ssa.rawBits(cg.ir, cg.ip, inst) <= info.bits;
 }
 
 /// `d = a op b` for division `tag` of 64-bit extended registers, signed
