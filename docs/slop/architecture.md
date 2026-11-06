@@ -1640,7 +1640,10 @@ identity is in every cache key):
   others through a result pointer passed in rdi (x8, the indirect result
   register, as Apple's C convention). Large aggregates stay in the
   outgoing stack area on aarch64 too (the callee reads them at
-  `[fp, #16 + n]`); only the C ABI module passes aggregates over 16 bytes
+  `[fp, #16 + n]`, and a `*const` copy Sema makes of the parameter is
+  that slot when only loads and field and element pointers use its
+  address and the slot has its alignment, `planArgAliases`; a tail call
+  reads every argument before it rewrites the slots); only the C ABI module passes aggregates over 16 bytes
   by reference to a caller copy, and HFAs in v registers.
 - The error return trace pointer goes in a fixed register outside the
   argument registers: rax on x86_64 (free at a call: only variadic C
