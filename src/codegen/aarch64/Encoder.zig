@@ -700,7 +700,7 @@ pub fn cas(e: *Encoder, size: Size, order: Ordering, expected: Reg, new: Reg, ba
 /// must be even.
 pub fn casp(e: *Encoder, size: Size, order: Ordering, expected: Reg, new: Reg, base: Reg) !void {
     e.writes(expected);
-    if (expected != .zr) e.writes(@enumFromInt(@backingInt(expected) + 1));
+    if (expected != .zr) e.writes(@fromBackingInt(@intCast(@backingInt(expected) + 1)));
     assert(size == .word or size == .dword);
     assert(expected.zrEnc() & 1 == 0);
     assert(new.zrEnc() & 1 == 0);
