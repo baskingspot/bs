@@ -1851,9 +1851,6 @@ fn fillsOut(f: *const Ssa, ir: *const Ir, block: u32, n: usize, out: *[max_fill_
     }
 }
 
-/// Whether value `inst` may go unemitted when nothing reads it: it reads
-/// no volatile memory, writes nothing but its own result, cannot trap, and
-/// requests nothing from the linker that its users would not.
 /// How many low bits of the register holding unsigned integer `r` may be
 /// set, at most 64: the backends hold an integer extended to 64 bits and
 /// normalize one after an operation that may set bits above its type
@@ -1977,6 +1974,9 @@ fn constShift(ip: *const InternPool, r: Inst.Ref) ?u8 {
     return if (k < 64) @intCast(k) else null;
 }
 
+/// Whether value `inst` may go unemitted when nothing reads it: it reads
+/// no volatile memory, writes nothing but its own result, cannot trap, and
+/// requests nothing from the linker that its users would not.
 pub fn removable(ir: *const Ir, ip: *const InternPool, inst: Inst.Index) bool {
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
