@@ -322,14 +322,25 @@ pub fn splice(gpa: Allocator, ir: *Ir, splices: []const Splice) Allocator.Error!
         try extra.append(gpa, @backingInt(begin));
         var len: u32 = 1;
         const tags = callee.instructions.items(.tag);
+        // As `Sema.endDbgInline`: before the body's final terminator when
+        // it leaves the body, after it when it is a `switch_br` or
+        // `cond_br` whose bodies return, so that their code stays in the
+        // inlined call.
+        const before_last = switch (tags[@backingInt(main[main.len - 1])]) {
+            .br, .repeat, .ret, .unreach, .trap => true,
+            else => false,
+        };
         for (main, 0..) |inst, i| {
             if (tags[@backingInt(inst)] == .arg) continue;
-            // As `Sema.endDbgInline`: before the body's final terminator.
-            if (i == main.len - 1) {
+            if (before_last and i == main.len - 1) {
                 try extra.append(gpa, @backingInt(end));
                 len += 1;
             }
             try extra.append(gpa, base + @backingInt(inst));
+            len += 1;
+        }
+        if (!before_last) {
+            try extra.append(gpa, @backingInt(end));
             len += 1;
         }
         extra.items[payload] = len;

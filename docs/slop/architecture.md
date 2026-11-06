@@ -1078,7 +1078,10 @@ comptime arguments are run-time values in the lowered code (uucode's
     hand them out in place. Inlined calls come from IR markers: Sema puts
     `dbg_inline_begin` (callee, call position) and `dbg_inline_end` around
     each runtime inline body, whose `dbg_stmt`s are relative to the
-    callee's declaration; CodeGen turns them into `Debug.inlines` records
+    callee's declaration (the end goes before the body's final `br`,
+    `ret` or trap, and after a final `switch_br` or `cond_br` whose bodies
+    return, so their code stays in the call; the backend inliner places
+    it the same way); CodeGen turns them into `Debug.inlines` records
     and `LineProgram.switchTo` patches, and gives each the callee's stable
     key (`Debug.inline_callees`, for the cache only). A function's unit is
     its module's root file path.
