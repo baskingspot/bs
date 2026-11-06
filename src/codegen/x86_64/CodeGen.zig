@@ -158,6 +158,10 @@ cover_pcs: std.ArrayList(u32) = .empty,
 cold_open: std.ArrayList(OpenInline) = .empty,
 /// The function contains inline assembly (`planRegisters`).
 has_asm: bool = false,
+/// From `planRegisters`: the prologue only moves the arguments from the
+/// registers they arrive in, or stores them whole, writing no register
+/// but their homes and r11 (`plainArgs`).
+plain_args: bool = false,
 /// From `planRegisters`: per position (as `Ssa.clobbers`), how many
 /// inline assembly statements come at or before it.
 asm_counts: std.ArrayList(u32) = .empty,
@@ -380,7 +384,17 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         // Placeholder large enough for the imm32 form; patched below.
         try cg.e.alu(.sub, .qword, .{ .reg = .rsp }, .{ .imm = 0x10000 });
         frame_patch = cg.e.code.items.len;
+        cg.e.written = 0;
         try cg.setupParams();
+        if (cg.live and cg.plain_args) {
+            var own: u16 = Reg.bit(.r11);
+            for (cg.ir.mainBody()) |inst| {
+                if (cg.ir.instructions.items(.tag)[@backingInt(inst)] != .arg) break;
+                own |= homeRegs(cg.homes[@backingInt(inst)]);
+                if (cg.homes[@backingInt(inst)] == .ind) own |= cg.homes[@backingInt(inst)].ind.bit();
+            }
+            if (cg.e.written & checked_mask & ~own != 0) return cg.fail("internal error: the prologue writes {t}, which may hold a value", .{@as(Reg, @enumFromInt(@ctz(cg.e.written & checked_mask & ~own)))});
+        }
     }
     try cg.emitBlocks();
     // Stubs need the epilogue's frame description even in a function
@@ -2077,6 +2091,8 @@ fn scalarScratch(cg: *CodeGen, inst: Inst.Index) u16 {
     const rcx = Reg.bit(.rcx);
     switch (tag) {
         .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .loop => return 0,
+        // The prologue's moves (`setupParams`).
+        .arg => return if (cg.plain_args) 0 else all,
         // A block's result is written by its `br`s; an alloc takes a
         // slot or computes an address with rax.
         .block, .alloc => return 0,
@@ -2116,6 +2132,31 @@ fn scalarScratch(cg: *CodeGen, inst: Inst.Index) u16 {
         },
         else => return all,
     }
+}
+
+/// Whether the `.auto` prologue (`setupParams`) only moves each argument
+/// from the registers it arrives in to its home or stores it whole, so
+/// arguments may stay in rcx and rdx: none passed by reference, which is
+/// copied in, nor with odd-sized parts.
+fn plainArgs(cg: *CodeGen) Error!bool {
+    if (cg.fn_ty.cc != .auto) return false;
+    const ir = cg.ir;
+    var n: usize = 0;
+    for (ir.mainBody()) |inst| {
+        if (ir.instructions.items(.tag)[@backingInt(inst)] != .arg) break;
+        n += 1;
+    }
+    const args = ir.mainBody()[0..n];
+    const tys, const locs = try cg.argScratch(n);
+    for (args, tys) |inst, *ty| ty.* = ir.instructions.items(.data)[@backingInt(inst)].arg.ty;
+    _ = cg.autoArgs(cg.fn_ty.return_type, tys, locs);
+    for (tys, locs) |ty, l| switch (l) {
+        .none, .sse, .stack => {},
+        .gpr => if (!cg.passInRegs(ty)) return false,
+        .gpr_pair => if (Type.abiSize(cg.ip, ty) != 16) return false,
+        .ref, .ref_stack => return false,
+    };
+    return true;
 }
 
 /// Whether type `ty` lives in a general-purpose register as a scalar.
@@ -2548,6 +2589,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
     var consts = cg.const_alias.keyIterator();
     while (consts.next()) |a| cg.split.unset(a.*);
     try cg.planRetCalls();
+    cg.plain_args = try cg.plainArgs();
     try cg.planScratch();
     var restrictions: [scratch_regs.len + 1]Ssa.Restriction = undefined;
     var n_restrictions: usize = 0;

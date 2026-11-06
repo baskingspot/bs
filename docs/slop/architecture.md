@@ -2755,7 +2755,8 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    the scalar ones `scalarScratch` lists (loads, stores, field and
    element addresses and reads, casts, the ALU operations, compares,
    tests of optionals and error unions, native-width add and sub with
-   overflow, jumps, branches, and returns in rax). Those write rcx
+   overflow, jumps, branches, returns in rax, and `.auto` arguments the
+   prologue only moves, which then stay in rcx and rdx). Those write rcx
    only for a variable shift count or a constant that is no 32-bit
    immediate; an operand in memory is read in place at its width, and
    a pointer or index in memory goes through the result's register or
