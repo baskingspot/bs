@@ -105,6 +105,9 @@ payload_region: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
 /// From `planDeferred`: aggregates built in the memory of the store that
 /// is their only user, with the store's pointer, by value.
 in_place: std.AutoHashMapUnmanaged(u32, Ref) = .empty,
+/// The aggregates some user reads whole (`readWhole`), once computed.
+read_whole: std.DynamicBitSetUnmanaged = .{},
+read_whole_known: bool = false,
 /// From `planRotates`: `bit_or`s that are rotates, with what they rotate
 /// left and by how much, by value.
 rotates: std.AutoHashMapUnmanaged(u32, Rotate) = .empty,
@@ -382,6 +385,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.slot_alias.deinit(gpa);
         cg.payload_region.deinit(gpa);
         cg.in_place.deinit(gpa);
+        cg.read_whole.deinit(gpa);
         cg.rotates.deinit(gpa);
         cg.mul_dead.deinit(gpa);
         cg.cold_starts.deinit(gpa);
@@ -658,6 +662,110 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
         cg.held = null;
     };
     return home;
+}
+
+/// The byte offset of element `i` of aggregate type `ty`, or null for a
+/// comptime field, which has no bytes.
+fn elemOffset(ip: *const InternPool, ty: Index, i: usize) ?u64 {
+    return switch (ip.indexToKey(ty)) {
+        .array_type => |a| i * Type.abiSize(ip, a.child),
+        else => if (Type.comptimeFieldValue(ip, ty, i) != .none) null else Type.fieldOffset(ip, ty, i),
+    };
+}
+
+/// Builds a struct, tuple or array of 2 to 64 bytes whose elements are
+/// scalars of 1, 2, 4 or 8 bytes in rax an eightbyte at a time (rcx
+/// holding each further element) and writes each eightbyte whole, when
+/// some user reads the value whole (`readWhole`). Written element by
+/// element, such a value is read back as eightbytes (an argument or
+/// result in registers, a copy), and a load wider than the store that
+/// wrote its bytes, or covering several stores, is not served by store
+/// forwarding but waits for the stores to reach the cache. Uses rax and
+/// rcx, and `dst` must be based on neither.
+fn composeWords(cg: *CodeGen, inst: Inst.Index, ty: Index, elems: []const Ref, dst: Mem) Error!bool {
+    const ip = cg.ip;
+    const size = Type.abiSize(ip, ty);
+    if (size < 2 or size > 64 or elems.len < 2) return false;
+    switch (ip.keyTag(ty)) {
+        .struct_type => if (Type.isPackedStruct(ip, ty)) return false,
+        .tuple_type, .array_type => {},
+        else => return false,
+    }
+    for (elems, 0..) |elem, i| {
+        const off = elemOffset(ip, ty, i) orelse continue;
+        const ety = cg.typeOf(elem);
+        const es = Type.abiSize(ip, ety);
+        if (!cg.passInRegs(ety) or off % 8 + es > 8) return false;
+        const float = Type.class(ip, ety) == .float and (es == 4 or es == 8);
+        if (!float and !cg.scalar(ety)) return false;
+    }
+    // Read only by field, each as wide as it was written.
+    if (!try cg.readWhole(inst)) return false;
+    var w: u64 = 0;
+    while (w < size) : (w += 8) {
+        const width = @min(8, size - w);
+        // The element that fills the eightbyte alone is stored as it is,
+        // and the highest one's bits above it are shifted out of what is
+        // stored.
+        var count: u32 = 0;
+        var top: u64 = 0;
+        var only: Ref = .none;
+        for (elems, 0..) |elem, i| {
+            const off = elemOffset(ip, ty, i) orelse continue;
+            if (off < w or off >= w + 8) continue;
+            count += 1;
+            top = @max(top, off);
+            only = elem;
+        }
+        if (count == 1 and Type.abiSize(ip, cg.typeOf(only)) == width) {
+            try cg.copyTo(offsetMem(dst, w), only);
+            continue;
+        }
+        var first = true;
+        for (elems, 0..) |elem, i| {
+            const off = elemOffset(ip, ty, i) orelse continue;
+            if (off < w or off >= w + 8) continue;
+            const es = Type.abiSize(ip, cg.typeOf(elem));
+            const r: Reg = if (first) .rax else .rcx;
+            try cg.load(r, elem);
+            // A float comes from its register zero-extended.
+            if (cg.xmmOf(elem) == null and !(off == top and off - w + es == width)) switch (es) {
+                1, 2 => try cg.e.movzx(.dword, r, sizeOf(es), .{ .reg = r }),
+                4 => try cg.e.mov(.dword, .{ .reg = r }, .{ .reg = r }),
+                else => {},
+            };
+            if (off % 8 != 0) try cg.e.shift(.shl, .qword, .{ .reg = r }, @intCast(off % 8 * 8));
+            if (!first) try cg.e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .reg = .rcx });
+            first = false;
+        }
+        if (first) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = 0 });
+        try cg.storeBytes(offsetMem(dst, w), .rax, width);
+    }
+    return true;
+}
+
+/// Whether some user of aggregate `inst` reads it whole rather than by
+/// field: an argument, a result, a copy, a store of it.
+fn readWhole(cg: *CodeGen, inst: Inst.Index) Error!bool {
+    if (!cg.read_whole_known) {
+        const ir = cg.ir;
+        const tags = ir.instructions.items(.tag);
+        try cg.read_whole.resize(cg.gpa, ir.instructions.len, false);
+        const Mark = struct {
+            set: *std.DynamicBitSetUnmanaged,
+            tags: []const Inst.Tag,
+            pub fn use(m: @This(), ref: Ref) void {
+                const i = ref.toIndex() orelse return;
+                if (m.tags[@backingInt(i)] == .aggregate_init) m.set.set(@backingInt(i));
+            }
+        };
+        for (tags, 0..) |tag, i| switch (tag) {
+            .struct_field_val, .array_elem_val => {},
+            else => Ssa.forEachOperand(ir, @fromBackingInt(@as(u32, @intCast(i))), Mark{ .set = &cg.read_whole, .tags = tags }),
+        };
+        cg.read_whole_known = true;
+    }
+    return cg.read_whole.isSet(@backingInt(inst));
 }
 
 /// The memory of a result slot, or of the store that is the value's only
@@ -6210,6 +6318,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 }
                 return;
             }
+            if (try cg.composeWords(inst, ty, elems, dst)) return;
             // A run of one element over 128 bytes (a `@splat`): copies of
             // the element until they span 64 bytes, then copies of what is
             // written until it spans 512, then one overlapping forward
