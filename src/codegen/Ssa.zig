@@ -76,6 +76,12 @@ clobbers: std.ArrayList([2]u32) = .empty,
 /// are short of registers, where more values want a general-purpose
 /// register than there are.
 short: std.ArrayList(u32) = .empty,
+/// Scratch for `liveness`: per block of `layout`, how often it runs
+/// (`blockFreqs`); per block, its index in `layout`; per loop, whether
+/// the walk entered it.
+block_freq: std.ArrayList(u64) = .empty,
+layout_index: std.ArrayList(u32) = .empty,
+loop_entered: std.ArrayList(bool) = .empty,
 /// Overflow operations whose results only their `struct_field_val`s read
 /// (`Fate.pair`), and those two values (or `no_tie`), from `plan`.
 pairs: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
@@ -114,8 +120,8 @@ pub const Live = struct {
     /// value is still needed afterwards.
     crosses: bool,
     /// From `liveness`: what keeping the value in memory costs, its
-    /// definition (a store) and its uses (loads), each weighted by loop
-    /// depth, 8 per level (up to 6).
+    /// definition (a store) and its uses (loads), each weighted by how
+    /// often its block runs (`blockFreqs`).
     weight: u32,
     /// After `allocate`, for a value marked `want_pair` that got registers:
     /// the register of its high eightbyte (`reg` holds the low one); else
@@ -263,6 +269,9 @@ pub fn deinit(f: *Ssa, gpa: Allocator) void {
     f.slots.active.deinit(gpa);
     f.clobbers.deinit(gpa);
     f.short.deinit(gpa);
+    f.block_freq.deinit(gpa);
+    f.layout_index.deinit(gpa);
+    f.loop_entered.deinit(gpa);
     f.pairs.deinit(gpa);
     f.candidates.deinit(gpa);
     f.var_loads.deinit(gpa);
@@ -681,6 +690,7 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
     defer gpa.free(born);
     var arms: DeadArms = try .init(gpa, f);
     defer arms.deinit(gpa);
+    const freq = try f.blockFreqs(gpa, ir);
     var w: LiveWalk = .{ .uses = s.items(.uses), .weight = s.items(.weight), .def = s.items(.def), .end = s.items(.end), .born = born, .crosses = s.items(.crosses), .clobbers = cl, .arms = &arms, .loops = f.loops.items, .loop = no_loop, .pos = 0, .scale = 1, .dead_start = null };
     const insts = f.values.items(.inst);
     const datas = ir.instructions.items(.data);
@@ -688,12 +698,7 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
     for (f.layout.items, 0..) |block, k| {
         const b = f.blocks.items[@backingInt(block)];
         w.loop = f.block_loop.items[@backingInt(block)];
-        {
-            var depth: u32 = 0;
-            var q = w.loop;
-            while (q != no_loop and depth < 6) : (q = w.loops[q].parent) depth += 1;
-            w.scale = @as(u32, 1) << @intCast(3 * depth);
-        }
+        w.scale = @intCast(freq[k]);
         const from = doom[@backingInt(block)].from;
         w.dead_start = if (from != no_tie) 2 * from + 1 else null;
         arms.enter(k);
@@ -732,6 +737,82 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
         const i = @backingInt(inst);
         if (cl[w.end[i]][0] != cl[w.bornAt(i)][0]) w.crosses[i] = true;
     }
+}
+
+/// How often each block of `layout` runs, estimated: 64 for the entry,
+/// 8 times as often in each loop around it (up to 6), split evenly among
+/// a block's successors further on in the layout, and divided by 8 again
+/// for each loop an edge leaves. Cold blocks count 0. At least 1 for
+/// every other block.
+fn blockFreqs(f: *Ssa, gpa: Allocator, ir: *const Ir) Allocator.Error![]const u64 {
+    const n = f.layout.items.len;
+    try f.block_freq.resize(gpa, n);
+    // What reaches each block from those before it, until the walk
+    // replaces it with the block's estimate.
+    const acc = f.block_freq.items;
+    @memset(acc, 0);
+    if (n == 0) return acc;
+    acc[0] = 64;
+    try f.layout_index.resize(gpa, f.blocks.items.len);
+    const index = f.layout_index.items;
+    @memset(index, std.math.maxInt(u32));
+    for (f.layout.items, 0..) |block, k| index[@backingInt(block)] = @intCast(k);
+    try f.loop_entered.resize(gpa, f.loops.items.len);
+    const entered = f.loop_entered.items;
+    @memset(entered, false);
+    const datas = ir.instructions.items(.data);
+    var prev_loop: u32 = no_loop;
+    for (f.layout.items, 0..) |block, k| {
+        const bi = @backingInt(block);
+        const loop = f.block_loop.items[bi];
+        var x = acc[k];
+        if (loop != prev_loop) {
+            var depth: u32 = 0;
+            var q = loop;
+            while (q != no_loop) : (q = f.loops.items[q].parent) {
+                depth += 1;
+                if (entered[q]) continue;
+                entered[q] = true;
+                if (depth <= 6) x *|= 8;
+            }
+            prev_loop = loop;
+        }
+        // Without `place` (unit tests), no block is cold.
+        const cold = bi < f.cold.items.len and f.cold.items[bi];
+        acc[k] = if (cold) 0 else @max(1, @min(x, std.math.maxInt(u32)));
+        const t = f.blocks.items[bi].term;
+        switch (t.tag) {
+            .jump, .fallthrough => f.flowTo(acc, index, loop, t.succ[0], k, x),
+            .branch => for (t.succ) |s| f.flowTo(acc, index, loop, s, k, x / 2),
+            .switch_br => {
+                const cases = f.switchCases(t, ir.extraData(Ir.SwitchBr, datas[@backingInt(t.inst)].pl_op.payload).data.cases_len);
+                const share = x / (cases.len + 1);
+                for (cases) |c| f.flowTo(acc, index, loop, @backingInt(c), k, share);
+                f.flowTo(acc, index, loop, t.succ[1], k, share);
+            },
+            .ret, .noreturn, .unreach => {},
+        }
+    }
+    return acc;
+}
+
+/// Adds `x` to the estimate of block `to`, reached from the block at
+/// layout index `from` in loop `loop`, unless the edge goes back.
+fn flowTo(f: *const Ssa, acc: []u64, index: []const u32, loop: u32, to: u32, from: usize, x: u64) void {
+    const k = index[to];
+    if (k == std.math.maxInt(u32) or k <= from) return;
+    var y = x;
+    var q = loop;
+    const target = f.block_loop.items[to];
+    while (q != no_loop and !f.loopContains(q, target)) : (q = f.loops.items[q].parent) y /= 8;
+    acc[k] +|= y;
+}
+
+/// Whether loop `outer` is `inner` or contains it.
+fn loopContains(f: *const Ssa, outer: u32, inner: u32) bool {
+    var q = inner;
+    while (q != no_loop) : (q = f.loops.items[q].parent) if (q == outer) return true;
+    return false;
 }
 
 /// Decisions after `liveness` that are the same on every architecture,
@@ -2084,8 +2165,8 @@ const LiveWalk = struct {
     /// the current use.
     loop: u32,
     pos: u32,
-    /// What a read or write in the current block costs: 8 per loop
-    /// around it, up to 6.
+    /// What a read or write in the current block costs: how often it
+    /// runs (`blockFreqs`).
     scale: u32,
     /// In a block that does not continue: the position before its first
     /// value.
@@ -2267,10 +2348,20 @@ pub fn allocate(f: *Ssa, gpa: Allocator, n: u8, n_float: u8, survives: u32, fold
     }
     // Evicting a value helps only where registers are short: count those
     // positions, where more values want a general-purpose register than
-    // there are (`spillsBefore`).
-    try f.short.resize(gpa, f.clobbers.items.len + 1);
-    const short = f.short.items;
-    {
+    // there are (`spillsBefore`). None is when they all fit at once.
+    const gpr_span: Span = gpr_span: {
+        var wanted: u32 = 0;
+        for (f.values.items(.inst)) |inst| {
+            const x = @backingInt(inst);
+            wanted += switch (reg[x]) {
+                want_reg => 1,
+                want_pair => 2,
+                else => 0,
+            };
+        }
+        if (wanted <= n) break :gpr_span .none;
+        try f.short.resize(gpa, f.clobbers.items.len + 1);
+        const short = f.short.items;
         @memset(short, 0);
         for (f.values.items(.inst)) |inst| {
             const x = @backingInt(inst);
@@ -2290,7 +2381,8 @@ pub fn allocate(f: *Ssa, gpa: Allocator, n: u8, n_float: u8, survives: u32, fold
             p.* = count;
             if (pressure > n) count += 1;
         }
-    }
+        break :gpr_span .{ .short = short };
+    };
     var active_len: u8 = 0;
     var free: u32 = gprs | floats;
     var used: u32 = 0;
@@ -2339,7 +2431,7 @@ pub fn allocate(f: *Ssa, gpa: Allocator, n: u8, n_float: u8, survives: u32, fold
                 want_vec => floats & ~survives,
                 else => gprs,
             };
-            const span: []const u32 = if (class == gprs) short else &.{};
+            const span: Span = if (class == gprs) gpr_span else .positions;
             const usable: u32 = class & ~keep_out & if (crosses[inst] and !splits) survives else ~@as(u32, 0);
             const v = share[inst];
             if (v != no_tie and reg[v] < total) {
@@ -2447,19 +2539,38 @@ pub fn allocate(f: *Ssa, gpa: Allocator, n: u8, n_float: u8, survives: u32, fold
 
 /// Whether value `a` goes to memory before value `b` when registers run
 /// out at position `now`: its `weight` per position left in its interval
-/// that is short of registers (counted in `short`, or every position when
-/// it is empty) is lower, so that its register serves more of the values
-/// that would not fit at less cost, or the same and it ends later. A
+/// that `span` counts (those short of registers, for general-purpose
+/// ones) is lower, so that its register serves more of the values that
+/// would not fit at less cost, or the same and it ends later. A
 /// pair's weight counts once, as each of its two registers carries half
 /// its memory traffic.
-fn spillsBefore(weight: []const u32, end: []const u32, short: []const u32, now: u32, a: u32, b: u32) bool {
+fn spillsBefore(weight: []const u32, end: []const u32, span: Span, now: u32, a: u32, b: u32) bool {
     const ca: u64 = weight[a];
     const cb: u64 = weight[b];
-    const la: u64 = 1 + if (short.len == 0) end[a] - now else short[end[a] + 1] - short[now];
-    const lb: u64 = 1 + if (short.len == 0) end[b] - now else short[end[b] + 1] - short[now];
+    const la: u64 = 1 + span.count(now, end[a]);
+    const lb: u64 = 1 + span.count(now, end[b]);
     if (ca * lb != cb * la) return ca * lb < cb * la;
     return end[a] > end[b];
 }
+
+/// The positions `spillsBefore` spreads a value's weight over.
+const Span = union(enum) {
+    /// Every position.
+    positions,
+    /// Those short of registers, counted before each position.
+    short: []const u32,
+    /// None.
+    none,
+
+    /// How many positions in `from` through `to` count.
+    fn count(s: Span, from: u32, to: u32) u32 {
+        return switch (s) {
+            .positions => to - from,
+            .short => |short| short[to + 1] - short[from],
+            .none => 0,
+        };
+    }
+};
 
 /// Whether active value `a` may give up its register to value `inst`,
 /// which may use `usable`: it holds one of them, no load sharing it

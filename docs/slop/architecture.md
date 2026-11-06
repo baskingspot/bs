@@ -2663,14 +2663,17 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    is linear scan without splitting: a value that does not fit is kept in
    memory for its whole life. When no register is free, the value that
    costs the least in memory per position where registers are short goes
-   there: its definition and uses, weighted by loop depth (8 per level,
-   `Live.weight`), over the positions left in its interval at which more
-   values want a general-purpose register than there are. A value read
-   a few times in an inner loop but live across the whole outer loop gives
-   way to the inner loop's temporaries, while an inner loop's own values
-   keep their registers (SipHash's state), and a loop's variable is not
-   given up for the temporaries of a path that is short of registers
-   only for a few positions. x86_64 values of scalar types (integers up
+   there: its definition and uses, each weighted by an estimate of how
+   often its block runs (`Live.weight`, `Ssa.blockFreqs`: 8 times as
+   often per loop level, split evenly between a branch's arms and a
+   switch's cases, divided by 8 again per loop an edge leaves, and
+   nothing on a failing check's way to its panic), over the positions
+   left in its interval at which more values want a general-purpose
+   register than there are. A value read a few times in an inner loop but
+   live across the whole outer loop gives way to the inner loop's
+   temporaries, while an inner loop's own values keep their registers
+   (SipHash's state), and a loop's variable is not given up for the
+   temporaries of one arm of a switch in its body. x86_64 values of scalar types (integers up
    to 64 bits, bools, pointers, error codes, optional pointers) that the
    lowering leaves in a register get one of rbx, r12–r15, which every
    lowering leaves alone and calls preserve, or, when their interval
