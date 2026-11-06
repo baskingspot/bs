@@ -1330,6 +1330,144 @@ fn namespaceOutdated(r: *Replay, n: u32) bool {
     return false;
 }
 
+/// Whether a full build reaches every unit with an error, as far as a
+/// failing lazy build can tell: those a walk from the roots reaches over
+/// the edges that hold in this build. Those are a red node's from this
+/// build's analysis (`Zcu.deps` without its conditional ones, or what a
+/// unit that failed read before it did, `Zcu.failed_deps`, and the
+/// functions it queued), as for a unit without a node, and any other
+/// node's recorded ones, but none out of a node an edit reached that the
+/// build left undecided. Without this, a unit entered from an assumed
+/// node (`assumeReached`) that a unit analyzed again no longer reaches,
+/// such as one whose body now fails before its old references, reports
+/// errors a full build does not (the edit hunter, seeds 5201 and 5202).
+pub fn errorsReached(r: *Replay) !bool {
+    if (r.assumed.count() == 0) return true;
+    const gpa = r.gpa;
+    const m = r.m;
+    const zcu = r.zcu;
+    // What this build's analysis refers to, by unit.
+    var refers: std.AutoHashMapUnmanaged(Zcu.AnalUnit, std.ArrayList(Zcu.AnalUnit)) = .empty;
+    defer {
+        var it = refers.valueIterator();
+        while (it.next()) |l| l.deinit(gpa);
+        refers.deinit(gpa);
+    }
+    var dep_nodes: std.AutoHashMapUnmanaged(Zcu.AnalUnit, std.ArrayList(u32)) = .empty;
+    defer {
+        var it = dep_nodes.valueIterator();
+        while (it.next()) |l| l.deinit(gpa);
+        dep_nodes.deinit(gpa);
+    }
+    for (zcu.deps.keys(), zcu.deps.values()) |unit, dependees| {
+        const conditional = zcu.conditional_deps.get(unit) orelse &.{};
+        var next_conditional: usize = 0;
+        for (dependees, 0..) |d, j| {
+            if (next_conditional < conditional.len and conditional[next_conditional] == j) {
+                next_conditional += 1;
+                continue;
+            }
+            try r.addRefer(&refers, &dep_nodes, unit, d);
+        }
+    }
+    // A unit that failed refers to what it read before it did.
+    var failed = zcu.failed_deps.iterator();
+    while (failed.next()) |e| for (e.value_ptr.*) |d| try r.addRefer(&refers, &dep_nodes, e.key_ptr.*, d);
+    for (zcu.func_refs.keys()) |fr| {
+        const gop = try refers.getOrPut(gpa, fr.from);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(gpa, .{ .func = fr.func });
+    }
+    // References a unit records no dependency for: the first referrer of
+    // each unit.
+    var by = zcu.referenced_by.iterator();
+    while (by.next()) |e| {
+        const gop = try refers.getOrPut(gpa, e.value_ptr.from);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(gpa, e.key_ptr.*);
+    }
+    // Nodes red in this build, by unit.
+    var unit_of: std.AutoHashMapUnmanaged(u32, Zcu.AnalUnit) = .empty;
+    defer unit_of.deinit(gpa);
+    var units = refers.keyIterator();
+    while (units.next()) |u| if (try r.nodeOf(u.*)) |n| if (r.state[n] == .red) try unit_of.put(gpa, n, u.*);
+
+    var reached = try std.bit_set.Dynamic.initEmpty(gpa, m.nodeCount());
+    defer reached.deinit(gpa);
+    var reached_units: std.AutoHashMapUnmanaged(Zcu.AnalUnit, void) = .empty;
+    defer reached_units.deinit(gpa);
+    var stack: std.ArrayList(u32) = .empty;
+    defer stack.deinit(gpa);
+    var unit_stack: std.ArrayList(Zcu.AnalUnit) = .empty;
+    defer unit_stack.deinit(gpa);
+    try stack.appendSlice(gpa, r.roots.items);
+    var next: std.ArrayList(u32) = .empty;
+    defer next.deinit(gpa);
+    while (true) {
+        // A unit: its node, or its edges from this build.
+        const from: Zcu.AnalUnit = if (unit_stack.pop()) |u| u else if (stack.pop()) |n| n: {
+            if (reached.isSet(n)) continue;
+            reached.set(n);
+            if (r.dead.isSet(n)) continue;
+            if (unit_of.get(n)) |u| break :n u;
+            if (r.state[n] == .red) continue;
+            if (m.node(n).tag != @backingInt(Tag.namespace) and r.outdated.isSet(n) and r.state[n] != .green) continue;
+            next.clearRetainingCapacity();
+            try Incremental.reachNext(m.deps(n), m.nodeRefs(n), &next, gpa);
+            try stack.appendSlice(gpa, next.items);
+            continue;
+        } else break;
+        if ((try reached_units.getOrPut(gpa, from)).found_existing) continue;
+        if (dep_nodes.get(from)) |l| try stack.appendSlice(gpa, l.items);
+        const targets = refers.get(from) orelse continue;
+        for (targets.items) |t| {
+            if (try r.nodeOf(t)) |n| try stack.append(gpa, n) else try unit_stack.append(gpa, t);
+        }
+    }
+    for (zcu.errors.items) |e| if (e.unit) |u| if (!try r.isReached(u, &reached, &reached_units)) return false;
+    for (zcu.compile_logs.items) |l| if (!try r.isReached(l.unit, &reached, &reached_units)) return false;
+    return true;
+}
+
+/// Adds `unit`'s reading of `d` to `errorsReached`'s edges: the unit
+/// that produces it, or the node of a namespace or embedded file.
+fn addRefer(
+    r: *Replay,
+    refers: *std.AutoHashMapUnmanaged(Zcu.AnalUnit, std.ArrayList(Zcu.AnalUnit)),
+    dep_nodes: *std.AutoHashMapUnmanaged(Zcu.AnalUnit, std.ArrayList(u32)),
+    unit: Zcu.AnalUnit,
+    d: Zcu.Dependee,
+) !void {
+    const gpa = r.gpa;
+    const target: Zcu.AnalUnit = switch (d) {
+        .nav_val, .nav_ty => |nav| .{ .nav_val = nav },
+        .type_layout => |ty| .{ .type_layout = ty },
+        .struct_defaults => |ty| .{ .struct_defaults = ty },
+        .func_ies, .func_inline => |func| .{ .func = func },
+        .func_body => return,
+        .namespace, .namespace_name, .embed_file => {
+            const node = r.m.find((try r.keyer.dependeeInfo(d)).key) orelse return;
+            const gop = try dep_nodes.getOrPut(gpa, unit);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(gpa, node);
+            return;
+        },
+    };
+    const gop = try refers.getOrPut(gpa, unit);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(gpa, target);
+}
+
+fn nodeOf(r: *Replay, unit: Zcu.AnalUnit) !?u32 {
+    return r.unit_nodes.get(unit) orelse r.m.find(try r.keyer.keyOf(Incremental.Recorder.unitTag(unit), &.{try r.keyer.unitKeyString(unit)}));
+}
+
+fn isReached(r: *Replay, unit: Zcu.AnalUnit, reached: *const std.bit_set.Dynamic, reached_units: *const std.AutoHashMapUnmanaged(Zcu.AnalUnit, void)) !bool {
+    if (reached_units.contains(unit)) return true;
+    const n = try r.nodeOf(unit) orelse return false;
+    return reached.isSet(n);
+}
+
 /// `comptime` declarations an edit reached that analysis never ran: the
 /// walk made their namespaces again (an outdated root does that,
 /// `namespaceOutdated`), whose scans queue every `comptime` declaration

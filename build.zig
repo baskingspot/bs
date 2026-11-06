@@ -1450,6 +1450,19 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &em.step, 10);
         test_step.dependOn(&em.step);
     }
+    // An error in a unit a failing edit no longer reaches:
+    // test/run/edit_unreached_error.sh.
+    {
+        const ue = b.addSystemCommand(&.{"sh"});
+        ue.setName("bs edit with an error in a unit no longer reached");
+        ue.addFileArg(b.path("test/run/edit_unreached_error.sh"));
+        ue.addArtifactArg(bs);
+        _ = ue.addOutputDirectoryArg("work");
+        ue.addDirectoryArg(std_zir);
+        ue.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &ue.step, 10);
+        test_step.dependOn(&ue.step);
+    }
 
     const bs_run = b.addRunArtifact(bs);
     bs_run.setName("bs run args");

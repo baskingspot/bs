@@ -6336,6 +6336,24 @@ records only what changed, and links from the manifest.
   (`Emit.inputs_deferred`), or a change in the link's inputs outside the atoms
   (external symbols, whether the error name table is written, and new
   error names while it is). `BS_CACHE_TIMING` says why.
+- *Failing lazily.* A lazy build that fails prints its errors without
+  recording, but only if a full build reaches each unit with one
+  (`Replay.errorsReached`, called from `main` before the errors are
+  returned): a walk from the roots over the edges that hold now, a red
+  node's from this build's analysis (`Zcu.deps` without its conditional
+  ones; for a unit that failed, what it read before it did,
+  `Zcu.failed_deps`, which `Sema.destroy` records; and the functions it
+  queued), any other node's recorded ones,
+  none out of an outdated node left undecided. Otherwise it builds
+  again eagerly. The walk's assumption (`assumeReached`) can enter a
+  unit from an assumed node that a unit analyzed again no longer
+  reaches: one that takes a function's address rather than calling it
+  (no `func_inline` edge, so not outdated), whose referrer now fails
+  before referring to it. Until 2026-11-06 such a unit's errors were
+  printed though a full build never analyzes it (the edit hunter, seeds
+  5201 and 5202 on the zig compiler; test/run/edit_unreached_error.sh).
+  The check costs a walk of the graph, and only failing lazy builds pay
+  it.
 - `BS_CACHE_VERIFY` compares a full build with the edit build's manifest
   as before, and also requires the full build's nodes to be neither
   `stale` nor, with atoms, `unlinked` there. Nodes only in the edit

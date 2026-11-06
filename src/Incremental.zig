@@ -2405,6 +2405,15 @@ fn fallBack(inc: *Incremental) error{LazyFallback} {
     return error.LazyFallback;
 }
 
+/// For a lazy build that failed: builds again eagerly if a unit with an
+/// error may be one a full build does not reach (`Replay.errorsReached`).
+pub fn checkLazyErrors(inc: *Incremental) !void {
+    const r = inc.replay orelse return;
+    if (!r.lazy or try r.errorsReached()) return;
+    if (inc.timing) std.debug.print("cache: building again eagerly: an error may be in a unit a full build does not reach\n", .{});
+    return inc.fallBack();
+}
+
 /// Ends the replay of a build that the caller builds again
 /// (`Zcu.finalizeNames`).
 pub fn endReplay(inc: *Incremental) void {

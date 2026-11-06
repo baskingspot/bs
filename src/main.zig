@@ -1484,6 +1484,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         if (inc_opt) |i| i.endReplay();
         return error.NamesRerun;
     }
+    if (zcu.failed()) if (inc_opt) |i| try i.checkLazyErrors();
     // A lazy edit build leaves the test list as the last build linked it.
     if (is_test and !(if (zcu.replay) |r| r.lazy else false)) Sema.populateTestFunctions(&zcu) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

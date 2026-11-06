@@ -78,6 +78,9 @@ deps: std.ArrayList(Zcu.Dependee) = .empty,
 /// Per entry of `deps`: whether only a lowering for the comptime
 /// evaluator read it (see `Zcu.conditional_deps`).
 deps_conditional: std.ArrayList(bool) = .empty,
+/// Whether `finish` recorded `deps`: otherwise the unit failed, and
+/// `destroy` records what it read (`Zcu.recordFailedDeps`).
+finished: bool = false,
 /// The entries of `deps` with their indices, once it is long enough to
 /// search this way.
 deps_set: DependeeMap = .empty,
@@ -1064,6 +1067,12 @@ fn create(zcu: *Zcu, arena: Allocator, file: u32, owner: Zcu.AnalUnit) Sema {
 fn destroy(sema: *Sema) void {
     const gpa = sema.gpa;
     if (sema.zcu.unit_timing) |*t| t.stop(gpa, sema.zcu.io, sema.owner, sema.timer);
+    // Not a lowering for the comptime evaluator, which is no analysis of
+    // its unit. Without the record, a failing lazy build builds again
+    // eagerly (`Replay.errorsReached`).
+    if (!sema.finished and sema.bc == null) {
+        sema.zcu.recordFailedDeps(sema.owner, sema.deps.items, sema.deps_conditional.items) catch {}; // ziglint-ignore: Z026 -- without it a failing lazy build builds again eagerly
+    }
     sema.ir_insts.deinit(gpa);
     sema.ir_extra.deinit(gpa);
     sema.inst_map.deinit(gpa);
@@ -1092,6 +1101,7 @@ fn finish(sema: *Sema) !void {
     var conditional: std.ArrayList(u32) = .empty;
     for (sema.deps_conditional.items, 0..) |c, i| if (c) try conditional.append(sema.arena, @intCast(i));
     try sema.zcu.recordDeps(sema.owner, sema.deps.items, conditional.items);
+    sema.finished = true;
 }
 
 fn rootBlock(sema: *Sema, namespace: u32, src_base: Ast.Node.Index, is_comptime: bool) Block {

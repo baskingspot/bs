@@ -41,6 +41,10 @@ deps: std.array_hash_map.Auto(AnalUnit, []const Dependee) = .empty,
 /// those, ascending. Such an edge counts for invalidation, but the unit
 /// does not resolve its dependee itself. Arena-allocated.
 conditional_deps: std.AutoHashMapUnmanaged(AnalUnit, []const u32) = .empty,
+/// What each unit whose analysis failed had read before it did, without
+/// conditional dependencies (`recordFailedDeps`): the units a failing
+/// build reaches through it, for `Replay.errorsReached`. Arena-allocated.
+failed_deps: std.AutoHashMapUnmanaged(AnalUnit, []const Dependee) = .empty,
 /// Empty dependee maps with their capacity kept, for Sema's per-unit sets
 /// (`Sema.takeDepMap`), so that each of the many units does not grow a
 /// fresh one. Per analysis thread once Sema runs in parallel.
@@ -542,6 +546,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.comptime_decls.deinit(gpa);
     zcu.comptime_memo.deinit(gpa);
     zcu.conditional_deps.deinit(gpa);
+    zcu.failed_deps.deinit(gpa);
     for (zcu.dep_maps.items) |*m| m.deinit(gpa);
     zcu.dep_maps.deinit(gpa);
     gpa.free(zcu.string_cache);
@@ -1284,6 +1289,16 @@ pub fn recordDeps(zcu: *Zcu, unit: AnalUnit, deps: []const Dependee, conditional
     if (conditional.len != 0) {
         try zcu.conditional_deps.put(zcu.gpa, unit, try zcu.arena.allocator().dupe(u32, conditional));
     } else _ = zcu.conditional_deps.remove(unit);
+    _ = zcu.failed_deps.remove(unit);
+}
+
+/// Records what `unit` read before its analysis failed (`failed_deps`):
+/// `deps` with `conditional[i]` set for each conditional one.
+pub fn recordFailedDeps(zcu: *Zcu, unit: AnalUnit, deps: []const Dependee, conditional: []const bool) !void {
+    const arena = zcu.arena.allocator();
+    var plain: std.ArrayList(Dependee) = .empty;
+    for (deps, conditional) |d, c| if (!c) try plain.append(arena, d);
+    try zcu.failed_deps.put(zcu.gpa, unit, plain.items);
 }
 
 /// Renders a unit's stable key, which does not depend on analysis order or
