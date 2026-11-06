@@ -935,8 +935,8 @@ comptime arguments are run-time values in the lowered code (uucode's
   such a lowering lies in its interval or at its ends, and clobber
   points (below) keep the values they read or compute out of all four
   (`Restriction.endpoints_only`). x15 joins them only where it does not
-  hold the error return trace (`trace_x15`: C-convention functions and
-  builds without error tracing); elsewhere an always-on restriction
+  hold the error return trace (`trace_x15`: functions of a convention
+  other than `.auto`, and builds without error tracing); elsewhere an always-on restriction
   keeps every value out of it. The encoder records the general
   registers each instruction writes (`Encoder.written`; bl and blr
   count as writing every caller-saved one), and genBlock checks each

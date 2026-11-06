@@ -734,9 +734,9 @@ fn allocBit(r: Reg) u32 {
     return @as(u32, 1) << @intCast(std.mem.findScalar(Reg, &alloc_regs, r).?);
 }
 
-/// `trace_x15`, before `setupParams` sets it.
+/// `trace_x15`, before `setupParams` sets it, by the same rule.
 fn traceInX15(cg: *CodeGen) bool {
-    return !isC(cg.fn_ty.cc) and cg.emit.zcu.fe.any_error_tracing;
+    return cg.fn_ty.cc == .auto and cg.emit.zcu.fe.any_error_tracing;
 }
 
 /// x19-x28, which the prologue saves and the epilogue restores.
@@ -779,7 +779,8 @@ fn scratchUse(cg: *CodeGen, inst: Inst.Index) u32 {
         .load, .store => 0,
         // The element's address is computed into x12 (`elemAddrTo`).
         .ptr_elem_val, .slice_elem_val => x12,
-        // C functions load the trace into x15 for it (`call`).
+        // Functions without the trace in x15 load it there for it
+        // (`call`).
         .call => if (ir.instructions.items(.data)[@backingInt(inst)].pl_op.operand.toInterned() == cg.emit.zcu.return_error)
             @as(u32, if (cg.traceInX15()) 0 else 1 << 15)
         else
