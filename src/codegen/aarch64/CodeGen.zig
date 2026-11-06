@@ -787,7 +787,14 @@ fn termScratch(cg: *CodeGen, block: Ssa.Block.Index) u32 {
         .ret => ret: {
             const size = Type.abiSize(cg.ip, cg.fn_ty.return_type);
             const last = if (size > 8) size - 8 else size;
-            break :ret if (size <= 16 and last != 0 and !std.math.isPowerOfTwo(last)) 1 << 13 else 0;
+            if (size <= 16) break :ret if (last != 0 and !std.math.isPowerOfTwo(last)) 1 << 13 else 0;
+            // x2 and x3 of a `gpr_quad` result.
+            if (!isC(cg.fn_ty.cc) and cg.autoRetClass(cg.fn_ty.return_type) == .gpr_quad and size < 32) {
+                const x2 = @min(size - 16, 8);
+                const odd = !std.math.isPowerOfTwo(x2) or (size > 24 and !std.math.isPowerOfTwo(size - 24));
+                break :ret if (odd) 1 << 13 else 0;
+            }
+            break :ret 0;
         },
     };
 }
