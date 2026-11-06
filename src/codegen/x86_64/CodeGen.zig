@@ -858,6 +858,7 @@ fn loadGpr(cg: *CodeGen, reg: Reg, ref: Ref, ty: Index) Error!void {
 /// Loads `.auto` value `ref` of class `gpr_pair` into `lo` and `hi`.
 fn loadPair(cg: *CodeGen, lo: Reg, hi: Reg, ref: Ref) Error!void {
     if (cg.pairOf(ref) != null) return cg.loadRegs(.{ .lo = lo, .hi = hi }, ref);
+    if (try cg.loadConstPair(.{ .lo = lo, .hi = hi }, ref)) return;
     const size = Type.abiSize(cg.ip, cg.typeOf(ref));
     const m = try cg.memOf(ref);
     if (memUses(m, lo) and !memUses(m, hi)) {
@@ -1819,14 +1820,15 @@ fn loadRegs(cg: *CodeGen, d: Regs, ref: Ref) Error!void {
         if (p.hi != d.hi) try cg.e.mov(.qword, .{ .reg = d.hi }, .{ .reg = p.hi });
         return;
     }
+    if (try cg.loadConstPair(d, ref)) return;
     try cg.loadQwords(d.lo, d.hi, try cg.memOf(ref));
 }
 
 /// Whether `ty`'s values live in two general-purpose registers when they
-/// get registers: slices, optional slices, and error unions with an
-/// 8-byte aligned payload of up to 8 bytes (the error code in the low
-/// eightbyte, the payload in the high one), and 128-bit integers
-/// (`int128`); all 16 bytes.
+/// get registers: slices, optional slices, optionals of 8-byte integers
+/// (`optPair`), and error unions with an 8-byte aligned payload of up to
+/// 8 bytes (the error code in the low eightbyte, the payload in the high
+/// one), and 128-bit integers (`int128`); all 16 bytes.
 pub fn inPair(cg: *CodeGen, ty: Index) bool {
     const ip = cg.ip;
     return switch (Type.class(ip, ty)) {
@@ -1834,7 +1836,7 @@ pub fn inPair(cg: *CodeGen, ty: Index) bool {
         // Not an optional `allowzero` slice, whose flag follows the slice.
         .optional => blk: {
             const child = Type.childType(ip, ty);
-            break :blk Type.class(ip, child) == .pointer and Type.isSlice(ip, child) and Type.abiSize(ip, ty) == 16;
+            break :blk (Type.class(ip, child) == .pointer and Type.isSlice(ip, child) and Type.abiSize(ip, ty) == 16) or cg.optPair(ty);
         },
         // The payload at offset 8 makes the error union 16 bytes.
         .error_union => blk: {
@@ -1844,6 +1846,40 @@ pub fn inPair(cg: *CodeGen, ty: Index) bool {
         .int => int128.is128(ip, ty),
         else => false,
     };
+}
+
+/// Whether optional `ty` is an 8-byte integer or enum and its flag: in a
+/// pair (`inPair`), the payload in the low register and the flag in the
+/// low byte of the high one, whose other bytes are the optional's padding,
+/// so the flag is read as a byte.
+fn optPair(cg: *CodeGen, ty: Index) bool {
+    const ip = cg.ip;
+    const child = Type.childType(ip, ty);
+    return switch (Type.class(ip, child)) {
+        .int, .@"enum" => Type.abiSize(ip, child) == 8 and cg.inGpr(child) and Type.abiSize(ip, ty) == 16 and Type.optionalFlagOffset(ip, ty) == 8,
+        else => false,
+    };
+}
+
+/// Loads constant `ref` of an `optPair` type into `d` as immediates, not
+/// from memory; false for other values.
+fn loadConstPair(cg: *CodeGen, d: Regs, ref: Ref) Error!bool {
+    const v = ref.toInterned() orelse return false;
+    const ty = cg.typeOf(ref);
+    if (Type.class(cg.ip, ty) != .optional or !cg.optPair(ty)) return false;
+    switch (cg.ip.indexToKey(v)) {
+        .opt => |o| {
+            // The payload of null is undefined.
+            if (o.val == .none) {
+                try cg.e.alu(.xor, .dword, .{ .reg = d.hi }, .{ .reg = d.hi });
+            } else {
+                try cg.load(d.lo, .fromInterned(o.val));
+                try cg.e.mov(.dword, .{ .reg = d.hi }, .{ .imm = 1 });
+            }
+            return true;
+        },
+        else => return false,
+    }
 }
 
 /// Whether every value of integer type `src`, extended to 64 bits by its
@@ -4434,8 +4470,13 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
                 const r = try cg.regOf(data.un_op, .rax);
                 try cg.e.@"test"(.qword, .{ .reg = r }, .{ .reg = r });
             } else if (cg.pairOf(data.un_op)) |p| {
-                // An optional slice: a null `ptr`.
-                try cg.e.@"test"(.qword, .{ .reg = p.lo }, .{ .reg = p.lo });
+                if (cg.optPair(opt_ty)) {
+                    // The flag, below the padding (`optPair`).
+                    try cg.e.@"test"(.byte, .{ .reg = p.hi }, .{ .reg = p.hi });
+                } else {
+                    // An optional slice: a null `ptr`.
+                    try cg.e.@"test"(.qword, .{ .reg = p.lo }, .{ .reg = p.lo });
+                }
             } else if (cg.optInGpr(opt_ty) and try cg.locOf(data.un_op) == .reg) {
                 // The flag above the payload's bytes (`optInGpr`).
                 const r = (try cg.locOf(data.un_op)).reg;
@@ -5366,6 +5407,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .optional_payload => {
             const child = data.ty_op.ty;
             if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
+            // The low register (`optPair`).
+            if (cg.pairOf(data.ty_op.operand)) |p| if (cg.optPair(cg.typeOf(data.ty_op.operand))) return cg.setResult(inst, child, p.lo);
             if (Type.optionalReprIsPtr(ip, child)) {
                 const d = cg.destReg(inst);
                 try cg.load(d, data.ty_op.operand);
@@ -5406,7 +5449,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .wrap_optional => {
             const opt_ty = data.ty_op.ty;
-            if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
+            if (cg.pairOf(inst.toRef())) |d| {
+                if (!cg.optPair(opt_ty)) return cg.loadRegs(d, data.ty_op.operand);
+                try cg.load(d.lo, data.ty_op.operand);
+                return cg.e.mov(.dword, .{ .reg = d.hi }, .{ .imm = 1 });
+            }
             if (cg.inGpr(opt_ty)) {
                 // An optional pointer is the pointer; another optional the
                 // payload's bytes and the flag above them (`optInGpr`).
