@@ -105,8 +105,10 @@ slot_alias: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 /// call and the block that unwraps it. The region holds the error union,
 /// and the alloc and the block are its payload.
 payload_region: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
-/// From `planDeferred`: aggregates built in the memory of the store that
-/// is their only user, with the store's pointer, by value.
+/// From `planDeferred`: aggregates and calls built in the memory of the
+/// store that is their only user, with the store's pointer, by value.
+/// `Ref.none` is this function's result memory (an aggregate that a `ret`
+/// returns).
 in_place: std.AutoHashMapUnmanaged(u32, Ref) = .empty,
 /// The aggregates some user reads whole (`readWhole`), once computed.
 read_whole: std.DynamicBitSetUnmanaged = .{},
@@ -784,6 +786,10 @@ fn readWhole(cg: *CodeGen, inst: Inst.Index) Error!bool {
 pub fn resultMem(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Mem {
     if (cg.in_place.count() != 0) {
         if (cg.in_place.get(@backingInt(inst))) |ptr| {
+            if (ptr == .none) {
+                try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
+                return Mem.at(.r10, 0);
+            }
             const result = try cg.ptrMem(ptr);
             return result;
         }
@@ -3751,7 +3757,12 @@ fn rvoEarlyLoad(cg: *CodeGen, l: Inst.Index, a: Inst.Index) bool {
 ///   it is not in a register the lowering writes. The elements are values
 ///   already computed, and none is read from memory lazily (a deferred
 ///   load's only user is a call or `ret`), so writing the memory early
-///   changes nothing.
+///   changes nothing. So is one that a `ret` right after it returns, in
+///   this function's result memory, which nothing else in the function
+///   points to (`planRetCalls` keeps its values out of it there).
+/// - A call that returns in memory, whose only user is a store right after
+///   it to a fresh `var`, writes its result there: the alloc comes right
+///   before the call, so nothing has its address yet, the callee included.
 fn planDeferred(cg: *CodeGen) Error!void {
     const ir = cg.ir;
     const f = cg.ssa;
@@ -3823,6 +3834,7 @@ fn planDeferred(cg: *CodeGen) Error!void {
         }
         if (ret_deferred and b.term.tag == .ret and tags[@backingInt(b.term.inst)] == .ret) {
             cg.deferLoad(datas[@backingInt(b.term.inst)].un_op, values, prev, 2 * (b.start + b.len) + 1);
+            try cg.retInPlace(datas[@backingInt(b.term.inst)].un_op, values);
         }
     }
 }
@@ -4167,6 +4179,11 @@ fn planRetCalls(cg: *CodeGen) Error!void {
         if (cg.rvo_alloc) |a| if (x.lo <= end[@backingInt(a)] and def[@backingInt(a)] <= x.hi) {
             x.ok = false;
         };
+        // Nor as an aggregate built in the result's memory (`retInPlace`).
+        var it = cg.in_place.iterator();
+        while (it.next()) |e| if (e.value_ptr.* == .none and x.lo <= def[e.key_ptr.*] and def[e.key_ptr.*] <= x.hi) {
+            x.ok = false;
+        };
     }
     for (chains.items) |x| {
         if (!x.ok) continue;
@@ -4312,36 +4329,76 @@ pub fn deferLoad(cg: *CodeGen, arg: Ref, before: []const Inst.Index, prev: []con
     cg.homes[li] = .deferred;
 }
 
+/// The last of the `before` values, ignoring debug markers.
+fn lastOf(cg: *CodeGen, before: []const Inst.Index) ?Inst.Index {
+    const tags = cg.ir.instructions.items(.tag);
+    for (0..before.len) |j| {
+        const x = before[before.len - 1 - j];
+        switch (tags[@backingInt(x)]) {
+            .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+            else => return x,
+        }
+    }
+    return null;
+}
+
+/// Whether value `v`, an aggregate or a call, may be built in place: its
+/// only user is the store or `ret` that follows it, and it lives in
+/// memory with no home planned yet.
+fn buildsInPlace(cg: *CodeGen, v: Inst.Index, before: []const Inst.Index) bool {
+    const vi = @backingInt(v);
+    const live = cg.ssa.live.slice();
+    if (live.items(.uses)[vi] != 1 or live.items(.fate)[vi] != .normal) return false;
+    if (cg.lastOf(before) != v) return false;
+    const ty = cg.ir.typeOfIndex(v, cg.ip);
+    if (Type.abiSize(cg.ip, ty) == 0 or cg.passInRegs(ty) or cg.inPair(ty) or cg.inFloat(ty)) return false;
+    // An initializer that is its `*const` alloc's memory (`planCopies`).
+    if (cg.copy_private.count() != 0 and cg.copy_private.contains(vi)) return false;
+    return cg.homes[vi] == .none;
+}
+
 /// Builds the aggregate that store `st` stores in place (`planDeferred`)
 /// if it is the last of the `before` values, ignoring debug markers.
 fn storeInPlace(cg: *CodeGen, st: Inst.Index, before: []const Inst.Index) Error!void {
     const ir = cg.ir;
     const ip = cg.ip;
     const tags = ir.instructions.items(.tag);
-    const live = cg.ssa.live.slice();
-    const bin = ir.instructions.items(.data)[@backingInt(st)].bin_op;
+    const datas = ir.instructions.items(.data);
+    const bin = datas[@backingInt(st)].bin_op;
     const v = bin.rhs.toIndex() orelse return;
     const vi = @backingInt(v);
     // `x.* = try f()`: the payload of a call's result is copied straight
     // to the store's memory; the call's own memory does not overlap it.
-    const unwrap = tags[vi] == .unwrap_errunion_payload and if (ir.instructions.items(.data)[vi].ty_op.operand.toIndex()) |c| tags[@backingInt(c)] == .call else false;
-    if (tags[vi] != .aggregate_init and tags[vi] != .union_init and !unwrap and !(tags[vi] == .bitcast and vector.bitcastInPlace(cg, v))) return;
-    if (live.items(.uses)[vi] != 1 or live.items(.fate)[vi] != .normal) return;
-    const prev = for (0..before.len) |j| {
-        const x = before[before.len - 1 - j];
-        switch (tags[@backingInt(x)]) {
-            .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
-            else => break x,
-        }
-    } else return;
-    if (prev != v) return;
-    const ty = cg.typeOf(bin.rhs);
-    if (Type.abiSize(ip, ty) == 0 or cg.passInRegs(ty) or cg.inPair(ty) or cg.inFloat(ty)) return;
+    const unwrap = tags[vi] == .unwrap_errunion_payload and if (datas[vi].ty_op.operand.toIndex()) |c| tags[@backingInt(c)] == .call else false;
+    if (tags[vi] == .call) {
+        // `var x = f()`: the call's result memory is x if nothing has x's
+        // address yet. A `*const` alloc already shares the call's memory
+        // (`planCopies`).
+        const a = bin.lhs.toIndex() orelse return;
+        if (tags[@backingInt(a)] != .alloc or a == cg.rvo_alloc) return;
+        const info = Type.ptrInfo(ip, datas[@backingInt(a)].ty);
+        if (info.flags.is_const or info.flags.is_volatile) return;
+        if (cg.copy_of.count() != 0) if (cg.copy_of.get(@backingInt(a))) |c| if (c != no_copy) return;
+        if (cg.calleeCc(datas[vi]) != .auto or cg.autoClass(cg.typeOf(bin.rhs)) != .memory) return;
+        if (cg.ssa.live.items(.fate)[@backingInt(a)] != .normal) return;
+        const k = std.mem.findScalar(Inst.Index, before, v) orelse return;
+        if (cg.lastOf(before[0..k]) != a) return;
+        const extra = ir.extraData(Ir.Call, datas[vi].pl_op.payload);
+        for (ir.refSlice(extra.end, extra.data.args_len)) |arg| if (arg == bin.lhs or cg.frameRoot(arg) == a) return;
+    } else if (tags[vi] != .aggregate_init and tags[vi] != .union_init and !unwrap and !(tags[vi] == .bitcast and vector.bitcastInPlace(cg, v))) return;
+    if (!cg.buildsInPlace(v, before)) return;
     if (Type.ptrInfo(ip, cg.typeOf(bin.lhs)).flags.is_volatile) return;
-    // An initializer that is its `*const` alloc's memory (`planCopies`).
-    if (cg.copy_private.count() != 0 and cg.copy_private.contains(vi)) return;
-    if (cg.homes[vi] != .none) return;
     try cg.in_place.put(cg.gpa, vi, bin.lhs);
+}
+
+/// Builds the aggregate that a `ret` returns in this function's result
+/// memory (`planDeferred`) if it is the last of the block's `values`.
+fn retInPlace(cg: *CodeGen, operand: Ref, values: []const Inst.Index) Error!void {
+    const v = operand.toIndex() orelse return;
+    const tag = cg.ir.instructions.items(.tag)[@backingInt(v)];
+    if (tag != .aggregate_init and tag != .union_init) return;
+    if (!cg.buildsInPlace(v, values)) return;
+    try cg.in_place.put(cg.gpa, @backingInt(v), .none);
 }
 
 /// A `copy_of` entry for an alloc that is not a copy.
@@ -7522,7 +7579,8 @@ fn ret(cg: *CodeGen, operand: Ref, next: Ssa.Block.Index) Error!void {
                 .deferred => cg.rvo_alloc != null and cg.ir.instructions.items(.data)[@backingInt(l)].ty_op.operand.toIndex() == cg.rvo_alloc,
                 // Already there (`planRetCalls`).
                 .result => true,
-                else => false,
+                // Built there (`retInPlace`).
+                else => cg.in_place.count() != 0 and cg.in_place.get(@backingInt(l)) == .none,
             } else false;
             if (!rvo) {
                 try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
@@ -7569,6 +7627,14 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const to_result: ?u32 = switch (cg.homes[@backingInt(inst)]) {
         .result => |off| off,
         else => null,
+    };
+    // A fresh `var`'s memory (`storeInPlace`) is a frame address the
+    // argument copies leave alone; otherwise the store copies the result.
+    if (cg.in_place.count() != 0) if (cg.in_place.get(@backingInt(inst))) |p| if (switch (try cg.locOf(p)) {
+        .addr => |m| m.base != .reg or m.base.reg != .rbp,
+        else => true,
+    }) {
+        _ = cg.in_place.remove(@backingInt(inst));
     };
     // Left in rax (and rdx) for the `ret` right after it.
     const ret_regs = cg.retInRegs(inst.toRef());

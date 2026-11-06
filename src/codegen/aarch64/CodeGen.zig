@@ -93,6 +93,10 @@ slots_size: u32 = 0,
 out_args_size: u32 = 0,
 /// The slot holding the result pointer, for results returned in memory.
 ret_ptr_slot: ?Mem = null,
+/// From `planInPlace`: values built in the memory of the store that is
+/// their only user, with the store's pointer, by value. `Ref.none` is this
+/// function's result memory (an aggregate that a `ret` returns).
+in_place: std.AutoHashMapUnmanaged(u32, Ref) = .empty,
 /// The slot holding the error return trace pointer. In an `.auto`
 /// function (`trace_x15`), x15 saved around what may write it; in another,
 /// the trace from `set_err_return_trace`, or null when it has none, and
@@ -293,6 +297,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.tmp_slots.deinit(gpa);
         cg.tmp16_slots.deinit(gpa);
         cg.pending.deinit(gpa);
+        cg.in_place.deinit(gpa);
         cg.stub_chains.deinit(gpa);
         cg.stub_open.deinit(gpa);
     }
@@ -313,6 +318,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.live = true;
         if (!f.no_regs) {
             try cg.allocateRegs();
+            try cg.planInPlace();
             try cg.planRetCalls();
         }
     } else @memset(f.live.items(.fate), .normal);
@@ -957,6 +963,15 @@ pub fn ovfFlagsOnly(_: *CodeGen, tag: Inst.Tag, bits: u16) bool {
 /// that `flushResults` moves to the register when the instruction's code
 /// is done, after it read its operands.
 pub fn resultMem(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Mem {
+    if (cg.in_place.count() != 0) if (cg.in_place.get(@backingInt(inst))) |ptr| {
+        if (ptr != .none) {
+            const mem = try cg.ptrMem(ptr);
+            return mem;
+        }
+        // x13: no copy into it uses it (`copyTo`).
+        try cg.loadMem(.x13, cg.ret_ptr_slot.?, .usize_type);
+        return .at(.x13, 0);
+    };
     if (cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .vreg or cg.homes[@backingInt(inst)] == .regs) {
         if (!Type.hasRuntimeBits(cg.ip, ty)) return null;
         const m = if (cg.homes[@backingInt(inst)] == .reg) try cg.tempSlot() else try cg.tempSlot16();
@@ -1090,12 +1105,19 @@ fn planRetCalls(cg: *CodeGen) Error!void {
         };
         if (ok) try chains.append(cg.gpa, .{ .ret_val = o, .call = c, .lo = def[@backingInt(c)], .hi = hi, .ok = true });
     }
-    for (chains.items, 0..) |*x, i| for (chains.items[i + 1 ..]) |*y| {
-        if (x.call != y.call and x.lo <= y.hi and y.lo <= x.hi) {
-            x.ok = false;
-            y.ok = false;
+    for (chains.items, 0..) |*x, i| {
+        for (chains.items[i + 1 ..]) |*y| {
+            if (x.call != y.call and x.lo <= y.hi and y.lo <= x.hi) {
+                x.ok = false;
+                y.ok = false;
+            }
         }
-    };
+        // Nor as an aggregate built in the result's memory (`planInPlace`).
+        var it = cg.in_place.iterator();
+        while (it.next()) |e| if (e.value_ptr.* == .none and x.lo <= def[e.key_ptr.*] and def[e.key_ptr.*] <= x.hi) {
+            x.ok = false;
+        };
+    }
     for (chains.items) |x| {
         if (!x.ok) continue;
         var v = x.ret_val;
@@ -1108,6 +1130,75 @@ fn planRetCalls(cg: *CodeGen) Error!void {
             v = datas[@backingInt(v)].ty_op.operand.toIndex().?;
         }
     }
+}
+
+/// Before allocation, as in the x86_64 backend: an aggregate or union
+/// that a `ret` right after it returns in memory is built in this
+/// function's result memory, which nothing else in the function points to
+/// (`planRetCalls` keeps its values out of it there); and a call that
+/// returns in memory, whose only user is a store right after it to a
+/// fresh `var`, writes its result there: the alloc comes right before the
+/// call, so nothing has its address yet, the callee included.
+fn planInPlace(cg: *CodeGen) Error!void {
+    const f = cg.ssa;
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const fates = f.live.items(.fate);
+    const ret_mem = cg.fn_ty.cc == .auto and cg.autoClass(cg.fn_ty.return_type) == .memory;
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        const values = f.blockInsts(block);
+        for (values, 0..) |u, k| {
+            if (tags[@backingInt(u)] != .store or fates[@backingInt(u)] != .normal) continue;
+            const bin = datas[@backingInt(u)].bin_op;
+            const v = bin.rhs.toIndex() orelse continue;
+            const vi = @backingInt(v);
+            const a = bin.lhs.toIndex() orelse continue;
+            if (tags[vi] != .call or tags[@backingInt(a)] != .alloc or fates[@backingInt(a)] != .normal) continue;
+            const info = Type.ptrInfo(ip, datas[@backingInt(a)].ty);
+            if (info.flags.is_const or info.flags.is_volatile) continue;
+            if (cg.calleeType(datas[vi].pl_op.operand).cc != .auto or cg.autoClass(cg.typeOf(bin.rhs)) != .memory) continue;
+            if (!cg.buildsInPlace(v, values[0..k])) continue;
+            const j = std.mem.findScalar(Inst.Index, values[0..k], v).?;
+            if (lastOf(tags, values[0..j]) != a) continue;
+            const extra = ir.extraData(Ir.Call, datas[vi].pl_op.payload);
+            if (std.mem.findScalar(Ref, ir.refSlice(extra.end, extra.data.args_len), bin.lhs) != null) continue;
+            try cg.in_place.put(cg.gpa, vi, bin.lhs);
+        }
+        if (ret_mem and b.term.tag == .ret and tags[@backingInt(b.term.inst)] == .ret) {
+            const v = datas[@backingInt(b.term.inst)].un_op.toIndex() orelse continue;
+            if (tags[@backingInt(v)] != .aggregate_init and tags[@backingInt(v)] != .union_init) continue;
+            if (ip.keyTag(ir.typeOfIndex(v, ip)) == .vector_type) continue;
+            if (cg.buildsInPlace(v, values)) try cg.in_place.put(cg.gpa, @backingInt(v), .none);
+        }
+    }
+}
+
+/// The last of `values`, ignoring debug markers.
+fn lastOf(tags: []const Inst.Tag, values: []const Inst.Index) ?Inst.Index {
+    for (0..values.len) |j| {
+        const x = values[values.len - 1 - j];
+        switch (tags[@backingInt(x)]) {
+            .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+            else => return x,
+        }
+    }
+    return null;
+}
+
+/// Whether value `v` may be built in place (`planInPlace`): its only user
+/// is the store or `ret` right after it, and it lives in memory with no
+/// home yet.
+fn buildsInPlace(cg: *CodeGen, v: Inst.Index, before: []const Inst.Index) bool {
+    const vi = @backingInt(v);
+    const live = cg.ssa.live.slice();
+    if (live.items(.uses)[vi] != 1 or live.items(.fate)[vi] != .normal) return false;
+    if (lastOf(cg.ir.instructions.items(.tag), before) != v) return false;
+    const ty = cg.ir.typeOfIndex(v, cg.ip);
+    if (Type.abiSize(cg.ip, ty) == 0 or cg.passInRegs(ty) or cg.inPair(ty) or cg.inVec(ty)) return false;
+    return cg.homes[vi] == .none;
 }
 
 fn calleeType(cg: *CodeGen, callee: Ref) InternPool.FuncType {
@@ -2648,6 +2739,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.copyMem(dst, .at(.x12, 0), Type.abiSize(ip, ty));
         },
         .store => {
+            // Already there (`planInPlace`).
+            if (cg.in_place.count() != 0) if (data.bin_op.rhs.toIndex()) |v| if (cg.in_place.contains(@backingInt(v))) return;
             const val = vector.stored(cg, data.bin_op.rhs);
             const size = Type.abiSize(ip, cg.typeOf(val));
             if (size == 0) return;
@@ -4034,6 +4127,8 @@ fn ret(cg: *CodeGen, operand: Ref) Error!void {
         .memory => {
             // Already there (`planRetCalls`).
             if (operand.toIndex()) |v| if (cg.homes[@backingInt(v)] == .result) return cg.epilogue();
+            // Built there (`planInPlace`).
+            if (operand.toIndex()) |v| if (cg.in_place.count() != 0 and cg.in_place.get(@backingInt(v)) == .none) return cg.epilogue();
             try cg.loadMem(.x12, cg.ret_ptr_slot.?, .usize_type);
             try cg.copyTo(.at(.x12, 0), operand);
         },
@@ -4306,6 +4401,14 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         else => null,
     };
     const in_pair = if (tail) null else cg.pairOf(inst.toRef());
+    // A fresh `var`'s memory (`planInPlace`) is a frame address the
+    // argument copies leave alone; otherwise the store copies the result.
+    if (cg.in_place.count() != 0) if (cg.in_place.get(@backingInt(inst))) |p| if (switch (try cg.locOf(p)) {
+        .addr => |m| m.base != .reg or (m.base.reg != .sp and m.base.reg != .x29),
+        else => true,
+    }) {
+        _ = cg.in_place.remove(@backingInt(inst));
+    };
     const dst = if (tail or in_reg or to_result != null or in_pair != null) null else try cg.resultMem(inst, ret_ty);
     var pn_save: ?Mem = null;
     var stack_args = false;
