@@ -1620,12 +1620,17 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
     if (!Type.hasRuntimeBits(ip, ty)) return .none;
     switch (ip.indexToKey(val)) {
         .undef => if (cg.passInRegs(ty)) {
-            // The 0xaa bytes of its size, extended as a load extends them.
-            const bits: u6 = @intCast(Type.abiSize(ip, ty) * 8 % 64);
+            // The 0xaa bytes of its size, extended as a load extends them:
+            // an integer or enum from its width (`loadMem`), so a register
+            // holds no bits a switch's bounds exclude (`switch_br.bounds`).
+            const bits: u6 = @intCast(switch (Type.class(ip, ty)) {
+                .int, .@"enum" => Type.intInfo(ip, ty).bits,
+                else => Type.abiSize(ip, ty) * 8,
+            } % 64);
             const v: u64 = 0xaaaa_aaaa_aaaa_aaaa;
             if (bits == 0) return .{ .imm = v };
             if (cg.signed(ty)) return .{ .imm = @bitCast(@as(i64, @bitCast(v << @intCast(64 - @as(u7, bits)))) >> @intCast(64 - @as(u7, bits))) };
-            return .{ .imm = v >> @intCast(64 - @as(u7, bits)) };
+            return .{ .imm = v << @intCast(64 - @as(u7, bits)) >> @intCast(64 - @as(u7, bits)) };
         },
         .int => if (cg.passInRegs(ty)) return .{ .imm = intBits(ip, val) },
         .float => |f| if (cg.passInRegs(ty)) return .{ .imm = @truncate(f.bits()) },
@@ -2427,7 +2432,10 @@ fn switchBr(cg: *CodeGen, data: Inst.Data, term: Ssa.Term) Error!bool {
         try cg.load(.x9, data.pl_op.operand);
         const else_label = cg.blockLabel(term.succ[1]);
         const em: SwitchEmit = .{ .cg = cg, .flip = flip, .else_label = else_label };
-        const b = switch_br.bounds(Type.abiSize(cg.ip, op_ty), flip != 0);
+        const b = switch_br.bounds(switch (Type.class(cg.ip, op_ty)) {
+            .int, .@"enum" => Type.intInfo(cg.ip, op_ty).bits,
+            else => Type.abiSize(cg.ip, op_ty) * 8,
+        }, flip != 0);
         return switch_br.lower(cg.gpa, em, switch_br.prepare(cases.items), b[0], b[1], @backingInt(else_label));
     }
     if (!wide) try cg.load(.x9, data.pl_op.operand);

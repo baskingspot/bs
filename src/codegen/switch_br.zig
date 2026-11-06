@@ -45,12 +45,13 @@ pub fn prepare(cases: []Case) []Case {
     return cases[0..n];
 }
 
-/// The keys an operand of `abi_size` bytes can hold, extended as
-/// registers and memory hold it (a value is extended from its ABI size,
-/// not its bits: an undefined `u4` is 0xaa).
-pub fn bounds(abi_size: u64, signed: bool) [2]u64 {
-    const bytes: u64 = @min(abi_size, 8);
-    const bits: u7 = @intCast(bytes * 8);
+/// The keys an operand of `bits` bits can hold. A register holds an
+/// integer or enum extended from its width (an undefined `u4` is 0xa, as
+/// a load of 0xaa reads it), so a switch whose cases cover every value of
+/// a `u3` or an `enum(u2)` needs no bounds check: the corrupt-value else
+/// block is unreachable, as in upstream's LLVM build.
+pub fn bounds(bits_in: u64, signed: bool) [2]u64 {
+    const bits: u7 = @intCast(@min(bits_in, 64));
     const top: u64 = if (bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bits)) - 1;
     if (!signed) return .{ 0, top };
     const half = top >> 1;
