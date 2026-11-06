@@ -1028,10 +1028,14 @@ comptime arguments are run-time values in the lowered code (uucode's
   where the caller's own came (Sema made the two function types equal),
   stack ones through slots since they may read the caller's, passes the
   caller's result pointer in x8, pops the frame and branches. An `.auto`
-  argument passed by reference must be a by-reference parameter, in any
-  position, or a constant: a value in the popped frame is refused with
-  an error at the call's line (bs may reject more than upstream, whose
-  LLVM emits it), as is any C argument passed by reference. Inline assembly is parsed from GNU/LLVM syntax: the
+  argument passed by reference has a slot reserved for it in its
+  caller's outgoing area, after the stack arguments, which the callee
+  owns and where the caller puts the copy it needs: a tail call passes
+  on by-reference parameters and constants, and puts a value from the
+  frame it pops in that slot, its own as the callee's type is its own
+  (then every parameter it passes on too, which may point to any of the
+  slots). A C argument passed by reference is refused, as its copy lives
+  in the popped frame. Inline assembly is parsed from GNU/LLVM syntax: the
   loads, stores, moves, arithmetic, branches, barriers, hints, and `mrs`
   of the thread registers that std uses, and the NEON instructions of
   std's AES, GHASH/POLYVAL and SHA-256 code (`aese`/`aesmc`, `pmull`,
@@ -1639,8 +1643,8 @@ identity is in every cache key):
   copied at all), a by-reference parameter's pointer, or a value's slot
   (values have no address anything could write through, and a slot is
   reused only after the call), and copies anything else, such as a load
-  whose memory the callee might write, to its outgoing area, after the
-  stack arguments. A parameter that gets no register is copied in at
+  whose memory the callee might write, to the slot reserved for it in
+  its outgoing area, after the stack arguments. A parameter that gets no register is copied in at
   entry; on aarch64 it keeps the pointer it came with for the calls that
   pass it on (`byref_ptr`). `test/run/byref.zig` and
   `test/run/arg_byref.zig` check the aliasing cases (`f(g.*)` writing

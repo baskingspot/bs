@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "21 100 22 270 22 278 27 71 197 1496 10003 10010 46 7890123456\n"
+//! stdout: "21 100 22 270 22 278 27 71 197 1496 10003 10010 46 7890123456 212\n"
 
 // `.auto` passes an argument larger than 16 bytes by reference: a pointer
 // to memory that does not change during the call. The callee reads it
@@ -10,7 +10,8 @@
 // still sees the value it was called with; so does one whose result goes
 // where its argument came from. Twelve such parameters live across calls
 // do not all get registers; four are passed on the stack. A tail call
-// passes on its by-reference parameters and constants.
+// passes on its by-reference parameters and constants, and puts a value
+// from the frame it pops in a slot the callee's caller reserved for it.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -108,6 +109,27 @@ noinline fn rotate(a: Big, b: Big, c: Big, d: Big, e: Big, f: Big, g: Big, h: Bi
 
 const seven: Big = .{ .v = .{ 7, 0, 0, 0, 0, 0 } };
 
+/// Tail calls with arguments from the frame they pop, which go in the
+/// callee's reserved slots, while parameters passed on in other positions
+/// point to those slots.
+noinline fn shuffle(a: Big, b: Big, n: u64) u64 {
+    const modifier: std.builtin.CallModifier = if (builtin.cpu.arch == .aarch64) .always_tail else .auto;
+    switch (n) {
+        0 => return a.v[0] * 100 + b.v[0],
+        1, 3 => return @call(modifier, shuffle, .{ b, a, n - 1 }),
+        2 => {
+            var z = b;
+            z.v[0] += 10;
+            return @call(modifier, shuffle, .{ z, b, n - 1 });
+        },
+        else => {
+            var x = a;
+            x.v[0] += 1;
+            return @call(modifier, shuffle, .{ x, b, n - 1 });
+        },
+    }
+}
+
 pub fn main() void {
     var v: Big = .{ .v = .{ 1, 2, 3, 4, 5, 6 } };
     std.mem.doNotOptimizeAway(&v);
@@ -134,7 +156,7 @@ pub fn main() void {
     var r: [10]Big = undefined;
     for (&r, 0..) |*x, k| x.* = .{ .v = .{ k, 0, 0, 0, 0, 0 } };
     std.mem.doNotOptimizeAway(&r);
-    w.print("{} {} {} {} {} {} {} {} {} {} {} {} {} {}\n", .{
+    w.print("{} {} {} {} {} {} {} {} {} {} {} {} {} {} {}\n", .{
         a,
         b,
         c,
@@ -149,6 +171,7 @@ pub fn main() void {
         countdown(table, v, 1),
         overAligned(v) + overAligned(table),
         rotate(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], 3),
+        shuffle(r[1], r[5], 4),
     }) catch unreachable;
     std.Io.File.stdout().writeStreamingAll(std.Options.debug_io, w.buffered()) catch {};
 }
