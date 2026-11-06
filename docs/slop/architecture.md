@@ -2664,7 +2664,9 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    `.auto` arguments and results, and the error-union and optional
    operations produce and read in registers; other code reads a pair
    from a spill slot written at the read. A pair gets two free registers
-   or none, and is neither evicted nor tied. Error unions of up to 8
+   or none, and is neither evicted nor tied. A call's pair result or a
+   wrapped optional that only its block's `ret` reads, computed last,
+   gets none: it is in rax and rdx, where `.auto` returns it. Error unions of up to 8
    bytes are in one register (error code in the low 16 bits). So are
    loads and block results of other aggregates of 1, 2, 4, or 8 bytes
    (`inGprBytes`: their bytes, extended like a load); code that reads
