@@ -1410,6 +1410,12 @@ with few enough bits, a narrowing cast of such a value or past its
 emitted safety check, with `Ssa.heldBits` bounding a load by the bytes
 it reads; signed values are always normalized. On the zig compiler's
 source, 188,049 → 159,994 `ubfx`.
+A u32's arithmetic, shifts, divisions and `~` run on w registers, which
+zero-extend, so they need no `ubfx` at all; so do byte swaps, bit
+reversals, and the counting operations at 32 bits and below (a byte swap
+or bit reversal shifts the bits above its operand out, so it extends
+nothing first). On the zig compiler's source, 159,994 → 152,935 `ubfx`;
+std's tests 85,782 → 71,069.
 
 The position is the IR's statement position (line, column) and the
 innermost open inline call (an index into the function's inline table),

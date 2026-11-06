@@ -2945,6 +2945,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const d = cg.resultReg(inst, .x9);
             if (ty == .bool_type) {
                 try cg.e.logic(.eor, .x, d, a, .{ .imm = 1 });
+            } else if (Type.isInt(ip, ty) and Type.intInfo(ip, ty).signedness == .unsigned and Type.intInfo(ip, ty).bits == 32) {
+                // On a w register: zero-extended.
+                try cg.e.mvn(.w, d, a);
             } else {
                 try cg.e.mvn(.x, d, a);
                 try cg.normalize(d, ty);
@@ -3439,7 +3442,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             if (cg.isWideInt(src_ty)) return cg.wideBitOp(inst, tag, data);
             const bits = Type.intInfo(ip, src_ty).bits;
             try cg.bitOp(tag, bits, data.ty_op.operand);
-            if (tag == .byte_swap or tag == .bit_reverse) try cg.normalize(.x9, ty);
+            // A byte swap or bit reversal leaves `bits` bits, zero-extended;
+            // a byte swap of a byte leaves the operand.
+            if ((tag == .byte_swap and (bits <= 8 or cg.signed(ty))) or (tag == .bit_reverse and cg.signed(ty))) try cg.normalize(.x9, ty);
             try cg.setResult(inst, ty, .x9);
         },
         .tag_name => {
@@ -3592,39 +3597,45 @@ fn memset(cg: *CodeGen, data: Inst.Data) Error!void {
     e.bind(done);
 }
 
-/// The bit operations into x9.
+/// The bit operations into x9, on w registers for at most 32 bits, which
+/// read only their low 32 bits and zero-extend. A byte swap or bit
+/// reversal shifts the bits above the operand's out, so it needs no
+/// extending first.
 fn bitOp(cg: *CodeGen, tag: Inst.Tag, bits: u16, operand: Ref) Error!void {
     const e = &cg.e;
     // A u0 at run time (`std.mem.writeInt` of no bytes): every result is
     // 0.
     if (bits == 0) return e.movImm(.x, .x9, 0);
     try cg.load(.x9, operand);
-    // Only the operand's own bits.
-    if (bits < 64) try e.bitfield(.ubfm, .x, .x9, .x9, 0, @intCast(bits - 1));
+    const w: Encoder.Width = if (bits <= 32) .w else .x;
+    const wb = w.bits();
     switch (tag) {
         .clz => {
-            try e.bitOp(.clz, .x, .x9, .x9);
-            if (bits < 64) try e.addSub(.sub, .x, .x9, .x9, .{ .imm = 64 - bits });
+            // Only the operand's own bits.
+            if (bits < wb) try e.bitfield(.ubfm, .x, .x9, .x9, 0, @intCast(bits - 1));
+            try e.bitOp(.clz, w, .x9, .x9);
+            if (bits < wb) try e.addSub(.sub, .x, .x9, .x9, .{ .imm = wb - bits });
         },
         .ctz => {
             // A bit above the operand's makes 0 count `bits`.
-            if (bits < 64) try e.logic(.orr, .x, .x9, .x9, .{ .imm = @as(u64, 1) << @intCast(bits) });
-            try e.bitOp(.rbit, .x, .x9, .x9);
-            try e.bitOp(.clz, .x, .x9, .x9);
+            if (bits < wb) try e.logic(.orr, w, .x9, .x9, .{ .imm = @as(u64, 1) << @intCast(bits) });
+            try e.bitOp(.rbit, w, .x9, .x9);
+            try e.bitOp(.clz, w, .x9, .x9);
         },
         .popcount => {
-            try e.fmovFromGpr(.f64, .v0, .x, .x9);
+            if (bits < wb) try e.bitfield(.ubfm, .x, .x9, .x9, 0, @intCast(bits - 1));
+            if (w == .w) try e.fmovFromGpr(.f32, .v0, .w, .x9) else try e.fmovFromGpr(.f64, .v0, .x, .x9);
             try e.cnt(.v0, .v0);
             try e.addv(.v0, .v0);
             try e.fmovToGpr(.w, .x9, .f32, .v0);
         },
         .byte_swap => if (bits > 8) {
-            try e.bitOp(.rev, .x, .x9, .x9);
-            if (bits < 64) try e.shiftImm(.lsr, .x, .x9, .x9, @intCast(64 - bits));
+            try e.bitOp(.rev, w, .x9, .x9);
+            if (bits < wb) try e.shiftImm(.lsr, w, .x9, .x9, @intCast(wb - bits));
         },
         .bit_reverse => {
-            try e.bitOp(.rbit, .x, .x9, .x9);
-            if (bits < 64) try e.shiftImm(.lsr, .x, .x9, .x9, @intCast(64 - bits));
+            try e.bitOp(.rbit, w, .x9, .x9);
+            if (bits < wb) try e.shiftImm(.lsr, w, .x9, .x9, @intCast(wb - bits));
         },
         else => unreachable,
     }
@@ -3706,14 +3717,18 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Cond {
     }
 }
 
-/// Computes `lhs op rhs`, value `inst`, on 64-bit extended operands into
+/// Computes `lhs op rhs`, value `inst`, on 64-bit extended operands (a
+/// u32's arithmetic and shifts on w registers, which zero-extend) into
 /// `d`, normalized to `ty` unless that changes nothing (`rawFits`),
 /// writing `d` after reading both. Uses x9, x10, x11, x13, and x14; `d`
 /// is x9 or none of those.
 fn binOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref, d: Reg) Error!void {
     const e = &cg.e;
     const s = cg.signed(ty);
-    const norm = !cg.rawFits(inst, ty);
+    // A u32 operation on w registers zero-extends its result, which is
+    // then normalized.
+    const w: Encoder.Width = if (Type.isInt(cg.ip, ty) and !s and Type.intInfo(cg.ip, ty).bits == 32) .w else .x;
+    const norm = w == .x and !cg.rawFits(inst, ty);
     const a = try cg.use(lhs, .x9);
     // Immediate forms of the operations that have them.
     const imm: ?u64 = switch (try cg.locOf(rhs)) {
@@ -3722,7 +3737,7 @@ fn binOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, ty: Index, lhs: Ref, rhs
     };
     switch (tag) {
         .add_wrap, .sub_wrap => if (imm) |v| if (v < 4096) {
-            try e.addSub(if (tag == .add_wrap) .add else .sub, .x, d, a, .{ .imm = @intCast(v) });
+            try e.addSub(if (tag == .add_wrap) .add else .sub, w, d, a, .{ .imm = @intCast(v) });
             if (norm) try cg.normalize(d, ty);
             return;
         },
@@ -3734,7 +3749,7 @@ fn binOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, ty: Index, lhs: Ref, rhs
             }, .x, d, a, .{ .imm = v });
         },
         .shl, .shr => if (imm) |v| {
-            try e.shiftImm(if (tag == .shl) .lsl else if (s) .asr else .lsr, .x, d, a, @intCast(v & 63));
+            try e.shiftImm(if (tag == .shl) .lsl else if (s) .asr else .lsr, w, d, a, @intCast(v & (w.bits() - 1)));
             if (norm) try cg.normalize(d, ty);
             return;
         },
@@ -3748,15 +3763,15 @@ fn binOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, ty: Index, lhs: Ref, rhs
     }
     const b = try cg.use(rhs, .x10);
     switch (tag) {
-        .add_wrap => try e.addSub(.add, .x, d, a, .r(b)),
-        .sub_wrap => try e.addSub(.sub, .x, d, a, .r(b)),
-        .mul_wrap => try e.mul(.x, d, a, b),
+        .add_wrap => try e.addSub(.add, w, d, a, .r(b)),
+        .sub_wrap => try e.addSub(.sub, w, d, a, .r(b)),
+        .mul_wrap => try e.mul(w, d, a, b),
         .bit_and => return e.logic(.@"and", .x, d, a, .r(b)),
         .bit_or => return e.logic(.orr, .x, d, a, .r(b)),
         .xor => return e.logic(.eor, .x, d, a, .r(b)),
-        .shl => try e.shiftReg(.lsl, .x, d, a, b),
-        .shr => try e.shiftReg(if (s) .asr else .lsr, .x, d, a, b),
-        .div_trunc, .div_floor, .div_ceil, .rem, .mod => try cg.divide(tag, s, a, b, d),
+        .shl => try e.shiftReg(.lsl, w, d, a, b),
+        .shr => try e.shiftReg(if (s) .asr else .lsr, w, d, a, b),
+        .div_trunc, .div_floor, .div_ceil, .rem, .mod => try cg.divide(tag, s, w, a, b, d),
         else => unreachable,
     }
     if (norm) try cg.normalize(d, ty);
@@ -3775,13 +3790,14 @@ fn rawFits(cg: *CodeGen, inst: Inst.Index, ty: Index) bool {
 }
 
 /// `d = a op b` for division `tag` of 64-bit extended registers, signed
-/// or not by `s`, writing `d` after reading both. Uses x11, x13, and x14.
-fn divide(cg: *CodeGen, tag: Inst.Tag, s: bool, a: Reg, b: Reg, d: Reg) Error!void {
+/// or not by `s`, on `w` registers for a u32, writing `d` after reading
+/// both. Uses x11, x13, and x14.
+fn divide(cg: *CodeGen, tag: Inst.Tag, s: bool, w: Encoder.Width, a: Reg, b: Reg, d: Reg) Error!void {
     const e = &cg.e;
     // x11 = quotient, x13 = remainder. Safety checks before this
     // rule out division by zero and minInt / -1.
-    try e.div(s, .x, .x11, a, b);
-    try e.mulAdd(.msub, .x, .x13, .x11, b, a);
+    try e.div(s, w, .x11, a, b);
+    try e.mulAdd(.msub, w, .x13, .x11, b, a);
     if (s and (tag == .div_floor or tag == .mod)) {
         // Adjust when the remainder is non-zero and its sign
         // differs from the divisor's.
@@ -6172,9 +6188,9 @@ fn wideDivFast(cg: *CodeGen, tag: Inst.Tag, s: bool, lhs: Mem, rhs: Mem, rhs_ref
             try cg.divConstSigned(tag, .x9, c, 64, .x9);
         } else {
             try e.movImm(.x, .x10, c);
-            try cg.divide(tag, s, .x9, .x10, .x9);
+            try cg.divide(tag, s, .x, .x9, .x10, .x9);
         }
-    } else try cg.divide(tag, s, .x9, .x10, .x9);
+    } else try cg.divide(tag, s, .x, .x9, .x10, .x9);
     try cg.strLimb(dst, 0, .x9);
     if (s) {
         try e.shiftImm(.asr, .x, .x9, .x9, 63);
