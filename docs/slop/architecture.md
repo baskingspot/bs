@@ -2771,7 +2771,13 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    of the variable, moves from the register instead of reloading memory
    just written, until a value writes the register (`Encoder.written`)
    or may write memory other than its own slot or another variable's
-   (`keepsSlot`), or the slot is given to another value. The encoder records the general-purpose registers
+   (`keepsSlot`), or the slot is given to another value; it carries into
+   the next block when that block's only predecessor is the block just
+   emitted and that block ends in a fallthrough, a conditional branch or
+   a switch that writes neither the register nor memory. A store through
+   any pointer that is not itself a variable's address, memcpy and
+   memset, atomics, calls and inline assembly all end it, so a variable
+   whose address escapes is safe as well. The encoder records the general-purpose registers
    each instruction writes (`Encoder.written`: destinations, implicit
    ones such as mul's rdx or rep movsb's rcx, rsi and rdi, every
    caller-saved one for a call or an inline assembly instruction), and

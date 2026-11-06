@@ -193,6 +193,13 @@ held_before: u16 = 0,
 held_new: bool = false,
 /// Whether `genBlock` is emitting a value, the only code that sets `held`.
 holding: bool = false,
+/// The block `genBlock` emitted last if `held` was still valid at its end:
+/// its terminator writes neither memory nor the register. A block whose
+/// only predecessor that is (`only_pred`) keeps `held`. Else `no_base`.
+held_from: u32 = no_base,
+/// From `planDeferred`: per block, its only predecessor after forwarding;
+/// `maxInt` for none, `maxInt - 1` for several.
+only_pred: std.ArrayList(u32) = .empty,
 /// From `planVarShares`: loads of promoted variables in memory that read
 /// the variable's slot as their own.
 var_share: std.bit_set.Dynamic = .{},
@@ -361,6 +368,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.arg_refs.deinit(gpa);
         cg.pair_spills.deinit(gpa);
         cg.split.deinit(gpa);
+        cg.only_pred.deinit(gpa);
         cg.var_share.deinit(gpa);
         cg.var_counts.deinit(gpa);
         cg.var_stores.deinit(gpa);
@@ -3508,9 +3516,10 @@ fn planDeferred(cg: *CodeGen) Error!void {
     const fate = f.live.items(.fate);
     const ret_deferred = cg.fn_ty.cc == .auto and cg.autoClass(cg.fn_ty.return_type) == .memory;
     // Each block's predecessor when it has exactly one, after forwarding.
-    const pred = try cg.gpa.alloc(u32, 2 * f.blocks.items.len);
-    defer cg.gpa.free(pred);
-    const pos = pred[f.blocks.items.len..];
+    try cg.only_pred.resize(cg.gpa, f.blocks.items.len);
+    const pred = cg.only_pred.items;
+    const pos = try cg.gpa.alloc(u32, f.blocks.items.len);
+    defer cg.gpa.free(pos);
     const none = std.math.maxInt(u32);
     @memset(pred[0..f.blocks.items.len], none);
     for (f.layout.items, 0..) |block, li| pos[@backingInt(block)] = @intCast(li);
@@ -5099,6 +5108,7 @@ fn emitBlocks(cg: *CodeGen) Error!void {
     const f = cg.ssa;
     const order = f.order.items;
     for (cg.labels) |*l| l.* = try cg.e.newLabel();
+    cg.held_from = no_base;
     var k: usize = 0; // the next block in `order`
     for (f.layout.items, 0..) |block, i| {
         if (!f.emits(i, block)) continue;
@@ -5198,7 +5208,10 @@ fn keepSymbols(cg: *CodeGen, inst: Inst.Index) Error!void {
 fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!void {
     cg.e.bind(cg.labels[@backingInt(block)]);
     cg.cur_block = @backingInt(block);
-    cg.held = null;
+    // Entered only from the block just emitted, past a terminator that
+    // kept it.
+    if (!cg.live or cg.held_from == no_base or cg.only_pred.items[@backingInt(block)] != cg.held_from or cg.ssa.covered.items[@backingInt(block)]) cg.held = null;
+    cg.held_from = no_base;
     if (cg.ssa.covered.items[@backingInt(block)]) try cg.coverPoint(block == cg.ssa.layout.items[0]);
     const b = cg.ssa.blocks.items[@backingInt(block)];
     const cl = cg.ssa.clobbers.items;
@@ -5225,6 +5238,15 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
     cg.e.written = 0;
     const term = cg.ssa.blocks.items[@backingInt(block)].term;
     try cg.genTerm(term, next);
+    // A conditional branch or a switch writes no memory; a `br` may write
+    // its block's result.
+    if (cg.held) |h| if (cg.e.written & h.reg.bit() == 0 and switch (term.tag) {
+        .fallthrough, .switch_br => true,
+        .branch => cg.ir.instructions.items(.tag)[@backingInt(term.inst)] == .cond_br,
+        else => false,
+    }) {
+        cg.held_from = @backingInt(block);
+    };
     if (cg.live) {
         const data = cg.ir.instructions.items(.data)[@backingInt(term.inst)];
         // A `br` writes its block's result; a `ret` ends with the epilogue.
