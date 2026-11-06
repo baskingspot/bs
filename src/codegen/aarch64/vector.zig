@@ -273,8 +273,9 @@ fn fusedCmp(cg: *CodeGen, inst: Inst.Index) ?Inst.Index {
     return c;
 }
 
-/// Whether bitcast `inst`, of a vector of lanes to an array or vector of
-/// its size (the coercion before storing a vector into an array), is not
+/// Whether bitcast `inst`, of a vector of lanes to an array, vector or
+/// integer of its size (the coercion before storing a vector into an
+/// array), is not
 /// emitted: its only user is the store right after it, which stores the
 /// operand instead (`stored`), saving a copy of the vector.
 fn storedBitcast(cg: *CodeGen, inst: Inst.Index) bool {
@@ -283,8 +284,10 @@ fn storedBitcast(cg: *CodeGen, inst: Inst.Index) bool {
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op;
     const src_ty = cg.typeOf(data.operand);
     if (shape(ip, src_ty) == null) return false;
-    if (ip.keyTag(data.ty) != .array_type and ip.keyTag(data.ty) != .vector_type) return false;
+    if (ip.keyTag(data.ty) != .array_type and ip.keyTag(data.ty) != .vector_type and !Type.isInt(ip, data.ty)) return false;
     if (Type.abiSize(ip, data.ty) != Type.abiSize(ip, src_ty)) return false;
+    // An integer of all the vector's bytes (GHASH's u128 of a product).
+    if (Type.isInt(ip, data.ty) and Type.intInfo(ip, data.ty).bits != 8 * Type.abiSize(ip, src_ty)) return false;
     const live = cg.ssa.live.slice();
     if (live.items(.uses)[@backingInt(inst)] != 1 or live.items(.fate)[@backingInt(inst)] != .normal) return false;
     const tags = cg.ir.instructions.items(.tag);
@@ -550,8 +553,10 @@ fn loadChunk(cg: *CodeGen, r: VReg, ref: Ref, k: u32) Error!void {
         },
         .none => try zero(cg, r),
         .vreg => |v| try move(cg, r, v),
-        // Vectors have no general register (`CodeGen.inGpr`, `CodeGen.inPair`).
-        .addr, .err, .reg, .regs => unreachable,
+        // A 128-bit integer in a register pair, bitcast.
+        .regs => |p| try fromPair(cg, r, p),
+        // Vectors have no general register (`CodeGen.inGpr`).
+        .addr, .err, .reg => unreachable,
     }
 }
 
@@ -585,6 +590,19 @@ pub fn copy(cg: *CodeGen, inst: Inst.Index, ty: Index, operand: Ref) Error!void 
         .reg => |r| try loadVec(cg, r, operand),
         .mem => |m| try cg.copyTo(m, operand),
     }
+}
+
+/// `fmov dr, x(lo); fmov vr.d[1], x(hi)`: the 16 bytes of a register pair
+/// (a 128-bit integer) in a vector register.
+pub fn fromPair(cg: *CodeGen, r: VReg, p: CodeGen.Regs) Error!void {
+    try cg.e.fmovFromGpr(.f64, r, .x, p.lo);
+    try emit(cg, 0x9eaf0000 | xn(p.hi) << 5 | vn(r));
+}
+
+/// `fmov x(lo), dv; fmov x(hi), vv.d[1]`: the inverse of `fromPair`.
+pub fn toPair(cg: *CodeGen, d: CodeGen.Regs, v: VReg) Error!void {
+    try cg.e.fmovToGpr(.x, d.lo, .f64, v);
+    try emit(cg, 0x9eae0000 | vn(v) << 5 | xn(d.hi));
 }
 
 /// `mov d.16b, s.16b`.
