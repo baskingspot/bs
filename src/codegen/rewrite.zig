@@ -377,12 +377,13 @@ const Walker = struct {
         const r = w.constOf(bin.rhs) orelse return null;
         const a = value(l);
         const b = value(r);
-        const exact: i128 = switch (tag) {
+        // In i129: the product of two u64s reaches almost 2^128.
+        const exact: i129 = switch (tag) {
             .add_with_overflow => a + b,
             .sub_with_overflow => a - b,
-            else => a * b,
+            else => @as(i129, a) * b,
         };
-        const wrapped = truncate(low64(exact), l.info.bits);
+        const wrapped = truncate(@truncate(@as(u129, @bitCast(exact))), l.info.bits);
         const elems = [2]Index{
             (try w.intern(ty, wrapped)).toInterned().?,
             (try w.intern(.u1_type, @intFromBool(value(.{ .bits = wrapped, .info = l.info }) != exact))).toInterned().?,
