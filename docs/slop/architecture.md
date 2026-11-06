@@ -917,8 +917,8 @@ comptime arguments are run-time values in the lowered code (uucode's
   in stack slots shared by lifetime. Floats and vectors share one home,
   `.vreg`. x9-x11 hold every lowering's operands and x16-x17 its
   addresses; x12-x14 are also scratch, but only for the lowerings that
-  `scratchUse` names before allocation (x12 for a load or store through
-  a spilled pointer, all three for overflow arithmetic, division,
+  `scratchUse` names before allocation (x12 for an element read, x13
+  for a return of an odd-sized value, all three for overflow arithmetic, division,
   memcpy and memset, wide integers, and anything not on its list): one
   `Ssa.allocate` restriction per register keeps a value out of it when
   such a lowering lies in its interval or at its ends, and clobber

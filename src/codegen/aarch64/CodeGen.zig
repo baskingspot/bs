@@ -751,8 +751,11 @@ fn scratchUse(cg: *CodeGen, inst: Inst.Index) u32 {
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => 0,
         .intcast, .trunc, .bitcast, .int_from_bool, .int_from_ptr, .ptr_from_int => 0,
         .optional_payload, .optional_payload_ptr, .wrap_optional, .unwrap_errunion_payload, .unwrap_errunion_err, .wrap_errunion_payload, .wrap_errunion_err, .get_union_tag => 0,
-        // A pointer in memory is loaded into x12 (`ptrMem`, `elemAddrTo`).
-        .load, .store, .ptr_elem_val, .slice_elem_val => x12,
+        // A pointer in memory is loaded into x11 (`ptrMem`); copies go
+        // through x9, x10, x16 and x17 (`copyMem`).
+        .load, .store => 0,
+        // The element's address is computed into x12 (`elemAddrTo`).
+        .ptr_elem_val, .slice_elem_val => x12,
         else => scratch_mask,
     };
 }
@@ -765,8 +768,14 @@ fn termScratch(cg: *CodeGen, block: Ssa.Block.Index) u32 {
     return switch (term.tag) {
         .fallthrough, .noreturn, .unreach, .jump, .branch => 0,
         .switch_br => if (cg.isWideInt(cg.typeOf(cg.ir.instructions.items(.data)[@backingInt(term.inst)].pl_op.operand))) scratch_mask else 0,
-        // Storing the result through the result pointer.
-        .ret => 1 << 12 | 1 << 13,
+        // Loading a result of an odd size into x0 or x1 (`loadBytes`); a
+        // result in memory is copied through x9, x10, x16 and x17 to the
+        // result pointer, in x11.
+        .ret => ret: {
+            const size = Type.abiSize(cg.ip, cg.fn_ty.return_type);
+            const last = if (size > 8) size - 8 else size;
+            break :ret if (size <= 16 and last != 0 and !std.math.isPowerOfTwo(last)) 1 << 13 else 0;
+        },
     };
 }
 
@@ -2333,14 +2342,14 @@ pub fn setResult(cg: *CodeGen, inst: Inst.Index, ty: Index, reg: Reg) Error!void
     try cg.storeReg(m, reg, Type.abiSize(cg.ip, ty));
 }
 
-/// The memory pointer `ptr` points to. May use x12.
+/// The memory pointer `ptr` points to. May use x11.
 fn ptrMem(cg: *CodeGen, ptr: Ref) Error!Mem {
     switch (try cg.locOf(ptr)) {
         .addr => |m| return m,
         .reg => |r| return .at(r, 0),
         else => {
-            try cg.load(.x12, ptr);
-            return .at(.x12, 0);
+            try cg.load(.x11, ptr);
+            return .at(.x11, 0);
         },
     }
 }
@@ -2860,8 +2869,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 return cg.setResult(inst, ty, d);
             }
             const dst = try cg.resultMem(inst, ty) orelse return;
-            try cg.load(.x12, data.ty_op.operand);
-            try cg.copyMem(dst, .at(.x12, 0), Type.abiSize(ip, ty));
+            try cg.load(.x11, data.ty_op.operand);
+            try cg.copyMem(dst, .at(.x11, 0), Type.abiSize(ip, ty));
         },
         .store => {
             const val = vector.stored(cg, data.bin_op.rhs);
@@ -4208,8 +4217,8 @@ fn ret(cg: *CodeGen, operand: Ref) Error!void {
         .memory => {
             // Already there (`planRetCalls`).
             if (operand.toIndex()) |v| if (cg.homes[@backingInt(v)] == .result) return cg.epilogue();
-            try cg.loadMem(.x12, cg.ret_ptr_slot.?, .usize_type);
-            try cg.copyTo(.at(.x12, 0), operand);
+            try cg.loadMem(.x11, cg.ret_ptr_slot.?, .usize_type);
+            try cg.copyTo(.at(.x11, 0), operand);
         },
     }
     try cg.epilogue();
@@ -4227,8 +4236,8 @@ fn cRet(cg: *CodeGen, operand: Ref) Error!void {
             try cg.loadFpRun(try cg.valMem(try cg.valOf(operand)), 0, h.n, h.size);
         },
         .indirect => {
-            try cg.loadMem(.x12, cg.ret_ptr_slot.?, .usize_type);
-            try cg.copyTo(.at(.x12, 0), operand);
+            try cg.loadMem(.x11, cg.ret_ptr_slot.?, .usize_type);
+            try cg.copyTo(.at(.x11, 0), operand);
         },
         .unsupported, .bool_split => unreachable, // rejected by `setupParams`
     }
