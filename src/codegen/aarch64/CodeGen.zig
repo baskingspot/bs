@@ -546,15 +546,6 @@ fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
     return error.CodegenFail;
 }
 
-/// As `fail`, at the line of the statement being lowered.
-fn failStmt(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
-    if (try asm_src.stmt(cg.emit.zcu, cg.ir.func, if (cg.dbg_open.getLastOrNull()) |o| cg.dbg_inlines.items[o.index] else null, cg.dbg_files.items, cg.dbg_line)) |at| {
-        try cg.emit.addError(at.file, at.span, "bs codegen (aarch64): " ++ fmt, args);
-        return error.CodegenFail;
-    }
-    return cg.fail(fmt, args);
-}
-
 // ---------------------------------------------------------------------------
 // Frame and homes
 
@@ -4916,6 +4907,16 @@ fn argRef(cg: *CodeGen, ref: Ref, tail: bool) Error!?ArgRef {
     };
 }
 
+/// The position of this function's parameter that `ref` is, also as a
+/// load forwarded from it (`Live.fwd`).
+fn paramIndex(cg: *CodeGen, ref: Ref) ?usize {
+    const tags = cg.ir.instructions.items(.tag);
+    var v = @backingInt(ref.toIndex() orelse return null);
+    if (cg.live and cg.ssa.live.items(.fwd)[v] != Ssa.no_tie and tags[v] == .load) v = cg.ssa.live.items(.fwd)[v];
+    if (tags[v] != .arg) return null;
+    return std.mem.indexOfScalar(Inst.Index, cg.ir.mainBody(), @fromBackingInt(v));
+}
+
 /// Puts by-reference argument pointer `src` in `reg`.
 fn argPtrTo(cg: *CodeGen, reg: Reg, src: ArgRef) Error!void {
     switch (src) {
@@ -4930,18 +4931,47 @@ fn argPtrTo(cg: *CodeGen, reg: Reg, src: ArgRef) Error!void {
 /// argument register is written once, after the copies that use scratch
 /// registers. A tail call's stack arguments replace the caller's incoming
 /// ones (at fp + 16), which they may be computed from, so they are copied
-/// to slots first, and so are the pointers of by-reference ones. `refs`,
-/// for an `.auto` call, are the arguments, and `copies` the offset in the
-/// outgoing area of the copies of by-reference arguments that need one
-/// (`argRef`), each 16-byte aligned (`outgoingArgsSize`); a C callee may
-/// write its copies, which are always made.
+/// to slots first, and so are the pointers of by-reference ones. A C
+/// callee may write its copies, which are always made.
+///
+/// `refs`, for an `.auto` call, are the arguments. Each by-reference one
+/// has a slot reserved for it in the outgoing area (`outgoingArgsSize`),
+/// from `copies` on, 16-byte aligned, in order: its copy goes there when
+/// it needs one (`argRef`). The callee owns those slots, at fp + 16 + the
+/// same offsets, and only a tail call writes them: a value from the frame
+/// it pops goes in its reserved slot, which is the callee's, whose type is
+/// the caller's. Then so does every parameter passed on, which may point to
+/// any reserved slot: parameters passed on in other positions without a
+/// copy keep their pointers.
 fn placeArgs(cg: *CodeGen, vals: []const Val, refs: ?[]const Ref, locs: []const ArgLoc, tail: bool, copies: u32) Error!void {
     const ip = cg.ip;
     const temps = try cg.gpa.alloc(Mem, if (tail) vals.len else 0);
     defer cg.gpa.free(temps);
     const srcs = try cg.gpa.alloc(ArgRef, if (refs != null) vals.len else 0);
     defer cg.gpa.free(srcs);
-    var out = copies;
+    const reserved = try cg.gpa.alloc(u32, if (refs != null) vals.len else 0);
+    defer cg.gpa.free(reserved);
+    const fresh = try cg.gpa.alloc(bool, if (refs != null and tail) vals.len else 0);
+    defer cg.gpa.free(fresh);
+    if (refs) |rs| {
+        var off = copies;
+        for (vals, locs, reserved) |v, l, *r| if (l == .gpr_indirect or l == .stack_indirect) {
+            r.* = off;
+            off += @intCast(std.mem.alignForward(u64, Type.abiSize(ip, v.ty), 16));
+        };
+        if (tail) {
+            var any = false;
+            for (rs, locs, fresh) |a, l, *f| {
+                f.* = (l == .gpr_indirect or l == .stack_indirect) and try cg.argRef(a, true) == null;
+                any = any or f.*;
+            }
+            // Parameters passed on may point to any reserved slot, when
+            // they were passed on in another position before.
+            if (any) for (rs, locs, fresh) |a, l, *f| {
+                if ((l == .gpr_indirect or l == .stack_indirect) and cg.paramIndex(a) != null) f.* = true;
+            };
+        }
+    }
     for (vals, locs, 0..) |v, l, i| switch (l) {
         .stack => |off| if (tail) {
             temps[i] = try cg.allocSlot(Type.abiSize(ip, v.ty), @min(Type.abiAlignment(ip, v.ty), 16));
@@ -4956,14 +4986,16 @@ fn placeArgs(cg: *CodeGen, vals: []const Val, refs: ?[]const Ref, locs: []const 
             }
         },
         .gpr_indirect, .stack_indirect => if (refs) |rs| {
+            const size = Type.abiSize(ip, v.ty);
+            if (tail and fresh[i]) {
+                // Copied to its reserved slot once every argument is read.
+                temps[i] = try cg.allocSlot(size, @min(Type.abiAlignment(ip, v.ty), 16));
+                try cg.copyVal(temps[i], v);
+                srcs[i] = .{ .addr = .at(.fp, @intCast(16 + reserved[i])) };
+                continue;
+            }
             srcs[i] = try cg.argRef(rs[i], tail) orelse src: {
-                // Its memory is in this function's frame, which a tail
-                // call pops, and the callee's parameter is not its own to
-                // write.
-                if (tail) return cg.failStmt("unable to perform tail call: argument {} of type '{f}' is passed by reference, and its value lives in the frame the tail call pops; pass a parameter or a constant instead", .{ i + 1, cg.fmtType(v.ty) });
-                const size = Type.abiSize(ip, v.ty);
-                const m: Mem = .at(.sp, @intCast(out));
-                out += @intCast(std.mem.alignForward(u64, size, 16));
+                const m: Mem = .at(.sp, @intCast(reserved[i]));
                 try cg.copyVal(m, v);
                 break :src .{ .addr = m };
             };
@@ -4994,9 +5026,12 @@ fn placeArgs(cg: *CodeGen, vals: []const Val, refs: ?[]const Ref, locs: []const 
     };
     if (tail) for (vals, locs, 0..) |v, l, i| switch (l) {
         .stack => |off| try cg.copyVal(.at(.fp, @intCast(16 + off)), memVal(v.ty, temps[i])),
-        .stack_indirect => |off| {
-            try cg.loadMem(.x9, temps[i], .usize_type);
-            try cg.storeReg(.at(.fp, @intCast(16 + off)), .x9, 8);
+        .gpr_indirect, .stack_indirect => {
+            if (fresh[i]) try cg.copyMem(srcs[i].addr, temps[i], Type.abiSize(ip, v.ty));
+            if (l == .stack_indirect) {
+                try cg.argPtrTo(.x9, srcs[i]);
+                try cg.storeReg(.at(.fp, @intCast(16 + l.stack_indirect)), .x9, 8);
+            }
         },
         else => {},
     };
