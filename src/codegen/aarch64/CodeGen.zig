@@ -103,6 +103,26 @@ trace_slot: ?Mem = null,
 trace_x15: bool = false,
 /// `Ssa.liveness` ran, so value slots are shared by lifetime.
 live: bool = false,
+/// From `planScratch`: per register of `scratch_regs` and position (as
+/// `Ssa.clobbers`), how many values and terminators before it that are no
+/// clobber point may write that register (`scratchUse`).
+scratch_counts: [scratch_regs.len]std.ArrayList(u32) = @splat(.empty),
+/// From `planScratch`: per value (by position in `Ssa.values`) and per
+/// block's terminator, the registers `scratchUse` said it may write, as
+/// `Encoder.written` holds them, which `checkWrites` checks against.
+scratch_values: std.ArrayList(u32) = .empty,
+scratch_terms: std.ArrayList(u32) = .empty,
+/// Per position, how many clobber points lie at or before it
+/// (`clobber_counts`), and the position itself (`always_counts`), for
+/// `allocateRegs`' restrictions.
+clobber_counts: std.ArrayList(u32) = .empty,
+always_counts: std.ArrayList(u32) = .empty,
+/// `argsPlain`, for `scratchUse`.
+plain_args: bool = false,
+/// The values `Ssa.allocate` may keep in a register that does not survive
+/// the clobber points they cross, saved and restored around each one.
+/// None yet.
+split: std.bit_set.Dynamic = .{},
 /// The condition under which the last overflow operation whose bit its
 /// block's branch reads from the flags (`fate == .fused`) overflowed.
 ovf_cc: Cond = .vs,
@@ -285,6 +305,12 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.pending.deinit(gpa);
         cg.stub_chains.deinit(gpa);
         cg.stub_open.deinit(gpa);
+        for (&cg.scratch_counts) |*c| c.deinit(gpa);
+        cg.scratch_values.deinit(gpa);
+        cg.scratch_terms.deinit(gpa);
+        cg.clobber_counts.deinit(gpa);
+        cg.always_counts.deinit(gpa);
+        cg.split.deinit(gpa);
     }
     @memset(cg.homes, .none);
     @memset(cg.pair_base, no_base);
@@ -302,6 +328,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         f.bypassUnread(ir);
         cg.live = true;
         if (!f.no_regs) {
+            try cg.planScratch();
             try cg.allocateRegs();
             try cg.planRetCalls();
         }
@@ -576,8 +603,12 @@ pub fn fate(cg: *const CodeGen, inst: Inst.Index) Ssa.Fate {
 // Registers
 
 /// The registers the allocator hands out: the callee-saved x19-x28, which
-/// no lowering uses as scratch and every call preserves.
-const alloc_regs = [_]Reg{ .x19, .x20, .x21, .x22, .x23, .x24, .x25, .x26, .x27, .x28 };
+/// no lowering uses as scratch and every call preserves, then x12-x15
+/// (`scratch_regs`), which hold values whose intervals contain no
+/// lowering that may write them and no call.
+const alloc_regs = [_]Reg{ .x19, .x20, .x21, .x22, .x23, .x24, .x25, .x26, .x27, .x28, .x14, .x13, .x12, .x15 };
+/// How many of `alloc_regs` calls preserve: x19-x28.
+const saved_regs = 10;
 
 /// The floating-point registers the allocator hands out, after
 /// `alloc_regs`: d8-d15, whose low 64 bits every call preserves, enough
@@ -610,17 +641,43 @@ fn allocateRegs(cg: *CodeGen) Error!void {
     const fates = live.items(.fate);
     @memset(live.items(.hint), .{ Ssa.no_reg, Ssa.no_reg });
     // x19-x28 and d8-d15 survive the clobber points, the instructions
-    // that may call (`callFree`); v20-v29 do not, so a value in one never
-    // crosses a clobber point, and a vector that crosses one stays in
-    // memory (`Ssa.want_vec`). None is split.
-    var split = try std.bit_set.Dynamic.initEmpty(cg.gpa, cg.ir.instructions.len);
-    defer split.deinit(cg.gpa);
+    // that may call (`callFree`); x12-x15 and v20-v29 do not, so a value
+    // in one never crosses a clobber point unless it is split, and a
+    // vector that crosses one stays in memory (`Ssa.want_vec`).
+    try cg.split.resize(cg.gpa, cg.ir.instructions.len, false);
+    cg.split.unsetAll();
     const survive = alloc_regs.len + float_regs.len;
     const n = survive + vreg_count;
+    const survives: u32 = (1 << saved_regs) - 1 | ((1 << float_regs.len) - 1) << alloc_regs.len;
     var counts: std.ArrayList(u32) = .empty;
     defer counts.deinit(cg.gpa);
-    const restrictions: []const Ssa.Restriction = if (try f.asmCounts(cg.gpa, cg.ir, &counts)) |c| &.{.{ .regs = cg.asmRegs(), .counts = c }} else &.{};
-    const used = f.allocate(alloc_regs.len, float_regs.len + vreg_count, (1 << survive) - 1, cg.pair_base, &split, restrictions);
+    var restrictions: [scratch_regs.len + 3]Ssa.Restriction = undefined;
+    var n_restrictions: usize = 0;
+    if (try f.asmCounts(cg.gpa, cg.ir, &counts)) |c| {
+        restrictions[0] = .{ .regs = cg.asmRegs(), .counts = c };
+        n_restrictions = 1;
+    }
+    // The lowerings that write each scratch register; a clobber point
+    // writes them all, which matters to the values it reads or computes:
+    // the ones that cross it either survive it or are saved around it
+    // (`split`).
+    for (scratch_regs, &cg.scratch_counts) |r, *c| {
+        restrictions[n_restrictions] = .{ .regs = allocBit(r), .counts = c.items };
+        n_restrictions += 1;
+    }
+    const cl = f.clobbers.items;
+    try cg.clobber_counts.resize(cg.gpa, cl.len);
+    for (cg.clobber_counts.items, cl) |*c, x| c.* = x[0] + x[1];
+    restrictions[n_restrictions] = .{ .regs = allocBit(.x12) | allocBit(.x13) | allocBit(.x14) | allocBit(.x15), .counts = cg.clobber_counts.items, .endpoints_only = true };
+    n_restrictions += 1;
+    // x15 holds the error return trace throughout (`trace_x15`).
+    if (traceInX15(cg)) {
+        try cg.always_counts.resize(cg.gpa, cl.len);
+        for (cg.always_counts.items, 0..) |*c, q| c.* = @intCast(q);
+        restrictions[n_restrictions] = .{ .regs = allocBit(.x15), .counts = cg.always_counts.items };
+        n_restrictions += 1;
+    }
+    const used = f.allocate(alloc_regs.len, float_regs.len + vreg_count, survives, cg.pair_base, &cg.split, restrictions[0..n_restrictions]);
     for (0..5) |k| if (used >> @intCast(2 * k) & 3 != 0) {
         cg.saved |= @as(u16, 1) << @intCast(k);
     };
@@ -640,6 +697,201 @@ fn allocateRegs(cg: *CodeGen) Error!void {
             .{ .vreg = @fromBackingInt(@intCast(vreg_first + reg[i] - survive)) };
         if (reg[i] >= survive) cg.vregs = true;
     }
+}
+
+/// The registers lowerings write as scratch that may hold values whose
+/// intervals contain no value or terminator that may write them
+/// (`scratchUse`). x9-x11 hold every lowering's operands and x16-x17 its
+/// addresses, so they hold no values.
+const scratch_regs = [_]Reg{ .x12, .x13, .x14, .x15 };
+const scratch_mask: u32 = 1 << 12 | 1 << 13 | 1 << 14 | 1 << 15;
+
+/// Register `r`'s bit as `Ssa.allocate` numbers `alloc_regs`.
+fn allocBit(r: Reg) u32 {
+    return @as(u32, 1) << @intCast(std.mem.findScalar(Reg, &alloc_regs, r).?);
+}
+
+/// `trace_x15`, before `setupParams` sets it.
+fn traceInX15(cg: *CodeGen) bool {
+    return !isC(cg.fn_ty.cc) and cg.emit.zcu.fe.any_error_tracing;
+}
+
+/// x19-x28, which the prologue saves and the epilogue restores.
+const callee_saved_mask: u32 = 0x3ff << 19;
+/// The registers whose writes `checkWrites` checks: those values may get.
+const checked_mask: u32 = scratch_mask | callee_saved_mask;
+
+/// The registers of `scratch_regs` value `inst`'s lowering may write,
+/// decided before allocation, so that no value that lives across it, or
+/// that it reads last or computes, lives in them. `checkWrites` fails a
+/// function whose lowering writes one this did not list.
+fn scratchUse(cg: *CodeGen, inst: Inst.Index) u32 {
+    const ir = cg.ir;
+    const tag = ir.instructions.items(.tag)[@backingInt(inst)];
+    const x12: u32 = 1 << 12;
+    // The wide-integer lowerings loop through x12-x14.
+    const Wide = struct {
+        cg: *CodeGen,
+        found: *bool,
+        const Self = @This();
+        pub fn use(c: Self, r: Ref) void {
+            const t = c.cg.typeOf(r);
+            if (t != .none and c.cg.isWideInt(t)) c.found.* = true;
+        }
+    };
+    var wide = false;
+    Ssa.forEachOperand(ir, inst, Wide{ .cg = cg, .found = &wide });
+    const ty = ir.typeOfIndex(inst, cg.ip);
+    if (wide or (ty != .none and cg.isWideInt(ty))) return scratch_mask;
+    return switch (tag) {
+        .arg => if (cg.plain_args) 0 else scratch_mask,
+        .alloc, .block, .loop, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => 0,
+        .struct_field_ptr, .struct_field_val, .slice_ptr, .slice_len, .slice, .ptr_add, .ptr_elem_ptr, .slice_elem_ptr => 0,
+        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .not => 0,
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => 0,
+        .intcast, .trunc, .bitcast, .int_from_bool, .int_from_ptr, .ptr_from_int => 0,
+        .optional_payload, .optional_payload_ptr, .wrap_optional, .unwrap_errunion_payload, .unwrap_errunion_err, .wrap_errunion_payload, .wrap_errunion_err, .get_union_tag => 0,
+        // A pointer in memory is loaded into x12 (`ptrMem`, `elemAddrTo`).
+        .load, .store, .ptr_elem_val, .slice_elem_val => x12,
+        else => scratch_mask,
+    };
+}
+
+/// `scratchUse` for block `block`'s terminator: none for jumps and
+/// branches, which write a block result only to its slot, or for a
+/// switch on a scalar, which compares in x9-x11 and x16-x17.
+fn termScratch(cg: *CodeGen, block: Ssa.Block.Index) u32 {
+    const term = cg.ssa.blocks.items[@backingInt(block)].term;
+    return switch (term.tag) {
+        .fallthrough, .noreturn, .unreach, .jump, .branch => 0,
+        .switch_br => if (cg.isWideInt(cg.typeOf(cg.ir.instructions.items(.data)[@backingInt(term.inst)].pl_op.operand))) scratch_mask else 0,
+        // Storing the result through the result pointer.
+        .ret => 1 << 12 | 1 << 13,
+    };
+}
+
+/// `scratch_counts`, `scratch_values` and `scratch_terms`, after
+/// `Ssa.plan`, whose fates `scratchUse` reads. A clobber point writes
+/// every caller-saved register; its counts are not here.
+fn planScratch(cg: *CodeGen) Error!void {
+    const f = cg.ssa;
+    cg.plain_args = try cg.argsPlain();
+    var cls: [scratch_regs.len][]u32 = undefined;
+    for (&cg.scratch_counts, &cls) |*c, *cl| {
+        try c.resize(cg.gpa, f.clobbers.items.len);
+        cl.* = c.items;
+        cl.*[0] = 0;
+        cl.*[1] = 0;
+    }
+    try cg.scratch_values.resize(cg.gpa, f.values.len);
+    try cg.scratch_terms.resize(cg.gpa, f.blocks.items.len);
+    @memset(cg.scratch_terms.items, 0);
+    var counts: [scratch_regs.len]u32 = @splat(0);
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        for (b.start..b.start + b.len) |i| {
+            const inst = f.values.items(.inst)[i];
+            const clobber = !std.meta.eql(f.clobbers.items[2 * i + 2], f.clobbers.items[2 * i + 1]);
+            const m = if (f.live.items(.fate)[@backingInt(inst)] == .dead or clobber) 0 else cg.scratchUse(inst);
+            cg.scratch_values.items[i] = m;
+            for (scratch_regs, &counts, cls) |r, *n, cl| {
+                if (m & regBit(r) != 0) n.* += 1;
+                cl[2 * i + 2] = n.*;
+                cl[2 * i + 3] = n.*;
+            }
+        }
+        const m = cg.termScratch(block);
+        cg.scratch_terms.items[@backingInt(block)] = m;
+        for (scratch_regs, &counts, cls) |r, *n, cl| {
+            if (m & regBit(r) != 0) n.* += 1;
+            cl[2 * (b.start + b.len) + 1] = n.*;
+            cl[2 * (b.start + b.len) + 2] = n.*;
+        }
+    }
+}
+
+/// Whether `setupParams` moves every argument home without `scratch_regs`:
+/// none arrives through a pointer (x12) or is stored in pieces (x13).
+fn argsPlain(cg: *CodeGen) Error!bool {
+    const ir = cg.ir;
+    var n: usize = 0;
+    for (ir.mainBody()) |inst| {
+        if (ir.instructions.items(.tag)[@backingInt(inst)] != .arg) break;
+        n += 1;
+    }
+    const tys = try cg.gpa.alloc(Index, n);
+    defer cg.gpa.free(tys);
+    const locs = try cg.gpa.alloc(ArgLoc, n);
+    defer cg.gpa.free(locs);
+    for (ir.mainBody()[0..n], tys) |inst, *ty| ty.* = ir.instructions.items(.data)[@backingInt(inst)].arg.ty;
+    if (isC(cg.fn_ty.cc)) {
+        for (tys) |ty| if (cg.cClass(ty) == .unsupported) return false;
+        _ = cg.cArgs(cg.fn_ty.cc, tys, null, locs);
+    } else _ = cg.autoArgs(tys, locs);
+    for (tys, locs) |ty, l| {
+        const size = Type.abiSize(cg.ip, ty);
+        switch (l) {
+            .none, .fpr, .stack => {},
+            .gpr => if (size > 8 or !std.math.isPowerOfTwo(size)) return false,
+            .gpr_pair => if (!std.math.isPowerOfTwo(size - 8)) return false,
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// The general-purpose registers home `h` occupies, as `Encoder.written`
+/// holds them.
+fn homeRegs(h: Home) u32 {
+    return switch (h) {
+        .reg => |r| regBit(r),
+        .regs => |p| regBit(p.lo) | regBit(p.hi),
+        else => 0,
+    };
+}
+
+fn regBit(r: Reg) u32 {
+    return if (@backingInt(r) <= 30) @as(u32, 1) << @intCast(@backingInt(r)) else 0;
+}
+
+/// The registers value `inst` writes as its own (`checkWrites`): its
+/// result's, an overflow pair's fields', and the promoted variable a
+/// store writes. Inline assembly may write any: the values that meet it
+/// keep out of the registers it names (`asmRegs`) and of `scratch_regs`
+/// (a clobber point).
+fn ownRegs(cg: *CodeGen, inst: Inst.Index) u32 {
+    const i = @backingInt(inst);
+    var m = homeRegs(cg.homes[i]);
+    const ir = cg.ir;
+    switch (ir.instructions.items(.tag)[i]) {
+        .assembly => m |= checked_mask,
+        // A tail call restores x19-x28 before it branches.
+        .call => if (ir.extraData(Ir.Call, ir.instructions.items(.data)[i].pl_op.payload).data.flags.always_tail) {
+            m |= callee_saved_mask;
+        },
+        .store => if (ir.instructions.items(.data)[i].bin_op.lhs.toIndex()) |a| {
+            m |= homeRegs(cg.homes[@backingInt(a)]);
+        },
+        else => {},
+    }
+    if (cg.fate(inst) == .pair) for (cg.ssa.pairs.get(i).?) |fld| {
+        if (fld != Ssa.no_tie) m |= homeRegs(cg.homes[fld]);
+    };
+    return m;
+}
+
+/// Fails unless the registers the encoder saw written since it cleared
+/// `written` are ones value `inst` (or a terminator, for null) may write:
+/// `planned` (`scratchUse`), every caller-saved one at a clobber point,
+/// and its own (`ownRegs`).
+fn checkWrites(cg: *CodeGen, inst: ?Inst.Index, planned: u32, clobber: bool, own: u32) Error!void {
+    var allowed = planned | own;
+    if (clobber) allowed |= Encoder.caller_saved;
+    const bad = cg.e.written & checked_mask & ~allowed;
+    if (bad == 0) return;
+    const r: Reg = @fromBackingInt(@intCast(@ctz(bad)));
+    if (inst) |x| return cg.fail("internal error: '{t}' writes {t}, which may hold a value", .{ cg.ir.instructions.items(.tag)[@backingInt(x)], r });
+    return cg.fail("internal error: a terminator writes {t}, which may hold a value", .{r});
 }
 
 /// The allocator's registers (as `allocateRegs` numbers them) that an
@@ -1441,7 +1693,6 @@ fn argVReg(i: u8) VReg {
 /// The callee side: gives each `arg` a home, storing register arguments
 /// to slots.
 fn setupParams(cg: *CodeGen) Error!void {
-    const ip = cg.ip;
     const ir = cg.ir;
     const tags = ir.instructions.items(.tag);
     const is_c = isC(cg.fn_ty.cc);
@@ -1471,78 +1722,80 @@ fn setupParams(cg: *CodeGen) Error!void {
         cg.va_stack = cg.cArgs(cg.fn_ty.cc, tys, null, locs);
     } else _ = cg.autoArgs(tys, locs);
     for (args, tys, locs) |inst, ty, l| {
-        const size = Type.abiSize(ip, ty);
-        // Only scalars of 1, 2, 4, or 8 bytes have registers.
-        if (cg.homes[@backingInt(inst)] == .reg) switch (l) {
-            .gpr => |r| {
-                try cg.setResult(inst, ty, argReg(r));
-                continue;
+        cg.e.written = 0;
+        try cg.setupParam(inst, ty, l);
+        if (cg.live and !cg.ssa.no_regs) try cg.checkWrites(inst, if (cg.fate(inst) == .dead) 0 else cg.scratchUse(inst), false, cg.ownRegs(inst));
+    }
+}
+
+/// Moves argument `inst`, of type `ty`, from where it arrives (`l`) to its
+/// home.
+fn setupParam(cg: *CodeGen, inst: Inst.Index, ty: Index, l: ArgLoc) Error!void {
+    const size = Type.abiSize(cg.ip, ty);
+    // Only scalars of 1, 2, 4, or 8 bytes have registers.
+    if (cg.homes[@backingInt(inst)] == .reg) switch (l) {
+        .gpr => |r| return cg.setResult(inst, ty, argReg(r)),
+        .stack => |off| return cg.loadKnown(cg.homes[@backingInt(inst)].reg, .at(.fp, @intCast(16 + off)), ty),
+        else => unreachable,
+    };
+    if (cg.homes[@backingInt(inst)] == .regs) {
+        const d = cg.homes[@backingInt(inst)].regs;
+        switch (l) {
+            .gpr_pair => |r| {
+                try cg.e.mov(.x, d.lo, argReg(r));
+                try cg.e.mov(.x, d.hi, argReg(r + 1));
+            },
+            .stack => |off| try cg.loadRegsMem(d, .at(.fp, @intCast(16 + off))),
+            else => unreachable,
+        }
+        return;
+    }
+    if (cg.homes[@backingInt(inst)] == .vreg and cg.inVec(ty)) {
+        const v = cg.homes[@backingInt(inst)].vreg;
+        switch (l) {
+            .fpr => |a| {
+                try vector.move(cg, v, argVReg(a));
+                return;
             },
             .stack => |off| {
-                try cg.loadKnown(cg.homes[@backingInt(inst)].reg, .at(.fp, @intCast(16 + off)), ty);
-                continue;
+                try vector.loadMem(cg, v, .at(.fp, @intCast(16 + off)), @intCast(size));
+                return;
             },
-            else => unreachable,
-        };
-        if (cg.homes[@backingInt(inst)] == .regs) {
-            const d = cg.homes[@backingInt(inst)].regs;
-            switch (l) {
-                .gpr_pair => |r| {
-                    try cg.e.mov(.x, d.lo, argReg(r));
-                    try cg.e.mov(.x, d.hi, argReg(r + 1));
-                },
-                .stack => |off| try cg.loadRegsMem(d, .at(.fp, @intCast(16 + off))),
-                else => unreachable,
-            }
-            continue;
+            // A 1-byte vector, in a general register.
+            else => {},
         }
-        if (cg.homes[@backingInt(inst)] == .vreg and cg.inVec(ty)) {
-            const v = cg.homes[@backingInt(inst)].vreg;
-            switch (l) {
-                .fpr => |a| {
-                    try vector.move(cg, v, argVReg(a));
-                    continue;
-                },
-                .stack => |off| {
-                    try vector.loadMem(cg, v, .at(.fp, @intCast(16 + off)), @intCast(size));
-                    continue;
-                },
-                // A 1-byte vector, in a general register.
-                else => {},
-            }
-        } else if (cg.homes[@backingInt(inst)] == .vreg) {
-            const v = cg.homes[@backingInt(inst)].vreg;
-            switch (l) {
-                .fpr => |a| try cg.loadFp(v, .{ .ty = ty, .loc = .{ .vreg = argVReg(a) } }),
-                .gpr => |r| try cg.setResult(inst, ty, argReg(r)),
-                .stack => |off| try cg.loadFp(v, memVal(ty, .at(.fp, @intCast(16 + off)))),
-                else => unreachable,
-            }
-            continue;
-        }
+    } else if (cg.homes[@backingInt(inst)] == .vreg) {
+        const v = cg.homes[@backingInt(inst)].vreg;
         switch (l) {
-            .none => {},
-            .gpr => |r| try cg.storeBytes((try cg.resultMem(inst, ty)).?, argReg(r), size),
-            .gpr_pair => |r| {
-                const m = (try cg.resultMem(inst, ty)).?;
-                try cg.storeReg(m, argReg(r), 8);
-                try cg.storeBytes(m.plus(8), argReg(r + 1), size - 8);
-            },
-            .fpr => |v| try cg.storeFp((try cg.resultMem(inst, ty)).?, argVReg(v), size),
-            .fpr_run => |run| try cg.storeFpRun((try cg.resultMem(inst, ty)).?, run.first, run.n, run.size),
-            .bool_split => |b| try cg.gatherBools((try cg.resultMem(inst, ty)).?, b, size),
-            .stack => |off| cg.homes[@backingInt(inst)] = .{ .slot = .at(.fp, @intCast(16 + off)) },
-            .gpr_indirect => |r| {
-                // The callee owns the caller's copy, but a slot keeps every
-                // home sp- or fp-based.
-                try cg.e.mov(.x, .x12, argReg(r));
-                try cg.copyMem((try cg.resultMem(inst, ty)).?, .at(.x12, 0), size);
-            },
-            .stack_indirect => |off| {
-                try cg.loadMem(.x12, .at(.fp, @intCast(16 + off)), .usize_type);
-                try cg.copyMem((try cg.resultMem(inst, ty)).?, .at(.x12, 0), size);
-            },
+            .fpr => |a| try cg.loadFp(v, .{ .ty = ty, .loc = .{ .vreg = argVReg(a) } }),
+            .gpr => |r| try cg.setResult(inst, ty, argReg(r)),
+            .stack => |off| try cg.loadFp(v, memVal(ty, .at(.fp, @intCast(16 + off)))),
+            else => unreachable,
         }
+        return;
+    }
+    switch (l) {
+        .none => {},
+        .gpr => |r| try cg.storeBytes((try cg.resultMem(inst, ty)).?, argReg(r), size),
+        .gpr_pair => |r| {
+            const m = (try cg.resultMem(inst, ty)).?;
+            try cg.storeReg(m, argReg(r), 8);
+            try cg.storeBytes(m.plus(8), argReg(r + 1), size - 8);
+        },
+        .fpr => |v| try cg.storeFp((try cg.resultMem(inst, ty)).?, argVReg(v), size),
+        .fpr_run => |run| try cg.storeFpRun((try cg.resultMem(inst, ty)).?, run.first, run.n, run.size),
+        .bool_split => |b| try cg.gatherBools((try cg.resultMem(inst, ty)).?, b, size),
+        .stack => |off| cg.homes[@backingInt(inst)] = .{ .slot = .at(.fp, @intCast(16 + off)) },
+        .gpr_indirect => |r| {
+            // The callee owns the caller's copy, but a slot keeps every
+            // home sp- or fp-based.
+            try cg.e.mov(.x, .x12, argReg(r));
+            try cg.copyMem((try cg.resultMem(inst, ty)).?, .at(.x12, 0), size);
+        },
+        .stack_indirect => |off| {
+            try cg.loadMem(.x12, .at(.fp, @intCast(16 + off)), .usize_type);
+            try cg.copyMem((try cg.resultMem(inst, ty)).?, .at(.x12, 0), size);
+        },
     }
 }
 
@@ -2267,16 +2520,30 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
     cg.block = block;
     cg.tmp_next = 0;
     cg.tmp16_next = 0;
-    for (cg.ssa.blockInsts(block)) |inst| {
+    const checked = cg.live and !cg.ssa.no_regs;
+    const b = cg.ssa.blocks.items[@backingInt(block)];
+    const cl = cg.ssa.clobbers.items;
+    for (cg.ssa.blockInsts(block), b.start..) |inst, idx| {
         if (cg.fate(inst) != .dead) {
             const calls = cg.e.calls;
+            cg.e.written = 0;
             try cg.genInst(inst);
             // A call clobbers v20-v29: only clobber points may make one.
             assert(!cg.vregs or cg.e.calls == calls or !cg.callFree(inst));
             try cg.flushResults();
+            if (checked) {
+                const q = Ssa.valuePos(idx);
+                try cg.checkWrites(inst, cg.scratch_values.items[idx], !std.meta.eql(cl[q], cl[q - 1]), cg.ownRegs(inst));
+            }
         } else try cg.keepSymbols(inst);
     }
-    try cg.genTerm(cg.ssa.blocks.items[@backingInt(block)].term, next);
+    cg.e.written = 0;
+    try cg.genTerm(b.term, next);
+    if (checked) {
+        // A `ret` ends with the epilogue, which restores x19-x28.
+        const own: u32 = if (b.term.tag == .ret) callee_saved_mask else 0;
+        try cg.checkWrites(null, cg.scratch_terms.items[@backingInt(block)], false, own);
+    }
 }
 
 fn checkNaked(cg: *CodeGen, tag: Inst.Tag) Error!void {
