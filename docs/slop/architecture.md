@@ -2880,7 +2880,12 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    each `br` writes. A load shares its variable's register when the
    variable's interval contains the load's and no store to the variable
    lies inside it (`Live.share`); `allocate` keeps such a variable from
-   being evicted while loads share it. A pair class (`want_pair`,
+   being evicted while loads share it. On x86_64, when neither gets a
+   register, the load reads the variable's slot as its own on the same
+   condition, checked without `shareable`'s limit on the interval's
+   length (`CodeGen.planVarShares`), so it is neither copied nor given a
+   slot; a `slice_ptr` or `slice_len` without a register likewise reads
+   its half of the slice's slot while the slice keeps it. A pair class (`want_pair`,
    `Live.reg2`) holds 16-byte values as their two eightbytes: on x86_64,
    slices, optional slices, and error unions with an 8-byte payload
    (error code low, payload high), which loads, `slice`, element reads,
