@@ -42,7 +42,7 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
     // and stores straight through a local are left to `Ssa.plan`.
     const n = ir.instructions.len;
     scratch.clearRetainingCapacity();
-    const words = try scratch.addManyAsSlice(gpa, 12 * n + 1);
+    const words = try scratch.addManyAsSlice(gpa, 14 * n + 1);
     const stored_once = words[0..n];
     @memset(stored_once, none);
     for (tags, datas) |tag, data| if (tag == .store) if (data.bin_op.lhs.toIndex()) |a| if (tags[@backingInt(a)] == .alloc) {
@@ -90,10 +90,14 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
         .flags = @ptrCast(words[8 * n .. 9 * n]),
         .subst = words[9 * n .. 10 * n],
         .exits = words[11 * n .. 12 * n],
+        .alias = words[12 * n .. 13 * n],
+        .last_load = words[13 * n .. 14 * n],
     };
     // Read for any operand; the rest is set as the walk reaches it.
     @memset(w.root, none);
     @memset(w.subst, none);
+    @memset(w.alias, none);
+    @memset(w.last_load, none);
     if (copies) {
         @memset(w.uses, 0);
         w.count_uses = true;
@@ -144,26 +148,32 @@ fn baseHash(ir: *const Ir, stored_once: []const u32, ptr: Inst.Ref) ?u256 {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
     var base = ptr;
-    if (base.toIndex()) |i| {
-        switch (tags[@backingInt(i)]) {
-            .alloc => return null,
-            .struct_field_ptr => base = ir.extraData(Ir.StructField, datas[@backingInt(i)].ty_pl.payload).data.operand,
-            else => {},
-        }
-    }
-    // A pointer loaded from a local: the pointer stored there, when it
-    // was stored once (`Walk.canon` folds no other), else the local.
-    while (base.toIndex()) |i| {
-        if (tags[@backingInt(i)] != .load) break;
-        const a = datas[@backingInt(i)].ty_op.operand.toIndex() orelse break;
-        if (tags[@backingInt(a)] != .alloc) break;
-        const v = stored_once[@backingInt(a)];
-        if (v == none or v == multi) {
-            base = a.toRef();
-            break;
-        }
-        base = @fromBackingInt(v);
-    }
+    if (base.toIndex()) |i| switch (tags[@backingInt(i)]) {
+        .alloc => return null,
+        .struct_field_ptr => base = ir.extraData(Ir.StructField, datas[@backingInt(i)].ty_pl.payload).data.operand,
+        else => {},
+    };
+    // Elements of one base, which `Walk.canon` folds by base and index,
+    // also of an element (`a[i][j]`), and a pointer loaded from a local:
+    // the pointer stored there, when it was stored once (`Walk.canon`
+    // folds no other), else the local, which `Walk.canon` folds as an
+    // earlier load of it. Every address `Walk.canon` folds together must
+    // hash the same, or whether two of them meet would depend on another
+    // pair of bases sharing a hash.
+    while (base.toIndex()) |i| switch (tags[@backingInt(i)]) {
+        .ptr_elem_ptr => base = ir.extraData(Ir.Bin, datas[@backingInt(i)].ty_pl.payload).data.lhs,
+        .load => {
+            const a = datas[@backingInt(i)].ty_op.operand.toIndex() orelse break;
+            if (tags[@backingInt(a)] != .alloc) break;
+            const v = stored_once[@backingInt(a)];
+            if (v == none or v == multi) {
+                base = a.toRef();
+                break;
+            }
+            base = @fromBackingInt(v);
+        },
+        else => break,
+    };
     return @as(u256, 1) << @intCast(std.hash.int(@backingInt(base)) % 256);
 }
 
@@ -194,6 +204,22 @@ fn scalar(ip: *const InternPool, ty: Index) bool {
         .float => ty == .f32_type or ty == .f64_type,
         // A slice is a pair of registers.
         .pointer => true,
+        else => false,
+    };
+}
+
+/// A value a load may read from a load or store of it that already ran
+/// (`forwardLoads`), though `hoistLoads` moves none: a scalar, a packed
+/// struct of at most 8 bytes (its backing integer, as hash maps'
+/// `Metadata`), or an optional pointer whose null is 0 (`self.metadata`).
+fn forwardable(ip: *const InternPool, ty: Index) bool {
+    if (scalar(ip, ty)) return true;
+    return switch (Type.class(ip, ty)) {
+        .@"struct" => Type.isPackedStruct(ip, ty) and Type.abiSize(ip, ty) <= 8,
+        .optional => {
+            const child = ip.keyPayload(.opt_type, ty);
+            return ip.keyTag(child) == .ptr_type and Type.optionalReprIsPayload(ip, child);
+        },
         else => false,
     };
 }
@@ -279,6 +305,15 @@ const Walk = struct {
     subst: []u32,
     /// Per `block`, how many `br`s exit it.
     exits: []u32,
+    /// Per load of a local's value, an earlier load of it that reads the
+    /// same value, and per element pointer an earlier one of the same
+    /// element, as a ref, or `none` (`canon`).
+    alias: []u32,
+    /// Per local, its last load with no store to it since.
+    last_load: []u32,
+    /// The pointers `ptr_elem_ptr` derived, by base and index (`canon`).
+    elems: [max_known][3]Inst.Ref = undefined,
+    elems_len: u32 = 0,
     plain_cache: [64]Cached = @splat(.{}),
     disjoint_cache: [64]Cached = @splat(.{}),
     next: u32 = 0,
@@ -345,13 +380,19 @@ const Walk = struct {
         return count;
     }
 
-    /// Store-to-load forwarding and load reuse: a load of a scalar from
-    /// memory that a dominating store in the same loop wrote, or a
-    /// dominating load in the same loop read, with no write in between
-    /// that may reach it, becomes that value (`subst`). Positions are
-    /// scanned in order, so a write anywhere between the two, also in a
-    /// branch not taken, forgets what was known. A panic does not return,
-    /// so the safety checks between them forget nothing.
+    /// Store-to-load forwarding and load reuse: a load of a `forwardable`
+    /// value from memory that a dominating store wrote, or a dominating
+    /// load read, with no write in between that may reach it, becomes
+    /// that value (`subst`). Only a value computed on every path to the
+    /// load is reused: nothing is loaded where the program did not load,
+    /// and volatile pointers (`plainPtr`) and atomic loads (their own
+    /// instruction) are left alone. Positions are scanned in order, so a
+    /// write anywhere between the two, also in a branch not taken,
+    /// forgets what was known: a store, or a returning call, atomic write
+    /// or inline assembly for all memory but locals whose address does
+    /// not escape. Across a loop, no write in the loop may reach it
+    /// either (`sameAcrossLoops`). A panic does not return, so the safety
+    /// checks between them forget nothing.
     fn forwardLoads(w: *Walk, cands: []u32, ncands: *u32) u32 {
         const ir = w.ir;
         const subst = w.subst;
@@ -361,6 +402,7 @@ const Walk = struct {
         var known: [max_known]Known = undefined;
         var len: u32 = 0;
         var count: u32 = 0;
+        var loop_writes: CachedLoopWrites = .{};
         for (w.order[0..w.next]) |i| {
             const data = datas[i];
             switch (tags[i]) {
@@ -368,8 +410,20 @@ const Walk = struct {
                     const ty = data.ty_op.ty;
                     // A load straight through a local is left alone:
                     // `Ssa.plan` forwards one whose address does not
-                    // escape, and `run`'s filter looks for no other.
-                    if (isAlloc(ir, data.ty_op.operand) or !scalar(ip, ty)) continue;
+                    // escape, and `run`'s filter looks for no other. It
+                    // stands for the local's value in addresses (`canon`).
+                    if (isAlloc(ir, data.ty_op.operand)) {
+                        const a = @backingInt(data.ty_op.operand.toIndex().?);
+                        // Only `store`s write a scalar local whose address
+                        // does not escape.
+                        if (w.flags[a].escaped or !forwardable(ip, ty)) continue;
+                        const j = w.last_load[a];
+                        if (j != none and w.pos[j] < w.pos[i] and w.pos[i] <= w.scope_end[j] and w.loop_of[j] == w.loop_of[i]) {
+                            w.alias[i] = @backingInt(Inst.Index.toRef(@fromBackingInt(j)));
+                        } else w.last_load[a] = i;
+                        continue;
+                    }
+                    if (!forwardable(ip, ty)) continue;
                     const key = w.keyOf(data.ty_op.operand) orelse continue;
                     if (w.promoted(key)) continue;
                     const match: ?Known = for (known[0..len]) |k| {
@@ -377,20 +431,40 @@ const Walk = struct {
                     } else null;
                     if (match) |k| {
                         const s = k.inst;
-                        if (k.ty == ty and w.pos[s] < w.pos[i] and w.pos[i] <= w.scope_end[s] and w.loop_of[s] == w.loop_of[i]) {
+                        if (k.ty == ty and w.pos[s] < w.pos[i] and w.pos[i] <= w.scope_end[s] and w.sameAcrossLoops(key, s, i, &loop_writes)) {
                             subst[i] = @backingInt(k.value);
                             count += 1;
                             continue;
                         }
                     }
-                    if (w.loop_of[i] != none) {
+                    // Only a scalar's load moves before its loop; the
+                    // others are only forwarded.
+                    if (w.loop_of[i] != none and scalar(ip, ty)) {
                         cands[ncands.*] = i;
                         ncands.* += 1;
                     }
                     len = remember(&known, len, .{ .key = key, .value = Inst.Index.toRef(@fromBackingInt(i)), .ty = ty, .inst = i });
                 },
+                .ptr_elem_ptr => {
+                    // The same element of the same base, as the same
+                    // values, is the same pointer when its type is.
+                    const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+                    const e: [3]Inst.Ref = .{ w.canon(bin.lhs), w.canon(bin.rhs), Inst.Index.toRef(@fromBackingInt(i)) };
+                    for (w.elems[0..w.elems_len]) |x| {
+                        if (x[0] == e[0] and x[1] == e[1] and datas[@backingInt(x[2].toIndex().?)].ty_pl.ty == data.ty_pl.ty) {
+                            w.alias[i] = @backingInt(x[2]);
+                            break;
+                        }
+                    } else if (w.elems_len < max_known) {
+                        w.elems[w.elems_len] = e;
+                        w.elems_len += 1;
+                    }
+                },
                 .store => {
                     const ptr = data.bin_op.lhs;
+                    // Also through a field pointer, as into a packed
+                    // struct.
+                    if (w.rootOf(ptr)) |r| w.last_load[r] = none;
                     if (w.direct(ptr)) {
                         // A whole store into an aggregate local.
                         len = w.forget(&known, len, w.unknownKey(ptr));
@@ -404,7 +478,7 @@ const Walk = struct {
                     len = w.forget(&known, len, key);
                     const value = w.resolve(data.bin_op.rhs);
                     const ty = ir.typeOf(value, ip);
-                    if (scalar(ip, ty)) len = remember(&known, len, .{ .key = key, .value = value, .ty = ty, .inst = i });
+                    if (forwardable(ip, ty)) len = remember(&known, len, .{ .key = key, .value = value, .ty = ty, .inst = i });
                 },
                 .memset, .memcpy, .memmove, .set_union_tag => len = w.forget(&known, len, w.unknownKey(data.bin_op.lhs)),
                 .optional_payload_ptr_set, .errunion_payload_ptr_set => len = w.forget(&known, len, w.unknownKey(data.ty_op.operand)),
@@ -723,6 +797,24 @@ const Walk = struct {
         return scalar(w.ip, Type.ptrInfo(w.ip, alloc_ty).child);
     }
 
+    const CachedLoopWrites = struct { loop: u32 = none, writes: LoopWrites = .{} };
+
+    /// Whether load `i` may read what load or store `s`, which dominates
+    /// it, found through `key`, as far as loops go: in position order,
+    /// the scan forgets the writes between them, but a loop around `i`
+    /// that does not hold `s` may repeat after a write later in its body.
+    /// The value is one `s` computed on every path to `i`; nothing is
+    /// loaded where the program did not load it.
+    fn sameAcrossLoops(w: *Walk, key: Key, s: u32, i: u32, cache: *CachedLoopWrites) bool {
+        var lp = w.loop_of[i];
+        while (lp != w.loop_of[s]) : (lp = w.loop_of[lp]) {
+            if (lp == none) return false;
+            if (cache.loop != lp) cache.* = .{ .loop = lp, .writes = w.loopWrites(lp) };
+            if (cache.writes.reach(w, key, i)) return false;
+        }
+        return true;
+    }
+
     /// Adds `k` to what is known, in place of what it overwrites (same
     /// key), or else dropping the oldest entry when full.
     fn remember(known: *[max_known]Known, len: u32, k: Known) u32 {
@@ -809,6 +901,10 @@ const Walk = struct {
         var r = w.resolve(ref);
         while (r.toIndex()) |idx| {
             const i = @backingInt(idx);
+            if (w.alias[i] != none) {
+                r = @fromBackingInt(w.alias[i]);
+                continue;
+            }
             if (tags[i] != .load) break;
             const a = @backingInt(datas[i].ty_op.operand.toIndex() orelse break);
             if (tags[a] != .alloc) break;

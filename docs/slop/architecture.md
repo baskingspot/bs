@@ -2229,26 +2229,40 @@ rewrites use it:
   (see Rewrite rules); splitting them loaded every field at the copy,
   which lengthened intervals (nbody +12% Ir).
 - Loads. A load of a scalar (an integer or enum of at most 8 bytes,
-  `f32`, `f64`, an error code, `bool`, or a pointer, slices included) through an ordinary pointer
-  reads the value of a dominating store or load in the same loop through
-  the same address: the same pointer value, or the same field of it,
-  where a pointer loaded from a `const` local stored once counts as the
-  pointer stored (each `self.x` reloads `self` from its parameter's
-  slot). Positions are scanned in order, so any write in between, also
-  in a branch not taken, forgets what it may overlap: a store forgets
-  other fields of the same struct only if the struct's fields do not
-  overlap, two locals never overlap, a local whose address does not
-  escape overlaps nothing reached otherwise, a pointer parameter itself
-  (not one loaded through it) never points into a local, and a
-  returning call forgets all but those locals. Panics do not return, so safety checks forget
-  nothing. Values do not flow around loop back edges. Loads straight
-  through a local are left alone: `Ssa.plan` forwards and promotes those
-  of scalar locals whose address does not escape (forwarding them first
-  only lengthened intervals, fmt +3%), and the filter does not look for
-  those of locals whose address escapes, which would walk nearly every
-  function (96% of the zig workload's IR against 66%) for about 200
-  loads.
-- Loop-invariant loads. A load of such a scalar in a loop that the
+  `f32`, `f64`, an error code, `bool`, or a pointer, slices included), a
+  packed struct of at most 8 bytes, or an optional pointer whose null is
+  0, through an ordinary pointer (never a volatile one; atomic loads are
+  their own instruction and stay) reads the value of a dominating store
+  or load through the same address: the same pointer value, or the same
+  field of it, where a pointer loaded from a `const` local stored once
+  counts as the pointer stored (each `self.x` reloads `self` from its
+  parameter's slot), a load of a scalar `var` local whose address does
+  not escape counts as an earlier load of it in the same loop with no
+  store into the local between, and an element pointer counts as an
+  earlier one of the same type with the same base and index (each
+  `metadata[0]` of a hash map's probe loop). Only a value that a load or
+  store already computed on every path to the load is reused; nothing is
+  loaded where the program did not load. Positions are scanned in order,
+  so any write in between, also in a branch not taken, forgets what it
+  may overlap: a store forgets other fields of the same struct only if
+  the struct's fields do not overlap, two locals never overlap, a local
+  whose address does not escape overlaps nothing reached otherwise, a
+  pointer parameter itself (not one loaded through it) never points into
+  a local, and a returning call, an atomic write or inline assembly
+  forgets all but those locals. Panics do not return, so safety checks
+  forget nothing. A load in a loop that the store or load does not share
+  reads it only when no write anywhere in each such loop around the load
+  may overlap its memory (the test loop-invariant loads use below), as a
+  write after the load would reach it when the loop repeats: hash maps'
+  `self.metadata`, read before the probe loop, is read in it from there.
+  Loads straight through a local are left alone: `Ssa.plan` forwards and
+  promotes those of scalar locals whose address does not escape
+  (forwarding them first only lengthened intervals, fmt +3%), and the
+  filter does not look for those of locals whose address escapes, which
+  would walk nearly every function (96% of the zig workload's IR against
+  66%) for about 200 loads.
+- Loop-invariant loads. A load of a scalar (not a packed struct or an
+  optional pointer: those are only forwarded) in a loop that the
   previous rule did not forward moves to just before its innermost loop
   (which becomes `block { loads; loop }` in its place) when three things
   hold. Its address, or the base of its field pointer, is computed before
