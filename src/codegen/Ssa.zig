@@ -78,6 +78,10 @@ var_loads: std.ArrayList(u32) = .empty,
 var_load_loops: std.ArrayList(u32) = .empty,
 /// Scratch for `deadFills`.
 fills: Fills = .{},
+/// Per narrowing `intcast` that follows its safety check in the same body
+/// (`build`): the check's condition, for `heldBits`. A cast without its
+/// check (runtime safety off) has none.
+checked_casts: std.AutoHashMapUnmanaged(u32, Inst.Ref) = .empty,
 
 pub const no_loop = std.math.maxInt(u32);
 
@@ -257,6 +261,7 @@ pub fn deinit(f: *Ssa, gpa: Allocator) void {
     f.var_loads.deinit(gpa);
     f.var_load_loops.deinit(gpa);
     f.fills.deinit(gpa);
+    f.checked_casts.deinit(gpa);
     f.* = undefined;
 }
 
@@ -285,6 +290,7 @@ pub fn build(f: *Ssa, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
     f.targets.clearRetainingCapacity();
     f.loops.clearRetainingCapacity();
     f.block_loop.clearRetainingCapacity();
+    f.checked_casts.clearRetainingCapacity();
     try f.targets.appendNTimes(gpa, .none, ir.instructions.len);
     // At most one value per IR instruction.
     try f.values.ensureTotalCapacity(gpa, ir.instructions.len);
@@ -1848,6 +1854,129 @@ fn fillsOut(f: *const Ssa, ir: *const Ir, block: u32, n: usize, out: *[max_fill_
 /// Whether value `inst` may go unemitted when nothing reads it: it reads
 /// no volatile memory, writes nothing but its own result, cannot trap, and
 /// requests nothing from the linker that its users would not.
+/// How many low bits of the register holding unsigned integer `r` may be
+/// set, at most 64: the backends hold an integer extended to 64 bits and
+/// normalize one after an operation that may set bits above its type
+/// (`rawBits`), so a normalization `rawBits` shows to change nothing can
+/// be left out. A load of memory may find any bits in the bytes it reads
+/// (a `u3` written through a `@ptrCast` pointer), so it is bounded by its
+/// width, not its type.
+pub fn heldBits(f: *const Ssa, ir: *const Ir, ip: *const InternPool, r: Inst.Ref) u8 {
+    return f.heldRec(ir, ip, r, 6);
+}
+
+/// For `inst`, an operation on unsigned integers of at most 64 bits: how
+/// many low bits its result may have before the lowering normalizes it to
+/// its type. The normalization changes nothing when this is at most the
+/// type's width.
+pub fn rawBits(f: *const Ssa, ir: *const Ir, ip: *const InternPool, inst: Inst.Index) u8 {
+    return f.rawRec(ir, ip, inst, 6);
+}
+
+fn heldRec(f: *const Ssa, ir: *const Ir, ip: *const InternPool, r: Inst.Ref, depth: u8) u8 {
+    if (r.toInterned()) |v| {
+        if (ip.keyTag(v) != .int) return 64;
+        const k = ip.intValue(u64, v) orelse return 64;
+        return @intCast(64 - @clz(k));
+    }
+    const inst = r.toIndex().?;
+    const i = @backingInt(inst);
+    switch (ir.instructions.items(.tag)[i]) {
+        .bit_and, .bit_or, .xor, .load, .struct_field_val, .int_from_bool, .intcast, .trunc, .add_wrap, .sub_wrap, .mul_wrap, .shl, .shr, .not => {},
+        else => return 64,
+    }
+    const ty = ir.typeOfIndex(inst, ip);
+    if (!Type.isInt(ip, ty)) return 64;
+    const info = Type.intInfo(ip, ty);
+    if (info.signedness == .signed or info.bits > 64) return 64;
+    const bits: u8 = @intCast(info.bits);
+    const raw_bits = f.rawRec(ir, ip, inst, depth);
+    return switch (ir.instructions.items(.tag)[i]) {
+        // Not normalized after: their result is the raw one.
+        .bit_and, .bit_or, .xor, .load, .struct_field_val, .int_from_bool => raw_bits,
+        // A widening cast keeps its operand's register; a narrowing one
+        // normalizes unless that changes nothing.
+        .intcast, .trunc => blk: {
+            const src_ty = ir.typeOf(ir.instructions.items(.data)[i].ty_op.operand, ip);
+            if (Type.isInt(ip, src_ty)) {
+                const src = Type.intInfo(ip, src_ty);
+                if (src.signedness == .unsigned and src.bits <= bits) break :blk raw_bits;
+            }
+            break :blk @min(raw_bits, bits);
+        },
+        .add_wrap, .sub_wrap, .mul_wrap, .shl, .shr, .not => @min(raw_bits, bits),
+        else => 64,
+    };
+}
+
+fn rawRec(f: *const Ssa, ir: *const Ir, ip: *const InternPool, inst: Inst.Index, depth: u8) u8 {
+    if (depth == 0) return 64;
+    const i = @backingInt(inst);
+    const data = ir.instructions.items(.data)[i];
+    const ty = ir.typeOfIndex(inst, ip);
+    if (!Type.isInt(ip, ty)) return 64;
+    const info = Type.intInfo(ip, ty);
+    if (info.signedness == .signed or info.bits > 64) return 64;
+    const bits: u8 = @intCast(info.bits);
+    const d = depth - 1;
+    return switch (ir.instructions.items(.tag)[i]) {
+        .load => @intCast(@min(64, 8 * Type.abiSize(ip, ty))),
+        .int_from_bool => 1,
+        .bit_and => @min(f.heldRec(ir, ip, data.bin_op.lhs, d), f.heldRec(ir, ip, data.bin_op.rhs, d)),
+        .bit_or, .xor => @max(f.heldRec(ir, ip, data.bin_op.lhs, d), f.heldRec(ir, ip, data.bin_op.rhs, d)),
+        // An unsigned shift right never sets a bit above its operand's.
+        .shr => blk: {
+            const a = f.heldRec(ir, ip, data.bin_op.lhs, d);
+            const k = constShift(ip, data.bin_op.rhs) orelse break :blk a;
+            break :blk a -| k;
+        },
+        .shl => blk: {
+            const k = constShift(ip, data.bin_op.rhs) orelse break :blk 64;
+            break :blk @intCast(@min(64, @as(u32, f.heldRec(ir, ip, data.bin_op.lhs, d)) + k));
+        },
+        .add_wrap => @min(64, @max(f.heldRec(ir, ip, data.bin_op.lhs, d), f.heldRec(ir, ip, data.bin_op.rhs, d)) + 1),
+        .mul_wrap => @intCast(@min(64, @as(u32, f.heldRec(ir, ip, data.bin_op.lhs, d)) + f.heldRec(ir, ip, data.bin_op.rhs, d))),
+        .intcast, .trunc => blk: {
+            const src = data.ty_op.operand;
+            const src_ty = ir.typeOf(src, ip);
+            if (!Type.isInt(ip, src_ty) or Type.intInfo(ip, src_ty).signedness == .signed) break :blk 64;
+            const h = f.heldRec(ir, ip, src, d);
+            // Past its check, a narrowing cast's operand is at most the
+            // type's maximum, which the check compared it with as held,
+            // when its register holds no bits above its type.
+            if (h > bits and h <= Type.intInfo(ip, src_ty).bits) if (f.checked_casts.get(i)) |c| {
+                const cmp = ir.instructions.items(.data)[@backingInt(c.toIndex().?)].bin_op;
+                const k = if (cmp.rhs.toInterned()) |v| (if (ip.keyTag(v) == .int) ip.intValue(u64, v) else null) else null;
+                if (k) |max| {
+                    const lim = if (ir.instructions.items(.tag)[@backingInt(c.toIndex().?)] == .cmp_lt) max -| 1 else max;
+                    const top: u8 = @intCast(64 - @clz(lim));
+                    if (top <= bits) break :blk top;
+                }
+            };
+            break :blk h;
+        },
+        // An overflow bit is 0 or 1.
+        .struct_field_val => blk: {
+            const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+            const op = sf.operand.toIndex() orelse break :blk 64;
+            break :blk switch (ir.instructions.items(.tag)[@backingInt(op)]) {
+                .add_with_overflow, .sub_with_overflow, .mul_with_overflow => if (sf.index == 1) 1 else bits,
+                else => 64,
+            };
+        },
+        .sub_wrap, .not => 64,
+        else => 64,
+    };
+}
+
+/// The amount of a shift by a constant.
+fn constShift(ip: *const InternPool, r: Inst.Ref) ?u8 {
+    const v = r.toInterned() orelse return null;
+    if (ip.keyTag(v) != .int) return null;
+    const k = ip.intValue(u64, v) orelse return null;
+    return if (k < 64) @intCast(k) else null;
+}
+
 pub fn removable(ir: *const Ir, ip: *const InternPool, inst: Inst.Index) bool {
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
@@ -2358,11 +2487,57 @@ const Builder = struct {
     /// return; if that one is a value, it ends its block. An empty body
     /// leaves its block open, to fall through into the next one.
     fn body(b: *Builder, insts: []const Inst.Index) Allocator.Error!void {
-        for (insts) |inst| try b.instruction(inst);
+        for (insts, 1..) |inst, next| try b.instruction(inst, insts[next..]);
         if (insts.len != 0 and b.cur != .none) try b.terminate(.{ .tag = .noreturn, .inst = insts[insts.len - 1] });
     }
 
-    fn instruction(b: *Builder, inst: Inst.Index) Allocator.Error!void {
+    /// The condition of `blk` if it is a safety check of a compare (for
+    /// `checked_casts`): a block whose body is one `cond_br` whose else
+    /// side ends in `unreach` or `trap`, comparing with `<=` or `<`.
+    fn checkOf(ir: *const Ir, blk: Inst.Index) Inst.Ref {
+        const tags = ir.instructions.items(.tag);
+        const datas = ir.instructions.items(.data);
+        const x = ir.extraData(Ir.Block, datas[@backingInt(blk)].ty_pl.payload);
+        const blk_body = ir.bodySlice(x.end, x.data.body_len);
+        if (blk_body.len != 1 or tags[@backingInt(blk_body[0])] != .cond_br) return .none;
+        const cb = datas[@backingInt(blk_body[0])].pl_op;
+        const c = cb.operand.toIndex() orelse return .none;
+        switch (tags[@backingInt(c)]) {
+            .cmp_lte, .cmp_lt => {},
+            else => return .none,
+        }
+        const cx = ir.extraData(Ir.CondBr, cb.payload);
+        const then_body = ir.bodySlice(cx.end, cx.data.then_body_len);
+        const else_body = ir.bodySlice(cx.end + then_body.len, cx.data.else_body_len);
+        if (else_body.len == 0 or then_body.len == 0) return .none;
+        const isEnd = struct {
+            fn f(t: Inst.Tag) bool {
+                return t == .unreach or t == .trap;
+            }
+        }.f;
+        if (!isEnd(tags[@backingInt(else_body[else_body.len - 1])]) or isEnd(tags[@backingInt(then_body[then_body.len - 1])])) return .none;
+        return cb.operand;
+    }
+
+    /// A narrowing cast right after the check of its operand, past only
+    /// `dbg_stmt`s in `rest`, the instructions after block `blk`
+    /// (`checked_casts`).
+    fn checkedCast(b: *Builder, blk: Inst.Index, rest: []const Inst.Index) Allocator.Error!void {
+        const ir = b.ir;
+        const tags = ir.instructions.items(.tag);
+        const cast = for (rest) |r| switch (tags[@backingInt(r)]) {
+            .dbg_stmt => {},
+            .intcast => break r,
+            else => return,
+        } else return;
+        const c = checkOf(ir, blk);
+        const datas = ir.instructions.items(.data);
+        if (c != .none and datas[@backingInt(c.toIndex().?)].bin_op.lhs == datas[@backingInt(cast)].ty_op.operand)
+            try b.f.checked_casts.put(b.gpa, @backingInt(cast), c);
+    }
+
+    /// `rest` is the instructions after `inst` in its body.
+    fn instruction(b: *Builder, inst: Inst.Index, rest: []const Inst.Index) Allocator.Error!void {
         b.last = inst;
         const ir = b.ir;
         const data = ir.instructions.items(.data)[@backingInt(inst)];
@@ -2375,6 +2550,7 @@ const Builder = struct {
                 b.f.targets.items[@backingInt(inst)] = exit;
                 try b.body(ir.bodySlice(extra.end, extra.data.body_len));
                 try b.open(exit);
+                try b.checkedCast(inst, rest);
             },
             .loop => {
                 try b.value(inst);
