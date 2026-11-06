@@ -4538,7 +4538,10 @@ fn emitStubs(cg: *CodeGen) Error!void {
                 copy.low = pc;
                 copy.parent = parent;
                 parent = @intCast(cg.dbg_inlines.items.len);
-                try cg.dbg_inline_callees.append(cg.gpa, cg.dbg_inline_callees.items[o.index]);
+                // Copied first: `append` may take the element by reference and
+                // read it after growing (and freeing) the buffer.
+                const callee = cg.dbg_inline_callees.items[o.index];
+                try cg.dbg_inline_callees.append(cg.gpa, callee);
                 try cg.dbg_inlines.append(cg.gpa, copy);
             }
             try cg.e.switchLines(cg.dbg_inlines.items[parent].file, parent + 1);
@@ -4621,7 +4624,10 @@ fn emitBlocks(cg: *CodeGen) Error!void {
             copy.low = pc;
             copy.high = pc;
             copy.parent = if (cg.dbg_open.getLastOrNull()) |p| p.index else Atom.Debug.Inline.none;
-            try cg.dbg_inline_callees.append(cg.gpa, cg.dbg_inline_callees.items[o.index]);
+            // Copied first: `append` may take the element by reference and
+            // read it after growing (and freeing) the buffer.
+            const callee = cg.dbg_inline_callees.items[o.index];
+            try cg.dbg_inline_callees.append(cg.gpa, callee);
             try cg.dbg_open.append(cg.gpa, .{ .index = @intCast(cg.dbg_inlines.items.len), .line = o.line, .column = o.column, .backend = o.backend });
             try cg.dbg_inlines.append(cg.gpa, copy);
         }

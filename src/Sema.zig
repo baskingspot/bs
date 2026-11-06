@@ -1213,7 +1213,10 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
     if (!nav.is_const and try sema.isComptimeOnlyResolved(&block, src, sema.ip.typeOf(val)))
         return sema.failComptimeVar(&block, .{ .base = decl.src_node, .loc = .var_init }, sema.ip.typeOf(val));
     nav.val = val;
-    nav.ty = sema.ip.typeOf(val);
+    // A typed declaration already has its type (`analyzeNavTy`), which
+    // codegen workers may be reading; the coerced value has that type, so
+    // only an untyped declaration stores here.
+    if (nav.ty != sema.ip.typeOf(val)) nav.ty = sema.ip.typeOf(val);
     // Emit lays out the value of any declaration code refers to.
     try sema.resolveLayoutIfIdle(&block, src, nav.ty);
     try sema.finish();
