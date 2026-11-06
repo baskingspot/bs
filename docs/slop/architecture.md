@@ -937,7 +937,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   preserve x19-x28 and d8-d15 (only their low 64 bits, all an f64
   needs) but clobber v20-v29, so every instruction not known to be
   call-free (`callFree`, a conservative whitelist that genBlock checks
-  against the calls the encoder emits) is a clobber point, and a value
+  against the calls the encoder emits) is a clobber point, except a
+  call of `returnError`, which is compiled without registers and whose
+  own code `checkWrites` allows no write to x12-x15 or x19-x28, and a value
   that crosses one keeps d8-d15 or memory; no value is spilled or split
   around a call, and both conventions (Apple's and Linux's AAPCS64) only
   move arguments into their homes at entry and results out of x0 or
