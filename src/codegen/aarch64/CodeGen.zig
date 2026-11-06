@@ -53,6 +53,7 @@ const Ref = Inst.Ref;
 const Type = @import("../../Type.zig");
 const Emit = @import("../../Emit.zig");
 const Atom = @import("../../link/Atom.zig");
+const Frontend = @import("../../Frontend.zig");
 const asm_src = @import("../asm_src.zig");
 const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
@@ -145,6 +146,8 @@ dbg_column: u32 = 0,
 dbg_inlines: std.ArrayList(Atom.Debug.Inline) = .empty,
 dbg_inline_names: std.ArrayList(u8) = .empty,
 dbg_inline_callees: std.ArrayList(SymbolKey) = .empty,
+/// The modules of `Atom.Debug.inline_units` (`Emit.inlineUnit`).
+dbg_inline_units: std.ArrayList(Frontend.Module.Index) = .empty,
 dbg_files: std.ArrayList(u32) = .empty,
 dbg_open: std.ArrayList(OpenInline) = .empty,
 /// Panic calls in code the backend inlined, which call a chain of stubs
@@ -276,6 +279,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.dbg_inlines.deinit(gpa);
         cg.dbg_inline_names.deinit(gpa);
         cg.dbg_inline_callees.deinit(gpa);
+        cg.dbg_inline_units.deinit(gpa);
         cg.dbg_files.deinit(gpa);
         cg.dbg_open.deinit(gpa);
         cg.cold_starts.deinit(gpa);
@@ -358,7 +362,6 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     const arena = emit.allocator();
     const nav = ip.getNav(func.owner_nav);
     const file = emit.zcu.file(nav.file);
-    const module = emit.zcu.fe.module(file.module);
     var files: std.ArrayList(u8) = .empty;
     for (cg.dbg_files.items) |fname| {
         try files.appendSlice(arena, emit.zcu.file(fname).display_path);
@@ -369,7 +372,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .name = try emit.funcDebugName(ir.func),
         .base_line = file.zir.getDeclaration(nav.zir_inst).src_line,
         .lines = try arena.dupe(u8, cg.e.lines.bytes.items),
-        .unit = try std.Io.Dir.path.join(arena, &.{ module.root_dir, module.root_file }),
+        .unit = try emit.unitPath(file.module),
+        .inline_units = try emit.inlineUnits(cg.dbg_inline_units.items),
         .files = files.items,
         .inlines = try arena.dupe(Atom.Debug.Inline, cg.dbg_inlines.items),
         .inline_names = try arena.dupe(u8, cg.dbg_inline_names.items),
@@ -466,6 +470,7 @@ fn beginInline(cg: *CodeGen, func: Index, site: Ir.DbgInline) Error!void {
         .low = @intCast(cg.e.code.items.len),
         .high = @intCast(cg.e.code.items.len),
         .parent = if (cg.dbg_open.getLastOrNull()) |o| o.index else Atom.Debug.Inline.none,
+        .unit = try cg.emit.inlineUnit(cg.gpa, &cg.dbg_inline_units, own_file, nav.file, site.flags.backend),
     });
     try cg.dbg_open.append(cg.gpa, .{ .index = index, .line = cg.dbg_line, .column = cg.dbg_column, .backend = site.flags.backend });
     try cg.e.switchLines(file, index + 1);

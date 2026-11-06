@@ -1090,7 +1090,11 @@ comptime arguments are run-time values in the lowered code (uucode's
     it the same way); CodeGen turns them into `Debug.inlines` records
     and `LineProgram.switchTo` patches, and gives each the callee's stable
     key (`Debug.inline_callees`, for the cache only). A function's unit is
-    its module's root file path.
+    its module's root file path. A call the backend inlined names its
+    callee's module's unit (`Inline.unit`, an index into
+    `Debug.inline_units`, 0 for the function's own); Sema's inline calls
+    inherit the unit of the code around them, as upstream's inline code
+    is its caller's.
 - The symbol key is 128 bits: a hash of the rendered unit key for
   declarations, or of the contents for anonymous constants. Atoms with equal
   keys are one symbol; the linker keeps one and rejects a key whose atoms

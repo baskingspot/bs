@@ -17,6 +17,7 @@ const Index = InternPool.Index;
 const Ir = @import("Ir.zig");
 const Type = @import("Type.zig");
 const Zcu = @import("Zcu.zig");
+const Frontend = @import("Frontend.zig");
 const Diag = @import("diag.zig");
 const VersionScript = @import("link/VersionScript.zig");
 const Atom = @import("link/Atom.zig");
@@ -2444,6 +2445,37 @@ pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.Ar
             return a.atom < b.atom;
         }
     }.lt);
+}
+
+/// The `Atom.Debug.Inline.unit` of a call of a function in file `callee`
+/// inlined into one in file `caller`, by the backend if `backend`, else by
+/// Sema. `units` holds the modules of the function's `inline_units` so
+/// far, to which a new one is added (see `inlineUnits`).
+pub fn inlineUnit(emit: *Emit, gpa: Allocator, units: *std.ArrayList(Frontend.Module.Index), caller: u32, callee: u32, backend: bool) Allocator.Error!u32 {
+    if (!backend) return Atom.Debug.Inline.inherit;
+    const module = emit.zcu.file(callee).module;
+    if (module == emit.zcu.file(caller).module) return 0;
+    for (units.items, 1..) |m, k| if (m == module) return @intCast(k);
+    try units.append(gpa, module);
+    return @intCast(units.items.len);
+}
+
+/// The compile unit of `module`, as `Atom.Debug.unit`: its root file's
+/// path. A compile unit per module, named after its root file, as
+/// upstream's.
+pub fn unitPath(emit: *Emit, module: Frontend.Module.Index) Allocator.Error![]const u8 {
+    const m = emit.zcu.fe.module(module);
+    return std.Io.Dir.path.join(emit.allocator(), &.{ m.root_dir, m.root_file });
+}
+
+/// `Atom.Debug.inline_units` of the modules `inlineUnit` collected.
+pub fn inlineUnits(emit: *Emit, units: []const Frontend.Module.Index) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (units) |m| {
+        try out.appendSlice(emit.allocator(), try emit.unitPath(m));
+        try out.append(emit.allocator(), 0);
+    }
+    return out.items;
 }
 
 /// Adds a function's atom and its debug info.

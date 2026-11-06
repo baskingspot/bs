@@ -428,6 +428,9 @@ pub const Debug = struct {
     /// The inline calls' names, which `Inline.name_off` and
     /// `Inline.name_len` slice (see `inlineName`).
     inline_names: []const u8 = "",
+    /// The units of calls inlined from other modules (`Inline.unit`), with
+    /// `unit`'s path rules, each followed by a 0 byte.
+    inline_units: []const u8 = "",
     /// For the cache, not the linker: per inline call, the callee
     /// declaration's stable key (`SymbolKey.fromName` of its `Nav.key`),
     /// by which a relink can refresh `Inline.base_line` when the callee
@@ -463,8 +466,19 @@ pub const Debug = struct {
         /// Index in `inlines` of the inline call containing this one, or
         /// `none` for a call directly in the function.
         parent: u32,
+        /// The compile unit of the inlined code, outside the calls inlined
+        /// into it that name their own: 0 for the function's `unit`, k for
+        /// the k-th path in `inline_units`, or `inherit` for the unit of
+        /// the code around the call. A call the backend inlined has its
+        /// callee's module's unit, since upstream compiles it as a call of
+        /// a function in that unit, and std's traces name a frame's module
+        /// after the unit that holds its address; a Sema-inlined call (an
+        /// `inline fn`) inherits, as upstream's code for it is its
+        /// caller's.
+        unit: u32 = inherit,
 
         pub const none = std.math.maxInt(u32);
+        pub const inherit = std.math.maxInt(u32);
     };
 
     /// The path of local file index `local`, which must be in range.
@@ -473,6 +487,14 @@ pub const Debug = struct {
         var start: usize = 0;
         for (1..local) |_| start = std.mem.findScalarPos(u8, d.files, start, 0).? + 1;
         return d.files[start..std.mem.findScalarPos(u8, d.files, start, 0).?];
+    }
+
+    /// The path of unit `k` of `inline_units`, which must be in range
+    /// (see `Inline.unit`).
+    pub fn inlineUnit(d: *const Debug, k: u32) []const u8 {
+        var start: usize = 0;
+        for (1..k) |_| start = std.mem.findScalarPos(u8, d.inline_units, start, 0).? + 1;
+        return d.inline_units[start..std.mem.findScalarPos(u8, d.inline_units, start, 0).?];
     }
 
     pub fn inlineName(d: *const Debug, inl: Inline) []const u8 {

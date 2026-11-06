@@ -68,7 +68,7 @@ const DebugHeader = extern struct {
     /// Counts of elements: patches, and inlines (and inline callees).
     patches_len: u32,
     inlines_len: u32,
-    unused: u32 = 0,
+    inline_units_len: u32,
 };
 
 comptime {
@@ -105,13 +105,14 @@ fn debugHeader(d: *const Atom.Debug) DebugHeader {
         .inline_names_len = @intCast(d.inline_names.len),
         .patches_len = @intCast(d.patches.len),
         .inlines_len = @intCast(d.inlines.len),
+        .inline_units_len = @intCast(d.inline_units.len),
     };
 }
 
-/// The bytes of the debug strings: file, name, lines, unit, files, and
-/// inline names.
+/// The bytes of the debug strings: file, name, lines, unit, files, inline
+/// names, and inline units.
 fn debugBytesLen(dh: DebugHeader) usize {
-    return @as(usize, dh.file_len) + dh.name_len + dh.lines_len + dh.unit_len + dh.files_len + dh.inline_names_len;
+    return @as(usize, dh.file_len) + dh.name_len + dh.lines_len + dh.unit_len + dh.files_len + dh.inline_names_len + dh.inline_units_len;
 }
 
 /// Walks a link's debug slice, sorted by `Debug.atom`, alongside its atoms
@@ -169,7 +170,7 @@ pub fn encode(atom: *const Atom, debug: ?*const Atom.Debug, out: []u8) void {
     if (debug) |d| w.writeAll(std.mem.asBytes(&debugHeader(d))) catch unreachable;
     w.writeAll(atom.bytes) catch unreachable;
     if (debug) |d| {
-        for ([_][]const u8{ d.file, d.name, d.lines, d.unit, d.files, d.inline_names }) |bytes| w.writeAll(bytes) catch unreachable;
+        for ([_][]const u8{ d.file, d.name, d.lines, d.unit, d.files, d.inline_names, d.inline_units }) |bytes| w.writeAll(bytes) catch unreachable;
         const runs = DebugRuns.at(w.end, debugHeader(d));
         w.splatByteAll(0, runs.patches - w.end) catch unreachable;
         w.writeAll(@ptrCast(d.patches)) catch unreachable;
@@ -226,11 +227,15 @@ pub fn check(bytes: []align(alignment) const u8, arch: Atom.Unwind.Arch) ?usize 
 /// `advance_line` opcode within `lines` (see `LineProgram.switchTo`).
 fn debugValid(atom_len: usize, d: *const Atom.Debug) bool {
     // 0-terminated, nonempty paths.
-    if (d.files.len != 0 and (d.files[0] == 0 or d.files[d.files.len - 1] != 0 or std.mem.find(u8, d.files, "\x00\x00") != null)) return false;
+    for ([_][]const u8{ d.files, d.inline_units }) |paths| {
+        if (paths.len != 0 and (paths[0] == 0 or paths[paths.len - 1] != 0 or std.mem.find(u8, paths, "\x00\x00") != null)) return false;
+    }
     const files = std.mem.countScalar(u8, d.files, 0);
+    const units = std.mem.countScalar(u8, d.inline_units, 0);
     for (d.inlines, 0..) |inl, i| {
         if (@as(u64, inl.name_off) + inl.name_len > d.inline_names.len) return false;
         if (inl.file > files) return false;
+        if (inl.unit != Atom.Debug.Inline.inherit and inl.unit > units) return false;
         if (inl.parent != Atom.Debug.Inline.none and inl.parent >= i) return false;
         if (inl.low > inl.high or inl.high > atom_len) return false;
     }
@@ -279,6 +284,8 @@ pub inline fn view(rec: [*]align(alignment) const u8) struct { atom: Atom, debug
         off += dh.files_len;
         const inline_names = rec[off..][0..dh.inline_names_len];
         off += dh.inline_names_len;
+        const inline_units = rec[off..][0..dh.inline_units_len];
+        off += dh.inline_units_len;
         const runs = DebugRuns.at(off, dh);
         const patches: [*]const u32 = @ptrCast(@alignCast(rec + runs.patches));
         const inlines: [*]const Atom.Debug.Inline = @ptrCast(@alignCast(rec + runs.inlines));
@@ -292,6 +299,7 @@ pub inline fn view(rec: [*]align(alignment) const u8) struct { atom: Atom, debug
             .files = files,
             .inlines = inlines[0..dh.inlines_len],
             .inline_names = inline_names,
+            .inline_units = inline_units,
             .inline_callees = callees[0..dh.inlines_len],
             .patches = patches[0..dh.patches_len],
         };
@@ -345,6 +353,7 @@ pub fn expectEqualDebug(expected: ?*const Atom.Debug, actual: ?*const Atom.Debug
         try t.expectEqualSlices(u8, e.files, a.files);
         try t.expectEqualSlices(u8, @ptrCast(e.inlines), @ptrCast(a.inlines));
         try t.expectEqualSlices(u8, e.inline_names, a.inline_names);
+        try t.expectEqualSlices(u8, e.inline_units, a.inline_units);
         try t.expectEqualSlices(Atom.SymbolKey, e.inline_callees, a.inline_callees);
         try t.expectEqualSlices(u32, e.patches, a.patches);
     }
@@ -378,8 +387,9 @@ test "atoms round-trip through records" {
             .lines = &.{ 5, 0x13, 0x04, 0x81, 0x80, 0x00, 0x03, 0x81, 0x80, 0x80, 0x80, 0x00 },
             .unit = "src/main.zig",
             .files = "lib/std/start.zig\x00",
-            .inlines = &.{.{ .name_off = 0, .name_len = 8, .file = 1, .base_line = 600, .call_line = 2, .call_column = 4, .low = 1, .high = 5, .parent = Atom.Debug.Inline.none }},
+            .inlines = &.{.{ .name_off = 0, .name_len = 8, .file = 1, .base_line = 600, .call_line = 2, .call_column = 4, .low = 1, .high = 5, .parent = Atom.Debug.Inline.none, .unit = 1 }},
             .inline_names = "callMain",
+            .inline_units = "lib/std/std.zig\x00",
             .inline_callees = &.{.fromName("std.start.callMain")},
             .patches = &.{ 2, 6 },
         },
