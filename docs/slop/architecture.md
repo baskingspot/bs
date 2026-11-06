@@ -2970,6 +2970,12 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      calls whose chains' intervals overlap another's, or the result
      alloc's, keep their slots. Each level of `return f(x)` held one more
      copy (sandopolis's 64 MiB test stack overflowed).
+     On x86_64, an `.auto` call returning an aggregate without a
+     register in rax or rax:rdx, whose result the `.auto` function's
+     `ret` returns right after it (its only use, no value with code
+     between them), leaves the result there: no slot, no store, no
+     reload (`retInRegs`). Pairs and scalars get rax and rdx as their
+     homes instead (`planRegisters`).
      With them, a `@splat` (an `aggregate_init` of one repeated element)
      over 128 bytes writes the element until it spans 64 bytes, doubles
      that by copies up to 512, and repeats it with one overlapping
