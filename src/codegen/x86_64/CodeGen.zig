@@ -1922,6 +1922,10 @@ pub fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
         },
         else => {},
     }
+    // An unsigned type narrower than 32 bits: one `and`, whose 32-bit form
+    // clears the upper half.
+    if (info.signedness == .unsigned and info.bits < 32)
+        return cg.e.alu(.@"and", .dword, .{ .reg = reg }, .{ .imm = (@as(u32, 1) << @intCast(info.bits)) - 1 });
     const shift: u8 = @intCast(64 - info.bits);
     try cg.e.shift(.shl, .qword, .{ .reg = reg }, shift);
     try cg.e.shift(if (info.signedness == .signed) .sar else .shr, .qword, .{ .reg = reg }, shift);
