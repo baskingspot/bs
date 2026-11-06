@@ -552,7 +552,7 @@ pub const Debug = struct {
                 file: u32 = std.math.maxInt(u32),
                 base: u32 = std.math.maxInt(u32),
 
-                fn row(w: *@This(), a: std.mem.Allocator, offset: u32, r: RowIter.Row) !void {
+                fn row(w: *@This(), a: std.mem.Allocator, offset: u32, r: RowIter.Row) !void { // ziglint-ignore: Z020 -- a function-local struct cannot name itself
                     if (r.file != w.file) {
                         try w.lp.switchTo(a, r.file, r.base);
                     } else if (r.base != w.base) {
@@ -594,7 +594,7 @@ pub const Debug = struct {
             pending: ?Foreign = null,
             pos: u32 = 0,
 
-            fn add(o: *@This(), hi: u32, unit: u32) !void {
+            fn add(o: *@This(), hi: u32, unit: u32) !void { // ziglint-ignore: Z020 -- a function-local struct cannot name itself
                 if (hi <= o.pos) return;
                 defer o.pos = hi;
                 if (o.pending) |*p| {
