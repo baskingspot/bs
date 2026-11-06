@@ -26,6 +26,7 @@ const Encoder = @import("Encoder.zig");
 const CodeGen = @import("CodeGen.zig");
 const Ssa = @import("../Ssa.zig");
 const shared = @import("../vector.zig");
+const int128 = @import("int128.zig");
 const Lane = shared.Lane;
 const Reg = Encoder.Reg;
 const Mem = Encoder.Mem;
@@ -99,10 +100,13 @@ pub fn lowers(cg: *CodeGen, inst: Inst.Index) bool {
         // value in memory (an array, a wide integer): one movdqu. Between
         // a vector in an XMM register and an integer or array of 1, 2, 4,
         // or 8 bytes in a general-purpose register: one movd or movq.
+        // Between one and a 128-bit integer in a register pair: movq and
+        // pinsrq or pextrq (`int128Bitcast`).
         .bitcast => blk: {
             const ty = data.ty_op.ty;
             const src_ty = cg.typeOf(data.ty_op.operand);
             if ((inXmm(ip, src_ty) and inGpr(ip, ty)) or (inXmm(ip, ty) and inGpr(ip, src_ty))) break :blk true;
+            if ((inXmm(ip, src_ty) and int128.is128(ip, ty)) or (inXmm(ip, ty) and int128.is128(ip, src_ty))) break :blk true;
             if (Type.abiSize(ip, ty) != 16 or Type.abiSize(ip, src_ty) != 16) break :blk false;
             break :blk (inXmm(ip, ty) or inXmm(ip, src_ty)) and (inXmm(ip, ty) or inMem(cg, ty)) and (inXmm(ip, src_ty) or inMem(cg, src_ty));
         },
@@ -355,6 +359,8 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
         },
         .bitcast => {
             if (inGpr(ip, data.ty_op.ty)) return toGpr(cg, inst, data.ty_op.ty, data.ty_op.operand);
+            if (int128.is128(ip, data.ty_op.ty)) return toInt128(cg, inst, data.ty_op.ty, data.ty_op.operand);
+            if (int128.is128(ip, cg.typeOf(data.ty_op.operand))) return fromInt128(cg, inst, data.ty_op.ty, data.ty_op.operand);
             const dst = try Dst.of(cg, inst, data.ty_op.ty);
             if (inGpr(ip, cg.typeOf(data.ty_op.operand))) {
                 const r = dst.home orelse .xmm0;
@@ -535,6 +541,83 @@ fn toGpr(cg: *CodeGen, inst: Inst.Index, ty: Index, operand: Ref) Error!void {
     }
     if (extend) try cg.normalize(d, ty);
     return cg.setResult(inst, ty, d);
+}
+
+/// Bitcast of 128-bit integer `operand` to 16-byte vector type `ty`: its
+/// eightbytes into the low and high lanes, from a register pair, from
+/// memory with one load, or from a widened value's one register.
+fn fromInt128(cg: *CodeGen, inst: Inst.Index, ty: Index, operand: Ref) Error!void {
+    const e = &cg.e;
+    const dst = try Dst.of(cg, inst, ty);
+    const r = dst.home orelse .xmm0;
+    const h = try int128.halves(cg, operand);
+    if (h[0] == .mem and h[1] == .mem) {
+        try e.movdq(false, .{ .reg = r }, .{ .mem = h[0].mem });
+        return dst.put(cg, r, 0);
+    }
+    try e.movToXmm(.qword, r, try rmOf(cg, h[0], .rax));
+    // movq zeroes the high lane.
+    if (h[1] != .imm or h[1].imm != 0) {
+        if (has(cg, .sse4_1)) {
+            try e.pinsrq(r, try rmOf(cg, h[1], .rax), 1);
+        } else {
+            const t: Xmm = if (r == .xmm1) .xmm2 else .xmm1;
+            try e.movToXmm(.qword, t, try rmOf(cg, h[1], .rax));
+            try e.pint(.punpcklqdq, r, .{ .reg = t });
+        }
+    }
+    try dst.put(cg, r, 0);
+}
+
+/// Half `x` of a 128-bit integer as a register or memory operand: an
+/// immediate goes through `scratch`.
+fn rmOf(cg: *CodeGen, x: Encoder.Operand, scratch: Reg) Error!Encoder.Rm {
+    return switch (x) {
+        .reg => |r| .{ .reg = r },
+        .mem => |m| .{ .mem = m },
+        .imm => |v| {
+            try cg.e.mov(.qword, .{ .reg = scratch }, .{ .imm = v });
+            return .{ .reg = scratch };
+        },
+    };
+}
+
+/// Bitcast of 16-byte vector `operand` to 128-bit integer type `ty`: its
+/// lanes into the result's register pair, or its bytes into memory.
+fn toInt128(cg: *CodeGen, inst: Inst.Index, ty: Index, operand: Ref) Error!void {
+    const e = &cg.e;
+    const c = try chunk(cg, operand, 0);
+    const p = cg.pairOf(inst.toRef()) orelse {
+        const m = try cg.resultMem(inst, ty) orelse return;
+        const x = switch (c) {
+            .reg => |x| x,
+            else => x: {
+                try loadFrom(cg, .xmm0, c);
+                break :x .xmm0;
+            },
+        };
+        return e.movdq(false, .{ .mem = m }, .{ .reg = x });
+    };
+    switch (c) {
+        .mem, .umem => |m| {
+            try e.mov(.qword, .{ .reg = p.lo }, .{ .mem = m });
+            try e.mov(.qword, .{ .reg = p.hi }, .{ .mem = CodeGen.offsetMem(m, 8) });
+        },
+        .zero, .ones => {
+            const v: i64 = if (c == .zero) 0 else -1;
+            try e.mov(.qword, .{ .reg = p.lo }, .{ .imm = v });
+            try e.mov(.qword, .{ .reg = p.hi }, .{ .imm = v });
+        },
+        .reg => |x| {
+            try e.movFromXmm(.qword, .{ .reg = p.lo }, x);
+            if (has(cg, .sse4_1)) {
+                try e.pextrq(.{ .reg = p.hi }, x, 1);
+            } else {
+                try e.pshuf(.d, .xmm0, .{ .reg = x }, 0xee);
+                try e.movFromXmm(.qword, .{ .reg = p.hi }, .xmm0);
+            }
+        },
+    }
 }
 
 /// Loads chunk `k` of vector `ref` into `r`.

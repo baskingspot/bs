@@ -1076,6 +1076,21 @@ pub fn pint3a(e: *Encoder, opcode: u8, dst: Xmm, src: XmmRm, imm: u8) !void {
     e.byte(imm);
 }
 
+/// SSE4.1 pinsrq: qword `src` into lane `lane` of `dst`.
+pub fn pinsrq(e: *Encoder, dst: Xmm, src: Rm, lane: u1) !void {
+    try e.reserve();
+    try e.modRm(.{ .op16 = true, .w = true }, &.{ 0x0f, 0x3a, 0x22 }, @backingInt(dst), rmGpr(src), 1);
+    e.byte(lane);
+}
+
+/// SSE4.1 pextrq: lane `lane` of `src` into qword `dst`.
+pub fn pextrq(e: *Encoder, dst: Rm, src: Xmm, lane: u1) !void {
+    try e.reserve();
+    e.writesRm(dst);
+    try e.modRm(.{ .op16 = true, .w = true }, &.{ 0x0f, 0x3a, 0x16 }, @backingInt(src), rmGpr(dst), 1);
+    e.byte(lane);
+}
+
 pub const VexMap = enum(u5) { @"0f" = 1, @"0f38" = 2, @"0f3a" = 3 };
 
 /// A VEX.128.66 instruction, AVX's encoding of the SSE integer and AES

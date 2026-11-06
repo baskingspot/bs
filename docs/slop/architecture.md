@@ -1735,7 +1735,10 @@ backend does, not scalarized. The split has three parts:
   16-byte vector and a 16-byte array, wide integer or f128 is one
   `movdqu` (`vector.lowers`), so `@as(V, @bitCast(p[i..][0..16].*))`
   loads straight into an XMM register, and the bitcast is no clobber
-  point. The lowerings
+  point. With a 128-bit integer in a register pair it is `movq` and
+  `pinsrq` in, `movq` and `pextrq` out (SSE4.1; `punpcklqdq` and
+  `pshufd` without it), so a u128 meets inline assembly's vector
+  operands without the frame (GHASH's `clmul`). The lowerings
   use only rax, rcx, rdx, r10, r11 and xmm0–xmm5, so none is a clobber
   point: a vector variable stays in xmm8–xmm15 across them, as a loop's
   accumulator does.
