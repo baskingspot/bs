@@ -2092,7 +2092,7 @@ fn LinkOf(comptime Input: type) type {
                 const n_u = units.len;
                 var at: usize = thread * l.dsym_scratch_len;
                 for (units, pieces[0..n_u], pieces[n_u..][0..n_u], pieces[2 * n_u ..][0..n_u], pieces[3 * n_u ..][0..n_u]) |u, *i, *r, *ln, *a| {
-                    const lens = [4]u64{ u.info_len, u.n_runs * Dwarf.range_len, u.line_len, u.n_runs * Dwarf.aranges_tuple_len };
+                    const lens = [4]u64{ u.info_len, u.rangesLen(), u.line_len, u.arangesLen() };
                     switch (l.dsym) {
                         .memory => |m| {
                             i.* = m[l.dsym_info_off + u.info_off ..][0..lens[0]];

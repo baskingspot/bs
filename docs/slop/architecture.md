@@ -2174,8 +2174,11 @@ build, the passes, and the debug info treat them as Sema's inline calls
   description. The hot path is untouched; the cost is 5 bytes per stub.
   A panic call with arguments passed in memory keeps the direct call
   (std's handlers take theirs in registers), and the stubs stop growing
-  near `epilogue`'s 16 bits. `zig build test` compares
-  `test/run/panic_inlined.zig`'s and `panic_trace.zig`'s traces with
+  near `epilogue`'s 16 bits. A stub of a call inlined from another module
+  is in that module's compile unit, as all of the call's code is (see
+  "Debug info"), so its frame names that module. `zig build test`
+  compares `test/run/panic_inlined.zig`'s, `panic_module_inlined.zig`'s,
+  `panic_module_nested.zig`'s and `panic_trace.zig`'s traces with
   those of the same programs built with `BS_INLINE=0`. Limit: a hardware
   fault (a segfault from a bad pointer, a division trap) in inlined code
   has no stub, so the signal handler's trace shows the callee's line
@@ -3334,8 +3337,30 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
   directory 0 is the unit's directory and file 0 its root file, with a
   sequence per function of the unit; and each
   unit's address ranges in .debug_rnglists, as DW_RLE_offset_pair entries
-  with offsets padded to 5 bytes, one per run of consecutive entries of
-  the unit within a chunk. A run also covers code without `Debug`
+  with offsets padded to 5 bytes, one per run of consecutive pieces of
+  the unit within a chunk. A function is one piece of its unit unless the
+  backend inlined code of another module into it: then the code of each
+  such call (`Inline.unit`), outside the calls inside it that name their
+  own, is a piece of the callee's module's unit (`Dwarf.forEachPiece`),
+  out of the function's unit's ranges and in the other unit's, which
+  also gets a sequence with the function's rows that cover the piece
+  (`Dwarf.foreignSequence`, decoded from the fragment). std's traces name
+  a frame's module after the first unit whose ranges hold its address and
+  read its line from that unit's program, so a frame inlined across
+  modules shows its callee's module, as upstream's call would
+  (`test/run/panic_module_*.zig`, `panic_main_inlined.zig`). The
+  function's entries and its own sequence stay whole in its unit: std
+  takes names from the innermost entry of any unit, and gdb still finds
+  the function and its inlined calls. A dSYM's aranges stay per run of
+  whole functions, as lldb maps addresses to units only through them and
+  then looks for the function in that unit. Rejected: a separate unit per
+  module for the pieces, first in .debug_info, with the functions' units
+  left whole (std would find it first and `dwarfdump --verify` accepts
+  overlapping units, but gdb maps an address to the unit with the
+  smallest span holding it, which is such a unit, and loses the frame's
+  function). The cost: `dwarfdump --verify` reports a function whose
+  pieces are in another unit as a DIE not contained by its unit's
+  ranges. A run also covers code without `Debug`
   between its functions; code before the first or after the last
   function of a run is in no unit. Per-entry sizes depend only on the
   entry (file indices and range offsets are padded LEB128s), so a pass

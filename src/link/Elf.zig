@@ -2130,7 +2130,7 @@ fn LinkOf(comptime Input: type) type {
             {
                 var at: usize = thread * l.scratch_len + lens[0] + lens[1];
                 for (units, info, ranges, line) |u, *i, *r, *ln| {
-                    const piece_lens = [3]u64{ u.info_len, u.n_runs * Dwarf.range_len, u.line_len };
+                    const piece_lens = [3]u64{ u.info_len, u.rangesLen(), u.line_len };
                     switch (l.target) {
                         .memory => |buf| {
                             i.* = buf[l.info_off + u.info_off ..][0..piece_lens[0]];

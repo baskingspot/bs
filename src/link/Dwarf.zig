@@ -9,6 +9,19 @@
 //! set): one range per run of consecutive entries of the unit within a
 //! chunk, which also covers code between them that has no debug info.
 //!
+//! Code the backend inlined from another module is in that module's unit
+//! (`Atom.Debug.Inline.unit`), as upstream's call of a function there would
+//! be: std's traces name a frame's module after the first unit whose
+//! ranges hold its address and read its line from that unit's line
+//! program. So a function's code is cut into pieces of one unit each
+//! (`forEachPiece`); runs are of pieces, and a piece in another unit gets a
+//! sequence there with the rows of the function's that cover it
+//! (`foreignSequence`). The function's entries and its own sequence stay in
+//! its unit, whole: std takes a frame's name from the innermost entry of any
+//! unit, and gdb finds the function there. Aranges (dSYMs) stay per run of
+//! whole entries: lldb maps a dSYM's addresses to units only through them,
+//! and finds the function and its inlined calls in its own unit.
+//!
 //! The headers depend only on the file and unit tables and are built
 //! serially; the per-function parts have sizes known from their
 //! `Atom.Debug` alone, so threads can write them in place, and a sequence
@@ -153,8 +166,8 @@ pub fn place(gpa: Allocator, chunks: []Chunk, comp_dir: []const u8, text_addr: u
             }
             u.info_len += part.info_len;
             u.line_len += part.line_len;
-            u.ranges_len += part.n_runs * range_len;
-            u.aranges_len += part.n_runs * aranges_tuple_len;
+            u.ranges_len += part.rangesLen();
+            u.aranges_len += part.arangesLen();
             try unit_map.append(arena, @intCast(gop.index));
         }
         c.file_map = file_map[at..][0..c.files.count()];
@@ -212,9 +225,9 @@ pub fn place(gpa: Allocator, chunks: []Chunk, comp_dir: []const u8, text_addr: u
             part.line_off = u.line_off;
             part.aranges_off = u.aranges_off;
             u.info_off += part.info_len;
-            u.ranges_off += part.n_runs * range_len;
+            u.ranges_off += part.rangesLen();
             u.line_off += part.line_len;
-            u.aranges_off += part.n_runs * aranges_tuple_len;
+            u.aranges_off += part.arangesLen();
         }
     }
     for (units.values()) |*u| {
@@ -619,6 +632,11 @@ pub const Chunk = struct {
     /// `local_starts` has each such entry's start in it.
     locals: std.ArrayList(u32),
     local_starts: std.ArrayList(u32),
+    /// Per piece of an entry in another unit (`forEachPiece`), in entry
+    /// and piece order: the unit's index in `units`, then for each local
+    /// file of the entry the index in `files` of its key in that unit, or
+    /// `skip` if the piece's rows do not use it.
+    foreign: std.ArrayList(u32),
     // Filled in by `place`.
     /// FDEs in the chunks before this one, and their bytes.
     frame_base: u32,
@@ -626,13 +644,14 @@ pub const Chunk = struct {
     /// Index of each of `files` in its unit's file table.
     file_map: []u32,
 
-    pub const empty: Chunk = .{ .n_frames = 0, .frame_bytes = 0, .files = .empty, .units = .empty, .locals = .empty, .local_starts = .empty, .frame_base = 0, .frame_off = 0, .file_map = &.{} };
+    pub const empty: Chunk = .{ .n_frames = 0, .frame_bytes = 0, .files = .empty, .units = .empty, .locals = .empty, .local_starts = .empty, .foreign = .empty, .frame_base = 0, .frame_off = 0, .file_map = &.{} };
 
     pub fn deinit(c: *Chunk, gpa: Allocator) void {
         c.files.deinit(gpa);
         c.units.deinit(gpa);
         c.locals.deinit(gpa);
         c.local_starts.deinit(gpa);
+        c.foreign.deinit(gpa);
         c.* = undefined;
     }
 
@@ -641,13 +660,15 @@ pub const Chunk = struct {
     pub fn lens(c: *const Chunk) struct { info: u64, ranges: u64, line: u64, aranges: u64 } {
         var info: u64 = 0;
         var line: u64 = 0;
-        var runs: u64 = 0;
+        var ranges: u64 = 0;
+        var aranges: u64 = 0;
         for (c.units.values()) |u| {
             info += u.info_len;
             line += u.line_len;
-            runs += u.n_runs;
+            ranges += u.rangesLen();
+            aranges += u.arangesLen();
         }
-        return .{ .info = info, .ranges = runs * range_len, .line = line, .aranges = runs * aranges_tuple_len };
+        return .{ .info = info, .ranges = ranges, .line = line, .aranges = aranges };
     }
 };
 
@@ -671,14 +692,25 @@ pub const UnitPart = struct {
     // Filled in by `layOutChunk`.
     info_len: u64 = 0,
     line_len: u64 = 0,
-    /// Runs of consecutive entries of the unit, each one range.
+    /// Runs of consecutive pieces of the unit (`forEachPiece`), each one
+    /// range, and runs of consecutive entries of the unit, each one aranges
+    /// tuple.
     n_runs: u32 = 0,
+    n_entry_runs: u32 = 0,
     // Filled in by `place`: offsets within .debug_info, .debug_rnglists,
     // .debug_line, and .debug_aranges.
     info_off: u64 = 0,
     ranges_off: u64 = 0,
     line_off: u64 = 0,
     aranges_off: u64 = 0,
+
+    pub fn rangesLen(u: UnitPart) u64 {
+        return @as(u64, u.n_runs) * range_len;
+    }
+
+    pub fn arangesLen(u: UnitPart) u64 {
+        return @as(u64, u.n_entry_runs) * aranges_tuple_len;
+    }
 };
 
 /// The `file_of` of an entry whose atom was deduplicated away. Otherwise
@@ -706,6 +738,9 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
     var files_by_addr: ByAddr = .{};
     var units_by_addr: ByAddr = .{};
     var units: UnitCursor = .{};
+    // The units of the current runs of pieces and of entries.
+    var run_unit: u32 = no_run;
+    var entry_run_unit: u32 = no_run;
     for (l.file_of[begin..end], begin..) |*file_of, j| {
         file_of.* = skip;
         const atom = l.input.debugAtom(j);
@@ -725,7 +760,8 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
             files_by_addr.put(d.file, unit, @intCast(gop.index));
             break :index @as(u32, @intCast(gop.index));
         };
-        c.local_starts.append(l.gpa, @intCast(c.locals.items.len)) catch return l.fail(task, atom, error.OutOfMemory, .{});
+        const local_start = c.locals.items.len;
+        c.local_starts.append(l.gpa, @intCast(local_start)) catch return l.fail(task, atom, error.OutOfMemory, .{});
         if (d.inlines.len > 0 or d.patches.len > 0 or d.files.len > 0) {
             if (!valid(d, l.input.atom(atom).bytes.len)) return l.fail(task, atom, error.InvalidDebugInfo, .{ .atom = l.input.atom(atom).name });
             var start: usize = 0;
@@ -737,11 +773,18 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
             }
         }
         file_of.* = file | unit << file_bits;
-        const part = units.part;
+        const part = &c.units.values()[unit];
         const a = l.input.atom(atom);
         part.info_len += subprogramSize(d, a.name);
         part.line_len += sequenceSize(d);
-        part.n_runs += @intFromBool(units.new_run);
+        if (unit != entry_run_unit) {
+            part.n_entry_runs += 1;
+            entry_run_unit = unit;
+        }
+        if (hasForeign(d)) {
+            var lay: ForeignLayout = .{ .gpa = l.gpa, .c = c, .d = d, .unit = unit, .run_unit = &run_unit, .locals = c.locals.items[local_start..], .rows = .init(d) };
+            forEachPiece(d, a.bytes.len, &lay, ForeignLayout.piece) catch return l.fail(task, atom, error.OutOfMemory, .{});
+        } else countRun(c, &run_unit, unit);
         if (a.unwind.kind != .none) {
             c.n_frames += 1;
             // Mach-O, aarch64 only, writes no .eh_frame and has no `arch`.
@@ -764,8 +807,11 @@ fn valid(d: *const Atom.Debug, size: u64) bool {
         if (i == 0 or d.files[i - 1] == 0) return false;
         n_files += 1;
     }
+    if (d.inline_units.len > 0 and d.inline_units[d.inline_units.len - 1] != 0) return false;
+    const n_units = std.mem.countScalar(u8, d.inline_units, 0);
     for (d.inlines, 0..) |inl, k| {
         if (inl.file > n_files or inl.low > inl.high or inl.high > size) return false;
+        if (inl.unit != Atom.Debug.Inline.inherit and inl.unit > n_units) return false;
         if (inl.name_off > d.inline_names.len or inl.name_len > d.inline_names.len - inl.name_off) return false;
         // Preorder: the parent is the previous entry or one of its
         // ancestors.
@@ -798,19 +844,14 @@ fn valid(d: *const Atom.Debug, size: u64) bool {
 }
 
 /// Finds the index in the chunk's units of each entry's unit, in entry
-/// order, and whether the entry starts a run of the unit.
+/// order.
 const UnitCursor = struct {
     prev: ?[]const u8 = null,
     index: u32 = 0,
-    part: *UnitPart = undefined,
-    new_run: bool = false,
 
     inline fn next(u: *UnitCursor, gpa: Allocator, c: *Chunk, by_addr: *ByAddr, unit: []const u8) Allocator.Error!u32 {
         // Consecutive entries' units are usually the same bytes.
-        if (u.prev) |prev| if (prev.ptr == unit.ptr and prev.len == unit.len) {
-            u.new_run = false;
-            return u.index;
-        };
+        if (u.prev) |prev| if (prev.ptr == unit.ptr and prev.len == unit.len) return u.index;
         return u.find(gpa, c, by_addr, unit);
     }
 
@@ -821,10 +862,8 @@ const UnitCursor = struct {
             by_addr.put(unit, 0, @intCast(gop.index));
             break :index @as(u32, @intCast(gop.index));
         };
-        u.new_run = u.prev == null or index != u.index;
         u.prev = unit;
         u.index = index;
-        u.part = &c.units.values()[index];
         return index;
     }
 };
@@ -862,9 +901,11 @@ const ByAddr = struct {
 
 /// Writes one chunk's entries in order: each entry's subprogram entry to
 /// its unit's part of `info` and its sequence to its unit's part of `line`,
-/// and each run's range to its unit's part of `ranges` and, if not empty,
-/// `aranges`. A part is where the chunk's part of a unit goes, in the
-/// chunk's unit order; the writer advances them.
+/// each of its pieces in another unit's sequence to that unit's part of
+/// `line`, each run of pieces' range to its unit's part of `ranges`, and,
+/// if `aranges` is not empty, each run of entries' tuple to its unit's
+/// part of it. A part is where the chunk's part of a unit goes, in
+/// the chunk's unit order; the writer advances them.
 pub const ChunkWriter = struct {
     c: *const Chunk,
     info: [][]u8,
@@ -874,55 +915,419 @@ pub const ChunkWriter = struct {
     /// Range offsets are from the units' low_pc.
     text_addr: u64,
     /// The current run's unit, as an index in the chunk's units or
-    /// `no_unit`, and the rest of its parts of `info` and `line`.
-    k: u32 = no_unit,
-    unit_info: []u8 = &.{},
-    unit_line: []u8 = &.{},
+    /// `no_run`.
+    k: u32 = no_run,
     run_start: u64 = 0,
     run_end: u64 = 0,
-    /// The entries written so far.
+    /// The same for the current run of entries.
+    entry_k: u32 = no_run,
+    entry_run_start: u64 = 0,
+    entry_run_end: u64 = 0,
+    /// The entries written so far, and how much of the chunk's `foreign`
+    /// their pieces read.
     n: u32 = 0,
+    foreign_at: usize = 0,
 
     /// Writes the entry `debug` of the `size`-byte function at `addr`,
     /// whose file is `file_of` (see `layOutChunk`) and whose symbol is
     /// `linkage_name`.
     pub inline fn entry(w: *ChunkWriter, debug: *const Atom.Debug, linkage_name: []const u8, addr: u64, size: u64, file_of: u32) void {
         const k = file_of >> file_bits;
-        if (k != w.k) w.switchUnit(k, addr);
-        w.run_end = addr + size;
         const files: FileMap = .{ .c = w.c, .locals = w.c.locals.items[w.c.local_starts.items[w.n]..], .file = w.c.file_map[file_of & (1 << file_bits) - 1] };
         w.n += 1;
-        w.unit_info = w.unit_info[writeSubprogram(w.unit_info, debug, linkage_name, addr, size, files)..];
-        w.unit_line = w.unit_line[writeSequence(w.unit_line, debug, addr, size, files)..];
+        w.info[k] = w.info[k][writeSubprogram(w.info[k], debug, linkage_name, addr, size, files)..];
+        w.line[k] = w.line[k][writeSequence(w.line[k], debug, addr, size, files)..];
+        if (k != w.entry_k) {
+            if (w.entry_k != no_run) w.endEntryRun();
+            w.entry_k = k;
+            w.entry_run_start = addr;
+        }
+        w.entry_run_end = addr + size;
+        if (hasForeign(debug)) w.pieces(debug, addr, size, k) else w.piece(k, addr, addr + size);
     }
 
-    const no_unit = std.math.maxInt(u32);
+    /// Adds the code at `lo..hi` in unit `k` to the runs.
+    fn piece(w: *ChunkWriter, k: u32, lo: u64, hi: u64) void {
+        if (k != w.k) {
+            if (w.k != no_run) w.endRun();
+            w.k = k;
+            w.run_start = lo;
+        }
+        w.run_end = hi;
+    }
 
-    fn switchUnit(w: *ChunkWriter, k: u32, addr: u64) void {
-        if (w.k != no_unit) w.endRun();
-        w.k = k;
-        w.unit_info = w.info[k];
-        w.unit_line = w.line[k];
-        w.run_start = addr;
+    /// The pieces of the function at `addr` whose own unit is `k`, as
+    /// `ForeignLayout` laid them out.
+    noinline fn pieces(w: *ChunkWriter, debug: *const Atom.Debug, addr: u64, size: u64, k: u32) void {
+        var ctx: ForeignWriter = .{ .w = w, .d = debug, .addr = addr, .k = k, .rows = .init(debug) };
+        forEachPiece(debug, size, &ctx, ForeignWriter.piece) catch unreachable;
     }
 
     pub fn finish(w: *ChunkWriter) void {
-        if (w.k != no_unit) w.endRun();
+        if (w.k != no_run) w.endRun();
+        if (w.entry_k != no_run) w.endEntryRun();
     }
 
     fn endRun(w: *ChunkWriter) void {
         const k = w.k;
-        w.info[k] = w.unit_info;
-        w.line[k] = w.unit_line;
         w.ranges[k][0] = DW.RLE.offset_pair;
         w.ranges[k][1..6].* = paddedUleb5(w.run_start - w.text_addr);
         w.ranges[k][6..11].* = paddedUleb5(w.run_end - w.text_addr);
         w.ranges[k] = w.ranges[k][range_len..];
-        if (w.aranges.len > 0) {
-            std.mem.writeInt(u64, w.aranges[k][0..8], w.run_start, .little);
-            std.mem.writeInt(u64, w.aranges[k][8..16], w.run_end - w.run_start, .little);
-            w.aranges[k] = w.aranges[k][aranges_tuple_len..];
+    }
+
+    fn endEntryRun(w: *ChunkWriter) void {
+        if (w.aranges.len == 0) return;
+        const k = w.entry_k;
+        std.mem.writeInt(u64, w.aranges[k][0..8], w.entry_run_start, .little);
+        std.mem.writeInt(u64, w.aranges[k][8..16], w.entry_run_end - w.entry_run_start, .little);
+        w.aranges[k] = w.aranges[k][aranges_tuple_len..];
+    }
+};
+
+const no_run = std.math.maxInt(u32);
+
+/// Counts a piece of unit `k` toward the runs of a chunk, `run_unit`
+/// being the unit of the current run.
+fn countRun(c: *Chunk, run_unit: *u32, k: u32) void {
+    if (k == run_unit.*) return;
+    c.units.values()[k].n_runs += 1;
+    run_unit.* = k;
+}
+
+/// Code at `lo..hi` of a function, in unit `unit`: 0 for the function's
+/// own, k for `inline_units`' k-th (see `Atom.Debug.Inline.unit`).
+const Piece = struct { lo: u64, hi: u64, unit: u32 };
+
+/// Whether some of the function's code is in another unit than its own.
+fn hasForeign(d: *const Atom.Debug) bool {
+    for (d.inlines) |inl| if (inl.unit != Atom.Debug.Inline.inherit and inl.unit != 0) return true;
+    return false;
+}
+
+/// Calls `f(ctx, piece)` for the pieces of the `size`-byte function of `d`
+/// in address order: the code around each address is in the unit of the
+/// innermost inlined call there that names one, else in the function's;
+/// adjacent pieces of one unit are one, and empty ones are left out. An
+/// inlined call's code ends at the end of the enclosing call that names a
+/// unit, and starts after the code of the calls before it, so pieces never
+/// overlap even if the entries do.
+fn forEachPiece(d: *const Atom.Debug, size: u64, ctx: anytype, comptime f: fn (@TypeOf(ctx), Piece) Allocator.Error!void) Allocator.Error!void {
+    const inlines = d.inlines;
+    const inherit = Atom.Debug.Inline.inherit;
+    const none = Atom.Debug.Inline.none;
+    const Out = struct {
+        pending: ?Piece = null,
+        pos: u64 = 0,
+
+        fn add(o: *@This(), c: @TypeOf(ctx), hi: u64, unit: u32) Allocator.Error!void {
+            if (hi <= o.pos) return;
+            defer o.pos = hi;
+            if (o.pending) |*p| {
+                if (p.unit == unit) {
+                    p.hi = hi;
+                    return;
+                }
+                try f(c, p.*);
+            }
+            o.pending = .{ .lo = o.pos, .hi = hi, .unit = unit };
         }
+    };
+    var o: Out = .{};
+    // The innermost open call that names a unit.
+    var cur: u32 = none;
+    for (inlines, 0..) |inl, k| {
+        if (inl.unit == inherit) continue;
+        const outer = enclosing(inlines, @intCast(k));
+        while (cur != none and cur != outer) : (cur = enclosing(inlines, cur)) try o.add(ctx, inlines[cur].high, inlines[cur].unit);
+        try o.add(ctx, inl.low, if (cur == none) 0 else inlines[cur].unit);
+        cur = @intCast(k);
+    }
+    while (cur != none) : (cur = enclosing(inlines, cur)) try o.add(ctx, inlines[cur].high, inlines[cur].unit);
+    try o.add(ctx, size, 0);
+    if (o.pending) |p| try f(ctx, p);
+}
+
+/// The nearest ancestor of inlined call `k` that names a unit, or `none`.
+fn enclosing(inlines: []const Atom.Debug.Inline, k: u32) u32 {
+    var p = inlines[k].parent;
+    while (p != Atom.Debug.Inline.none and inlines[p].unit == Atom.Debug.Inline.inherit) p = inlines[p].parent;
+    return p;
+}
+
+/// A row of a function's line program: its code offset, local file
+/// index, and line and column registers.
+const Row = struct { offset: u64, file: u32, line: i64, column: u64 };
+
+/// Decodes the rows of a function's line program fragment (`Atom.Debug.lines`),
+/// as its sequence would have them after `writeSequence`: lines from the
+/// function's base, patches applied. Stops at an opcode `LineProgram` does
+/// not write.
+const RowIter = struct {
+    d: *const Atom.Debug,
+    at: usize = 0,
+    patch: usize = 0,
+    base: u32,
+    row: Row,
+
+    fn init(d: *const Atom.Debug) RowIter {
+        return .{ .d = d, .base = d.base_line, .row = .{ .offset = 0, .file = 0, .line = @as(i64, d.base_line) + 1, .column = 0 } };
+    }
+
+    fn next(it: *RowIter) ?Row {
+        const lines = it.d.lines;
+        const r = &it.row;
+        while (it.at < lines.len) {
+            const p = it.at;
+            const op = lines[p];
+            it.at += 1;
+            const patched = it.patch < it.d.patches.len and it.d.patches[it.patch] == p;
+            if (patched) it.patch += 1;
+            if (op >= Atom.LineProgram.opcode_base) {
+                const adjusted = op - Atom.LineProgram.opcode_base;
+                r.offset += adjusted / Atom.LineProgram.line_range;
+                r.line += @as(i64, Atom.LineProgram.line_base) + adjusted % Atom.LineProgram.line_range;
+                return r.*;
+            }
+            switch (op) {
+                DW.LNS.set_file => {
+                    if (!patched or lines.len - p < set_file_len) return null;
+                    r.file = readPaddedUleb(lines[p + 1 ..][0..3]);
+                    it.at = p + set_file_len;
+                },
+                DW.LNS.advance_line => if (patched) {
+                    if (lines.len - p < 6) return null;
+                    const k: u32 = @intCast(readPaddedSleb(lines[p + 1 ..][0..5]));
+                    const to = if (k == 0) it.d.base_line else it.d.inlines[k - 1].base_line;
+                    r.line += @as(i64, to) - it.base;
+                    it.base = to;
+                    it.at = p + 6;
+                } else {
+                    r.line += it.sleb() orelse return null;
+                },
+                DW.LNS.set_column => r.column = it.uleb() orelse return null,
+                DW.LNS.advance_pc => r.offset += it.uleb() orelse return null,
+                DW.LNS.const_add_pc => r.offset += (255 - Atom.LineProgram.opcode_base) / Atom.LineProgram.line_range,
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    fn uleb(it: *RowIter) ?u64 {
+        var v: u64 = 0;
+        var shift: u32 = 0;
+        while (it.at < it.d.lines.len and shift < 64) : (shift += 7) {
+            const b = it.d.lines[it.at];
+            it.at += 1;
+            v |= @as(u64, b & 0x7f) << @intCast(shift);
+            if (b & 0x80 == 0) return v;
+        }
+        return null;
+    }
+
+    fn sleb(it: *RowIter) ?i64 {
+        var v: u64 = 0;
+        var shift: u32 = 0;
+        while (it.at < it.d.lines.len and shift < 64) : (shift += 7) {
+            const b = it.d.lines[it.at];
+            it.at += 1;
+            v |= @as(u64, b & 0x7f) << @intCast(shift);
+            if (b & 0x80 == 0) {
+                if (shift + 7 < 64 and b & 0x40 != 0) v |= @as(u64, std.math.maxInt(u64)) << @intCast(shift + 7);
+                return @bitCast(v);
+            }
+        }
+        return null;
+    }
+};
+
+/// The rows of a function, read in address order across its pieces: `cur`
+/// the last row read, `next` the one after it.
+const RowCursor = struct {
+    it: RowIter,
+    cur: ?Row = null,
+    next: ?Row = null,
+
+    fn init(d: *const Atom.Debug) RowCursor {
+        var c: RowCursor = .{ .it = .init(d) };
+        c.next = c.it.next();
+        return c;
+    }
+
+    fn advance(c: *RowCursor) void {
+        c.cur = c.next;
+        c.next = c.it.next();
+    }
+};
+
+/// Writes, or with a null `out` sizes, the sequence of another unit for
+/// piece `p` of the function at `addr`: its rows at `p.lo` and in it, the
+/// first moved to `p.lo`, through `rows`, which must not be past `p.lo`;
+/// `fileIndex(ctx, local)` gives each local file's index in the unit's
+/// file table. Sizes do not depend on the indices, which are padded.
+fn foreignSequence(rows: *RowCursor, p: Piece, addr: u64, out: ?[]u8, ctx: anytype, comptime fileIndex: fn (@TypeOf(ctx), u32) Allocator.Error!u32) Allocator.Error!usize {
+    var w: SeqWriter = .{ .out = out, .offset = p.lo };
+    var buf: [set_address_len]u8 = undefined;
+    setAddress(&buf, addr + p.lo);
+    w.put(&buf);
+    while (rows.next) |r| {
+        if (r.offset > p.lo) break;
+        rows.advance();
+    }
+    if (rows.cur) |r| try w.row(p.lo, r, ctx, fileIndex);
+    while (rows.next) |r| {
+        if (r.offset >= p.hi) break;
+        try w.row(r.offset, r, ctx, fileIndex);
+        rows.advance();
+    }
+    if (p.hi != w.offset) {
+        w.put(&.{DW.LNS.advance_pc});
+        w.uleb(p.hi - w.offset);
+    }
+    w.put(&.{ 0, 1, DW.LNE.end_sequence });
+    return w.len;
+}
+
+/// The registers and output of a sequence `foreignSequence` writes.
+const SeqWriter = struct {
+    out: ?[]u8,
+    len: usize = 0,
+    offset: u64,
+    file: u32 = std.math.maxInt(u32),
+    line: i64 = 1,
+    column: u64 = 0,
+
+    fn put(w: *SeqWriter, bytes: []const u8) void {
+        if (w.out) |o| @memcpy(o[w.len..][0..bytes.len], bytes);
+        w.len += bytes.len;
+    }
+
+    fn uleb(w: *SeqWriter, value: u64) void {
+        var buf: [10]u8 = undefined;
+        var v = value;
+        var n: usize = 0;
+        while (v >= 0x80) : (v >>= 7) {
+            buf[n] = @as(u8, @truncate(v)) | 0x80;
+            n += 1;
+        }
+        buf[n] = @intCast(v);
+        w.put(buf[0 .. n + 1]);
+    }
+
+    fn sleb(w: *SeqWriter, value: i64) void {
+        var buf: [10]u8 = undefined;
+        var v = value;
+        var n: usize = 0;
+        while (true) : (n += 1) {
+            const b: u8 = @as(u7, @truncate(@as(u64, @bitCast(v))));
+            v >>= 7;
+            if ((v == 0 and b & 0x40 == 0) or (v == -1 and b & 0x40 != 0)) {
+                buf[n] = b;
+                break;
+            }
+            buf[n] = b | 0x80;
+        }
+        w.put(buf[0 .. n + 1]);
+    }
+
+    fn row(w: *SeqWriter, offset: u64, r: Row, ctx: anytype, comptime fileIndex: fn (@TypeOf(ctx), u32) Allocator.Error!u32) Allocator.Error!void {
+        if (r.file != w.file) {
+            var buf: [set_file_len]u8 = undefined;
+            paddedFile(&buf, try fileIndex(ctx, r.file));
+            w.put(&buf);
+            w.file = r.file;
+        }
+        if (r.column != w.column) {
+            w.put(&.{DW.LNS.set_column});
+            w.uleb(r.column);
+            w.column = r.column;
+        }
+        if (r.line != w.line) {
+            w.put(&.{DW.LNS.advance_line});
+            w.sleb(r.line - w.line);
+            w.line = r.line;
+        }
+        if (offset != w.offset) {
+            w.put(&.{DW.LNS.advance_pc});
+            w.uleb(offset - w.offset);
+            w.offset = offset;
+        }
+        w.put(&.{DW.LNS.copy});
+    }
+};
+
+/// Lays out an entry's pieces (`layOutChunk`): counts their runs, adds the
+/// other units they are in to the chunk with their sequences' sizes and
+/// files, and records them in `Chunk.foreign`.
+const ForeignLayout = struct {
+    gpa: Allocator,
+    c: *Chunk,
+    d: *const Atom.Debug,
+    /// The entry's unit, as an index in the chunk's units.
+    unit: u32,
+    run_unit: *u32,
+    /// `Chunk.locals` from the entry's.
+    locals: []const u32,
+    rows: RowCursor,
+    /// The current piece's file map in `Chunk.foreign`.
+    map: usize = 0,
+    k: u32 = 0,
+
+    fn piece(lay: *ForeignLayout, p: Piece) Allocator.Error!void {
+        const c = lay.c;
+        if (p.unit == 0) return countRun(c, lay.run_unit, lay.unit);
+        const gop = try c.units.getOrPut(lay.gpa, lay.d.inlineUnit(p.unit));
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const k: u32 = @intCast(gop.index);
+        countRun(c, lay.run_unit, k);
+        const n_files = 1 + std.mem.countScalar(u8, lay.d.files, 0);
+        try c.foreign.ensureUnusedCapacity(lay.gpa, 1 + n_files);
+        c.foreign.appendAssumeCapacity(k);
+        lay.map = c.foreign.items.len;
+        c.foreign.appendNTimesAssumeCapacity(skip, n_files);
+        // Units of the same path are one.
+        if (k == lay.unit) return;
+        lay.k = k;
+        c.units.values()[k].line_len += try foreignSequence(&lay.rows, p, 0, null, lay, file);
+    }
+
+    /// Adds local file `local`'s key in the piece's unit to the chunk.
+    fn file(lay: *ForeignLayout, local: u32) Allocator.Error!u32 {
+        const slot = &lay.c.foreign.items[lay.map + local];
+        if (slot.* == skip) {
+            const path = if (local == 0) lay.d.file else lay.c.files.keys()[lay.locals[local - 1]].path;
+            slot.* = @intCast((try lay.c.files.getOrPut(lay.gpa, .{ .unit = lay.k, .path = path })).index);
+        }
+        return 0;
+    }
+};
+
+/// Writes an entry's pieces as `ForeignLayout` laid them out.
+const ForeignWriter = struct {
+    w: *ChunkWriter,
+    d: *const Atom.Debug,
+    addr: u64,
+    /// The entry's unit.
+    k: u32,
+    rows: RowCursor,
+    map: []const u32 = &.{},
+
+    fn piece(fw: *ForeignWriter, p: Piece) Allocator.Error!void {
+        const w = fw.w;
+        if (p.unit == 0) return w.piece(fw.k, fw.addr + p.lo, fw.addr + p.hi);
+        const foreign = w.c.foreign.items;
+        const k = foreign[w.foreign_at];
+        const n_files = 1 + std.mem.countScalar(u8, fw.d.files, 0);
+        fw.map = foreign[w.foreign_at + 1 ..][0..n_files];
+        w.foreign_at += 1 + n_files;
+        w.piece(k, fw.addr + p.lo, fw.addr + p.hi);
+        if (k == fw.k) return;
+        w.line[k] = w.line[k][try foreignSequence(&fw.rows, p, fw.addr, w.line[k], fw, file)..];
+    }
+
+    fn file(fw: *ForeignWriter, local: u32) Allocator.Error!u32 {
+        return fw.w.c.file_map[fw.map[local]];
     }
 };
 

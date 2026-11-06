@@ -809,7 +809,7 @@ fn traceCheck(b: *std.Build, test_step: *std.Build.Step, bs: *std.Build.Step.Com
 }
 
 fn isTraceChecked(file: []const u8) bool {
-    for ([_][]const u8{ "error_inlined.zig", "error_prong_inlined.zig", "panic_inlined.zig", "panic_prong_inlined.zig", "panic_switch_inlined.zig", "panic_trace.zig" }) |f| {
+    for ([_][]const u8{ "error_inlined.zig", "error_prong_inlined.zig", "panic_inlined.zig", "panic_main_inlined.zig", "panic_module_inlined.zig", "panic_module_nested.zig", "panic_prong_inlined.zig", "panic_switch_inlined.zig", "panic_trace.zig" }) |f| {
         if (std.mem.eql(u8, file, f)) return true;
     }
     return false;
