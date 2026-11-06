@@ -758,6 +758,17 @@ fn scratchUse(cg: *CodeGen, inst: Inst.Index) u32 {
         // A pointer in memory is loaded into x11 (`ptrMem`); copies go
         // through x9, x10, x16 and x17 (`copyMem`).
         .load, .store => 0,
+        // An addition or subtraction with overflow at 32 or 64 bits, and a
+        // multiplication at 64, read the flags; the others compare in x13
+        // (`truncCheck`), and a multiplication wider than 32 bits sets a
+        // bit in x14 (`overflowOp`).
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => ovf: {
+            const op_ty = cg.typeOf(ir.extraData(Ir.Bin, ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload).data.lhs);
+            if (Type.class(cg.ip, op_ty) != .int) break :ovf scratch_mask;
+            const bits = Type.intInfo(cg.ip, op_ty).bits;
+            if (tag == .mul_with_overflow) break :ovf if (bits == 64) 0 else if (bits <= 32) 1 << 13 else 1 << 13 | 1 << 14;
+            break :ovf if (bits == 32 or bits == 64) 0 else 1 << 13;
+        },
         // The element's address is computed into x12 (`elemAddrTo`).
         .ptr_elem_val, .slice_elem_val => x12,
         // Functions without the trace in x15 load it there for it
