@@ -1894,6 +1894,8 @@ pub fn pairOf(cg: *CodeGen, ref: Ref) ?Regs {
 fn loadRegs(cg: *CodeGen, d: Regs, ref: Ref) Error!void {
     if (ref.toInterned()) |c| if (int128.is128(cg.ip, cg.ip.typeOf(c))) return int128.loadConst(cg, d, c);
     const v = try cg.valOf(ref);
+    // A 16-byte vector, bitcast.
+    if (v.loc == .vreg) return vector.toPair(cg, d, v.loc.vreg);
     if (v.loc != .regs) return cg.loadRegsMem(d, try cg.valMem(v));
     const p = v.loc.regs;
     if (p.hi == d.lo) {
@@ -2763,6 +2765,13 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             if (cg.homes[@backingInt(inst)] == .result) return;
             if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(src_ty)) and Type.isInt(ip, ty)) {
                 if (int128.lowers(cg, inst) != null) return int128.gen(cg, inst, tag, data);
+                // A 16-byte vector as a 128-bit integer in a pair.
+                if (tag == .bitcast) if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
+                // A 16-byte vector in a register, stored as the integer.
+                if (tag == .bitcast) if (try cg.locOf(data.ty_op.operand) == .vreg) {
+                    const v = (try cg.locOf(data.ty_op.operand)).vreg;
+                    return vector.storeMem(cg, (try cg.resultMem(inst, ty)) orelse return, v, @intCast(Type.abiSize(ip, ty)));
+                };
                 // A wide integer truncated to a register: its low limb.
                 if (tag != .bitcast and cg.passInRegs(ty) and Type.isInt(ip, src_ty)) {
                     const d = cg.resultReg(inst, .x9);
