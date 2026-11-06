@@ -94,6 +94,9 @@ ret_ptr_slot: ?Mem = null,
 trace_slot: ?Mem = null,
 /// `Ssa.liveness` ran, so value slots are shared by lifetime.
 live: bool = false,
+/// From `planArgAliases`: `*const` allocs that are the incoming stack slot
+/// of the parameter (the value) they are initialized with.
+arg_alias: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 /// The condition under which the last overflow operation whose bit its
 /// block's branch reads from the flags (`fate == .fused`) overflowed.
 ovf_cc: Cond = .vs,
@@ -272,6 +275,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.cold_starts.deinit(gpa);
         cg.cold_open.deinit(gpa);
         cg.tmp_slots.deinit(gpa);
+        cg.arg_alias.deinit(gpa);
         cg.tmp16_slots.deinit(gpa);
         cg.pending.deinit(gpa);
         cg.stub_chains.deinit(gpa);
@@ -1548,6 +1552,83 @@ fn setupParams(cg: *CodeGen) Error!void {
             },
         }
     }
+    try cg.planArgAliases(args, locs);
+}
+
+/// Finds the `*const` allocs that can be the incoming stack slot of the
+/// parameter they are initialized with, saving the copy: Sema copies each
+/// by-value parameter into such a local, as AES's `encrypt` does its
+/// 176-byte context for every block. Nothing writes the slot during the
+/// call but a tail call, which reads every argument into its own outgoing
+/// area before it moves them there (`placeArgs`), and nothing writes the
+/// alloc but that store when nothing uses its address but the store and
+/// loads, directly or through field and element pointers and pointer
+/// casts (x86_64's `sealedRef` rule, with the casts that inlined vector
+/// helpers such as AES's `Block.fromBytes` add). The slot must have the
+/// alloc's alignment: fp is 16-byte aligned, and the slots 8.
+fn planArgAliases(cg: *CodeGen, args: []const Inst.Index, locs: []const ArgLoc) Error!void {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    var any = false;
+    for (args) |a| any = any or cg.homes[@backingInt(a)] == .slot;
+    if (!any) return;
+    for (ir.mainBody()) |inst| {
+        if (tags[@backingInt(inst)] != .store) continue;
+        const d = datas[@backingInt(inst)].bin_op;
+        const a = d.rhs.toIndex() orelse continue;
+        const l = d.lhs.toIndex() orelse continue;
+        if (tags[@backingInt(a)] != .arg or cg.homes[@backingInt(a)] != .slot) continue;
+        const loc = locs[std.mem.indexOfScalar(Inst.Index, args, a) orelse continue];
+        if (loc != .stack) continue;
+        const off = loc.stack;
+        if (tags[@backingInt(l)] != .alloc or datas[@backingInt(l)].ty == .none) continue;
+        const info = Type.ptrInfo(ip, datas[@backingInt(l)].ty);
+        if (!info.flags.is_const or info.flags.is_volatile or info.child != datas[@backingInt(a)].arg.ty) continue;
+        const alignment = @max(Type.abiAlignment(ip, info.child), if (info.flags.alignment == 0) 1 else @as(u64, 1) << @intCast(info.flags.alignment - 1));
+        if (alignment > 16 or (alignment == 16 and off % 16 != 0)) continue;
+        try cg.arg_alias.put(cg.gpa, @backingInt(l), @backingInt(a));
+    }
+    if (cg.arg_alias.count() == 0) return;
+    const Uses = struct {
+        cg: *CodeGen,
+        user: u32,
+        /// The alloc a chain `p` of field and element pointers and pointer
+        /// casts starts at.
+        fn root(ir_: *const Ir, p: u32) ?u32 {
+            const t = ir_.instructions.items(.tag);
+            const d = ir_.instructions.items(.data);
+            var q = p;
+            for (0..8) |_| switch (t[q]) {
+                .alloc => return q,
+                // The base is the first word of both payloads.
+                .struct_field_ptr, .ptr_elem_ptr => q = @backingInt(@as(Ref, @fromBackingInt(ir_.extra[d[q].ty_pl.payload])).toIndex() orelse return null),
+                .bitcast => q = @backingInt(d[q].ty_op.operand.toIndex() orelse return null),
+                else => return null,
+            };
+            return null;
+        }
+        pub fn use(u: @This(), r: Ref) void {
+            const ir_ = u.cg.ir;
+            const t = ir_.instructions.items(.tag);
+            const d = ir_.instructions.items(.data);
+            const p = @backingInt(r.toIndex() orelse return);
+            const base = root(ir_, p) orelse return;
+            const arg = u.cg.arg_alias.get(base) orelse return;
+            const ok = switch (t[u.user]) {
+                .load => true,
+                // The initializer, the only store.
+                .store => p == base and d[u.user].bin_op.lhs == r and d[u.user].bin_op.rhs == @as(Inst.Index, @fromBackingInt(arg)).toRef(),
+                .struct_field_ptr, .ptr_elem_ptr => @as(Ref, @fromBackingInt(ir_.extra[d[u.user].ty_pl.payload])) == r,
+                // To another pointer type, which `root` follows.
+                .bitcast => u.cg.ip.keyTag(d[u.user].ty_op.ty) == .ptr_type,
+                else => false,
+            };
+            if (!ok) _ = u.cg.arg_alias.remove(base);
+        }
+    };
+    for (0..ir.instructions.len) |i| Ssa.forEachOperand(ir, @fromBackingInt(@intCast(i)), Uses{ .cg = cg, .user = @intCast(i) });
 }
 
 // ---------------------------------------------------------------------------
@@ -2540,6 +2621,10 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .alloc => {
             // A promoted variable in a register needs no memory.
             if (data.ty == .none or cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .vreg or cg.homes[@backingInt(inst)] == .regs) return;
+            if (cg.arg_alias.get(@backingInt(inst))) |a| {
+                cg.homes[@backingInt(inst)] = .{ .frame_addr = cg.homes[a].slot };
+                return;
+            }
             const info = Type.ptrInfo(ip, data.ty);
             const size = @max(Type.abiSize(ip, info.child), 1);
             const alignment = @max(Type.abiAlignment(ip, info.child), if (info.flags.alignment == 0) 1 else @as(u64, 1) << @intCast(info.flags.alignment - 1));
@@ -2601,6 +2686,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.copyMem(dst, .at(.x12, 0), Type.abiSize(ip, ty));
         },
         .store => {
+            // The parameter's slot is the alloc (`planArgAliases`).
+            if (cg.arg_alias.count() != 0) if (data.bin_op.lhs.toIndex()) |a| if (cg.arg_alias.contains(@backingInt(a))) return;
             const val = vector.stored(cg, data.bin_op.rhs);
             const size = Type.abiSize(ip, cg.typeOf(val));
             if (size == 0) return;
