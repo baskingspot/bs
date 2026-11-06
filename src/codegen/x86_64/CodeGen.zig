@@ -192,6 +192,13 @@ held_before: u16 = 0,
 held_new: bool = false,
 /// Whether `genBlock` is emitting a value, the only code that sets `held`.
 holding: bool = false,
+/// From `planVarShares`: loads of promoted variables in memory that read
+/// the variable's slot as their own.
+var_share: std.bit_set.Dynamic = .{},
+/// Scratch for `planVarShares`: per variable, how many loads and stores
+/// it has; and the variables' stores, with the positions they write at.
+var_counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+var_stores: std.ArrayList(struct { v: u32, pos: u32, rhs: Ref }) = .empty,
 /// Scratch for `genSplit`: the values saved around the current clobber
 /// point, with their homes.
 split_now: std.ArrayList(struct { v: u32, home: Home, reload: bool }) = .empty,
@@ -350,6 +357,9 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.arg_refs.deinit(gpa);
         cg.pair_spills.deinit(gpa);
         cg.split.deinit(gpa);
+        cg.var_share.deinit(gpa);
+        cg.var_counts.deinit(gpa);
+        cg.var_stores.deinit(gpa);
         cg.split_vals.deinit(gpa);
         cg.split_now.deinit(gpa);
         cg.arg_hints.deinit(gpa);
@@ -2623,6 +2633,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
         n_restrictions += 1;
     }
     cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split, restrictions[0..n_restrictions]) & callee_saved | asm_regs & callee_saved;
+    try cg.planVarShares();
     const reg2 = live.items(.reg2);
     for (f.values.items(.inst)) |inst| {
         const i = @backingInt(inst);
@@ -2663,6 +2674,91 @@ fn planRegisters(cg: *CodeGen) Error!void {
         if (fate[i] != .normal) continue;
         const of = if (share[i] != Ssa.no_tie and reg[share[i]] == reg[i]) share[i] else if (fwd[i] != Ssa.no_tie) fwd[i] else continue;
         if (cg.split.isSet(of)) try cg.split_vals.append(cg.gpa, .{ .v = i, .of = of });
+    }
+}
+
+/// Marks in `var_share` the loads without a register of promoted
+/// variables without one, when no store to the variable but of the load
+/// itself lies in the load's interval: the variable's slot holds the
+/// load's value for as long as it is read, so the load needs no slot of
+/// its own and no copy into it. As `Live.share`, but without its limit on
+/// the interval's length, and with a value built in place in the variable
+/// (`planDeferred`) writing it where the value is computed.
+fn planVarShares(cg: *CodeGen) Error!void {
+    const ir = cg.ir;
+    const f = cg.ssa;
+    const live = f.live.slice();
+    const reg = live.items(.reg);
+    const fate = live.items(.fate);
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const uses = live.items(.uses);
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const insts = f.values.items(.inst);
+    cg.var_share.unsetAll();
+    cg.var_counts.clearRetainingCapacity();
+    // The loads in question, and their variables.
+    for (insts) |inst| {
+        const l = @backingInt(inst);
+        if (tags[l] != .load or fate[l] != .normal or reg[l] != Ssa.no_reg or cg.homes[l] != .none) continue;
+        const v = @backingInt(datas[l].ty_op.operand.toIndex() orelse continue);
+        if (tags[v] != .alloc or reg[v] != Ssa.no_reg or fate[v] != .normal) continue;
+        if (Type.ptrInfo(cg.ip, datas[v].ty).flags.is_volatile) continue;
+        if (cg.var_share.bit_length < ir.instructions.len) try cg.var_share.resize(cg.gpa, ir.instructions.len, false);
+        cg.var_share.set(l);
+        try cg.var_counts.put(cg.gpa, v, 0);
+    }
+    if (cg.var_counts.count() == 0) return;
+    // A variable is promoted when its loads and stores are all its uses
+    // (as `Ssa.plan` decides). Its stores, in layout order.
+    cg.var_stores.clearRetainingCapacity();
+    for (insts, 0..) |inst, k| {
+        const i = @backingInt(inst);
+        if (fate[i] == .dead) continue;
+        switch (tags[i]) {
+            .load => if (cg.var_counts.getPtr(@backingInt(datas[i].ty_op.operand.toIndex() orelse continue))) |n| {
+                n.* += 1;
+            },
+            .store => {
+                const bin = datas[i].bin_op;
+                if (bin.rhs == bin.lhs) continue;
+                const v = @backingInt(bin.lhs.toIndex() orelse continue);
+                const n = cg.var_counts.getPtr(v) orelse continue;
+                n.* += 1;
+                // A value built in place writes the variable where it is
+                // computed (`planDeferred`).
+                const built = if (bin.rhs.toIndex()) |r| cg.in_place.contains(@backingInt(r)) else false;
+                const pos = if (built) def[@backingInt(bin.rhs.toIndex().?)] else Ssa.valuePos(k);
+                try cg.var_stores.append(cg.gpa, .{ .v = v, .pos = pos, .rhs = bin.rhs });
+            },
+            else => {},
+        }
+    }
+    const Store = @TypeOf(cg.var_stores.items[0]);
+    const order = struct {
+        fn lt(_: void, a: Store, b: Store) bool {
+            return a.v < b.v or a.v == b.v and a.pos < b.pos;
+        }
+    };
+    std.sort.pdq(Store, cg.var_stores.items, {}, order.lt);
+    for (insts) |inst| {
+        const l = @backingInt(inst);
+        if (tags[l] != .load or !cg.var_share.isSet(l)) continue;
+        const v = @backingInt(datas[l].ty_op.operand.toIndex().?);
+        const n = cg.var_counts.get(v) orelse continue;
+        // The variable's first store after the load's definition, on.
+        const key: Store = .{ .v = v, .pos = def[l] + 1, .rhs = .none };
+        const first = std.sort.lowerBound(Store, cg.var_stores.items, key, struct {
+            fn cmp(k: Store, st: Store) std.math.Order {
+                return if (order.lt({}, st, k)) .gt else if (st.v == k.v and st.pos == k.pos) .eq else .lt;
+            }
+        }.cmp);
+        const shared = n == uses[v] and for (cg.var_stores.items[first..]) |st| {
+            if (st.v != v or st.pos > end[l]) break true;
+            if (st.rhs != inst.toRef()) break false;
+        } else true;
+        if (!shared) cg.var_share.unset(l);
     }
 }
 
@@ -5383,6 +5479,17 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                     return;
                 }
             }
+            if (cg.live and @backingInt(inst) < cg.var_share.bit_length and cg.var_share.isSet(@backingInt(inst))) {
+                // The variable's slot is its slot (`planVarShares`).
+                const a = @backingInt(data.ty_op.operand.toIndex().?);
+                const own = cg.copy_of.contains(a) or cg.payload_region.contains(a) or cg.ref_alias.contains(a) or cg.const_alias.contains(a);
+                if (cg.homes[a] == .frame_addr and !own and cg.homes[@backingInt(inst)] == .none and
+                    !cg.slot_alias.contains(@backingInt(inst)) and !cg.copy_private.contains(@backingInt(inst)))
+                {
+                    cg.homes[@backingInt(inst)] = .{ .slot = cg.homes[a].frame_addr };
+                    return;
+                }
+            }
             if (cg.varReg(data.ty_op.operand)) |r| return cg.setResult(inst, ty, r);
             if (cg.varXmm(data.ty_op.operand)) |x| return cg.setXmm(inst, ty, x);
             if (cg.varSlot(data.ty_op.operand)) |off| if (cg.heldReg(Mem.at(.rbp, off), 8)) |r| return cg.setResult(inst, ty, r);
@@ -5846,6 +5953,18 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 }
                 return cg.setResult(inst, data.ty_op.ty, r);
             }
+            // Without a register, its half of the slice's slot is its slot
+            // while the slice keeps that slot.
+            if (cg.live and cg.homes[@backingInt(inst)] == .none) if (data.ty_op.operand.toIndex()) |s| {
+                const end = cg.ssa.live.items(.end);
+                const si = @backingInt(s);
+                if (cg.homes[si] == .slot and end[@backingInt(inst)] <= end[si] and cg.ir.instructions.items(.tag)[si] != .block and
+                    !cg.slot_alias.contains(si) and !cg.slot_alias.contains(@backingInt(inst)) and !cg.copy_private.contains(@backingInt(inst)))
+                {
+                    cg.homes[@backingInt(inst)] = .{ .slot = cg.homes[si].slot + @as(i32, if (tag == .slice_len) 8 else 0) };
+                    return;
+                }
+            };
             const src = try cg.memOf(data.ty_op.operand);
             const d = cg.destReg(inst);
             try cg.e.mov(.qword, .{ .reg = d }, .{ .mem = offsetMem(src, if (tag == .slice_len) 8 else 0) });
