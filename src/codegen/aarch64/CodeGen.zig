@@ -147,10 +147,10 @@ dbg_inline_names: std.ArrayList(u8) = .empty,
 dbg_inline_callees: std.ArrayList(SymbolKey) = .empty,
 dbg_files: std.ArrayList(u32) = .empty,
 dbg_open: std.ArrayList(OpenInline) = .empty,
-/// Panic calls in code the backend inlined, which call a chain of stubs
-/// emitted after the blocks instead of the handler (`panicThroughStubs`),
-/// with the inlined calls open at each (`stub_open`), and the stubs'
-/// bytes so far (as in the x86_64 backend).
+/// Calls in code the backend inlined, which call a chain of stubs emitted
+/// after the blocks instead of their target (`callThroughStubs`), with the
+/// inlined calls open at each (`stub_open`), and the stubs' bytes so far
+/// (as in the x86_64 backend).
 stub_chains: std.ArrayList(StubChain) = .empty,
 stub_open: std.ArrayList(OpenInline) = .empty,
 stub_bytes: u32 = 0,
@@ -159,10 +159,11 @@ stub_bytes: u32 = 0,
 /// resume after it.
 const OpenInline = struct { index: u32, line: u32, column: u32, backend: bool = false };
 
-/// A panic call through stubs: the stubs' first label, the handler, the
-/// inlined calls open at the call (`stub_open[open_start..][0..open_len]`),
-/// and the row of the check, relative to the innermost.
-const StubChain = struct { label: Encoder.Label, target: SymbolKey, open_start: u32, open_len: u32, line: u32, column: u32 };
+/// A call through stubs: the stubs' first label, the target, the inlined
+/// calls open at the call (`stub_open[open_start..][0..open_len]`), the
+/// row of the call, relative to the innermost, and whether the stubs
+/// return (all but a panic handler's call).
+const StubChain = struct { label: Encoder.Label, target: SymbolKey, open_start: u32, open_len: u32, line: u32, column: u32, returns: bool };
 
 const Pending = struct { inst: Inst.Index, mem: Mem };
 
@@ -1079,14 +1080,42 @@ fn calleeType(cg: *CodeGen, callee: Ref) InternPool.FuncType {
 const AutoClass = enum { none, gpr, gpr_pair, fpr, memory };
 
 fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
-    const ip = cg.ip;
+    return autoClassOf(cg.ip, ty);
+}
+
+fn autoClassOf(ip: *const InternPool, ty: Index) AutoClass {
     if (Type.class(ip, ty) == .float) return switch (Type.floatBits(ip, ty)) {
         16, 32, 64 => .fpr,
         else => .memory,
     };
-    if (cg.autoVec(ty)) return .fpr;
+    if (autoVecOf(ip, ty)) return .fpr;
     const size = Type.abiSize(ip, ty);
     return if (size == 0) .none else if (size <= 8) .gpr else if (size <= 16) .gpr_pair else .memory;
+}
+
+/// Whether `.auto` passes every argument of function type `fn_ty` in
+/// registers (`autoArgs`): a call of it can go through returning stubs
+/// (`callThroughStubs`), which come between the caller's frame and the
+/// callee's. Its result may go through x8.
+pub fn argsInRegs(ip: *const InternPool, fn_ty: Index) bool {
+    const f = ip.keyPayload(.func_type, fn_ty);
+    if (f.cc != .auto or f.is_var_args) return false;
+    var gp: u8 = 0;
+    var fp: u8 = 0;
+    for (f.param_types) |ty| switch (autoClassOf(ip, ty)) {
+        .none => {},
+        .gpr => if (gp < 8) {
+            gp += 1;
+        } else return false,
+        .gpr_pair => if (gp < 7) {
+            gp += 2;
+        } else return false,
+        .fpr => if (fp < 8) {
+            fp += 1;
+        } else return false,
+        .memory => return false,
+    };
+    return true;
 }
 
 /// Whether `.auto` passes `ty` in a vector register as its bytes: a
@@ -1094,10 +1123,13 @@ fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
 /// or a struct whose one runtime field is such a vector, as `crypto.aes`
 /// wraps its blocks.
 fn autoVec(cg: *CodeGen, ty: Index) bool {
-    const ip = cg.ip;
+    return autoVecOf(cg.ip, ty);
+}
+
+fn autoVecOf(ip: *const InternPool, ty: Index) bool {
     const size = Type.abiSize(ip, ty);
     if (size < 2) return false;
-    if (cg.inVec(ty)) return true;
+    if (vector.inVreg(ip, ty)) return true;
     if (ip.keyTag(ty) != .struct_type or Type.isPacked(ip, ty)) return false;
     const info = ip.structInfo(ty);
     var only: ?Index = null;
@@ -1107,7 +1139,7 @@ fn autoVec(cg: *CodeGen, ty: Index) bool {
         only = ft;
     }
     const f = only orelse return false;
-    return Type.abiSize(ip, f) == size and cg.autoVec(f);
+    return Type.abiSize(ip, f) == size and autoVecOf(ip, f);
 }
 
 const ArgLoc = union(enum) {
@@ -3970,15 +4002,17 @@ fn cRet(cg: *CodeGen, operand: Ref) Error!void {
     }
 }
 
-/// Calls panic handler `target` from cold code through a chain of stubs,
-/// one per call the backend inlined that is open here, so that the stack
-/// trace shows the frames those calls would have had (docs/slop/architecture.md,
-/// "Synthetic panic frames"), as the x86_64 backend does: the `bl` itself
-/// is at the outermost such call's site, in its caller, and the stubs
-/// after the blocks (`emitStubs`) are at each next site inward, the last
-/// at the check. Without such calls open, or past the stubs' room, calls
-/// `target`.
-fn panicThroughStubs(cg: *CodeGen, target: SymbolKey) Error!void {
+/// Calls `target` through a chain of stubs, one per call the backend
+/// inlined that is open here, so that a stack trace taken in `target`
+/// shows the frames those calls would have had (docs/slop/architecture.md,
+/// "Synthetic frames"), as the x86_64 backend does: the `bl` itself is at
+/// the outermost such call's site, in its caller, and the stubs after the
+/// blocks (`emitStubs`) are at each next site inward, the last at the call.
+/// Without such calls open, or past the stubs' room, calls `target`. A
+/// panic handler's call (`returns` false) is the last code of a cold
+/// block. Otherwise each stub returns after its call, and the inlined
+/// calls open here end before the call and get new entries after it.
+fn callThroughStubs(cg: *CodeGen, target: SymbolKey, returns: bool) Error!void {
     const open = cg.dbg_open.items;
     var first: ?usize = null;
     var depth: u32 = 0;
@@ -3987,14 +4021,23 @@ fn panicThroughStubs(cg: *CodeGen, target: SymbolKey) Error!void {
         depth += 1;
     };
     // `Atom.Unwind.epilogue` counts the stubs and probes in 16 bits.
-    if (first == null or cg.stub_bytes + stub_size * depth > 0xfe00) return cg.e.bl(.{ .sym = target });
-    cg.stub_bytes += stub_size * depth;
+    const size: u32 = if (returns) returning_stub_size else stub_size;
+    if (first == null) return cg.e.bl(.{ .sym = target });
+    if (cg.stub_bytes + size * depth > 0xfe00) {
+        cg.emit.codegen_stats.stubless += 1;
+        return cg.e.bl(.{ .sym = target });
+    }
+    cg.stub_bytes += size * depth;
     const b = first.?;
     const label = try cg.e.newLabel();
-    try cg.stub_chains.append(cg.gpa, .{ .label = label, .target = target, .open_start = @intCast(cg.stub_open.items.len), .open_len = @intCast(open.len), .line = cg.dbg_line, .column = cg.dbg_column });
+    const open_start: u32 = @intCast(cg.stub_open.items.len);
+    const open_len: u32 = @intCast(open.len);
+    try cg.stub_chains.append(cg.gpa, .{ .label = label, .target = target, .open_start = open_start, .open_len = open_len, .line = cg.dbg_line, .column = cg.dbg_column, .returns = returns });
     try cg.stub_open.appendSlice(cg.gpa, open);
     // The call is the outermost inlined call's caller's: the inlined calls
-    // from there in end before it. No code that runs follows it.
+    // from there in end before it.
+    const line = cg.dbg_line;
+    const column = cg.dbg_column;
     const pc: u32 = @intCast(cg.e.code.items.len);
     for (open[b..]) |o| cg.dbg_inlines.items[o.index].high = pc;
     const site = cg.dbg_inlines.items[open[b].index];
@@ -4006,19 +4049,39 @@ fn panicThroughStubs(cg: *CodeGen, target: SymbolKey) Error!void {
     cg.dbg_column = site.call_column;
     try cg.e.line(site.call_line, site.call_column);
     try cg.e.bl(.{ .label = label });
+    if (!returns) return;
+    // The code after the call is in the same inlined calls again, as new
+    // entries with the same call information.
+    const after: u32 = @intCast(cg.e.code.items.len);
+    for (cg.stub_open.items[open_start + b .. open_start + open_len]) |o| {
+        var copy = cg.dbg_inlines.items[o.index];
+        copy.low = after;
+        copy.high = after;
+        copy.parent = if (cg.dbg_open.getLastOrNull()) |p| p.index else Atom.Debug.Inline.none;
+        try cg.dbg_inline_callees.append(cg.gpa, cg.dbg_inline_callees.items[o.index]);
+        try cg.dbg_open.append(cg.gpa, .{ .index = @intCast(cg.dbg_inlines.items.len), .line = o.line, .column = o.column, .backend = o.backend });
+        try cg.dbg_inlines.append(cg.gpa, copy);
+    }
+    const inner = cg.dbg_open.getLast().index;
+    try cg.e.switchLines(cg.dbg_inlines.items[inner].file, inner + 1);
+    cg.dbg_line = line;
+    cg.dbg_column = column;
+    try cg.e.line(line, column);
 }
 
 /// The bytes of a stub: `stp x29, x30, [sp, #-16]!; mov x29, sp; bl`.
 const stub_size = 12;
+/// A returning stub's: those, then `ldp x29, x30, [sp], #16; ret`.
+const returning_stub_size = 20;
 
-/// The stubs of the panic calls `panicThroughStubs` made, after the
-/// blocks. Each makes a frame record, as a prologue does, so the frame
+/// The stubs of the calls `callThroughStubs` made, after the blocks. Each makes a frame record, as a prologue does, so the frame
 /// pointer chain and the stubs' unwind info (the frame record's rule with
 /// no saved registers, `Atom.Unwind.epilogue`) step through it. Stub k is
 /// in entries copying the inlined calls open from the k-th backend-inlined
 /// call to the next one (from the function's own for the first), at the
 /// next one's site, and calls stub k + 1, which follows; the last is at
-/// the check and calls the handler.
+/// the call and calls its target. A returning chain's stubs pop their
+/// frame record and return after their call.
 fn emitStubs(cg: *CodeGen) Error!void {
     for (cg.stub_chains.items) |ch| {
         cg.e.bind(ch.label);
@@ -4057,11 +4120,13 @@ fn emitStubs(cg: *CodeGen) Error!void {
             } else try cg.e.line(ch.line, ch.column);
             try cg.e.stp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .pre = -16 } });
             try cg.e.mov(.x, .fp, .sp);
-            if (end < open.len) {
-                const next = try cg.e.newLabel();
-                try cg.e.bl(.{ .label = next });
-                cg.e.bind(next);
-            } else try cg.e.bl(.{ .sym = ch.target });
+            const next = if (end < open.len) try cg.e.newLabel() else null;
+            if (next) |n| try cg.e.bl(.{ .label = n }) else try cg.e.bl(.{ .sym = ch.target });
+            if (ch.returns) {
+                try cg.e.ldp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .post = 16 } });
+                try cg.e.ret();
+            }
+            if (next) |n| cg.e.bind(n);
             i = end;
         }
         const end_pc: u32 = @intCast(cg.e.code.items.len);
@@ -4265,9 +4330,13 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     }
     if (callee_val) |f| {
         // A panic in code the backend inlined, with its arguments in
-        // registers, gets the frames of the calls it was inlined from.
-        if (ret_ty == .noreturn_type and cg.in_cold and !is_c and !stack_args and !cg.outermost_frame) {
-            try cg.panicThroughStubs(try cg.emit.funcKey(f));
+        // registers, gets the frames of the calls it was inlined from. So
+        // does a call that returns there, through stubs that return
+        // (inlined bodies keep calls only of such functions,
+        // `Emit.keepable`), but for an error return trace's push, whose
+        // address maps to the inlined frames.
+        if (!is_c and !stack_args and !cg.outermost_frame and cg.in_cold == (ret_ty == .noreturn_type) and f != cg.emit.zcu.return_error) {
+            try cg.callThroughStubs(try cg.emit.funcKey(f), !cg.in_cold);
         } else try cg.e.bl(.{ .sym = try cg.emit.funcKey(f) });
     } else try cg.e.blr(.x16);
     if (pn_save) |save| for (0..10) |k| try cg.loadMem(@fromBackingInt(@intCast(19 + k)), save.plus(@intCast(8 * k)), .usize_type);

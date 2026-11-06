@@ -26,6 +26,12 @@ pub const loop_factor = 2;
 /// its inner loop. A callee's own loop would add its registers to the
 /// caller's hottest code (sort's `blockSwap` in `block`: +0.9%).
 pub const nested_loop_factor = 3;
+/// The most instructions a body that keeps calls has and is still
+/// inlinable, at every site: a wrapper that forwards to a callee too big
+/// to inline (hash map `get` to `getContext` to `getAdapted`). CodeGen
+/// calls a kept call through returning stubs, so the stack keeps the
+/// inlined frames.
+pub const nonleaf_budget = 12;
 
 /// How many times the budget a callee of a call `loops` loops deep may
 /// have; `straight` is whether the callee has no loop.
@@ -41,11 +47,12 @@ pub fn factor(loops: u32, straight: bool) u32 {
 /// array.
 const small_aggregate = 8;
 
-/// A call that may be inlined: a direct call of an `.auto` function, not
-/// `never_inline`, outside cold code. `line:column` is the call's statement
-/// position.
+/// A direct call of an `.auto` function outside cold code: one that may
+/// be inlined, or a `never_inline` one (`keep`), which stays a call.
+/// `line:column` is the call's statement position.
 pub const Site = struct {
     call: Inst.Index,
+    keep: bool,
     /// How many `loop`s of the caller it is inside (`factor`).
     loops: u32,
     callee: Index,
@@ -62,7 +69,8 @@ pub const Scan = struct {
     /// Whether the function could be spliced into a caller once its
     /// candidate calls are inlined: an `.auto`, non-`noinline` function
     /// whose IR uses only instructions `splice` maps, and that calls
-    /// nothing else but cold `noreturn` functions and `returnError`.
+    /// nothing else but the sites' callees, cold `noreturn` functions and
+    /// `returnError`.
     inlinable: bool = true,
     /// Whether the function can start a panic: it calls a cold `noreturn`
     /// function (a safety check's handler, `unreachable`, `@panic`) or
@@ -266,15 +274,27 @@ const Scanner = struct {
         // (docs/slop/architecture.md, "What users see"), and nothing
         // unwinds through it.
         if (callee == s.return_error) return;
-        if (cold or extra.flags.never_inline or ip.keyTag(callee) != .func or
+        if (cold or ip.keyTag(callee) != .func or
             ip.keyPayload(.func_type, ip.typeOf(callee)).cc != .auto)
         {
             s.out.inlinable = false;
             return;
         }
-        try s.sites.append(s.gpa, .{ .call = inst, .loops = s.loops, .callee = callee, .line = s.line, .column = s.column });
+        try s.sites.append(s.gpa, .{ .call = inst, .keep = extra.flags.never_inline, .loops = s.loops, .callee = callee, .line = s.line, .column = s.column });
     }
 };
+
+/// Whether an inlinable body keeps a call: one that returns, but for an
+/// error return trace's push (`return_error`). Its other calls are cold
+/// `noreturn` ones.
+pub fn keepsCalls(body: *const Ir, return_error: Index) bool {
+    for (body.instructions.items(.tag), body.instructions.items(.data)) |tag, data| {
+        if (tag != .call) continue;
+        const extra = body.extraData(Ir.Call, data.pl_op.payload).data;
+        if (extra.ret_ty != .noreturn_type and data.pl_op.operand.toInterned() != return_error) return true;
+    }
+    return false;
+}
 
 /// Whether a body is cold code: a safety check's failure or `unreachable`.
 fn isCold(ir: *const Ir, body: []const Inst.Index) bool {

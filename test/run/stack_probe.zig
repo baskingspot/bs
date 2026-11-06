@@ -14,8 +14,11 @@ var go: std.atomic.Value(bool) = .init(false);
 var touch = false;
 
 /// Its frame holds `buf` even when `touch` is false; then the only access
-/// to it is the call's return address, at the bottom.
-fn big() void {
+/// to it is the call's return address, at the bottom. `noinline`: inlined
+/// into `thread`, keeping its call of `doNotOptimizeAway`, its frame would
+/// be `thread`'s, and a fault there has no frame of its own
+/// (docs/slop/architecture.md, "Synthetic frames").
+noinline fn big() void {
     if (touch) {
         var buf: [128 * 1024]u8 = undefined;
         std.mem.doNotOptimizeAway(&buf);

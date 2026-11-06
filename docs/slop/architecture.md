@@ -1964,13 +1964,18 @@ build, the passes, and the debug info treat them as Sema's inline calls
   tls's `ct_protected.mulWide` (63) in the Montgomery inner loop, −5.8%
   of tls-test's instructions. A callee with a loop of its own stays at
   twice: sort's `blockSwap` inlined into `block` was +0.9%. A function whose callees are
-  not all inlined is not inlinable itself, so only leaves and functions
-  that become leaves inline, but for calls of `std.lang.returnError` (an
-  error return trace's push): the address it records is in the inlined
+  not all inlined keeps those calls, and is inlinable only within
+  `nonleaf_budget` (12) at every site, a wrapper: each call it keeps
+  must be a direct `.auto` call whose arguments all go in registers, of
+  a function that is not cyclic (below; `Emit.keepable`), and CodeGen
+  makes it through returning stubs (see "Synthetic frames"), so traces
+  keep the inlined frames. A function that inlines such a body keeps its
+  calls too. Calls of `std.lang.returnError` (an error return trace's
+  push) are not kept calls: the address it records is in the inlined
   copy, which maps to the callee's line and name as before (see "What
   users see"), so `std.math.add`, `sub` and ArrayList's `addOrOom`
-  inline; every decision reads the callee's own IR, the same in every
-  build and schedule.
+  inline at the full budget; every decision reads the callee's own IR,
+  the same in every build and schedule.
 - **Error returns are free.** A `cond_br` side or switch prong whose
   body ends in a `ret` of an error (`return error.X`, `try`'s error
   side: `Scanner.isErrorReturn`) is left out of the size like cold code,
@@ -1983,21 +1988,33 @@ build, the passes, and the debug info treat them as Sema's inline calls
   8% off zls's tests and 12% off msgpack's, for +0.11% instructions
   compiling zls and 16 KB more code (std.debug's unwinder) per program.
 - **Variants.** *Full*, the default, inlines any such callee; synthetic
-  panic frames (below) keep its panic traces complete. *Safe* also
+  frames (below) keep its panic traces complete. *Safe* also
   requires that the callee can start no panic: no call of a cold
   `noreturn` function (safety checks, `@panic`, `unreachable`), which
   also excludes `try` adding to an error return trace, so every function
   on a panic stack keeps its own frame without synthetic frames. A
-  function with `@trap` never inlines. `BS_INLINE=<budget>` sets the
-  budget (`0` turns inlining off) and `BS_INLINE_SAFE=1` selects safe; a
+  function with `@trap` never inlines; safe keeps no calls.
+  `BS_INLINE=<budget>` sets the budget (`0` turns inlining off),
+  `BS_INLINE_NONLEAF=<budget>` the wrappers' (`0` inlines only bodies
+  that keep no call), and `BS_INLINE_SAFE=1` selects safe; a
   non-default setting gets its own cache target (`main.cacheTarget`).
 - **When.** On the Sema thread, as Sema hands a function to the sink
   (`Emit.functionOwned`), before CodeGen gets it: `inline.scan` finds the
   candidate sites and the size, and `Emit.inlineFate` decides each
   callee, depth first. A callee not analyzed yet is analyzed out of queue
   order (`Zcu.takeFuncBody`, as `ensureFuncIes` does), and its own fate
-  is decided and its IR handed to CodeGen in turn. A cycle of calls makes
-  the call stay a call, for every function on the cycle. A callee whose
+  is decided and its IR handed to CodeGen in turn. A cycle of candidate
+  calls makes every function on it *cyclic* (`Fate.cyclic`): not
+  inlinable, and no body keeps a call of it, since whether one function
+  of the cycle could keep its call of the next would depend on which was
+  decided first. A cycle reaches a function still being decided
+  (`inline_active`); the lowest such index propagates back to the
+  callers on the way (`inline_cycle`), so every function from the one
+  reached to the one that reached it is cyclic. A function that calls a
+  cyclic function is cyclic too: that covers a member reached through an
+  already decided member, and an edit build that loads the member's fate
+  from the cache (recorded as `InlineResult.cyclic`) decides as a full
+  build does (`test/run/edit_inline_cycle.zig`). A callee whose
   analysis is in progress or waits on a speculation defers the caller to
   `ready_irs` (or, for a body made from the cache, leaves it without one
   for now) and never makes the call stay a call, so each decision reads
@@ -2125,7 +2142,7 @@ build, the passes, and the debug info treat them as Sema's inline calls
   ELF), so a panic inside an inlined function would show the callee's
   line and lose its callers' frames. Debuggers show both (they read
   `DW_TAG_inlined_subroutine`). Upstream Debug never inlines. Synthetic
-  panic frames remove the loss.
+  frames remove the loss.
   Error return traces are unaffected: their return-site addresses
   already map to the callee's lines.
 - **Non-leaf callees (measured, not taken; branch `m7-inline-stubs`).**
@@ -2150,11 +2167,11 @@ build, the passes, and the debug info treat them as Sema's inline calls
   36), indirect
   calls through stubs (the stub calls r11) if vtable-heavy code shows a
   win, or an unwinder whose cost does not grow with distinct pcs.
-- **Synthetic panic frames.** Only cold code changes. A panic call in
+- **Synthetic frames.** A panic call in
   cold code inside calls the backend inlined (`DbgInline.flags.backend`;
   Sema's inline calls lose their frame as upstream's do) calls a chain of
   stubs after the function's epilogue instead of the handler
-  (`CodeGen.panicThroughStubs`, `emitStubs`): one stub per backend call
+  (`CodeGen.callThroughStubs`, `emitStubs`): one stub per backend call
   open there, `call next` each, the last calling the handler. The call in
   the cold block is at the outermost such call's site, in its caller;
   stub k is at the site of backend call k + 1, inside copies of the
@@ -2190,6 +2207,22 @@ build, the passes, and the debug info treat them as Sema's inline calls
   `__compact_unwind`). `zig build test` compares the traces with
   `BS_INLINE=0`'s for aarch64-linux (under qemu) and, on a Mac,
   aarch64-macos.
+
+  A call a wrapper keeps goes through the same chain, with stubs that
+  return: `call next; ret` (6 bytes; aarch64: the frame record, `bl`,
+  then `ldp x29, x30, [sp], #16; ret`, 20 bytes), the last calling the
+  callee, so a trace taken anywhere under the callee has the wrappers'
+  frames. The call site is in hot code: the inline entries open there
+  end before the `call` and are opened again as copies after it, so
+  the return address maps to the outermost wrapper's call site, in its
+  caller; on x86_64 an odd depth is wrapped in `sub rsp, 8` and `add rsp,
+  8`, so the callee gets an aligned stack (`test/run/inline_keep_call.zig`).
+  The callee's arguments, the trace pointer (rax, x15), its results and
+  every register the caller keeps pass through the stubs untouched; each
+  layer costs a `call` and a `ret` when it runs. Calls past the stubs'
+  room are counted (`calls without stubs`) and lose the frames.
+  `test/run/panic_through_call.zig` and `error_through_call.zig` compare
+  the traces with upstream's and `BS_INLINE=0`'s.
 
 #### Unrolling
 

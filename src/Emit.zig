@@ -301,6 +301,14 @@ inline_bodies: std.ArrayList(Ir) = .empty,
 /// The functions whose fate is being decided, which a cycle of calls
 /// reaches again.
 inline_active: std.ArrayList(Index) = .empty,
+/// The lowest index in `inline_active` that a cycle of candidate calls
+/// through the function decided last reached (`no_cycle` for none), which
+/// its caller reads: every function from there to the one that reached it
+/// is on the cycle.
+inline_cycle: usize = no_cycle,
+/// The budget of a body that keeps calls (`inline_ir.nonleaf_budget`; 0
+/// inlines only bodies that keep none).
+inline_nonleaf: u32 = inline_ir.nonleaf_budget,
 /// Each function seen so far that returns a slice whose length is one of
 /// its arguments: that argument (`inline_ir.retLen`), recorded before its
 /// callees are decided, so a cycle of calls reads it too.
@@ -365,7 +373,13 @@ pub const Pool = struct {
 };
 
 const Fate = union(enum) {
+    /// Not inlinable; a body inlined elsewhere may keep a call of it.
     no,
+    /// Not inlinable, and on a cycle of candidate calls or calling a
+    /// function that is: whether a function of the cycle could keep a call
+    /// of the next would depend on which of them was decided first, so no
+    /// body keeps a call of it.
+    cyclic,
     yes: struct {
         size: u32,
         hash: cache.Hash,
@@ -378,6 +392,7 @@ const Fate = union(enum) {
 };
 
 const no_body = std.math.maxInt(u32);
+const no_cycle = std.math.maxInt(usize);
 
 /// What deciding a function's fate came to: a fate, or not yet, because a
 /// cycle of calls reached a function being decided (which makes every
@@ -470,6 +485,9 @@ pub const CodeGenStats = struct {
     /// outgoing argument areas.
     code_bytes: u64 = 0,
     frame_bytes: u64 = 0,
+    /// Calls in backend-inlined code made directly because the function's
+    /// stubs ran out of room: their traces lack the inlined frames.
+    stubless: u64 = 0,
 
     pub fn print(s: CodeGenStats, label: []const u8) void {
         const per = struct {
@@ -482,7 +500,7 @@ pub const CodeGenStats = struct {
                 return @as(f64, @floatFromInt(ns)) / 1e6;
             }
         }.f;
-        std.debug.print("{s}: {d} functions, {d} IR instructions; rewrite {d:.1} ms ({d:.1} ns/IR, {d} folds), sroa {d:.1} ms ({d:.1} ns/IR, {d} splits), forward {d:.1} ms ({d:.1} ns/IR, {d} forwarded), prove {d:.1} ms ({d:.1} ns/IR, {d} of {d} checks proven), ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
+        std.debug.print("{s}: {d} functions, {d} IR instructions; rewrite {d:.1} ms ({d:.1} ns/IR, {d} folds), sroa {d:.1} ms ({d:.1} ns/IR, {d} splits), forward {d:.1} ms ({d:.1} ns/IR, {d} forwarded), prove {d:.1} ms ({d:.1} ns/IR, {d} of {d} checks proven), ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function, {d} calls without stubs\n", .{
             label,
             s.functions,
             s.ir_insts,
@@ -508,6 +526,7 @@ pub const CodeGenStats = struct {
             per(s.build_ns + s.alloc_ns + s.emit_ns, s.ir_insts),
             per(s.code_bytes, s.ir_insts),
             per(s.frame_bytes, s.functions),
+            s.stubless,
         });
     }
 };
@@ -753,7 +772,12 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     defer if (ir_owned) ir.deinit(gpa);
     const func = ir.func;
     try emit.inline_active.append(gpa, func);
+    const depth = emit.inline_active.items.len - 1;
     defer emit.inline_active.items.len -= 1;
+    // The lowest index in `inline_active` a cycle through this function's
+    // candidate calls reaches.
+    var low: usize = no_cycle;
+    emit.inline_cycle = no_cycle;
 
     var sites: std.ArrayList(inline_ir.Site) = .empty;
     defer sites.deinit(gpa);
@@ -768,6 +792,7 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     var seen: std.AutoHashMapUnmanaged(Index, void) = .empty;
     defer seen.deinit(gpa);
     for (sites.items, 0..) |site, i| {
+        if (site.keep) continue;
         // Functions with hundreds of calls (big switches) are common.
         const dup = if (i < 16) for (sites.items[0..i]) |prev| {
             if (prev.callee == site.callee) break true;
@@ -784,45 +809,79 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     var size = s.size;
     var straight = s.straight;
     var all = s.inlinable;
+    // Whether a call stays in the body, and whether the function is on a
+    // cycle of candidate calls or calls one that is.
+    var keeps = false;
+    var cyclic = false;
     // The callees of calls that stay calls that return a slice of an
     // argument's length, for prove.
     var ret_lens: std.ArrayList(Ir.RetLen) = .empty;
     defer ret_lens.deinit(gpa);
     for (sites.items) |site| {
-        const fate = switch (try emit.inlineFate(site.callee)) {
+        if (site.keep) {
+            if (!emit.keepable(site.callee)) all = false;
+            keeps = true;
+            continue;
+        }
+        const result = try emit.inlineFate(site.callee);
+        low = @min(low, emit.inline_cycle);
+        emit.inline_cycle = no_cycle;
+        const fate = switch (result) {
             .fate => |f| f,
-            .cycle => Fate.no,
+            .cycle => blk: {
+                low = @min(low, std.mem.findScalar(Index, emit.inline_active.items, site.callee).?);
+                break :blk Fate.cyclic;
+            },
             .busy => return emit.handBack(&ir, &ir_owned, mode),
         };
         const yes = switch (fate) {
             .no => {
-                all = false;
+                if (!emit.keepable(site.callee)) all = false;
+                keeps = true;
+                try emit.keepRetLen(&ret_lens, site.callee);
+                continue;
+            },
+            .cyclic => {
+                cyclic = true;
                 try emit.keepRetLen(&ret_lens, site.callee);
                 continue;
             },
             .yes => |y| if (y.size <= emit.inline_budget * inline_ir.factor(site.loops, y.straight)) y else {
-                all = false;
+                if (!emit.keepable(site.callee)) all = false;
+                keeps = true;
                 try emit.keepRetLen(&ret_lens, site.callee);
                 continue;
             },
         };
-        const body = emit.inlineBody(site.callee) catch |err| switch (err) {
+        const body_or_null = emit.inlineBody(site.callee) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // As for a busy fate.
             error.Busy => return emit.handBack(&ir, &ir_owned, mode),
-        } orelse {
-            all = false;
+        };
+        // Making a body loaded from the cache decided nothing of this
+        // function's.
+        emit.inline_cycle = no_cycle;
+        const body = body_or_null orelse {
+            if (!emit.keepable(site.callee)) all = false;
+            keeps = true;
             try emit.keepRetLen(&ret_lens, site.callee);
             continue;
         };
+        if (inline_ir.keepsCalls(&emit.inline_bodies.items[body], zcu.return_error)) keeps = true;
         size += yes.size;
         straight = straight and yes.straight;
         callee_hash = cache.hash(@truncate(callee_hash), std.mem.asBytes(&yes.hash)) ^ callee_hash;
         try bodies.append(gpa, body);
         try splices.append(gpa, .{ .site = site, .body = undefined });
     }
-    // Up to the loop budget: a caller decides per site.
-    const inlinable = all and size <= emit.inline_budget * inline_ir.nested_loop_factor;
+    // The functions on a cycle are those from the one it reached to the
+    // one that reached it, whichever of them was decided first; the
+    // caller learns whether it is one of them.
+    if (low <= depth) cyclic = true;
+    emit.inline_cycle = if (low < depth) low else no_cycle;
+    // Up to the loop budget: a caller decides per site. A body that keeps
+    // a call inlines within the smaller budget at every site.
+    const inlinable = all and !cyclic and size <= if (keeps) emit.inline_nonleaf else emit.inline_budget * inline_ir.nested_loop_factor;
     // Of its own body, before the splices.
     const loaded = emit.inline_fates.contains(func);
     const own_hash: cache.Hash = if (inlinable and !loaded) try inline_ir.hashBody(gpa, &zcu.ip, &ir) else 0;
@@ -856,6 +915,13 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
         });
         try emit.inline_fates.put(gpa, func, .{ .yes = .{ .size = size, .hash = hash, .straight = straight, .body = @intCast(emit.inline_bodies.items.len - 1) } });
         try zcu.inline_results.put(gpa, func, .{ .size = size, .hash = hash, .ret_len = ret_len1, .straight = straight });
+    } else if (cyclic) {
+        try emit.inline_fates.put(gpa, func, .cyclic);
+        try zcu.inline_results.put(gpa, func, .{
+            .size = Zcu.InlineResult.cyclic,
+            .hash = emit.inlineSalt() ^ 2 ^ Zcu.InlineResult.retLenHash(ret_len1),
+            .ret_len = ret_len1,
+        });
     } else {
         try emit.inline_fates.put(gpa, func, .no);
         // Its callers' calls read its `ret_len` (`func_inline`).
@@ -882,13 +948,30 @@ fn keepRetLen(emit: *const Emit, list: *std.ArrayList(Ir.RetLen), callee: Index)
 /// Mixed into every `func_inline` result, so a different budget or
 /// variant changes every caller's.
 fn inlineSalt(emit: *const Emit) cache.Hash {
-    return cache.hash(emit.inline_budget, if (emit.inline_safe) "safe" else "full");
+    return cache.hash(emit.inline_budget | @as(u64, emit.inline_nonleaf) << 32, if (emit.inline_safe) "safe" else "full");
 }
 
-/// Turns inlining on, with `budget` and the variant (`inline_safe`).
-pub fn enableInlining(emit: *Emit, budget: u32, safe: bool) void {
+/// Whether an inlinable body may keep its call of `callee`: CodeGen calls
+/// it through returning stubs, one per inlined call open there, so the
+/// stack shows their frames (docs/slop/architecture.md, "Synthetic
+/// frames"). The stubs come between the caller's frame and the callee's,
+/// so the callee may take no arguments on the stack. The safe variant
+/// inlines only bodies that cannot panic, which a call may.
+fn keepable(emit: *const Emit, callee: Index) bool {
+    if (emit.inline_safe or emit.inline_nonleaf == 0) return false;
+    const ip = &emit.zcu.ip;
+    return switch (ip.target) {
+        .x86_64_linux => CodeGen.argsInRegs(ip, ip.typeOf(callee)),
+        .aarch64_macos, .aarch64_linux => CodeGenA64.argsInRegs(ip, ip.typeOf(callee)),
+    };
+}
+
+/// Turns inlining on, with `budget`, the budget of bodies that keep calls,
+/// and the variant (`inline_safe`).
+pub fn enableInlining(emit: *Emit, budget: u32, nonleaf: u32, safe: bool) void {
     emit.inlining = true;
     emit.inline_budget = budget;
+    emit.inline_nonleaf = nonleaf;
     emit.inline_safe = safe;
     emit.zcu.inline_salt = emit.inlineSalt();
 }
@@ -904,10 +987,11 @@ pub fn inlineFate(emit: *Emit, func: Index) Allocator.Error!FateResult {
         // Loaded from the cache: its recorded result.
         .done => {
             const res = emit.zcu.inline_results.get(func);
-            try emit.inline_fates.put(emit.gpa, func, if (res) |r| if (r.size != Zcu.InlineResult.not_inlinable)
-                .{ .yes = .{ .size = r.size, .hash = r.hash, .straight = r.straight, .body = no_body } }
-            else
-                .no else .no);
+            try emit.inline_fates.put(emit.gpa, func, if (res) |r| switch (r.size) {
+                Zcu.InlineResult.not_inlinable => .no,
+                Zcu.InlineResult.cyclic => .cyclic,
+                else => .{ .yes = .{ .size = r.size, .hash = r.hash, .straight = r.straight, .body = no_body } },
+            } else .no);
             if (res) |r| if (r.ret_len != 0) try emit.ret_lens.put(emit.gpa, func, r.ret_len - 1);
         },
         .analyzed => |ir| if (!try emit.inlineProcess(ir, .generate)) return .busy,

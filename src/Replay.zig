@@ -1291,9 +1291,9 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
 /// inlines that are.
 fn inlineMoved(r: *Replay, d: u32, depth: u32) !bool {
     const m = r.m;
-    // Not inlinable (no size, or `not_inlinable`): its callers keep the
-    // call.
-    if (m.result(d).len == 0 or m.result(d)[0] == Zcu.InlineResult.not_inlinable) return false;
+    // Not inlinable (no size, `not_inlinable` or `cyclic`): its callers
+    // keep the call.
+    if (m.result(d).len == 0 or m.result(d)[0] == Zcu.InlineResult.not_inlinable or m.result(d)[0] == Zcu.InlineResult.cyclic) return false;
     for (m.deps(d)) |pe| {
         const p = Manifest.Edge.nodeOf(pe);
         if (r.inChangedInput(p)) return true;

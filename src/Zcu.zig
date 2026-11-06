@@ -1537,7 +1537,8 @@ pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !bool {
 }
 
 pub const InlineResult = struct {
-    /// `not_inlinable` for a function here only for its `ret_len`.
+    /// `not_inlinable` for a function here only for its `ret_len`, or
+    /// `cyclic`.
     size: u32,
     hash: cache.Hash,
     /// One more than the argument that is the length of every slice the
@@ -1547,6 +1548,9 @@ pub const InlineResult = struct {
     straight: bool = false,
 
     pub const not_inlinable = std.math.maxInt(u32);
+    /// For a function on a cycle of candidate calls, or calling one
+    /// (Emit's `Fate.cyclic`): no inlined body keeps a call of it.
+    pub const cyclic = std.math.maxInt(u32) - 1;
     /// In its `func_inline` node's first result word, above the size (but
     /// for `not_inlinable`); a record without it reads as having a loop.
     pub const straight_bit: u32 = 1 << 31;
@@ -1564,7 +1568,7 @@ pub const InlineResult = struct {
 
     /// From its first result word, `size` and `straight`.
     pub fn fromWord(word: u32) struct { u32, bool } {
-        if (word == not_inlinable) return .{ word, false };
+        if (word == not_inlinable or word == cyclic) return .{ word, false };
         return .{ word & ~straight_bit, word & straight_bit != 0 };
     }
 };
