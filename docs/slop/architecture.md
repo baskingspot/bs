@@ -2281,6 +2281,34 @@ rewrites use it:
 `+noforward`), to compare a program's behavior with and without it;
 scalar replacement still leaves the copies whole.
 
+#### Views
+
+On the SSA, after `Ssa.plan` and before allocation, for both backends
+(`src/codegen/view.zig`): a load of an aggregate in memory whose every
+user reads only a part of it (`is_null`, `is_non_null`, `is_err`,
+`is_non_err`, `get_union_tag`, `struct_field_val`, `optional_payload`,
+`unwrap_errunion_payload`, `unwrap_errunion_err`) is not copied, and its
+users read their parts where the load points. Sema emits such loads for
+`x.opt == null`, `x.opt.?`, `if (x.eu) |*p|` and `switch (ptr.*)`; each
+copied the whole aggregate to a slot to read a byte of it (std's stack
+unwinder copied its 480-byte `StackIterator` per frame to read the tag).
+The users read later than the load would have, which reads the same
+bytes when no value that may write memory (anything not `Ssa.removable`
+but debug markers and blocks) comes between: every user is in the load's
+block, or in a successor whose only predecessor that block is, later in
+the layout, before any such value in it; a condition its block's branch
+computes reads at the block's end; no terminator reads the load. Volatile
+loads, packed layouts, loads of register variables and loads through
+folded addresses are left alone. The pointer's interval is extended to
+the last user, which also keeps it out of registers a clobber point in
+between writes. The backend gives the load the memory as its home: x86_64
+`Home.deferred` (through r11 when the pointer has no register, as for
+other deferred loads), aarch64 the pointer's memory as `Home.slot` when
+the pointer is an address or in a register, and otherwise a copy as
+before. Each user still copies a part that is itself an aggregate in
+memory (a captured union payload), so a part read out of such a part
+still copies the inner part.
+
 #### Rewrite rules
 
 Built on the IR, after inlining (`src/codegen/rewrite.zig`): a table of

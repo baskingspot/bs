@@ -46,6 +46,7 @@ const asm_sse = @import("asm_sse.zig");
 const asm_src = @import("../asm_src.zig");
 const cpu_mod = @import("../../cpu.zig");
 const Ssa = @import("../Ssa.zig");
+const view = @import("../view.zig");
 const switch_br = @import("../switch_br.zig");
 const vector = @import("vector.zig");
 const atomic128 = @import("atomic128.zig");
@@ -253,8 +254,9 @@ const Home = union(enum) {
     /// The value is the address `base + off`, a register holding another
     /// value (`addrFoldable`).
     reg_addr: struct { base: Reg, off: i32 },
-    /// A load read in place by its only user (see `planDeferred`): the
-    /// value is the memory its pointer points to.
+    /// A load read in place by its only user (see `planDeferred`), or by
+    /// users that each read a part of it (`view.plan`): the value is the
+    /// memory its pointer points to.
     deferred,
     /// The memory this many bytes into the function's own result, through
     /// the pointer the caller passed: a call whose result a `ret` returns
@@ -1827,6 +1829,14 @@ fn loadRegs(cg: *CodeGen, d: Regs, ref: Ref) Error!void {
 /// 8-byte aligned payload of up to 8 bytes (the error code in the low
 /// eightbyte, the payload in the high one), and 128-bit integers
 /// (`int128`); all 16 bytes.
+/// For `view.plan`: a load of `ty` in memory, which nothing else plans,
+/// through a pointer that is not an address folded into its users.
+pub fn viewable(cg: *CodeGen, l: Inst.Index, ty: Index) bool {
+    if (cg.homes[@backingInt(l)] != .none or cg.passInRegs(ty) or cg.inPair(ty)) return false;
+    const p = cg.ir.instructions.items(.data)[@backingInt(l)].ty_op.operand.toIndex() orelse return true;
+    return cg.addr_base[@backingInt(p)] == no_base;
+}
+
 pub fn inPair(cg: *CodeGen, ty: Index) bool {
     const ip = cg.ip;
     return switch (Type.class(ip, ty)) {
@@ -3117,6 +3127,13 @@ fn planDeferred(cg: *CodeGen) Error!void {
     const datas = ir.instructions.items(.data);
     const fate = f.live.items(.fate);
     const ret_deferred = cg.fn_ty.cc == .auto and cg.autoClass(cg.fn_ty.return_type) == .memory;
+    // Loads whose users read parts of them in place (`view.plan`).
+    {
+        var views: std.ArrayList(u32) = .empty;
+        defer views.deinit(cg.gpa);
+        try view.plan(f, cg.gpa, ir, cg.ip, cg, &views);
+        for (views.items) |l| cg.homes[l] = .deferred;
+    }
     // Each block's predecessor when it has exactly one, after forwarding.
     const pred = try cg.gpa.alloc(u32, 2 * f.blocks.items.len);
     defer cg.gpa.free(pred);
