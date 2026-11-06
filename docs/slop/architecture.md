@@ -2145,28 +2145,28 @@ build, the passes, and the debug info treat them as Sema's inline calls
   frames remove the loss.
   Error return traces are unaffected: their return-site addresses
   already map to the callee's lines.
-- **Non-leaf callees (measured, not taken; branch `m7-inline-stubs`).**
-  Letting a body that keeps direct `.auto` register-argument calls
-  inline within a budget n, each kept call going through returning
-  stubs (`call next; ret`, one per open backend-inlined call) so traces
-  stay complete, measured against main 3a3fca3 (run time in callgrind
-  Ir, compile time as medians of 11 interleaved cold builds): at n = 16, std's test build +1.1% and the
-  zig workload +0.1%, IR +5–6%, binaries +9% (std tests) and +13% (zig);
-  hash −1.1%, fmt and the other runtime benchmarks 0, vaxis −0.25%, zig
-  fmt −1.2%, zls tests +2.8%. n = 20 costs +2% compile for −1.5% at best.
-  A prototype's n = 30 win (vaxis −1.8%, zls −5.4%, zig fmt −5%, hash and
-  fmt −4–5%) was illusory: it also inlined bodies with indirect (vtable)
-  and other-convention calls, whose traces lost the inlined frames, and
-  zls's share came from shorter traces, since its tests spend ~17% in
-  DebugAllocator's stack captures; with complete traces, each inlined
-  copy's stubs add distinct return pcs that miss SelfUnwinder's cache
-  (`computeRules`, `CacheEntry.populate`). fmt's hot callees are over any
-  budget (`Io.Writer.write` measures 114). What would change the answer:
-  a size measure under which small hot callees fit (one that discounts
-  the checks prove removes, for leaves like `std.fmt.digitToChar` at
-  36), indirect
-  calls through stubs (the stub calls r11) if vtable-heavy code shows a
-  win, or an unwinder whose cost does not grow with distinct pcs.
+- **Wrapper cost (measured on dd7c901 plus the error-prong change,
+  x86_64 callgrind Ir unless noted).** Edit builds with a warm cache on
+  the zig workload (median of 3): an edit inside `Sema.addInst`
+  0.38 → 0.48 s, regenerating 140 functions instead of 98 (98 is the
+  floor for any edit in Sema.zig; the rest are the callers that inline
+  it); inside `Type.zigTypeTag` 1.35 → 1.73 s, 328 → 975 functions; an
+  edit in a caller (`zirBitcast`) 0.48 → 0.61 s with the same 98.
+  Cold: zls compile Ir +1.0%, zig workload wall +4.5% (CPU +10%, RSS
+  1.47 → 1.65 GiB), std 0 (CPU +1.5%); `.text` +6–9% on most programs,
+  monstar +14%, siv's ui +2%. Run time: monstar −14%, hash −7.3%, zig
+  fmt −5.2%, fmt −3.4%, vaxis −3.2%, msgpack −2.7%, unwinder and stack
+  capture −1.7%, zls tests −0.7% (−3.8% outside stack capture), sort
+  and ctr 0; wall flow −1%, siv's text +3% (it crashes under valgrind
+  on either side, so no Ir). aarch64-macos, best of 9 wall: hash −2.9%,
+  fmt −3.9%, zig fmt −1.6%, stack capture −2.0%, `.text` +3–4%; less
+  than x86 because `.auto` passes arguments over 16 bytes on the stack
+  there (a by-value `self` hash map), and those calls are not kept. Of
+  the zig workload's 78,346 functions, 8,880 are cyclic and inline no
+  wrapper; 18,436 wrappers and 12,374 leaves are inlinable. An earlier
+  attempt at n = 16 without the error-prong change (branch
+  `m7-inline-stubs`) found wrapper bodies over budget in hot code and
+  no gain beyond hash −1.1%.
 - **Synthetic frames.** A panic call in
   cold code inside calls the backend inlined (`DbgInline.flags.backend`;
   Sema's inline calls lose their frame as upstream's do) calls a chain of
