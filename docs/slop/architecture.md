@@ -1785,8 +1785,25 @@ between): `@reduce(.Or/.And)` of a compare reads the lane masks with
 `umaxv`/`uminv` and makes no bits, and the select of `firstTrue` and
 `lastTrue` (below) becomes `rbit`/`clz` of the predicate's bits. A
 reduce of bits that only its block's branch reads is fused into the
-branch, as on x86_64. Not yet: deferred (in-place) loads, and keeping
-vectors in V registers, which waits for register allocation there.
+branch, as on x86_64. Vectors of up to 16 bytes may live in v20-v29.
+Those over 16 bytes (at most 4 chunks) skip two copies (`vector.plan`,
+after `Ssa.plan`, recorded in `CodeGen.vec_mem`): a load whose users are
+all lane-wise operations, shuffles, rotates or casts later in its block,
+with only values that write no memory between (no store, call, asm or
+atomic), is not emitted, and its users read the memory it points to; its
+pointer lives until the last of them. An operation whose only user is a
+store right after it (through a bitcast to an array, or at the start of
+the block its only predecessor jumps to, where an inlined call's result
+block ends) writes the store's memory: it computes all its chunks in
+v16-v19 (v0-v3 for a shuffle, whose tables are in v16-v19) before
+storing any, so the destination may overlap the operands at any offset,
+and the store is not emitted. Neither goes through an `alloc` itself,
+whose loads `Ssa.plan` may forward. `x << k | x >> (bits - k)` on
+unsigned lanes, with shifts used only there, is a rotate (`planRotate`):
+the shifts are not emitted (fate `.dead`) and `x` lives until the
+rotate, which is `rev32`/`rev16`/`rev64` for half a lane and `shl` then
+`usra` otherwise. A shuffle loads only the source chunks each result
+chunk reads and keeps its index vector while it repeats.
 
 Measured on a Mac satellite (Apple M-series, mac.medium; ReleaseFast bs
 against the scalarizing parent, 64 MiB inputs, best of 5;

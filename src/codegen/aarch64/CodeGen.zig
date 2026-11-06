@@ -79,6 +79,10 @@ homes: []Home,
 /// registers (`lengthenIntervals`), the slice; else `no_base`. Indexed as
 /// `Ssa.allocate`'s `fold`.
 pair_base: []u32,
+/// Vectors of more than 16 bytes read or written in place (`vector.plan`):
+/// a load not emitted, to its pointer; an operation that writes its
+/// store's memory, to the store's pointer; and that store, to `.none`.
+vec_mem: std.AutoHashMapUnmanaged(u32, Ref) = .empty,
 ssa: *const Ssa,
 /// Each SSA block's label, by block index.
 labels: []Encoder.Label,
@@ -267,6 +271,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.e.deinit();
         gpa.free(cg.homes);
         gpa.free(cg.pair_base);
+        cg.vec_mem.deinit(gpa);
         gpa.free(cg.labels);
         cg.dbg_inlines.deinit(gpa);
         cg.dbg_inline_names.deinit(gpa);
@@ -294,6 +299,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         // `clobbers` marks the values that want a register.
         try f.liveness(gpa, ir, &cg);
         try f.plan(gpa, ir, ip, &cg);
+        try vector.plan(&cg);
         f.bypassUnread(ir);
         cg.live = true;
         if (!f.no_regs) {
@@ -2107,7 +2113,7 @@ pub fn setResult(cg: *CodeGen, inst: Inst.Index, ty: Index, reg: Reg) Error!void
 }
 
 /// The memory pointer `ptr` points to. May use x12.
-fn ptrMem(cg: *CodeGen, ptr: Ref) Error!Mem {
+pub fn ptrMem(cg: *CodeGen, ptr: Ref) Error!Mem {
     switch (try cg.locOf(ptr)) {
         .addr => |m| return m,
         .reg => |r| return .at(r, 0),

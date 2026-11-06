@@ -35,6 +35,7 @@ const Reg = Encoder.Reg;
 const VReg = Encoder.VReg;
 const Mem = CodeGen.Mem;
 const Error = CodeGen.Error;
+const Ssa = @import("../Ssa.zig");
 
 /// A vector type lowered as lanes.
 const Shape = struct {
@@ -103,7 +104,8 @@ pub fn lowers(cg: *CodeGen, inst: Inst.Index) bool {
         .not, .intcast, .trunc => ip.keyTag(data.ty_op.ty) == .vector_type,
         .aggregate_init => isSplat(cg, data),
         .bitcast => storedBitcast(cg, inst),
-        .load => loadedBitcast(cg, inst) != null,
+        .load => loadedBitcast(cg, inst) != null or cg.vec_mem.contains(@backingInt(inst)),
+        .store => cg.vec_mem.count() != 0 and cg.vec_mem.contains(@backingInt(inst)),
         else => false,
     };
 }
@@ -123,7 +125,8 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
     const ip = cg.ip;
     switch (tag) {
         .bitcast => {}, // the store after it stores the operand (`stored`)
-        .load => {}, // the bitcast after it loads (`loaded`)
+        .load => {}, // the bitcast after it loads (`loaded`), or its users (`plan`)
+        .store => {}, // the operation before it wrote the memory (`plan`)
         .intcast, .trunc => try cast(cg, inst, data.ty_op.ty, data.ty_op.operand),
         .cmp_vector => {
             if (absorbed(cg, inst)) return; // computed by its reduce
@@ -162,10 +165,11 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
                 else => unreachable,
             };
             for (0..s.chunks()) |k| {
-                const r = destReg(dst, .v0);
+                const r = destReg(dst, .v0, @intCast(k));
                 try emit(cg, misc(u, 0b10 | @as(u2, s.sz()), op, r, try srcChunk(cg, data.un_op, @intCast(k), .v0)));
                 try storeChunk(cg, dst, r, s, @intCast(k));
             }
+            try finish(cg, dst, s);
         },
         .aggregate_init => {
             const extra = cg.ir.extraData(Ir.Aggregate, data.ty_pl.payload);
@@ -182,10 +186,11 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
             const s = shape(ip, ty).?;
             const dst = try dest(cg, inst, ty) orelse return;
             for (0..s.chunks()) |k| {
-                const r = destReg(dst, .v0);
+                const r = destReg(dst, .v0, @intCast(k));
                 try emit(cg, misc(1, 0, 0b00101, r, try srcChunk(cg, data.ty_op.operand, @intCast(k), .v0)));
                 try storeChunk(cg, dst, r, s, @intCast(k));
             }
+            try finish(cg, dst, s);
         },
         else => {
             const ty = cg.typeOf(data.bin_op.lhs);
@@ -315,6 +320,288 @@ fn loadedBitcast(cg: *CodeGen, inst: Inst.Index) ?Inst.Index {
         return x;
     }
     return null;
+}
+
+// ---------------------------------------------------------------------------
+// Vectors of more than 16 bytes in place
+//
+// They live in memory, and each operation reads and writes them 16 bytes
+// at a time. Before allocation, `plan` saves two copies:
+// - A load of one whose users are all operations here that read it chunk
+//   by chunk (`readsInPlace`), later in its block, with only values that
+//   write no memory between, is not emitted: the users read the memory it
+//   points to (`loadChunk`), and the pointer lives until the last of them.
+// - An operation whose only user is a store right after it writes the
+//   store's memory, and the store is not emitted. It keeps all its chunks
+//   (at most 4) in registers until the last is computed (`Dst.buf`), so
+//   that memory may overlap its operands'.
+// Neither applies through a variable's own pointer (an `alloc`), whose
+// loads `Ssa.plan` may forward.
+
+/// Operations that read their vector operands, and write their result,
+/// only through `loadChunk` and `Dst`, at their own position.
+fn inPlaceOp(cg: *CodeGen, inst: Inst.Index) bool {
+    return switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .min_int, .max_int => true,
+        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .neg_float, .abs_float, .sqrt => true,
+        .not, .intcast, .trunc, .shuffle => true,
+        else => false,
+    } and lowers(cg, inst);
+}
+
+/// Whether `inst` reads vector `ref` only chunk by chunk, where it is.
+fn readsInPlace(cg: *CodeGen, inst: Inst.Index, ref: Ref) bool {
+    if (!inPlaceOp(cg, inst)) return false;
+    const tag = cg.ir.instructions.items(.tag)[@backingInt(inst)];
+    // A shift amount is read as a scalar.
+    return !((tag == .shl or tag == .shr) and cg.ir.instructions.items(.data)[@backingInt(inst)].bin_op.rhs == ref);
+}
+
+/// A vector type of more than 16 bytes of lanes (at most 4 chunks).
+fn wide(ip: *const InternPool, ty: Index) bool {
+    const s = shape(ip, ty) orelse return false;
+    return s.size > 16 and s.chunks() <= 4;
+}
+
+/// Marks the loads read in place and the operations that write their
+/// store's memory, in `CodeGen.vec_mem`, after `Ssa.plan`.
+pub fn plan(cg: *CodeGen) Error!void {
+    const f = cg.ssa;
+    const ir = cg.ir;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const fate = f.live.items(.fate);
+    for (f.values.items(.inst)) |v| if (fate[@backingInt(v)] == .normal and tags[@backingInt(v)] == .bit_or) planRotate(cg, v);
+    var preds: ?[]u32 = null;
+    defer if (preds) |p| cg.gpa.free(p);
+    for (0..f.blocks.items.len) |bi| {
+        const insts = f.blockInsts(@fromBackingInt(@intCast(bi)));
+        for (insts, 0..) |v, i| {
+            if (fate[@backingInt(v)] != .normal) continue;
+            switch (tags[@backingInt(v)]) {
+                .load => if (wide(cg.ip, datas[@backingInt(v)].ty_op.ty)) try deferLoad(cg, v, insts[i + 1 ..]),
+                .store => {
+                    if (!wide(cg.ip, cg.typeOf(datas[@backingInt(v)].bin_op.rhs))) continue;
+                    // The first value of a block that its only predecessor
+                    // jumps to (an inlined call's result block ends
+                    // there) stores what that block computed last.
+                    const first = for (insts[0..i]) |x| {
+                        if (!isDbg(tags[@backingInt(x)])) break false;
+                    } else true;
+                    const before = if (!first) insts[0..i] else before: {
+                        if (preds == null) preds = try predecessors(cg);
+                        const p = preds.?[bi];
+                        if (p >= no_pred - 1) continue;
+                        const t = f.blocks.items[p].term;
+                        if (t.tag != .jump and t.tag != .fallthrough) continue;
+                        // A `br` that writes its block's result.
+                        if (t.tag == .jump and tags[@backingInt(t.inst)] == .br) {
+                            const br = datas[@backingInt(t.inst)].br;
+                            if (br.operand != Ref.void_value and f.live.items(.uses)[@backingInt(br.block_inst)] != 0) continue;
+                        }
+                        break :before f.blockInsts(@fromBackingInt(p));
+                    };
+                    try storeInPlace(cg, v, before);
+                },
+                else => {},
+            }
+        }
+    }
+}
+
+const no_pred = std.math.maxInt(u32);
+
+/// Each block's predecessor when it has exactly one, else `no_pred` (none)
+/// or `no_pred - 1` (several).
+fn predecessors(cg: *CodeGen) Error![]u32 {
+    const f = cg.ssa;
+    const pred = try cg.gpa.alloc(u32, f.blocks.items.len);
+    @memset(pred, no_pred);
+    const add = struct {
+        fn add(ff: *const Ssa, p: []u32, to: u32, from: u32) void {
+            const t = @backingInt(ff.fwd.items[to]);
+            p[t] = if (p[t] == no_pred) from else no_pred - 1;
+        }
+    }.add;
+    for (f.blocks.items, 0..) |b, bi| {
+        // An empty block forwarded to its target emits nothing.
+        if (@backingInt(f.fwd.items[bi]) != bi) continue;
+        const t = b.term;
+        switch (t.tag) {
+            .jump, .fallthrough => add(f, pred, t.succ[0], @intCast(bi)),
+            .branch => for (t.succ) |x| add(f, pred, x, @intCast(bi)),
+            .switch_br => {
+                const extra = cg.ir.extraData(Ir.SwitchBr, cg.ir.instructions.items(.data)[@backingInt(t.inst)].pl_op.payload);
+                for (f.switchCases(t, extra.data.cases_len)) |c| add(f, pred, @backingInt(c), @intCast(bi));
+                add(f, pred, t.succ[1], @intCast(bi));
+            },
+            .noreturn, .ret, .unreach => {},
+        }
+    }
+    return pred;
+}
+
+/// A rotate: `x << k | x >> (bits - k)` on unsigned integer lanes with a
+/// constant `k` (what std.math.rotl and rotr become), whose shifts
+/// `planRotate` keeps from being emitted.
+const Rotate = struct { x: Ref, k: u32 };
+
+/// The shifts of `bit_or` `inst` if it can be a rotate.
+fn rotateShifts(cg: *CodeGen, inst: Inst.Index) ?struct { shl: Inst.Index, shr: Inst.Index, r: Rotate } {
+    const ip = cg.ip;
+    const ir = cg.ir;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    if (tags[@backingInt(inst)] != .bit_or) return null;
+    const bin = datas[@backingInt(inst)].bin_op;
+    const ty = cg.typeOf(bin.lhs);
+    const s = shape(ip, ty) orelse return null;
+    if (s.lane.isFloat() or isSigned(cg, ty)) return null;
+    const a = bin.lhs.toIndex() orelse return null;
+    const b = bin.rhs.toIndex() orelse return null;
+    const sl, const sr = if (tags[@backingInt(a)] == .shl and tags[@backingInt(b)] == .shr)
+        .{ a, b }
+    else if (tags[@backingInt(a)] == .shr and tags[@backingInt(b)] == .shl)
+        .{ b, a }
+    else
+        return null;
+    const lb = datas[@backingInt(sl)].bin_op;
+    const rb = datas[@backingInt(sr)].bin_op;
+    if (lb.lhs != rb.lhs) return null;
+    const k1 = CodeGen.intBits(ip, elemValue(ip, lb.rhs.toInterned() orelse return null, 0));
+    const k2 = CodeGen.intBits(ip, elemValue(ip, rb.rhs.toInterned() orelse return null, 0));
+    const bits = s.lane.bytes() * 8;
+    if (k1 == 0 or k2 == 0 or k1 + k2 != bits) return null;
+    return .{ .shl = sl, .shr = sr, .r = .{ .x = lb.lhs, .k = @intCast(k1) } };
+}
+
+/// For `bit_or` `inst`: the rotate it computes, when `planRotate` made it
+/// one.
+fn rotate(cg: *CodeGen, inst: Inst.Index) ?Rotate {
+    const r = rotateShifts(cg, inst) orelse return null;
+    if (cg.fate(r.shl) != .dead or cg.fate(r.shr) != .dead) return null;
+    return r.r;
+}
+
+/// Makes `bit_or` `inst` a rotate, before allocation, when its shifts
+/// have no other user: they are not emitted, and their operand lives
+/// until the rotate.
+fn planRotate(cg: *CodeGen, inst: Inst.Index) void {
+    if (!lowers(cg, inst)) return;
+    const r = rotateShifts(cg, inst) orelse return;
+    const live = cg.ssa.live.slice();
+    const fate = live.items(.fate);
+    for ([_]Inst.Index{ r.shl, r.shr }) |x| {
+        if (live.items(.uses)[@backingInt(x)] != 1 or fate[@backingInt(x)] != .normal) return;
+    }
+    if (r.r.x.toIndex()) |x| {
+        const xi = @backingInt(x);
+        // A load sharing a variable's register holds its value only until
+        // its end (`Live.share`).
+        if (fate[xi] != .normal or live.items(.share)[xi] != Ssa.no_tie) return;
+        const def = live.items(.def);
+        const end = live.items(.end);
+        const cl = cg.ssa.clobbers.items;
+        const at = def[@backingInt(inst)];
+        end[xi] = @max(end[xi], at);
+        live.items(.crosses)[xi] = live.items(.crosses)[xi] or cl[at][0] != cl[def[xi]][0] or cl[at][1] != cl[def[xi]][1];
+    }
+    for ([_]Inst.Index{ r.shl, r.shr }) |x| {
+        fate[@backingInt(x)] = .dead;
+        live.items(.reg)[@backingInt(x)] = Ssa.no_reg;
+    }
+    live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
+}
+
+/// Reads load `l` in place if its users are among the values `after` it,
+/// with nothing before the last that writes memory.
+fn deferLoad(cg: *CodeGen, l: Inst.Index, after: []const Inst.Index) Error!void {
+    const f = cg.ssa;
+    const ir = cg.ir;
+    const tags = ir.instructions.items(.tag);
+    const live = f.live.slice();
+    const li = @backingInt(l);
+    if (live.items(.fwd)[li] != Ssa.no_tie or cg.homes[li] != .none or !Ssa.removable(ir, cg.ip, l)) return;
+    const ptr = ir.instructions.items(.data)[li].ty_op.operand;
+    if (ptr.toIndex()) |p| if (tags[@backingInt(p)] == .alloc) return;
+    var left = live.items(.uses)[li];
+    const last = for (after[0..@min(after.len, 64)]) |x| {
+        const Count = struct {
+            l: Ref,
+            n: *u32,
+            pub fn use(c: @This(), ref: Ref) void {
+                if (ref == c.l) c.n.* += 1;
+            }
+        };
+        // A rotate's shifts are not emitted; the rotate reads their operand.
+        if (live.items(.fate)[@backingInt(x)] == .dead) continue;
+        var n: u32 = 0;
+        Ssa.forEachOperand(ir, x, Count{ .l = l.toRef(), .n = &n });
+        if (rotate(cg, x)) |r| if (r.x == l.toRef()) {
+            n += 2;
+        };
+        if (n != 0) {
+            if (n > left or !readsInPlace(cg, x, l.toRef())) return;
+            left -= n;
+            if (left == 0) break x;
+        }
+        switch (tags[@backingInt(x)]) {
+            .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+            // Its result is written by its `br`s, which are terminators.
+            .block => {},
+            else => if (!Ssa.removable(ir, cg.ip, x)) return,
+        }
+    } else return;
+    if (ptr.toIndex()) |p0| {
+        var p = @backingInt(p0);
+        const fwd = live.items(.fwd);
+        if (fwd[p] != Ssa.no_tie) p = fwd[p];
+        if (live.items(.share)[p] != Ssa.no_tie or live.items(.fate)[p] != .normal) return;
+        const at = live.items(.def)[@backingInt(last)];
+        const def = live.items(.def);
+        const end = live.items(.end);
+        const cl = f.clobbers.items;
+        end[p] = @max(end[p], at);
+        live.items(.crosses)[p] = live.items(.crosses)[p] or cl[at][0] != cl[def[p]][0] or cl[at][1] != cl[def[p]][1];
+    }
+    try cg.vec_mem.put(cg.gpa, li, ptr);
+}
+
+/// Has the operation store `st` stores, the last of the values `before`
+/// it, write the store's memory.
+fn storeInPlace(cg: *CodeGen, st: Inst.Index, before: []const Inst.Index) Error!void {
+    const ir = cg.ir;
+    const tags = ir.instructions.items(.tag);
+    const live = cg.ssa.live.slice();
+    const bin = ir.instructions.items(.data)[@backingInt(st)].bin_op;
+    var v = bin.rhs.toIndex() orelse return;
+    var j = before.len;
+    const prev = while (j > 0) {
+        j -= 1;
+        if (!isDbg(tags[@backingInt(before[j])])) break before[j];
+    } else return;
+    if (prev != v) return;
+    // A bitcast to an array of its size, which the store stores the
+    // operand of (`storedBitcast`).
+    if (tags[@backingInt(v)] == .bitcast) {
+        const op = ir.instructions.items(.data)[@backingInt(v)].ty_op.operand;
+        const to = cg.ip.keyTag(cg.typeOf(bin.rhs));
+        if (to != .array_type and to != .vector_type) return;
+        if (live.items(.uses)[@backingInt(v)] != 1 or Type.abiSize(cg.ip, cg.typeOf(op)) != Type.abiSize(cg.ip, cg.typeOf(bin.rhs))) return;
+        v = op.toIndex() orelse return;
+        const prev2 = while (j > 0) {
+            j -= 1;
+            if (!isDbg(tags[@backingInt(before[j])])) break before[j];
+        } else return;
+        if (prev2 != v) return;
+    }
+    const vi = @backingInt(v);
+    if (!inPlaceOp(cg, v) or !wide(cg.ip, cg.typeOf(v.toRef()))) return;
+    if (live.items(.uses)[vi] != 1 or live.items(.fate)[vi] != .normal or cg.homes[vi] != .none) return;
+    if (Type.ptrInfo(cg.ip, cg.typeOf(bin.lhs)).flags.is_volatile) return;
+    if (bin.lhs.toIndex()) |p| if (tags[@backingInt(p)] == .alloc) return;
+    try cg.vec_mem.put(cg.gpa, vi, bin.lhs);
+    try cg.vec_mem.put(cg.gpa, @backingInt(st), .none);
 }
 
 /// Whether bitcast `inst` loads its result's vector register from its
@@ -541,6 +828,10 @@ fn zero(cg: *CodeGen, d: VReg) Error!void {
 /// than 16 bytes fills the low bytes, zeroing the rest.
 fn loadChunk(cg: *CodeGen, r: VReg, ref: Ref, k: u32) Error!void {
     const size: u32 = @intCast(Type.abiSize(cg.ip, cg.typeOf(ref)));
+    // A load read in place (`plan`): the memory it points to.
+    if (size > 16) if (ref.toIndex()) |i| if (cg.vec_mem.get(@backingInt(i))) |ptr| {
+        return loadMem(cg, r, (try cg.ptrMem(ptr)).plus(16 * k), 16);
+    };
     switch (try cg.locOf(ref)) {
         .mem => |m| try loadMem(cg, r, m.plus(16 * k), @min(size, 16)),
         .imm => |x| {
@@ -564,12 +855,13 @@ fn srcChunk(cg: *CodeGen, ref: Ref, k: u32, scratch: VReg) Error!VReg {
     return scratch;
 }
 
-/// The register to compute a chunk of `dst` in: its own, or `scratch`
-/// for `storeChunk` to store.
-fn destReg(dst: Dst, scratch: VReg) VReg {
+/// The register to compute chunk `k` of `dst` in: its own, `scratch` for
+/// `storeChunk` to store, or the chunk's buffer register.
+fn destReg(dst: Dst, scratch: VReg, k: u32) VReg {
     return switch (dst) {
         .reg => |r| r,
         .mem => scratch,
+        .buf => |b| b.reg(k),
     };
 }
 
@@ -584,6 +876,7 @@ pub fn copy(cg: *CodeGen, inst: Inst.Index, ty: Index, operand: Ref) Error!void 
     switch (try dest(cg, inst, ty) orelse return) {
         .reg => |r| try loadVec(cg, r, operand),
         .mem => |m| try cg.copyTo(m, operand),
+        .buf => unreachable, // not a vector operation (`plan`)
     }
 }
 
@@ -600,13 +893,45 @@ pub fn inVreg(ip: *const InternPool, ty: Index) bool {
     return s.size <= 16;
 }
 
-/// Where an instruction's vector result goes: its register, or memory.
-const Dst = union(enum) { mem: Mem, reg: VReg };
+/// Where an instruction's vector result goes: its register, memory, or
+/// the memory a store after it writes (`plan`), through registers that
+/// hold all its chunks until the last is computed (`finish`).
+const Dst = union(enum) {
+    mem: Mem,
+    reg: VReg,
+    buf: Buf,
+
+    const Buf = struct {
+        ptr: Ref,
+        /// The first of the 4 registers: v16-v19, or v0-v3 for a shuffle,
+        /// which builds its tables in v16-v19.
+        first: u5,
+
+        fn reg(b: Buf, k: u32) VReg {
+            return @fromBackingInt(@intCast(b.first + k));
+        }
+    };
+};
 
 /// The destination of vector result `inst`, or null when it has no bits.
 fn dest(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Dst {
     if (cg.homes[@backingInt(inst)] == .vreg) return .{ .reg = cg.homes[@backingInt(inst)].vreg };
+    if (cg.vec_mem.count() != 0) if (cg.vec_mem.get(@backingInt(inst))) |ptr| {
+        const first: u5 = if (cg.ir.instructions.items(.tag)[@backingInt(inst)] == .shuffle) 0 else 16;
+        return .{ .buf = .{ .ptr = ptr, .first = first } };
+    };
     return .{ .mem = try cg.resultMem(inst, ty) orelse return null };
+}
+
+/// Writes the chunks of a result buffered in registers (`Dst.buf`) to
+/// their memory.
+fn finish(cg: *CodeGen, dst: Dst, s: Shape) Error!void {
+    const b = switch (dst) {
+        .buf => |b| b,
+        else => return,
+    };
+    const m = try cg.ptrMem(b.ptr);
+    for (0..s.chunks()) |k| try storeMem(cg, m.plus(16 * k), b.reg(@intCast(k)), 16);
 }
 
 /// Loads the `bytes` bytes (1 to 16, a power of two) at `m` into `r`.
@@ -633,6 +958,7 @@ fn storeChunk(cg: *CodeGen, dst: Dst, r: VReg, s: Shape, k: u32) Error!void {
             try move(cg, h, r);
         },
         .mem => |m| try storeMem(cg, m.plus(16 * k), r, @min(s.size, 16)),
+        .buf => |b| try move(cg, b.reg(k), r),
     }
 }
 
@@ -708,13 +1034,14 @@ fn arith(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, ty: Index, lhs: Ref, rhs
     const s = shape(cg.ip, ty).?;
     const signed = isSigned(cg, ty);
     const dst = try dest(cg, inst, ty) orelse return;
+    if (tag == .bit_or) if (rotate(cg, inst)) |rot| return rotateLanes(cg, dst, s, rot);
     const sz: u2 = s.sz();
     const es = s.esize();
     for (0..s.chunks()) |kk| {
         const k: u32 = @intCast(kk);
         const a = try srcChunk(cg, lhs, k, .v0);
         const b = try srcChunk(cg, rhs, k, .v1);
-        var r = destReg(dst, .v0);
+        var r = destReg(dst, .v0, k);
         switch (tag) {
             .add_wrap => try emit(cg, same(0, es, 0b10000, r, a, b)),
             .sub_wrap => try emit(cg, same(1, es, 0b10000, r, a, b)),
@@ -735,6 +1062,35 @@ fn arith(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, ty: Index, lhs: Ref, rhs
         }
         try storeChunk(cg, dst, r, s, k);
     }
+    try finish(cg, dst, s);
+}
+
+/// A rotate left by `rot.k` (`planRotate`): rev32, rev16 or rev64 for half
+/// a lane, else shl, then usra by the rest.
+fn rotateLanes(cg: *CodeGen, dst: Dst, s: Shape, rot: Rotate) Error!void {
+    const bits = s.lane.bytes() * 8;
+    for (0..s.chunks()) |kk| {
+        const k: u32 = @intCast(kk);
+        const a = try srcChunk(cg, rot.x, k, .v1);
+        if (2 * rot.k == bits and bits != 8) {
+            const r = destReg(dst, .v0, k);
+            try emit(cg, switch (bits) {
+                16 => misc(0, 0, 0b00001, r, a), // rev16 .16b
+                32 => misc(1, 1, 0b00000, r, a), // rev32 .8h
+                64 => misc(0, 2, 0b00000, r, a), // rev64 .4s
+                else => unreachable,
+            });
+            try storeChunk(cg, dst, r, s, k);
+            continue;
+        }
+        // Not in the operand's register, which usra reads after shl.
+        const d = destReg(dst, .v0, k);
+        const r = if (d == a) .v0 else d;
+        try emit(cg, shiftImm(1, 0, 0b01010, @intCast(bits + rot.k), r, a));
+        try emit(cg, shiftImm(1, 1, 0b00010, @intCast(bits + rot.k), r, a));
+        try storeChunk(cg, dst, r, s, k);
+    }
+    try finish(cg, dst, s);
 }
 
 /// `@min` or `@max` of integer lanes in `a` and `b`, into `d` or v2;
@@ -755,7 +1111,7 @@ fn splat(cg: *CodeGen, inst: Inst.Index, ty: Index, elem: Ref) Error!void {
     const s = shape(cg.ip, ty).?;
     const dst = try dest(cg, inst, ty) orelse return;
     try cg.load(.x9, elem);
-    const r = destReg(dst, .v0);
+    const r = destReg(dst, .v0, 0);
     try emit(cg, dupGpr(s.esize(), r, .x9));
     for (0..s.chunks()) |k| try storeChunk(cg, dst, r, s, @intCast(k));
 }
@@ -777,18 +1133,20 @@ fn cast(cg: *CodeGen, inst: Inst.Index, ty: Index, operand: Ref) Error!void {
             // extended to twice its width (ushll or sshll #0) until wide
             // enough.
             const off = j * 16 / ratio;
-            try loadChunk(cg, .v0, operand, off / 16);
-            if (off % 16 != 0) try emit(cg, ext(.v0, .v0, .v0, @intCast(off % 16)));
+            const r = destReg(dst, .v0, j);
+            try loadChunk(cg, r, operand, off / 16);
+            if (off % 16 != 0) try emit(cg, ext(r, r, r, @intCast(off % 16)));
             var es = s.esize();
             while (es != d.esize()) : (es += 1) {
-                try emit(cg, shiftImm(0, u, 0b10100, @as(u7, 8) << es, .v0, .v0));
+                try emit(cg, shiftImm(0, u, 0b10100, @as(u7, 8) << es, r, r));
             }
-            try storeChunk(cg, dst, .v0, d, j);
+            try storeChunk(cg, dst, r, d, j);
         } else {
             try pack(cg, operand, s, j * ratio, ratio, 0);
             try storeChunk(cg, dst, .v0, d, j);
         }
     }
+    try finish(cg, dst, d);
 }
 
 /// Computes in v`r` one 16-byte chunk of lanes `count` times narrower
@@ -839,7 +1197,7 @@ fn shift(cg: *CodeGen, inst: Inst.Index, left: bool, ty: Index, lhs: Ref, rhs: R
     for (0..s.chunks()) |kk| {
         const k: u32 = @intCast(kk);
         const a = try srcChunk(cg, lhs, k, .v0);
-        var r = destReg(dst, .v0);
+        var r = destReg(dst, .v0, k);
         if (amount) |n| {
             if (left) {
                 try emit(cg, shiftImm(1, 0, 0b01010, @intCast(bits + n), r, a));
@@ -851,6 +1209,7 @@ fn shift(cg: *CodeGen, inst: Inst.Index, left: bool, ty: Index, lhs: Ref, rhs: R
         }
         try storeChunk(cg, dst, r, s, k);
     }
+    try finish(cg, dst, s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,33 +1457,47 @@ fn shuffle(cg: *CodeGen, inst: Inst.Index, ty: Index, a: Ref, b: Ref, mask: Inde
         for (0..lb) |q| src[i * lb + q] = base + @as(u32, @intCast(q));
     }
     const total_chunks = a_chunks + if (b_shape) |bs| bs.chunks() else 0;
+    // The index vector in v4, kept while the next chunk's is the same.
+    var last_idx: ?[16]u8 = null;
     for (0..s.chunks()) |jj| {
         const j: u32 = @intCast(jj);
+        // Not in the result's own register, which a later group's
+        // operand may be.
+        const r: VReg = if (dst == .buf) destReg(dst, .v0, j) else .v0;
         var first = true;
         var g: u32 = 0;
         while (g * 4 < total_chunks) : (g += 1) {
-            var idx: [16]u8 = @splat(0xff);
-            var regs: u32 = 0;
+            // The source chunks of this group that the result chunk reads,
+            // from `lo` to `hi`, as tables from v16 on.
+            var lo: u32 = 4;
+            var hi: u32 = 0;
             for (0..16) |p| {
                 const x = src[j * 16 + p] orelse continue;
                 if (x / 64 != g) continue;
-                idx[p] = @intCast(x % 64);
-                regs = @max(regs, x % 64 / 16 + 1);
+                lo = @min(lo, x % 64 / 16);
+                hi = @max(hi, x % 64 / 16);
             }
-            if (regs == 0) continue;
-            for (0..regs) |c| {
+            if (lo > hi) continue;
+            var idx: [16]u8 = @splat(0xff);
+            for (0..16) |p| {
+                const x = src[j * 16 + p] orelse continue;
+                if (x / 64 == g) idx[p] = @intCast(x % 64 - 16 * lo);
+            }
+            for (lo..hi + 1) |c| {
                 const chunk = g * 4 + @as(u32, @intCast(c));
-                const r: VReg = @fromBackingInt(@intCast(16 + c));
+                const t: VReg = @fromBackingInt(@intCast(16 + c - lo));
                 if (chunk < a_chunks) {
-                    try loadChunk(cg, r, a, chunk);
+                    try loadChunk(cg, t, a, chunk);
                 } else {
-                    try loadChunk(cg, r, b, chunk - a_chunks);
+                    try loadChunk(cg, t, b, chunk - a_chunks);
                 }
             }
-            try loadConst(cg, .v4, idx);
-            try emit(cg, tbl(!first, regs, .v0, .v16, .v4));
+            if (last_idx == null or !std.mem.eql(u8, &last_idx.?, &idx)) try loadConst(cg, .v4, idx);
+            last_idx = idx;
+            try emit(cg, tbl(!first, hi - lo + 1, r, .v16, .v4));
             first = false;
         }
-        if (!first) try storeChunk(cg, dst, .v0, s, j);
+        if (!first) try storeChunk(cg, dst, r, s, j);
     }
+    try finish(cg, dst, s);
 }
