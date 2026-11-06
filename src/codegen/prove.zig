@@ -1384,7 +1384,11 @@ const Walker = struct {
             if (for (s.cands.items) |g| (if (g.v == v) break true) else false) continue;
             const info = w.varInfo(v) orelse continue;
             if (info.signedness == .signed) continue;
-            const hi = w.range(w.varTerm(v), info).hi;
+            const r = w.range(w.varTerm(v), info);
+            // An empty range: the facts contradict, so the loop is never
+            // reached (code after a checked sub that always overflows).
+            if (r.hi < r.lo) continue;
+            const hi = r.hi;
             if (hi >= limits(info).hi or !w.shrinks(insts, v, hi)) continue;
             try s.cands.append(gpa, .{ .v = v, .base = .{ .tag = .variable, .a = v, .b = stamp }, .c = 0, .op = .le, .bits = @intCast(info.bits), .y = .konst(@intCast(hi)) });
         }
@@ -1805,8 +1809,12 @@ const Walker = struct {
         if (t.tag != .inst or w.ir.instructions.items(.tag)[t.a] != .intcast) return null;
         const operand = w.ir.instructions.items(.data)[t.a].ty_op.operand;
         const from = w.intInfo(operand) orelse return null;
-        if (from.signedness != .unsigned) return null;
-        return @intCast(w.range(w.term(operand), from).hi);
+        if (from.signedness != .unsigned or from.bits > 64) return null;
+        const span = w.range(w.term(operand), from);
+        // An empty range: the facts contradict, so this code is never
+        // reached; decide nothing on it.
+        if (span.hi < span.lo) return null;
+        return @intCast(span.hi);
     }
 
     const Range = struct { lo: i128, hi: i128 };
