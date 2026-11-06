@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "68 1 null 5 20 13 99 507 394 8589934593 120 7442\n"
+//! stdout: "68 1 null 5 20 13 99 507 394 8589934593 120 7442 5867311 252\n"
 
 // Tiny constant-trip `for` loops are unrolled (`codegen/unroll.zig`):
 // each copy of the body has the counter as a constant. `continue`,
@@ -8,7 +8,9 @@
 // stays a loop. Line markers do not count toward the size budget, so
 // `MultiArrayList.slice` of an 8-field struct is unrolled. A slice's
 // constant length (`@ptrCast` of a `*T`, as in `std.mem.swap`) counts as
-// a constant trip count.
+// a constant trip count. An element of an array literal of runtime
+// values, read at a copy's constant index, is that value
+// (`codegen/rewrite.zig`), as in `std.mem.eql`'s short-slice loop.
 const std = @import("std");
 
 const weights = [_]u32{ 3, 5, 7, 11 };
@@ -85,6 +87,19 @@ noinline fn eight(list: *const std.MultiArrayList(Eight)) u64 {
     return sum;
 }
 
+noinline fn windows(a: []const u8) u32 {
+    var x: u32 = 0;
+    for ([_]usize{ 0, a.len - 4, a.len / 2 - 1 }, 0..) |n, k| x = x *% 31 +% (@as(u32, a[n]) << @intCast(k));
+    for ([_:0]u32{ a[1], a[2] }) |e| x = x *% 7 +% e;
+    return x;
+}
+
+noinline fn shortEql(a: []const u8, b: []const u8) u8 {
+    var bits: u8 = 0;
+    for (4..12) |l| bits = bits << 1 | @intFromBool(std.mem.eql(u8, a[0..l], b[0..l]));
+    return bits;
+}
+
 pub fn main() void {
     var buf: [128]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -95,7 +110,7 @@ pub fn main() void {
     var list: std.MultiArrayList(Eight) = .empty;
     list.setCapacity(fba.allocator(), 3) catch unreachable;
     for (1..4) |k| list.appendAssumeCapacity(.{ .a = 1, .b = k * 100, .c = 2, .d = @intCast(k), .e = 3, .f = 4, .g = @intCast(k * 7), .h = @intCast(k * 1000) });
-    w.print("{} {any} {any} {} {} {} {} {} {} {} {} {}\n", .{
+    w.print("{} {any} {any} {} {} {} {} {} {} {} {} {} {} {}\n", .{
         weighted(&x),
         firstLong(2),
         firstLong(4),
@@ -108,6 +123,8 @@ pub fn main() void {
         swapped(1, 2),
         byteSum(&v),
         eight(&list),
+        windows("unrolled loop!"),
+        shortEql("abcdefghijkl", "abcdefghiXkl"),
     }) catch unreachable;
     std.Io.File.stdout().writeStreamingAll(std.Options.debug_io, w.buffered()) catch {};
 }

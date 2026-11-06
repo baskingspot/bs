@@ -2297,6 +2297,9 @@ code. Rules are matched per tag (a comptime index of the table):
   `len`, a constant optional's or error union's state and payload, and
   the fields of an overflow operation on constants (so a check of `n - 1`
   for a constant `n` folds);
+- reads of an `aggregate_init`: a field of a struct or tuple, and an
+  element of an array at a constant index (a `for` over an array literal
+  of runtime values, as in `std.mem.eql`'s short slices, once unrolled);
 - reads through a wrapper: an optional's or error union's state, payload
   or error code read from the `wrap_optional`/`wrap_errunion_*` that made
   it (`return x` in a function that traces errors tests the error union
