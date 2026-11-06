@@ -124,16 +124,29 @@ plain_args: bool = false,
 /// each one (`Ssa.planSplits`).
 split: std.bit_set.Dynamic = .{},
 /// The values that got such a register: each clobber point they cross
-/// stores them to their slot (`split_slots`) first, and they are read from
-/// there and reloaded after it (`genSplit`). Loads that share such a
-/// value's register follow it (`of`, else the value itself). A value that
-/// does not change (not a variable or a block result) is stored once per
-/// block (`stored`, the last block that stored it).
-split_vals: std.ArrayList(struct { v: u32, of: u32, stored: u32 = no_base }) = .empty,
+/// stores them to their slot (`split_slots`) first, unless it holds their
+/// value already (`split_clean`), and they are read from there and
+/// reloaded after it unless nothing reads them before the next one
+/// (`genSplit`). Loads that share such a value's register follow it (`of`,
+/// else the value itself).
+split_vals: std.ArrayList(struct { v: u32, of: u32 }) = .empty,
 split_slots: std.AutoHashMapUnmanaged(u32, Mem) = .empty,
+/// The values of `split_vals` by the value whose register they hold.
+split_of: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+/// Per block, how many emitted blocks' terminators go to it (at most 2).
+split_preds: []u8 = &.{},
+/// Per register, the split value whose slot holds what the register
+/// holds, which no instruction has written since it was stored or loaded
+/// (`genSplit`), else `no_base`; and the registers that have one.
+split_clean: [32]u32 = @splat(no_base),
+split_clean_mask: u32 = 0,
+/// The block emitted last, and the position in `Ssa.order` of the one
+/// being emitted.
+prev_block: Ssa.Block.Index = .none,
+order_k: usize = 0,
 /// Scratch for `genSplit`: the values saved around the current clobber
 /// point, with their homes.
-split_now: std.ArrayList(struct { v: u32, home: Home, reload: bool }) = .empty,
+split_now: std.ArrayList(struct { v: u32, home: Home, reload: bool, own: bool }) = .empty,
 /// The condition under which the last overflow operation whose bit its
 /// block's branch reads from the flags (`fate == .fused`) overflowed.
 ovf_cc: Cond = .vs,
@@ -324,6 +337,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.split.deinit(gpa);
         cg.split_vals.deinit(gpa);
         cg.split_slots.deinit(gpa);
+        cg.split_of.deinit(gpa);
+        gpa.free(cg.split_preds);
         cg.split_now.deinit(gpa);
     }
     @memset(cg.homes, .none);
@@ -759,21 +774,64 @@ fn planSplitVals(cg: *CodeGen) Error!void {
         const of = if (share[i] != Ssa.no_tie and reg[share[i]] == reg[i]) share[i] else if (fwd[i] != Ssa.no_tie) fwd[i] else continue;
         if (cg.split.isSet(of)) try cg.split_vals.append(cg.gpa, .{ .v = i, .of = of });
     }
+    for (cg.split_vals.items) |sv| try cg.split_of.put(cg.gpa, sv.v, sv.of);
+    cg.split_preds = try cg.gpa.alloc(u8, f.blocks.items.len);
+    @memset(cg.split_preds, 0);
+    const Count = struct {
+        preds: []u8,
+        const Self = @This();
+        pub fn target(c: Self, b: Ssa.Block.Index) void {
+            const n = &c.preds[@backingInt(b)];
+            n.* = @min(n.* + 1, 2);
+        }
+    };
+    for (f.order.items) |b| cg.forEachTarget(f.blocks.items[@backingInt(b)].term, Count{ .preds = cg.split_preds });
 }
 
-/// Emits value `inst`, at position `q`, a clobber point, saving the values
-/// in `split_vals` whose intervals contain it: each is stored to its slot,
-/// read from there by `inst`, and reloaded after it unless this was its
-/// last use or `inst` does not return. The moves count as `inst`'s writes,
-/// which may be any caller-saved register (`checkWrites`).
-fn genSplit(cg: *CodeGen, inst: Inst.Index, q: u32) Error!void {
+/// Calls `ctx.target` with each block terminator `term` may go to.
+fn forEachTarget(cg: *CodeGen, term: Ssa.Term, ctx: anytype) void {
+    const fwd = cg.ssa.fwd.items;
+    switch (term.tag) {
+        .jump, .fallthrough => ctx.target(fwd[term.succ[0]]),
+        .branch => for (term.succ) |t| ctx.target(fwd[t]),
+        .switch_br => {
+            const payload = cg.ir.instructions.items(.data)[@backingInt(term.inst)].pl_op.payload;
+            for (cg.ssa.switchCases(term, cg.ir.extraData(Ir.SwitchBr, payload).data.cases_len)) |t| ctx.target(fwd[@backingInt(t)]);
+            ctx.target(fwd[term.succ[1]]);
+        },
+        .ret, .unreach, .noreturn => {},
+    }
+}
+
+/// Whether block `next`, emitted right after `block`, runs only after it.
+fn continues(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) bool {
+    if (block == .none or next == .none or cg.split_preds[@backingInt(next)] != 1) return false;
+    const Find = struct {
+        next: Ssa.Block.Index,
+        found: *bool,
+        const Self = @This();
+        pub fn target(c: Self, b: Ssa.Block.Index) void {
+            if (b == c.next) c.found.* = true;
+        }
+    };
+    var found = false;
+    cg.forEachTarget(cg.ssa.blocks.items[@backingInt(block)].term, Find{ .next = next, .found = &found });
+    return found;
+}
+
+/// Emits value `inst`, the value `idx` of `Ssa.values`, a clobber point,
+/// saving the values in `split_vals` whose intervals contain it: each is
+/// stored to its slot unless the slot holds it (`split_clean`), read from
+/// there by `inst`, and reloaded after it unless `inst` does not return or
+/// nothing reads it first (`splitReloads`). The moves count as `inst`'s
+/// writes, which may be any caller-saved register (`checkWrites`).
+fn genSplit(cg: *CodeGen, inst: Inst.Index, idx: usize) Error!void {
     const live = cg.ssa.live.slice();
     const def = live.items(.def);
     const end = live.items(.end);
-    const tags = cg.ir.instructions.items(.tag);
-    const block = @backingInt(cg.block);
+    const q = Ssa.valuePos(idx);
     cg.split_now.clearRetainingCapacity();
-    for (cg.split_vals.items) |*sv| {
+    for (cg.split_vals.items) |sv| {
         const v = sv.v;
         if (def[v] >= q or end[v] < q) continue;
         const home = cg.homes[v];
@@ -785,7 +843,7 @@ fn genSplit(cg: *CodeGen, inst: Inst.Index, q: u32) Error!void {
             } else continue;
             if (!std.meta.eql(home, of.home)) continue;
             cg.homes[v] = cg.homes[sv.of];
-            try cg.split_now.append(cg.gpa, .{ .v = v, .home = home, .reload = false });
+            try cg.split_now.append(cg.gpa, .{ .v = v, .home = home, .reload = false, .own = false });
             continue;
         }
         const r = switch (home) {
@@ -794,24 +852,193 @@ fn genSplit(cg: *CodeGen, inst: Inst.Index, q: u32) Error!void {
         };
         const slot = try cg.split_slots.getOrPut(cg.gpa, v);
         if (!slot.found_existing) slot.value_ptr.* = try cg.allocSlot(8, 8);
-        const fixed = tags[v] != .alloc and tags[v] != .block;
-        if (!fixed or sv.stored != block) try cg.storeReg(slot.value_ptr.*, r, 8);
-        if (fixed) sv.stored = block;
+        // Not stored when its slot holds it, or when `inst` does not read
+        // it and computes its variable's next value in its register.
+        const clean = cg.split_clean_mask & regBit(r) != 0 and cg.split_clean[@backingInt(r)] == v;
+        const overwritten = std.meta.eql(cg.homes[@backingInt(inst)], home) and !cg.readsSplit(inst, v);
+        if (!clean and !overwritten) try cg.storeReg(slot.value_ptr.*, r, 8);
         cg.homes[v] = .{ .slot = slot.value_ptr.* };
-        try cg.split_now.append(cg.gpa, .{ .v = v, .home = home, .reload = end[v] != q });
+        try cg.split_now.append(cg.gpa, .{ .v = v, .home = home, .reload = end[v] != q, .own = true });
     }
     try cg.genInst(inst);
     try cg.flushResults();
     const returns = cg.ir.typeOfIndex(inst, cg.ip) != .noreturn_type;
+    if (returns) cg.splitReloads(idx);
     // A result computed in a variable's register (`Live.share`) is the
     // variable's new value.
     const result = cg.homes[@backingInt(inst)];
+    cg.split_clean_mask = 0;
     for (cg.split_now.items) |sn| {
         cg.homes[sn.v] = sn.home;
-        if (!sn.reload or !returns or std.meta.eql(sn.home, result)) continue;
-        try cg.loadMem(sn.home.reg, cg.split_slots.get(sn.v).?, .usize_type);
+        if (!sn.own or std.meta.eql(sn.home, result)) continue;
+        cg.split_clean[@backingInt(sn.home.reg)] = sn.v;
+        cg.split_clean_mask |= regBit(sn.home.reg);
+        if (sn.reload and returns) try cg.loadMem(sn.home.reg, cg.split_slots.get(sn.v).?, .usize_type);
     }
 }
+
+/// Whether `inst` reads split value `v` or a value holding its register.
+fn readsSplit(cg: *CodeGen, inst: Inst.Index, v: u32) bool {
+    const Find = struct {
+        cg: *CodeGen,
+        v: u32,
+        found: *bool,
+        const Self = @This();
+        pub fn use(c: Self, ref: Ref) void {
+            const i = ref.toIndex() orelse return;
+            if (c.cg.split_of.get(@backingInt(i)) == c.v) c.found.* = true;
+        }
+    };
+    var found = false;
+    Ssa.forEachOperand(cg.ir, inst, Find{ .cg = cg, .v = v, .found = &found });
+    return found;
+}
+
+/// After the clobber point at the value `idx` of `Ssa.values`, clears
+/// `reload` in `split_now` for the values nothing reads before the next
+/// clobber point (which reads them from their slots), the end of their
+/// intervals, or an instruction that writes their register whole (a
+/// store to a variable). It follows the blocks emitted next while each
+/// runs only after the one before it, and keeps `reload` for the values
+/// another block they may go to holds.
+fn splitReloads(cg: *CodeGen, idx: usize) void {
+    const f = cg.ssa;
+    const ir = cg.ir;
+    const live = f.live.slice();
+    const cl = f.clobbers.items;
+    // The values still undecided, by index in `split_now`.
+    var open: Open = .{ .cg = cg };
+    for (cg.split_now.items, 0..) |sn, k| {
+        if (!sn.own or !sn.reload) continue;
+        if (open.n == open.ks.len) return;
+        open.ks[open.n] = @intCast(k);
+        open.n += 1;
+    }
+    var block = cg.block;
+    var k = cg.order_k;
+    var i = idx + 1;
+    while (true) {
+        const b = f.blocks.items[@backingInt(block)];
+        while (i < b.start + b.len) : (i += 1) {
+            const p = Ssa.valuePos(i);
+            open.ended(p);
+            if (open.n == 0) return;
+            const u = f.values.items(.inst)[i];
+            if (live.items(.fate)[@backingInt(u)] == .dead) continue;
+            if (!std.meta.eql(cl[p], cl[p - 1])) return open.decideAll(false);
+            // A store to a split variable writes its register whole.
+            var stored: ?u32 = null;
+            if (ir.instructions.items(.tag)[@backingInt(u)] == .store) {
+                if (ir.instructions.items(.data)[@backingInt(u)].bin_op.lhs.toIndex()) |ptr| {
+                    if (cg.split_of.get(@backingInt(ptr)) == @backingInt(ptr)) stored = @backingInt(ptr);
+                }
+            }
+            Ssa.forEachOperand(ir, u, Read{ .open = &open, .skip = stored });
+            // A value holding a split value's register reads it.
+            if (cg.split_of.get(@backingInt(u))) |of| if (of != @backingInt(u)) open.read(of);
+            if (stored) |v| open.decide(v, false);
+        }
+        const p: u32 = @intCast(2 * (b.start + b.len) + 1);
+        open.ended(p);
+        if (open.n == 0) return;
+        const term_data = ir.instructions.items(.data)[@backingInt(b.term.inst)];
+        const is_br = ir.instructions.items(.tag)[@backingInt(b.term.inst)] == .br;
+        const read: Read = .{ .open = &open, .skip = null };
+        switch (b.term.tag) {
+            .jump, .branch => if (is_br) {
+                read.use(term_data.br.operand);
+            } else if (b.term.tag == .branch) {
+                read.use(term_data.pl_op.operand);
+            },
+            .switch_br => read.use(term_data.pl_op.operand),
+            .ret => read.use(term_data.un_op),
+            .fallthrough, .noreturn, .unreach => {},
+        }
+        // A fused condition reads its operands here.
+        if (b.term.tag == .branch) if (Ssa.branchCond(ir, b.term).toIndex()) |c| {
+            if (live.items(.fate)[@backingInt(c)] == .fused) Ssa.forEachOperand(ir, c, read);
+        };
+        if (!std.meta.eql(cl[p], cl[p - 1])) return open.decideAll(true);
+        // A `br` that only jumps writes its block's result.
+        if (b.term.tag == .jump and is_br) open.decide(@backingInt(term_data.br.block_inst), false);
+        const order = f.order.items;
+        const next: Ssa.Block.Index = if (k + 1 < order.len) order[k + 1] else .none;
+        const chain = next != .none and f.blocks.items[@backingInt(next)].start >= b.start + b.len and cg.continues(block, next);
+        cg.forEachTarget(b.term, Side{ .open = &open, .next = if (chain) next else .none });
+        if (!chain) {
+            open.ended(p + 1);
+            return open.decideAll(true);
+        }
+        block = next;
+        k += 1;
+        i = f.blocks.items[@backingInt(next)].start;
+    }
+}
+
+/// `splitReloads`' undecided values.
+const Open = struct {
+    cg: *CodeGen,
+    ks: [4]u32 = undefined,
+    n: usize = 0,
+
+    fn decideAt(o: *Open, j: usize, reload: bool) void {
+        o.cg.split_now.items[o.ks[j]].reload = reload;
+        o.n -= 1;
+        o.ks[j] = o.ks[o.n];
+    }
+
+    fn decide(o: *Open, v: u32, reload: bool) void {
+        for (o.ks[0..o.n], 0..) |k, j| if (o.cg.split_now.items[k].v == v) return o.decideAt(j, reload);
+    }
+
+    fn read(o: *Open, v: u32) void {
+        o.decide(v, true);
+    }
+
+    fn decideAll(o: *Open, reload: bool) void {
+        while (o.n > 0) o.decideAt(0, reload);
+    }
+
+    /// The values whose intervals end before position `p` are not read.
+    fn ended(o: *Open, p: u32) void {
+        const end = o.cg.ssa.live.items(.end);
+        var j: usize = 0;
+        while (j < o.n) {
+            if (end[o.cg.split_now.items[o.ks[j]].v] < p) o.decideAt(j, false) else j += 1;
+        }
+    }
+};
+
+const Read = struct {
+    open: *Open,
+    skip: ?u32,
+    pub fn use(r: Read, ref: Ref) void {
+        const i = ref.toIndex() orelse return;
+        if (r.skip == @backingInt(i)) return;
+        const of = r.open.cg.split_of.get(@backingInt(i)) orelse return;
+        r.open.read(of);
+    }
+};
+
+/// Keeps `reload` for the values a block that `splitReloads` does not
+/// follow (not `next`) holds: its positions meet their intervals.
+const Side = struct {
+    open: *Open,
+    next: Ssa.Block.Index,
+    pub fn target(s: Side, block: Ssa.Block.Index) void {
+        if (block == s.next) return;
+        const o = s.open;
+        const b = o.cg.ssa.blocks.items[@backingInt(block)];
+        const lo = 2 * b.start + 1;
+        const hi = 2 * (b.start + b.len) + 1;
+        const live = o.cg.ssa.live.slice();
+        var j: usize = 0;
+        while (j < o.n) {
+            const v = o.cg.split_now.items[o.ks[j]].v;
+            if (lo <= live.items(.end)[v] and hi > live.items(.def)[v]) o.decideAt(j, true) else j += 1;
+        }
+    }
+};
 
 /// The registers lowerings write as scratch that may hold values whose
 /// intervals contain no value or terminator that may write them
@@ -2603,6 +2830,7 @@ fn emitBlocks(cg: *CodeGen) Error!void {
             try cg.cold_open.appendSlice(cg.gpa, cg.dbg_open.items);
             continue;
         }
+        cg.order_k = k;
         k += 1;
         try cg.genBlock(block, if (k < order.len) order[k] else .none);
     }
@@ -2628,6 +2856,7 @@ fn emitBlocks(cg: *CodeGen) Error!void {
         cg.dbg_line = s.line;
         cg.dbg_column = s.column;
         try cg.e.line(s.line, s.column);
+        cg.order_k = i;
         try cg.genBlock(block, if (i + 1 < order.len) order[i + 1] else .none);
         const end: u32 = @intCast(cg.e.code.items.len);
         for (cg.dbg_open.items) |o| cg.dbg_inlines.items[o.index].high = end;
@@ -2686,6 +2915,10 @@ fn keepSymbols(cg: *CodeGen, inst: Inst.Index) Error!void {
 fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!void {
     cg.e.bind(cg.labels[@backingInt(block)]);
     cg.block = block;
+    // A split value's slot holds its register's value into a block that
+    // runs only after the one emitted before it.
+    if (cg.split_vals.items.len != 0 and !cg.continues(cg.prev_block, block)) cg.split_clean_mask = 0;
+    defer cg.prev_block = block;
     cg.tmp_next = 0;
     cg.tmp16_next = 0;
     // `returnError` has no registers, but its writes are checked too.
@@ -2699,9 +2932,10 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
             cg.e.written = 0;
             const q = Ssa.valuePos(idx);
             const clobber = cg.live and !std.meta.eql(cl[q], cl[q - 1]);
-            if (clobber and cg.split_vals.items.len != 0) try cg.genSplit(inst, q) else {
+            if (clobber and cg.split_vals.items.len != 0) try cg.genSplit(inst, idx) else {
                 try cg.genInst(inst);
                 try cg.flushResults();
+                cg.split_clean_mask &= ~cg.e.written;
             }
             // A call clobbers v20-v29: only clobber points may make one,
             // and calls of `returnError`, which writes no vector register.
@@ -2714,6 +2948,7 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
     }
     cg.e.written = 0;
     try cg.genTerm(b.term, next);
+    cg.split_clean_mask &= ~cg.e.written;
     if (checked) {
         // A `ret` ends with the epilogue, which restores x19-x28.
         const own: u32 = if (b.term.tag == .ret) callee_saved_mask else 0;

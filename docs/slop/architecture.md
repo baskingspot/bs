@@ -944,7 +944,16 @@ comptime arguments are run-time values in the lowered code (uucode's
   that crosses one keeps x19-x28, d8-d15 or memory, or, when more
   values cross clobber points than x19-x28 hold, x12-x15, saved to its
   slot before each clobber point it crosses and reloaded after it
-  (`Ssa.planSplits`, the x86_64 backend's rule, and `genSplit`); no
+  (`Ssa.planSplits`, the x86_64 backend's rule, and `genSplit`). The
+  store is skipped while the slot still holds the register's value
+  (nothing wrote the register since the last store or reload, along
+  blocks that only the block emitted before them reaches) or the
+  clobber point computes its variable's next value there without
+  reading it, and the
+  reload while nothing reads the value before the next clobber point,
+  its interval's end, or a store to its variable (`splitReloads`), so a
+  run of u128 operations, each a clobber point, does not save and
+  reload the same values around every one; no
   value is spilled around a call otherwise, and both conventions (Apple's and Linux's AAPCS64) only
   move arguments into their homes at entry and results out of x0 or
   v0. Each lowering writes its result register after reading every
