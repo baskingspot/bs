@@ -37,7 +37,8 @@
 //!
 //! Registers: x9-x14 are scratch within one instruction's lowering; x16 and
 //! x17 legalize addresses (and x16 holds indirect call targets); x8 is the
-//! result pointer and x15 the error return trace pointer at `.auto` calls.
+//! result pointer. x15 is the error return trace pointer, which an `.auto`
+//! function keeps there throughout and returns with (`trace_x15`).
 //! A scalar in a register is extended to 64 bits as its type's load extends
 //! it.
 
@@ -88,10 +89,18 @@ slots_size: u32 = 0,
 out_args_size: u32 = 0,
 /// The slot holding the result pointer, for results returned in memory.
 ret_ptr_slot: ?Mem = null,
-/// The slot holding the error return trace pointer: an `.auto` function's
-/// from x15, another's from `set_err_return_trace`. Null in a function
-/// that has none, whose `.auto` calls pass null.
+/// The slot holding the error return trace pointer. In an `.auto`
+/// function (`trace_x15`), x15 saved around what may write it; in another,
+/// the trace from `set_err_return_trace`, or null when it has none, and
+/// its `.auto` calls pass null.
 trace_slot: ?Mem = null,
+/// An `.auto` function of a build that traces errors, where the error
+/// return trace pointer stays in x15 throughout: its `.auto` callees
+/// return with x15 as they got it, and it saves x15 around anything else
+/// that may write it (a call of another convention, compiler_rt, inline
+/// assembly that names x15 or calls; `saveTrace`), so it returns with x15
+/// as it got it too.
+trace_x15: bool = false,
 /// `Ssa.liveness` ran, so value slots are shared by lifetime.
 live: bool = false,
 /// The condition under which the last overflow operation whose bit its
@@ -1436,21 +1445,8 @@ fn setupParams(cg: *CodeGen) Error!void {
     const ir = cg.ir;
     const tags = ir.instructions.items(.tag);
     const is_c = isC(cg.fn_ty.cc);
-    if (!is_c) {
-        // The error return trace pointer arrives in x15; a function that
-        // neither reads it nor calls drops it.
-        const needs_trace = for (cg.ssa.values.items(.inst)) |inst| switch (tags[@backingInt(inst)]) {
-            .call, .err_return_trace => break true,
-            // Sema marks every trace index it may restore later; one no
-            // restore uses has no type and no code.
-            .save_err_return_trace_index => if (ir.instructions.items(.data)[@backingInt(inst)].ty_pl.ty != .none) break true,
-            else => {},
-        } else false;
-        if (needs_trace) {
-            cg.trace_slot = try cg.allocSlot(8, 8);
-            try cg.storeReg(cg.trace_slot.?, .x15, 8);
-        }
-    }
+    // The error return trace pointer arrives in x15 and stays there.
+    cg.trace_x15 = !is_c and cg.emit.zcu.fe.any_error_tracing;
     const ret_ty = cg.fn_ty.return_type;
     if (if (is_c) cg.cRetClass(ret_ty) == .indirect else cg.autoClass(ret_ty) == .memory) {
         cg.ret_ptr_slot = try cg.allocSlot(8, 8);
@@ -2728,15 +2724,21 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.setResult(inst, data.ty, .x9);
         },
         .set_err_return_trace => {
+            // Sema sets up a trace only in functions other than `.auto`
+            // ones, which are not inlined.
+            assert(!cg.trace_x15);
             if (cg.trace_slot == null) cg.trace_slot = try cg.allocSlot(8, 8);
             try cg.load(.x9, data.un_op);
             try cg.storeReg(cg.trace_slot.?, .x9, 8);
         },
         .save_err_return_trace_index => {
             if (data.ty_pl.ty == .none) return;
-            if (cg.trace_slot) |m| {
+            const off: i32 = @intCast(Type.fieldOffset(ip, data.ty_pl.ty, data.ty_pl.payload));
+            if (cg.trace_x15) {
+                try cg.loadMem(.x9, .at(.x15, off), .usize_type);
+            } else if (cg.trace_slot) |m| {
                 try cg.loadMem(.x9, m, .usize_type);
-                try cg.loadMem(.x9, .at(.x9, @intCast(Type.fieldOffset(ip, data.ty_pl.ty, data.ty_pl.payload))), .usize_type);
+                try cg.loadMem(.x9, .at(.x9, off), .usize_type);
             } else {
                 try cg.e.movImm(.x, .x9, 0);
             }
@@ -4123,11 +4125,25 @@ fn loadPair(cg: *CodeGen, lo: Reg, hi: Reg, v: Val) Error!void {
 
 /// Loads the error return trace pointer, or null if the function has none.
 fn loadTrace(cg: *CodeGen, reg: Reg) Error!void {
-    if (cg.trace_slot) |m| {
+    if (cg.trace_x15) {
+        try cg.e.mov(.x, reg, .x15);
+    } else if (cg.trace_slot) |m| {
         try cg.loadMem(reg, m, .usize_type);
     } else {
         try cg.e.movImm(.x, reg, 0);
     }
+}
+
+/// Before code that may write x15 in a `trace_x15` function: saves the
+/// trace pointer, which `restoreTrace` reloads after it.
+fn saveTrace(cg: *CodeGen) Error!void {
+    if (!cg.trace_x15) return;
+    if (cg.trace_slot == null) cg.trace_slot = try cg.allocSlot(8, 8);
+    try cg.storeReg(cg.trace_slot.?, .x15, 8);
+}
+
+fn restoreTrace(cg: *CodeGen) Error!void {
+    if (cg.trace_x15) try cg.loadMem(.x15, cg.trace_slot.?, .usize_type);
 }
 
 /// x9 = the address of thread-local `t` on aarch64-linux. An executable
@@ -4213,6 +4229,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         }
         try cg.cCallArgs(callee_ty.cc, vals, if (callee_ty.is_var_args) callee_ty.param_types.len else null, tail);
         if (cg.cRetClass(ret_ty) == .indirect) try cg.resultPtrTo(dst, tail);
+        if (ret_ty != .noreturn_type) try cg.saveTrace();
     } else {
         const tys = try cg.gpa.alloc(Index, args.len);
         defer cg.gpa.free(tys);
@@ -4230,7 +4247,8 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             try cg.loadMem(.x8, cg.ret_ptr_slot.?, .usize_type);
             if (off != 0) try cg.e.addSub(.add, .x, .x8, .x8, .{ .imm = @intCast(off) });
         }
-        try cg.loadTrace(.x15);
+        // An `.auto` caller's x15 holds the trace already.
+        if (!cg.trace_x15 and cg.emit.zcu.fe.any_error_tracing) try cg.loadTrace(.x15);
     }
     if (callee_val == null) try cg.load(.x16, callee_ref);
     if (tail) {
@@ -4246,6 +4264,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         } else try cg.e.bl(.{ .sym = try cg.emit.funcKey(f) });
     } else try cg.e.blr(.x16);
     if (pn_save) |save| for (0..10) |k| try cg.loadMem(@fromBackingInt(@intCast(19 + k)), save.plus(@intCast(8 * k)), .usize_type);
+    if (is_c and ret_ty != .noreturn_type) try cg.restoreTrace();
     if (in_reg) {
         // f32 and f64 results come back in v0 in every convention.
         if (vec_in_v0) return vector.move(cg, cg.homes[@backingInt(inst)].vreg, .v0);
@@ -4473,6 +4492,12 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         if (mentionsVReg(source, @intCast(r))) vused |= @as(u32, 1) << @intCast(r);
     }
     const free_regs = [_]Reg{ .x9, .x10, .x11, .x12, .x13, .x14, .x15, .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7, .x8 };
+    // The trace pointer in x15 (`trace_x15`) is saved around a statement
+    // that names x15 or may call; otherwise no operand takes x15.
+    const keeps_trace = cg.trace_x15 and (used >> 15 & 1 != 0 or mentionsReg(source, 15) or asmCalls(source));
+    if (keeps_trace) try cg.saveTrace() else if (cg.trace_x15) {
+        used |= 1 << 15;
+    }
     // Callee-saved registers the template mentions or the clobbers name,
     // saved to slots first. A context switch (zio's) names them only as
     // clobbers, and its caller's values live in them. A naked function
@@ -4591,6 +4616,7 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     }
     for (saved, 19..) |m, r| if (m) |slot| try cg.loadMem(@fromBackingInt(@intCast(r)), slot, .usize_type);
     for (vsaved, 8..) |m, r| if (m) |slot| try cg.e.ldrQ(@fromBackingInt(@intCast(r)), try cg.access(slot, 16, .x16));
+    if (keeps_trace) try cg.restoreTrace();
 }
 
 /// The SIMD register constraints: `w`, any of v0-v31, and `x`, one of
@@ -4660,6 +4686,16 @@ fn mentionsReg(source: []const u8, r: u8) bool {
     while (it.next()) |tok| {
         if (tok.len < 2 or (tok[0] != 'x' and tok[0] != 'w')) continue;
         if ((std.fmt.parseInt(u8, tok[1..], 10) catch continue) == r) return true;
+    }
+    return false;
+}
+
+/// Whether an asm template has a `bl` or `blr*`, which may call code that
+/// writes any caller-saved register.
+fn asmCalls(source: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, source, " \t\n,[]!;{}");
+    while (it.next()) |tok| {
+        if (std.ascii.eqlIgnoreCase(tok, "bl") or std.ascii.startsWithIgnoreCase(tok, "blr")) return true;
     }
     return false;
 }
@@ -5367,7 +5403,9 @@ fn rtCall(cg: *CodeGen, file: []const u8, name: []const u8, args: []const Val, r
     const key: SymbolKey = .fromName(try cg.emit.requestCompilerRt(file, name));
     try cg.cCallArgs(.c, args, null, false);
     if (cg.cRetClass(ret_ty) == .indirect) try cg.addrTo(.x8, dst);
+    try cg.saveTrace();
     try cg.e.bl(.{ .sym = key });
+    try cg.restoreTrace();
     try cg.cCallResult(ret_ty, dst);
 }
 
@@ -6120,7 +6158,9 @@ fn divEi4(cg: *CodeGen, file: []const u8, name: []const u8, dst: Mem, u: Mem, v:
     try cg.addrTo(.x1, u_arg);
     try cg.addrTo(.x2, v_arg);
     try cg.e.movImm(.x, .x3, Type.intInfo(cg.ip, ty).bits);
+    try cg.saveTrace();
     try cg.e.bl(.{ .sym = key });
+    try cg.restoreTrace();
 }
 
 /// Instructions on wide integers.
