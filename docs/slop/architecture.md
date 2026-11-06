@@ -1415,6 +1415,18 @@ callgrind Ir +0.6% on `zig fmt --check std` (Token.Tag is a u7 enum),
 +0.16% on bench/runtime's fmt, within 0.02% on the others. x86_64 may use
 8- and 16-bit forms where they give the same result.
 
+Until then, x86_64 normalizes an unsigned narrow result after each
+operation that may set bits above its type, with one 32-bit `and` below
+32 bits, and leaves the normalization out where `Ssa.rawBits` bounds the
+result within the type: a shift right (never above its operand), a
+shift left, sum or product of values with few enough bits, a narrowing
+cast of such a value or past its safety check (only where Sema emitted
+the check: not under `@setRuntimeSafety(false)`). `Ssa.heldBits` bounds
+what a register holds: a load by the bytes it reads, an overflow bit by
+1, a constant by its value. Signed values are always normalized.
+hash_map's fingerprint (`@truncate(hash >> 57)`) and `used` bit, and
+vaxis's code points, lose their shift pairs.
+
 The position is the IR's statement position (line, column) and the
 innermost open inline call (an index into the function's inline table),
 copied from the last `dbg_stmt` and `dbg_inline_begin`/`end` seen.
