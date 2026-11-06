@@ -918,8 +918,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   `.vreg`. x9-x11 hold every lowering's operands and x16-x17 its
   addresses; x12-x14 are also scratch, but only for the lowerings that
   `scratchUse` names before allocation (x12 for an element read, x13
-  for a return of an odd-sized value, all three for overflow arithmetic, division,
-  memcpy and memset, wide integers, and anything not on its list): one
+  for a return of an odd-sized value, x13 and x14 for overflow
+  arithmetic at widths other than 32 and 64 bits, all three for
+  division, memcpy and memset, wide integers, and anything not on its list): one
   `Ssa.allocate` restriction per register keeps a value out of it when
   such a lowering lies in its interval or at its ends, and clobber
   points (below) keep the values they read or compute out of all four
@@ -940,8 +941,11 @@ comptime arguments are run-time values in the lowered code (uucode's
   against the calls the encoder emits) is a clobber point, except a
   call of `returnError`, which is compiled without registers and whose
   own code `checkWrites` allows no write to x12-x15 or x19-x28, and a value
-  that crosses one keeps d8-d15 or memory; no value is spilled or split
-  around a call, and both conventions (Apple's and Linux's AAPCS64) only
+  that crosses one keeps x19-x28, d8-d15 or memory, or, when more
+  values cross clobber points than x19-x28 hold, x12-x15, saved to its
+  slot before each clobber point it crosses and reloaded after it
+  (`Ssa.planSplits`, the x86_64 backend's rule, and `genSplit`); no
+  value is spilled around a call otherwise, and both conventions (Apple's and Linux's AAPCS64) only
   move arguments into their homes at entry and results out of x0 or
   v0. Each lowering writes its result register after reading every
   operand (results it writes through `resultMem` go to a scratch slot
@@ -3026,7 +3030,9 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      there (as do loads sharing its register), and reloads it after,
      unless the clobbering value's result is computed in its register
      (`Live.share`). Not across clobbering terminators, and not for
-     bases of folded addresses.
+     bases of folded addresses. aarch64 takes the same rule from the
+     shared layer (`Ssa.planSplits`, for general registers only, x12-x15),
+     which x86_64's copy predates.
    - The value field of an addition or subtraction with overflow that
      writes its fields is tied to the left operand.
    - Lowering: narrowing to 8, 16, or 32 bits is one `movzx`/`movsx`

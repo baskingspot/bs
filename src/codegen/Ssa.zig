@@ -2188,6 +2188,98 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
     }
 }
 
+/// Marks in `split` the values that may cross clobber points in a
+/// register that does not survive them, which the architecture saves to
+/// their slot before each and reloads after it, when no surviving
+/// register is free (`allocate`): single general-purpose registers (and
+/// floating-point ones unless `float_room` is null), crossing no
+/// clobbering terminator (which would need the reload in its
+/// successors), whose clobber points, two moves each, cost less than
+/// reading their uses from memory, each weighted by 8 per loop around it.
+/// Loads sharing a promoted variable's register ride on the variable.
+/// Nothing is marked when `gpr_room` surviving general-purpose registers
+/// (and `float_room` floating-point ones) fit every crossing value.
+pub fn planSplits(f: *const Ssa, gpa: Allocator, ir: *const Ir, split: *std.bit_set.Dynamic, gpr_room: u32, float_room: ?u32) Allocator.Error!void {
+    const live = f.live.slice();
+    const reg = live.items(.reg);
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const crosses = live.items(.crosses);
+    const fate = live.items(.fate);
+    const cl = f.clobbers.items;
+    try split.resize(gpa, ir.instructions.len, false);
+    split.unsetAll();
+    var n_gpr: u32 = 0;
+    var n_float: u32 = 0;
+    for (f.values.items(.inst)) |inst| {
+        const i = @backingInt(inst);
+        if (!crosses[i] or fate[i] != .normal) continue;
+        if (reg[i] == want_reg) n_gpr += 1;
+        if (reg[i] == want_float) n_float += 1;
+    }
+    const floats = float_room != null and n_float > float_room.?;
+    if (n_gpr <= gpr_room and !floats) return;
+    // Loop depths, by loop; parents come before their loops.
+    const depth = try gpa.alloc(u8, f.loops.items.len);
+    defer gpa.free(depth);
+    for (f.loops.items, depth) |l, *d| d.* = if (l.parent == no_loop) 1 else @min(depth[l.parent] + 1, 6);
+    const Weights = struct {
+        uses: []u64,
+        w: u64 = 0,
+        const Self = @This();
+        pub fn use(c: *Self, ref: Inst.Ref) void {
+            if (ref.toIndex()) |x| c.uses[@backingInt(x)] += c.w;
+        }
+    };
+    var ws: Weights = .{ .uses = try gpa.alloc(u64, ir.instructions.len) };
+    defer gpa.free(ws.uses);
+    @memset(ws.uses, 0);
+    // Prefix sums of the clobber points' weights by position, as
+    // `clobbers` counts them.
+    const wcl = try gpa.alloc(u64, cl.len);
+    defer gpa.free(wcl);
+    wcl[0] = 0;
+    var terms: std.ArrayList(u32) = .empty;
+    defer terms.deinit(gpa);
+    const datas = ir.instructions.items(.data);
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        const lp = f.block_loop.items[@backingInt(block)];
+        ws.w = @as(u64, 1) << @intCast(3 * @as(u32, if (lp == no_loop) 0 else depth[lp]));
+        for (b.start..b.start + b.len + 1) |idx| {
+            const q = valuePos(idx) - 1;
+            wcl[q] = wcl[q - 1] + if (cl[q][0] != cl[q - 1][0]) ws.w else 0;
+            if (idx == b.start + b.len) break;
+            wcl[q + 1] = wcl[q] + if (cl[q + 1][0] != cl[q][0]) ws.w else 0;
+            forEachOperand(ir, f.values.items(.inst)[idx], &ws);
+        }
+        const q = 2 * (b.start + b.len) + 1;
+        if (!std.meta.eql(cl[q], cl[q - 1])) try terms.append(gpa, q);
+        const t = datas[@backingInt(b.term.inst)];
+        switch (b.term.tag) {
+            .jump => if (ir.instructions.items(.tag)[@backingInt(b.term.inst)] == .br) ws.use(t.br.operand),
+            .branch => ws.use(branchCond(ir, b.term)),
+            .switch_br => ws.use(t.pl_op.operand),
+            .ret => ws.use(t.un_op),
+            .fallthrough, .noreturn, .unreach => {},
+        }
+        wcl[q + 1] = wcl[q];
+    }
+    for (f.values.items(.inst)) |inst| {
+        const i = @backingInt(inst);
+        if (!crosses[i] or fate[i] != .normal or live.items(.share)[i] != no_tie) continue;
+        if (reg[i] != want_reg and !(floats and reg[i] == want_float)) continue;
+        if (2 * (wcl[end[i]] - wcl[def[i]]) > ws.uses[i] + 1) continue;
+        const k = std.sort.lowerBound(u32, terms.items, def[i] + 1, orderU32);
+        if (k < terms.items.len and terms.items[k] <= end[i]) continue;
+        split.set(i);
+    }
+}
+
+fn orderU32(a: u32, b: u32) std.math.Order {
+    return std.math.order(a, b);
+}
+
 /// Linear-scan register allocation (Poletto and Sarkar) over the values
 /// `liveness` gave intervals and the architecture marked `want_reg` or
 /// `want_pair`, with `n` general-purpose registers (indices 0 to n - 1),
