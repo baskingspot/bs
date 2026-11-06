@@ -118,6 +118,7 @@ def record(proj, zig, src, cmds_path):
     gen = os.path.join(WORK, "gen", proj["name"])
     shutil.rmtree(gen, ignore_errors=True)
     cmds = {}
+    named = {}
     # What the steps install is not needed (the commands are), and for some
     # projects it is gigabytes, so it goes to a directory deleted afterwards.
     prefix = os.path.join(WORK, "install", proj["name"])
@@ -139,15 +140,27 @@ def record(proj, zig, src, cmds_path):
                 continue
             if "--name" not in words:
                 continue
-            name = words[words.index("--name") + 1]
-            if name in cmds and cmds[name] != words:
-                # Another step with the same name (zwasm has several
-                # `test`s): the later ones are `<name>:<root file>`.
-                root = next((w.split("=", 1)[1] for w in words if w.startswith("-Mroot=")), "")
-                name = f"{name}:{root}"
-            cmds.setdefault(name, words)
+            steps = named.setdefault(words[words.index("--name") + 1], [])
+            if words not in steps:
+                steps.append(words)
         if p.returncode != 0:
             log(f"  zig build {' '.join(args)} failed (exit {p.returncode}); recorded what ran:\n{p.stderr[-3000:]}")
+    for name, steps in named.items():
+        if len(steps) == 1:
+            cmds[name] = steps[0]
+            continue
+        # Several steps with one name (json-zig and zwasm have several
+        # `test`s), printed in the order the parallel build finished them:
+        # each is `<name>:<root file>` (`#2` and on for more with that
+        # root, superhtml's per-target builds), and the bare name is the
+        # first in that order.
+        steps.sort(key=lambda words: (root_file(words), words))
+        cmds[name] = steps[0]
+        roots = {}
+        for words in steps:
+            root = root_file(words)
+            roots[root] = roots.get(root, 0) + 1
+            cmds[f"{name}:{root}" + (f"#{roots[root]}" if roots[root] > 1 else "")] = words
     os.makedirs(os.path.dirname(cmds_path), exist_ok=True)
     with open(cmds_path, "w") as f:
         json.dump(cmds, f, indent=1)
@@ -179,6 +192,11 @@ def strip_common(words, cache_dir, out):
     if words[1] == "test":
         res.append("--test-no-exec")
     return res
+
+
+def root_file(words):
+    """The root source file of a recorded compile command ("" if none)."""
+    return next((w.split("=", 1)[1] for w in words if w.startswith("-Mroot=")), "")
 
 
 def translate_source(words):

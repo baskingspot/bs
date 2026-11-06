@@ -127,8 +127,11 @@ StaticHttpFileServer; zwasm is Apache-2.0, the rest MIT) were added on
 2026-11-05 the same way: a WebAssembly runtime, a text editor (fizzy), web
 frameworks (ziex, merjs), a GPU UI toolkit (nanoui), a scripting language
 (revo) and smaller libraries. A step name a build uses twice (zwasm's and
-revo's several `test`s) is recorded as `<name>:<root file>` after the
-first. The 15 after StaticHttpFileServer (flash through XirAsm) were
+revo's several `test`s) is recorded as `<name>:<root file>` for each of
+its steps (`#2` and on after the first with that root, as superhtml's
+per-target builds), and the bare name is the step with the first root
+file in sort order, since the parallel build prints the steps in no
+fixed order. The 15 after StaticHttpFileServer (flash through XirAsm) were
 added on 2026-11-05 toward the kinds of code that had found bugs: crypto
 and protocols (zquic, zig-blind-rsa-signatures, zig-cbc, nats.zig), SIMD
 and image processing (zignal), a columnar format (zarrow), an assembler

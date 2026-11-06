@@ -1523,9 +1523,6 @@
      "name": "test:src/zwasm.zig"
     },
     {
-     "name": "test:src/cli/main.zig"
-    },
-    {
      "name": "test"
     }
    ]
@@ -2133,7 +2130,7 @@
      "name": "test"
     },
     {
-     "name": "test:src/io_backend.zig"
+     "name": "test:src/nats.zig"
     }
    ]
   },
@@ -2364,7 +2361,7 @@
      "name": "test:src/sorting.zig"
     },
     {
-     "name": "test:src/brace_optimizer.zig"
+     "name": "test:src/walker/git_excludes.zig"
     },
     {
      "name": "test:test/test_brace.zig"
@@ -2462,7 +2459,7 @@
      "name": "test:src/quic/fuzz.zig"
     },
     {
-     "name": "test:src/quic/congestion/bbr.zig"
+     "name": "test:src/quic/tls_client.zig"
     },
     {
      "name": "test:src/quic/netsim.zig"
@@ -2682,7 +2679,7 @@
      "name": "test"
     },
     {
-     "name": "test:examples/root.zig"
+     "name": "test:validation/std_io_net_kv.zig"
     },
     {
      "name": "test:src/root.zig"
@@ -2781,7 +2778,7 @@
      "name": "test"
     },
     {
-     "name": "test:src/bench/main.zig"
+     "name": "test:src/root.zig"
     },
     {
      "name": "test:src/ffi/ffi.zig"
@@ -2868,7 +2865,7 @@
      "name": "test:test/json_diagnostics_test.zig"
     },
     {
-     "name": "test:bench/main.zig"
+     "name": "test:test/mutable_strings_test.zig"
     },
     {
      "name": "test:test/contracts_test.zig"
@@ -3037,7 +3034,7 @@
      "name": "mpt-key-tests"
     },
     {
-     "name": "test:pkg/mpt/test.zig"
+     "name": "test:pkg/stdx/src/test.zig"
     },
     {
      "name": "test:pkg/rlp/src/test.zig"
@@ -3510,7 +3507,10 @@
      "name": "test:src/runtime/common/execution_context.zig"
     },
     {
-     "name": "test:src/root.zig"
+     "name": "test:src/wasi/native_aot.zig"
+    },
+    {
+     "name": "test:src/runtime/common/execution_context.zig#2"
     }
    ]
   },
@@ -3536,7 +3536,7 @@
      "name": "test"
     },
     {
-     "name": "test:src/lib.zig"
+     "name": "test:src/tests.zig"
     }
    ]
   },

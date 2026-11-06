@@ -283,7 +283,8 @@ class Corpus(Workload):
         "uucode-gen": ("ghostty", "uucode_generate", 0),
         "vulkan-gen": ("vulkan-zig", "vulkan-zig-generator", 0),
         "zigimg-test": ("zigimg", "zigimgtest", 0),
-        "json-zig-test": ("json-zig", "test", 0),
+        # json-zig has three `test` steps; this is its property tests'.
+        "json-zig-test": ("json-zig", "test:src/document_property.zig", 0),
         "msgpack-test": ("zig-msgpack", "test", 0),
         "tls-test": ("tls.zig", "test", 0),
         "hpke-test": ("zig-hpke", "test", 1),
@@ -321,7 +322,9 @@ class Corpus(Workload):
         with open(os.path.join(REPO_DIR, "tools", "corpus", "manifest.json")) as f:
             manifest = json.load(f)
         self.proj = next(p for p in manifest["projects"] if p["name"] == self.project)
-        tgt = next(t for t in self.proj["targets"] if t["name"] == self.target)
+        # A target the corpus does not build itself (json-zig's property
+        # tests) runs with no arguments in the project's directory.
+        tgt = next((t for t in self.proj["targets"] if t["name"] == self.target), {})
         self.cwd, self.cmds = corpus.setup(self.proj, self.zig, False)
         self.words = self.cmds[self.target]
         self.is_test = self.words[1] == "test"
