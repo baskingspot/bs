@@ -3853,6 +3853,44 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
     return if (pair and cg.inPair(ty)) .pair else .none;
 }
 
+/// Whether `ref` is an `.auto` call whose result this `.auto`
+/// function returns right after it, in rax or rax:rdx, and which has no
+/// register (an aggregate other than a pair): the result's only use is
+/// its block's `ret`, and no value after the call emits code. The call
+/// leaves its result there instead of in a slot, and the `ret` loads
+/// nothing.
+fn retInRegs(cg: *CodeGen, ref: Ref) bool {
+    const inst = ref.toIndex() orelse return false;
+    if (cg.fn_ty.cc != .auto) return false;
+    const ir = cg.ir;
+    const i = @backingInt(inst);
+    if (ir.instructions.items(.tag)[i] != .call) return false;
+    const data = ir.instructions.items(.data)[i];
+    if (ir.extraData(Ir.Call, data.pl_op.payload).data.flags.always_tail or cg.calleeCc(data) != .auto) return false;
+    switch (cg.autoClass(cg.fn_ty.return_type)) {
+        .gpr, .gpr_pair => {},
+        else => return false,
+    }
+    // A result in registers is in rax (and rdx) already when only the
+    // `ret` reads it (`planRegisters`).
+    if (cg.ssa.live.items(.uses)[i] != 1 or cg.homes[i] != .none) return false;
+    const b = cg.ssa.blocks.items[cg.cur_block];
+    if (b.term.tag != .ret or ir.instructions.items(.data)[@backingInt(b.term.inst)].un_op.toIndex() != inst) return false;
+    const insts = cg.ssa.blockInsts(@fromBackingInt(cg.cur_block));
+    var k = insts.len;
+    while (k > 0) {
+        k -= 1;
+        const x = insts[k];
+        if (x == inst) return true;
+        if (cg.homes[@backingInt(x)] == .dead) continue;
+        switch (ir.instructions.items(.tag)[@backingInt(x)]) {
+            .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+            else => return false,
+        }
+    }
+    return false;
+}
+
 /// The calling convention of call `data`'s callee.
 fn calleeCc(cg: *CodeGen, data: Inst.Data) InternPool.CallingConvention {
     const callee_fn_ty = cg.typeOf(data.pl_op.operand);
@@ -6160,8 +6198,9 @@ fn ret(cg: *CodeGen, operand: Ref, next: Ssa.Block.Index) Error!void {
         try cg.winRet(operand);
     } else switch (cg.autoClass(ty)) {
         .none => {},
-        .gpr => try cg.loadGpr(.rax, operand, ty),
-        .gpr_pair => try cg.loadPair(.rax, .rdx, operand),
+        // Left there by the call that computed it (`retInRegs`).
+        .gpr => if (!cg.retInRegs(operand)) try cg.loadGpr(.rax, operand, ty),
+        .gpr_pair => if (!cg.retInRegs(operand)) try cg.loadPair(.rax, .rdx, operand),
         .sse => try cg.loadXmm(.xmm0, try cg.valOf(operand)),
         .memory => {
             // A load of the result's own alloc is not emitted (`planCopies`).
@@ -6220,7 +6259,9 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         .result => |off| off,
         else => null,
     };
-    const dst = if (in_rax or in_pair != null or in_xmm != null or to_result != null) null else try cg.resultMem(inst, ret_ty);
+    // Left in rax (and rdx) for the `ret` right after it.
+    const ret_regs = cg.retInRegs(inst.toRef());
+    const dst = if (ret_regs or in_rax or in_pair != null or in_xmm != null or to_result != null) null else try cg.resultMem(inst, ret_ty);
     var stack_args = false;
     // A variadic callee learns from al how many vector registers hold
     // arguments.
@@ -6297,6 +6338,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         if (is_c and callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
         try cg.e.callIndirect(.{ .reg = cg.r11() });
     }
+    if (ret_regs) return;
     if (in_rax) {
         // C callees leave the bits above a narrow result unspecified.
         const size = Type.abiSize(ip, ret_ty);
