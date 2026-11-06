@@ -2395,14 +2395,20 @@ user branches are coverage points and are only learned from.
   for an exact unsigned addition; and `(x - k) + k` after an exact `x -
   k` cannot overflow. Constant bounds come from exact additions and
   subtractions, `%`, `@mod`, `&`, `>>` of unsigned values, `@intCast`,
-  `@truncate`, `@min`, `@max`, exact unsigned products, from facts whose other side has bounds
+  `@truncate`, `@min`, `@max`, exact unsigned products, unsigned `<<`
+  that can shift out no bits (`(1 << a) - 1`), an exact `c * x` being
+  at least `c` when another exact product of `x` is above a value (`2 *
+  n` after `i < 4 * n`), from facts whose other side has bounds
   (transitively, depth-limited), and `t != k` at an end of `t`'s range
   moves that end. A compare the facts leave undecided is tried again
   with an operand replaced by a value a fact makes equal to it, directly
   or through one more equality (at most four others, never a constant,
   which bounds already read): after `assert(d.len == m.len)` and
   `assert(y.len == d.len)`, a loop to `m.len` indexes `y` without
-  checks (`std.crypto.ff`'s `montgomeryLoop`). Facts name values, so a
+  checks (`std.crypto.ff`'s `montgomeryLoop`). Unsigned `x % n < n`
+  once `n >= 1`; `x < y` from `x < @min(y, z)`; and `c * x` cannot
+  overflow when an exact `c' * x` of a type no wider has `c <= c'`.
+  Facts name values, so a
   length loaded after a store or call is another value and no fact
   before it applies.
 - **Offsets.** An unsigned value that is a chain of constant additions
@@ -2419,7 +2425,12 @@ user branches are coverage points and are only learned from.
   after `i + 32 < s.len` keeps none of its three checks, nor does the
   next block's at `i + 16`, derived from the exact `i += 16` that made
   the new `i`, not from a later load.
-- **Loops.** A fact from before a loop on a variable the loop loads,
+- **Loops.** A variable the loop does not store (none of its stores,
+  in nested bodies too, names it; at most 32 checked) holds in it what it
+  held before, so its loads there name that value and facts from before
+  the loop on it apply (`for (0..@min(a.len, b.len)) |i|` indexing `a`,
+  `@min` being Sema's `if (a < b) a else b` block). A fact from before a
+  loop on a variable the loop loads,
   `v + c < y`, is a candidate at the loop's start, where loads of `v`
   before any store name the variable at the loop's entry. The body is
   walked assuming the candidates; at every `repeat` each must hold for
@@ -2433,7 +2444,16 @@ user branches are coverage points and are only learned from.
   that did not wrap, a remainder, a mask, or a minimum
   (`index -= 2`, `i = (i + 1) & mask`) is a candidate `v <= hi` for its
   largest value before the loop; `repeat` also accepts a value whose
-  own bounds keep it within. Variables changed in a failed walk are
+  own bounds keep it within. Likewise a constant lower bound before the
+  loop, `k <= v` (`16 <= i` past `while (i < 16)`), is a candidate when
+  the loop's stores to `v` are each a sum, an `|`, a maximum, or a
+  constant, and holds at `repeat` by `v`'s own bounds there; and an
+  unsigned variable holding a constant before the loop, whose stores
+  in it each add a multiple of `m >= 2` or store a constant of the same
+  remainder, keeps `v % m` (`stride`): `repeat` accepts the start's
+  value plus an exact multiple of `m`, and bounds round to that
+  remainder, so `i` counting from 0 by 4 below 32 is at most 28 and
+  `st[i + 3]` keeps no check. Variables changed in a failed walk are
   restored from an undo log of their versions, which also restores them
   between a `cond_br`'s or `switch_br`'s sides.
 - **Turning it off.** `BS_PROVE=off` keeps every check (its own cache
@@ -2446,9 +2466,11 @@ user branches are coverage points and are only learned from.
   `prove_offset_retry`, `prove_mem`, `prove_mem_merge`,
   `prove_mem_loop`, `prove_wrap_end`, `prove_sub`, `prove_bool`,
   `prove_assert`, `prove_rem`, `prove_mul_narrow`, `prove_mul_wide`,
-  `prove_ret_len`, `prove_ret_len_arg`, and `prove_store_len` one that
-  a wrong offset, loop, memory, range, product, returned-length,
-  forwarding, or `bool` rule would remove.
+  `prove_ret_len`, `prove_ret_len_arg`, `prove_store_len`,
+  `prove_rem_len`, `prove_lower`, `prove_stride`, `prove_shl`,
+  `prove_multiple`, and `prove_invariant` one that a wrong offset, loop,
+  memory, range, product, returned-length, forwarding, or `bool` rule
+  would remove.
 
 #### Compile-time budget and how it is measured
 
