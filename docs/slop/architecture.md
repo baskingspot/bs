@@ -957,7 +957,11 @@ comptime arguments are run-time values in the lowered code (uucode's
   restriction); the
   statement saves those it names around itself, for its caller's
   values (a context switch names them only as clobbers), except in a
-  naked function. The prologue saves the used pairs right below the frame record (x19 at fp
+  naked function. A SIMD operand reads its value in the value's own
+  register, and a SIMD result is written in its own, when the
+  constraint allows that register and no template, clobber or other
+  operand names it; other SIMD operands get the scratch registers
+  (`asmVReg`). The prologue saves the used pairs right below the frame record (x19 at fp
   - 8, x20 at fp - 16, then the next used pair, the d pairs after the x
   pairs), which compact unwind's frame mode reads from
   `Atom.Unwind.saved` (d8/d9 is 0x100) and the aarch64-linux FDE

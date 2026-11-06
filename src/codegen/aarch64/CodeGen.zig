@@ -4564,6 +4564,26 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     for (8..16) |r| {
         if (vused >> @intCast(r) & 1 != 0) try cg.saveVReg(&vsaved, @intCast(r));
     }
+    // A SIMD input whose value is in a register of its own (v20-v29,
+    // d8-d15) that the template and the clobbers do not name, and that the
+    // constraint allows, is read there: the statement only reads its
+    // inputs. No other operand gets that register.
+    const in_place = try cg.gpa.alloc(?VReg, inputs.len);
+    defer cg.gpa.free(in_place);
+    var in_place_used: u32 = 0;
+    for (inputs, in_place) |in, *p| {
+        p.* = null;
+        const low = vecConstraint(asmAlternative(ip.stringSlice(in.constraint))) orelse continue;
+        const v = switch (try cg.locOf(in.operand)) {
+            .vreg => |v| v,
+            else => continue,
+        };
+        const r = @backingInt(v);
+        if ((low and r >= 16) or vused >> r & 1 != 0) continue;
+        p.* = v;
+        in_place_used |= @as(u32, 1) << r;
+    }
+    vused |= in_place_used;
     const out_regs = try cg.gpa.alloc(AsmOut, outputs.len);
     defer cg.gpa.free(out_regs);
     for (outputs, out_regs) |out, *out_reg| {
@@ -4582,7 +4602,15 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             out_reg.* = .{ .gpr = reg };
             try names.put(cg.gpa, ip.stringSlice(out.name), .{ .reg = reg });
         } else if (vecConstraint(constraint)) |low| {
-            const v = try cg.asmVReg(&vused, &vsaved, low);
+            // The result's own register when no other operand has it and
+            // the template does not name it: its value is not live here,
+            // other than an input's that dies here, which is read from a
+            // register of its own (or copied to one) by then.
+            const home: ?VReg = if (out.operand == .none and cg.homes[@backingInt(inst)] == .vreg) cg.homes[@backingInt(inst)].vreg else null;
+            const v = if (home != null and vused >> @backingInt(home.?) & 1 == 0 and !(low and @backingInt(home.?) >= 16)) v: {
+                vused |= @as(u32, 1) << @backingInt(home.?);
+                break :v home.?;
+            } else try cg.asmVReg(&vused, &vsaved, low);
             out_reg.* = .{ .fpr = v };
             try names.put(cg.gpa, ip.stringSlice(out.name), .{ .vreg = v });
         } else {
@@ -4606,9 +4634,11 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     }
     // SIMD inputs first: loading one uses x9 and x16, which may be `r`
     // operands.
-    for (inputs) |in| {
+    for (inputs, in_place) |in, p| {
         const constraint = asmAlternative(ip.stringSlice(in.constraint));
-        if (vecConstraint(constraint)) |low| {
+        if (p) |v| {
+            try names.put(cg.gpa, ip.stringSlice(in.name), .{ .vreg = v });
+        } else if (vecConstraint(constraint)) |low| {
             const v = try cg.asmVReg(&vused, &vsaved, low);
             try cg.loadFp(v, try cg.valOf(in.operand));
             try names.put(cg.gpa, ip.stringSlice(in.name), .{ .vreg = v });
