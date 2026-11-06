@@ -2356,6 +2356,23 @@ fn planRegisters(cg: *CodeGen) Error!void {
             hint[wi][0] = hint_rax;
         }
     }
+    if (cg.fn_ty.cc == .auto and cg.autoClass(cg.fn_ty.return_type) == .gpr_pair) {
+        // A call's result or a wrapped optional only its block's `ret`
+        // reads, computed last, is in rax and rdx, where it is returned.
+        const tags = ir.instructions.items(.tag);
+        const hint = live.items(.hint);
+        for (f.layout.items) |block| {
+            const b = f.blocks.items[@backingInt(block)];
+            if (b.term.tag != .ret) continue;
+            const w = ir.instructions.items(.data)[@backingInt(b.term.inst)].un_op.toIndex() orelse continue;
+            const wi = @backingInt(w);
+            if (reg[wi] != Ssa.want_pair or fate[wi] != .normal or live.items(.uses)[wi] != 1) continue;
+            if (tags[wi] != .call and tags[wi] != .wrap_optional) continue;
+            if (cg.lastValue(block) != w) continue;
+            reg[wi] = Ssa.no_reg;
+            hint[wi] = .{ hint_rax, hint_rax };
+        }
+    }
     try cg.planSplits();
     // A by-reference argument's register holds a pointer, which `genSplit`
     // would spill as the value.
@@ -2383,7 +2400,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
             .normal => {
                 const r = reg[i];
                 if (r == Ssa.no_reg or r == Ssa.folded) {
-                    if (live.items(.hint)[i][0] == hint_rax) cg.homes[i] = .{ .reg = .rax };
+                    if (live.items(.hint)[i][0] == hint_rax) cg.homes[i] = if (live.items(.hint)[i][1] == hint_rax) .{ .regs = .{ .lo = .rax, .hi = .rdx } } else .{ .reg = .rax };
                     continue;
                 }
                 cg.homes[i] = if (r >= alloc_regs.len) .{ .xmm = float_regs[r - alloc_regs.len] } else if (reg2[i] != Ssa.no_reg) .{ .regs = .{ .lo = alloc_regs[r], .hi = alloc_regs[reg2[i]] } } else .{ .reg = alloc_regs[r] };
@@ -6716,8 +6733,10 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     if (is_win) return cg.winCallResult(ret_ty, dst);
     if (in_pair) |d| {
         // `.auto` pairs come back in rax and rdx, which no value lives in.
-        try cg.e.mov(.qword, .{ .reg = d.lo }, .{ .reg = .rax });
-        return cg.e.mov(.qword, .{ .reg = d.hi }, .{ .reg = .rdx });
+        // Or stay there to be returned (`planRegisters`).
+        if (d.lo != .rax) try cg.e.mov(.qword, .{ .reg = d.lo }, .{ .reg = .rax });
+        if (d.hi != .rdx) try cg.e.mov(.qword, .{ .reg = d.hi }, .{ .reg = .rdx });
+        return;
     }
     const m = dst orelse return;
     const size = Type.abiSize(ip, ret_ty);
