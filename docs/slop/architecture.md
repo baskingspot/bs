@@ -2935,7 +2935,11 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    slot; a `slice_ptr` or `slice_len` without a register likewise reads
    its half of the slice's slot while the slice keeps it. A pair class (`want_pair`,
    `Live.reg2`) holds 16-byte values as their two eightbytes: on x86_64,
-   slices, optional slices, and error unions with an 8-byte payload
+   slices, optional slices, optionals of 8-byte integers and enums
+   (`optPair`: payload low, the flag in the low byte of the high
+   register, above it the optional's padding, so the flag is tested as a
+   byte and a store writes all 16 bytes; a constant is immediates, null
+   `xor hi, hi`), and error unions with an 8-byte payload
    (error code low, payload high), which loads, `slice`, element reads,
    `.auto` arguments and results, and the error-union and optional
    operations produce and read in registers; other code reads a pair
