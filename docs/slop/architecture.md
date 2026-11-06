@@ -2426,7 +2426,9 @@ user branches are coverage points and are only learned from.
   next block's at `i + 16`, derived from the exact `i += 16` that made
   the new `i`, not from a later load.
 - **Loops.** A variable the loop does not store (none of its stores,
-  in nested bodies too, names it; at most 32 checked) holds in it what it
+  in nested bodies and inlined calls' blocks too, names it, and its
+  address goes nowhere a callee could write it; at most 32 checked)
+  holds in it what it
   held before, so its loads there name that value and facts from before
   the loop on it apply (`for (0..@min(a.len, b.len)) |i|` indexing `a`,
   `@min` being Sema's `if (a < b) a else b` block). A fact from before a
@@ -2453,7 +2455,13 @@ user branches are coverage points and are only learned from.
   remainder, keeps `v % m` (`stride`): `repeat` accepts the start's
   value plus an exact multiple of `m`, and bounds round to that
   remainder, so `i` counting from 0 by 4 below 32 is at most 28 and
-  `st[i + 3]` keeps no check. Variables changed in a failed walk are
+  `st[i + 3]` keeps no check. The store shapes only pick candidates;
+  `repeat` is what proves them, and it counts only additions that
+  cannot wrap: a wrapping `i +%= m`, or an `@addWithOverflow` whose
+  overflow bit nothing checks, has bounds only where its operands' keep
+  it from wrapping and is no exact multiple, so a counter that crosses
+  2^bits fails the walk (`prove_wrap_lower.zig`,
+  `prove_wrap_stride.zig`). Variables changed in a failed walk are
   restored from an undo log of their versions, which also restores them
   between a `cond_br`'s or `switch_br`'s sides.
 - **Turning it off.** `BS_PROVE=off` keeps every check (its own cache
