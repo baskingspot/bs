@@ -1,10 +1,11 @@
 //! exit: 0
-//! stderr: "5105 9009 7 3\n"
+//! stderr: "5105 9009 7 3 7 72340172838076673 9 11 8\n"
 //! Variables and loads of them that get no register, among more live
 //! values than callee-saved registers across calls: a load reads the
 //! variable's slot as its own only while nothing stores to the variable,
 //! and a variable just stored is read from the register that stored it
-//! only until something else may write it.
+//! only until something else may write it, also in the next block when
+//! that block has no other predecessor.
 const std = @import("std");
 
 noinline fn id(x: u64) u64 {
@@ -81,9 +82,53 @@ noinline fn writtenThrough(n: u64) [2]u64 {
     return .{ after_call, x };
 }
 
+noinline fn alias(p: *u64) *u64 {
+    return p;
+}
+
+/// An address-taken variable stored from a register, then written through
+/// an alias of its address that is not known to be it, by a store, a
+/// memset, an atomic store and inline assembly that clobbers memory, each
+/// between the store and a load of the variable.
+noinline fn writtenThroughAlias(n: u64) [4]u64 {
+    var x: u64 = 0;
+    const q = alias(&x);
+    var r: [4]u64 = undefined;
+    x = id(n);
+    q.* = 7;
+    r[0] = id(x);
+    x = id(n);
+    @memset(std.mem.asBytes(q), 1);
+    r[1] = id(x);
+    x = id(n);
+    @atomicStore(u64, q, 9, .seq_cst);
+    r[2] = id(x);
+    x = id(n);
+    asm volatile ("movq $11, (%%rdi)"
+        :
+        : [p] "{rdi}" (q),
+        : .{ .memory = true });
+    r[3] = id(x);
+    return r;
+}
+
+/// A variable stored just before a loop whose header also continues from
+/// the loop's end, where the register no longer holds it.
+noinline fn storedBeforeLoop(n: u64) u64 {
+    var x: u64 = 0;
+    const q = alias(&x);
+    x = id(n);
+    while (x < n + 5) {
+        q.* = x + 1;
+        _ = id(1000);
+    }
+    return x;
+}
+
 pub fn main() void {
     const a = storedInInterval(5);
     const b = storedAfter(9);
     const w = writtenThrough(4);
-    std.debug.print("{d} {d} {d} {d}\n", .{ a, b, w[0], w[1] });
+    const v = writtenThroughAlias(4);
+    std.debug.print("{d} {d} {d} {d} {d} {d} {d} {d} {d}\n", .{ a, b, w[0], w[1], v[0], v[1], v[2], v[3], storedBeforeLoop(3) });
 }
