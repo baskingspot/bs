@@ -2347,7 +2347,16 @@ user branches are coverage points and are only learned from.
   version naming the same values, and the memory version there, instead
   of forgetting them. A `bool` block (`a and b`, an inlined call
   returning `bool`) keeps what held at its exits per value: assuming it
-  true adds what held at every `br` that may exit it true. Other `bool`
+  true adds what held at every `br` that may exit it true. An integer
+  block with at most four exits, one with a constant (an inlined
+  `capacity()` that returns 0 when `metadata` is null), keeps what held
+  at each exit and what was numbered on the way to it; a later fact on
+  its value, `b op k`, or `b - k` passing its overflow check (`k <=
+  b`), that no constant exit's value satisfies adds what held at every
+  exit left, and where one is left, the block's value is its value and
+  what was numbered before it is known again. So past hash_map's
+  `capacity() - 1`, `metadata.?` and the header's `@alignCast` are the
+  checks already passed in `capacity`. Other `bool`
   values give the fact `b == 1` or `b == 0`. Deciding a `bool`
   condition handles `not`, `bool` blocks, and `a & b` / `a | b` by
   assuming one side and deciding the other. The 64 most recent facts are
