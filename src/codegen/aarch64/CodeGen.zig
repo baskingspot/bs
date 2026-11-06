@@ -1075,6 +1075,11 @@ fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => data.bin_op.lhs,
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => data.bin_op.lhs,
         .not, .load, .float_cast => data.ty_op.operand,
+        // Copies, extended or offset in their result's register
+        // (`moveResult`, `normalizeFrom`, `addrPlus`).
+        .intcast, .trunc, .bitcast, .ptr_from_int, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set => data.ty_op.operand,
+        .int_from_ptr, .int_from_bool => data.un_op,
+        .struct_field_ptr => cg.ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand,
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => data.bin_op.lhs,
         .neg_float, .abs_float, .sqrt => data.un_op,
         .ptr_elem_ptr, .ptr_add => cg.ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs,
@@ -2023,6 +2028,15 @@ fn use(cg: *CodeGen, ref: Ref, scratch: Reg) Error!Reg {
     return scratch;
 }
 
+/// Value `inst`, of type `ty`, as a copy of scalar `ref`: a move from
+/// its register to the result's, or a load straight into the result's.
+fn moveResult(cg: *CodeGen, inst: Inst.Index, ty: Index, ref: Ref) Error!void {
+    const d = cg.resultReg(inst, .x9);
+    const s = try cg.use(ref, d);
+    if (d != s) try cg.e.mov(.x, d, s);
+    try cg.setResult(inst, ty, d);
+}
+
 /// The register value `inst` is computed in: its own, or `scratch` for
 /// `setResult` to store.
 fn resultReg(cg: *CodeGen, inst: Inst.Index, scratch: Reg) Reg {
@@ -2328,12 +2342,20 @@ fn valMem(cg: *CodeGen, v: Val) Error!Mem {
 /// Truncates the 64-bit value in `reg` to integer type `ty` and extends it
 /// back, so it is normalized.
 pub fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
-    if (!Type.isInt(cg.ip, ty)) return; // bools stay 0 or 1
-    const info = Type.intInfo(cg.ip, ty);
-    if (info.bits >= 64) return;
+    try cg.normalizeFrom(reg, reg, ty);
+}
+
+/// `d = src`, extended from `ty`'s width.
+fn normalizeFrom(cg: *CodeGen, d: Reg, src: Reg, ty: Index) Error!void {
+    const info: Type.IntInfo = if (Type.isInt(cg.ip, ty)) Type.intInfo(cg.ip, ty) else .{ .signedness = .unsigned, .bits = 64 };
+    // Bools stay 0 or 1.
+    if (info.bits >= 64) {
+        if (d != src) try cg.e.mov(.x, d, src);
+        return;
+    }
     // A zero-bit integer's only value.
-    if (info.bits == 0) return cg.e.movImm(.x, reg, 0);
-    try cg.e.bitfield(if (info.signedness == .signed) .sbfm else .ubfm, .x, reg, reg, 0, @intCast(info.bits - 1));
+    if (info.bits == 0) return cg.e.movImm(.x, d, 0);
+    try cg.e.bitfield(if (info.signedness == .signed) .sbfm else .ubfm, .x, d, src, 0, @intCast(info.bits - 1));
 }
 
 /// Stores value `inst` of type `ty`, computed in `reg`, to its slot, or
@@ -2405,10 +2427,7 @@ fn promotedPair(cg: *CodeGen, ptr: Ref) ?Regs {
 fn addrPlus(cg: *CodeGen, d: Reg, ptr: Ref, off: u64) Error!void {
     switch (try cg.locOf(ptr)) {
         .addr => |m| try cg.addrTo(d, m.plus(off)),
-        else => {
-            try cg.load(d, ptr);
-            try cg.addImm(d, d, @intCast(off));
-        },
+        else => try cg.addImm(d, try cg.use(ptr, d), @intCast(off)),
     }
 }
 
@@ -3019,8 +3038,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.setResult(inst, data.ty_op.ty, .x9);
         },
         .err_return_trace => {
-            try cg.loadTrace(.x9);
-            try cg.setResult(inst, data.ty, .x9);
+            const d = cg.resultReg(inst, .x9);
+            try cg.loadTrace(d);
+            try cg.setResult(inst, data.ty, d);
         },
         .set_err_return_trace => {
             // Sema sets up a trace only in functions other than `.auto`
@@ -3077,12 +3097,16 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 return vector.loadVec(cg, v, data.ty_op.operand);
             }
             if (cg.passInRegs(ty) and cg.passInRegs(src_ty)) {
-                try cg.load(.x9, data.ty_op.operand);
-                if (Type.isInt(ip, ty)) try cg.normalize(.x9, ty);
-                // A bool from an i1 (a lane of a vector bitcast): its
-                // register holds -1 as all ones.
-                if (ty == .bool_type and src_ty != .bool_type) try cg.e.logic(.@"and", .x, .x9, .x9, .{ .imm = 1 });
-                return cg.setResult(inst, ty, .x9);
+                const d = cg.resultReg(inst, .x9);
+                const s = try cg.use(data.ty_op.operand, d);
+                if (ty == .bool_type and src_ty != .bool_type) {
+                    // A bool from an i1 (a lane of a vector bitcast): its
+                    // register holds -1 as all ones.
+                    try cg.e.logic(.@"and", .x, d, s, .{ .imm = 1 });
+                } else if (Type.isInt(ip, ty)) {
+                    try cg.normalizeFrom(d, s, ty);
+                } else if (d != s) try cg.e.mov(.x, d, s);
+                return cg.setResult(inst, ty, d);
             }
             const dst = try cg.resultMem(inst, ty) orelse return;
             if (src_size != size) {
@@ -3109,10 +3133,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.e.addSub(.add, .x, .x12, .x12, .{ .reg = .{ .reg = .x9, .amount = 4 } });
             try cg.copyMem(dst, .at(.x12, 0), 16);
         },
-        .int_from_bool, .int_from_ptr => {
-            try cg.load(.x9, data.un_op);
-            try cg.setResult(inst, ir.typeOfIndex(inst, ip), .x9);
-        },
+        .int_from_bool, .int_from_ptr => try cg.moveResult(inst, ir.typeOfIndex(inst, ip), data.un_op),
 
         // The block's result, which each `br` writes (see `genTerm`).
         .block => _ = try cg.slotFor(inst, data.ty_pl.ty),
@@ -3125,8 +3146,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .struct_field_ptr => {
             const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
             const container = Type.ptrInfo(ip, cg.typeOf(sf.operand)).child;
-            try cg.addrPlus(.x9, sf.operand, Type.fieldOffset(ip, container, sf.index));
-            try cg.setResult(inst, data.ty_pl.ty, .x9);
+            const d = cg.resultReg(inst, .x9);
+            try cg.addrPlus(d, sf.operand, Type.fieldOffset(ip, container, sf.index));
+            try cg.setResult(inst, data.ty_pl.ty, d);
         },
         .struct_field_val => {
             const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
@@ -3237,10 +3259,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .optional_payload => {
             const child = data.ty_op.ty;
             if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
-            if (Type.optionalReprIsPtr(ip, child)) {
-                try cg.load(.x9, data.ty_op.operand);
-                return cg.setResult(inst, child, .x9);
-            }
+            if (Type.optionalReprIsPtr(ip, child)) return cg.moveResult(inst, child, data.ty_op.operand);
             const src = try cg.memOf(data.ty_op.operand);
             if (cg.passInRegs(child)) {
                 const d = cg.resultReg(inst, .x9);
@@ -3251,15 +3270,14 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.copyMem(dst, src, Type.abiSize(ip, child));
         },
         .optional_payload_ptr, .optional_payload_ptr_set => {
-            try cg.load(.x9, data.ty_op.operand);
             if (tag == .optional_payload_ptr_set) {
                 const opt_ty = Type.ptrInfo(ip, cg.typeOf(data.ty_op.operand)).child;
                 if (!Type.optionalReprIsPayload(ip, Type.childType(ip, opt_ty))) {
                     try cg.e.movImm(.x, .x10, 1);
-                    try cg.storeReg(.at(.x9, @intCast(Type.optionalFlagOffset(ip, opt_ty))), .x10, 1);
+                    try cg.storeReg(.at(try cg.use(data.ty_op.operand, .x9), @intCast(Type.optionalFlagOffset(ip, opt_ty))), .x10, 1);
                 }
             }
-            try cg.setResult(inst, data.ty_op.ty, .x9);
+            try cg.moveResult(inst, data.ty_op.ty, data.ty_op.operand);
         },
         .wrap_optional => {
             const opt_ty = data.ty_op.ty;
@@ -3323,8 +3341,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 try cg.storeReg(dst.plus(layout.err_offset), .zr, 2);
                 try cg.copyTo(dst.plus(layout.payload_offset), data.ty_op.operand);
             } else {
-                try cg.load(.x9, data.ty_op.operand);
-                try cg.storeReg(dst.plus(layout.err_offset), .x9, 2);
+                try cg.storeReg(dst.plus(layout.err_offset), try cg.use(data.ty_op.operand, .x9), 2);
             }
         },
         .aggregate_init => {
@@ -3870,6 +3887,10 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     const s = info.signedness == .signed;
     const a = try cg.use(bin.lhs, .x9);
     const b = try cg.use(bin.rhs, .x10);
+    // The result, computed in its field's register when it has one (none
+    // of x12-x15, which this lowering writes), else in x9. A result that
+    // needs normalizing is computed in x13 first (`truncCheck`).
+    const r: Reg = if (fields[0] != Ssa.no_tie and cg.homes[fields[0]] == .reg) cg.homes[fields[0]].reg else .x9;
     // The condition under which the flags say it overflowed, or null when
     // x11 holds the bit.
     const cc: ?Cond = switch (tag) {
@@ -3878,29 +3899,30 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
             if (info.bits == 32 or info.bits == 64) {
                 // The flags of the operation at the type's width; the
                 // extension after it keeps them.
-                try e.addSub(if (add) .adds else .subs, if (info.bits == 64) .x else .w, .x9, a, .r(b));
-                if (info.bits == 32 and s) try e.sxt(.word, .x, .x9, .x9);
+                try e.addSub(if (add) .adds else .subs, if (info.bits == 64) .x else .w, r, a, .r(b));
+                if (info.bits == 32 and s) try e.sxt(.word, .x, r, r);
                 break :cc if (s) .vs else if (add) .hs else .lo;
             }
-            try e.addSub(if (add) .add else .sub, .x, .x9, a, .r(b));
-            break :cc try cg.truncCheck(ty);
+            try e.addSub(if (add) .add else .sub, .x, .x13, a, .r(b));
+            break :cc try cg.truncCheck(r, ty);
         },
         .mul_with_overflow => if (info.bits <= 32) cc: {
             // The product of extended operands is exact in 64 bits.
-            try e.mul(.x, .x9, a, b);
-            break :cc try cg.truncCheck(ty);
+            try e.mul(.x, .x13, a, b);
+            break :cc try cg.truncCheck(r, ty);
         } else cc: {
             // The high half must extend the low one.
             try e.mulHigh(s, .x11, a, b);
-            try e.mul(.x, .x9, a, b);
+            const lo: Reg = if (info.bits == 64) r else .x13;
+            try e.mul(.x, lo, a, b);
             if (s) {
-                try e.cmp(.x, .x11, .{ .reg = .{ .reg = .x9, .shift = .asr, .amount = 63 } });
+                try e.cmp(.x, .x11, .{ .reg = .{ .reg = lo, .shift = .asr, .amount = 63 } });
             } else {
                 try e.cmp(.x, .x11, .{ .imm = 0 });
             }
             if (info.bits == 64) break :cc .ne;
             try e.cset(.x, .x14, .ne);
-            try e.cset(.x, .x11, try cg.truncCheck(ty));
+            try e.cset(.x, .x11, try cg.truncCheck(r, ty));
             try e.logic(.orr, .x, .x11, .x11, .r(.x14));
             break :cc null;
         },
@@ -3911,7 +3933,7 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     } else assert(!in_flags);
     // Only stores from here on, which keep the flags.
     if (pair) {
-        if (fields[0] != Ssa.no_tie) try cg.setResult(@fromBackingInt(fields[0]), ty, .x9);
+        if (fields[0] != Ssa.no_tie) try cg.setResult(@fromBackingInt(fields[0]), ty, r);
         if (fields[1] != Ssa.no_tie and !in_flags) try cg.setResult(@fromBackingInt(fields[1]), .u1_type, .x11);
         return;
     }
@@ -3919,12 +3941,11 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     try cg.storeReg(dst.plus(Type.fieldOffset(ip, tuple_ty, 1)), .x11, 1);
 }
 
-/// Normalizes x9 to `ty` and compares it with its value before: `ne` if
-/// that changed it. Uses x13.
-fn truncCheck(cg: *CodeGen, ty: Index) Error!Cond {
-    try cg.e.mov(.x, .x13, .x9);
-    try cg.normalize(.x9, ty);
-    try cg.e.cmp(.x, .x9, .r(.x13));
+/// `d` = x13 normalized to `ty`, compared with x13: `ne` if normalizing
+/// changed it.
+fn truncCheck(cg: *CodeGen, d: Reg, ty: Index) Error!Cond {
+    try cg.normalizeFrom(d, .x13, ty);
+    try cg.e.cmp(.x, d, .r(.x13));
     return .ne;
 }
 
