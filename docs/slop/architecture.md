@@ -2665,7 +2665,16 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    a pointer or index in memory goes through the result's register or
    rax, else through one of the three that holds no operand, saved with
    push and pop around the use (`borrowReg`), so their masks hold
-   whatever the allocator decides. The encoder records the general-purpose registers
+   whatever the allocator decides. An element address whose base and
+   index are both in memory, computed in rax, scales the index in rax and
+   adds the base from memory, so it borrows none. Within a block, a value
+   spilled to its slot (`setResult`) or an 8-byte integer or pointer
+   stored to a variable in memory stays known in the register that was
+   stored (`CodeGen.held`): a read of that slot through `load`, or a load
+   of the variable, moves from the register instead of reloading memory
+   just written, until a value writes the register (`Encoder.written`)
+   or may write memory other than its own slot or another variable's
+   (`keepsSlot`), or the slot is given to another value. The encoder records the general-purpose registers
    each instruction writes (`Encoder.written`: destinations, implicit
    ones such as mul's rdx or rep movsb's rcx, rsi and rdi, every
    caller-saved one for a call or an inline assembly instruction), and

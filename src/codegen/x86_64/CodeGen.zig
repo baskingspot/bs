@@ -179,6 +179,19 @@ split: std.bit_set.Dynamic = .{},
 split_vals: std.ArrayList(struct { v: u32, of: u32, stored: u32 = no_base }) = .empty,
 /// The block `genBlock` emits.
 cur_block: u32 = 0,
+/// The frame slot the current block last stored a register to, a value's
+/// spill slot (`setResult`) or a variable's (`.store`), while the register
+/// still holds what it stored and nothing may have written the slot since
+/// (`keepsSlot`): reads of the slot read the register (`heldReg`). Only
+/// qwords, so the register holds exactly what the slot does.
+held: ?struct { off: i32, reg: Reg } = null,
+/// The registers the current value wrote before it set `held`; the
+/// encoder's `written` holds those it wrote since.
+held_before: u16 = 0,
+/// Whether the current value set `held`.
+held_new: bool = false,
+/// Whether `genBlock` is emitting a value, the only code that sets `held`.
+holding: bool = false,
 /// Scratch for `genSplit`: the values saved around the current clobber
 /// point, with their homes.
 split_now: std.ArrayList(struct { v: u32, home: Home, reload: bool }) = .empty,
@@ -618,6 +631,10 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
         break :blk off;
     } else try cg.allocSlot(size, alignment) };
     cg.homes[@backingInt(inst)] = home;
+    // A slot shared with a value whose interval ended.
+    if (cg.held) |h| if (home.slot < h.off + 8 and h.off < home.slot + @as(i32, @intCast(@max(size, 1)))) {
+        cg.held = null;
+    };
     return home;
 }
 
@@ -1174,7 +1191,9 @@ pub fn load(cg: *CodeGen, reg: Reg, ref: Ref) Error!void {
             if (m.base.reg != reg) try cg.e.mov(.qword, .{ .reg = reg }, .{ .reg = m.base.reg });
         } else try cg.e.lea(.qword, reg, m),
         .err => |name| try cg.loadError(reg, name),
-        .mem => |m| try cg.loadKnown(reg, m, ty),
+        .mem => |m| if (cg.heldReg(m, Type.abiSize(cg.ip, ty))) |r| {
+            if (r != reg) try cg.e.mov(.qword, .{ .reg = reg }, .{ .reg = r });
+        } else try cg.loadKnown(reg, m, ty),
     }
 }
 
@@ -4508,7 +4527,10 @@ pub fn setResult(cg: *CodeGen, inst: Inst.Index, ty: Index, reg: Reg) Error!void
         .xmm => |x| try cg.e.movToXmm(sizeOf(Type.abiSize(cg.ip, ty)), x, .{ .reg = reg }),
         else => {
             const m = try cg.resultMem(inst, ty) orelse return;
-            try cg.storeReg(m, reg, Type.abiSize(cg.ip, ty));
+            const size = Type.abiSize(cg.ip, ty);
+            try cg.storeReg(m, reg, size);
+            // A spill slot: its reads in this block read `reg` (`held`).
+            if (size == 8 and cg.homes[@backingInt(inst)] == .slot and std.meta.eql(m, Mem.at(.rbp, cg.homes[@backingInt(inst)].slot))) cg.holdSlot(m.disp, reg);
         },
     }
 }
@@ -4668,9 +4690,29 @@ fn storeVal(cg: *CodeGen, m: Mem, ref: Ref, size: u64) Error!void {
 
 /// `d = base + index * size`, where `base` is a pointer or, if `is_slice`,
 /// a slice, operands of value `inst`. Uses no scratch register but `d`
-/// and rax, unless `d` is rax and holds the base, and the index is in
-/// memory or needs scaling, when it borrows one (`borrowReg`).
+/// and rax, unless `d` is rax and holds the base, which is not in a slot,
+/// and the index is in memory or needs scaling, when it borrows one
+/// (`borrowReg`).
 fn elemAddrTo(cg: *CodeGen, inst: Inst.Index, d: Reg, is_slice: bool, base: Ref, index: Ref, size: u64) Error!void {
+    // Base and index both in memory, and only rax to compute in: the
+    // scaled index goes into rax and the base is added from memory, so
+    // nothing is borrowed.
+    if (d == .rax and size != 0 and size <= std.math.maxInt(i32) and index.toInterned() == null and
+        cg.homes[@backingInt(index.toIndex().?)] != .reg)
+    {
+        const m: ?Mem = if (base.toIndex()) |b| switch (cg.homes[@backingInt(b)]) {
+            .slot => |off| Mem.at(.rbp, off),
+            .ind => |r| Mem.at(r, 0),
+            else => null,
+        } else null;
+        if (m) |bm| {
+            try cg.load(.rax, index);
+            if (std.math.isPowerOfTwo(size)) {
+                if (size != 1) try cg.e.shift(.shl, .qword, .{ .reg = .rax }, std.math.log2_int(u64, size));
+            } else try cg.e.imul(.qword, .rax, .{ .reg = .rax }, @intCast(size));
+            return cg.e.alu(.add, .qword, .{ .reg = .rax }, .{ .mem = bm });
+        }
+    }
     const base_reg: Reg = if (is_slice) blk: {
         if (cg.pairOf(base)) |p| break :blk p.lo;
         try cg.e.mov(.qword, .{ .reg = d }, .{ .mem = try cg.memOf(base) });
@@ -5050,6 +5092,7 @@ fn keepSymbols(cg: *CodeGen, inst: Inst.Index) Error!void {
 fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!void {
     cg.e.bind(cg.labels[@backingInt(block)]);
     cg.cur_block = @backingInt(block);
+    cg.held = null;
     if (cg.ssa.covered.items[@backingInt(block)]) try cg.coverPoint(block == cg.ssa.layout.items[0]);
     const b = cg.ssa.blocks.items[@backingInt(block)];
     const cl = cg.ssa.clobbers.items;
@@ -5061,7 +5104,16 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
         const q = Ssa.valuePos(idx);
         const clobber = cg.live and !std.meta.eql(cl[q], cl[q - 1]);
         cg.e.written = 0;
+        cg.held_new = false;
+        cg.held_before = 0;
+        cg.holding = true;
+        defer cg.holding = false;
         if (cg.split_vals.items.len != 0 and clobber) try cg.genSplit(inst, q) else try cg.genInst(inst);
+        // Writing the register, or memory the slot may be, ends it.
+        if (cg.held) |h| if (cg.e.written & h.reg.bit() != 0 or (!cg.held_new and !cg.keepsSlot(inst, h.off))) {
+            cg.held = null;
+        };
+        cg.e.written |= cg.held_before;
         if (cg.live) try cg.checkWrites(inst, cg.scratch_values.items[idx], clobber, cg.ownRegs(inst));
     }
     cg.e.written = 0;
@@ -5077,6 +5129,67 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
         };
         try cg.checkWrites(null, cg.scratch_terms.items[@backingInt(block)], cg.termClobbers(block), own);
     }
+}
+
+/// The variable `ptr` is if its slot may be `held`: an integer or pointer
+/// variable of 8 bytes in a frame slot of its own.
+fn varSlot(cg: *CodeGen, ptr: Ref) ?i32 {
+    const a = @backingInt(ptr.toIndex() orelse return null);
+    if (cg.ir.instructions.items(.tag)[a] != .alloc or cg.homes[a] != .frame_addr) return null;
+    const info = Type.ptrInfo(cg.ip, cg.ir.instructions.items(.data)[a].ty);
+    if (info.flags.is_volatile or Type.abiSize(cg.ip, info.child) != 8) return null;
+    switch (Type.class(cg.ip, info.child)) {
+        .int, .pointer => {},
+        else => return null,
+    }
+    // Memory a value's lowering writes too.
+    if (cg.copy_of.contains(a) or cg.payload_region.contains(a) or cg.ref_alias.contains(a) or cg.const_alias.contains(a)) return null;
+    return cg.homes[a].frame_addr;
+}
+
+/// Sets `held`: slot `off` holds the qword `reg` holds.
+fn holdSlot(cg: *CodeGen, off: i32, reg: Reg) void {
+    if (!cg.holding) return;
+    cg.held = .{ .off = off, .reg = reg };
+    cg.held_new = true;
+    cg.held_before |= cg.e.written;
+    cg.e.written = 0;
+}
+
+/// The register holding the `size` bytes at `m` if they are the `held`
+/// slot's qword and the current value has not written the register since.
+fn heldReg(cg: *CodeGen, m: Mem, size: u64) ?Reg {
+    const h = cg.held orelse return null;
+    if (size != 8 or m.base != .reg or m.base.reg != .rbp or m.index != null or m.disp != h.off) return null;
+    if (cg.e.written & h.reg.bit() != 0) return null;
+    return h.reg;
+}
+
+/// Whether value `inst` writes no memory of the `held` slot at `off`, as
+/// far as the encoder does not see: a store to another variable's slot, or
+/// a value that writes no memory but slots of its own.
+fn keepsSlot(cg: *CodeGen, inst: Inst.Index, off: i32) bool {
+    const i = @backingInt(inst);
+    // Built in the memory of the store that is its only user.
+    if (cg.in_place.count() != 0 and cg.in_place.contains(i)) return false;
+    return switch (cg.ir.instructions.items(.tag)[i]) {
+        .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .load, .alloc, .block, .loop => true,
+        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .not => true,
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => true,
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => true,
+        .intcast, .trunc, .bitcast, .int_from_bool, .int_from_ptr => true,
+        .struct_field_ptr, .struct_field_val, .ptr_elem_ptr, .slice_elem_ptr, .ptr_elem_val, .slice_elem_val, .ptr_add => true,
+        .slice_ptr, .slice_len, .is_null, .is_non_null, .optional_payload, .wrap_optional => true,
+        .is_err, .is_non_err, .unwrap_errunion_payload, .unwrap_errunion_err => true,
+        .store => {
+            const a = @backingInt(cg.ir.instructions.items(.data)[i].bin_op.lhs.toIndex() orelse return false);
+            if (cg.ir.instructions.items(.tag)[a] != .alloc or cg.homes[a] != .frame_addr) return false;
+            const size: i32 = @intCast(@max(Type.abiSize(cg.ip, Type.ptrInfo(cg.ip, cg.ir.instructions.items(.data)[a].ty).child), 1));
+            const at = cg.homes[a].frame_addr;
+            return at + size <= off or off + 8 <= at;
+        },
+        else => false,
+    };
 }
 
 fn checkNaked(cg: *CodeGen, tag: Inst.Tag) Error!void {
@@ -5272,6 +5385,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             }
             if (cg.varReg(data.ty_op.operand)) |r| return cg.setResult(inst, ty, r);
             if (cg.varXmm(data.ty_op.operand)) |x| return cg.setXmm(inst, ty, x);
+            if (cg.varSlot(data.ty_op.operand)) |off| if (cg.heldReg(Mem.at(.rbp, off), 8)) |r| return cg.setResult(inst, ty, r);
             // A vector.
             if (cg.xmmOf(inst.toRef())) |x| if (!cg.passInRegs(ty)) return cg.e.movups(.{ .reg = x }, .{ .mem = try cg.ptrMem(data.ty_op.operand) });
             if (cg.pairOf(data.ty_op.operand)) |_| {
@@ -5321,6 +5435,12 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                         return cg.giveBack(b);
                     }
                 }
+                if (cg.varSlot(ptr)) |off| if (cg.xmmOf(val) == null and try cg.locOf(val) != .imm) {
+                    // Its loads in this block read the register (`held`).
+                    const r = try cg.regOf(val, .rax);
+                    try cg.storeReg(Mem.at(.rbp, off), r, 8);
+                    return cg.holdSlot(off, r);
+                };
                 return cg.storeVal(try cg.ptrMem(ptr), val, size);
             }
             // Not based on a register `copyTo` uses.
