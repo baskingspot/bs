@@ -388,7 +388,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
                 own |= homeRegs(cg.homes[@backingInt(inst)]);
                 if (cg.homes[@backingInt(inst)] == .ind) own |= cg.homes[@backingInt(inst)].ind.bit();
             }
-            if (cg.e.written & checked_mask & ~own != 0) return cg.fail("internal error: the prologue writes {t}, which may hold a value", .{@as(Reg, @enumFromInt(@ctz(cg.e.written & checked_mask & ~own)))});
+            if (cg.e.written & checked_mask & ~own != 0) return cg.fail("internal error: the prologue writes {t}, which may hold a value", .{@as(Reg, @fromBackingInt(@intCast(@ctz(cg.e.written & checked_mask & ~own))))});
         }
     }
     try cg.emitBlocks();
@@ -2289,7 +2289,7 @@ fn checkWrites(cg: *CodeGen, inst: ?Inst.Index, planned: u16, clobber: bool, own
     if (cg.ir.func == cg.emit.zcu.return_error) allowed = scratch_mask;
     const bad = cg.e.written & checked_mask & ~allowed;
     if (bad == 0) return;
-    const r: Reg = @enumFromInt(@ctz(bad));
+    const r: Reg = @fromBackingInt(@intCast(@ctz(bad)));
     if (inst) |i| return cg.fail("internal error: '{t}' writes {t}, which may hold a value", .{ cg.ir.instructions.items(.tag)[@backingInt(i)], r });
     return cg.fail("internal error: a terminator writes {t}, which may hold a value", .{r});
 }
