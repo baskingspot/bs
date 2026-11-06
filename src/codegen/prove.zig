@@ -105,8 +105,16 @@ pub const Scratch = struct {
     /// Per load of a slice whose length a store just before wrote
     /// (`Walker.forwardStore`): that length.
     load_lens: std.AutoHashMapUnmanaged(u32, Term) = .empty,
+    /// Per loop scanned (`Walker.scanLoops`): its index in `loop_stored`;
+    /// and the loops open in the scan.
+    loop_index: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    loop_stored: std.ArrayList(LoopStored) = .empty,
+    loop_stack: std.ArrayList(u32) = .empty,
 
     pub fn deinit(s: *Scratch, gpa: Allocator) void {
+        s.loop_index.deinit(gpa);
+        s.loop_stored.deinit(gpa);
+        s.loop_stack.deinit(gpa);
         s.load_lens.deinit(gpa);
         s.canon.deinit(gpa);
         s.numbers.deinit(gpa);
@@ -259,9 +267,10 @@ const Key = struct {
     b: Term,
 };
 
-/// A candidate fact at a loop's start: `v + c op y`, with `v` variable
-/// `v`'s value there (`base`, the variable at the loop's entry stamp), `c`
-/// added exactly, and `y` and `bits` as in a `Fact` (unsigned).
+/// A candidate fact at a loop's start: `v + c op y` (`upper`), with `v`
+/// variable `v`'s value there (`base`, the variable at the loop's entry
+/// stamp), `c` added exactly, and `y` and `bits` as in a `Fact`
+/// (unsigned); `y op v` (`lower`, `c` 0); or `v % c == y` (`stride`).
 const Cand = struct {
     v: u32,
     base: Term,
@@ -269,7 +278,48 @@ const Cand = struct {
     op: Op,
     bits: u8,
     y: Term,
+    kind: enum(u8) { upper, lower, stride } = .upper,
 };
+
+/// What a loop's body (with the bodies in it) stores to variables: per
+/// variable stored, whether each store is likely no smaller than the value
+/// before (`grows`: a sum, an `|`, a maximum, or a constant) and the
+/// steps it changes by; `all` past `vars`' room (every variable may be
+/// stored, none grows). Filled for a loop and those nested in it by one
+/// scan (`Walker.scanLoops`), the first time one is entered.
+const LoopStored = struct {
+    n: u8 = 0,
+    all: bool = false,
+    vars: [32]LoopVar = undefined,
+
+    fn find(ls: *const LoopStored, a: u32) ?*const LoopVar {
+        for (ls.vars[0..ls.n]) |*lv| if (lv.v == a) return lv;
+        return null;
+    }
+
+    fn has(ls: *const LoopStored, a: u32) bool {
+        return ls.all or ls.find(a) != null;
+    }
+};
+
+const LoopVar = struct {
+    v: u32,
+    grows: bool = true,
+    /// The greatest common divisor of the constants added (1 when a
+    /// store adds something else or is an `|` or a maximum; 0 for none).
+    step: u64 = 0,
+    /// The first constant stored, and the greatest common divisor of the
+    /// others' differences from it.
+    first: ?i128 = null,
+    spread: u64 = 0,
+};
+
+/// `gcd(a, b)`, with 0 standing for no value.
+fn gcd0(a: u64, b: u64) u64 {
+    if (a == 0) return b;
+    if (b == 0) return a;
+    return std.math.gcd(a, b);
+}
 
 /// An instruction as it was before a speculative walk changed it.
 const Undo = struct {
@@ -314,6 +364,8 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *Scratch, fu
     scratch.int_exits.clearRetainingCapacity();
     scratch.int_blocks.clearRetainingCapacity();
     scratch.load_lens.clearRetainingCapacity();
+    scratch.loop_index.clearRetainingCapacity();
+    scratch.loop_stored.clearRetainingCapacity();
     classify(ip, ir, scratch.kind.items);
     var w: Walker = .{ .gpa = gpa, .ip = ip, .ir = ir, .s = scratch, .fuzz = fuzz };
     try w.body(ir.mainBody());
@@ -678,7 +730,8 @@ const Walker = struct {
                 const nlen = s.nlog.items.len;
                 // A write later in the loop reaches its start.
                 w.changeMem();
-                if (w.spec == null and try w.speculate(inst, insts)) {
+                const ls = try w.loopInfo(inst, insts);
+                if (w.spec == null and try w.speculate(inst, insts, &ls)) {
                     s.facts.shrinkRetainingCapacity(depth);
                     w.dropNumbers(nlen);
                     try w.merge(from);
@@ -686,6 +739,7 @@ const Walker = struct {
                     return;
                 }
                 w.stamp = w.tick();
+                try w.pinInvariant(&ls, outer);
                 try w.body(insts);
                 w.stamp = outer;
                 s.facts.shrinkRetainingCapacity(depth);
@@ -1518,7 +1572,7 @@ const Walker = struct {
             best = .le;
         }
         for (w.s.cands.items) |g| {
-            if (bits != 0 and g.bits > bits) continue;
+            if (g.kind != .upper or (bits != 0 and g.bits > bits)) continue;
             const dx: u64 = if (g.base.eql(x)) d else if (x.tag == .konst) std.math.add(u64, d, @intCast(x.value())) catch continue else continue;
             if (g.c < dx) continue;
             if (y) |b| if (!g.y.eql(b)) continue;
@@ -1556,15 +1610,18 @@ const Walker = struct {
     /// loop's entry stamp, which the candidate names. Walks the body
     /// assuming them (`spec`); returns whether they held at every
     /// `repeat`, and else undoes what that walk changed.
-    fn speculate(w: *Walker, loop: Inst.Index, insts: []const Inst.Index) Allocator.Error!bool {
+    fn speculate(w: *Walker, loop: Inst.Index, insts: []const Inst.Index, ls: *const LoopStored) Allocator.Error!bool {
         const s = w.s;
         const gpa = w.gpa;
         const stamp = w.tick();
         s.cands.clearRetainingCapacity();
+        // A variable the loop does not store keeps its value (`pinInvariant`),
+        // so facts on it hold in the loop without being candidates.
         for (w.recent()) |g| {
             if (g.signed or (g.op != .lt and g.op != .le)) continue;
             const o = w.offset(g.a, true);
             const v = w.variableOf(o.x) orelse continue;
+            if (!ls.has(v)) continue;
             try s.cands.append(gpa, .{ .v = v, .base = .{ .tag = .variable, .a = v, .b = stamp }, .c = o.c, .op = g.op, .bits = g.bits, .y = g.b });
             if (s.cands.items.len == 8) break;
         }
@@ -1575,13 +1632,42 @@ const Walker = struct {
         for (0..@min(st.len, 16)) |j| {
             if (s.cands.items.len >= 12) break;
             const v = st[st.len - 1 - j];
-            if (s.kind.items[v] != .variable) continue;
+            if (s.kind.items[v] != .variable or !ls.has(v)) continue;
             if (for (s.cands.items) |g| (if (g.v == v) break true) else false) continue;
             const info = w.varInfo(v) orelse continue;
             if (info.signedness == .signed) continue;
             const hi = w.range(w.varTerm(v), info).hi;
             if (hi >= limits(info).hi or !w.shrinks(insts, v, hi)) continue;
             try s.cands.append(gpa, .{ .v = v, .base = .{ .tag = .variable, .a = v, .b = stamp }, .c = 0, .op = .le, .bits = @intCast(info.bits), .y = .konst(@intCast(hi)) });
+        }
+        // An unsigned variable's constant least value before the loop
+        // (`16 <= i` after `while (i < 16)`), and the remainder of its
+        // value before the loop by the steps it changes by, when the loop
+        // only stores to it what is likely no smaller (`LoopVar.grows`): a count
+        // up (`i += 4`).
+        for (w.recent()) |g| {
+            if (s.cands.items.len >= 12) break;
+            if (g.signed or (g.op != .lt and g.op != .le) or !g.a.isConst()) continue;
+            const v = w.variableOf(g.b) orelse continue;
+            if (!g.b.eql(w.varTerm(v)) or !ls.has(v)) continue;
+            if (for (s.cands.items) |c| (if (c.v == v and c.kind == .lower) break true) else false) continue;
+            if (!ls.all) if (ls.find(v)) |lv| if (!lv.grows) continue;
+            if (ls.all) continue;
+            try s.cands.append(gpa, .{ .kind = .lower, .v = v, .base = .{ .tag = .variable, .a = v, .b = stamp }, .c = 0, .op = g.op, .bits = g.bits, .y = g.a });
+        }
+        for (0..@min(st.len, 16)) |j| {
+            if (s.cands.items.len >= 12) break;
+            const v = st[st.len - 1 - j];
+            if (s.kind.items[v] != .variable or !ls.has(v)) continue;
+            const t = w.varTerm(v);
+            if (t.tag != .konst) continue;
+            const info = w.varInfo(v) orelse continue;
+            if (info.signedness == .signed) continue;
+            if (for (s.cands.items) |c| (if (c.v == v and c.kind == .stride) break true) else false) continue;
+            if (ls.all) continue;
+            const m = stride(ls.find(v) orelse continue, t.value());
+            if (m < 2) continue;
+            try s.cands.append(gpa, .{ .kind = .stride, .v = v, .base = .{ .tag = .variable, .a = v, .b = stamp }, .c = m, .op = .eq, .bits = @intCast(info.bits), .y = .konst(@intCast(@mod(t.value(), m))) });
         }
         if (s.cands.items.len == 0) return false;
         // What a failed walk must restore.
@@ -1594,10 +1680,14 @@ const Walker = struct {
         const log = s.vlog.items.len;
         const nlen = s.nlog.items.len;
         // A candidate with no offset is a fact, which every rule reads.
-        for (s.cands.items) |g| if (g.c == 0)
-            try s.facts.append(gpa, .{ .op = g.op, .signed = false, .bits = g.bits, .a = g.base, .b = g.y });
+        for (s.cands.items) |g| switch (g.kind) {
+            .upper => if (g.c == 0) try s.facts.append(gpa, .{ .op = g.op, .signed = false, .bits = g.bits, .a = g.base, .b = g.y }),
+            .lower => try s.facts.append(gpa, .{ .op = g.op, .signed = false, .bits = g.bits, .a = g.y, .b = g.base }),
+            .stride => {},
+        };
         const outer = w.stamp;
         w.stamp = stamp;
+        try w.pinInvariant(ls, outer);
         w.spec = .{ .loop = loop, .ok = true };
         try w.body(insts);
         const ok = w.spec.?.ok;
@@ -1628,6 +1718,131 @@ const Walker = struct {
         return false;
     }
 
+    /// What loop `loop` (with body `insts`) stores (`LoopStored`), from
+    /// the scan of the outermost loop entered around it.
+    fn loopInfo(w: *Walker, loop: Inst.Index, insts: []const Inst.Index) Allocator.Error!LoopStored {
+        const s = w.s;
+        if (s.loop_index.get(@backingInt(loop))) |k| return s.loop_stored.items[k];
+        s.loop_stack.clearRetainingCapacity();
+        try w.scanLoop(loop, insts);
+        return s.loop_stored.items[s.loop_index.get(@backingInt(loop)).?];
+    }
+
+    fn scanLoop(w: *Walker, loop: Inst.Index, insts: []const Inst.Index) Allocator.Error!void {
+        const s = w.s;
+        const k: u32 = @intCast(s.loop_stored.items.len);
+        try s.loop_stored.append(w.gpa, .{});
+        try s.loop_index.put(w.gpa, @backingInt(loop), k);
+        try s.loop_stack.append(w.gpa, k);
+        try w.scanLoops(insts);
+        _ = s.loop_stack.pop();
+    }
+
+    /// Records each store to a variable in `insts` (and the bodies in
+    /// them) in every loop open in the scan (`Scratch.loop_stack`).
+    fn scanLoops(w: *Walker, insts: []const Inst.Index) Allocator.Error!void {
+        const ir = w.ir;
+        const s = w.s;
+        for (insts) |inst| {
+            const ii = @backingInt(inst);
+            const data = ir.instructions.items(.data)[ii];
+            switch (ir.instructions.items(.tag)[ii]) {
+                .store => if (data.bin_op.lhs.toIndex()) |p| if (s.kind.items[@backingInt(p)] == .variable) {
+                    const a = @backingInt(p);
+                    // What the store is: a constant, a sum with a constant
+                    // step (0 when not), another growing value, or not.
+                    const t = w.term(data.bin_op.rhs);
+                    var grows = true;
+                    var inc: u64 = 0;
+                    if (!t.isConst()) inc = blk: {
+                        const r = data.bin_op.rhs.toIndex() orelse {
+                            grows = false;
+                            break :blk 1;
+                        };
+                        switch (ir.instructions.items(.tag)[@backingInt(r)]) {
+                            .bit_or, .max_int, .add_wrap => break :blk 1,
+                            .struct_field_val => {
+                                const sf = ir.extraData(Ir.StructField, ir.instructions.items(.data)[@backingInt(r)].ty_pl.payload).data;
+                                if (sf.operand.toIndex()) |op| if (sf.index == 0 and ir.instructions.items(.tag)[@backingInt(op)] == .add_with_overflow) {
+                                    const bin = ir.extraData(Ir.Bin, ir.instructions.items(.data)[@backingInt(op)].ty_pl.payload).data;
+                                    const l = w.term(bin.lhs);
+                                    const rr = w.term(bin.rhs);
+                                    const c = if (rr.tag == .konst) rr else if (l.tag == .konst) l else break :blk 1;
+                                    break :blk @max(@as(u64, @intCast(c.value())), 1);
+                                };
+                                grows = false;
+                                break :blk 1;
+                            },
+                            else => {
+                                grows = false;
+                                break :blk 1;
+                            },
+                        }
+                    };
+                    for (s.loop_stack.items) |k| {
+                        const ls = &s.loop_stored.items[k];
+                        if (ls.all) continue;
+                        const lv: *LoopVar = for (ls.vars[0..ls.n]) |*lv| {
+                            if (lv.v == a) break lv;
+                        } else add: {
+                            if (ls.n == ls.vars.len) {
+                                ls.all = true;
+                                continue;
+                            }
+                            ls.vars[ls.n] = .{ .v = a };
+                            ls.n += 1;
+                            break :add &ls.vars[ls.n - 1];
+                        };
+                        lv.grows = lv.grows and grows;
+                        if (t.isConst()) {
+                            if (lv.first) |f0| {
+                                lv.spread = gcd0(lv.spread, @intCast(@min(@abs(t.value() - f0), std.math.maxInt(u64))));
+                            } else lv.first = t.value();
+                        } else lv.step = gcd0(lv.step, inc);
+                    }
+                },
+                .block => {
+                    const x = ir.extraData(Ir.Block, data.ty_pl.payload);
+                    try w.scanLoops(ir.bodySlice(x.end, x.data.body_len));
+                },
+                .loop => {
+                    const x = ir.extraData(Ir.Block, data.ty_pl.payload);
+                    try w.scanLoop(inst, ir.bodySlice(x.end, x.data.body_len));
+                },
+                .cond_br => {
+                    const x = ir.extraData(Ir.CondBr, data.pl_op.payload);
+                    try w.scanLoops(ir.bodySlice(x.end, x.data.then_body_len + x.data.else_body_len));
+                },
+                .switch_br => {
+                    var it = ir.switchCases(data.pl_op.payload);
+                    while (it.next()) |c| try w.scanLoops(c.body);
+                    try w.scanLoops(it.elseBody());
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// At a loop's start (`stamp` set, `outer` the enclosing one's): the
+    /// last variables stored before it that the loop does not store hold
+    /// in it what they held before, since nothing else writes a variable.
+    /// Their loads there name that value, not the variable at the loop's
+    /// entry, so facts from before the loop on them still apply
+    /// (`for (0..@min(a.len, b.len)) |i|` indexing `a`).
+    fn pinInvariant(w: *Walker, ls: *const LoopStored, outer: u32) Allocator.Error!void {
+        if (ls.all) return;
+        const s = w.s;
+        const st = s.stored.items;
+        const ver = w.tick();
+        for (0..@min(st.len, 32)) |j| {
+            const v = st[st.len - 1 - j];
+            if (s.kind.items[v] != .variable or ls.has(v) or s.version.items[v] == ver) continue;
+            const old = s.version.items[v];
+            const t: Term = if (old > outer) (if (s.value.items[v].tag != .none) s.value.items[v] else .{ .tag = .variable, .a = v, .b = old }) else .{ .tag = .variable, .a = v, .b = outer };
+            try w.setVar(v, ver, t);
+        }
+    }
+
     /// The variable that holds `x` here: `x` itself, or a known value of
     /// one of the last 32 variables stored.
     fn variableOf(w: *const Walker, x: Term) ?u32 {
@@ -1650,6 +1865,24 @@ const Walker = struct {
         for (w.s.cands.items) |g| {
             const now = w.varTerm(g.v);
             if (now.eql(g.base)) continue;
+            switch (g.kind) {
+                .upper => {},
+                // At least the constant by the value's own bounds (`i + 1`
+                // exact, with `i` at least it).
+                .lower => {
+                    const lo = w.range(now, .{ .signedness = .unsigned, .bits = g.bits }).lo;
+                    if (lo > g.y.value() or (g.op == .le and lo == g.y.value())) continue;
+                    return false;
+                },
+                // The value at the start plus a multiple of the step,
+                // exactly, or a constant of the same remainder.
+                .stride => {
+                    if (now.tag == .konst and @mod(now.value(), g.c) == g.y.value()) continue;
+                    const o = w.offset(now, true);
+                    if (o.x.eql(g.base) and o.c % g.c == 0) continue;
+                    return false;
+                },
+            }
             // Within a constant bound by the value's own bounds.
             if (g.c == 0 and g.y.isConst()) {
                 const hi = w.range(now, .{ .signedness = .unsigned, .bits = g.bits }).hi;
@@ -1718,6 +1951,19 @@ const Walker = struct {
             }
         }
         return true;
+    }
+
+    /// The steps a variable stored in a loop changes by there, from its
+    /// value `start` before the loop: the greatest common divisor of the
+    /// constants it adds and the constants' differences from `start`; 0
+    /// when it is not stored, 1 when other values are.
+    fn stride(lv: *const LoopVar, start: i128) u64 {
+        var m = lv.step;
+        if (lv.first) |f0| {
+            m = gcd0(m, lv.spread);
+            m = gcd0(m, @intCast(@min(@abs(f0 - start), std.math.maxInt(u64))));
+        }
+        return m;
     }
 
     /// Records instruction `i` before a speculative walk changes it.
@@ -1972,8 +2218,12 @@ const Walker = struct {
             else => {
                 // Unsigned, so both operands are at least 0.
                 if (signed) return false;
-                const p = std.math.mul(i128, ra.hi, rb.hi) catch return false;
-                return p <= lim.hi;
+                const p = std.math.mul(i128, ra.hi, rb.hi) catch lim.hi + 1;
+                if (p <= lim.hi) return true;
+                // `c * x` at most an exact `c' * x` with `c <= c'`, of a
+                // type no wider (`2 * n` after `4 * n`).
+                const c, const x = if (a.tag == .konst) .{ a, b } else if (b.tag == .konst) .{ b, a } else return false;
+                return w.multipleOf(x, c.value(), info.bits) != null;
             },
         }
     }
@@ -2066,7 +2316,11 @@ const Walker = struct {
                         } else break :blk_none,
                     };
                     const lim = limits(own);
-                    if (exact.lo >= lim.lo and exact.hi <= lim.hi) r = .{ .lo = @max(r.lo, exact.lo), .hi = @min(r.hi, exact.hi) };
+                    const fits = exact.lo >= lim.lo and exact.hi <= lim.hi;
+                    if (fits) r = .{ .lo = @max(r.lo, exact.lo), .hi = @min(r.hi, exact.hi) };
+                    // An exact product (its check passed) of a constant.
+                    if (tag == .mul_wrap and (fits or w.s.exact.isSet(t.a)) and own.signedness == .unsigned)
+                        r.lo = @max(r.lo, w.leastProduct(w.term(data.bin_op.lhs), w.term(data.bin_op.rhs)));
                 },
                 // An addition or subtraction that did not wrap computed
                 // the exact result.
@@ -2077,7 +2331,7 @@ const Walker = struct {
                     const own = w.intInfo(@as(Inst.Index, @fromBackingInt(@intCast(t.a))).toRef()) orelse break :blk_none;
                     const a = w.rangeIn(p[0], own, depth - 1);
                     const b = w.rangeIn(p[1], own, depth - 1);
-                    const exact: Range = if (add != null)
+                    var exact: Range = if (add != null)
                         .{ .lo = a.lo + b.lo, .hi = a.hi + b.hi }
                     else if (sub != null)
                         .{ .lo = a.lo - b.hi, .hi = a.hi - b.lo }
@@ -2085,6 +2339,7 @@ const Walker = struct {
                         .{ .lo = a.lo * b.lo, .hi = std.math.mul(i128, a.hi, b.hi) catch break :blk_none }
                     else
                         break :blk_none;
+                    if (add == null and sub == null and exact.lo == 0 and own.signedness == .unsigned) exact.lo = w.leastProduct(p[0], p[1]);
                     r = .{ .lo = @max(r.lo, exact.lo), .hi = @min(r.hi, exact.hi) };
                 },
                 // A value-preserving `intcast` keeps its operand's bounds,
@@ -2095,6 +2350,17 @@ const Walker = struct {
                     const a = w.rangeIn(w.term(data.ty_op.operand), from, depth - 1);
                     const lim = limits(own);
                     if (ir.instructions.items(.tag)[t.a] == .intcast or (a.lo >= lim.lo and a.hi <= lim.hi)) r = .{ .lo = @max(r.lo, a.lo), .hi = @min(r.hi, a.hi) };
+                },
+                // An unsigned `a << b` that shifts out no bits, by the
+                // bounds of `a` and of `b`, is `a * 2^b`.
+                .shl => if (depth > 0) if (w.intInfo(@as(Inst.Index, @fromBackingInt(@intCast(t.a))).toRef())) |own| {
+                    if (own.signedness == .signed) break :blk_none;
+                    const a = w.rangeIn(w.term(data.bin_op.lhs), own, depth - 1);
+                    const b = w.rangeIn(w.term(data.bin_op.rhs), w.intInfo(data.bin_op.rhs) orelse break :blk_none, depth - 1);
+                    if (a.lo < 0 or b.lo < 0 or b.hi >= own.bits) break :blk_none;
+                    const hi = a.hi << @intCast(b.hi);
+                    if (hi > limits(own).hi) break :blk_none;
+                    r = .{ .lo = @max(r.lo, a.lo << @intCast(b.lo)), .hi = @min(r.hi, hi) };
                 },
                 .min_int, .max_int => |tag| if (depth > 0) if (w.intInfo(@as(Inst.Index, @fromBackingInt(@intCast(t.a))).toRef())) |own| {
                     const a = w.rangeIn(w.term(data.bin_op.lhs), own, depth - 1);
@@ -2168,7 +2434,76 @@ const Walker = struct {
             if (r.lo == k) r.lo += 1;
             if (r.hi == k) r.hi -= 1;
         }
+        // A loop variable stepping by a constant (`stride`) keeps its
+        // remainder by it: below 32 and a multiple of 4, `i` is at most 28.
+        if (t.tag == .variable and w.s.cands.items.len != 0) for (w.s.cands.items) |g| {
+            if (g.kind != .stride or !g.base.eql(t)) continue;
+            const m: i128 = g.c;
+            const rem = g.y.value();
+            r.lo += @mod(rem - r.lo, m);
+            r.hi -= @mod(r.hi - rem, m);
+        };
         return r;
+    }
+
+    /// The least value of an exact unsigned product `a * b`, one of them
+    /// a constant `c`: `c` when another exact product of the other is
+    /// above a value (`2 * n` after `i < 4 * n`, so `n >= 1`), else 0.
+    fn leastProduct(w: *const Walker, a: Term, b: Term) i128 {
+        const c, const x = if (a.tag == .konst) .{ a, b } else if (b.tag == .konst) .{ b, a } else return 0;
+        if (c.value() == 0) return 0;
+        const m = w.multipleOf(x, 1, 64) orelse return 0;
+        return if (m.positive) c.value() else 0;
+    }
+
+    /// The operands' terms of a minimum: a vector-style `min_int`, or the
+    /// block Sema builds for a scalar `@min(x, y)`, `if (x < y) x else y`.
+    fn minOperands(w: *const Walker, i: u32) ?[2]Term {
+        const ir = w.ir;
+        const tags = ir.instructions.items(.tag);
+        const datas = ir.instructions.items(.data);
+        switch (tags[i]) {
+            .min_int => return .{ w.term(datas[i].bin_op.lhs), w.term(datas[i].bin_op.rhs) },
+            .block => {
+                const x = ir.extraData(Ir.Block, datas[i].ty_pl.payload);
+                const blk_body = ir.bodySlice(x.end, x.data.body_len);
+                if (blk_body.len != 1 or tags[@backingInt(blk_body[0])] != .cond_br) return null;
+                const cb = datas[@backingInt(blk_body[0])].pl_op;
+                const c = cb.operand.toIndex() orelse return null;
+                if (tags[@backingInt(c)] != .cmp_lt) return null;
+                const cx = ir.extraData(Ir.CondBr, cb.payload);
+                if (cx.data.then_body_len != 1 or cx.data.else_body_len != 1) return null;
+                const sides = ir.bodySlice(cx.end, 2);
+                for (sides) |sd| if (tags[@backingInt(sd)] != .br or datas[@backingInt(sd)].br.block_inst != @as(Inst.Index, @fromBackingInt(i))) return null;
+                const cmp = datas[@backingInt(c)].bin_op;
+                if (datas[@backingInt(sides[0])].br.operand != cmp.lhs or datas[@backingInt(sides[1])].br.operand != cmp.rhs) return null;
+                return .{ w.term(cmp.lhs), w.term(cmp.rhs) };
+            },
+            else => return null,
+        }
+    }
+
+    const Multiple = struct { c: i128, positive: bool };
+
+    /// An exact unsigned product `c * x` of at most `bits`, with `c` at
+    /// least `min`, that a recent fact names, and whether a fact puts it
+    /// above a value (so `x >= 1`).
+    fn multipleOf(w: *const Walker, x: Term, min: i128, bits: u16) ?Multiple {
+        var best: ?Multiple = null;
+        for (w.recent()) |g| {
+            if (g.signed) continue;
+            for ([2]Term{ g.a, g.b }, 0..) |t, which| {
+                const p = w.exactOperands(t, .mul_with_overflow) orelse continue;
+                const c, const y = if (p[0].tag == .konst) .{ p[0], p[1] } else if (p[1].tag == .konst) .{ p[1], p[0] } else continue;
+                if (!y.eql(x) or c.value() < min) continue;
+                const own = w.intInfo(@as(Inst.Index, @fromBackingInt(@intCast(t.a))).toRef()) orelse continue;
+                if (own.signedness == .signed or own.bits > bits) continue;
+                const positive = which == 1 and g.op == .lt;
+                if (best == null or positive) best = .{ .c = c.value(), .positive = positive };
+                if (positive) return best;
+            }
+        }
+        return best;
     }
 
     /// The facts searched: the most recent, which keeps a function with
@@ -2274,6 +2609,21 @@ const Walker = struct {
         }
         if (w.holds(f) or w.offsetHolds(f)) return true;
         if (w.holds(negate(f)) or w.offsetHolds(negate(f))) return false;
+        if (f.op == .lt or f.op == .le) {
+            const ir = w.ir;
+            // Unsigned `x % n < n`, `n` at least 1.
+            if (!f.signed and f.a.tag == .inst) switch (ir.instructions.items(.tag)[f.a.a]) {
+                .rem, .mod => if (w.term(ir.instructions.items(.data)[f.a.a].bin_op.rhs).eql(f.b) and w.range(f.b, info).lo >= 1) return true,
+                else => {},
+            };
+            // `x < y` from `x < @min(y, z)` (or `<=`).
+            for (w.recent()) |g| {
+                if (g.signed != f.signed or !g.a.eql(f.a) or g.b.tag != .inst) continue;
+                if (g.op != .lt and !(g.op == .le and f.op == .le)) continue;
+                const m = w.minOperands(g.b.a) orelse continue;
+                if (m[0].eql(f.b) or m[1].eql(f.b)) return true;
+            }
+        }
         // `x + 1 <= y` from `x < y`: then `x + 1 <= y <= max`, so even a
         // wrapping `+%` computed `x + 1` exactly.
         if (f.op == .le) if (w.plusOne(f.a, false)) |x| {
