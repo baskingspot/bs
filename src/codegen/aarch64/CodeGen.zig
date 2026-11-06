@@ -120,9 +120,20 @@ always_counts: std.ArrayList(u32) = .empty,
 /// `argsPlain`, for `scratchUse`.
 plain_args: bool = false,
 /// The values `Ssa.allocate` may keep in a register that does not survive
-/// the clobber points they cross, saved and restored around each one.
-/// None yet.
+/// the clobber points they cross (x12-x15), saved and restored around
+/// each one (`Ssa.planSplits`).
 split: std.bit_set.Dynamic = .{},
+/// The values that got such a register: each clobber point they cross
+/// stores them to their slot (`split_slots`) first, and they are read from
+/// there and reloaded after it (`genSplit`). Loads that share such a
+/// value's register follow it (`of`, else the value itself). A value that
+/// does not change (not a variable or a block result) is stored once per
+/// block (`stored`, the last block that stored it).
+split_vals: std.ArrayList(struct { v: u32, of: u32, stored: u32 = no_base }) = .empty,
+split_slots: std.AutoHashMapUnmanaged(u32, Mem) = .empty,
+/// Scratch for `genSplit`: the values saved around the current clobber
+/// point, with their homes.
+split_now: std.ArrayList(struct { v: u32, home: Home, reload: bool }) = .empty,
 /// The condition under which the last overflow operation whose bit its
 /// block's branch reads from the flags (`fate == .fused`) overflowed.
 ovf_cc: Cond = .vs,
@@ -311,6 +322,9 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.clobber_counts.deinit(gpa);
         cg.always_counts.deinit(gpa);
         cg.split.deinit(gpa);
+        cg.split_vals.deinit(gpa);
+        cg.split_slots.deinit(gpa);
+        cg.split_now.deinit(gpa);
     }
     @memset(cg.homes, .none);
     @memset(cg.pair_base, no_base);
@@ -648,8 +662,15 @@ fn allocateRegs(cg: *CodeGen) Error!void {
     // that may call (`callFree`); x12-x15 and v20-v29 do not, so a value
     // in one never crosses a clobber point unless it is split, and a
     // vector that crosses one stays in memory (`Ssa.want_vec`).
-    try cg.split.resize(cg.gpa, cg.ir.instructions.len, false);
-    cg.split.unsetAll();
+    try f.planSplits(cg.gpa, cg.ir, &cg.split, saved_regs, null);
+    // A by-reference argument's register holds a pointer, which
+    // `genSplit` would save as the value; a folded address's base may be
+    // overwritten by the clobbering value before it reads its users.
+    if (cg.fn_ty.cc == .auto) for (cg.ir.mainBody()) |inst| {
+        if (cg.ir.instructions.items(.tag)[@backingInt(inst)] != .arg) break;
+        if (cg.autoClass(cg.ir.instructions.items(.data)[@backingInt(inst)].arg.ty) == .memory) cg.split.unset(@backingInt(inst));
+    };
+    for (cg.pair_base) |b| if (b != no_base) cg.split.unset(b);
     const survive = alloc_regs.len + float_regs.len;
     const n = survive + vreg_count;
     const survives: u32 = (1 << saved_regs) - 1 | ((1 << float_regs.len) - 1) << alloc_regs.len;
@@ -700,6 +721,95 @@ fn allocateRegs(cg: *CodeGen) Error!void {
         else
             .{ .vreg = @fromBackingInt(@intCast(vreg_first + reg[i] - survive)) };
         if (reg[i] >= survive) cg.vregs = true;
+    }
+    try cg.planSplitVals();
+}
+
+/// `split_vals`, after allocation: the split values that cross a clobber
+/// point in one of x12-x15, and the values that share their registers.
+fn planSplitVals(cg: *CodeGen) Error!void {
+    const f = cg.ssa;
+    const live = f.live.slice();
+    const reg = live.items(.reg);
+    const fates = live.items(.fate);
+    const share = live.items(.share);
+    for (f.values.items(.inst)) |inst| {
+        const i = @backingInt(inst);
+        if (fates[i] != .normal) continue;
+        // A value computed or loaded in a split variable's register
+        // (`Live.share`) that kept it when the variable was evicted later
+        // has no variable to be saved with: it is saved itself.
+        const sh = share[i];
+        const orphan = sh != Ssa.no_tie and reg[i] < alloc_regs.len and reg[sh] != reg[i];
+        if (!cg.split.isSet(i) and !orphan) continue;
+        const keep = live.items(.crosses)[i] and switch (cg.homes[i]) {
+            .reg => |r| callee_saved_mask & regBit(r) == 0,
+            else => false,
+        };
+        if (keep) try cg.split_vals.append(cg.gpa, .{ .v = i, .of = i }) else cg.split.unset(i);
+    }
+    if (cg.split_vals.items.len == 0) return;
+    // A load that shares a promoted variable's register, or one forwarded
+    // from a value (whose home it takes when emitted), reads the same
+    // register.
+    const fwd = live.items(.fwd);
+    for (f.values.items(.inst)) |inst| {
+        const i = @backingInt(inst);
+        if (fates[i] != .normal) continue;
+        const of = if (share[i] != Ssa.no_tie and reg[share[i]] == reg[i]) share[i] else if (fwd[i] != Ssa.no_tie) fwd[i] else continue;
+        if (cg.split.isSet(of)) try cg.split_vals.append(cg.gpa, .{ .v = i, .of = of });
+    }
+}
+
+/// Emits value `inst`, at position `q`, a clobber point, saving the values
+/// in `split_vals` whose intervals contain it: each is stored to its slot,
+/// read from there by `inst`, and reloaded after it unless this was its
+/// last use or `inst` does not return. The moves count as `inst`'s writes,
+/// which may be any caller-saved register (`checkWrites`).
+fn genSplit(cg: *CodeGen, inst: Inst.Index, q: u32) Error!void {
+    const live = cg.ssa.live.slice();
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const tags = cg.ir.instructions.items(.tag);
+    const block = @backingInt(cg.block);
+    cg.split_now.clearRetainingCapacity();
+    for (cg.split_vals.items) |*sv| {
+        const v = sv.v;
+        if (def[v] >= q or end[v] < q) continue;
+        const home = cg.homes[v];
+        if (sv.of != v) {
+            // Once emitted, it holds the register of its value, which
+            // comes first in `split_vals`.
+            const of = for (cg.split_now.items) |o| {
+                if (o.v == sv.of) break o;
+            } else continue;
+            if (!std.meta.eql(home, of.home)) continue;
+            cg.homes[v] = cg.homes[sv.of];
+            try cg.split_now.append(cg.gpa, .{ .v = v, .home = home, .reload = false });
+            continue;
+        }
+        const r = switch (home) {
+            .reg => |r| r,
+            else => continue,
+        };
+        const slot = try cg.split_slots.getOrPut(cg.gpa, v);
+        if (!slot.found_existing) slot.value_ptr.* = try cg.allocSlot(8, 8);
+        const fixed = tags[v] != .alloc and tags[v] != .block;
+        if (!fixed or sv.stored != block) try cg.storeReg(slot.value_ptr.*, r, 8);
+        if (fixed) sv.stored = block;
+        cg.homes[v] = .{ .slot = slot.value_ptr.* };
+        try cg.split_now.append(cg.gpa, .{ .v = v, .home = home, .reload = end[v] != q });
+    }
+    try cg.genInst(inst);
+    try cg.flushResults();
+    const returns = cg.ir.typeOfIndex(inst, cg.ip) != .noreturn_type;
+    // A result computed in a variable's register (`Live.share`) is the
+    // variable's new value.
+    const result = cg.homes[@backingInt(inst)];
+    for (cg.split_now.items) |sn| {
+        cg.homes[sn.v] = sn.home;
+        if (!sn.reload or !returns or std.meta.eql(sn.home, result)) continue;
+        try cg.loadMem(sn.home.reg, cg.split_slots.get(sn.v).?, .usize_type);
     }
 }
 
@@ -2587,15 +2697,18 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
         if (cg.fate(inst) != .dead) {
             const calls = cg.e.calls;
             cg.e.written = 0;
-            try cg.genInst(inst);
+            const q = Ssa.valuePos(idx);
+            const clobber = cg.live and !std.meta.eql(cl[q], cl[q - 1]);
+            if (clobber and cg.split_vals.items.len != 0) try cg.genSplit(inst, q) else {
+                try cg.genInst(inst);
+                try cg.flushResults();
+            }
             // A call clobbers v20-v29: only clobber points may make one,
             // and calls of `returnError`, which writes no vector register.
             assert(!cg.vregs or cg.e.calls == calls or !cg.callFree(inst) or cg.ir.instructions.items(.tag)[@backingInt(inst)] == .call);
-            try cg.flushResults();
             if (checked) {
-                const q = Ssa.valuePos(idx);
                 const planned = if (ret_err) 0 else cg.scratch_values.items[idx];
-                try cg.checkWrites(inst, planned, !std.meta.eql(cl[q], cl[q - 1]), cg.ownRegs(inst));
+                try cg.checkWrites(inst, planned, clobber, cg.ownRegs(inst));
             }
         } else try cg.keepSymbols(inst);
     }
