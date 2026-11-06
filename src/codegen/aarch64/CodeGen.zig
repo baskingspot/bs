@@ -216,7 +216,7 @@ const Home = union(enum) {
     /// The memory this many bytes into the function's own result, through
     /// the pointer the caller passed, read through x8: a call whose result
     /// a `ret` returns (`planRetCalls`) writes it there, and its users read
-    /// it there. Such values are larger than 16 bytes, which the lowerings
+    /// it there. Such values are larger than 32 bytes, which the lowerings
     /// that use x8 as scratch (`atomicRmw16`) never read.
     result: u32,
     /// A 16-byte value (`inPair`) whose eightbytes are in these registers;
@@ -982,7 +982,7 @@ fn retCall(cg: *CodeGen, v0: Inst.Index) ?Inst.Index {
         .call => {
             const extra = ir.extraData(Ir.Call, datas[@backingInt(v)].pl_op.payload);
             if (extra.data.flags.always_tail) return null;
-            if (cg.calleeType(datas[@backingInt(v)].pl_op.operand).cc != .auto or cg.autoClass(ir.typeOfIndex(v, ip)) != .memory) return null;
+            if (cg.calleeType(datas[@backingInt(v)].pl_op.operand).cc != .auto or cg.autoRetClass(ir.typeOfIndex(v, ip)) != .memory) return null;
             return v;
         },
         .bitcast => {
@@ -1006,7 +1006,7 @@ fn retCall(cg: *CodeGen, v0: Inst.Index) ?Inst.Index {
 /// `return f(x)` held one more copy of a large result. The result's memory
 /// holds one such value at a time.
 fn planRetCalls(cg: *CodeGen) Error!void {
-    if (cg.fn_ty.cc != .auto or cg.autoClass(cg.fn_ty.return_type) != .memory) return;
+    if (cg.fn_ty.cc != .auto or cg.autoRetClass(cg.fn_ty.return_type) != .memory) return;
     const f = cg.ssa;
     const ir = cg.ir;
     const ip = cg.ip;
@@ -1075,8 +1075,9 @@ fn calleeType(cg: *CodeGen, callee: Ref) InternPool.FuncType {
 /// extended like a load), in a vector register (v0-v7: floats of 16, 32,
 /// and 64 bits, and vectors of 2 to 16 bytes, `autoVec`), or in memory
 /// (arguments in the outgoing area, in 8-byte aligned slots; results
-/// through the pointer in x8).
-const AutoClass = enum { none, gpr, gpr_pair, fpr, memory };
+/// through the pointer in x8). `gpr_quad` is for results only
+/// (`autoRetClass`).
+const AutoClass = enum { none, gpr, gpr_pair, gpr_quad, fpr, memory };
 
 fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
     const ip = cg.ip;
@@ -1087,6 +1088,19 @@ fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
     if (cg.autoVec(ty)) return .fpr;
     const size = Type.abiSize(ip, ty);
     return if (size == 0) .none else if (size <= 8) .gpr else if (size <= 16) .gpr_pair else .memory;
+}
+
+/// How `.auto` returns a value: as `autoClass` passes it, except that
+/// one of 17 to 32 bytes other than a float comes back as its bytes in
+/// x0-x3 (`gpr_quad`, the last register holding the bytes past 24 or 16
+/// as `gpr_pair`'s second does), not through x8: the callee loads the
+/// registers where it would have copied to x8's memory, and the caller
+/// stores them where it would have pointed x8. Error unions of slices and
+/// of 16-byte optionals are this size. Nothing outside bs calls `.auto`.
+fn autoRetClass(cg: *CodeGen, ty: Index) AutoClass {
+    const c = cg.autoClass(ty);
+    if (c == .memory and Type.class(cg.ip, ty) != .float and Type.abiSize(cg.ip, ty) <= 32) return .gpr_quad;
+    return c;
 }
 
 /// Whether `.auto` passes `ty` in a vector register as its bytes: a
@@ -1160,6 +1174,7 @@ fn autoArgs(cg: *CodeGen, tys: []const Index, locs: ?[]ArgLoc) u32 {
                 break :blk .{ .fpr = fp - 1 };
             } else .{ .stack = 0 },
             .memory => .{ .stack = 0 },
+            .gpr_quad => unreachable,
         };
         if (l == .stack) {
             l = .{ .stack = stack };
@@ -1451,7 +1466,7 @@ fn setupParams(cg: *CodeGen) Error!void {
     // function called through a pointer, which bs calls like `.auto`.
     cg.trace_x15 = cg.fn_ty.cc == .auto and cg.emit.zcu.fe.any_error_tracing;
     const ret_ty = cg.fn_ty.return_type;
-    if (if (is_c) cg.cRetClass(ret_ty) == .indirect else cg.autoClass(ret_ty) == .memory) {
+    if (if (is_c) cg.cRetClass(ret_ty) == .indirect else cg.autoRetClass(ret_ty) == .memory) {
         cg.ret_ptr_slot = try cg.allocSlot(8, 8);
         try cg.storeReg(cg.ret_ptr_slot.?, .x8, 8);
     }
@@ -3936,10 +3951,21 @@ fn ret(cg: *CodeGen, operand: Ref) Error!void {
     const ty = cg.fn_ty.return_type;
     if (isC(cg.fn_ty.cc)) {
         try cg.cRet(operand);
-    } else switch (cg.autoClass(ty)) {
+    } else switch (cg.autoRetClass(ty)) {
         .none => {},
         .gpr => try cg.loadGpr(.x0, operand),
         .gpr_pair => try cg.loadPair(.x0, .x1, try cg.valOf(operand)),
+        .gpr_quad => {
+            const m = try cg.valMem(try cg.valOf(operand));
+            const size = Type.abiSize(cg.ip, ty);
+            try cg.e.ldp(.dword, .x0, .x1, try cg.pairAccess(m, .x16));
+            if (size == 32) {
+                try cg.e.ldp(.dword, .x2, .x3, try cg.pairAccess(m.plus(16), .x16));
+            } else {
+                try cg.loadBytes(.x2, m.plus(16), @min(size - 16, 8));
+                if (size > 24) try cg.loadBytes(.x3, m.plus(24), size - 24);
+            }
+        },
         .fpr => try cg.loadFp(.v0, try cg.valOf(operand)),
         .memory => {
             // Already there (`planRetCalls`).
@@ -4205,7 +4231,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const is_c = isC(callee_ty.cc);
     // A scalar result in a register is moved there from x0 (or v0), and
     // so is a vector returned in v0.
-    const vec_in_v0 = cg.inVec(ret_ty) and (if (is_c) cg.cRetClass(ret_ty) == .fpr else cg.autoClass(ret_ty) == .fpr);
+    const vec_in_v0 = cg.inVec(ret_ty) and (if (is_c) cg.cRetClass(ret_ty) == .fpr else cg.autoRetClass(ret_ty) == .fpr);
     const in_reg = !tail and (cg.homes[@backingInt(inst)] == .reg or (cg.homes[@backingInt(inst)] == .vreg and (vec_in_v0 or !cg.inVec(ret_ty))));
     // Written straight into this function's result (`planRetCalls`).
     const to_result: ?u32 = switch (cg.homes[@backingInt(inst)]) {
@@ -4245,7 +4271,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             else => {},
         };
         try cg.placeArgs(vals, locs, tail);
-        if (cg.autoClass(ret_ty) == .memory) try cg.resultPtrTo(dst, tail);
+        if (cg.autoRetClass(ret_ty) == .memory) try cg.resultPtrTo(dst, tail);
         if (to_result) |off| {
             try cg.loadMem(.x8, cg.ret_ptr_slot.?, .usize_type);
             if (off != 0) try cg.e.addSub(.add, .x, .x8, .x8, .{ .imm = @intCast(off) });
@@ -4286,11 +4312,17 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const m = dst orelse return;
     if (is_c) return cg.cCallResult(ret_ty, m);
     const size = Type.abiSize(ip, ret_ty);
-    switch (cg.autoClass(ret_ty)) {
+    switch (cg.autoRetClass(ret_ty)) {
         .gpr => try cg.storeBytes(m, .x0, size),
         .gpr_pair => {
             try cg.storeReg(m, .x0, 8);
             try cg.storeBytes(m.plus(8), .x1, size - 8);
+        },
+        .gpr_quad => {
+            try cg.storeRegsMem(m, .{ .lo = .x0, .hi = .x1 });
+            if (size == 32) return cg.storeRegsMem(m.plus(16), .{ .lo = .x2, .hi = .x3 });
+            try cg.storeBytes(m.plus(16), .x2, @min(size - 16, 8));
+            if (size > 24) try cg.storeBytes(m.plus(24), .x3, size - 24);
         },
         .fpr => try cg.storeFp(m, .v0, size),
         .none, .memory => {},
