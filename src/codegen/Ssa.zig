@@ -78,6 +78,8 @@ pairs: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
 /// Scratch for `plan`: the allocs it considers promoting, and their loads.
 candidates: std.ArrayList(u32) = .empty,
 var_loads: std.ArrayList(u32) = .empty,
+/// Their stores of undefined values, which go with a forwarded variable.
+var_undefs: std.ArrayList(u32) = .empty,
 /// The innermost loop around each of `var_loads`.
 var_load_loops: std.ArrayList(u32) = .empty,
 /// Scratch for `deadFills`.
@@ -260,6 +262,7 @@ pub fn deinit(f: *Ssa, gpa: Allocator) void {
     f.pairs.deinit(gpa);
     f.candidates.deinit(gpa);
     f.var_loads.deinit(gpa);
+    f.var_undefs.deinit(gpa);
     f.var_load_loops.deinit(gpa);
     f.fills.deinit(gpa);
     f.* = undefined;
@@ -744,6 +747,12 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
 ///   keeps one register for its interval, which `liveness` extends over
 ///   the loops that use it, so it needs no phis. A load may share the
 ///   variable's register (`Live.share`).
+/// - Forwarding: a candidate whose only store of a value comes before its
+///   loads in the layout, and, for a variable, dominates them, is not
+///   emitted, nor are its stores; each load is that value (`Live.fwd`).
+///   A `*const` alloc's store dominates its loads by Sema's scoping. A
+///   variable may also be stored undefined; a load the value's store does
+///   not dominate keeps it a variable.
 /// With inline assembly only pass 2 runs. `ctx.inGpr(ty)` says whether
 /// an overflow operation on `ty` runs in general-purpose registers.
 pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: anytype) Allocator.Error!void {
@@ -788,6 +797,7 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
     const candidate = no_tie - 1;
     f.candidates.clearRetainingCapacity();
     f.var_loads.clearRetainingCapacity();
+    f.var_undefs.clearRetainingCapacity();
     f.var_load_loops.clearRetainingCapacity();
     // A candidate's `fwd` holds its only store while forwarding is
     // possible, then `no_fwd`.
@@ -856,7 +866,6 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
                     // Class 3: only forwarded, never promoted.
                     const class: u32 = if (ctx.inGpr(info.child)) 0 else if (ctx.inPair(info.child)) 1 else if (ctx.inFloat(info.child)) 2 else if (ctx.inVec(info.child)) 4 else if (info.flags.is_const) 3 else continue;
                     count[i] = candidate;
-                    if (!info.flags.is_const) fwd[i] = no_fwd;
                     try f.candidates.append(gpa, i | class << 29);
                 },
                 .load => if (fate[i] != .dead) {
@@ -870,7 +879,10 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
                     const bin = datas[i].bin_op;
                     const v = @backingInt(bin.lhs.toIndex() orelse continue);
                     if (count[v] != no_tie and bin.rhs != bin.lhs) count[v] -%= 1;
-                    if (count[v] != no_tie) fwd[v] = if (fwd[v] == no_tie and bin.rhs.toIndex() != null) i else no_fwd;
+                    // An undefined value may be any, such as the one stored.
+                    const undef = if (bin.rhs.toInterned()) |c| ip.keyTag(c) == .undef else false;
+                    if (count[v] != no_tie and !undef) fwd[v] = if (fwd[v] == no_tie and bin.rhs.toIndex() != null) i else no_fwd;
+                    if (count[v] != no_tie and undef) try f.var_undefs.append(gpa, i);
                 },
                 else => if (cond != null and cond.? == inst and uses[i] == 1 and ctx.fusable(inst)) {
                     fate[i] = .fused;
@@ -889,11 +901,20 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
             }
         }
     }
-    // Forwarding needs the store before every load in the layout, as it
-    // dominates them.
+    // Forwarding needs the store before every load in the layout, and
+    // dominating them: a `*const` alloc's does.
+    var doms: ?Doms = null;
+    defer if (doms) |*d| d.deinit(gpa);
     for (f.var_loads.items) |l| {
         const v = @backingInt(datas[l].ty_op.operand.toIndex().?);
-        if (fwd[v] < no_fwd and def[l] < def[fwd[v]]) fwd[v] = no_fwd;
+        if (fwd[v] >= no_fwd) continue;
+        if (def[l] < def[fwd[v]]) {
+            fwd[v] = no_fwd;
+            continue;
+        }
+        if (Type.ptrInfo(ip, datas[v].ty).flags.is_const) continue;
+        if (doms == null) doms = try f.dominators(gpa, ir);
+        if (!doms.?.dominates(valueIndex(def[fwd[v]]), valueIndex(def[l]))) fwd[v] = no_fwd;
     }
     // A candidate whose every use is a load or a store's address is
     // forwarded or promoted (see `plan`).
@@ -919,6 +940,9 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
         // Only a forwarded alloc keeps its store (read below); `fwd` of
         // any other value is a forwarded load's.
         if (fate[v] != .dead) fwd[v] = no_tie;
+    }
+    for (f.var_undefs.items) |st| {
+        if (fate[@backingInt(datas[st].bin_op.lhs.toIndex().?)] == .dead) fate[st] = .dead;
     }
     const crosses = live.items(.crosses);
     const end = live.items(.end);
@@ -996,6 +1020,9 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
                     if (f.termReadsShared(ir, pb.term, @fromBackingInt(v))) break false;
                     if (def[w] >= valuePos(pb.start)) {
                         start = valuePos(pb.start);
+                        // A check proven to pass continues into the block
+                        // of its passing side (`prove`).
+                        if (pb.term.tag == .fallthrough or (pb.term.tag == .jump and f.fwd.items[pb.term.succ[0]] == block)) break true;
                         if (pb.term.tag != .branch) break false;
                         var here = false;
                         for (pb.term.succ) |succ| {
@@ -2055,6 +2082,146 @@ pub const DeadArms = struct {
         return at - cl[lo][1] > left;
     }
 };
+
+/// The index of the value at position `pos` (`valuePos`).
+fn valueIndex(pos: u32) u32 {
+    return (pos - 2) / 2;
+}
+
+/// Dominators of the blocks, for `plan`'s forwarding of variables.
+const Doms = struct {
+    /// Per block, its immediate dominator (itself for the entry, `none` if
+    /// unreached); per value, its block.
+    idom: []u32,
+    block_of: []u32,
+
+    const none = std.math.maxInt(u32);
+
+    fn deinit(d: *Doms, gpa: Allocator) void {
+        gpa.free(d.idom);
+        gpa.free(d.block_of);
+        d.* = undefined;
+    }
+
+    /// Whether value `a`'s block dominates value `b`'s, which comes after
+    /// `a` in the layout.
+    fn dominates(d: *const Doms, a: u32, b: u32) bool {
+        const ba = d.block_of[a];
+        var x = d.block_of[b];
+        while (x != ba) {
+            if (d.idom[x] == none or d.idom[x] == x) return false;
+            x = d.idom[x];
+        }
+        return true;
+    }
+};
+
+/// The blocks' dominators, as Cooper, Harvey and Kennedy's iteration
+/// over reverse postorder computes them.
+fn dominators(f: *const Ssa, gpa: Allocator, ir: *const Ir) Allocator.Error!Doms {
+    const nb = f.blocks.items.len;
+    const none = Doms.none;
+    const block_of = try gpa.alloc(u32, f.values.len);
+    errdefer gpa.free(block_of);
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        @memset(block_of[b.start..][0..b.len], @backingInt(block));
+    }
+    // Successors, then predecessors, each a slice per block of one array.
+    var succs: std.ArrayList(u32) = .empty;
+    defer succs.deinit(gpa);
+    const succ_start = try gpa.alloc(u32, nb + 1);
+    defer gpa.free(succ_start);
+    for (f.blocks.items, 0..) |b, bi| {
+        succ_start[bi] = @intCast(succs.items.len);
+        switch (b.term.tag) {
+            .jump, .fallthrough => try succs.append(gpa, b.term.succ[0]),
+            .branch => try succs.appendSlice(gpa, &b.term.succ),
+            .switch_br => {
+                const n = ir.extraData(Ir.SwitchBr, ir.instructions.items(.data)[@backingInt(b.term.inst)].pl_op.payload).data.cases_len;
+                for (f.switchCases(b.term, n)) |c| try succs.append(gpa, @backingInt(c));
+                try succs.append(gpa, b.term.succ[1]);
+            },
+            .ret, .unreach, .noreturn => {},
+        }
+    }
+    succ_start[nb] = @intCast(succs.items.len);
+    const pred_start = try gpa.alloc(u32, nb + 1);
+    defer gpa.free(pred_start);
+    @memset(pred_start, 0);
+    for (succs.items) |t| pred_start[t + 1] += 1;
+    for (1..nb + 1) |i| pred_start[i] += pred_start[i - 1];
+    const preds = try gpa.alloc(u32, succs.items.len);
+    defer gpa.free(preds);
+    const fill = try gpa.dupe(u32, pred_start[0..nb]);
+    defer gpa.free(fill);
+    for (0..nb) |p| for (succs.items[succ_start[p]..succ_start[p + 1]]) |t| {
+        preds[fill[t]] = @intCast(p);
+        fill[t] += 1;
+    };
+    // Postorder numbers from a depth-first walk from the entry.
+    const po = try gpa.alloc(u32, nb);
+    defer gpa.free(po);
+    @memset(po, none);
+    var order: std.ArrayList(u32) = .empty;
+    defer order.deinit(gpa);
+    var stack: std.ArrayList([2]u32) = .empty;
+    defer stack.deinit(gpa);
+    const entry = @backingInt(f.layout.items[0]);
+    const seen = try gpa.alloc(bool, nb);
+    defer gpa.free(seen);
+    @memset(seen, false);
+    seen[entry] = true;
+    try stack.append(gpa, .{ entry, succ_start[entry] });
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top[1] < succ_start[top[0] + 1]) {
+            const t = succs.items[top[1]];
+            top[1] += 1;
+            if (!seen[t]) {
+                seen[t] = true;
+                try stack.append(gpa, .{ t, succ_start[t] });
+            }
+        } else {
+            po[top[0]] = @intCast(order.items.len);
+            try order.append(gpa, top[0]);
+            _ = stack.pop();
+        }
+    }
+    const idom = try gpa.alloc(u32, nb);
+    @memset(idom, none);
+    idom[entry] = entry;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var k = order.items.len;
+        while (k > 0) {
+            k -= 1;
+            const bi = order.items[k];
+            if (bi == entry) continue;
+            var new: u32 = none;
+            for (preds[pred_start[bi]..pred_start[bi + 1]]) |p| {
+                if (idom[p] == none) continue;
+                if (new == none) {
+                    new = p;
+                    continue;
+                }
+                var x = p;
+                var y = new;
+                while (x != y) {
+                    while (po[x] < po[y]) x = idom[x];
+                    while (po[y] < po[x]) y = idom[y];
+                }
+                new = x;
+            }
+            if (new != none and idom[bi] != new) {
+                idom[bi] = new;
+                changed = true;
+            }
+        }
+    }
+    return .{ .idom = idom, .block_of = block_of };
+}
 
 const LiveWalk = struct {
     uses: []u32,

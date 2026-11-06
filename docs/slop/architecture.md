@@ -2928,6 +2928,14 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      interval grows over the loads' intervals and the loops around them.
      Sema makes such an alloc for every `const` local and capture, which
      promotion gave a register and a move of their own.
+     A `var` local is forwarded the same way when its one store of a
+     value dominates every load (dominators of the blocks, Cooper, Harvey
+     and Kennedy, computed only when such a candidate exists); its stores
+     of `undefined` go with it. A `*const` alloc's store dominates its
+     loads by Sema's scoping. On the zig compiler's source: aarch64
+     register moves 2,053,818 → 2,024,331, x86 1,141,858 → 1,117,130,
+     .text −0.25% to −0.96%, Ir of tls's tests −3.9% and hpke's −6.4% on
+     x86, compile time neutral.
    - Frame addresses: a field pointer, or an element pointer with a
      constant index, of an alloc in the frame is itself a frame address
      (`Home.frame_addr`): no register, no code. Of a pointer that wants
@@ -3032,7 +3040,9 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      and no terminator on the way. The store is in the value's block, or
      in the arm its block's branch takes when the other arm, between
      them in the layout, ends the function (the failing check of
-     `i += 1`). A value whose only use is its block's `br` shares the
+     `i += 1`), or in the block its block continues into when `prove`
+     made that check pass (`.fallthrough`, or a `.jump` to the block
+     next in the layout). A value whose only use is its block's `br` shares the
      block result's register the same way; nothing reads that register
      before the block ends.
    - An overflow operation at a native width adds or subtracts in its
