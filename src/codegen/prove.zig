@@ -97,6 +97,11 @@ pub const Scratch = struct {
     vlog: std.ArrayList(VarState) = .empty,
     block_facts: std.ArrayList(Fact) = .empty,
     bool_blocks: std.AutoHashMapUnmanaged(u32, BoolFacts) = .empty,
+    /// The exits of integer blocks (`Exit.ints`), each linked to the
+    /// block's one before, and per walked block with a constant exit and
+    /// at most `max_int_exits`, its last (`Walker.restoreExits`).
+    int_exits: std.ArrayList(IntExit) = .empty,
+    int_blocks: std.AutoHashMapUnmanaged(u32, IntBlock) = .empty,
     /// Per load of a slice whose length a store just before wrote
     /// (`Walker.forwardStore`): that length.
     load_lens: std.AutoHashMapUnmanaged(u32, Term) = .empty,
@@ -112,6 +117,8 @@ pub const Scratch = struct {
         s.vlog.deinit(gpa);
         s.block_facts.deinit(gpa);
         s.bool_blocks.deinit(gpa);
+        s.int_exits.deinit(gpa);
+        s.int_blocks.deinit(gpa);
         s.kind.deinit(gpa);
         s.version.deinit(gpa);
         s.value.deinit(gpa);
@@ -209,7 +216,23 @@ const Exit = struct {
     /// (`nsnaps[nsnap.start..][0..nsnap.len]`, with `nsnap.count` 1).
     nfrom: u32 = 0,
     nsnap: Span = .{},
+    /// For an integer block: how many `br`s exit it so far, and the last
+    /// one's `IntExit` (`int_exits`), while at most `max_int_exits`.
+    is_int: bool = false,
+    ints: u32 = 0,
+    last_int: u32 = 0,
 };
+
+/// A `br` to an integer block: its value, and unless a constant, what
+/// held there (`exit_facts[facts.start..][0..facts.len]`) and what
+/// `numbers` added in the block (`nsnaps`, `nums.count` 0 when more than
+/// 64); `prev`, the block's `br` before.
+const IntExit = struct { value: Term, facts: Span, nums: Span, prev: u32 };
+
+const max_int_exits = 4;
+
+/// A walked integer block's last `IntExit` and how many it has.
+const IntBlock = struct { last: u32, n: u32 };
 
 const NumberSnap = struct { key: Key, value: Term };
 
@@ -288,6 +311,8 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *Scratch, fu
     scratch.vlog.clearRetainingCapacity();
     scratch.block_facts.clearRetainingCapacity();
     scratch.bool_blocks.clearRetainingCapacity();
+    scratch.int_exits.clearRetainingCapacity();
+    scratch.int_blocks.clearRetainingCapacity();
     scratch.load_lens.clearRetainingCapacity();
     classify(ip, ir, scratch.kind.items);
     var w: Walker = .{ .gpa = gpa, .ip = ip, .ir = ir, .s = scratch, .fuzz = fuzz };
@@ -575,6 +600,7 @@ const Walker = struct {
                     .block = inst,
                     .depth = @intCast(depth),
                     .is_bool = data.ty_pl.ty == .bool_type,
+                    .is_int = data.ty_pl.ty != .bool_type and w.intInfo(inst.toRef()) != null,
                     .from = @intCast(from),
                     .nfrom = @intCast(s.nlog.items.len),
                 });
@@ -589,6 +615,7 @@ const Walker = struct {
                     for (exit.cond) |c| try s.block_facts.appendSlice(w.gpa, s.cond_exit_facts.items[c.start..][0..c.len]);
                     try s.bool_blocks.put(w.gpa, ii, .{ .start = start, .len = .{ exit.cond[0].len, exit.cond[1].len } });
                 }
+                if (exit.is_int) try w.intBlock(ii, exit, insts);
                 // A body whose only exit is the `br` to this block that ends
                 // it ran every store at its top level before leaving, so
                 // they hold after it; stores in nested bodies were merged
@@ -1029,7 +1056,8 @@ const Walker = struct {
             // hold after it anyway), at most the 16 most recent.
             const all = s.facts.items[e.depth..];
             const inside = all[all.len -| 16..];
-            try w.meet(&s.exit_facts, &e.facts, inside);
+            if (e.is_int) try w.intExit(k, operand, inside);
+            try w.meet(&s.exit_facts, &s.exits.items[k].facts, inside);
             return;
         }
     }
@@ -1054,6 +1082,119 @@ const Walker = struct {
         sp.start = @intCast(start);
         sp.len = @intCast(list.items.len - start);
         sp.count += 1;
+    }
+
+    /// Records a `br` to integer block `exits[k]` with `operand`: for
+    /// any but a constant, what held there (`inside`) and what `numbers`
+    /// added in the block, for `restoreExits`.
+    fn intExit(w: *Walker, k: usize, operand: Inst.Ref, inside: []const Fact) Allocator.Error!void {
+        const s = w.s;
+        const e = &s.exits.items[k];
+        e.ints += 1;
+        if (e.ints > max_int_exits) return;
+        const v = w.term(operand);
+        var x: IntExit = .{ .value = v, .facts = .{}, .nums = .{}, .prev = e.last_int };
+        if (!v.isConst()) {
+            x.facts = .{ .count = 1, .start = @intCast(s.exit_facts.items.len), .len = @intCast(inside.len) };
+            try s.exit_facts.appendSlice(w.gpa, inside);
+            if (s.nlog.items.len - e.nfrom <= 64) {
+                x.nums = .{ .count = 1, .start = @intCast(s.nsnaps.items.len), .len = @intCast(s.nlog.items.len - e.nfrom) };
+                try s.nsnaps.appendSlice(w.gpa, s.nlog.items[e.nfrom..]);
+            }
+        }
+        e.last_int = @intCast(s.int_exits.items.len);
+        try s.int_exits.append(w.gpa, x);
+    }
+
+    /// After integer block `ii` is walked: keeps its exits for
+    /// `restoreExits` when they are its only ones (its body does not
+    /// continue), at most `max_int_exits`, and one is a constant, which a
+    /// later fact may exclude.
+    fn intBlock(w: *Walker, ii: u32, exit: Exit, insts: []const Inst.Index) Allocator.Error!void {
+        const s = w.s;
+        const ir = w.ir;
+        const closed = insts.len != 0 and ir.typeOfIndex(insts[insts.len - 1], w.ip) == .noreturn_type;
+        if (closed and exit.ints >= 2 and exit.ints <= max_int_exits and exit.ints == exit.facts.count) {
+            var i = exit.last_int;
+            for (0..exit.ints) |_| {
+                const x = s.int_exits.items[i];
+                if (x.value.isConst()) return s.int_blocks.put(w.gpa, ii, .{ .last = exit.last_int, .n = exit.ints });
+                i = x.prev;
+            }
+        }
+        // A walk of the body under other assumptions (`speculate`) may
+        // have kept it.
+        _ = s.int_blocks.remove(ii);
+    }
+
+    /// After fact `f`: when it bounds the value of an integer block
+    /// (`intBlock`) so that it cannot be some constant exits' values,
+    /// what held at every other exit holds here, and where one is left,
+    /// the block's value is that exit's and what `numbers` added before
+    /// it is known again. `f` is `b op k` or `k op b` for the block's
+    /// value `b`, or the overflow bit of `b - k` (unsigned) being 0,
+    /// which is `k <= b`.
+    fn restoreExits(w: *Walker, f: Fact) Allocator.Error!void {
+        const s = w.s;
+        const ir = w.ir;
+        var b: Term = f.a;
+        var k: Term = f.b;
+        var left = true;
+        var op = f.op;
+        if (!k.isConst()) {
+            b = f.b;
+            k = f.a;
+            left = false;
+        }
+        if (!k.isConst() or b.tag != .inst) return;
+        if (ir.instructions.items(.tag)[b.a] == .struct_field_val) {
+            // `@subWithOverflow(b, k)[1] == 0`, unsigned: `k <= b`.
+            if (f.op != .eq or !left or k.value() != 0) return;
+            const sf = ir.extraData(Ir.StructField, ir.instructions.items(.data)[b.a].ty_pl.payload).data;
+            const sub = sf.operand.toIndex() orelse return;
+            if (sf.index != 1 or ir.instructions.items(.tag)[@backingInt(sub)] != .sub_with_overflow) return;
+            const bin = ir.extraData(Ir.Bin, ir.instructions.items(.data)[@backingInt(sub)].ty_pl.payload).data;
+            const info = w.intInfo(bin.lhs) orelse return;
+            if (info.signedness == .signed) return;
+            b = w.term(bin.lhs);
+            k = w.term(bin.rhs);
+            if (!k.isConst() or b.tag != .inst) return;
+            left = false;
+            op = .le;
+        }
+        const blk = s.int_blocks.get(b.a) orelse return;
+        // The exits left.
+        var left_exits: [max_int_exits]IntExit = undefined;
+        var n: usize = 0;
+        var i = blk.last;
+        for (0..blk.n) |_| {
+            const x = s.int_exits.items[i];
+            i = x.prev;
+            const possible = !x.value.isConst() or holdsConst(op, if (left) x.value.value() else k.value(), if (left) k.value() else x.value.value());
+            if (possible) {
+                // A constant exit left: nothing held there was kept.
+                if (x.value.isConst()) return;
+                left_exits[n] = x;
+                n += 1;
+            }
+        }
+        // None excluded, or none left (this path does not run).
+        if (n == 0 or n == blk.n) return;
+        // What held at every exit left.
+        const first = left_exits[0].facts;
+        for (s.exit_facts.items[first.start..][0..first.len]) |g| {
+            for (left_exits[1..n]) |x| {
+                if (for (s.exit_facts.items[x.facts.start..][0..x.facts.len]) |h| (if (std.meta.eql(g, h)) break true) else false) continue;
+                break;
+            } else try s.facts.append(w.gpa, g);
+        }
+        if (n != 1) return;
+        const x = left_exits[0];
+        if (x.nums.count != 0) for (s.nsnaps.items[x.nums.start..][0..x.nums.len]) |nm| {
+            _ = try w.numberOf(nm.key, nm.value);
+        };
+        const info = w.intInfo(@as(Inst.Index, @fromBackingInt(b.a)).toRef()) orelse return;
+        try s.facts.append(w.gpa, .{ .op = .eq, .signed = info.signedness == .signed, .bits = @intCast(info.bits), .a = b, .b = x.value });
     }
 
     /// The value of `bool` `r` if known: a constant, or decided by the facts.
@@ -1645,7 +1786,9 @@ const Walker = struct {
                 if (w.isUndef(data.bin_op.lhs) or w.isUndef(data.bin_op.rhs)) return;
                 var f = fact(tag, w.term(data.bin_op.lhs), w.term(data.bin_op.rhs), info);
                 if (!truth) f = negate(f);
-                return w.s.facts.append(w.gpa, f);
+                try w.s.facts.append(w.gpa, f);
+                if (w.s.int_blocks.count() != 0) try w.restoreExits(f);
+                return;
             },
             // What held at every exit of a `bool` block (`a and b`, an
             // inlined call) with this value.
@@ -2212,6 +2355,16 @@ fn negate(f: Fact) Fact {
         .le => with(f, .lt, f.b, f.a),
         .eq => with(f, .ne, f.a, f.b),
         .ne => with(f, .eq, f.a, f.b),
+    };
+}
+
+/// Whether `a op b` holds for constants.
+fn holdsConst(op: Op, a: i128, b: i128) bool {
+    return switch (op) {
+        .lt => a < b,
+        .le => a <= b,
+        .eq => a == b,
+        .ne => a != b,
     };
 }
 
