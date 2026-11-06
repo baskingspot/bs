@@ -1900,8 +1900,10 @@ pub fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
 
 /// The registers the allocator hands out: the callee-saved ones, in the
 /// order the prologue saves them, then the caller-saved ones no lowering
-/// uses as scratch except the clobbering ones (`clobbers`).
-const alloc_regs = [_]Reg{ .rbx, .r12, .r13, .r14, .r15, .rsi, .rdi, .r8, .r9, .r11 };
+/// uses as scratch except the clobbering ones (`clobbers`), then the
+/// scratch registers, which hold values whose intervals contain no
+/// lowering that may write them (`scratchUse`).
+const alloc_regs = [_]Reg{ .rbx, .r12, .r13, .r14, .r15, .rsi, .rdi, .r8, .r9, .r11, .r10, .rdx, .rcx };
 const callee_saved: u32 = 0b11111;
 const callee_saved_mask: u16 = Reg.bit(.rbx) | Reg.bit(.r12) | Reg.bit(.r13) | Reg.bit(.r14) | Reg.bit(.r15);
 /// The registers lowerings write as scratch besides rax, which hold only
@@ -2054,14 +2056,142 @@ fn fusedUsesR11(cg: *CodeGen, c: Inst.Index) bool {
 /// The registers of `scratch_regs` value `inst`'s lowering may write,
 /// decided before allocation, so that no value that lives across it, or
 /// that it reads last or computes, lives in them. `checkWrites` fails a
-/// function whose lowering writes one this did not list.
+/// function whose lowering writes one this did not list. Clobber points
+/// (`clobbers`) write all of them; `planScratch` does not ask.
 fn scratchUse(cg: *CodeGen, inst: Inst.Index) u16 {
-    return @as(u16, if (cg.usesR11(inst)) Reg.bit(.r11) else 0) | Reg.bit(.rcx) | Reg.bit(.rdx) | Reg.bit(.r10);
+    const r11_bit: u16 = if (cg.usesR11(inst)) Reg.bit(.r11) else 0;
+    return r11_bit | cg.scalarScratch(inst);
+}
+
+/// The registers of rcx, rdx and r10 the lowering of value `inst` may
+/// write: none for the scalar lowerings below, whose fallbacks for an
+/// operand in memory use their result's register, rax, or a register
+/// they save around the use (`borrowReg`); all for the rest.
+fn scalarScratch(cg: *CodeGen, inst: Inst.Index) u16 {
+    const all: u16 = Reg.bit(.rcx) | Reg.bit(.rdx) | Reg.bit(.r10);
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const i = @backingInt(inst);
+    const tag = ir.instructions.items(.tag)[i];
+    const data = ir.instructions.items(.data)[i];
+    const rcx = Reg.bit(.rcx);
+    switch (tag) {
+        .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .loop => return 0,
+        // A block's result is written by its `br`s; an alloc takes a
+        // slot or computes an address with rax.
+        .block, .alloc => return 0,
+        .load => return if (cg.scalar(data.ty_op.ty) or cg.inGprBytes(data.ty_op.ty)) 0 else all,
+        .store => {
+            const ty = cg.typeOf(data.bin_op.rhs);
+            return if (cg.scalar(ty) or cg.inGprBytes(ty)) 0 else all;
+        },
+        .struct_field_ptr => return 0,
+        .struct_field_val => return if (cg.scalar(data.ty_pl.ty) and int128.lowers(cg, inst) == null) 0 else all,
+        .slice_ptr, .slice_len => return 0,
+        .ptr_elem_ptr, .slice_elem_ptr, .ptr_add => return 0,
+        .ptr_elem_val, .slice_elem_val => return if (cg.scalar(ir.typeOfIndex(inst, ip))) 0 else all,
+        .int_from_bool, .int_from_ptr => return 0,
+        .intcast, .trunc, .bitcast => return if (cg.scalar(data.ty_op.ty) and cg.scalar(cg.typeOf(data.ty_op.operand))) 0 else all,
+        .not => return if (cg.scalar(data.ty_op.ty)) 0 else all,
+        .add_wrap, .sub_wrap, .bit_and, .bit_or, .xor, .mul_wrap => {
+            const ty = cg.typeOf(data.bin_op.lhs);
+            if (!cg.scalar(ty)) return all;
+            if (tag == .mul_wrap and Type.abiSize(ip, ty) == 1 and data.bin_op.rhs.toInterned() == null) return rcx;
+            return if (cg.srcScratch(data.bin_op.rhs)) rcx else 0;
+        },
+        .shl, .shr => {
+            if (!cg.scalar(cg.typeOf(data.bin_op.lhs))) return all;
+            return if (data.bin_op.rhs.toInterned() == null) rcx else 0;
+        },
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => return cg.condScratch(inst),
+        .add_with_overflow, .sub_with_overflow => {
+            const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+            const ty = cg.typeOf(bin.lhs);
+            if (!cg.scalar(ty) or Type.class(ip, ty) != .int) return all;
+            // `overflowArith` at a native width.
+            return switch (Type.intInfo(ip, ty).bits) {
+                8, 16, 32, 64 => if (cg.srcScratch(bin.rhs)) rcx else 0,
+                else => all,
+            };
+        },
+        else => return all,
+    }
+}
+
+/// Whether type `ty` lives in a general-purpose register as a scalar.
+fn scalar(cg: *CodeGen, ty: Index) bool {
+    return Type.class(cg.ip, ty) != .vector and cg.inGpr(ty);
+}
+
+/// Whether `srcOperand` may load `ref` into its scratch register: a
+/// constant that is no 32-bit immediate, or an address in the frame or
+/// folded into a register (`Loc.addr`). A value in a register or in
+/// memory is read there.
+fn srcScratch(cg: *CodeGen, ref: Ref) bool {
+    if (ref.toInterned()) |v| return switch (cg.ip.indexToKey(v)) {
+        .int => std.math.cast(i32, @as(i64, @bitCast(intBits(cg.ip, v)))) == null,
+        .simple_value => |sv| sv != .true and sv != .false,
+        else => true,
+    };
+    const x = ref.toIndex().?;
+    return cg.ir.instructions.items(.tag)[@backingInt(x)] == .alloc or cg.addr_base[@backingInt(x)] != no_base or cg.frameFoldable(ref);
+}
+
+/// `scalarScratch` for a condition `condFlags` computes, as a bool or in
+/// the flags of the branch it is fused into: a scalar compare, a test of
+/// an optional or an error union, an overflow bit left in the flags, or a
+/// `not` of one of those or of a bool.
+fn condScratch(cg: *CodeGen, inst: Inst.Index) u16 {
+    const all: u16 = Reg.bit(.rcx) | Reg.bit(.rdx) | Reg.bit(.r10);
+    const ir = cg.ir;
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    const fate = cg.ssa.live.items(.fate);
+    switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .is_null, .is_non_null, .is_err, .is_non_err => return 0,
+        // An overflow bit in the flags (`overflowOp`).
+        .struct_field_val => return if (fate[@backingInt(inst)] == .fused) 0 else all,
+        .not => {
+            if (!cg.scalar(data.ty_op.ty)) return all;
+            const x = data.ty_op.operand.toIndex() orelse return 0;
+            return if (fate[@backingInt(x)] == .fused) cg.condScratch(x) else 0;
+        },
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
+            const lhs = data.bin_op.lhs;
+            if (lhs.toIndex()) |bit| if (fate[@backingInt(bit)] == .fused) return 0; // an overflow bit
+            if (!cg.scalar(cg.typeOf(lhs))) return all;
+            return if (cg.srcScratch(data.bin_op.rhs)) Reg.bit(.rcx) else 0;
+        },
+        else => return all,
+    }
 }
 
 /// `scratchUse` for block `block`'s terminator.
 fn termScratch(cg: *CodeGen, block: Ssa.Block.Index) u16 {
-    return @as(u16, if (cg.termUsesR11(block)) Reg.bit(.r11) else 0) | Reg.bit(.rcx) | Reg.bit(.rdx) | Reg.bit(.r10);
+    const r11_bit: u16 = if (cg.termUsesR11(block)) Reg.bit(.r11) else 0;
+    return r11_bit | cg.termScalarScratch(block);
+}
+
+/// `scalarScratch` for block `block`'s terminator: a jump or branch whose
+/// `br` writes a scalar block result and whose condition is a bool or a
+/// fused scalar compare, or a return of a scalar in rax.
+fn termScalarScratch(cg: *CodeGen, block: Ssa.Block.Index) u16 {
+    const all: u16 = Reg.bit(.rcx) | Reg.bit(.rdx) | Reg.bit(.r10);
+    const ir = cg.ir;
+    const term = cg.ssa.blocks.items[@backingInt(block)].term;
+    const tag = ir.instructions.items(.tag)[@backingInt(term.inst)];
+    const data = ir.instructions.items(.data)[@backingInt(term.inst)];
+    const br_ok = tag != .br or cg.ssa.live.items(.uses)[@backingInt(data.br.block_inst)] == 0 or
+        cg.scalar(ir.typeOfIndex(data.br.block_inst, cg.ip));
+    return switch (term.tag) {
+        .fallthrough, .noreturn, .unreach => 0,
+        .jump => if (br_ok) 0 else all,
+        .branch => if (!br_ok) all else if (Ssa.branchCond(ir, term).toIndex()) |c| switch (cg.ssa.live.items(.fate)[@backingInt(c)]) {
+            .fused => cg.condScratch(c),
+            else => 0,
+        } else 0,
+        .ret => if (cg.fn_ty.cc == .auto and cg.autoClass(cg.fn_ty.return_type) == .gpr and cg.passInRegs(cg.fn_ty.return_type)) 0 else all,
+        .switch_br => all,
+    };
 }
 
 /// `scratch_counts`, `scratch_values` and `scratch_terms`, after
@@ -2083,7 +2213,8 @@ fn planScratch(cg: *CodeGen) Error!void {
         const b = f.blocks.items[@backingInt(block)];
         for (b.start..b.start + b.len) |i| {
             const inst = f.values.items(.inst)[i];
-            const m = if (f.live.items(.fate)[@backingInt(inst)] != .dead) cg.scratchUse(inst) else 0;
+            const clobber = !std.meta.eql(f.clobbers.items[2 * i + 2], f.clobbers.items[2 * i + 1]);
+            const m = if (f.live.items(.fate)[@backingInt(inst)] == .dead) 0 else if (clobber) scratch_mask else cg.scratchUse(inst);
             cg.scratch_values.items[i] = m;
             for (scratch_regs, &counts, cls) |r, *n, cl| {
                 if (m & r.bit() != 0) n.* += 1;
@@ -2091,7 +2222,7 @@ fn planScratch(cg: *CodeGen) Error!void {
                 cl[2 * i + 3] = n.*;
             }
         }
-        const m = cg.termScratch(block);
+        const m = if (cg.termClobbers(block)) scratch_mask else cg.termScratch(block);
         cg.scratch_terms.items[@backingInt(block)] = m;
         for (scratch_regs, &counts, cls) |r, *n, cl| {
             if (m & r.bit() != 0) n.* += 1;
@@ -4391,16 +4522,78 @@ fn srcOperand(cg: *CodeGen, ref: Ref, scratch: Reg) Error!Encoder.Operand {
     return .{ .reg = scratch };
 }
 
+/// `srcOperand`, but memory of 1, 2 or 4 bytes too, with the size of the
+/// instruction that reads it: an extended integer's low bytes, from a
+/// slot a register of its type wrote (`loadKnown`). The others are
+/// `.qword`. `srcScratch` decides before allocation whether `scratch` may
+/// be written.
+fn srcOperandNarrow(cg: *CodeGen, ref: Ref, scratch: Reg) Error!struct { Encoder.Operand, Size } {
+    switch (try cg.locOf(ref)) {
+        .reg => |r| return .{ .{ .reg = r }, .qword },
+        .imm => |v| if (std.math.cast(i32, @as(i64, @bitCast(v)))) |x| return .{ .{ .imm = x }, .qword },
+        .mem => |m| switch (Type.abiSize(cg.ip, cg.typeOf(ref))) {
+            8 => return .{ .{ .mem = m }, .qword },
+            1, 2, 4 => |n| return .{ .{ .mem = m }, sizeOf(n) },
+            else => {},
+        },
+        else => {},
+    }
+    try cg.load(scratch, ref);
+    return .{ .{ .reg = scratch }, .qword };
+}
+
 /// The memory pointer `ptr` points to. May use r10.
 fn ptrMem(cg: *CodeGen, ptr: Ref) Error!Mem {
+    return cg.ptrMemVia(ptr, .r10);
+}
+
+/// `ptrMem`, loading a pointer that is not in a register into `scratch`.
+fn ptrMemVia(cg: *CodeGen, ptr: Ref, scratch: Reg) Error!Mem {
     switch (try cg.locOf(ptr)) {
         .addr => |m| return m,
         .reg => |r| return Mem.at(r, 0),
         else => {
-            try cg.load(.r10, ptr);
-            return Mem.at(.r10, 0);
+            try cg.load(scratch, ptr);
+            return Mem.at(scratch, 0);
         },
     }
+}
+
+/// A register of rcx, rdx and r10 that holds none of value `inst`'s
+/// operands, nor `avoid`, which a scalar lowering (`scalarScratch`) saves
+/// on the stack around its use as scratch (`giveBack`): the fallback for
+/// an operand in memory when its result's register and rax are taken.
+/// Nothing addresses the frame through rsp there.
+fn borrowReg(cg: *CodeGen, inst: Inst.Index, avoid: u16) Error!struct { Reg, u16 } {
+    const OperandRegs = struct {
+        cg: *CodeGen,
+        mask: *u16,
+        const Self = @This();
+        pub fn use(c: Self, ref: Ref) void {
+            const x = ref.toIndex() orelse return;
+            c.mask.* |= homeRegs(c.cg.homes[@backingInt(x)]);
+            switch (c.cg.homes[@backingInt(x)]) {
+                .reg_addr => |a| c.mask.* |= a.base.bit(),
+                .ind => |r| c.mask.* |= r.bit(),
+                else => {},
+            }
+        }
+    };
+    var used = avoid;
+    Ssa.forEachOperand(cg.ir, inst, OperandRegs{ .cg = cg, .mask = &used });
+    const r: Reg = for ([_]Reg{ .r10, .rdx, .rcx }) |r| {
+        if (used & r.bit() == 0) break r;
+    } else unreachable;
+    try cg.e.push(r);
+    return .{ r, cg.e.written };
+}
+
+/// Restores the register `borrowReg` saved, which then counts as not
+/// written unless it was before.
+fn giveBack(cg: *CodeGen, b: struct { Reg, u16 }) Error!void {
+    const r, const written = b;
+    try cg.e.pop(r);
+    cg.e.written = cg.e.written & ~r.bit() | written & r.bit();
 }
 
 /// `d = ptr + off`.
@@ -4432,8 +4625,10 @@ fn storeVal(cg: *CodeGen, m: Mem, ref: Ref, size: u64) Error!void {
 }
 
 /// `d = base + index * size`, where `base` is a pointer or, if `is_slice`,
-/// a slice. Uses rcx.
-fn elemAddrTo(cg: *CodeGen, d: Reg, is_slice: bool, base: Ref, index: Ref, size: u64) Error!void {
+/// a slice, operands of value `inst`. Uses no scratch register but `d`
+/// and rax, unless `d` is rax and holds the base, and the index is in
+/// memory or needs scaling, when it borrows one (`borrowReg`).
+fn elemAddrTo(cg: *CodeGen, inst: Inst.Index, d: Reg, is_slice: bool, base: Ref, index: Ref, size: u64) Error!void {
     const base_reg: Reg = if (is_slice) blk: {
         if (cg.pairOf(base)) |p| break :blk p.lo;
         try cg.e.mov(.qword, .{ .reg = d }, .{ .mem = try cg.memOf(base) });
@@ -4447,7 +4642,24 @@ fn elemAddrTo(cg: *CodeGen, d: Reg, is_slice: bool, base: Ref, index: Ref, size:
         },
         else => {},
     };
-    const idx = try cg.regOf(index, .rcx);
+    if (size == 0) {
+        if (base_reg != d) try cg.e.mov(.qword, .{ .reg = d }, .{ .reg = base_reg });
+        return;
+    }
+    // The index's register, else `d` when the base is elsewhere, else rax.
+    var borrowed: ?struct { Reg, u16 } = null;
+    const home: ?Reg = if (index.toIndex()) |x| switch (cg.homes[@backingInt(x)]) {
+        .reg => |r| r,
+        else => null,
+    } else null;
+    const idx: Reg = home orelse idx: {
+        const r = if (base_reg != d) d else if (d != .rax) .rax else r: {
+            borrowed = try cg.borrowReg(inst, d.bit());
+            break :r borrowed.?[0];
+        };
+        try cg.load(r, index);
+        break :idx r;
+    };
     const scale: ?Mem.Scale = switch (size) {
         1 => .@"1",
         2 => .@"2",
@@ -4455,14 +4667,18 @@ fn elemAddrTo(cg: *CodeGen, d: Reg, is_slice: bool, base: Ref, index: Ref, size:
         8 => .@"8",
         else => null,
     };
-    if (size == 0) {
-        if (base_reg != d) try cg.e.mov(.qword, .{ .reg = d }, .{ .reg = base_reg });
-    } else if (scale) |sc| {
+    if (scale) |sc| {
         try cg.e.lea(.qword, d, .{ .base = .{ .reg = base_reg }, .index = .{ .reg = idx, .scale = sc } });
     } else {
-        try cg.e.imul(.qword, .rcx, .{ .reg = idx }, @intCast(size));
-        try cg.e.lea(.qword, d, .{ .base = .{ .reg = base_reg }, .index = .{ .reg = .rcx } });
+        // The scaled index, in a register the base is not in.
+        const t = if (idx == d or idx == .rax or borrowed != null) idx else if (base_reg != d) d else if (d != .rax) .rax else t: {
+            borrowed = try cg.borrowReg(inst, d.bit());
+            break :t borrowed.?[0];
+        };
+        try cg.e.imul(.qword, t, .{ .reg = idx }, @intCast(size));
+        try cg.e.lea(.qword, d, .{ .base = .{ .reg = base_reg }, .index = .{ .reg = t } });
     }
+    if (borrowed) |b| try cg.giveBack(b);
 }
 
 /// Sets the flags for condition `inst` (a compare, `is_err`, or `is_null`
@@ -4494,9 +4710,10 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
             };
             if (int128.is128(ip, cg.typeOf(data.bin_op.lhs))) return int128.cmpFlags(cg, tag, data.bin_op.lhs, data.bin_op.rhs);
             const s = cg.signed(cg.typeOf(data.bin_op.lhs));
-            const rhs = try cg.srcOperand(data.bin_op.rhs, .rcx);
+            // Both extended, so their low bytes compare as they do.
+            const rhs, const at = try cg.srcOperandNarrow(data.bin_op.rhs, .rcx);
             const lhs = try cg.regOf(data.bin_op.lhs, .rax);
-            try cg.e.alu(.cmp, .qword, .{ .reg = lhs }, rhs);
+            try cg.e.alu(.cmp, at, .{ .reg = lhs }, rhs);
             return switch (tag) {
                 .cmp_lt => if (s) .l else .b,
                 .cmp_lte => if (s) .le else .be,
@@ -5027,7 +5244,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 return cg.copyTo((try cg.resultMem(inst, ty)) orelse return, data.ty_op.operand);
             }
             if (cg.pairOf(inst.toRef())) |d| return cg.loadQwords(d.lo, d.hi, try cg.ptrMem(data.ty_op.operand));
-            if (cg.passInRegs(ty)) return cg.loadResult(inst, ty, try cg.ptrMem(data.ty_op.operand));
+            // A pointer in memory goes through the result's register.
+            if (cg.passInRegs(ty)) return cg.loadResult(inst, ty, try cg.ptrMemVia(data.ty_op.operand, if (cg.xmmOf(inst.toRef()) != null) .rax else cg.destReg(inst)));
             const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.copyMem(dst, try cg.ptrMem(data.ty_op.operand), Type.abiSize(ip, data.ty_op.ty));
         },
@@ -5047,7 +5265,28 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             if (cg.varReg(data.bin_op.lhs)) |r| return cg.load(r, val);
             if (cg.varXmm(data.bin_op.lhs)) |x| return cg.loadXmm(x, try cg.valOf(val));
             if (cg.pairOf(data.bin_op.lhs)) |p| return cg.loadRegs(p, val); // a variable
-            if (cg.passInRegs(cg.typeOf(val))) return cg.storeVal(try cg.ptrMem(data.bin_op.lhs), val, size);
+            if (cg.passInRegs(cg.typeOf(val))) {
+                // A pointer in memory goes through rax unless the value
+                // does (`storeVal`).
+                const ptr = data.bin_op.lhs;
+                const in_reg = if (ptr.toIndex()) |p| switch (cg.homes[@backingInt(p)]) {
+                    .reg, .frame_addr, .reg_addr => true,
+                    else => false,
+                } else try cg.locOf(ptr) == .addr;
+                if (!in_reg) {
+                    {
+                        const direct = cg.xmmOf(val) != null or if (val.toIndex()) |v| cg.homes[@backingInt(v)] == .reg else switch (try cg.locOf(val)) {
+                            .imm => |k| size < 8 or std.math.cast(i32, @as(i64, @bitCast(k))) != null,
+                            else => false,
+                        };
+                        if (direct) return cg.storeVal(try cg.ptrMemVia(ptr, .rax), val, size);
+                        const b = try cg.borrowReg(inst, 0);
+                        try cg.storeVal(try cg.ptrMemVia(ptr, b[0]), val, size);
+                        return cg.giveBack(b);
+                    }
+                }
+                return cg.storeVal(try cg.ptrMem(ptr), val, size);
+            }
             // Not based on a register `copyTo` uses.
             const dst = switch (try cg.locOf(data.bin_op.lhs)) {
                 .addr => |m| m,
@@ -5376,7 +5615,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 if (cg.foldFrame(inst, bin.lhs, k *% Type.abiSize(ip, elem_ty))) return;
             };
             const d = cg.destReg(inst);
-            try cg.elemAddrTo(d, tag == .slice_elem_ptr, bin.lhs, bin.rhs, Type.abiSize(ip, elem_ty));
+            try cg.elemAddrTo(inst, d, tag == .slice_elem_ptr, bin.lhs, bin.rhs, Type.abiSize(ip, elem_ty));
             try cg.setResult(inst, data.ty_pl.ty, d);
         },
         .vector_store_elem => {
@@ -5406,13 +5645,15 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const ty = ir.typeOfIndex(inst, ip);
             const size = Type.abiSize(ip, ty);
             if (cg.pairOf(inst.toRef())) |d| {
-                try cg.elemAddrTo(.r10, tag == .slice_elem_val, data.bin_op.lhs, data.bin_op.rhs, size);
+                try cg.elemAddrTo(inst, .r10, tag == .slice_elem_val, data.bin_op.lhs, data.bin_op.rhs, size);
                 try cg.e.mov(.qword, .{ .reg = d.lo }, .{ .mem = Mem.at(.r10, 0) });
                 return cg.e.mov(.qword, .{ .reg = d.hi }, .{ .mem = Mem.at(.r10, 8) });
             }
             if (cg.passInRegs(ty)) {
-                try cg.elemAddrTo(.r10, tag == .slice_elem_val, data.bin_op.lhs, data.bin_op.rhs, size);
-                return cg.loadResult(inst, ty, Mem.at(.r10, 0));
+                // The address in the result's register.
+                const a = if (cg.xmmOf(inst.toRef()) != null) .rax else cg.destReg(inst);
+                try cg.elemAddrTo(inst, a, tag == .slice_elem_val, data.bin_op.lhs, data.bin_op.rhs, size);
+                return cg.loadResult(inst, ty, Mem.at(a, 0));
             }
             const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.elemAddr(.r10, tag == .slice_elem_val, data.bin_op.lhs, data.bin_op.rhs, size);
@@ -5988,7 +6229,8 @@ fn intOp(cg: *CodeGen, d: Reg, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Err
             try e.shift(op, size, .{ .reg = d }, count);
         },
         .mul_wrap => {
-            const src = try cg.srcOperand(rhs, .rcx);
+            // imul has no byte form with a memory operand.
+            const src, const at = if (Type.abiSize(cg.ip, ty) == 1) .{ try cg.srcOperand(rhs, .rcx), Size.qword } else try cg.srcOperandNarrow(rhs, .rcx);
             switch (src) {
                 .imm => |v| try e.imul(size, d, .{ .reg = try cg.regOf(lhs, d) }, @intCast(v)),
                 .reg => |r| {
@@ -5997,12 +6239,14 @@ fn intOp(cg: *CodeGen, d: Reg, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Err
                 },
                 .mem => |m| {
                     try cg.load(d, lhs);
-                    try e.imul(size, d, .{ .mem = m }, null);
+                    try e.imul(if (at == .qword) size else at, d, .{ .mem = m }, null);
+                    // The low bytes are the product's; the rest is lhs's.
+                    if (at != .qword and at != size) return cg.normalize(d, ty);
                 },
             }
         },
         else => {
-            const src = try cg.srcOperand(rhs, .rcx);
+            const src, const at = try cg.srcOperandNarrow(rhs, .rcx);
             try cg.load(d, lhs);
             try e.alu(switch (tag) {
                 .add_wrap => .add,
@@ -6011,7 +6255,10 @@ fn intOp(cg: *CodeGen, d: Reg, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Err
                 .bit_or => .@"or",
                 .xor => .xor,
                 else => unreachable,
-            }, size, .{ .reg = d }, src);
+            }, if (at == .qword) size else at, .{ .reg = d }, src);
+            // An operation on an operand's low bytes leaves lhs's above
+            // them, or none at 32 bits.
+            if (at != .qword and at != size) return cg.normalize(d, ty);
         },
     }
     if (size == .dword) return;
@@ -6387,8 +6634,8 @@ fn overflowArith(cg: *CodeGen, tag: Inst.Tag, bin: Ir.Bin, ty: Index, d: Reg) Er
                 try cg.e.unary(.mul, size, .{ .reg = rhs }); // writes rdx too
             }
         } else {
-            // A memory operand is 8 bytes, so only at 64 bits.
-            const rhs = try cg.srcOperand(bin.rhs, .rcx);
+            // A memory operand has the operation's width.
+            const rhs, _ = try cg.srcOperandNarrow(bin.rhs, .rcx);
             if (rhs == .reg and rhs.reg == r) r = .rax;
             try cg.load(r, bin.lhs);
             try cg.e.alu(if (tag == .add_with_overflow) .add else .sub, size, .{ .reg = r }, rhs);
