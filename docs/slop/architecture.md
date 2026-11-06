@@ -2347,19 +2347,35 @@ LLVM's thresholds, and at most 64 entries per block the table reaches,
 so wide ranges to few blocks, as in Aro's `codepointWidth`, are searched
 instead of filling kilobytes of table) as jump tables, and a binary search over the runs
 reaches them, ending in compares with immediates when 3 or fewer runs are
-left. The search tracks the values still possible, from the operand's ABI
-size (an undefined `u4` is 0xaa) and the compares made, so a case at an
-end of that range is one compare (`<= hi`), a table that covers it needs
-no bounds check, and a compare already in the flags is not repeated. A
+left. The search tracks the values still possible, from the operand's
+bit width and the compares made, so a case at an end of that range is
+one compare (`<= hi`), a table that covers it needs no bounds check, and
+a compare already in the flags is not repeated. A
 table is 32-bit offsets of the targets from the table itself, in the
 code right after the indirect jump (x86_64 `lea r11, [rip + T]; movsxd
 rcx, [r11 + idx*4]; add rcx, r11; jmp rcx`; aarch64 `adr x16, T; ldrsw
 x17, [x16, idx, lsl #2]; add x16, x16, x17; br x16`); the encoder writes
 the offsets once the code's layout is final, so the table is position
 independent and no linker sees it. A value no case holds goes to the
-else block, which keeps a corrupt or out-of-range operand on the safety
-check's path. Items whose values the linker assigns (error codes) and
-integers over 64 bits keep a compare per item, in order.
+else block, which keeps an out-of-range operand on the safety check's
+path. An integer or enum operand's register holds it extended from its
+width (a load of a `u3` masks the bits above it, "Narrow integers", and
+an undefined `u4` is 0xa, the 0xaa byte as a load reads it), so a
+switch whose cases cover every value of its type, such as
+`SelfUnwinder`'s on a `u3` and a `u2`, has no corrupt-value check: its
+else block, Sema's `corrupt_switch` panic, is unreachable. That is
+LLVM's reading of a narrow load (the low bits) and differs from
+upstream's self-hosted Debug build, which panics on a byte whose high
+bits are set (decided 2026-11-05). Items whose values the linker assigns
+(error codes) and integers over 64 bits keep a compare per item, in
+order.
+
+Measured (orb, ReleaseFast bs against main f067cd8, 2026-11-06):
+`SelfUnwinder.nextInner`'s own callgrind Ir falls 3.7% on zls's tests
+(-29M, 0.6% of the program) and 3.0% on bench/runtime's unwinder
+(-12M); the other programs are unchanged without stack capture. .text
+falls 0.08% on std's tests and 0.12% on the zig workload; compile Ir is
+unchanged.
 
 A case holds items and inclusive ranges (`Ir.SwitchBr`, read with
 `Ir.switchCases`; ranges since 2026-11-05). Sema keeps range prongs in
