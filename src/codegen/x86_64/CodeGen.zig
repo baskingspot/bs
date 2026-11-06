@@ -2287,10 +2287,14 @@ fn homeRegs(h: Home) u16 {
 /// write: `planned` (`scratchUse`), those a clobber point may write when
 /// it is one, and its own homes: its result's, an overflow pair's fields',
 /// a promoted variable's that a store writes, and for a `ret` the
-/// callee-saved ones the epilogue restores.
+/// callee-saved ones the epilogue restores. `returnError`'s own code may
+/// write only the scratch registers.
 fn checkWrites(cg: *CodeGen, inst: ?Inst.Index, planned: u16, clobber: bool, own: u16) Error!void {
     var allowed = planned | own;
     if (clobber) allowed |= clobber_mask | scratch_mask;
+    // Its callers keep every other register across a call of it
+    // (`clobbers`, `call`).
+    if (cg.ir.func == cg.emit.zcu.return_error) allowed = scratch_mask;
     const bad = cg.e.written & checked_mask & ~allowed;
     if (bad == 0) return;
     const r: Reg = @enumFromInt(@ctz(bad));
