@@ -733,6 +733,11 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
 ///   between sets the flags and `ctx.ovfFlagsOnly(tag, bits)`.
 /// - A condition only its block's branch reads is `fused` if
 ///   `ctx.fusable(inst)`.
+/// - A bit test is `fused` into its compare: a `trunc` to one bit (and
+///   a constant shift right it reads) compared with a constant or cast to
+///   `bool` (`.bool_true` for the constant), or a `bit_and` compared with
+///   0, when each is read only by the instruction after it and
+///   `ctx.fusableBit(inst, constant)` (`.none` for the shift). The compare reads the operand's bits itself, as `test`.
 /// - Arguments are all moved at the entry, so an unused one, whose interval
 ///   ends there, takes no register.
 /// - Promotion: a non-volatile alloc whose type is in a general-purpose
@@ -746,6 +751,20 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
 ///   variable's register (`Live.share`).
 /// With inline assembly only pass 2 runs. `ctx.inGpr(ty)` says whether
 /// an overflow operation on `ty` runs in general-purpose registers.
+/// The position in `values` of the instruction before position `k` that
+/// emits code, skipping line markers.
+fn prevValue(tags: []const Inst.Tag, values: []const Inst.Index, k: usize) ?usize {
+    var j = k;
+    while (j > 0) {
+        j -= 1;
+        switch (tags[@backingInt(values[j])]) {
+            .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+            else => return j,
+        }
+    }
+    return null;
+}
+
 pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: anytype) Allocator.Error!void {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
@@ -803,6 +822,31 @@ pub fn plan(f: *Ssa, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: 
         const values = insts[b.start..][0..b.len];
         for (values, 0..) |inst, k| {
             const i = @backingInt(inst);
+            // A bit test: a compare with a constant of a `trunc` to one
+            // bit, maybe of a shift right by a constant, or of a mask
+            // (`bit_and`) with 0, or a `trunc`'s bit cast to `bool`, each
+            // read only by the next instruction.
+            // The compare tests the bits of the operand in place
+            // (`ctx.fusableBit`).
+            const is_cmp = tags[i] == .cmp_eq or tags[i] == .cmp_neq;
+            // A `bool` field: its bit as a `bool`, as a compare with 1.
+            const is_bool = tags[i] == .bitcast and datas[i].ty_op.ty == .bool_type;
+            if (is_cmp or is_bool) bit: {
+                const c = if (is_bool) .bool_true else datas[i].bin_op.rhs.toInterned() orelse break :bit;
+                const l = (if (is_bool) datas[i].ty_op.operand else datas[i].bin_op.lhs).toIndex() orelse break :bit;
+                const li = @backingInt(l);
+                const lk = prevValue(tags, values, k) orelse break :bit;
+                if (values[lk] != l or uses[li] != 1 or fate[li] != .normal or !ctx.fusableBit(l, c)) break :bit;
+                fate[li] = .fused;
+                reg[li] = no_reg;
+                if (tags[li] != .trunc) break :bit;
+                const sh = datas[li].ty_op.operand.toIndex() orelse break :bit;
+                const si = @backingInt(sh);
+                const sk = prevValue(tags, values, lk) orelse break :bit;
+                if (values[sk] != sh or tags[si] != .shr or uses[si] != 1 or fate[si] != .normal or !ctx.fusableBit(sh, .none)) break :bit;
+                fate[si] = .fused;
+                reg[si] = no_reg;
+            }
             switch (tags[i]) {
                 .add_with_overflow, .sub_with_overflow, .mul_with_overflow => {
                     const op_ty = ir.typeOf(ir.extraData(Ir.Bin, datas[i].ty_pl.payload).data.lhs, ip);

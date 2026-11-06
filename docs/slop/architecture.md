@@ -2749,9 +2749,16 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    through slots, slices and floats through memory (promotion, step 4's
    successor). The decisions that do not depend on the architecture (dead
    values, overflow pairs and bits left in the flags, branch-condition
-   fusion, unused arguments) are `Ssa.plan`, run after `liveness` and
-   recorded per value as a `Live.fate` beside its register; the
-   architecture answers `inGpr`, `fusable`, and `ovfFlagsOnly`.
+   fusion, bit tests, unused arguments) are `Ssa.plan`, run after
+   `liveness` and recorded per value as a `Live.fate` beside its
+   register; the architecture answers `inGpr`, `fusable`, `fusableBit`,
+   and `ovfFlagsOnly`. A bit test is a `trunc` to `u1` (and the constant
+   shift right it reads) compared with a constant or cast to `bool`, as
+   Sema lowers a packed field's bit, or a `bit_and` with a constant mask
+   compared with 0, each read only by the next instruction: its compare
+   reads the operand's bits itself, which x86 does with `test` and an
+   immediate, in a register or in memory (`bitTest`; aarch64 fuses none
+   yet).
    Promotion, the next piece, is built in an interim form without
    renaming: `Ssa.plan` promotes a non-volatile alloc whose type is in a
    register (`inGpr`) or two (`inPair`) and whose address is only loaded

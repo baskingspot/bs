@@ -875,6 +875,12 @@ pub fn inGpr(cg: *CodeGen, ty: Index) bool {
     };
 }
 
+/// Whether bit test `inst` can be read by its compare (`Ssa.plan`): not
+/// yet on aarch64.
+pub fn fusableBit(_: *CodeGen, _: Inst.Index, _: Index) bool {
+    return false;
+}
+
 /// Whether condition `inst` can be computed by the branch it decides.
 pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];

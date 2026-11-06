@@ -4055,6 +4055,90 @@ fn scalarOperand(cg: *CodeGen, ref: Ref) bool {
     return !cg.isFloat(ty) and !cg.isWideInt(ty) and cg.passInRegs(ty);
 }
 
+/// Whether bit test `inst`, compared with constant `c` (`.none` for a
+/// shift a fused `trunc` reads), can be read by its compare as `test` of
+/// its operand with an immediate (`Ssa.plan`, `bitTest`): a `trunc` to
+/// `u1` compared with 0 or 1, a shift right by under 32 bits, or a
+/// `bit_and` with a mask under 2^32 compared with 0, of an integer in a
+/// general-purpose register.
+pub fn fusableBit(cg: *CodeGen, inst: Inst.Index, c: Index) bool {
+    const ip = cg.ip;
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    const S = struct {
+        fn int(ipp: *const InternPool, v: Index) ?u64 {
+            if (v == .bool_true) return 1;
+            if (v == .none or ipp.keyTag(v) != .int) return null;
+            return ipp.intValue(u64, v);
+        }
+    };
+    switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .trunc => {
+            if (data.ty_op.ty != .u1_type or !cg.bitOperand(data.ty_op.operand)) return false;
+            return (S.int(ip, c) orelse return false) <= 1;
+        },
+        .shr => {
+            // Only under a `trunc`: a shift compared with a constant is
+            // not a bit test.
+            if (c != .none or !cg.bitOperand(data.bin_op.lhs)) return false;
+            const k = S.int(ip, data.bin_op.rhs.toInterned() orelse return false) orelse return false;
+            return k < @min(32, Type.intInfo(ip, cg.typeOf(data.bin_op.lhs)).bits);
+        },
+        .bit_and => {
+            if (!cg.bitOperand(data.bin_op.lhs)) return false;
+            const mask = S.int(ip, data.bin_op.rhs.toInterned() orelse return false) orelse return false;
+            return mask < 1 << 32 and (S.int(ip, c) orelse return false) == 0;
+        },
+        else => return false,
+    }
+}
+
+/// Whether `ref` is an integer of at most 64 bits in a general-purpose
+/// register, whose bits `bitTest` reads.
+fn bitOperand(cg: *CodeGen, ref: Ref) bool {
+    const ty = cg.typeOf(ref);
+    return Type.class(cg.ip, ty) == .int and !cg.isWideInt(ty) and cg.inGpr(ty);
+}
+
+/// Sets the flags for compare `tag` of fused bit test `l` (`fusableBit`)
+/// with constant `rhs`: `test` of the bits it reads, in their register or
+/// memory, and returns the condition code that holds when it is true.
+fn bitTest(cg: *CodeGen, tag: Inst.Tag, l: Inst.Index, rhs: Ref) Error!Encoder.Cond {
+    const ip = cg.ip;
+    const tags = cg.ir.instructions.items(.tag);
+    const datas = cg.ir.instructions.items(.data);
+    const ld = datas[@backingInt(l)];
+    var x: Ref = undefined;
+    var mask: u64 = 1;
+    if (tags[@backingInt(l)] == .trunc) {
+        x = ld.ty_op.operand;
+        if (x.toIndex()) |s| if (cg.homes[@backingInt(s)] == .fused) {
+            // A shift right by a constant.
+            const sb = datas[@backingInt(s)].bin_op;
+            x = sb.lhs;
+            mask <<= @intCast(ip.intValue(u64, sb.rhs.toInterned().?).?);
+        };
+    } else {
+        x = ld.bin_op.lhs;
+        mask = ip.intValue(u64, ld.bin_op.rhs.toInterned().?).?;
+    }
+    // The bits are below the operand's width, so its low bytes hold them.
+    const size: Encoder.Size = if (mask <= 0xff) .byte else if (mask <= 0xffff) .word else .dword;
+    const imm: i32 = @bitCast(@as(u32, @intCast(mask)));
+    switch (try cg.locOf(x)) {
+        .reg => |r| try cg.e.@"test"(size, .{ .reg = r }, .{ .imm = imm }),
+        .mem => |m| try cg.e.@"test"(size, .{ .mem = m }, .{ .imm = imm }),
+        else => {
+            try cg.load(.rax, x);
+            try cg.e.@"test"(size, .{ .reg = .rax }, .{ .imm = imm });
+        },
+    }
+    // A `trunc` compared with 1 holds when the bit is set, as does one or
+    // a mask compared with 0 by `cmp_neq`.
+    const cv = rhs.toInterned().?;
+    const c = if (cv == .bool_true) 1 else ip.intValue(u64, cv).?;
+    return if ((c != 0) == (tag == .cmp_eq)) .ne else .e;
+}
+
 /// Whether condition `inst` can be computed by the branch it decides.
 pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
@@ -4064,6 +4148,8 @@ pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
         .is_err, .is_non_err, .is_null, .is_non_null, .cmp_lt_errors_len => true,
         .reduce => vector.fusable(cg, inst),
         .not => cg.typeOf(data.ty_op.operand) == .bool_type,
+        // A `bool` field's bit (`bitTest`) or a `u1` as a `bool`.
+        .bitcast => data.ty_op.ty == .bool_type and cg.typeOf(data.ty_op.operand) == .u1_type,
         else => false,
     };
 }
@@ -4385,7 +4471,18 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
             try cg.e.@"test"(.byte, .{ .reg = r }, .{ .reg = r });
             return .e;
         },
+        .bitcast => {
+            const x = data.ty_op.operand;
+            if (x.toIndex()) |l| if (cg.homes[@backingInt(l)] == .fused) return cg.bitTest(.cmp_eq, l, .fromInterned(.bool_true));
+            const r = try cg.regOf(x, .rax);
+            try cg.e.@"test"(.byte, .{ .reg = r }, .{ .imm = 1 });
+            return .ne;
+        },
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
+            if (data.bin_op.lhs.toIndex()) |l| if (cg.homes[@backingInt(l)] == .fused) switch (cg.ir.instructions.items(.tag)[@backingInt(l)]) {
+                .trunc, .bit_and => return cg.bitTest(tag, l, data.bin_op.rhs),
+                else => {},
+            };
             if (data.bin_op.lhs.toIndex()) |bit| if (cg.homes[@backingInt(bit)] == .fused) {
                 // An overflow bit left in the flags.
                 return if (Ssa.ovfBitCmp(cg.ir, cg.ip, inst, @backingInt(bit)).?) cg.ovf_cc else cg.ovf_cc.negate();
@@ -4398,7 +4495,12 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
             const s = cg.signed(cg.typeOf(data.bin_op.lhs));
             const rhs = try cg.srcOperand(data.bin_op.rhs, .rcx);
             const lhs = try cg.regOf(data.bin_op.lhs, .rax);
-            try cg.e.alu(.cmp, .qword, .{ .reg = lhs }, rhs);
+            // `test` sets the flags as a compare with 0 does, in fewer
+            // bytes.
+            if (rhs == .imm and rhs.imm == 0)
+                try cg.e.@"test"(.qword, .{ .reg = lhs }, .{ .reg = lhs })
+            else
+                try cg.e.alu(.cmp, .qword, .{ .reg = lhs }, rhs);
             return switch (tag) {
                 .cmp_lt => if (s) .l else .b,
                 .cmp_lte => if (s) .le else .be,
@@ -4948,6 +5050,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
 
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
+            // A bit test its compare reads (`bitTest`).
+            if (cg.homes[@backingInt(inst)] == .fused) return;
             const ty = cg.typeOf(data.bin_op.lhs);
             if (tag == .mul_wrap) if (cg.mulWide(inst)) |fs| {
                 try cg.loadFactor(.rax, fs[0]);
@@ -5153,8 +5257,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .intcast, .trunc, .bitcast, .ptr_from_int => {
             const ty = data.ty_op.ty;
-            // Its operand's memory (`Home.result`).
-            if (cg.homes[@backingInt(inst)] == .view or cg.homes[@backingInt(inst)] == .result) return;
+            // Its operand's memory (`Home.result`), or a bit test its
+            // compare reads (`bitTest`).
+            if (cg.homes[@backingInt(inst)] == .view or cg.homes[@backingInt(inst)] == .result or cg.homes[@backingInt(inst)] == .fused) return;
+            // A `bool` field's bit, which it tests in place.
+            if (tag == .bitcast) if (data.ty_op.operand.toIndex()) |l| if (cg.homes[@backingInt(l)] == .fused) return cg.genCond(inst);
             if (tag == .trunc) if (cg.mulPart(inst)) |part| {
                 const d = cg.destReg(inst);
                 if (cg.pairOf(part.m.toRef())) |p| {
