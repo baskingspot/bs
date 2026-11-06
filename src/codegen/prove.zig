@@ -81,8 +81,9 @@ pub const Scratch = struct {
     /// The first instruction per value computed (`Key`), among those
     /// that run on every path to the point walked (`Walker.number`).
     numbers: std.AutoHashMapUnmanaged(Key, Term) = .empty,
-    /// The keys of `numbers` in the order added, for `Walker.dropNumbers`.
-    nlog: std.ArrayList(Key) = .empty,
+    /// What `numbers` added, in order, for `Walker.dropNumbers` and the
+    /// snapshots of blocks' exits (`Exit.nsnap`).
+    nlog: std.ArrayList(NumberSnap) = .empty,
     /// What `numbers` added in a block held at its first `br`
     /// (`Exit.nsnap`).
     nsnaps: std.ArrayList(NumberSnap) = .empty,
@@ -896,7 +897,7 @@ const Walker = struct {
         const gop = try s.numbers.getOrPut(w.gpa, key);
         if (gop.found_existing) return gop.value_ptr.*;
         gop.value_ptr.* = own;
-        try s.nlog.append(w.gpa, key);
+        try s.nlog.append(w.gpa, .{ .key = key, .value = own });
         return own;
     }
 
@@ -908,7 +909,7 @@ const Walker = struct {
     /// first one only where the first one ran.
     fn dropNumbers(w: *Walker, len: usize) void {
         const s = w.s;
-        while (s.nlog.items.len > len) _ = s.numbers.remove(s.nlog.pop().?);
+        while (s.nlog.items.len > len) _ = s.numbers.remove(s.nlog.pop().?.key);
     }
 
     /// `a op b` (wrapping, in type `ty`) as a simpler term: `(a +% b) -% a`
@@ -1008,7 +1009,7 @@ const Walker = struct {
             }
             if (e.facts.count == 0 and s.nlog.items.len - e.nfrom <= 64) {
                 e.nsnap = .{ .count = 1, .start = @intCast(s.nsnaps.items.len) };
-                for (s.nlog.items[e.nfrom..]) |key| try s.nsnaps.append(w.gpa, .{ .key = key, .value = s.numbers.get(key).? });
+                try s.nsnaps.appendSlice(w.gpa, s.nlog.items[e.nfrom..]);
                 e.nsnap.len = @intCast(s.nsnaps.items.len - e.nsnap.start);
             }
             // A `bool` block: what held here, and what its value being
