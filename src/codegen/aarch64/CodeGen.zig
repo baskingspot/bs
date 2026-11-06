@@ -62,6 +62,7 @@ const vector = @import("vector.zig");
 const int128 = @import("int128.zig");
 const shared_vector = @import("../vector.zig");
 const Ssa = @import("../Ssa.zig");
+const view = @import("../view.zig");
 const switch_br = @import("../switch_br.zig");
 const print = @import("../../Ir/print.zig");
 const Reg = Encoder.Reg;
@@ -157,6 +158,10 @@ tmp16_next: u32 = 0,
 /// Results in a register written to a scratch slot (`resultMem`), moved
 /// to the register when the instruction's code is done (`flushResults`).
 pending: std.ArrayList(Pending) = .empty,
+/// Loads whose users read them in place (`view.plan`): such a load's home
+/// is the memory it points to (`Home.slot`) when its pointer is an
+/// address or in a register, and else a copy, as any other load's.
+views: std.DynamicBitSetUnmanaged = .{},
 /// Inline assembly marked the return address undefined (`.cfi_undefined
 /// lr`): this is the outermost frame.
 outermost_frame: bool = false,
@@ -236,7 +241,8 @@ pub const Mem = struct {
 /// Where an instruction's value lives.
 const Home = union(enum) {
     none,
-    /// The value is stored here.
+    /// The value is stored here; for a load its users read in place
+    /// (`views`), the memory it points to.
     slot: Mem,
     /// The value is this address (an `alloc`).
     frame_addr: Mem,
@@ -318,6 +324,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.tmp16_slots.deinit(gpa);
         cg.pending.deinit(gpa);
         cg.in_place.deinit(gpa);
+        cg.views.deinit(gpa);
         cg.stub_chains.deinit(gpa);
         cg.stub_open.deinit(gpa);
         for (&cg.scratch_counts) |*c| c.deinit(gpa);
@@ -347,6 +354,13 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         f.bypassUnread(ir);
         cg.live = true;
         if (!f.no_regs) {
+            var views: std.ArrayList(u32) = .empty;
+            defer views.deinit(gpa);
+            try view.plan(f, gpa, ir, ip, &cg, &views);
+            if (views.items.len != 0) {
+                try cg.views.resize(gpa, ir.instructions.len, false);
+                for (views.items) |l| cg.views.set(l);
+            }
             try cg.planScratch();
             try cg.allocateRegs();
             try cg.planInPlace();
@@ -1140,6 +1154,11 @@ fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
 
 pub fn termClobbers(_: *CodeGen, _: Ssa.Block.Index) bool {
     return false;
+}
+
+/// For `view.plan`: a load of `ty` in memory, which nothing else plans.
+pub fn viewable(cg: *CodeGen, l: Inst.Index, ty: Index) bool {
+    return cg.homes[@backingInt(l)] == .none and !cg.passInRegs(ty) and !cg.inPair(ty) and !cg.inVec(ty);
 }
 
 /// Whether `ty`'s values live in two general-purpose registers when they
@@ -3004,6 +3023,19 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                     return;
                 }
             }
+            // Read in place by its users (`view.plan`), whose pointer lives
+            // until they have.
+            if (cg.views.bit_length != 0 and cg.views.isSet(@backingInt(inst))) switch (try cg.locOf(data.ty_op.operand)) {
+                .addr => |m| {
+                    cg.homes[@backingInt(inst)] = .{ .slot = m };
+                    return;
+                },
+                .reg => |r| {
+                    cg.homes[@backingInt(inst)] = .{ .slot = .at(r, 0) };
+                    return;
+                },
+                else => {},
+            };
             // A load of a promoted variable is a move, or nothing when it
             // shares the variable's register (`Live.share`).
             if (cg.promotedV(data.ty_op.operand)) |v| {
