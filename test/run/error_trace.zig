@@ -1,12 +1,12 @@
 //! exit: 1
-//! stdout: "start 0\ncatch 0\nkept 2\nif-else 2\narg 0\nlabeled 0\ninline 2\ncfn 2\nafter-cfn 2\n"
+//! stdout: "start 0\ncatch 0\nkept 2\nif-else 2\narg 0\nlabeled 0\ninline 2\ncfn 2\nafter-cfn 2\nacross 2\n"
 //! stderr-contains: "error: TooBig\n"
-//! stderr-contains: "error_trace.zig:20:16: 0x"
+//! stderr-contains: "error_trace.zig:21:16: 0x"
 //! stderr-contains: " in fail (error_trace.zig)\n    if (x > 3) return error.TooBig;\n               ^\n"
 //! stderr-contains: " in twice (error_trace.zig)\n    return try fail(x) * 2;\n           ^\n"
-//! stderr-contains: "error_trace.zig:27:5: 0x"
+//! stderr-contains: "error_trace.zig:28:5: 0x"
 //! stderr-contains: " in inl (error_trace.zig)\n"
-//! stderr-contains: "error_trace.zig:76:9: 0x"
+//! stderr-contains: "error_trace.zig:80:9: 0x"
 //! stderr-contains: " in main (error_trace.zig)\n    _ = try inl(10);\n        ^\n"
 //! targets: x86_64-linux aarch64-macos aarch64-linux
 
@@ -15,6 +15,7 @@
 // an error pops what was pushed since. A `callconv(.c)` function that calls
 // `.auto` functions makes its own trace.
 const std = @import("std");
+const builtin = @import("builtin");
 
 fn fail(x: u32) !u32 {
     if (x > 3) return error.TooBig;
@@ -73,5 +74,21 @@ pub fn main() !void {
     print("inline", index());
     print("cfn", cfn());
     print("after-cfn", index());
+    reset();
+    print("across", across(9));
+    reset();
     _ = try inl(10);
+}
+
+// On aarch64 the trace pointer stays in x15 in `.auto` functions, which
+// keep it across what may write x15: a C call that sets up its own trace,
+// compiler_rt calls, and inline assembly that clobbers x15.
+fn across(x: u32) usize {
+    _ = cfn();
+    var f: f128 = @floatFromInt(x);
+    f = f * f;
+    if (builtin.cpu.arch == .aarch64) asm volatile ("mov x15, xzr" ::: .{ .x15 = true });
+    const kept = twice(@intFromFloat(f));
+    _ = &kept;
+    return index();
 }

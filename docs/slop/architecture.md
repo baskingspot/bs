@@ -973,7 +973,13 @@ comptime arguments are run-time values in the lowered code (uucode's
   hold call targets. `.auto` passes values of up to 8 bytes in one of
   x0-x7, up to 16 in two, f16/f32/f64 in v0-v7, the rest in the outgoing
   area; results come back the same way or through x8, and the error
-  return trace pointer goes in x15. `.c` is Apple's AAPCS64: aggregates
+  return trace pointer goes in x15, which a callee returns unchanged: an
+  `.auto` function keeps the pointer in x15 throughout, saving it only
+  around what may write x15 (calls of other conventions, compiler_rt,
+  inline assembly that names x15 or calls), so it neither stores it on
+  entry nor reloads it before each call. A function of another
+  convention puts its own trace, or null, in x15 before each `.auto`
+  call; a build without error tracing passes nothing. `.c` is Apple's AAPCS64: aggregates
   over 16 bytes by the address of a caller's copy, stack arguments packed
   at natural alignment, variadic arguments all on the stack in 8-byte
   slots (`va_list` is a pointer); f80 and f128, which C lacks here, go in
