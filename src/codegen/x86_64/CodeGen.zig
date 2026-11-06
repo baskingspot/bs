@@ -4605,7 +4605,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                         try cg.e.shift(.rol, sizeOf(Type.intInfo(ip, ty).bits / 8), .{ .reg = d }, rot.k);
                         return cg.setResult(inst, ty, d);
                     };
-                    try cg.intOp(d, tag, ty, data.bin_op.lhs, data.bin_op.rhs);
+                    try cg.intOp(d, inst, tag, ty, data.bin_op.lhs, data.bin_op.rhs);
                     try cg.setResult(inst, ty, d);
                 },
                 else => {
@@ -4800,7 +4800,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                             try cg.e.movzx(if (info.bits == 32) .qword else .dword, d, sizeOf(info.bits / 8), .{ .reg = src.reg });
                     } else {
                         try cg.load(d, data.ty_op.operand);
-                        try cg.normalize(d, ty);
+                        if (!cg.rawFits(inst, ty)) try cg.normalize(d, ty);
                     }
                 }
                 return cg.setResult(inst, ty, d);
@@ -5473,7 +5473,7 @@ fn genCond(cg: *CodeGen, inst: Inst.Index) Error!void {
 
 /// `d = lhs op rhs` for the operations with a two-operand form, normalized
 /// to `ty`. `d` is not the register of an operand. Uses rcx.
-fn intOp(cg: *CodeGen, d: Reg, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void {
+fn intOp(cg: *CodeGen, d: Reg, inst: Inst.Index, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void {
     const e = &cg.e;
     // A 32-bit operation zero-extends its result: a u32 needs no
     // normalizing.
@@ -5519,8 +5519,18 @@ fn intOp(cg: *CodeGen, d: Reg, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Err
     if (size == .dword) return;
     switch (tag) {
         .bit_and, .bit_or, .xor => {}, // stay extended
-        else => try cg.normalize(d, ty),
+        else => if (!cg.rawFits(inst, ty)) try cg.normalize(d, ty),
     }
+}
+
+/// Whether unsigned `inst`'s result is already normalized to `ty` before
+/// its lowering would normalize it (`Ssa.rawBits`): a shift right, or a
+/// narrowing cast of a value with no bits above the type.
+fn rawFits(cg: *CodeGen, inst: Inst.Index, ty: Index) bool {
+    if (!Type.isInt(cg.ip, ty)) return false;
+    const info = Type.intInfo(cg.ip, ty);
+    if (info.signedness == .signed or info.bits >= 64) return false;
+    return cg.ssa.rawBits(cg.ir, cg.ip, inst) <= info.bits;
 }
 
 /// Computes `lhs op rhs` on 64-bit extended operands into rax, normalized
