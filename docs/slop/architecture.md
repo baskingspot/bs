@@ -910,8 +910,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   and `Ssa.plan` (dead values, fused branch conditions, overflow pairs
   and bits left in the flags, promoted variables), then `Ssa.allocate`
   over the callee-saved x19-x28 and d8-d15 and the caller-saved
-  v20-v29: scalars that fit a general register (`inGpr`) get one of
-  x19-x28; f32 and f64 (`inFloat`, `want_float`) one of d8-d15, or of
+  x12-x15 and v20-v29: scalars that fit a general register (`inGpr`)
+  get one of x19-x28, or of x12-x15 (preferred) when they cross no
+  call; f32 and f64 (`inFloat`, `want_float`) one of d8-d15, or of
   v20-v29 when they cross no call; vectors of at most 16 bytes
   (`inVec`, `want_vec`, which takes only allocate's floats outside
   `survives`) one of v20-v29, and so does a struct whose one runtime
@@ -925,7 +926,25 @@ comptime arguments are run-time values in the lowered code (uucode's
   `struct_field_val` of a whole load, through a pointer cast that only
   adds `const`, so the local is promoted. Promoted variables likewise; the rest live
   in stack slots shared by lifetime. Floats and vectors share one home,
-  `.vreg`. No lowering uses an allocated register as scratch. Calls
+  `.vreg`. x9-x11 hold every lowering's operands and x16-x17 its
+  addresses; x12-x14 are also scratch, but only for the lowerings that
+  `scratchUse` names before allocation (x12 for a load or store through
+  a spilled pointer, all three for overflow arithmetic, division,
+  memcpy and memset, wide integers, and anything not on its list): one
+  `Ssa.allocate` restriction per register keeps a value out of it when
+  such a lowering lies in its interval or at its ends, and clobber
+  points (below) keep the values they read or compute out of all four
+  (`Restriction.endpoints_only`). x15 joins them only where it does not
+  hold the error return trace (`trace_x15`: C-convention functions and
+  builds without error tracing); elsewhere an always-on restriction
+  keeps every value out of it. The encoder records the general
+  registers each instruction writes (`Encoder.written`; bl and blr
+  count as writing every caller-saved one), and genBlock checks each
+  value's, terminator's and argument's writes to x12-x15 and x19-x28
+  against what it planned, its own result and pair fields, and at a
+  clobber point every caller-saved register (`checkWrites`, always
+  on), so a lowering that starts using one fails to compile instead of
+  corrupting a value. Calls
   preserve x19-x28 and d8-d15 (only their low 64 bits, all an f64
   needs) but clobber v20-v29, so every instruction not known to be
   call-free (`callFree`, a conservative whitelist that genBlock checks
@@ -938,7 +957,7 @@ comptime arguments are run-time values in the lowered code (uucode's
   and are moved to the register after the instruction), so a result may
   take the register of an operand that dies there (`tiedOperand`).
   Slices, optional slices, and error unions with an 8-byte payload
-  (`inPair`) take two of x19-x28 (`want_pair`, `Home.regs`) when
+  (`inPair`) take two general registers (`want_pair`, `Home.regs`) when
   computed by a load, `slice`, an element or field read, an optional's
   or error union's wrapping or unwrapping, an `.auto` argument or call
   result (`pairResult`), or a promoted variable; their users that read
