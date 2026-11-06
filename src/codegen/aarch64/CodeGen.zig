@@ -1445,8 +1445,11 @@ fn setupParams(cg: *CodeGen) Error!void {
     const ir = cg.ir;
     const tags = ir.instructions.items(.tag);
     const is_c = isC(cg.fn_ty.cc);
-    // The error return trace pointer arrives in x15 and stays there.
-    cg.trace_x15 = !is_c and cg.emit.zcu.fe.any_error_tracing;
+    // The error return trace pointer arrives in x15 and stays there. Only
+    // `.auto` functions get one from their caller, as upstream's do; Sema
+    // sets up a trace of its own in the others, such as an inline
+    // function called through a pointer, which bs calls like `.auto`.
+    cg.trace_x15 = cg.fn_ty.cc == .auto and cg.emit.zcu.fe.any_error_tracing;
     const ret_ty = cg.fn_ty.return_type;
     if (if (is_c) cg.cRetClass(ret_ty) == .indirect else cg.autoClass(ret_ty) == .memory) {
         cg.ret_ptr_slot = try cg.allocSlot(8, 8);
@@ -2725,7 +2728,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .set_err_return_trace => {
             // Sema sets up a trace only in functions other than `.auto`
-            // ones, which are not inlined.
+            // ones (`setupParams`).
             assert(!cg.trace_x15);
             if (cg.trace_slot == null) cg.trace_slot = try cg.allocSlot(8, 8);
             try cg.load(.x9, data.un_op);
@@ -4247,8 +4250,12 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             try cg.loadMem(.x8, cg.ret_ptr_slot.?, .usize_type);
             if (off != 0) try cg.e.addSub(.add, .x, .x8, .x8, .{ .imm = @intCast(off) });
         }
-        // An `.auto` caller's x15 holds the trace already.
-        if (!cg.trace_x15 and cg.emit.zcu.fe.any_error_tracing) try cg.loadTrace(.x15);
+        // A callee of another convention called like `.auto` gets no trace
+        // and may write x15 (`setupParams`). An `.auto` caller's x15 holds
+        // the trace already.
+        if (callee_ty.cc != .auto) {
+            if (ret_ty != .noreturn_type) try cg.saveTrace();
+        } else if (!cg.trace_x15 and cg.emit.zcu.fe.any_error_tracing) try cg.loadTrace(.x15);
     }
     if (callee_val == null) try cg.load(.x16, callee_ref);
     if (tail) {
@@ -4264,7 +4271,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         } else try cg.e.bl(.{ .sym = try cg.emit.funcKey(f) });
     } else try cg.e.blr(.x16);
     if (pn_save) |save| for (0..10) |k| try cg.loadMem(@fromBackingInt(@intCast(19 + k)), save.plus(@intCast(8 * k)), .usize_type);
-    if (is_c and ret_ty != .noreturn_type) try cg.restoreTrace();
+    if (callee_ty.cc != .auto and ret_ty != .noreturn_type) try cg.restoreTrace();
     if (in_reg) {
         // f32 and f64 results come back in v0 in every convention.
         if (vec_in_v0) return vector.move(cg, cg.homes[@backingInt(inst)].vreg, .v0);
