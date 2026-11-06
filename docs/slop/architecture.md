@@ -2205,13 +2205,15 @@ accesses does not matter: the filter passes every function the walk
 would forward a load in, so hash collisions, which depend on how
 instructions and interned values are numbered, cost only a walk and
 never change the output (a build that walks every function writes the
-same std and zig binaries). One walk numbers the
+same std and zig binaries). A load through a pointer cast of a local
+stored once also passes the filter (packed field reads, below). One walk
+numbers the
 instructions in body order and records, per local, whether its address
 escapes (is used other than to load, store, or derive a field or element
-pointer), its stores and its last use. Dominance is by position: an
-instruction reaches the end of the body holding it, and a `block` left
-only by the `br` ending its body passes that reach to its body. Three
-rewrites use it:
+pointer or a pointer cast), its stores and its last use. Dominance is by
+position: an instruction reaches the end of the body holding it, and a
+`block` left only by the `br` ending its body passes that reach to its
+body. Four rewrites use it:
 
 - Copies. A `const` local of an aggregate, stored once with a whole load
   `p.*` (also through Sema's inline-call argument tuple) and only read,
@@ -2267,6 +2269,15 @@ rewrites use it:
   not move. This keeps `self.buf.ptr` and `self.buf.len` in registers
   across a tokenizer's loop, and lets prove see the bound of every
   `buf[i]` as the same value.
+- Packed field reads. A field of a packed struct read through a pointer
+  loads the whole backing integer through a pointer cast. When the
+  pointer is a `const` local's that one whole store before the load set,
+  and nothing else writes, the load becomes a `bitcast` of the stored
+  value, in place. The stored value must be a packed struct, packed union
+  or integer with as many bits as the load. This is how an inline call
+  reads a field of its by-value argument (Ghostty's `cell.hasGrapheme()`
+  on a `packed struct(u64)`), which went through a frame slot. A backing
+  integer narrower than the load (`u63` read as `u64`) is left alone.
 
 `BS_FORWARD=off` turns the pass off (its own cache entries, as
 `+noforward`), to compare a program's behavior with and without it;

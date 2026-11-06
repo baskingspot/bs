@@ -50,6 +50,7 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
         v.* = if (v.* == none) @backingInt(data.bin_op.rhs) else multi;
     };
     var copies = false;
+    var packed_reads = false;
     var loaded: u256 = 0;
     var loaded_twice: u256 = 0;
     var stored: u256 = 0;
@@ -57,6 +58,10 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
         .load => if (baseHash(ir, stored_once, data.ty_op.operand)) |h| {
             loaded_twice |= loaded & h;
             loaded |= h;
+            if (!packed_reads) if (castAlloc(ir, data.ty_op.operand)) |a| {
+                const v = stored_once[a];
+                packed_reads = v != none and v != multi;
+            };
         },
         .store => if (baseHash(ir, stored_once, data.bin_op.lhs)) |h| {
             stored |= h;
@@ -73,7 +78,9 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
         },
         else => {},
     };
-    const reloads = loaded_twice | (loaded & stored) != 0;
+    // A packed field read of a `const` local stored once
+    // (`Walk.packedRead`) needs the walk too.
+    const reloads = packed_reads or loaded_twice | (loaded & stored) != 0;
     if (!copies and !reloads) return 0;
 
     var w: Walk = .{
@@ -165,6 +172,25 @@ fn baseHash(ir: *const Ir, stored_once: []const u32, ptr: Inst.Ref) ?u256 {
         base = @fromBackingInt(v);
     }
     return @as(u256, 1) << @intCast(std.hash.int(@backingInt(base)) % 256);
+}
+
+/// The local `ptr` is one or more pointer `bitcast`s of, if any: how a
+/// packed field read through a local's pointer reaches its backing
+/// integer.
+fn castAlloc(ir: *const Ir, ptr: Inst.Ref) ?u32 {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    var r = ptr;
+    var casts: u32 = 0;
+    while (r.toIndex()) |i| switch (tags[@backingInt(i)]) {
+        .bitcast => {
+            r = datas[@backingInt(i)].ty_op.operand;
+            casts += 1;
+        },
+        .alloc => return if (casts != 0) @backingInt(i) else null,
+        else => return null,
+    };
+    return null;
 }
 
 /// Whether `ref` is a local's own pointer.
@@ -366,6 +392,12 @@ const Walk = struct {
             switch (tags[i]) {
                 .load => {
                     const ty = data.ty_op.ty;
+                    if (w.packedRead(i)) |v| {
+                        tags[i] = .bitcast;
+                        datas[i] = .{ .ty_op = .{ .ty = ty, .operand = v } };
+                        count += 1;
+                        continue;
+                    }
                     // A load straight through a local is left alone:
                     // `Ssa.plan` forwards one whose address does not
                     // escape, and `run`'s filter looks for no other.
@@ -821,6 +853,32 @@ const Walk = struct {
         return r;
     }
 
+    /// The value a load `i` of an integer reads through a pointer cast of
+    /// a `const` local that one whole store before it, and no other
+    /// write, set to a packed struct, packed union or integer of as many
+    /// bits: a packed field read of an inline call's by-value argument
+    /// (`self.tag`) loads the whole backing integer that way. A backing
+    /// integer narrower than its load (`u63` read as `u64`) is left alone.
+    fn packedRead(w: *const Walk, i: u32) ?Inst.Ref {
+        const ir = w.ir;
+        const ip = w.ip;
+        const datas = ir.instructions.items(.data);
+        const ty = datas[i].ty_op.ty;
+        if (Type.class(ip, ty) != .int or Type.intInfo(ip, ty).bits > 64) return null;
+        const a = castAlloc(ir, datas[i].ty_op.operand) orelse return null;
+        const f = w.flags[a];
+        if (f.multi or f.forwarded or w.store[a] == none) return null;
+        const info = Type.ptrInfo(ip, datas[a].ty);
+        if (!info.flags.is_const or info.flags.is_volatile) return null;
+        if (!Type.isPacked(ip, info.child) and Type.class(ip, info.child) != .int) return null;
+        if (Type.packedBits(ip, info.child) != Type.intInfo(ip, ty).bits) return null;
+        const s = w.store[a];
+        // A store through a field pointer sets only part of it.
+        if (datas[s].bin_op.lhs != Inst.Index.toRef(@fromBackingInt(a))) return null;
+        if (!(w.pos[s] < w.pos[i] and w.pos[i] <= w.scope_end[s])) return null;
+        return w.resolve(datas[s].bin_op.rhs);
+    }
+
     fn isArg(w: *const Walk, ref: Inst.Ref) bool {
         if (ref == .none) return false;
         const i = ref.toIndex() orelse return false;
@@ -898,6 +956,18 @@ const Walk = struct {
                 if (w.rootOf(base)) |r| {
                     w.root[i] = r;
                     w.touch(base);
+                }
+            },
+            // A pointer cast reads and writes the local it points into,
+            // as a field pointer does (`Walk.packedRead`).
+            .bitcast => {
+                const op = data.ty_op.operand;
+                w.countUse(op);
+                if (w.rootOf(op)) |r| {
+                    if (w.ip.keyTag(data.ty_op.ty) == .ptr_type) {
+                        w.root[i] = r;
+                        w.touch(op);
+                    } else w.flags[r].escaped = true;
                 }
             },
             .ptr_elem_ptr => {
