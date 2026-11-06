@@ -117,6 +117,8 @@ def check(seed, tools, size, branch=None, base=None, text=None):
     try:
         src = os.path.join(scratch, f"p{seed}.zig")
         text = text or KINDS[KIND[0]].generate(seed, size)
+        if not text.strip():
+            raise H.HarnessError(f"seed {seed}: the generator returned an empty program")
         with open(src, "w") as f:
             f.write(text)
         t0 = time.time()
@@ -493,8 +495,9 @@ def main():
     pending = set()
     reductions = set()
     last = time.time()
+    harness_errors, aborted = 0, False
     try:
-        while True:
+        while not aborted:
             done_hunting = (args.count is not None and seed - start >= args.count) \
                 or (deadline and time.time() > deadline)
             while not done_hunting and len(pending) < args.jobs * 2:
@@ -523,6 +526,16 @@ def main():
                 pending.discard(fut)
                 try:
                     rec = fut.result()
+                except (H.HarnessError, OSError) as e:
+                    # Never a pass: counted, and repeated ones abort.
+                    log(f"HARNESS ERROR: {e}")
+                    rec = {"result": "harness-error", "seed": None}
+                    harness_errors += 1
+                    if harness_errors >= 3:
+                        stats.add(rec)
+                        log("ABORTED: repeated harness errors; this campaign's results after them are not valid")
+                        aborted = True
+                        break
                 except Exception as e:
                     log(f"worker error: {e!r}")
                     rec = {"result": "discard", "seed": None}
@@ -559,6 +572,8 @@ def main():
         log(stats.line())
         hunt.shutdown(cancel_futures=True)
         red.shutdown(cancel_futures=True)
+    if aborted:
+        sys.exit(3)
 
 
 if __name__ == "__main__":

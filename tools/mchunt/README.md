@@ -52,6 +52,12 @@ Seeds whose program upstream rejects (a comptime overflow the generator
 did not foresee) are discarded; `upstream-signal` and `upstream-timeout`
 count programs that upstream Debug's binary crashed or hung on.
 
+`harness-error` counts runs that cannot be trusted: less than 2 GB free
+for an hour, an empty or all-zero program, a failed write, or a binary
+that is not an executable (a full disk leaves zeroed binaries whose
+identical failures would otherwise compare equal). It is never a pass;
+after three, hunt.py stops with exit status 3.
+
 With `--ref-env VAR=VALUE`, bs under that environment replaces
 upstream as the oracle (`bs-ref` in reports): a pass switched off must
 not change any program's output or panic. With upstream out of the loop

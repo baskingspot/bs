@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(os.path.dirname(TOOL_DIR))
@@ -198,14 +199,55 @@ def run_bin(path):
     return Outcome(st, lines, p.returncode, detail=p.stderr[-2000:] if st != "ok" else "")
 
 
+class HarnessError(Exception):
+    """The run cannot be trusted (low disk, a program or binary that did
+    not reach the disk). Never a pass: hunt.py counts it as harness-error
+    and aborts the campaign when they repeat."""
+
+
+MIN_FREE = 2 << 30
+EXE_MAGIC = (b"\x7fELF", b"\xcf\xfa\xed\xfe")
+
+
+def guard_disk():
+    """Waits while the disk has less than MIN_FREE free (an hour at most,
+    then HarnessError): a full disk leaves zeroed programs and binaries
+    whose identical failures would compare equal."""
+    waited = 0
+    while True:
+        st = os.statvfs(WORK)
+        if st.f_bavail * st.f_frsize >= MIN_FREE:
+            return
+        if waited >= 3600:
+            raise HarnessError(f"less than {MIN_FREE >> 30} GB free on {WORK} for an hour")
+        time.sleep(60)
+        waited += 60
+
+
+def guard_file(path, what):
+    """`path` exists and is neither empty nor all zero bytes."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        raise HarnessError(f"{what} {path}: {e}")
+    if not data.strip(b"\0"):
+        raise HarnessError(f"{what} {path} is empty or all zero bytes")
+    return data
+
+
 def run_config(tools, cfg, src, scratch):
     """Compiles `src` with `cfg` into `scratch` and runs it."""
+    guard_disk()
+    guard_file(src, "program")
     out = os.path.join(scratch, cfg.name)
     if os.path.exists(out):
         os.unlink(out)
     o = compile_prog(tools, cfg, src, out, os.path.join(scratch, "zig-cache"))
     if o is not None:
         return o
+    if guard_file(out, "binary")[:4] not in EXE_MAGIC:
+        raise HarnessError(f"binary {out} is not an executable")
     return run_bin(out)
 
 
