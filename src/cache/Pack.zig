@@ -66,7 +66,7 @@ pub const AtomRef = extern struct {
     }
 };
 
-const magic = "ZAPPACK6".*;
+const magic = "ZAPPACK7".*;
 
 const Header = extern struct {
     magic: [8]u8 = magic,

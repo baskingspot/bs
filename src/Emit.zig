@@ -2484,6 +2484,14 @@ pub fn addFunction(emit: *Emit, atom: Atom, debug: Atom.Debug) !void {
     try emit.debug.ensureUnusedCapacity(emit.gpa, 1);
     var d = debug;
     d.atom = @intCast(emit.atoms.items.len);
+    // Cut the code of other units out of the line program here, where the
+    // result is cached with the function, so that links only copy it.
+    for (d.inlines) |inl| {
+        if (inl.unit != Atom.Debug.Inline.inherit and inl.unit != 0) {
+            try d.splitForeign(emit.allocator(), @intCast(atom.bytes.len));
+            break;
+        }
+    }
     try emit.addAtom(atom);
     emit.debug.appendAssumeCapacity(d);
 }

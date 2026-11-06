@@ -7,12 +7,14 @@
 //!   Header (64 bytes)
 //!   targets      [targets_len]SymbolKey (16 bytes each)
 //!   relocs       [relocs_len]Reloc (12 bytes each)
-//!   DebugHeader  (40 bytes, if `has_debug`)
+//!   DebugHeader  (52 bytes, if `has_debug`)
 //!   bytes, name (always empty: the manifest keeps symbol names,
 //!   `Manifest.atom_names`, so that a name can change without its record)
-//!   if `has_debug`: file, name, lines, unit, files, inline names;
-//!   then, aligned, patches (u32), inlines (`Atom.Debug.Inline`), and
-//!   inline callees (SymbolKey, 16-byte aligned)
+//!   if `has_debug`: file, name, lines, unit, files, inline names,
+//!   inline units, foreign lines; then, aligned, patches and foreign
+//!   patches (u32), inlines (`Atom.Debug.Inline`), foreign pieces
+//!   (`Atom.Debug.Foreign`), and inline callees (SymbolKey, 16-byte
+//!   aligned)
 //!   zero padding to a multiple of 16
 //!
 //! The linkers take debug info apart from the atoms, as a slice of
@@ -69,27 +71,35 @@ const DebugHeader = extern struct {
     patches_len: u32,
     inlines_len: u32,
     inline_units_len: u32,
+    foreign_len: u32,
+    foreign_lines_len: u32,
+    foreign_patches_len: u32,
 };
 
 comptime {
     std.debug.assert(@sizeOf(Header) == 64);
-    std.debug.assert(@sizeOf(DebugHeader) == 40);
+    std.debug.assert(@sizeOf(DebugHeader) == 52);
     std.debug.assert(@alignOf(Atom.Debug.Inline) == 4);
+    std.debug.assert(@alignOf(Atom.Debug.Foreign) == 4);
 }
 
 /// Where a record's aligned debug runs start, given `off`, the offset in
 /// the record just past the inline names.
 const DebugRuns = struct {
     patches: usize,
+    foreign_patches: usize,
     inlines: usize,
+    foreign: usize,
     callees: usize,
     end: usize,
 
     fn at(off: usize, dh: DebugHeader) DebugRuns {
         const patches = std.mem.alignForward(usize, off, 4);
-        const inlines = patches + 4 * @as(usize, dh.patches_len);
-        const callees = std.mem.alignForward(usize, inlines + @sizeOf(Atom.Debug.Inline) * @as(usize, dh.inlines_len), 16);
-        return .{ .patches = patches, .inlines = inlines, .callees = callees, .end = callees + 16 * @as(usize, dh.inlines_len) };
+        const foreign_patches = patches + 4 * @as(usize, dh.patches_len);
+        const inlines = foreign_patches + 4 * @as(usize, dh.foreign_patches_len);
+        const foreign = inlines + @sizeOf(Atom.Debug.Inline) * @as(usize, dh.inlines_len);
+        const callees = std.mem.alignForward(usize, foreign + @sizeOf(Atom.Debug.Foreign) * @as(usize, dh.foreign_len), 16);
+        return .{ .patches = patches, .foreign_patches = foreign_patches, .inlines = inlines, .foreign = foreign, .callees = callees, .end = callees + 16 * @as(usize, dh.inlines_len) };
     }
 };
 
@@ -106,13 +116,16 @@ fn debugHeader(d: *const Atom.Debug) DebugHeader {
         .patches_len = @intCast(d.patches.len),
         .inlines_len = @intCast(d.inlines.len),
         .inline_units_len = @intCast(d.inline_units.len),
+        .foreign_len = @intCast(d.foreign.len),
+        .foreign_lines_len = @intCast(d.foreign_lines.len),
+        .foreign_patches_len = @intCast(d.foreign_patches.len),
     };
 }
 
 /// The bytes of the debug strings: file, name, lines, unit, files, inline
-/// names, and inline units.
+/// names, inline units, and foreign lines.
 fn debugBytesLen(dh: DebugHeader) usize {
-    return @as(usize, dh.file_len) + dh.name_len + dh.lines_len + dh.unit_len + dh.files_len + dh.inline_names_len + dh.inline_units_len;
+    return @as(usize, dh.file_len) + dh.name_len + dh.lines_len + dh.unit_len + dh.files_len + dh.inline_names_len + dh.inline_units_len + dh.foreign_lines_len;
 }
 
 /// Walks a link's debug slice, sorted by `Debug.atom`, alongside its atoms
@@ -170,11 +183,13 @@ pub fn encode(atom: *const Atom, debug: ?*const Atom.Debug, out: []u8) void {
     if (debug) |d| w.writeAll(std.mem.asBytes(&debugHeader(d))) catch unreachable;
     w.writeAll(atom.bytes) catch unreachable;
     if (debug) |d| {
-        for ([_][]const u8{ d.file, d.name, d.lines, d.unit, d.files, d.inline_names, d.inline_units }) |bytes| w.writeAll(bytes) catch unreachable;
+        for ([_][]const u8{ d.file, d.name, d.lines, d.unit, d.files, d.inline_names, d.inline_units, d.foreign_lines }) |bytes| w.writeAll(bytes) catch unreachable;
         const runs = DebugRuns.at(w.end, debugHeader(d));
         w.splatByteAll(0, runs.patches - w.end) catch unreachable;
         w.writeAll(@ptrCast(d.patches)) catch unreachable;
+        w.writeAll(@ptrCast(d.foreign_patches)) catch unreachable;
         w.writeAll(@ptrCast(d.inlines)) catch unreachable;
+        w.writeAll(@ptrCast(d.foreign)) catch unreachable;
         w.splatByteAll(0, runs.callees - w.end) catch unreachable;
         w.writeAll(@ptrCast(d.inline_callees)) catch unreachable;
     }
@@ -239,6 +254,14 @@ fn debugValid(atom_len: usize, d: *const Atom.Debug) bool {
         if (inl.parent != Atom.Debug.Inline.none and inl.parent >= i) return false;
         if (inl.low > inl.high or inl.high > atom_len) return false;
     }
+    var lines_len: u64 = 0;
+    var patches_len: u64 = 0;
+    for (d.foreign) |f| {
+        if (f.low >= f.high or f.high > atom_len or f.unit == 0 or f.unit > units) return false;
+        lines_len += f.lines_len;
+        patches_len += f.patches_len;
+    }
+    if (lines_len != d.foreign_lines.len or patches_len != d.foreign_patches.len) return false;
     var next: u64 = 0;
     for (d.patches) |off| {
         if (off < next or off >= d.lines.len) return false;
@@ -286,9 +309,13 @@ pub inline fn view(rec: [*]align(alignment) const u8) struct { atom: Atom, debug
         off += dh.inline_names_len;
         const inline_units = rec[off..][0..dh.inline_units_len];
         off += dh.inline_units_len;
+        const foreign_lines = rec[off..][0..dh.foreign_lines_len];
+        off += dh.foreign_lines_len;
         const runs = DebugRuns.at(off, dh);
         const patches: [*]const u32 = @ptrCast(@alignCast(rec + runs.patches));
+        const foreign_patches: [*]const u32 = @ptrCast(@alignCast(rec + runs.foreign_patches));
         const inlines: [*]const Atom.Debug.Inline = @ptrCast(@alignCast(rec + runs.inlines));
+        const foreign: [*]const Atom.Debug.Foreign = @ptrCast(@alignCast(rec + runs.foreign));
         const callees: [*]const Atom.SymbolKey = @ptrCast(@alignCast(rec + runs.callees));
         break :d .{
             .file = file,
@@ -302,6 +329,9 @@ pub inline fn view(rec: [*]align(alignment) const u8) struct { atom: Atom, debug
             .inline_units = inline_units,
             .inline_callees = callees[0..dh.inlines_len],
             .patches = patches[0..dh.patches_len],
+            .foreign = foreign[0..dh.foreign_len],
+            .foreign_lines = foreign_lines,
+            .foreign_patches = foreign_patches[0..dh.foreign_patches_len],
         };
     } else null;
     return .{ .atom = .{
@@ -356,6 +386,9 @@ pub fn expectEqualDebug(expected: ?*const Atom.Debug, actual: ?*const Atom.Debug
         try t.expectEqualSlices(u8, e.inline_units, a.inline_units);
         try t.expectEqualSlices(Atom.SymbolKey, e.inline_callees, a.inline_callees);
         try t.expectEqualSlices(u32, e.patches, a.patches);
+        try t.expectEqualSlices(u8, @ptrCast(e.foreign), @ptrCast(a.foreign));
+        try t.expectEqualSlices(u8, e.foreign_lines, a.foreign_lines);
+        try t.expectEqualSlices(u32, e.foreign_patches, a.foreign_patches);
     }
 }
 
@@ -392,6 +425,9 @@ test "atoms round-trip through records" {
             .inline_units = "lib/std/std.zig\x00",
             .inline_callees = &.{.fromName("std.start.callMain")},
             .patches = &.{ 2, 6 },
+            .foreign = &.{.{ .low = 1, .high = 5, .unit = 1, .lines_len = 11, .patches_len = 2 }},
+            .foreign_lines = &.{ 0x04, 0x81, 0x80, 0x00, 0x03, 0x81, 0x80, 0x80, 0x80, 0x00, 0x13 },
+            .foreign_patches = &.{ 0, 4 },
         },
         .{ .atom = 2, .file = "src/u.zig", .name = "g", .base_line = 7, .lines = &.{0x14} },
     };

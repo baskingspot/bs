@@ -1094,7 +1094,11 @@ comptime arguments are run-time values in the lowered code (uucode's
     callee's module's unit (`Inline.unit`, an index into
     `Debug.inline_units`, 0 for the function's own); Sema's inline calls
     inherit the unit of the code around them, as upstream's inline code
-    is its caller's.
+    is its caller's. `Emit.addFunction` cuts the code in other units out
+    of the line program once (`Debug.splitForeign`): each such piece
+    gets a fragment of its own in `lines`' format (`Debug.foreign`,
+    `foreign_lines`, `foreign_patches`), cached with the function, so
+    that the linker copies and patches it as it does `lines`.
 - The symbol key is 128 bits: a hash of the rendered unit key for
   declarations, or of the contents for anonymous constants. Atoms with equal
   keys are one symbol; the linker keeps one and rejects a key whose atoms
@@ -3341,17 +3345,30 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
   the unit within a chunk. A function is one piece of its unit unless the
   backend inlined code of another module into it: then the code of each
   such call (`Inline.unit`), outside the calls inside it that name their
-  own, is a piece of the callee's module's unit (`Dwarf.forEachPiece`),
-  out of the function's unit's ranges and in the other unit's, which
-  also gets a sequence with the function's rows that cover the piece
-  (`Dwarf.foreignSequence`, decoded from the fragment). std's traces name
+  own, is a piece of the callee's module's unit (`Debug.foreign`), out
+  of the function's unit's ranges and in the other unit's, which also
+  gets a sequence with the function's rows that cover the piece: its
+  fragment, copied and patched like the function's own. Codegen cuts
+  the fragments out (`Debug.splitForeign`) because decoding them in the
+  linker cost 20 ms on every link of the zig workload, edit rebuilds
+  included; now a one-line edit in Sema.zig relinks in 172.5 ms against
+  main's 169.4 (paired median +0.1 ms over 30 runs) and a cold link takes
+  54.5 against 56.4 ms. The fragments stay relative to base lines, so the
+  cache keeps them when a declaration moves, at about 6 bytes per piece
+  over absolute lines: on the zig workload .debug_line grows 20.1 → 23.2
+  MB and .debug_rnglists 0.37 → 1.78 MB (+4.5 MB, +9.5% of .debug). std's traces name
   a frame's module after the first unit whose ranges hold its address and
   read its line from that unit's program, so a frame inlined across
   modules shows its callee's module, as upstream's call would
   (`test/run/panic_module_*.zig`, `panic_main_inlined.zig`). The
   function's entries and its own sequence stay whole in its unit: std
-  takes names from the innermost entry of any unit, and gdb still finds
-  the function and its inlined calls. A dSYM's aranges stay per run of
+  takes names from the innermost entry of any unit, and gdb finds
+  the function and its inlined calls, except that where a function holds
+  code of another module's function inlined directly into it, gdb maps
+  the address through the ranges to the callee's unit, finds no function
+  there, and names the frame after the caller (`m[main] at
+  debug.zig:442` for std's `assert` inlined into the root module's
+  `main`); that is accepted, as std's traces are what agents read. A dSYM's aranges stay per run of
   whole functions, as lldb maps addresses to units only through them and
   then looks for the function in that unit. Rejected: a separate unit per
   module for the pieces, first in .debug_info, with the functions' units

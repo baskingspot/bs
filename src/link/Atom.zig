@@ -446,6 +446,28 @@ pub const Debug = struct {
     ///   such patch's (at first, the function's).
     /// A fragment without patches is copied unchanged.
     patches: []const u32 = &.{},
+    /// The code in other units than `unit` (see `Inline.unit`), in pieces
+    /// in address order, each with a line-program fragment of its own for
+    /// its unit's line program, which `splitForeign` cuts out of `lines`
+    /// once per function so that the linkers only copy it.
+    foreign: []const Foreign = &.{},
+    /// The fragments of `foreign`, back to back, each in `lines`' format.
+    foreign_lines: []const u8 = "",
+    /// The fragments' patches, back to back, as `patches`, each relative to
+    /// its fragment.
+    foreign_patches: []const u32 = &.{},
+
+    pub const Foreign = extern struct {
+        /// The code: offsets `low..high` in the atom, nonempty.
+        low: u32,
+        high: u32,
+        /// Its unit, k ≥ 1 for the k-th path in `inline_units`.
+        unit: u32,
+        /// Its fragment's bytes in `foreign_lines` and its patches in
+        /// `foreign_patches`.
+        lines_len: u32,
+        patches_len: u32,
+    };
 
     pub const Inline = extern struct {
         /// The callee's simple name, in `inline_names`.
@@ -500,6 +522,180 @@ pub const Debug = struct {
     pub fn inlineName(d: *const Debug, inl: Inline) []const u8 {
         return d.inline_names[inl.name_off..][0..inl.name_len];
     }
+
+    /// Sets `foreign`, `foreign_lines`, and `foreign_patches` of the debug
+    /// info of a `code_len`-byte function from `inlines` and `lines`, in
+    /// `arena`. The code around each address is in the unit of the
+    /// innermost inlined call there that names one, else in `unit`;
+    /// adjacent code of one unit is one piece. A piece's fragment has the
+    /// row in effect at its start, moved there, and its rows after it; it
+    /// starts from address = the piece's start and line = 1 (its first
+    /// patch is from base line 0), and sets the file before its first
+    /// row.
+    pub fn splitForeign(d: *Debug, arena: std.mem.Allocator, code_len: u32) !void {
+        var pieces: std.ArrayList(Foreign) = .empty;
+        try forEachPiece(d.inlines, code_len, arena, &pieces);
+        if (pieces.items.len == 0) return;
+        var lines: std.ArrayList(u8) = .empty;
+        var patches: std.ArrayList(u32) = .empty;
+        var it: RowIter = .{ .d = d };
+        var cur: ?RowIter.Row = null;
+        var next = it.next();
+        for (pieces.items) |*p| {
+            while (next) |r| {
+                if (r.offset > p.low) break;
+                cur = r;
+                next = it.next();
+            }
+            var w: struct {
+                lp: LineProgram,
+                file: u32 = std.math.maxInt(u32),
+                base: u32 = std.math.maxInt(u32),
+
+                fn row(w: *@This(), a: std.mem.Allocator, offset: u32, r: RowIter.Row) !void {
+                    if (r.file != w.file) {
+                        try w.lp.switchTo(a, r.file, r.base);
+                    } else if (r.base != w.base) {
+                        try w.lp.rebase(a, r.base);
+                    }
+                    w.file = r.file;
+                    w.base = r.base;
+                    try w.lp.addRow(a, offset, r.line, r.column -| 1);
+                }
+            } = .{ .lp = .{ .state = .{ .offset = p.low }, .prev = .{ .offset = p.low } } };
+            const lp = &w.lp;
+            if (cur) |r| try w.row(arena, p.low, r);
+            while (next) |r| {
+                if (r.offset >= p.high) break;
+                try w.row(arena, r.offset, r);
+                cur = r;
+                next = it.next();
+            }
+            p.lines_len = @intCast(lp.bytes.items.len);
+            p.patches_len = @intCast(lp.patches.items.len);
+            try lines.appendSlice(arena, lp.bytes.items);
+            try patches.appendSlice(arena, lp.patches.items);
+        }
+        d.foreign = pieces.items;
+        d.foreign_lines = lines.items;
+        d.foreign_patches = patches.items;
+    }
+
+    /// Appends the pieces of the `code_len`-byte function with `inlines` that
+    /// are in another unit than its own to `out` in address order (see
+    /// `splitForeign`), without their fragments. An inlined call's code
+    /// ends at the end of the enclosing call that names a unit, and starts
+    /// after the code of the calls before it, so pieces never overlap even
+    /// if the calls do.
+    fn forEachPiece(inlines: []const Inline, code_len: u32, arena: std.mem.Allocator, out: *std.ArrayList(Foreign)) !void {
+        const Out = struct {
+            list: *std.ArrayList(Foreign),
+            arena: std.mem.Allocator,
+            pending: ?Foreign = null,
+            pos: u32 = 0,
+
+            fn add(o: *@This(), hi: u32, unit: u32) !void {
+                if (hi <= o.pos) return;
+                defer o.pos = hi;
+                if (o.pending) |*p| {
+                    if (p.unit == unit) {
+                        p.high = hi;
+                        return;
+                    }
+                    if (p.unit != 0) try o.list.append(o.arena, p.*);
+                }
+                o.pending = .{ .low = o.pos, .high = hi, .unit = unit, .lines_len = 0, .patches_len = 0 };
+            }
+        };
+        var o: Out = .{ .list = out, .arena = arena };
+        // The innermost open call that names a unit.
+        var cur: u32 = Inline.none;
+        for (inlines, 0..) |inl, k| {
+            if (inl.unit == Inline.inherit) continue;
+            const outer = enclosing(inlines, @intCast(k));
+            while (cur != Inline.none and cur != outer) : (cur = enclosing(inlines, cur)) try o.add(inlines[cur].high, inlines[cur].unit);
+            try o.add(inl.low, if (cur == Inline.none) 0 else inlines[cur].unit);
+            cur = @intCast(k);
+        }
+        while (cur != Inline.none) : (cur = enclosing(inlines, cur)) try o.add(inlines[cur].high, inlines[cur].unit);
+        try o.add(code_len, 0);
+        if (o.pending) |p| if (p.unit != 0) try out.append(arena, p);
+    }
+
+    /// The nearest ancestor of inlined call `k` that names a unit, or
+    /// `Inline.none`.
+    fn enclosing(inlines: []const Inline, k: u32) u32 {
+        var p = inlines[k].parent;
+        while (p != Inline.none and inlines[p].unit == Inline.inherit) p = inlines[p].parent;
+        return p;
+    }
+
+    /// Decodes the rows of `lines` as `LineProgram` wrote them, with
+    /// patched operands as written: a row's file is a local file index and
+    /// its line is relative to base `base` (see `LineProgram.switchTo`).
+    /// Stops at an opcode `LineProgram` does not write.
+    const RowIter = struct {
+        d: *const Debug,
+        at: usize = 0,
+        patch: usize = 0,
+        row: Row = .{ .offset = 0, .file = 0, .base = 0, .line = 0, .column = 0 },
+
+        const Row = struct { offset: u32, file: u32, base: u32, line: u32, column: u32 };
+
+        fn next(it: *RowIter) ?Row {
+            const lines = it.d.lines;
+            const r = &it.row;
+            while (it.at < lines.len) {
+                const p = it.at;
+                const op = lines[p];
+                it.at += 1;
+                const patched = it.patch < it.d.patches.len and it.d.patches[it.patch] == p;
+                if (patched) it.patch += 1;
+                if (op >= LineProgram.opcode_base) {
+                    const adjusted = op - LineProgram.opcode_base;
+                    r.offset += adjusted / LineProgram.line_range;
+                    r.line = @intCast(@as(i64, r.line) + LineProgram.line_base + adjusted % LineProgram.line_range);
+                    return r.*;
+                }
+                switch (op) {
+                    std.dwarf.LNS.set_file => {
+                        if (!patched or lines.len - p < 4) return null;
+                        r.file = @as(u32, lines[p + 1] & 0x7f) | @as(u32, lines[p + 2] & 0x7f) << 7 | @as(u32, lines[p + 3]) << 14;
+                        it.at = p + 4;
+                    },
+                    std.dwarf.LNS.advance_line => if (patched) {
+                        if (lines.len - p < 6) return null;
+                        var v: u32 = 0;
+                        for (lines[p + 1 ..][0..4], 0..) |b, i| v |= @as(u32, b & 0x7f) << @intCast(7 * i);
+                        r.base = v;
+                        it.at = p + 6;
+                    } else {
+                        r.line = @intCast(@as(i64, r.line) + (it.leb(true) orelse return null));
+                    },
+                    std.dwarf.LNS.set_column => r.column = @intCast(it.leb(false) orelse return null),
+                    std.dwarf.LNS.advance_pc => r.offset += @intCast(it.leb(false) orelse return null),
+                    std.dwarf.LNS.const_add_pc => r.offset += (255 - LineProgram.opcode_base) / LineProgram.line_range,
+                    else => return null,
+                }
+            }
+            return null;
+        }
+
+        fn leb(it: *RowIter, signed: bool) ?i64 {
+            var v: u64 = 0;
+            var shift: u32 = 0;
+            while (it.at < it.d.lines.len and shift < 64) : (shift += 7) {
+                const b = it.d.lines[it.at];
+                it.at += 1;
+                v |= @as(u64, b & 0x7f) << @intCast(shift);
+                if (b & 0x80 == 0) {
+                    if (signed and shift + 7 < 64 and b & 0x40 != 0) v |= @as(u64, std.math.maxInt(u64)) << @intCast(shift + 7);
+                    return @bitCast(v);
+                }
+            }
+            return null;
+        }
+    };
 };
 
 /// A function's unwind information (see `Atom.unwind`).
@@ -608,6 +804,17 @@ pub const LineProgram = struct {
         lp.bytes.appendAssumeCapacity(std.dwarf.LNS.advance_line);
         lp.bytes.appendSliceAssumeCapacity(&paddedSleb(base));
         // A row at the offset of the last one adds to it from here.
+        lp.prev = lp.state;
+        lp.prev_len = lp.bytes.items.len;
+    }
+
+    /// As `switchTo`, with the file of the rows before kept: only the
+    /// base changes.
+    pub fn rebase(lp: *LineProgram, gpa: std.mem.Allocator, base: u32) !void {
+        try lp.bytes.ensureUnusedCapacity(gpa, 6);
+        try lp.patches.append(gpa, @intCast(lp.bytes.items.len));
+        lp.bytes.appendAssumeCapacity(std.dwarf.LNS.advance_line);
+        lp.bytes.appendSliceAssumeCapacity(&paddedSleb(base));
         lp.prev = lp.state;
         lp.prev_len = lp.bytes.items.len;
     }
