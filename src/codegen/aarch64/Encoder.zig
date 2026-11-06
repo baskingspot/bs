@@ -32,6 +32,12 @@ line_events: std.ArrayList(LineEvent) = .empty,
 /// The calls (`bl`, `blr`) emitted, which the code generator checks
 /// against the instructions it expects to call.
 calls: u32 = 0,
+/// The general-purpose registers the instructions encoded since it was
+/// last cleared write, by bit (`Reg`, x0-x30): their destinations and the
+/// ones they write implicitly. A call writes every caller-saved one.
+/// CodeGen checks it against the scratch registers each value may use.
+/// `raw` records nothing: its callers record what their word writes.
+written: u32 = 0,
 
 const LineEvent = struct { offset: u32, kind: enum { row, switch_to }, a: u32, b: u32 };
 
@@ -329,6 +335,14 @@ const BranchField = enum {
     }
 };
 
+/// The registers a call does not preserve: x0-x17 and lr.
+pub const caller_saved: u32 = 0x3ffff | 1 << 30;
+
+/// Records that `r` is written; sp and zr are not tracked.
+pub fn writes(e: *Encoder, r: Reg) void {
+    if (@backingInt(r) <= 30) e.written |= @as(u32, 1) << @intCast(@backingInt(r));
+}
+
 pub fn init(gpa: Allocator) Encoder {
     return .{ .gpa = gpa };
 }
@@ -471,12 +485,14 @@ pub fn bind(e: *Encoder, label: Label) void {
 /// Loads `size` bytes into `dst`, zero-extended: ldrb, ldrh, and ldr into a
 /// w register, ldr into an x register for `.dword`.
 pub fn ldr(e: *Encoder, size: Size, dst: Reg, mem: Mem) !void {
+    e.writes(dst);
     try e.loadStore(size, false, 0b01, dst.zrEnc(), mem);
 }
 
 /// Loads `size` bytes into `dst` sign-extended to `width`: ldrsb, ldrsh
 /// (to w or x), and ldrsw (to x only).
 pub fn ldrs(e: *Encoder, size: Size, width: Width, dst: Reg, mem: Mem) !void {
+    e.writes(dst);
     assert(size != .dword);
     assert(!(size == .word and width == .w));
     try e.loadStore(size, false, if (width == .x) 0b10 else 0b11, dst.zrEnc(), mem);
@@ -499,6 +515,8 @@ pub fn strFp(e: *Encoder, ty: Float, src: VReg, mem: Mem) !void {
 
 /// Loads two w (`.word`) or x (`.dword`) registers from consecutive slots.
 pub fn ldp(e: *Encoder, size: Size, r1: Reg, r2: Reg, mem: Mem) !void {
+    e.writes(r1);
+    e.writes(r2);
     try e.pair(size, false, true, r1.zrEnc(), r2.zrEnc(), mem);
 }
 
@@ -618,6 +636,7 @@ pub const Ordering = enum(u2) {
 
 /// `ldar`: a load-acquire of `size` bytes from `[base]`, zero-extended.
 pub fn ldar(e: *Encoder, size: Size, dst: Reg, base: Reg) !void {
+    e.writes(dst);
     try e.reserve();
     e.word(0x08dffc00 | (@as(u32, @backingInt(size)) << 30) | (base.spEnc() << 5) | dst.zrEnc());
 }
@@ -631,6 +650,7 @@ pub fn stlr(e: *Encoder, size: Size, src: Reg, base: Reg) !void {
 /// `ldaxr{b,h}`: a load-acquire exclusive of `size` bytes from `[base]`,
 /// zero-extended (ARMv8.0).
 pub fn ldaxr(e: *Encoder, size: Size, dst: Reg, base: Reg) !void {
+    e.writes(dst);
     try e.reserve();
     e.word(0x085ffc00 | (@as(u32, @backingInt(size)) << 30) | (base.spEnc() << 5) | dst.zrEnc());
 }
@@ -638,6 +658,7 @@ pub fn ldaxr(e: *Encoder, size: Size, dst: Reg, base: Reg) !void {
 /// `stlxr{b,h}`: a store-release exclusive of the low `size` bytes of
 /// `src` to `[base]`; `status` gets 0 if it stored, 1 if not.
 pub fn stlxr(e: *Encoder, size: Size, status: Reg, src: Reg, base: Reg) !void {
+    e.writes(status);
     assert(status != src);
     assert(status != base);
     try e.reserve();
@@ -647,6 +668,8 @@ pub fn stlxr(e: *Encoder, size: Size, status: Reg, src: Reg, base: Reg) !void {
 /// `ldaxp`: a load-acquire exclusive of the x register pair at `[base]`,
 /// single-copy atomic only once a `stlxp` to it succeeds.
 pub fn ldaxp(e: *Encoder, lo: Reg, hi: Reg, base: Reg) !void {
+    e.writes(lo);
+    e.writes(hi);
     try e.reserve();
     e.word(0xc87f8000 | (hi.zrEnc() << 10) | (base.spEnc() << 5) | lo.zrEnc());
 }
@@ -654,6 +677,7 @@ pub fn ldaxp(e: *Encoder, lo: Reg, hi: Reg, base: Reg) !void {
 /// `stlxp`: a store-release exclusive of the x register pair `lo`, `hi`
 /// to `[base]`; `status` gets 0 if it stored, 1 if not.
 pub fn stlxp(e: *Encoder, status: Reg, lo: Reg, hi: Reg, base: Reg) !void {
+    e.writes(status);
     assert(status != lo);
     assert(status != hi);
     assert(status != base);
@@ -665,6 +689,7 @@ pub fn stlxp(e: *Encoder, status: Reg, lo: Reg, hi: Reg, base: Reg) !void {
 /// and, if equal, stores `new`. `expected` receives the old value either
 /// way (LSE, ARMv8.1, which every Apple Silicon core has).
 pub fn cas(e: *Encoder, size: Size, order: Ordering, expected: Reg, new: Reg, base: Reg) !void {
+    e.writes(expected);
     try e.reserve();
     e.word(0x08a07c00 | (@as(u32, @backingInt(size)) << 30) | (order.aBit() << 22) | (expected.zrEnc() << 16) |
         (order.rBit() << 15) | (base.spEnc() << 5) | new.zrEnc());
@@ -674,6 +699,8 @@ pub fn cas(e: *Encoder, size: Size, order: Ordering, expected: Reg, new: Reg, ba
 /// `expected` and `new` name the first of two consecutive registers, which
 /// must be even.
 pub fn casp(e: *Encoder, size: Size, order: Ordering, expected: Reg, new: Reg, base: Reg) !void {
+    e.writes(expected);
+    if (expected != .zr) e.writes(@enumFromInt(@backingInt(expected) + 1));
     assert(size == .word or size == .dword);
     assert(expected.zrEnc() & 1 == 0);
     assert(new.zrEnc() & 1 == 0);
@@ -689,6 +716,7 @@ pub const AtomicOp = enum(u4) { add, clr, eor, set, smax, smin, umax, umin, swp 
 /// for swp; `clr` is and-not). With `dst` = zr and no acquire this is the
 /// `st<op>` alias.
 pub fn atomic(e: *Encoder, op: AtomicOp, size: Size, order: Ordering, src: Reg, dst: Reg, base: Reg) !void {
+    e.writes(dst);
     try e.reserve();
     const o3: u32, const opc: u32 = if (op == .swp) .{ 1, 0 } else .{ 0, @backingInt(op) };
     e.word(0x38200000 | (@as(u32, @backingInt(size)) << 30) | (order.aBit() << 23) | (order.rBit() << 22) |
@@ -724,6 +752,7 @@ pub fn dmb(e: *Encoder, option: Barrier) !void {
 /// instruction's page (page21 relocation). Complete it with `add` of
 /// `.page_off` or a load or store with a `.page_off` offset.
 pub fn adrp(e: *Encoder, dst: Reg, sym: SymbolKey, addend: i32) !void {
+    e.writes(dst);
     try e.reserve();
     try e.reloc(.aarch64_page21, sym, addend);
     e.word(0x90000000 | dst.zrEnc());
@@ -731,6 +760,7 @@ pub fn adrp(e: *Encoder, dst: Reg, sym: SymbolKey, addend: i32) !void {
 
 /// `adr dst, label`: the address of a label in this function, ±1 MiB.
 pub fn adr(e: *Encoder, dst: Reg, label: Label) !void {
+    e.writes(dst);
     try e.reserve();
     try e.branchTo(0x10000000 | dst.zrEnc(), label, .adr21);
 }
@@ -747,6 +777,7 @@ pub fn labelDelta(e: *Encoder, label: Label, anchor: Label) !void {
 /// `adrp dst, sym@GOTPAGE`: the page of `sym`'s GOT slot (GOT page21
 /// relocation). Complete it with `ldr` of `.got_page_off`.
 pub fn adrpGot(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
+    e.writes(dst);
     try e.reserve();
     try e.reloc(.aarch64_got_load_page21, sym, 0);
     e.word(0x90000000 | dst.zrEnc());
@@ -778,14 +809,17 @@ pub fn threadLocalAddr(e: *Encoder, sym: SymbolKey) !void {
     try e.reserve();
     try e.reloc(.aarch64_tlvp_pageoff12, sym, 0);
     e.word(0x91000000); // add x0, x0, #0
+    const written = e.written;
     try e.ldr(.dword, .x16, .at(.x0, 0));
     try e.blr(.x16);
+    e.written = written | 1 << 0 | 1 << 16 | 1 << 17 | 1 << 30;
 }
 
 /// `dst` = the address of thread-local `sym` for the calling thread, ELF
 /// local-exec: `mrs dst, tpidr_el0; add dst, dst, #:tprel_hi12:sym, lsl
 /// #12; add dst, dst, #:tprel_lo12_nc:sym`.
 pub fn threadLocalOffset(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
+    e.writes(dst);
     try e.raw(System.mrs_tpidr_el0 | dst.zrEnc());
     try e.reserve();
     try e.reloc(.aarch64_tprel_hi12, sym, 0);
@@ -802,6 +836,7 @@ pub fn threadLocalOffset(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
 /// is the variable and the relocations are the TLSDESC ones the final
 /// link resolves; else `sym` is the descriptor itself, in the image.
 pub fn threadLocalDesc(e: *Encoder, sym: SymbolKey, object: bool) !void {
+    e.written |= 1 << 0 | 1 << 1 | 1 << 30;
     try e.reserve();
     try e.reloc(if (object) .aarch64_tlsdesc_page21 else .aarch64_page21, sym, 0);
     e.word(0x90000000); // adrp x0
@@ -820,6 +855,7 @@ pub fn threadLocalDesc(e: *Encoder, sym: SymbolKey, object: bool) !void {
 /// pointer, initial-exec, in an object: `adrp dst, :gottprel:S; ldr dst,
 /// [dst, :gottprel_lo12:S]`.
 pub fn threadLocalInitial(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
+    e.writes(dst);
     try e.reserve();
     try e.reloc(.aarch64_gottprel_page21, sym, 0);
     e.word(0x90000000 | dst.zrEnc());
@@ -841,6 +877,7 @@ pub const MovWideOp = enum(u2) { movn = 0b00, movz = 0b10, movk = 0b11 };
 /// movz, movn, or movk of `imm` shifted left by `shift` (0, 16, 32, or 48;
 /// 0 or 16 for w registers).
 pub fn movWide(e: *Encoder, op: MovWideOp, width: Width, dst: Reg, imm: u16, shift: u6) !void {
+    e.writes(dst);
     assert(shift % 16 == 0);
     assert(shift < width.bits());
     try e.reserve();
@@ -912,6 +949,7 @@ pub const AddOp = enum(u2) { add = 0b00, adds = 0b01, sub = 0b10, subs = 0b11 };
 /// src1 may be sp, except that the flag-setting forms write zr instead and
 /// shifted registers allow neither.
 pub fn addSub(e: *Encoder, op: AddOp, width: Width, dst: Reg, src1: Reg, src2: AddOperand) !void {
+    e.writes(dst);
     try e.reserve();
     const sets_flags = @backingInt(op) & 1 != 0;
     const base = width.sf() | (@as(u32, @backingInt(op)) << 29);
@@ -957,6 +995,7 @@ pub const CarryOp = enum(u2) { adc = 0b00, adcs = 0b01, sbc = 0b10, sbcs = 0b11 
 /// `dst = src1 + src2 + C` (adc, adcs) or `src1 - src2 - !C` (sbc, sbcs),
 /// for arithmetic over several words.
 pub fn carry(e: *Encoder, op: CarryOp, width: Width, dst: Reg, src1: Reg, src2: Reg) !void {
+    e.writes(dst);
     try e.reserve();
     e.word(0x1a000000 | width.sf() | (@as(u32, @backingInt(op)) << 29) | (src2.zrEnc() << 16) | (src1.zrEnc() << 5) | dst.zrEnc());
 }
@@ -976,6 +1015,7 @@ pub const LogicOp = enum(u3) { @"and", orr, eor, ands, bic, orn, eon, bics };
 /// `dst = src1 op src2`. dst may be sp for and, orr, and eor with an
 /// immediate.
 pub fn logic(e: *Encoder, op: LogicOp, width: Width, dst: Reg, src1: Reg, src2: LogicOperand) !void {
+    e.writes(dst);
     try e.reserve();
     const opc: u32 = @as(u2, @truncate(@backingInt(op)));
     const base = width.sf() | (opc << 29) | (src1.zrEnc() << 5);
@@ -1044,6 +1084,7 @@ pub const MulOp = enum { madd, msub };
 
 /// `dst = acc ± src1 * src2` (madd, msub).
 pub fn mulAdd(e: *Encoder, op: MulOp, width: Width, dst: Reg, src1: Reg, src2: Reg, acc: Reg) !void {
+    e.writes(dst);
     try e.reserve();
     e.word(0x1b000000 | width.sf() | (src2.zrEnc() << 16) | (@as(u32, @intFromBool(op == .msub)) << 15) | (acc.zrEnc() << 10) | (src1.zrEnc() << 5) | dst.zrEnc());
 }
@@ -1055,6 +1096,7 @@ pub fn mul(e: *Encoder, width: Width, dst: Reg, src1: Reg, src2: Reg) !void {
 
 /// smulh/umulh: the high 64 bits of the 128-bit product of x registers.
 pub fn mulHigh(e: *Encoder, signed: bool, dst: Reg, src1: Reg, src2: Reg) !void {
+    e.writes(dst);
     try e.reserve();
     const base: u32 = if (signed) 0x9b407c00 else 0x9bc07c00;
     e.word(base | (src2.zrEnc() << 16) | (src1.zrEnc() << 5) | dst.zrEnc());
@@ -1063,6 +1105,7 @@ pub fn mulHigh(e: *Encoder, signed: bool, dst: Reg, src1: Reg, src2: Reg) !void 
 /// smull/umull: the 64-bit product of two w registers into an x register
 /// (smaddl/umaddl with xzr).
 pub fn mulLong(e: *Encoder, signed: bool, dst: Reg, src1: Reg, src2: Reg) !void {
+    e.writes(dst);
     try e.reserve();
     const base: u32 = if (signed) 0x9b207c00 else 0x9ba07c00;
     e.word(base | (src2.zrEnc() << 16) | (src1.zrEnc() << 5) | dst.zrEnc());
@@ -1070,6 +1113,7 @@ pub fn mulLong(e: *Encoder, signed: bool, dst: Reg, src1: Reg, src2: Reg) !void 
 
 /// udiv/sdiv. Division by zero gives 0; it does not trap.
 pub fn div(e: *Encoder, signed: bool, width: Width, dst: Reg, src1: Reg, src2: Reg) !void {
+    e.writes(dst);
     try e.reserve();
     e.word(0x1ac00800 | width.sf() | (src2.zrEnc() << 16) | (@as(u32, @intFromBool(signed)) << 10) | (src1.zrEnc() << 5) | dst.zrEnc());
 }
@@ -1077,6 +1121,7 @@ pub fn div(e: *Encoder, signed: bool, width: Width, dst: Reg, src1: Reg, src2: R
 /// Shift by a register (lslv, lsrv, asrv, rorv); the amount is taken modulo
 /// the width.
 pub fn shiftReg(e: *Encoder, op: Shift, width: Width, dst: Reg, src: Reg, amount: Reg) !void {
+    e.writes(dst);
     try e.reserve();
     e.word(0x1ac02000 | width.sf() | (amount.zrEnc() << 16) | (@as(u32, @backingInt(op)) << 10) | (src.zrEnc() << 5) | dst.zrEnc());
 }
@@ -1084,6 +1129,7 @@ pub fn shiftReg(e: *Encoder, op: Shift, width: Width, dst: Reg, src: Reg, amount
 /// Shift by an immediate below the width: lsl and lsr (ubfm), asr (sbfm),
 /// ror (extr).
 pub fn shiftImm(e: *Encoder, op: Shift, width: Width, dst: Reg, src: Reg, amount: u6) !void {
+    e.writes(dst);
     const bits = width.bits();
     assert(amount < bits);
     const top: u6 = @intCast(bits - 1);
@@ -1105,6 +1151,7 @@ pub const BitfieldOp = enum(u2) { sbfm = 0b00, bfm = 0b01, ubfm = 0b10 };
 /// sbfm, bfm, ubfm, from which the shifts, extensions, and bitfield
 /// extracts and inserts are built.
 pub fn bitfield(e: *Encoder, op: BitfieldOp, width: Width, dst: Reg, src: Reg, immr: u6, imms: u6) !void {
+    e.writes(dst);
     assert(immr < width.bits());
     assert(imms < width.bits());
     try e.reserve();
@@ -1134,6 +1181,7 @@ pub const CselOp = enum(u2) { csel, csinc, csinv, csneg };
 
 /// `dst = cond ? src1 : op(src2)`: csel, csinc, csinv, csneg.
 pub fn csel(e: *Encoder, op: CselOp, width: Width, dst: Reg, src1: Reg, src2: Reg, cond: Cond) !void {
+    e.writes(dst);
     try e.reserve();
     const o: u32 = @backingInt(op);
     e.word(0x1a800000 | width.sf() | ((o >> 1) << 30) | (src2.zrEnc() << 16) | (@as(u32, @backingInt(cond)) << 12) | ((o & 1) << 10) | (src1.zrEnc() << 5) | dst.zrEnc());
@@ -1169,6 +1217,7 @@ pub const BitOp = enum { rbit, rev16, rev32, rev, clz, cls };
 /// Data-processing (1 source): rbit, rev16 (bytes within halfwords), rev32
 /// (bytes within words, x only), rev (bytes of the register), clz, cls.
 pub fn bitOp(e: *Encoder, op: BitOp, width: Width, dst: Reg, src: Reg) !void {
+    e.writes(dst);
     assert(op != .rev32 or width == .x);
     try e.reserve();
     const opcode: u32 = switch (op) {
@@ -1200,6 +1249,7 @@ pub fn branchFrom(e: *Encoder, at: u32, label: Label) !void {
 
 /// `bl`, as `b`.
 pub fn bl(e: *Encoder, target: Target) !void {
+    e.written |= caller_saved;
     e.calls += 1;
     try e.branch26(0x94000000, target);
 }
@@ -1231,6 +1281,7 @@ pub fn br(e: *Encoder, reg: Reg) !void {
 
 /// `blr reg`
 pub fn blr(e: *Encoder, reg: Reg) !void {
+    e.written |= caller_saved;
     e.calls += 1;
     try e.reserve();
     e.word(0xd63f0000 | (reg.zrEnc() << 5));
@@ -1343,6 +1394,7 @@ pub fn fmovFromGpr(e: *Encoder, ty: Float, dst: VReg, width: Width, src: Reg) !v
 
 /// fmov of the bits of an h, s, or d register into a general register.
 pub fn fmovToGpr(e: *Encoder, width: Width, dst: Reg, ty: Float, src: VReg) !void {
+    e.writes(dst);
     assert(ty == .f16 or (ty == .f32) == (width == .w));
     try e.reserve();
     e.word(0x1e260000 | width.sf() | ty.ftype() | (src.enc() << 5) | dst.zrEnc());
@@ -1464,6 +1516,7 @@ pub fn cvtf(e: *Encoder, signed: bool, ty: Float, dst: VReg, width: Width, src: 
 /// fcvtzs/fcvtzu: converts floating point to a w or x integer, rounding
 /// toward zero and saturating.
 pub fn fcvtz(e: *Encoder, signed: bool, width: Width, dst: Reg, ty: Float, src: VReg) !void {
+    e.writes(dst);
     try e.reserve();
     e.word(0x1e380000 | width.sf() | ty.ftype() | (@as(u32, @intFromBool(!signed)) << 16) | (src.enc() << 5) | dst.zrEnc());
 }
