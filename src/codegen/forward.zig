@@ -5,7 +5,9 @@
 //! `const x = p.*`, for `const x = buf[i]`, and for the by-value
 //! parameters of inline calls (Sema's and the backend inliner's, whose
 //! `self: S` receivers are the common case); each one cost a copy into
-//! the frame to read a field or two. And a load of a scalar that a
+//! the frame to read a field or two. `const x = s[i]` and a `for` loop's
+//! capture of a slice element (`slice_elem_val`, `ptr_elem_val`) read the
+//! element the same way, its value becoming the element's address. And a load of a scalar that a
 //! dominating store wrote, or a dominating load read, reads that value
 //! instead when nothing in between may write the memory: `self.index += 1`
 //! followed by a read of `self.index`, or `self.len` read twice. A load
@@ -65,7 +67,7 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
             // call's argument tuple, into a candidate local.
             const v = data.bin_op.rhs.toIndex() orelse continue;
             switch (tags[@backingInt(v)]) {
-                .load, .struct_field_val => {},
+                .load, .struct_field_val, .slice_elem_val, .ptr_elem_val => {},
                 else => continue,
             }
             const a = data.bin_op.lhs.toIndex() orelse continue;
@@ -101,7 +103,7 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
     w.body(ir.mainBody());
     w.straight();
 
-    var count: u32 = if (copies) w.forwardCopies(words[10 * n ..][0 .. w.next + 1]) else 0;
+    var count: u32 = if (copies) try w.forwardCopies(gpa, words[10 * n ..][0 .. w.next + 1]) else 0;
     if (reloads) {
         // The loads in loops not forwarded, for `hoistLoads`, in room
         // `forwardCopies` is done with.
@@ -289,7 +291,7 @@ const Walk = struct {
 
     /// Turns the copies that qualify into the memory they copy, given
     /// room for a count per position; returns how many.
-    fn forwardCopies(w: *Walk, prefix: []u32) u32 {
+    fn forwardCopies(w: *Walk, gpa: Allocator, prefix: []u32) Allocator.Error!u32 {
         const ir = w.ir;
         const ip = w.ip;
         const tags = ir.instructions.items(.tag);
@@ -302,7 +304,7 @@ const Walk = struct {
             else => false,
         });
 
-        var count: u32 = 0;
+        var count = try w.forwardElems(gpa, prefix);
         for (w.order[0..w.next]) |ii| {
             if (tags[ii] != .alloc or !candidate(ip, datas[ii].ty)) continue;
             const f = w.flags[ii];
@@ -343,6 +345,99 @@ const Walk = struct {
             count += 1;
         }
         return count;
+    }
+
+    /// Copies of a slice's or many-pointer's element (`const x = s[i]`,
+    /// `for (s) |x|`, and an inline callee's by-value parameter given
+    /// one): when every user of the element's value is the store of a
+    /// local that qualifies as a copy, the value becomes the element's
+    /// address (`slice_elem_ptr`, `ptr_elem_ptr`) and the locals that
+    /// address. Its operands escape any local they point into, so nothing
+    /// may write unknown memory from the element's read to each local's
+    /// last read. The bounds check before it stays where it is; the
+    /// address is computed where the value was read and lives as long as
+    /// the locals are read. Runs before the other copies, which then see
+    /// these locals as forwarded.
+    fn forwardElems(w: *Walk, gpa: Allocator, prefix: []const u32) Allocator.Error!u32 {
+        const ir = w.ir;
+        const ip = w.ip;
+        const tags = ir.instructions.items(.tag);
+        const datas = ir.instructions.items(.data);
+        // The qualifying locals, as (local, element read) pairs.
+        var found: std.ArrayList([2]u32) = .empty;
+        defer found.deinit(gpa);
+        for (w.order[0..w.next]) |ii| {
+            if (tags[ii] != .alloc or !candidate(ip, datas[ii].ty)) continue;
+            const f = w.flags[ii];
+            if (f.escaped or f.loop_mismatch or f.multi or w.store[ii] == none) continue;
+            const store = w.store[ii];
+            const e = datas[store].bin_op.rhs.toIndex() orelse continue;
+            const l = @backingInt(e);
+            if (tags[l] != .slice_elem_val and tags[l] != .ptr_elem_val) continue;
+            if (!w.elemLayout(l, datas[ii].ty)) continue;
+            if (!(w.pos[l] < w.pos[ii] and w.pos[ii] <= w.scope_end[l])) continue;
+            if (w.loop_of[l] != w.loop_of[ii]) continue;
+            const end = @max(w.last[ii], w.pos[store]);
+            if (prefix[end + 1] - prefix[w.pos[l] + 1] != 0) continue;
+            try found.append(gpa, .{ ii, l });
+        }
+        if (found.items.len == 0) return 0;
+        // Every user of the element's value must be such a store.
+        std.sort.pdq([2]u32, found.items, {}, struct {
+            fn lt(_: void, a: [2]u32, b: [2]u32) bool {
+                return a[1] < b[1];
+            }
+        }.lt);
+        var extra: std.ArrayList(u32) = .fromOwnedSlice(@constCast(ir.extra));
+        defer ir.extra = extra.allocatedSlice();
+        var count: u32 = 0;
+        var k: usize = 0;
+        while (k < found.items.len) {
+            const l = found.items[k][1];
+            var end = k;
+            while (end < found.items.len and found.items[end][1] == l) end += 1;
+            defer k = end;
+            if (end - k != w.uses[l]) continue;
+            const ptr_ty = datas[found.items[k][0]].ty;
+            const payload: u32 = @intCast(extra.items.len);
+            try extra.appendSlice(gpa, &.{ @backingInt(datas[l].bin_op.lhs), @backingInt(datas[l].bin_op.rhs) });
+            tags[l] = if (tags[l] == .slice_elem_val) .slice_elem_ptr else .ptr_elem_ptr;
+            datas[l] = .{ .ty_pl = .{ .ty = ptr_ty, .payload = payload } };
+            const addr = Inst.Index.toRef(@fromBackingInt(l));
+            for (found.items[k..end]) |x| {
+                const ii = x[0];
+                const ty = datas[ii].ty;
+                const store = w.store[ii];
+                tags[ii] = .bitcast;
+                datas[ii] = .{ .ty_op = .{ .ty = ty, .operand = addr } };
+                tags[store] = .bitcast;
+                datas[store] = .{ .ty_op = .{ .ty = ty, .operand = addr } };
+                w.flags[ii].forwarded = true;
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Whether element read `l` reads the type of a local of pointer type
+    /// `alloc_ty` at its natural alignment, through an ordinary pointer.
+    fn elemLayout(w: *const Walk, l: u32, alloc_ty: Index) bool {
+        const ip = w.ip;
+        const ir = w.ir;
+        const a = Type.ptrInfo(ip, alloc_ty);
+        if (a.flags.alignment != 0) return false;
+        const ty = ir.typeOf(ir.instructions.items(.data)[l].bin_op.lhs, ip);
+        if (ip.keyTag(ty) != .ptr_type) return false;
+        const p = Type.ptrInfo(ip, ty);
+        if (p.flags.is_volatile or p.flags.alignment != 0 or p.flags.address_space != .generic or
+            p.flags.vector_index != 0 or p.packed_offset.host_size != 0) return false;
+        const elem = switch (p.flags.size) {
+            .slice, .many => p.child,
+            // `*[N]T`; a vector's elements are not addressable.
+            .one => if (ip.keyTag(p.child) == .array_type) ip.keyPayload(.array_type, p.child).child else return false,
+            .c => return false,
+        };
+        return elem == a.child;
     }
 
     /// Store-to-load forwarding and load reuse: a load of a scalar from
