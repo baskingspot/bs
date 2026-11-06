@@ -167,7 +167,7 @@ fn amount(cg: *CodeGen, ref: Inst.Ref) ?u8 {
 }
 
 /// The low and high halves of 128-bit value `ref`, where they can be read.
-fn halves(cg: *CodeGen, ref: Inst.Ref) Error![2]Operand {
+pub fn halves(cg: *CodeGen, ref: Inst.Ref) Error![2]Operand {
     if (cg.pairOf(ref)) |p| return .{ .{ .reg = p.lo }, .{ .reg = p.hi } };
     // A widened value in one register (`plan`), or in the 8-byte slot
     // `genSplit` saved that register to around a clobbering instruction.

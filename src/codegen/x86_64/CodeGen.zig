@@ -4105,7 +4105,7 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
     // and reductions in GPRs.
     if (vector.lowers(cg, inst)) {
         const ty = ir.typeOfIndex(inst, cg.ip);
-        return if (cg.inFloat(ty)) .float else if (cg.inGpr(ty)) .gpr else .none;
+        return if (cg.inFloat(ty)) .float else if (cg.inGpr(ty)) .gpr else if (int128.is128(cg.ip, ty)) .pair else .none;
     }
     // f32 and f64 results of the lowerings that compute them in an XMM
     // register (`setXmm`) or a GPR (`setResult`), without calls.
