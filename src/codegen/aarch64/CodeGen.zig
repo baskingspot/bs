@@ -322,6 +322,10 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         // preserve_none passes arguments in x20-x28, where values live, and
         // its callee clobbers them all, so such functions get no registers.
         if (cg.fn_ty.cc == .aarch64_preserve_none or cg.callsPreserveNone()) f.no_regs = true;
+        // A value in memory is read and written through x9-x11 and
+        // x16-x17, so `returnError` keeps every register its callers'
+        // values may hold (`callFree`).
+        if (ir.func == emit.zcu.return_error) f.no_regs = true;
         // `clobbers` marks the values that want a register.
         try f.liveness(gpa, ir, &cg);
         try f.plan(gpa, ir, ip, &cg);
@@ -756,6 +760,11 @@ fn scratchUse(cg: *CodeGen, inst: Inst.Index) u32 {
         .load, .store => 0,
         // The element's address is computed into x12 (`elemAddrTo`).
         .ptr_elem_val, .slice_elem_val => x12,
+        // C functions load the trace into x15 for it (`call`).
+        .call => if (ir.instructions.items(.data)[@backingInt(inst)].pl_op.operand.toInterned() == cg.emit.zcu.return_error)
+            @as(u32, if (cg.traceInX15()) 0 else 1 << 15)
+        else
+            scratch_mask,
         else => scratch_mask,
     };
 }
@@ -896,6 +905,9 @@ fn ownRegs(cg: *CodeGen, inst: Inst.Index) u32 {
 fn checkWrites(cg: *CodeGen, inst: ?Inst.Index, planned: u32, clobber: bool, own: u32) Error!void {
     var allowed = planned | own;
     if (clobber) allowed |= Encoder.caller_saved;
+    // Its callers keep values in every other register across a call of it
+    // (`callFree`, `call`).
+    if (cg.ir.func == cg.emit.zcu.return_error) allowed = 0;
     const bad = cg.e.written & checked_mask & ~allowed;
     if (bad == 0) return;
     const r: Reg = @fromBackingInt(@intCast(@ctz(bad)));
@@ -1014,6 +1026,9 @@ fn callFree(cg: *CodeGen, inst: Inst.Index) bool {
         .wrap_errunion_payload, .wrap_errunion_err, .aggregate_init, .union_init, .get_union_tag, .set_union_tag => true,
         .memcpy, .memmove, .memset, .int_from_bool, .int_from_ptr, .ret_addr, .frame_addr => true,
         .save_err_return_trace_index, .err_return_trace, .set_err_return_trace => true,
+        // `returnError` writes only x0-x11, x16, x17 and lr
+        // (`checkWrites`), and no vector register.
+        .call => data.pl_op.operand.toInterned() == cg.emit.zcu.return_error,
         // Integers in a register, and f32 and f64, have instructions.
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil => cg.nativeScalar(cg.typeOf(data.bin_op.lhs)),
         // A float remainder calls fmod.
@@ -2529,7 +2544,9 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
     cg.block = block;
     cg.tmp_next = 0;
     cg.tmp16_next = 0;
-    const checked = cg.live and !cg.ssa.no_regs;
+    // `returnError` has no registers, but its writes are checked too.
+    const ret_err = cg.ir.func == cg.emit.zcu.return_error;
+    const checked = cg.live and (!cg.ssa.no_regs or ret_err);
     const b = cg.ssa.blocks.items[@backingInt(block)];
     const cl = cg.ssa.clobbers.items;
     for (cg.ssa.blockInsts(block), b.start..) |inst, idx| {
@@ -2537,12 +2554,14 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
             const calls = cg.e.calls;
             cg.e.written = 0;
             try cg.genInst(inst);
-            // A call clobbers v20-v29: only clobber points may make one.
-            assert(!cg.vregs or cg.e.calls == calls or !cg.callFree(inst));
+            // A call clobbers v20-v29: only clobber points may make one,
+            // and calls of `returnError`, which writes no vector register.
+            assert(!cg.vregs or cg.e.calls == calls or !cg.callFree(inst) or cg.ir.instructions.items(.tag)[@backingInt(inst)] == .call);
             try cg.flushResults();
             if (checked) {
                 const q = Ssa.valuePos(idx);
-                try cg.checkWrites(inst, cg.scratch_values.items[idx], !std.meta.eql(cl[q], cl[q - 1]), cg.ownRegs(inst));
+                const planned = if (ret_err) 0 else cg.scratch_values.items[idx];
+                try cg.checkWrites(inst, planned, !std.meta.eql(cl[q], cl[q - 1]), cg.ownRegs(inst));
             }
         } else try cg.keepSymbols(inst);
     }
@@ -2551,7 +2570,7 @@ fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!v
     if (checked) {
         // A `ret` ends with the epilogue, which restores x19-x28.
         const own: u32 = if (b.term.tag == .ret) callee_saved_mask else 0;
-        try cg.checkWrites(null, cg.scratch_terms.items[@backingInt(block)], false, own);
+        try cg.checkWrites(null, if (ret_err) 0 else cg.scratch_terms.items[@backingInt(block)], false, own);
     }
 }
 
@@ -4537,7 +4556,12 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         // registers, gets the frames of the calls it was inlined from.
         if (ret_ty == .noreturn_type and cg.in_cold and !is_c and !stack_args and !cg.outermost_frame) {
             try cg.panicThroughStubs(try cg.emit.funcKey(f));
-        } else try cg.e.bl(.{ .sym = try cg.emit.funcKey(f) });
+        } else {
+            const written = cg.e.written;
+            try cg.e.bl(.{ .sym = try cg.emit.funcKey(f) });
+            // `returnError` writes none of the registers values get.
+            if (f == cg.emit.zcu.return_error) cg.e.written = written | (Encoder.caller_saved & ~checked_mask);
+        }
     } else try cg.e.blr(.x16);
     if (pn_save) |save| for (0..10) |k| try cg.loadMem(@fromBackingInt(@intCast(19 + k)), save.plus(@intCast(8 * k)), .usize_type);
     if (is_c and ret_ty != .noreturn_type) try cg.restoreTrace();
