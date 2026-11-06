@@ -2,13 +2,13 @@
 //! stdout: "4 20 5 401 104 15 4\n"
 //! targets: aarch64-linux aarch64-macos
 
-// A by-value parameter passed in the caller's outgoing area is the memory
+// A by-value parameter, which `.auto` passes by reference, is the memory
 // of the `const` local Sema copies it into, when nothing but that copy
 // and reads, also through a pointer cast, uses the local's address
 // (`planArgAliases` on aarch64). A local whose address goes to a call
-// keeps the copy. A tail call rewrites the parameters' slots, but only
-// after it has read every argument: `swapTail` passes its locals back
-// swapped.
+// keeps the copy. A tail call rewrites the parameters' stack slots, but
+// only after it has read every argument: `swapTail` passes its locals
+// back swapped.
 const std = @import("std");
 const builtin = @import("builtin");
 

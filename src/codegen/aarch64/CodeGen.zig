@@ -123,9 +123,13 @@ plain_args: bool = false,
 /// the clobber points they cross, saved and restored around each one.
 /// None yet.
 split: std.bit_set.Dynamic = .{},
-/// From `planArgAliases`: `*const` allocs that are the incoming stack slot
-/// of the parameter (the value) they are initialized with.
-arg_alias: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+/// From `planArgAliases`: `*const` allocs that are the memory of the
+/// parameter they are initialized with.
+arg_alias: std.array_hash_map.Auto(u32, ArgAlias) = .empty,
+/// By-reference parameters without a register for their pointer, which
+/// `setupParam` copied in: the 8 bytes holding the pointer they came
+/// with, which calls pass on (`argRef`).
+byref_ptr: std.AutoHashMapUnmanaged(u32, Mem) = .empty,
 /// The condition under which the last overflow operation whose bit its
 /// block's branch reads from the flags (`fate == .fused`) overflowed.
 ovf_cc: Cond = .vs,
@@ -246,6 +250,9 @@ const Home = union(enum) {
     /// for an `alloc`, a promoted variable's. Code that reads it from
     /// memory gets a copy (`valMem`).
     regs: Regs,
+    /// A by-reference parameter (`byRefParam`): the memory this register
+    /// points to, which nothing writes during the call.
+    ind: Reg,
 };
 
 const Regs = struct { lo: Reg, hi: Reg };
@@ -305,6 +312,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.cold_open.deinit(gpa);
         cg.tmp_slots.deinit(gpa);
         cg.arg_alias.deinit(gpa);
+        cg.byref_ptr.deinit(gpa);
         cg.tmp16_slots.deinit(gpa);
         cg.pending.deinit(gpa);
         cg.stub_chains.deinit(gpa);
@@ -335,6 +343,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         try f.plan(gpa, ir, ip, &cg);
         f.bypassUnread(ir);
         cg.live = true;
+        try cg.planArgAliases();
         if (!f.no_regs) {
             try cg.planScratch();
             try cg.allocateRegs();
@@ -535,6 +544,15 @@ fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
     const decl = cg.emit.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst);
     try cg.emit.addError(nav.file, tree.nodeToSpan(decl.src_node), "bs codegen (aarch64): " ++ fmt, args);
     return error.CodegenFail;
+}
+
+/// As `fail`, at the line of the statement being lowered.
+fn failStmt(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
+    if (try asm_src.stmt(cg.emit.zcu, cg.ir.func, if (cg.dbg_open.getLastOrNull()) |o| cg.dbg_inlines.items[o.index] else null, cg.dbg_files.items, cg.dbg_line)) |at| {
+        try cg.emit.addError(at.file, at.span, "bs codegen (aarch64): " ++ fmt, args);
+        return error.CodegenFail;
+    }
+    return cg.fail(fmt, args);
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +878,8 @@ fn argsPlain(cg: *CodeGen) Error!bool {
     for (tys, locs) |ty, l| {
         const size = Type.abiSize(cg.ip, ty);
         switch (l) {
-            .none, .fpr, .stack => {},
+            // Copied in through x11 (`setupParam`).
+            .none, .fpr, .stack, .gpr_indirect, .stack_indirect => {},
             .gpr => if (size > 8 or !std.math.isPowerOfTwo(size)) return false,
             .gpr_pair => if (!std.math.isPowerOfTwo(size - 8)) return false,
             else => return false,
@@ -873,7 +892,7 @@ fn argsPlain(cg: *CodeGen) Error!bool {
 /// holds them.
 fn homeRegs(h: Home) u32 {
     return switch (h) {
-        .reg => |r| regBit(r),
+        .reg, .ind => |r| regBit(r),
         .regs => |p| regBit(p.lo) | regBit(p.hi),
         else => 0,
     };
@@ -989,6 +1008,12 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
                 return false;
             }
         },
+        // Its register holds the pointer (`Home.ind`).
+        .arg => if (cg.byRefParam(inst)) {
+            live.items(.reg)[@backingInt(inst)] = Ssa.want_reg;
+            live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
+            return false;
+        },
         else => {},
     }
     const ty = cg.ir.typeOfIndex(inst, cg.ip);
@@ -1095,7 +1120,19 @@ fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
         .ptr_elem_ptr, .ptr_add => cg.ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs,
         else => return Ssa.no_tie,
     };
-    return if (ref.toIndex()) |i| @backingInt(i) else Ssa.no_tie;
+    const i = ref.toIndex() orelse return Ssa.no_tie;
+    // A by-reference parameter's register holds its address (`Home.ind`),
+    // whose memory the lowering may still read after writing the result.
+    if (cg.byRefParam(i)) return Ssa.no_tie;
+    return @backingInt(i);
+}
+
+/// Whether `inst` is a parameter `.auto` passes by reference (`autoArgs`):
+/// the callee reads it where the pointer points, and never writes there.
+fn byRefParam(cg: *CodeGen, inst: Inst.Index) bool {
+    const ir = cg.ir;
+    return ir.instructions.items(.tag)[@backingInt(inst)] == .arg and cg.fn_ty.cc == .auto and
+        cg.autoClass(ir.instructions.items(.data)[@backingInt(inst)].arg.ty) == .memory;
 }
 
 pub fn termClobbers(_: *CodeGen, _: Ssa.Block.Index) bool {
@@ -1255,6 +1292,15 @@ fn outgoingArgsSize(cg: *CodeGen) u32 {
             }
             i += n;
         }
+        // Then copies of by-reference arguments (`placeArgs`).
+        if (!isC(callee_ty.cc)) {
+            var copies: u32 = 0;
+            for (args) |a| {
+                const t = cg.typeOf(a);
+                if (cg.autoClass(t) == .memory) copies += @intCast(std.mem.alignForward(u64, Type.abiSize(ip, t), 16));
+            }
+            if (copies != 0) stack = std.mem.alignForward(u32, stack, 16) + copies;
+        }
         max = @max(max, stack);
     }
     return std.mem.alignForward(u32, max, 16);
@@ -1366,8 +1412,8 @@ fn calleeType(cg: *CodeGen, callee: Ref) InternPool.FuncType {
 /// the value's bytes; one register holds a value of 1, 2, 4, or 8 bytes
 /// extended like a load), in a vector register (v0-v7: floats of 16, 32,
 /// and 64 bits, and vectors of 2 to 16 bytes, `autoVec`), or in memory
-/// (arguments in the outgoing area, in 8-byte aligned slots; results
-/// through the pointer in x8). `gpr_quad` is for results only
+/// (arguments by reference, `autoArgs`; results through the pointer in
+/// x8). `gpr_quad` is for results only
 /// (`autoRetClass`).
 const AutoClass = enum { none, gpr, gpr_pair, gpr_quad, fpr, memory };
 
@@ -1427,8 +1473,9 @@ const ArgLoc = union(enum) {
     /// in stack slots of `slot` bytes from `stack`.
     bool_split: BoolSplit,
     stack: u32,
-    /// C: a copy of the value, passed by its address in a register or on
-    /// the stack.
+    /// The value's address, in a register or on the stack: of a copy the
+    /// callee may write, for C; for `.auto`, of memory nothing writes
+    /// during the call (`argRef`).
     gpr_indirect: u8,
     stack_indirect: u32,
 };
@@ -1445,7 +1492,10 @@ const BoolSplit = struct {
 };
 
 /// Where `.auto` passes each argument; returns the stack bytes used.
-/// `locs` may be null to only count.
+/// `locs` may be null to only count. A memory-class argument is passed by
+/// reference (`gpr_indirect`, or `stack_indirect` when x0-x7 are taken),
+/// as on x86_64: the callee reads it where the pointer points
+/// (`Home.ind`), and nothing writes there during the call.
 fn autoArgs(cg: *CodeGen, tys: []const Index, locs: ?[]ArgLoc) u32 {
     var gp: u8 = 0;
     var fp: u8 = 0;
@@ -1465,12 +1515,18 @@ fn autoArgs(cg: *CodeGen, tys: []const Index, locs: ?[]ArgLoc) u32 {
                 fp += 1;
                 break :blk .{ .fpr = fp - 1 };
             } else .{ .stack = 0 },
-            .memory => .{ .stack = 0 },
+            .memory => if (gp < 8) blk: {
+                gp += 1;
+                break :blk .{ .gpr_indirect = gp - 1 };
+            } else .{ .stack_indirect = 0 },
             .gpr_quad => unreachable,
         };
         if (l == .stack) {
             l = .{ .stack = stack };
             stack += @intCast(std.mem.alignForward(u64, Type.abiSize(cg.ip, ty), 8));
+        } else if (l == .stack_indirect) {
+            l = .{ .stack_indirect = stack };
+            stack += 8;
         }
         if (locs) |ls| ls[i] = l;
     }
@@ -1781,13 +1837,47 @@ fn setupParams(cg: *CodeGen) Error!void {
         try cg.setupParam(inst, ty, l);
         if (cg.live and !cg.ssa.no_regs) try cg.checkWrites(inst, if (cg.fate(inst) == .dead) 0 else cg.scratchUse(inst), false, cg.ownRegs(inst));
     }
-    try cg.planArgAliases(args, locs);
 }
 
 /// Moves argument `inst`, of type `ty`, from where it arrives (`l`) to its
 /// home.
 fn setupParam(cg: *CodeGen, inst: Inst.Index, ty: Index, l: ArgLoc) Error!void {
     const size = Type.abiSize(cg.ip, ty);
+    if (l == .gpr_indirect or l == .stack_indirect) {
+        if (cg.live and cg.fate(inst) == .dead) return;
+        const in: Mem = if (l == .stack_indirect) .at(.fp, @intCast(16 + l.stack_indirect)) else undefined;
+        // The pointer stays in the register the parameter got.
+        if (cg.homes[@backingInt(inst)] == .reg) {
+            const d = cg.homes[@backingInt(inst)].reg;
+            if (l == .gpr_indirect) try cg.e.mov(.x, d, argReg(l.gpr_indirect)) else try cg.loadMem(d, in, .usize_type);
+            cg.homes[@backingInt(inst)] = .{ .ind = d };
+            return;
+        }
+        // Without one, the value is copied in, to a slot of its own if an
+        // alloc is its memory (`planArgAliases`), which pointers derived
+        // from the alloc may outlive the parameter's interval to read.
+        // The pointer is kept for calls that pass the value on (`argRef`).
+        const aliased = for (cg.arg_alias.values()) |a| {
+            if (a.arg == @backingInt(inst)) break true;
+        } else false;
+        const dst = if (aliased) blk: {
+            const m = try cg.allocSlot(size, @min(Type.abiAlignment(cg.ip, ty), 16));
+            cg.homes[@backingInt(inst)] = .{ .slot = m };
+            break :blk m;
+        } else (try cg.resultMem(inst, ty)).?;
+        if (l == .gpr_indirect) {
+            try cg.e.mov(.x, .x11, argReg(l.gpr_indirect));
+            if (!isC(cg.fn_ty.cc)) {
+                const ps = try cg.allocSlot(8, 8);
+                try cg.storeReg(ps, .x11, 8);
+                try cg.byref_ptr.put(cg.gpa, @backingInt(inst), ps);
+            }
+        } else {
+            try cg.loadMem(.x11, in, .usize_type);
+            if (!isC(cg.fn_ty.cc)) try cg.byref_ptr.put(cg.gpa, @backingInt(inst), in);
+        }
+        return cg.copyMem(dst, .at(.x11, 0), size);
+    }
     // Only scalars of 1, 2, 4, or 8 bytes have registers.
     if (cg.homes[@backingInt(inst)] == .reg) switch (l) {
         .gpr => |r| return cg.setResult(inst, ty, argReg(r)),
@@ -1842,53 +1932,83 @@ fn setupParam(cg: *CodeGen, inst: Inst.Index, ty: Index, l: ArgLoc) Error!void {
         .fpr_run => |run| try cg.storeFpRun((try cg.resultMem(inst, ty)).?, run.first, run.n, run.size),
         .bool_split => |b| try cg.gatherBools((try cg.resultMem(inst, ty)).?, b, size),
         .stack => |off| cg.homes[@backingInt(inst)] = .{ .slot = .at(.fp, @intCast(16 + off)) },
-        .gpr_indirect => |r| {
-            // The callee owns the caller's copy, but a slot keeps every
-            // home sp- or fp-based.
-            try cg.e.mov(.x, .x12, argReg(r));
-            try cg.copyMem((try cg.resultMem(inst, ty)).?, .at(.x12, 0), size);
-        },
-        .stack_indirect => |off| {
-            try cg.loadMem(.x12, .at(.fp, @intCast(16 + off)), .usize_type);
-            try cg.copyMem((try cg.resultMem(inst, ty)).?, .at(.x12, 0), size);
-        },
+        .gpr_indirect, .stack_indirect => unreachable,
     }
 }
 
-/// Finds the `*const` allocs that can be the incoming stack slot of the
-/// parameter they are initialized with, saving the copy: Sema copies each
-/// by-value parameter into such a local, as AES's `encrypt` does its
-/// 176-byte context for every block. Nothing writes the slot during the
-/// call but a tail call, which reads every argument into its own outgoing
-/// area before it moves them there (`placeArgs`), and nothing writes the
-/// alloc but that store when nothing uses its address but the store and
-/// loads, directly or through field and element pointers and pointer
-/// casts (x86_64's `sealedRef` rule, with the casts that inlined vector
-/// helpers such as AES's `Block.fromBytes` add). The slot must have the
-/// alloc's alignment: fp is 16-byte aligned, and the slots 8.
-fn planArgAliases(cg: *CodeGen, args: []const Inst.Index, locs: []const ArgLoc) Error!void {
+/// Where an alloc's memory is (`planArgAliases`): that of parameter `arg`,
+/// in its incoming stack slot `stack` bytes past fp + 16, or where its
+/// pointer points for a by-reference one (`stack == by_ref`).
+const ArgAlias = struct {
+    arg: u32,
+    stack: u32,
+
+    const by_ref = std.math.maxInt(u32);
+};
+
+/// Finds the `*const` allocs that can be the memory of the parameter they
+/// are initialized with, saving the copy: Sema copies each by-value
+/// parameter into such a local, as AES's `encrypt` does its 176-byte
+/// context for every block. That memory is the parameter's incoming stack
+/// slot, or for a by-reference one where its pointer points, which the
+/// parameter's interval is lengthened over the alloc's for, so its
+/// register holds it (`Home.ind`). Nothing writes a by-reference
+/// parameter's memory during the call, nor an incoming slot but a tail
+/// call, which reads every argument into its own outgoing area before it
+/// moves them there (`placeArgs`); and nothing writes the alloc but that
+/// store when nothing uses its address but the store and loads, directly
+/// or through field and element pointers and pointer casts (x86_64's
+/// `sealedRef` rule, with the casts that inlined vector helpers such as
+/// AES's `Block.fromBytes` add). The memory must have the alloc's
+/// alignment: fp is 16-byte aligned, the slots 8, and a by-reference
+/// parameter's memory its type's, up to 16 (`placeArgs`).
+fn planArgAliases(cg: *CodeGen) Error!void {
     const ir = cg.ir;
     const ip = cg.ip;
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
+    const live = cg.ssa.live.slice();
+    var n: usize = 0;
+    for (ir.mainBody()) |inst| {
+        if (tags[@backingInt(inst)] != .arg) break;
+        n += 1;
+    }
+    if (n == 0) return;
+    const args = ir.mainBody()[0..n];
+    const tys = try cg.gpa.alloc(Index, n);
+    defer cg.gpa.free(tys);
+    const locs = try cg.gpa.alloc(ArgLoc, n);
+    defer cg.gpa.free(locs);
+    for (args, tys) |inst, *ty| ty.* = datas[@backingInt(inst)].arg.ty;
+    if (isC(cg.fn_ty.cc)) {
+        for (tys) |ty| if (cg.cClass(ty) == .unsupported) return;
+        _ = cg.cArgs(cg.fn_ty.cc, tys, null, locs);
+    } else _ = cg.autoArgs(tys, locs);
     var any = false;
-    for (args) |a| any = any or cg.homes[@backingInt(a)] == .slot;
+    for (locs) |l| any = any or l == .stack or ((l == .gpr_indirect or l == .stack_indirect) and !isC(cg.fn_ty.cc));
     if (!any) return;
     for (ir.mainBody()) |inst| {
         if (tags[@backingInt(inst)] != .store) continue;
         const d = datas[@backingInt(inst)].bin_op;
         const a = d.rhs.toIndex() orelse continue;
         const l = d.lhs.toIndex() orelse continue;
-        if (tags[@backingInt(a)] != .arg or cg.homes[@backingInt(a)] != .slot) continue;
+        if (tags[@backingInt(a)] != .arg) continue;
         const loc = locs[std.mem.indexOfScalar(Inst.Index, args, a) orelse continue];
-        if (loc != .stack) continue;
-        const off = loc.stack;
+        const stack: u32 = switch (loc) {
+            .stack => |off| off,
+            .gpr_indirect, .stack_indirect => if (cg.byRefParam(a)) ArgAlias.by_ref else continue,
+            else => continue,
+        };
         if (tags[@backingInt(l)] != .alloc or datas[@backingInt(l)].ty == .none) continue;
+        // A promoted variable (`Ssa.plan`) is written by the store.
+        if (Ssa.wants(live.items(.reg)[@backingInt(l)])) continue;
         const info = Type.ptrInfo(ip, datas[@backingInt(l)].ty);
         if (!info.flags.is_const or info.flags.is_volatile or info.child != datas[@backingInt(a)].arg.ty) continue;
         const alignment = @max(Type.abiAlignment(ip, info.child), if (info.flags.alignment == 0) 1 else @as(u64, 1) << @intCast(info.flags.alignment - 1));
-        if (alignment > 16 or (alignment == 16 and off % 16 != 0)) continue;
-        try cg.arg_alias.put(cg.gpa, @backingInt(l), @backingInt(a));
+        if (stack == ArgAlias.by_ref) {
+            if (alignment > @min(Type.abiAlignment(ip, info.child), 16)) continue;
+        } else if (alignment > 16 or (alignment == 16 and stack % 16 != 0)) continue;
+        try cg.arg_alias.put(cg.gpa, @backingInt(l), .{ .arg = @backingInt(a), .stack = stack });
     }
     if (cg.arg_alias.count() == 0) return;
     const Uses = struct {
@@ -1919,16 +2039,32 @@ fn planArgAliases(cg: *CodeGen, args: []const Inst.Index, locs: []const ArgLoc) 
             const ok = switch (t[u.user]) {
                 .load => true,
                 // The initializer, the only store.
-                .store => p == base and d[u.user].bin_op.lhs == r and d[u.user].bin_op.rhs == @as(Inst.Index, @fromBackingInt(arg)).toRef(),
+                .store => p == base and d[u.user].bin_op.lhs == r and d[u.user].bin_op.rhs == @as(Inst.Index, @fromBackingInt(arg.arg)).toRef(),
                 .struct_field_ptr, .ptr_elem_ptr => @as(Ref, @fromBackingInt(ir_.extra[d[u.user].ty_pl.payload])) == r,
                 // To another pointer type, which `root` follows.
                 .bitcast => u.cg.ip.keyTag(d[u.user].ty_op.ty) == .ptr_type,
                 else => false,
             };
-            if (!ok) _ = u.cg.arg_alias.remove(base);
+            if (!ok) _ = u.cg.arg_alias.swapRemove(base);
         }
     };
     for (0..ir.instructions.len) |i| Ssa.forEachOperand(ir, @fromBackingInt(@intCast(i)), Uses{ .cg = cg, .user = @intCast(i) });
+    if (cg.ssa.no_regs) return;
+    // A by-reference parameter's register holds its pointer as long as
+    // the alloc is used: the pointers derived from it are computed from
+    // the register.
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const crosses = live.items(.crosses);
+    const cl = cg.ssa.clobbers.items;
+    var it = cg.arg_alias.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.stack != ArgAlias.by_ref) continue;
+        const a = e.value_ptr.arg;
+        const l = e.key_ptr.*;
+        end[a] = @max(end[a], end[l]);
+        crosses[a] = crosses[a] or crosses[l] or cl[end[a]][0] != cl[def[a]][0];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1950,6 +2086,7 @@ pub fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
             break :blk .{ .mem = .at(.x8, @intCast(off)) };
         },
         .regs => |p| .{ .regs = p },
+        .ind => |r| .{ .mem = .at(r, 0) },
     };
     return cg.constLoc(ref.toInterned().?);
 }
@@ -2954,7 +3091,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             // A promoted variable in a register needs no memory.
             if (data.ty == .none or cg.homes[@backingInt(inst)] == .reg or cg.homes[@backingInt(inst)] == .vreg or cg.homes[@backingInt(inst)] == .regs) return;
             if (cg.arg_alias.get(@backingInt(inst))) |a| {
-                cg.homes[@backingInt(inst)] = .{ .frame_addr = cg.homes[a].slot };
+                cg.homes[@backingInt(inst)] = .{ .frame_addr = if (a.stack != ArgAlias.by_ref) .at(.fp, @intCast(16 + a.stack)) else switch (cg.homes[a.arg]) {
+                    .ind => |r| .at(r, 0),
+                    .slot => |m| m,
+                    else => unreachable,
+                } };
                 return;
             }
             const info = Type.ptrInfo(ip, data.ty);
@@ -4672,12 +4813,12 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         const locs = try cg.gpa.alloc(ArgLoc, args.len);
         defer cg.gpa.free(locs);
         for (vals, tys) |v, *t| t.* = v.ty;
-        _ = cg.autoArgs(tys, locs);
+        const stack = cg.autoArgs(tys, locs);
         for (locs) |l| switch (l) {
             .stack, .stack_indirect => stack_args = true,
             else => {},
         };
-        try cg.placeArgs(vals, locs, tail);
+        try cg.placeArgs(vals, args, locs, tail, std.mem.alignForward(u32, stack, 16));
         if (cg.autoRetClass(ret_ty) == .memory) try cg.resultPtrTo(dst, tail);
         if (to_result) |off| {
             try cg.loadMem(.x8, cg.ret_ptr_slot.?, .usize_type);
@@ -4744,16 +4885,63 @@ fn resultPtrTo(cg: *CodeGen, dst: ?Mem, tail: bool) Error!void {
     if (dst) |m| try cg.addrTo(.x8, m);
 }
 
+/// Where a by-reference argument's pointer comes from: a register
+/// holding it, an address, or memory holding it.
+const ArgRef = union(enum) { reg: Reg, addr: Mem, ptr: Mem };
+
+/// The memory `.auto` by-reference argument `ref` may be passed in
+/// without a copy, which nothing writes during the call: a constant's, a
+/// by-reference parameter's (`Home.ind`, or the pointer it came with,
+/// `byref_ptr`), or a value's slot, unless the call is a tail call, which
+/// pops the frame the slot is in. A value has no address anything else
+/// could write through, and its slot is not shared with the call's result
+/// (`Ssa.takeSlot` frees a slot only after its interval's end, the call).
+/// Neither is a by-reference parameter's memory, inductively, nor any of
+/// these this function's result, which a `.result` home is.
+fn argRef(cg: *CodeGen, ref: Ref, tail: bool) Error!?ArgRef {
+    if (ref.toIndex()) |v0| {
+        var v = @backingInt(v0);
+        // A load forwarded from the parameter (`Live.fwd`).
+        if (cg.live and cg.ssa.live.items(.fwd)[v] != Ssa.no_tie and cg.ir.instructions.items(.tag)[v] == .load) v = cg.ssa.live.items(.fwd)[v];
+        if (cg.byref_ptr.get(v)) |m| return .{ .ptr = m };
+        return switch (cg.homes[@backingInt(v0)]) {
+            .ind => |r| .{ .reg = r },
+            .slot => |m| if (tail) null else .{ .addr = m },
+            else => null,
+        };
+    }
+    return switch (try cg.constLoc(ref.toInterned().?)) {
+        .mem => |m| .{ .addr = m },
+        else => null,
+    };
+}
+
+/// Puts by-reference argument pointer `src` in `reg`.
+fn argPtrTo(cg: *CodeGen, reg: Reg, src: ArgRef) Error!void {
+    switch (src) {
+        .reg => |r| try cg.e.mov(.x, reg, r),
+        .addr => |m| try cg.addrTo(reg, m),
+        .ptr => |m| try cg.loadMem(reg, m, .usize_type),
+    }
+}
+
 /// Puts call arguments where `locs` says. Only general registers that are
 /// arguments and v0-v7 are written besides the scratch registers, and each
 /// argument register is written once, after the copies that use scratch
 /// registers. A tail call's stack arguments replace the caller's incoming
 /// ones (at fp + 16), which they may be computed from, so they are copied
-/// to slots first.
-fn placeArgs(cg: *CodeGen, vals: []const Val, locs: []const ArgLoc, tail: bool) Error!void {
+/// to slots first, and so are the pointers of by-reference ones. `refs`,
+/// for an `.auto` call, are the arguments, and `copies` the offset in the
+/// outgoing area of the copies of by-reference arguments that need one
+/// (`argRef`), each 16-byte aligned (`outgoingArgsSize`); a C callee may
+/// write its copies, which are always made.
+fn placeArgs(cg: *CodeGen, vals: []const Val, refs: ?[]const Ref, locs: []const ArgLoc, tail: bool, copies: u32) Error!void {
     const ip = cg.ip;
     const temps = try cg.gpa.alloc(Mem, if (tail) vals.len else 0);
     defer cg.gpa.free(temps);
+    const srcs = try cg.gpa.alloc(ArgRef, if (refs != null) vals.len else 0);
+    defer cg.gpa.free(srcs);
+    var out = copies;
     for (vals, locs, 0..) |v, l, i| switch (l) {
         .stack => |off| if (tail) {
             temps[i] = try cg.allocSlot(Type.abiSize(ip, v.ty), @min(Type.abiAlignment(ip, v.ty), 16));
@@ -4767,7 +4955,28 @@ fn placeArgs(cg: *CodeGen, vals: []const Val, locs: []const ArgLoc, tail: bool) 
                 try cg.e.str(.byte, .x9, try cg.access(.at(.sp, @intCast(b.stack + (k - b.inRegs()) * b.slot)), 1, .x16));
             }
         },
-        .gpr_indirect, .stack_indirect => {
+        .gpr_indirect, .stack_indirect => if (refs) |rs| {
+            srcs[i] = try cg.argRef(rs[i], tail) orelse src: {
+                // Its memory is in this function's frame, which a tail
+                // call pops, and the callee's parameter is not its own to
+                // write.
+                if (tail) return cg.failStmt("unable to perform tail call: argument {} of type '{f}' is passed by reference, and its value lives in the frame the tail call pops; pass a parameter or a constant instead", .{ i + 1, cg.fmtType(v.ty) });
+                const size = Type.abiSize(ip, v.ty);
+                const m: Mem = .at(.sp, @intCast(out));
+                out += @intCast(std.mem.alignForward(u64, size, 16));
+                try cg.copyVal(m, v);
+                break :src .{ .addr = m };
+            };
+            if (tail) {
+                temps[i] = try cg.allocSlot(8, 8);
+                try cg.argPtrTo(.x9, srcs[i]);
+                try cg.storeReg(temps[i], .x9, 8);
+                srcs[i] = .{ .ptr = temps[i] };
+            } else if (l == .stack_indirect) {
+                try cg.argPtrTo(.x9, srcs[i]);
+                try cg.storeReg(.at(.sp, @intCast(l.stack_indirect)), .x9, 8);
+            }
+        } else {
             // The copy lives in the caller's frame, which a tail call pops.
             if (tail) return cg.fail("tail call passing '{f}' by reference", .{cg.fmtType(v.ty)});
             // A copy the callee may modify.
@@ -4785,9 +4994,13 @@ fn placeArgs(cg: *CodeGen, vals: []const Val, locs: []const ArgLoc, tail: bool) 
     };
     if (tail) for (vals, locs, 0..) |v, l, i| switch (l) {
         .stack => |off| try cg.copyVal(.at(.fp, @intCast(16 + off)), memVal(v.ty, temps[i])),
+        .stack_indirect => |off| {
+            try cg.loadMem(.x9, temps[i], .usize_type);
+            try cg.storeReg(.at(.fp, @intCast(16 + off)), .x9, 8);
+        },
         else => {},
     };
-    for (vals, locs) |v, l| switch (l) {
+    for (vals, locs, 0..) |v, l, i| switch (l) {
         .gpr => |r| try cg.loadGprVal(argReg(r), v),
         .gpr_pair => |r| try cg.loadPair(argReg(r), argReg(r + 1), v),
         .fpr => |r| try cg.loadFp(argVReg(r), v),
@@ -4796,6 +5009,7 @@ fn placeArgs(cg: *CodeGen, vals: []const Val, locs: []const ArgLoc, tail: bool) 
             const m = try cg.valMem(v);
             for (0..b.inRegs()) |k| try cg.extractBool(argReg(b.gp + @as(u8, @intCast(k))), m, @intCast(k));
         },
+        .gpr_indirect => |r| if (refs != null) try cg.argPtrTo(argReg(r), srcs[i]),
         else => {},
     };
 }
@@ -4839,7 +5053,7 @@ fn cCallArgs(cg: *CodeGen, cc: InternPool.CallingConvention, vals: []const Val, 
     }
     try cg.cArgsSupported(cc, tys, var_from != null);
     _ = cg.cArgs(cc, tys, var_from, locs);
-    try cg.placeArgs(vals, locs, tail);
+    try cg.placeArgs(vals, null, locs, tail, 0);
 }
 
 /// Stores the result of a C call, of type `ret_ty`, to `dst`.
