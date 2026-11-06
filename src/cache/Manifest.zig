@@ -939,8 +939,8 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
         _ = o.sources.remove(index);
         if (d[0].source_name.len != 0) try named.append(gpa, .{ .index = index, .name = d[0].source_name });
         if (d[0].atoms_len != 0) try with_atoms.append(gpa, index);
-        try addReverse(gpa, &o.rdeps, &seen, index, u32, prev_deps, node_deps, depNode);
-        try addReverse(gpa, &o.rrefs, &seen, index, Ref, prev_refs, node_refs, reachedNode);
+        try addReverse(u32, depNode, gpa, &o.rdeps, &seen, index, prev_deps, node_deps);
+        try addReverse(Ref, reachedNode, gpa, &o.rrefs, &seen, index, prev_refs, node_refs);
     }
     const input_deltas = r.take(InputDelta, rh.n_inputs);
     const errors = r.take(StrRef, rh.n_errors);
@@ -990,14 +990,14 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
 /// them again: the lists, and `readLog`, grew with every edit to the same
 /// function.)
 fn addReverse(
+    comptime T: type,
+    comptime nodeOf: fn (T) ?u32,
     gpa: Allocator,
     map: *std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)),
     seen: *std.AutoHashMapUnmanaged(u32, void),
     index: u32,
-    comptime T: type,
     prev: []const T,
     now: []const T,
-    comptime nodeOf: fn (T) ?u32,
 ) !void {
     if (std.mem.eql(u8, std.mem.sliceAsBytes(prev), std.mem.sliceAsBytes(now))) return;
     seen.clearRetainingCapacity();
