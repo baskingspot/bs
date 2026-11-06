@@ -2599,7 +2599,8 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// saves and restores around each clobber point it crosses. Each of
 /// `restrictions` keeps a value out of its registers when one of its
 /// lowerings lies in the value's interval, at its definition, or at its
-/// last use. Returns the mask of registers used.
+/// last use (only the last two for `Restriction.endpoints_only`). Returns
+/// the mask of registers used.
 pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.bit_set.Dynamic, restrictions: []const Restriction) u32 {
     const total = n + n_float;
     assert(total <= max_regs);
@@ -2680,7 +2681,8 @@ pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, s
             var keep_out: u32 = 0;
             for (restrictions) |r| {
                 const rc = r.counts;
-                if (rc[end[inst]] != rc[def[inst]] or rc[def[inst]] != rc[def[inst] - 1]) keep_out |= r.regs;
+                const at_ends = rc[def[inst]] != rc[def[inst] - 1] or rc[end[inst]] != rc[end[inst] - 1];
+                if (at_ends or (!r.endpoints_only and rc[end[inst]] != rc[def[inst]])) keep_out |= r.regs;
             }
             const class: u32 = switch (reg[inst]) {
                 want_float => floats,
@@ -2793,8 +2795,11 @@ pub const max_regs = 32;
 /// Registers that some lowerings write (r11 as x86_64's scratch, the
 /// registers inline assembly names or takes for its operands), and per
 /// position (as `clobbers`) how many of those lowerings come at or before
-/// it.
-pub const Restriction = struct { regs: u32, counts: []const u32 };
+/// it. A value may not take them when such a lowering lies in its
+/// interval, or, with `endpoints_only`, only when one computes it or
+/// reads it last: for clobber points, which the values that cross them
+/// survive in `survives` or are saved around (`split`).
+pub const Restriction = struct { regs: u32, counts: []const u32, endpoints_only: bool = false };
 
 /// The mask of register `r`, or 0 for `no_reg`.
 fn regBit(r: u8) u32 {
