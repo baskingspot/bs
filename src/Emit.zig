@@ -1596,11 +1596,21 @@ fn nameAtoms(emit: *Emit) !void {
             gop.value_ptr.* = try arena.dupe(u8, aw.written());
         }
         info.* = .{ .parent = nav.parent, .prefix_len = @intCast(gop.value_ptr.len) };
-        atom.name = if (generic)
-            try arena.print("{s}.{s}__func_{x:0>8}", .{ gop.value_ptr.*, ip.stringSlice(nav.name), @as(u32, @truncate(ip.stableHash(func_index))) })
-        else
-            try arena.print("{s}.{s}", .{ gop.value_ptr.*, ip.stringSlice(nav.name) });
+        atom.name = try arena.print("{s}.{s}", .{ gop.value_ptr.*, if (generic) try emit.funcDebugName(func_index) else ip.stringSlice(nav.name) });
     }
+}
+
+/// The unqualified name of function `func`, which its symbol name
+/// (`nameAtoms`) and debug info give: its declaration's, with `__func_` and
+/// a stable hash for an instance of a generic function, as upstream names
+/// an instance's declaration (upstream numbers them by a counter that
+/// follows analysis order).
+pub fn funcDebugName(emit: *Emit, func: Index) ![]const u8 {
+    const ip = &emit.zcu.ip;
+    const f = ip.keyPayload(.func, func);
+    const name = ip.stringSlice(ip.getNav(f.owner_nav).name);
+    if (f.generic_owner == .none) return name;
+    return emit.allocator().print("{s}__func_{x:0>8}", .{ name, @as(u32, @truncate(ip.stableHash(func))) });
 }
 
 /// Links the atoms `finish` prepared into `sub_path`. Returns false, after

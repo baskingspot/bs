@@ -436,7 +436,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     }
     const debug: Atom.Debug = .{
         .file = file.display_path,
-        .name = ip.stringSlice(nav.name),
+        .name = try emit.funcDebugName(ir.func),
         .base_line = file.zir.getDeclaration(nav.zir_inst).src_line,
         .lines = try arena.dupe(u8, cg.e.lines.bytes.items),
         .unit = try std.Io.Dir.path.join(arena, &.{ module.root_dir, module.root_file }),
@@ -505,7 +505,7 @@ fn beginInline(cg: *CodeGen, func: Index, site: Ir.DbgInline) Error!void {
         break :blk @intCast(cg.dbg_files.items.len);
     };
     const index: u32 = @intCast(cg.dbg_inlines.items.len);
-    const name = ip.stringSlice(nav.name);
+    const name = try cg.emit.funcDebugName(func);
     const callee: SymbolKey = .fromName(ip.stringSlice(nav.key));
     // A callee inlined again in this function shares its name.
     const name_off: u32 = for (cg.dbg_inline_callees.items, cg.dbg_inlines.items) |c, prev| {
