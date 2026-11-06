@@ -72,6 +72,10 @@ slots: Slots = .{},
 /// it in blocks that continue, and in blocks that do not (`ret`,
 /// `unreachable`, a noreturn call).
 clobbers: std.ArrayList([2]u32) = .empty,
+/// Scratch for `allocate`: per position, how many positions before it
+/// are short of registers, where more values want a general-purpose
+/// register than there are.
+short: std.ArrayList(u32) = .empty,
 /// Overflow operations whose results only their `struct_field_val`s read
 /// (`Fate.pair`), and those two values (or `no_tie`), from `plan`.
 pairs: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
@@ -109,8 +113,9 @@ pub const Live = struct {
     /// A clobber point (`liveness`) lies inside the interval, where the
     /// value is still needed afterwards.
     crosses: bool,
-    /// From `liveness`: its uses weighted by loop depth, 8 per level (up
-    /// to 6), which `allocate` keeps in registers first.
+    /// From `liveness`: what keeping the value in memory costs, its
+    /// definition (a store) and its uses (loads), each weighted by loop
+    /// depth, 8 per level (up to 6).
     weight: u32,
     /// After `allocate`, for a value marked `want_pair` that got registers:
     /// the register of its high eightbyte (`reg` holds the low one); else
@@ -257,6 +262,7 @@ pub fn deinit(f: *Ssa, gpa: Allocator) void {
     for (&f.slots.free) |*l| l.deinit(gpa);
     f.slots.active.deinit(gpa);
     f.clobbers.deinit(gpa);
+    f.short.deinit(gpa);
     f.pairs.deinit(gpa);
     f.candidates.deinit(gpa);
     f.var_loads.deinit(gpa);
@@ -675,13 +681,19 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
     defer gpa.free(born);
     var arms: DeadArms = try .init(gpa, f);
     defer arms.deinit(gpa);
-    var w: LiveWalk = .{ .uses = s.items(.uses), .weight = s.items(.weight), .def = s.items(.def), .end = s.items(.end), .born = born, .crosses = s.items(.crosses), .clobbers = cl, .arms = &arms, .loops = f.loops.items, .loop = no_loop, .pos = 0, .dead_start = null };
+    var w: LiveWalk = .{ .uses = s.items(.uses), .weight = s.items(.weight), .def = s.items(.def), .end = s.items(.end), .born = born, .crosses = s.items(.crosses), .clobbers = cl, .arms = &arms, .loops = f.loops.items, .loop = no_loop, .pos = 0, .scale = 1, .dead_start = null };
     const insts = f.values.items(.inst);
     const datas = ir.instructions.items(.data);
     const tags = ir.instructions.items(.tag);
     for (f.layout.items, 0..) |block, k| {
         const b = f.blocks.items[@backingInt(block)];
         w.loop = f.block_loop.items[@backingInt(block)];
+        {
+            var depth: u32 = 0;
+            var q = w.loop;
+            while (q != no_loop and depth < 6) : (q = w.loops[q].parent) depth += 1;
+            w.scale = @as(u32, 1) << @intCast(3 * depth);
+        }
         const from = doom[@backingInt(block)].from;
         w.dead_start = if (from != no_tie) 2 * from + 1 else null;
         arms.enter(k);
@@ -696,6 +708,8 @@ pub fn liveness(f: *Ssa, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.
             const p: u32 = @intCast(2 * i + 2);
             w.def[@backingInt(inst)] = p;
             w.end[@backingInt(inst)] = p;
+            // In memory, the value is stored where it is computed.
+            w.weight[@backingInt(inst)] +|= w.scale;
             born[@backingInt(inst)] = if (tags[@backingInt(inst)] == .block) no_tie else p;
             w.pos = if ((cond != null and cond.? == inst) or (negated != null and negated.? == inst)) term_pos else p;
             forEachOperand(ir, inst, &w);
@@ -2070,6 +2084,9 @@ const LiveWalk = struct {
     /// the current use.
     loop: u32,
     pos: u32,
+    /// What a read or write in the current block costs: 8 per loop
+    /// around it, up to 6.
+    scale: u32,
     /// In a block that does not continue: the position before its first
     /// value.
     dead_start: ?u32,
@@ -2083,10 +2100,7 @@ const LiveWalk = struct {
     fn use(w: *LiveWalk, ref: Inst.Ref) void {
         const inst = @backingInt(ref.toIndex() orelse return);
         w.uses[inst] += 1;
-        var depth: u32 = 0;
-        var q = w.loop;
-        while (q != no_loop and depth < 6) : (q = w.loops[q].parent) depth += 1;
-        w.weight[inst] +|= @as(u32, 1) << @intCast(3 * depth);
+        w.weight[inst] +|= w.scale;
         if (w.dead_start) |start| {
             if (w.arms.crossed(w.clobbers, @max(start, w.bornAt(inst)), w.pos, 0)) w.crosses[inst] = true;
         }
@@ -2196,10 +2210,11 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// `survives`), in order of definition. Only the
 /// registers in `survives` may hold a value that crosses a clobber point;
 /// a value that crosses none prefers the others. When none is free, the
-/// value whose interval ends last among those holding a register it could
-/// use is kept in memory for its whole life. A pair gets two free
-/// registers or stays in memory; it evicts none, and when it is evicted
-/// both its registers are freed. Values stay in
+/// value that costs the least in memory per position short of registers
+/// left in its interval (`spillsBefore`), among it and those holding a
+/// register it could use, is kept in memory for its whole life. A pair gets two registers,
+/// evicting at most two values that go before it, or stays in memory;
+/// when it is evicted both its registers are freed. Values stay in
 /// their registers through their last use, so a result shares a register
 /// only with its tied operand or, for a load of a promoted variable, with
 /// the variable (`Live.share`). A free register the value's `hint` names
@@ -2211,7 +2226,7 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// `restrictions` keeps a value out of its registers when one of its
 /// lowerings lies in the value's interval, at its definition, or at its
 /// last use. Returns the mask of registers used.
-pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.bit_set.Dynamic, restrictions: []const Restriction) u32 {
+pub fn allocate(f: *Ssa, gpa: Allocator, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.bit_set.Dynamic, restrictions: []const Restriction) Allocator.Error!u32 {
     const total = n + n_float;
     assert(total <= max_regs);
     const gprs: u32 = (@as(u32, 1) << @intCast(n)) - 1;
@@ -2248,6 +2263,32 @@ pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, s
             const t = tie[x];
             if (t == no_tie or end[t] != def[x] or crosses[t] or reg[t] != reg[x] or hint[t][0] != no_reg) continue;
             hint[t][0] = hint_saved;
+        }
+    }
+    // Evicting a value helps only where registers are short: count those
+    // positions, where more values want a general-purpose register than
+    // there are (`spillsBefore`).
+    try f.short.resize(gpa, f.clobbers.items.len + 1);
+    const short = f.short.items;
+    {
+        @memset(short, 0);
+        for (f.values.items(.inst)) |inst| {
+            const x = @backingInt(inst);
+            const k: u32 = switch (reg[x]) {
+                want_reg => 1,
+                want_pair => 2,
+                else => continue,
+            };
+            if (share[x] != no_tie) continue;
+            short[def[x]] +%= k;
+            short[end[x] + 1] -%= k;
+        }
+        var pressure: u32 = 0;
+        var count: u32 = 0;
+        for (short) |*p| {
+            pressure +%= p.*;
+            p.* = count;
+            if (pressure > n) count += 1;
         }
     }
     var active_len: u8 = 0;
@@ -2298,6 +2339,7 @@ pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, s
                 want_vec => floats & ~survives,
                 else => gprs,
             };
+            const span: []const u32 = if (class == gprs) short else &.{};
             const usable: u32 = class & ~keep_out & if (crosses[inst] and !splits) survives else ~@as(u32, 0);
             const v = share[inst];
             if (v != no_tie and reg[v] < total) {
@@ -2307,12 +2349,39 @@ pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, s
                 continue;
             }
             if (reg[inst] == want_pair) {
-                // Two registers or none; a pair evicts none.
-                const avail = free & usable;
-                if (@popCount(avail) < 2) {
+                // Two registers or none, evicting at most two values
+                // that go to memory before it.
+                var gain = free & usable;
+                var picks: [2]u8 = undefined;
+                var n_picks: u8 = 0;
+                while (@popCount(gain) < 2) {
+                    var best: ?u8 = null;
+                    for (active[0..active_len], 0..) |a, k| {
+                        if (n_picks == 1 and picks[0] == k) continue;
+                        if (!evictable(a, inst, usable, reg, reg2, held, hint, def)) continue;
+                        if (!spillsBefore(weight, end, span, def[inst], a, inst)) continue;
+                        if (best == null or spillsBefore(weight, end, span, def[inst], a, active[best.?])) best = @intCast(k);
+                    }
+                    picks[n_picks] = best orelse break;
+                    gain |= (regBit(reg[active[best.?]]) | regBit(reg2[active[best.?]])) & usable;
+                    n_picks += 1;
+                }
+                if (@popCount(gain) < 2) {
                     reg[inst] = no_reg;
                     continue;
                 }
+                // Higher indices first, as each removal moves the last
+                // value into its place.
+                if (n_picks == 2 and picks[0] < picks[1]) std.mem.swap(u8, &picks[0], &picks[1]);
+                for (picks[0..n_picks]) |k| {
+                    const a = active[k];
+                    free |= regBit(reg[a]) | regBit(reg2[a]);
+                    reg[a] = no_reg;
+                    reg2[a] = no_reg;
+                    active_len -= 1;
+                    active[k] = active[active_len];
+                }
+                const avail = free & usable;
                 const cheap = if (@popCount(avail & ~survives) >= 2 and !crosses[inst]) avail & ~survives else avail;
                 const pick = if (@popCount(cheap & ~pending) >= 2) cheap & ~pending else cheap;
                 const lo: u8 = if (h[0] < max_regs and avail >> @intCast(h[0]) & 1 != 0) h[0] else @intCast(@ctz(pick & ~regBit(h[1])));
@@ -2351,19 +2420,19 @@ pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, s
                 active_len += 1;
                 continue;
             }
-            // Out of registers: a value used a loop level less often than the
-            // others goes to memory, else the one that ends last. A pair that
-            // goes frees both its registers.
+            // Out of registers: the value that costs the least in memory
+            // per position short of registers goes there (`spillsBefore`).
+            // A pair that goes frees both its registers.
             var last: ?u8 = null;
             for (active[0..active_len], 0..) |a, k| {
-                if (usable & (regBit(reg[a]) | regBit(reg2[a])) == 0 or held[reg[a]] >= def[inst] or hint[a][1] == hint_pinned) continue;
-                if (last == null or spillsBefore(weight, end, a, active[last.?])) last = @intCast(k);
+                if (!evictable(a, inst, usable, reg, reg2, held, hint, def)) continue;
+                if (last == null or spillsBefore(weight, end, span, def[inst], a, active[last.?])) last = @intCast(k);
             }
             const victim = if (last) |l| active[l] else {
                 reg[inst] = no_reg;
                 continue;
             };
-            if (spillsBefore(weight, end, victim, inst)) {
+            if (spillsBefore(weight, end, span, def[inst], victim, inst)) {
                 const lo = usable >> @intCast(reg[victim]) & 1 != 0;
                 reg[inst] = if (lo) reg[victim] else reg2[victim];
                 if (reg2[victim] != no_reg) free |= regBit(if (lo) reg2[victim] else reg[victim]);
@@ -2377,14 +2446,26 @@ pub fn allocate(f: *Ssa, n: u8, n_float: u8, survives: u32, fold: []const u32, s
 }
 
 /// Whether value `a` goes to memory before value `b` when registers run
-/// out: its uses weigh at most an eighth of `b`'s (a loop level less),
-/// or, unless `b`'s weigh that little against `a`'s, it ends later.
-fn spillsBefore(weight: []const u32, end: []const u32, a: u32, b: u32) bool {
-    const wa: u64 = weight[a];
-    const wb: u64 = weight[b];
-    if (8 * wa <= wb) return true;
-    if (8 * wb <= wa) return false;
+/// out at position `now`: its `weight` per position left in its interval
+/// that is short of registers (counted in `short`, or every position when
+/// it is empty) is lower, so that its register serves more of the values
+/// that would not fit at less cost, or the same and it ends later. A
+/// pair's weight counts once, as each of its two registers carries half
+/// its memory traffic.
+fn spillsBefore(weight: []const u32, end: []const u32, short: []const u32, now: u32, a: u32, b: u32) bool {
+    const ca: u64 = weight[a];
+    const cb: u64 = weight[b];
+    const la: u64 = 1 + if (short.len == 0) end[a] - now else short[end[a] + 1] - short[now];
+    const lb: u64 = 1 + if (short.len == 0) end[b] - now else short[end[b] + 1] - short[now];
+    if (ca * lb != cb * la) return ca * lb < cb * la;
     return end[a] > end[b];
+}
+
+/// Whether active value `a` may give up its register to value `inst`,
+/// which may use `usable`: it holds one of them, no load sharing it
+/// still reads it, and it is not pinned.
+fn evictable(a: u32, inst: u32, usable: u32, reg: []const u8, reg2: []const u8, held: [max_regs]u32, hint: []const [2]u8, def: []const u32) bool {
+    return usable & (regBit(reg[a]) | regBit(reg2[a])) != 0 and held[reg[a]] < def[inst] and hint[a][1] != hint_pinned;
 }
 
 pub const max_regs = 32;

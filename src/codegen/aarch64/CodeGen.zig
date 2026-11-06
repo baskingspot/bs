@@ -611,7 +611,7 @@ fn allocateRegs(cg: *CodeGen) Error!void {
     var counts: std.ArrayList(u32) = .empty;
     defer counts.deinit(cg.gpa);
     const restrictions: []const Ssa.Restriction = if (try f.asmCounts(cg.gpa, cg.ir, &counts)) |c| &.{.{ .regs = cg.asmRegs(), .counts = c }} else &.{};
-    const used = f.allocate(alloc_regs.len, float_regs.len + vreg_count, (1 << survive) - 1, cg.pair_base, &split, restrictions);
+    const used = try f.allocate(cg.gpa, alloc_regs.len, float_regs.len + vreg_count, (1 << survive) - 1, cg.pair_base, &split, restrictions);
     for (0..5) |k| if (used >> @intCast(2 * k) & 3 != 0) {
         cg.saved |= @as(u16, 1) << @intCast(k);
     };

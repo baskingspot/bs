@@ -2662,10 +2662,15 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    reads it without defining it) and counts clobber points. `Ssa.allocate`
    is linear scan without splitting: a value that does not fit is kept in
    memory for its whole life. When no register is free, the value that
-   ends last goes to memory, unless the uses of one, weighted by loop
-   depth (8 per level, `Live.weight`), weigh at most an eighth of the
-   others': a value used a loop level less often goes first, so an inner
-   loop's values keep their registers (SipHash's state). x86_64 values of scalar types (integers up
+   costs the least in memory per position where registers are short goes
+   there: its definition and uses, weighted by loop depth (8 per level,
+   `Live.weight`), over the positions left in its interval at which more
+   values want a general-purpose register than there are. A value read
+   a few times in an inner loop but live across the whole outer loop gives
+   way to the inner loop's temporaries, while an inner loop's own values
+   keep their registers (SipHash's state), and a loop's variable is not
+   given up for the temporaries of a path that is short of registers
+   only for a few positions. x86_64 values of scalar types (integers up
    to 64 bits, bools, pointers, error codes, optional pointers) that the
    lowering leaves in a register get one of rbx, r12–r15, which every
    lowering leaves alone and calls preserve, or, when their interval
@@ -2787,7 +2792,8 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    `.auto` arguments and results, and the error-union and optional
    operations produce and read in registers; other code reads a pair
    from a spill slot written at the read. A pair gets two free registers
-   or none, and is neither evicted nor tied. Error unions of up to 8
+   or none, evicting at most two values that go to memory before it, and
+   is not tied. Error unions of up to 8
    bytes are in one register (error code in the low 16 bits). So are
    loads and block results of other aggregates of 1, 2, 4, or 8 bytes
    (`inGprBytes`: their bytes, extended like a load); code that reads

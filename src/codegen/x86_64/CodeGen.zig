@@ -2335,7 +2335,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
         restrictions[1] = .{ .regs = asm_regs, .counts = c };
         n_restrictions = 2;
     }
-    cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split, restrictions[0..n_restrictions]) & callee_saved | asm_regs & callee_saved;
+    cg.saved = try f.allocate(cg.gpa, alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split, restrictions[0..n_restrictions]) & callee_saved | asm_regs & callee_saved;
     const reg2 = live.items(.reg2);
     for (f.values.items(.inst)) |inst| {
         const i = @backingInt(inst);
