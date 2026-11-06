@@ -993,7 +993,10 @@ comptime arguments are run-time values in the lowered code (uucode's
   from x17. x9-x14 are per-instruction scratch, x16/x17 legalize addresses and
   hold call targets. `.auto` passes values of up to 8 bytes in one of
   x0-x7, up to 16 in two, f16/f32/f64 in v0-v7, the rest in the outgoing
-  area; results come back the same way or through x8, and the error
+  area; results come back the same way, results of 17 to 32 bytes (other
+  than f80 and f128) as their bytes in x0-x3 (the unwinders and the error
+  return trace read none of x0-x8, so the results' registers are bs's
+  choice), larger ones through x8, and the error
   return trace pointer goes in x15, which a callee returns unchanged: an
   `.auto` function keeps the pointer in x15 throughout, saving it only
   around what may write x15 (calls of other conventions, compiler_rt,
