@@ -1027,9 +1027,11 @@ comptime arguments are run-time values in the lowered code (uucode's
   and f128 are refused). `@call(.always_tail, ...)` places the arguments
   where the caller's own came (Sema made the two function types equal),
   stack ones through slots since they may read the caller's, passes the
-  caller's result pointer in x8, pops the frame and branches; an
-  argument passed by reference is refused, as its copy lives in the
-  popped frame. Inline assembly is parsed from GNU/LLVM syntax: the
+  caller's result pointer in x8, pops the frame and branches. An `.auto`
+  argument passed by reference must be a by-reference parameter, in any
+  position, or a constant: a value in the popped frame is refused with
+  an error at the call's line (bs may reject more than upstream, whose
+  LLVM emits it), as is any C argument passed by reference. Inline assembly is parsed from GNU/LLVM syntax: the
   loads, stores, moves, arithmetic, branches, barriers, hints, and `mrs`
   of the thread registers that std uses, and the NEON instructions of
   std's AES, GHASH/POLYVAL and SHA-256 code (`aese`/`aesmc`, `pmull`,
@@ -1625,29 +1627,36 @@ identity is in every cache key):
   in order; a pair takes two consecutive general registers, and a pair that
   does not fit entirely in registers goes on the stack, never split.
   Arguments that
-  do not fit go in the outgoing stack area. On x86_64, a memory-class
-  argument (over 16 bytes) goes by reference, as one more pointer
-  argument: memory holding the value that nothing writes during the call,
-  which the callee reads in place (`Home.ind`; a `*const` copy Sema makes
-  of the parameter is that memory too). Parameters are immutable, so this
-  is the same as a copy: the caller passes a constant's own memory (a
-  comptime table passed by value is not copied at all), a by-reference
-  parameter's pointer, or a value's slot (values have no address anything
-  could write through, and a slot is reused only after the call), and
-  copies anything else, such as a load whose memory the callee might
-  write, to its outgoing area. A parameter that gets no register is
-  copied in at entry. `test/run/byref.zig` checks the aliasing cases
-  (`f(g.*)` writing `g`, `s = f(s)`) against upstream's ReleaseSafe.
+  do not fit go in the outgoing stack area. A memory-class argument
+  (over 16 bytes) goes by reference, as one more pointer argument (on
+  aarch64 in x0-x7, then in an 8-byte stack slot): memory holding the
+  value that nothing writes during the call, which the callee reads in
+  place through the register holding the pointer (`Home.ind`; a `*const`
+  copy Sema makes of the parameter is that memory too, and on aarch64 the
+  parameter's interval covers the copy's uses, `planArgAliases`).
+  Parameters are immutable, so this is the same as a copy: the caller
+  passes a constant's own memory (a comptime table passed by value is not
+  copied at all), a by-reference parameter's pointer, or a value's slot
+  (values have no address anything could write through, and a slot is
+  reused only after the call), and copies anything else, such as a load
+  whose memory the callee might write, to its outgoing area, after the
+  stack arguments. A parameter that gets no register is copied in at
+  entry; on aarch64 it keeps the pointer it came with for the calls that
+  pass it on (`byref_ptr`). `test/run/byref.zig` and
+  `test/run/arg_byref.zig` check the aliasing cases (`f(g.*)` writing
+  `g`, `s = f(s)`) against upstream.
 - Results: scalars and pairs in rax/rdx (x0/x1), floats and those
   vectors in xmm0 (v0);
   others through a result pointer passed in rdi (x8, the indirect result
-  register, as Apple's C convention). Large aggregates stay in the
-  outgoing stack area on aarch64 too (the callee reads them at
-  `[fp, #16 + n]`, and a `*const` copy Sema makes of the parameter is
-  that slot when only loads and field and element pointers use its
-  address and the slot has its alignment, `planArgAliases`; a tail call
-  reads every argument before it rewrites the slots); only the C ABI module passes aggregates over 16 bytes
-  by reference to a caller copy, and HFAs in v registers.
+  register, as Apple's C convention). A by-value parameter that does
+  not fit the registers stays in the outgoing stack area on aarch64 (the
+  callee reads it at `[fp, #16 + n]`, and a `*const` copy Sema makes of
+  the parameter is that slot when only loads and field and element
+  pointers use its address and the slot has its alignment,
+  `planArgAliases`; a tail call reads every argument before it rewrites
+  the slots). The C ABI module passes aggregates over 16 bytes by
+  reference to a caller copy the callee may write, and HFAs in v
+  registers.
 - The error return trace pointer goes in a fixed register outside the
   argument registers: rax on x86_64 (free at a call: only variadic C
   calls use al) and x15 on aarch64, instead of today's r9. Not x9:
