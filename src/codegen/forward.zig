@@ -42,7 +42,7 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
     // and stores straight through a local are left to `Ssa.plan`.
     const n = ir.instructions.len;
     scratch.clearRetainingCapacity();
-    const words = try scratch.addManyAsSlice(gpa, 14 * n + 1);
+    const words = try scratch.addManyAsSlice(gpa, 16 * n + 1);
     const stored_once = words[0..n];
     @memset(stored_once, none);
     for (tags, datas) |tag, data| if (tag == .store) if (data.bin_op.lhs.toIndex()) |a| if (tags[@backingInt(a)] == .alloc) {
@@ -92,6 +92,8 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *std.ArrayLi
         .exits = words[11 * n .. 12 * n],
         .alias = words[12 * n .. 13 * n],
         .last_load = words[13 * n .. 14 * n],
+        .dom_end = words[14 * n .. 15 * n],
+        .early = words[15 * n .. 16 * n],
     };
     // Read for any operand; the rest is set as the walk reaches it.
     @memset(w.root, none);
@@ -162,6 +164,10 @@ fn baseHash(ir: *const Ir, stored_once: []const u32, ptr: Inst.Ref) ?u256 {
     // pair of bases sharing a hash.
     while (base.toIndex()) |i| switch (tags[@backingInt(i)]) {
         .ptr_elem_ptr => base = ir.extraData(Ir.Bin, datas[@backingInt(i)].ty_pl.payload).data.lhs,
+        // A pointer with `const` added (`Walk.constOnly`), as an inline
+        // callee's copy of a by-value parameter becomes, or any other
+        // cast: hashing more together only walks more.
+        .bitcast => base = datas[@backingInt(i)].ty_op.operand,
         .load => {
             const a = datas[@backingInt(i)].ty_op.operand.toIndex() orelse break;
             if (tags[@backingInt(a)] != .alloc) break;
@@ -303,14 +309,25 @@ const Walk = struct {
     flags: []Flags,
     /// Per load, the value it was found to read, or `none`.
     subst: []u32,
-    /// Per `block`, how many `br`s exit it.
+    /// Per `block`, the position of the first `br` that exits it, or
+    /// `none`.
     exits: []u32,
     /// Per load of a local's value, an earlier load of it that reads the
-    /// same value, and per element pointer an earlier one of the same
-    /// element, as a ref, or `none` (`canon`).
+    /// same value, per element pointer an earlier one of the same
+    /// element, and per cast that only adds `const` its operand, as a
+    /// ref, or `none` (`canon`).
     alias: []u32,
     /// Per local, its last load with no store to it since.
     last_load: []u32,
+    /// Per instruction, the last position it dominates: `scope_end`, and
+    /// past the blocks it runs in before they are left (`dominated`).
+    /// Filled the first time `scope_end` does not decide (`dominates`).
+    dom_end: []u32,
+    dom_ready: bool = false,
+    /// The blocks left before their end, inner ones first: only they
+    /// make an instruction dominate past its scope.
+    early: []u32,
+    early_len: u32 = 0,
     /// The pointers `ptr_elem_ptr` derived, by base and index (`canon`).
     elems: [max_known][3]Inst.Ref = undefined,
     elems_len: u32 = 0,
@@ -375,6 +392,7 @@ const Walk = struct {
             tags[store] = .bitcast;
             datas[store] = .{ .ty_op = .{ .ty = ty, .operand = src } };
             w.flags[ii].forwarded = true;
+            if (w.constOnly(datas[ii].ty_op)) w.alias[ii] = @backingInt(src);
             count += 1;
         }
         return count;
@@ -418,7 +436,7 @@ const Walk = struct {
                         // does not escape.
                         if (w.flags[a].escaped or !forwardable(ip, ty)) continue;
                         const j = w.last_load[a];
-                        if (j != none and w.pos[j] < w.pos[i] and w.pos[i] <= w.scope_end[j] and w.loop_of[j] == w.loop_of[i]) {
+                        if (j != none and w.pos[j] < w.pos[i] and w.loop_of[j] == w.loop_of[i] and w.dominates(j, i)) {
                             w.alias[i] = @backingInt(Inst.Index.toRef(@fromBackingInt(j)));
                         } else w.last_load[a] = i;
                         continue;
@@ -431,7 +449,7 @@ const Walk = struct {
                     } else null;
                     if (match) |k| {
                         const s = k.inst;
-                        if (k.ty == ty and w.pos[s] < w.pos[i] and w.pos[i] <= w.scope_end[s] and w.sameAcrossLoops(key, s, i, &loop_writes)) {
+                        if (k.ty == ty and w.pos[s] < w.pos[i] and w.dominates(s, i) and w.sameAcrossLoops(key, s, i, &loop_writes)) {
                             subst[i] = @backingInt(k.value);
                             count += 1;
                             continue;
@@ -893,7 +911,10 @@ const Walk = struct {
 
     /// `ref`, or when it loads a pointer from a `const` local stored once
     /// before, the pointer stored there: every `self.x` reloads `self`
-    /// from its parameter's slot.
+    /// from its parameter's slot. A cast that only adds `const` is its
+    /// operand (`alias`): an inline callee's copy of a by-value parameter becomes
+    /// one of the caller's local (`forwardCopies`), and so does a copy of
+    /// that copy.
     fn canon(w: *const Walk, ref: Inst.Ref) Inst.Ref {
         const ir = w.ir;
         const tags = ir.instructions.items(.tag);
@@ -915,6 +936,20 @@ const Walk = struct {
             r = w.resolve(datas[s].bin_op.rhs);
         }
         return r;
+    }
+
+    /// Whether pointer cast `op` only adds `const`: the same pointee,
+    /// alignment, address space and size, so a field of it is the same
+    /// field of its operand.
+    fn constOnly(w: *const Walk, op: @FieldType(Inst.Data, "ty_op")) bool {
+        if (w.ip.keyTag(op.ty) != .ptr_type) return false;
+        const from_ty = w.ir.typeOf(op.operand, w.ip);
+        if (w.ip.keyTag(from_ty) != .ptr_type) return false;
+        var from = Type.ptrInfo(w.ip, from_ty);
+        const to = Type.ptrInfo(w.ip, op.ty);
+        if (!to.flags.is_const) return false;
+        from.flags.is_const = true;
+        return std.meta.eql(from, to);
     }
 
     fn isArg(w: *const Walk, ref: Inst.Ref) bool {
@@ -945,11 +980,58 @@ const Walk = struct {
         const ir = w.ir;
         const tags = ir.instructions.items(.tag);
         for (w.order[0..w.next]) |b| {
-            if (tags[b] != .block or w.exits[b] != 1) continue;
+            if (tags[b] != .block or w.exits[b] == none) continue;
             const insts = blockBody(ir, @fromBackingInt(b));
             const last = @backingInt(insts[insts.len - 1]);
-            if (tags[last] != .br or @backingInt(ir.instructions.items(.data)[last].br.block_inst) != b) continue;
+            // Its first exit is its last instruction: its only one.
+            if (w.exits[b] != w.pos[last] or tags[last] != .br) continue;
             for (insts) |i| w.scope_end[@backingInt(i)] = w.scope_end[b];
+        }
+    }
+
+    /// Whether `d`, at a position before `i`, dominates `i`: `i` is in
+    /// its scope, or past blocks `d` runs in before they are left
+    /// (`dom_end`). That is filled on the first question `scope_end`
+    /// does not answer, from the blocks left before their end, outer ones
+    /// first, so a block's own reach is known before its body's.
+    fn dominates(w: *Walk, d: u32, i: u32) bool {
+        if (w.pos[i] <= w.scope_end[d]) return true;
+        if (w.early_len == 0) return false;
+        if (!w.dom_ready) {
+            w.dom_ready = true;
+            @memcpy(w.dom_end, w.scope_end);
+            var k = w.early_len;
+            while (k > 0) {
+                k -= 1;
+                const b = w.early[k];
+                w.dominated(blockBody(w.ir, @fromBackingInt(b)), w.exits[b], w.dom_end[b]);
+            }
+        }
+        return w.pos[i] <= w.dom_end[d];
+    }
+
+    /// The instructions of `insts` that run on every path to position
+    /// `exit`, the first `br` that leaves an enclosing block, dominate
+    /// what follows that block, up to `to`: those before the instruction
+    /// holding `exit`, and in it, when it is a block, those of its body
+    /// before both `exit` and the block's own first `br`. Not those in a
+    /// branch or a loop. A `br` is the only way out of a block that does
+    /// not leave the function, so its positions are where that block's
+    /// successors are entered from. Nothing is loaded where the program
+    /// did not load: a load is only read where one it dominates runs.
+    fn dominated(w: *Walk, insts: []const Inst.Index, exit: u32, to: u32) void {
+        const tags = w.ir.instructions.items(.tag);
+        for (insts, 0..) |inst, k| {
+            const i = @backingInt(inst);
+            if (k + 1 < insts.len and w.pos[@backingInt(insts[k + 1])] <= exit) {
+                w.dom_end[i] = @max(w.dom_end[i], to);
+                // A block left before `exit`: so are those of its body
+                // that run before it is left.
+                if (tags[i] == .block and w.exits[i] != none) w.dominated(blockBody(w.ir, inst), w.exits[i], to);
+                continue;
+            }
+            if (tags[i] == .block) w.dominated(blockBody(w.ir, inst), @min(exit, w.exits[i]), to);
+            return;
         }
     }
 
@@ -974,7 +1056,8 @@ const Walk = struct {
                 w.touch(data.ty_op.operand);
             },
             .br => {
-                w.exits[@backingInt(data.br.block_inst)] += 1;
+                const first = &w.exits[@backingInt(data.br.block_inst)];
+                if (first.* == none) first.* = w.pos[i];
                 w.user = i;
                 Ssa.forEachOperand(ir, inst, Escape{ .w = w });
             },
@@ -1013,9 +1096,19 @@ const Walk = struct {
         }
         switch (tag) {
             .block => {
-                w.exits[i] = 0;
-                w.body(blockBody(ir, inst));
+                w.exits[i] = none;
+                const insts = blockBody(ir, inst);
+                w.body(insts);
                 w.store[i] = w.next - 1;
+                if (w.exits[i] != none and w.exits[i] != w.pos[@backingInt(insts[insts.len - 1])]) {
+                    w.early[w.early_len] = i;
+                    w.early_len += 1;
+                }
+            },
+            // Its operand, to `canon`, as are the casts `forwardCopies`
+            // makes.
+            .bitcast => if (w.constOnly(data.ty_op)) {
+                w.alias[i] = @backingInt(data.ty_op.operand);
             },
             .loop => {
                 w.store[i] = slot;

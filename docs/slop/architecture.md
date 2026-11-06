@@ -2240,9 +2240,16 @@ rewrites use it:
   not escape counts as an earlier load of it in the same loop with no
   store into the local between, and an element pointer counts as an
   earlier one of the same type with the same base and index (each
-  `metadata[0]` of a hash map's probe loop). Only a value that a load or
-  store already computed on every path to the load is reused; nothing is
-  loaded where the program did not load. Positions are scanned in order,
+  `metadata[0]` of a hash map's probe loop), and a cast that only adds
+  `const` counts as its operand (an inline callee's copy of a by-value
+  parameter becomes one of the caller's local). Dominating means on
+  every path: before the use in the same body, or inside blocks the use
+  follows, when the load runs in them unconditionally (not in a branch
+  or a loop) before the first `br` leaving each of them, so a load in an
+  inline callee's `if (self.p == null) return 0;` serves the code after
+  the call. Only a value that a load or store already computed on every
+  path to the load is reused; nothing is loaded where the program did
+  not load. Positions are scanned in order,
   so any write in between, also in a branch not taken, forgets what it
   may overlap: a store forgets other fields of the same struct only if
   the struct's fields do not overlap, two locals never overlap, a local
