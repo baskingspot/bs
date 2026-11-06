@@ -19,7 +19,9 @@ const inline_ir = @import("inline.zig");
 
 /// The most iterations a loop is unrolled for.
 pub const max_trips = 8;
-/// The most instructions all copies of a body have together.
+/// The most instructions all copies of a body have together, not counting
+/// the line markers, which emit no code: `MultiArrayList.slice` over
+/// `Nav.Repr`'s 8 fields copies 27 instructions and 7 markers a trip.
 pub const max_copied = 256;
 
 /// A loop to unroll:
@@ -167,7 +169,9 @@ const Nested = struct {
         for (insts) |inst| {
             const data = ir.instructions.items(.data)[@backingInt(inst)];
             const tag = ir.instructions.items(.tag)[@backingInt(inst)];
-            if (it.count_only) it.n += 1 else try it.out.append(it.gpa, inst);
+            if (!it.count_only) {
+                try it.out.append(it.gpa, inst);
+            } else if (tag != .dbg_stmt) it.n += 1;
             switch (tag) {
                 // `Copier` does not copy these.
                 .ret_addr, .frame_addr, .err_return_trace, .set_err_return_trace, .assembly, .c_va_start, .c_va_arg, .c_va_copy, .arg => it.ok = false,

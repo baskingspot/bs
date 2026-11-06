@@ -2179,7 +2179,7 @@ loop in the shape Sema gives a loop over comptime-known arrays or a
 constant range (a `usize` counter alloc set to a constant before the
 loop, `i < N` against a constant, `i +% 1`, and no other use of the
 counter) runs at most 8 times and copies at most 256 instructions in
-all, becomes one copy of its body per iteration, each in a block that
+all (line markers, which emit no code, not counted), becomes one copy of its body per iteration, each in a block that
 `continue` exits, with the counter's load replaced by the iteration's
 constant. `N` may also be the length of a slice built with a constant
 length, directly or through a `const` local stored once, as
@@ -2187,9 +2187,10 @@ length, directly or through a `const` local stored once, as
 then fold what the constants make constant: elements of the constant
 arrays, and the bounds checks against their lengths, which are copied
 like every other check and fold only where the constant proves them.
-`MultiArrayList.slice` (2–5 iterations over its fields' sizes) is the
-case that matters: zig fmt −2.9%, the zls tests −4.1% outside std's
-unwinder.
+`MultiArrayList.slice` (an iteration per field over its fields' sizes)
+is the case that matters: zig fmt −2.9%, the zls tests −4.1% outside
+std's unwinder; with the markers left out of the budget, the
+compiler's 8-field `Nav.Repr` too (zig-sema −1%).
 
 #### Forwarding
 
