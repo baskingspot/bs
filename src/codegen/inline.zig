@@ -55,8 +55,9 @@ pub const Site = struct {
 
 pub const Scan = struct {
     /// Instructions with code outside cold bodies (those ending in
-    /// `unreach` or `trap`: safety checks, `unreachable`), but for the
-    /// ones `Scanner.free` leaves out.
+    /// `unreach` or `trap`: safety checks, `unreachable`) and error
+    /// returns (`isErrorReturn`), but for the ones `Scanner.free` leaves
+    /// out.
     size: u32 = 0,
     /// Whether the function could be spliced into a caller once its
     /// candidate calls are inlined: an `.auto`, non-`noinline` function
@@ -78,7 +79,7 @@ pub fn scan(gpa: Allocator, zcu: *const Zcu, ir: *const Ir, sites: *std.ArrayLis
     const start = sites.items.len;
     var s: Scanner = .{ .gpa = gpa, .ip = &zcu.ip, .ir = ir, .sites = sites, .return_error = zcu.return_error };
     s.out.inlinable = selfInlinable(zcu, ir.func);
-    try s.body(ir.mainBody(), false);
+    try s.body(ir.mainBody(), false, false);
     if (sites.items.len != start) {
         // A recursive call stays a call.
         var i = start;
@@ -127,7 +128,9 @@ const Scanner = struct {
     line: u32 = 0,
     column: u32 = 0,
 
-    fn body(s: *Scanner, insts: []const Inst.Index, cold: bool) Allocator.Error!void {
+    /// `uncounted`: inside an error return, whose instructions are
+    /// candidates and kept as usual but not counted in the size.
+    fn body(s: *Scanner, insts: []const Inst.Index, cold: bool, uncounted: bool) Allocator.Error!void {
         const ir = s.ir;
         const tags = ir.instructions.items(.tag);
         const datas = ir.instructions.items(.data);
@@ -151,20 +154,20 @@ const Scanner = struct {
                     const loop = tag == .loop;
                     s.loops += @intFromBool(loop);
                     if (loop) s.out.straight = false;
-                    try s.body(ir.bodySlice(extra.end, extra.data.body_len), cold);
+                    try s.body(ir.bodySlice(extra.end, extra.data.body_len), cold, uncounted);
                     s.loops -= @intFromBool(loop);
                 },
                 .cond_br => {
                     const extra = ir.extraData(Ir.CondBr, data.pl_op.payload);
                     const then_body = ir.bodySlice(extra.end, extra.data.then_body_len);
                     const else_body = ir.bodySlice(extra.end + then_body.len, extra.data.else_body_len);
-                    try s.body(then_body, cold or isCold(ir, then_body));
-                    try s.body(else_body, cold or isCold(ir, else_body));
+                    try s.body(then_body, cold or isCold(ir, then_body), uncounted or s.isErrorReturn(then_body));
+                    try s.body(else_body, cold or isCold(ir, else_body), uncounted or s.isErrorReturn(else_body));
                 },
                 .switch_br => {
                     var it = ir.switchCases(data.pl_op.payload);
-                    while (it.next()) |c| try s.body(c.body, cold or isCold(ir, c.body));
-                    try s.body(it.elseBody(), cold or isCold(ir, it.elseBody()));
+                    while (it.next()) |c| try s.body(c.body, cold or isCold(ir, c.body), uncounted or s.isErrorReturn(c.body));
+                    try s.body(it.elseBody(), cold or isCold(ir, it.elseBody()), uncounted or s.isErrorReturn(it.elseBody()));
                 },
                 .call => try s.call(inst, cold),
                 // A big array literal or `@splat` has an operand per element
@@ -181,8 +184,27 @@ const Scanner = struct {
                 },
                 else => {},
             }
-            if (!cold and !s.free(tag, data)) s.out.size += 1;
+            if (!cold and !uncounted and !s.free(tag, data)) s.out.size += 1;
         }
+    }
+
+    /// Whether a branch's body ends returning an error: a `return
+    /// error.X` prong, or `try`'s error side. Like cold code, it runs
+    /// rarely on the paths callers care about, and inlined it is a
+    /// return of the caller's own: `std.debug`'s `dwarfRegisterBytes`
+    /// (16 prongs of `return error.UnsupportedRegister`) and `regNative`
+    /// measured over the budget on these alone, though the hot paths of
+    /// every stack capture. Unlike cold code, its calls (the error
+    /// return trace's push) stay and run where it is inlined.
+    fn isErrorReturn(s: *const Scanner, insts: []const Inst.Index) bool {
+        if (insts.len == 0) return false;
+        const ir = s.ir;
+        const last = @backingInt(insts[insts.len - 1]);
+        if (ir.instructions.items(.tag)[last] != .ret) return false;
+        const r = ir.instructions.items(.data)[last].un_op;
+        if (r.toInterned()) |v| return s.ip.keyTag(v) == .error_union and s.ip.keyPayload(.error_union, v).val == .err_name;
+        const i = r.toIndex() orelse return false;
+        return ir.instructions.items(.tag)[@backingInt(i)] == .wrap_errunion_err;
     }
 
     /// Whether the size leaves an instruction out: `block`s and their

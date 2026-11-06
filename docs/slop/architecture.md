@@ -1971,6 +1971,17 @@ build, the passes, and the debug info treat them as Sema's inline calls
   users see"), so `std.math.add`, `sub` and ArrayList's `addOrOom`
   inline; every decision reads the callee's own IR, the same in every
   build and schedule.
+- **Error returns are free.** A `cond_br` side or switch prong whose
+  body ends in a `ret` of an error (`return error.X`, `try`'s error
+  side: `Scanner.isErrorReturn`) is left out of the size like cold code,
+  but its calls stay candidates and run where it is inlined, so the
+  error return trace's push records the same frames
+  (`test/run/error_prong_inlined.zig`). std.debug's `dwarfRegisterBytes`
+  and `regNative`, on every frame of a stack capture, were over the
+  budget on such prongs alone. Inlined, they take 15% of the
+  instructions off an unwinding benchmark and of a stack capture loop,
+  8% off zls's tests and 12% off msgpack's, for +0.11% instructions
+  compiling zls and 16 KB more code (std.debug's unwinder) per program.
 - **Variants.** *Full*, the default, inlines any such callee; synthetic
   panic frames (below) keep its panic traces complete. *Safe* also
   requires that the callee can start no panic: no call of a cold
