@@ -1998,8 +1998,7 @@ pub const Keyer = struct {
     }
 
     fn srcHash(k: *Keyer, file: u32, inst: std.zig.Zir.Inst.Index) Hash {
-        const h = k.zcu.file(file).zir.getAssociatedSrcHash(inst) orelse return 0;
-        return @bitCast(h);
+        return seeds.srcHash(&k.zcu.file(file).zir, inst);
     }
 
     /// `unitInfo(unit).src_hash`, without the rest.

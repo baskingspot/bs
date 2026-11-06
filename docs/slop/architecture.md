@@ -5715,7 +5715,13 @@ no longer maps, if its `src_hash` changed (for `func_body`, its result,
 which is that hash), if its container's declaration names changed, in
 order (`namespace`), or if the name it looks up appeared, disappeared,
 or changed `pub` (`namespace_name`); a changed embedded file's node is a
-seed, and without the old ZIR every node of the input is. Recording the
+seed, and without the old ZIR every node of the input is. A container's
+`src_hash` is AstGen's fields hash with the attributes AstGen 0.17.1
+leaves out of it mixed in (`seeds.srcHash`): a struct's layout, a
+union's kind, an enum's `_`. Until 2026-11-06 an edit to one alone
+(`struct` to `extern struct`) left the layout green: a stale
+`@sizeOf`, or a missing compile error (the edit hunter, seed 5202;
+test/run/edit_container_attrs.zig). Recording the
 sources costs nothing measurable and 8 bytes a node plus the looked-up
 names (libvaxis: manifest 2.94 to 3.22 MB). `BS_CACHE_CHECK` computes
 the seeds this way and checks that they reach every changed result:

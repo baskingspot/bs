@@ -155,8 +155,23 @@ fn isSeed(
     }
 }
 
-fn srcHash(zir: *const Zir, inst: Zir.Inst.Index) u128 {
-    return @bitCast(zir.getAssociatedSrcHash(inst) orelse return 0);
+/// Instruction `inst`'s source hash, as nodes record it
+/// (`Incremental.Keyer.srcHash`): AstGen's, and for a container the
+/// attributes AstGen 0.17.1 leaves out of its fields hash, though they
+/// change the layout: a struct's `extern` or `packed`, a union's kind
+/// (`union(enum)`), and an enum's `_`.
+pub fn srcHash(zir: *const Zir, inst: Zir.Inst.Index) u128 {
+    const h: u128 = @bitCast(zir.getAssociatedSrcHash(inst) orelse return 0);
+    if (zir.instructions.items(.tag)[@backingInt(inst)] != .extended) return h;
+    const ext = zir.instructions.items(.data)[@backingInt(inst)].extended;
+    const attrs: u8 = switch (ext.opcode) {
+        .struct_decl => @backingInt(@as(Zir.Inst.StructDecl.Small, @bitCast(ext.small)).layout),
+        .union_decl => @backingInt(@as(Zir.Inst.UnionDecl.Small, @bitCast(ext.small)).kind),
+        .enum_decl => @intFromBool(@as(Zir.Inst.EnumDecl.Small, @bitCast(ext.small)).nonexhaustive),
+        else => 0,
+    };
+    // The default attributes keep AstGen's hash.
+    return if (attrs == 0) h else h ^ (@as(u128, attrs) *% 0x9e3779b97f4a7c15f39cc0605cedc835);
 }
 
 fn isContainer(zir: *const Zir, inst: Zir.Inst.Index) bool {
