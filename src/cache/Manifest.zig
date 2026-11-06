@@ -891,6 +891,8 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
     // So are its atoms' names.
     var with_atoms: std.ArrayList(u32) = .empty;
     defer with_atoms.deinit(gpa);
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(gpa);
     for (0..rh.n_nodes) |_| {
         const d = r.take(NodeDelta, 1);
         const node_deps = r.take(u32, d[0].deps_len);
@@ -905,6 +907,14 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
         const node_names = r.take(u32, d[0].names_len);
         try o.targets.appendSlice(gpa, node_targets);
         const index = d[0].index;
+        // The node's previous state, in an earlier record or the base: its
+        // reverse edges are already in, so only new ones are added below.
+        const prev_deps: []const u32, const prev_refs: []const Ref = if (o.nodes.get(index)) |p|
+            .{ p.deps, p.refs }
+        else if (index < m.nodes.len)
+            .{ m.edges[m.nodes[index].deps_start..][0..m.nodes[index].deps_len], m.refs[m.ref_starts[index]..m.ref_starts[index + 1]] }
+        else
+            .{ &.{}, &.{} };
         if (index == m.nodeCount()) {
             o.added_nodes += 1;
             try o.added_keys.put(gpa, d[0].key, index);
@@ -929,16 +939,8 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
         _ = o.sources.remove(index);
         if (d[0].source_name.len != 0) try named.append(gpa, .{ .index = index, .name = d[0].source_name });
         if (d[0].atoms_len != 0) try with_atoms.append(gpa, index);
-        for (node_deps) |dep| {
-            const gop = try o.rdeps.getOrPut(gpa, Edge.nodeOf(dep));
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(gpa, index);
-        }
-        for (node_refs) |ref| if (reachRef(ref.kind)) {
-            const gop = try o.rrefs.getOrPut(gpa, ref.value);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(gpa, index);
-        };
+        try addReverse(gpa, &o.rdeps, &seen, index, u32, prev_deps, node_deps, depNode);
+        try addReverse(gpa, &o.rrefs, &seen, index, Ref, prev_refs, node_refs, reachedNode);
     }
     const input_deltas = r.take(InputDelta, rh.n_inputs);
     const errors = r.take(StrRef, rh.n_errors);
@@ -978,6 +980,41 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
     for (files) |f| try o.files.append(gpa, strings[f.off..][0..f.len]);
     for (ref_names) |f| try o.ref_names.append(gpa, strings[f.off..][0..f.len]);
     return rh.len;
+}
+
+/// Adds node `index` to the reverse list (`rdeps` or `rrefs`) of each node
+/// that `now`'s entries name and `prev`'s, the node's previous state's, do
+/// not. Every state's entries were added when it was applied, and the lists
+/// are supersets, so the old ones stay; a node an edit records again with
+/// the same edges adds nothing. (Until 2026-11-06 every record added all of
+/// them again: the lists, and `readLog`, grew with every edit to the same
+/// function.)
+fn addReverse(
+    gpa: Allocator,
+    map: *std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)),
+    seen: *std.AutoHashMapUnmanaged(u32, void),
+    index: u32,
+    comptime T: type,
+    prev: []const T,
+    now: []const T,
+    comptime nodeOf: fn (T) ?u32,
+) !void {
+    if (std.mem.eql(u8, std.mem.sliceAsBytes(prev), std.mem.sliceAsBytes(now))) return;
+    seen.clearRetainingCapacity();
+    for (prev) |p| if (nodeOf(p)) |k| try seen.put(gpa, k, {});
+    for (now) |x| if (nodeOf(x)) |k| if (!seen.contains(k)) {
+        const gop = try map.getOrPut(gpa, k);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(gpa, index);
+    };
+}
+
+fn depNode(dep: u32) ?u32 {
+    return Edge.nodeOf(dep);
+}
+
+fn reachedNode(ref: Ref) ?u32 {
+    return if (reachRef(ref.kind)) ref.value else null;
 }
 
 const Reader = struct {
@@ -2782,10 +2819,14 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
     var m3 = (try Manifest.open(gpa, io, tmp.dir)).?;
     try expectLogged(&m3);
     // The log's reverse edges join the base's, which keep node 2's old
-    // dependency on node 0 until the next base.
+    // dependency on node 0 until the next base. A dependency a node had
+    // before is not added again: node 2, recorded twice depending on node
+    // 3 as in the base, is in node 3's list once, and node 4, added and
+    // then recorded again, in node 2's once.
     try t.expectEqualSlices(u32, &.{ 1, 2 }, m3.rdeps(0)[0]);
-    try t.expectEqualSlices(u32, &.{ 2, 2 }, m3.rdeps(3)[1]);
-    try t.expectEqualSlices(u32, &.{ 4, 4 }, m3.rdeps(2)[1]);
+    try t.expectEqualSlices(u32, &.{2}, m3.rdeps(3)[0]);
+    try t.expectEqualSlices(u32, &.{}, m3.rdeps(3)[1]);
+    try t.expectEqualSlices(u32, &.{4}, m3.rdeps(2)[1]);
     {
         var d: Delta = .init(gpa, &m3);
         defer d.deinit();

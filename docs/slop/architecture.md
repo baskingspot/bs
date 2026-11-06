@@ -5342,7 +5342,18 @@ compilation (see "Integration" below).
   base, the next build writes a new base (`Builder.initFrom`, `write`).
   Reverse edges are a superset while a log exists: a node's old reverse
   edges stay until the next base, so a walk may re-check a unit that no
-  longer depends on the edit, never miss one.
+  longer depends on the edit, never miss one. Applying a record adds a
+  node's reverse edges and references only where its previous state
+  (base or earlier record) lacked them (`addReverse`). Until 2026-11-06
+  each record added all of them again, so a function edited N times put
+  itself N times in each dependency's list, and every build's `open`
+  (twice per lazy build: setup and the link) paid for all N: on the zig
+  workload, one-line Sema.zig edits grew the edit build ~2 ms per edit
+  (link stage 123 → 162 ms, whole build 347 → 447 ms over 50 edits)
+  until the fold at a quarter of the base, ~150 edits in. Now the link
+  stage holds at 124–128 ms; what still grows is reading and checksumming
+  the log itself (the gather 17 → 26 ms over 50 edits, ~0.2 ms per
+  edit), which the fold bounds.
 - **Symbol numbering** (in the manifest, for `Elf.Options.symbols`): a
   table from every key a live atom defines or references (error-code keys
   and the entry included) to a dense number (24-byte slots, about 80%
