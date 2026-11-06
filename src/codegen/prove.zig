@@ -2365,6 +2365,10 @@ const Walker = struct {
                     if (own.signedness == .signed) break :blk_none;
                     const a = w.rangeIn(w.term(data.bin_op.lhs), own, depth - 1);
                     const b = w.rangeIn(w.term(data.bin_op.rhs), w.intInfo(data.bin_op.rhs) orelse break :blk_none, depth - 1);
+                    // An empty range (hi below lo) is a path the facts
+                    // make infeasible: decide nothing on it. Past 64 bits
+                    // the shifted bound could overflow i128.
+                    if (a.hi < a.lo or b.hi < b.lo or own.bits > 64) break :blk_none;
                     if (a.lo < 0 or b.lo < 0 or b.hi >= own.bits) break :blk_none;
                     const hi = a.hi << @intCast(b.hi);
                     if (hi > limits(own).hi) break :blk_none;
