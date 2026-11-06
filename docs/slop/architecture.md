@@ -2641,7 +2641,7 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    lowering leaves alone and calls preserve, or, when their interval
    contains no clobber point, of rsi, rdi, r8, r9 (the scalar lowerings use
    only rax, rcx, rdx, r10, r11 as scratch; calls, string instructions,
-   and the fallback clobber the rest). A call of `std.lang.returnError`,
+   and the fallback clobber the rest), or of r11, r10, rdx, rcx (below). A call of `std.lang.returnError`,
    on every error path, is not a clobber point: that function gets no
    registers, so it writes only the scalar scratch registers. A return in
    registers is not one either. r11 is allocated too, to a value
@@ -2653,7 +2653,18 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    wide integers, odd-sized moves, calls, overflow bits, vector masks).
    `CodeGen.scratchUse` and `termScratch` return those decisions as a
    mask of the scratch registers (rcx, rdx, r10, r11), one restriction
-   per allocatable one. The encoder records the general-purpose registers
+   per register. rcx, rdx and r10 are allocated last, the same way:
+   a clobber point writes all of them, and so does every lowering but
+   the scalar ones `scalarScratch` lists (loads, stores, field and
+   element addresses and reads, casts, the ALU operations, compares,
+   tests of optionals and error unions, native-width add and sub with
+   overflow, jumps, branches, and returns in rax). Those write rcx
+   only for a variable shift count or a constant that is no 32-bit
+   immediate; an operand in memory is read in place at its width, and
+   a pointer or index in memory goes through the result's register or
+   rax, else through one of the three that holds no operand, saved with
+   push and pop around the use (`borrowReg`), so their masks hold
+   whatever the allocator decides. The encoder records the general-purpose registers
    each instruction writes (`Encoder.written`: destinations, implicit
    ones such as mul's rdx or rep movsb's rcx, rsi and rdi, every
    caller-saved one for a call or an inline assembly instruction), and
