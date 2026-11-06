@@ -1,5 +1,6 @@
 //! exit: 0
 //! stderr: "4 2.5 4\n"
+//! targets: x86_64-linux aarch64-macos aarch64-linux
 //! A float block result computed in its register before a call (the
 //! left operand of `e.from + ... * ease(..)`) lives across the call: the
 //! block keeps its XMM register, and the call saves it, also when the

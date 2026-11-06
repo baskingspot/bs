@@ -1,5 +1,6 @@
 //! exit: 0
 //! stderr: "false true true false\n"
+//! targets: x86_64-linux aarch64-macos aarch64-linux
 //! A block's result (a short-circuit `and`) that a later block returns
 //! lives in a register of its own across what comes between, here a call
 //! whose argument setup writes rax; only a result its own exit returns

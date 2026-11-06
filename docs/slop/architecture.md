@@ -933,9 +933,12 @@ comptime arguments are run-time values in the lowered code (uucode's
   result (`pairResult`), or a promoted variable; their users that read
   memory get a copy (`valMem`), and a `slice_ptr` or `slice_len` of a
   slice in registers takes none of its own but reads the slice's
-  (`lengthenIntervals`, as x86_64's `pairFoldable`). Block results
-  stay in slots. A value that meets an inline assembly statement (an operand,
-  its result, or a value live across it) takes none of the x19-x28 and
+  (`lengthenIntervals`, as x86_64's `pairFoldable`). A block result of
+  any of these types takes a register (or a pair) like other values,
+  and its `br`s move their operand there (`brResult`); a block of
+  another type, or one whose result is never read, keeps a slot. A
+  value that meets an inline assembly statement (an operand, its
+  result, or a value live across it) takes none of the x19-x28 and
   v8-v15 an assembly statement in the function names in its template,
   pins or clobbers (`asmRegs`, an `Ssa.allocate` restriction); the
   statement saves those it names around itself, for its caller's

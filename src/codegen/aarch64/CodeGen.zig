@@ -689,13 +689,21 @@ fn asmRegs(cg: *CodeGen) u32 {
 /// one that may call (`callFree`), which clobbers v20-v29; nothing
 /// clobbers x19-x28 or d8-d15. Also marks the values that want a
 /// register: scalars in general-purpose registers, f32 and f64 in
-/// floating-point ones, and vectors in v20-v29 (`inVec`), other than
-/// allocs (`Ssa.plan` promotes variables) and block results.
+/// floating-point ones, vectors in v20-v29 (`inVec`), and block results
+/// of those types and pairs' (`inPair`), whose `br`s are moves; not
+/// allocs (`Ssa.plan` promotes variables).
 pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
     if (cg.emit.ssa.no_regs) return false;
     const live = cg.emit.ssa.live.slice();
     switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
-        .alloc, .block => return false,
+        .alloc => return false,
+        .block => {
+            const ty = cg.ir.instructions.items(.data)[@backingInt(inst)].ty_pl.ty;
+            const want: u8 = if (cg.inGpr(ty)) Ssa.want_reg else if (cg.inFloat(ty)) Ssa.want_float else if (cg.inVec(ty)) Ssa.want_vec else if (cg.inPair(ty)) Ssa.want_pair else return false;
+            live.items(.reg)[@backingInt(inst)] = want;
+            live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
+            return false;
+        },
         // Read from the slice's registers if it gets them, taking none of
         // its own (`lengthenIntervals`).
         .slice_ptr, .slice_len => {
@@ -2335,8 +2343,14 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
 
 /// Writes a `br`'s operand to its block's result.
 fn brResult(cg: *CodeGen, br: @FieldType(Inst.Data, "br")) Error!void {
+    // Nothing reads a block the rewrite rules replaced, and its `br`s
+    // carry no value.
+    if (br.operand == Ref.void_value or cg.ssa.live.items(.uses)[@backingInt(br.block_inst)] == 0) return;
     switch (cg.homes[@backingInt(br.block_inst)]) {
         .slot => |m| try cg.copyTo(m, br.operand),
+        .reg => |r| try cg.load(r, br.operand),
+        .regs => |p| try cg.loadRegs(p, br.operand),
+        .vreg => |v| if (cg.inVec(cg.ir.typeOfIndex(br.block_inst, cg.ip))) try vector.loadVec(cg, v, br.operand) else try cg.loadFp(v, try cg.valOf(br.operand)),
         else => {},
     }
 }
@@ -2818,8 +2832,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.setResult(inst, ir.typeOfIndex(inst, ip), .x9);
         },
 
-        // The block's result, which each `br` writes (see `genTerm`).
-        .block => _ = try cg.slotFor(inst, data.ty_pl.ty),
+        // The block's result, which each `br` writes (see `genTerm`), in
+        // its register or its slot.
+        .block => if (cg.homes[@backingInt(inst)] == .none) {
+            _ = try cg.slotFor(inst, data.ty_pl.ty);
+        },
         .loop => {},
         .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap => unreachable,
         // As LLVM lowers `@breakpoint` on Darwin.
