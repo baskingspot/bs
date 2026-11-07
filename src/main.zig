@@ -309,9 +309,12 @@ pub const std_options: std.Options = .{
 /// records per allocation, which made a Debug bs 3–4x slower and
 /// `zig build test` with it (2026-11-04). `BS_ALLOC_TRACES=<frames>`
 /// records them again, to find where a leaked or doubly freed block came
-/// from.
+/// from. That holds with libc linked too: a bs for macOS always links
+/// libSystem, and std.start still picks SafeAllocator with traces there,
+/// which on aarch64-macos unwind through DWARF CFI and made a Debug bs
+/// about 4x slower.
 var safe_gpa: std.heap.SafeAllocator = undefined;
-const own_gpa = (builtin.mode == .safe or builtin.mode == .debug) and !builtin.link_libc;
+const own_gpa = builtin.mode == .debug or (builtin.mode == .safe and !builtin.link_libc);
 
 /// A ReleaseFast or ReleaseSafe bs keeps up to 16 MiB of freed large
 /// blocks for reuse (`BlockCache`), under the ReleaseSafe SafeAllocator.
