@@ -673,3 +673,12 @@ decides whether to drop it.
    `test/lint/`. Not yet: the Sema rules and hybrid verdicts (Z011,
    Z027; Sema's types for Z006, Z010, Z012, Z015, Z023, Z029, Z032,
    Z033, Z034), fixes and notes, the ported suite and `parity.py`.
+2. Branch `lint-2-suite`: the conformance suite (test/lint/README.md):
+   ziglint's 276 syntax-mode Linter tests and its 11 rules tests, ported
+   unchanged, and 144 of the 146 doc examples, all passing; the 28
+   semantic-mode tests and the 2 Z011 and Z027 examples wait for the
+   Sema rules. `tools/lint/parity.py` on bs's tree at 84c75e56 with that
+   tree's config (2026-11-07, `bs build`): ziglint 1269 findings, bs 444,
+   all 444 matched, none bs-only; ziglint-only: 745 sema-pending (Z011),
+   38 hybrid, 42 in files `bs build` does not reach (tools/, bench/), and
+   0 bugs. On main (2ba77df and later) both report 0.

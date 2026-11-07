@@ -49,6 +49,12 @@ lint:
 ziglint:
     ziglint
 
+[doc("bs's ziglint findings against ziglint's on this tree (tools/lint/parity.py), with bs at zig-out/bin/bs")]
+[group("lint")]
+lint-parity:
+    zig build
+    python3 tools/lint/parity.py --bs zig-out/bin/bs -- build --prefix .zig-cache/lint-parity
+
 [doc("Format everything lint checks")]
 [group("lint")]
 fmt:
