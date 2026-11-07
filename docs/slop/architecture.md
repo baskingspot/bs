@@ -4529,7 +4529,14 @@ differs from the design above:
   Zig atom references or unit requested), since a full build would
   generate more, or drop what the old objects needed and the manifest
   would keep recording; or when a declaration's data names an object's
-  atom without a slot (its old key is then undefined). Otherwise an edited
+  atom without a slot (its old key is then undefined). Such a relink
+  records the objects' new stats but not the slots it bound, so the
+  link's node still names the old objects' atoms: the compilation
+  directory's `rebound` file names the base, a relink from it binds the
+  slots again, and the next edit build replays eagerly (`beginReplay`),
+  which records a new base with the slots a full build gives. Until
+  2026-11-07 that build tried a lazy link first, which failed on the old
+  keys (`UndefinedSymbol (atom 'extern.c_atexit')`) and built again. Otherwise an edited
   object, or a Zig edit together with it, makes the edit build eager
   (`linkInputsChanged`), which binds the externs again and generates any
   compiler_rt function the object now needs. A lazy build does not load the objects, so one that writes a

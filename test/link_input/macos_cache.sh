@@ -133,6 +133,15 @@ build "inputs changed, first $work/libc_main.zig" "x=21 twice=63"
 lazy "-lc: the Zig code changed"
 sed -i '' 's/x=%d/X=%d/' libc.c
 build "1 link inputs changed and nothing else; relinked" "X=21 twice=63"
+# The relink bound the extern slots again without recording them: the
+# next edit build replays eagerly, which records them, rather than fail a
+# lazy link first; the one after it is lazy.
+sed -i '' 's/return 3 \* x/return 4 * x/' libc_main.zig
+build "replaying eagerly: the last relink bound the extern slots" "X=21 twice=84"
+eager "-lc: a Zig edit after a C edit's relink"
+sed -i '' 's/return 4 \* x/return 3 * x/' libc_main.zig
+build "inputs changed, first $work/libc_main.zig" "X=21 twice=63"
+lazy "-lc: a second Zig edit after a C edit's relink"
 
 # A C main, inside its section's atom after another function: the entry
 # point is an alias (`Emit.finish`), which a relink makes again.

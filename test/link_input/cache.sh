@@ -137,8 +137,16 @@ build "not relinking" "X=21 twice=42"
 # Touched, not changed: the record hits, and the link is the last one.
 touch libc.c
 build "not relinking" "X=21 twice=42"
+# The C edit's relink bound the extern slots again without recording
+# them: the next edit build replays eagerly, which records them, rather
+# than fail a lazy link first; the one after it is lazy.
 sed -i 's/return 2 \* x/return 3 * x/' libc_main.zig
-build "inputs changed, first $work/libc_main.zig" "X=21 twice=63"
+build "replaying eagerly: the last relink bound the extern slots" "X=21 twice=63"
+eager "a Zig edit after a C edit's relink"
+if grep -qF "UndefinedSymbol" cached.log; then fail "a Zig edit after a C edit's relink tried a lazy link"; fi
+sed -i 's/return 3 \* x/return 2 * x/' libc_main.zig
+build "inputs changed, first $work/libc_main.zig" "X=21 twice=42"
+lazy "a second Zig edit after a C edit's relink"
 
 # Assembly: `.S` records its include from the depfile; `.s` has none, so
 # its record holds the source alone, and an edit to either compiles again

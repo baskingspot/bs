@@ -414,6 +414,7 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
         return false;
     };
     if (objects_changed != 0) {
+        inc.noteBaseRebound(.{ m.id, m.pack_id });
         if (inc.timing) std.debug.print("cache: {d} link inputs changed and nothing else; relinked {d} atoms from the manifest in {d:.2} ms\n", .{ objects_changed, linked.atoms, ms(t0, now(io)) });
         return true;
     }
@@ -580,6 +581,25 @@ fn baseChecked(inc: *const Incremental, want: [2]Hash) bool {
 /// base. Best effort.
 fn noteBaseChecked(inc: *const Incremental, ids: [2]Hash) void {
     cache.writeReplace(inc.io, inc.dir, checked_name, &.{std.mem.asBytes(&ids)}) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
+}
+
+/// The base manifest and pack whose extern slots predate the link objects:
+/// a relink after only objects changed binds the slots again
+/// (`reboundSlots`) without recording them, so a later relink from that
+/// base must too, and an edit build replays eagerly (`beginReplay`), which
+/// records the slots and the link's atoms again in a new base.
+const rebound_name = "rebound";
+
+fn baseRebound(inc: *const Incremental, want: [2]Hash) bool {
+    var buf: [@sizeOf([2]Hash)]u8 = undefined;
+    const bytes = inc.dir.readFile(inc.io, rebound_name, &buf) catch return false;
+    return bytes.len == buf.len and std.mem.eql(u8, bytes, std.mem.asBytes(&want));
+}
+
+/// Records that `ids`' extern slots predate the link objects. A failure
+/// costs the next lazy relink, which builds eagerly instead.
+fn noteBaseRebound(inc: *const Incremental, ids: [2]Hash) void {
+    cache.writeReplace(inc.io, inc.dir, rebound_name, &.{std.mem.asBytes(&ids)}) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }
 
 /// Forgets the output's stat before a link replaces the output, so that
@@ -1117,7 +1137,7 @@ fn linkWithObjects(
     // they asked. Changed objects may ask in another order, which an
     // aarch64-macos link's import ordinals follow.
     var link_imports = imports;
-    if (inc.objects_changed) {
+    if (inc.objects_changed or inc.baseRebound(.{ m.id, m.pack_id })) {
         // A damaged pack record (`LinkAtoms.check`): build from scratch.
         const objects_only = sameObjectRequests(arena, m, pack_atoms, &live, objects, &requested_imports) catch |err| switch (err) {
             error.InvalidInput => return inc.noLink("{t}", .{err}),
@@ -1470,7 +1490,12 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     // paths. A donor's build is lazy only where `Replay.donorEager` allows;
     // its log then follows the donor's manifest (`finishLazy`).
     const has_inputs = inc.link_objects.len + inc.link_shared.len != 0;
-    const lazy = !std.mem.eql(u8, mode, "eager") and
+    // A lazy build after a relink that bound the slots again would keep
+    // the manifest's old link node (`baseRebound`), which a full build's
+    // differs from, and fail to link with it.
+    const rebound = has_inputs and inc.baseRebound(.{ m.id, m.pack_id });
+    if (rebound and inc.timing) std.debug.print("cache: replaying eagerly: the last relink bound the extern slots to changed objects\n", .{});
+    const lazy = !rebound and !std.mem.eql(u8, mode, "eager") and
         (!has_inputs or (!inc.link_objects_pending and if (inc.donor == null) !try inc.linkInputsChanged(m) else try inc.donorSharesLinkInputs(m)));
     const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy, inc.donor != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
