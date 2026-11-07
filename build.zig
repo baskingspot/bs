@@ -104,6 +104,18 @@ pub fn build(b: *std.Build) void {
         rec.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &rec.step, 10);
         test_step.dependOn(&rec.step);
+        // Objects, archives and C sources through the cache:
+        // test/link_input/macos_cache.sh.
+        const inputs = b.addSystemCommand(&.{"sh"});
+        inputs.setName("bs build-exe with link inputs, cached, on aarch64-macos");
+        inputs.addFileArg(b.path("test/link_input/macos_cache.sh"));
+        inputs.addArtifactArg(exe);
+        inputs.addArg(upstreamZig(b));
+        inputs.addDirectoryArg(b.path("test/link_input"));
+        _ = inputs.addOutputDirectoryArg("work");
+        inputs.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &inputs.step, 30);
+        test_step.dependOn(&inputs.step);
     }
     addDiagTests(b, exe, test_step, upstream_step, std_zir);
     const build_test_step = addBuildTest(b, exe, build_web_wasm, translate_c);

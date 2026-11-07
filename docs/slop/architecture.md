@@ -966,10 +966,26 @@ comptime arguments are run-time values in the lowered code (uucode's
   inputs, `link_shared`), the minimum macOS and the SDK version from the
   compilation's key (`--bs-macos-sdk` for a named target), and the
   rpaths, stack size and `-fstrip` from the command. A relink signs the
-  new file and rewrites the dSYM as every Mach-O link does. Builds with
-  object, archive or C inputs replay eagerly and link through
-  `Emit.link`, and objects and static libraries answer from their inputs
-  record (`InputsRecord`), as -fPIC builds do
+  new file and rewrites the dSYM as every Mach-O link does. Executables
+  with object, archive or C inputs relink as ELF's do (2026-11-07):
+  `Incremental.linkWithInputs` converts the objects again with
+  `MachOInput` instead of `ElfInput` (one generic `linkWithObjects`,
+  `sameObjectRequests` and `reboundSlots` over either), every name
+  nothing defines is a library's import, as `Emit.exportTarget` and
+  `Emit.InputResolver.importSym` make it, `--force_undefined` names drop
+  their `_` and must name a Zig export or an object's definition, a C
+  `main` inside its section's atom gets its entry alias
+  (`Emit.entry_alias_key`) again, and a keyed `MachO.linkInput` takes the
+  objects' local symbols and compact unwind. The imports keep the
+  manifest's order, which numbers them: the Zig code's, by name, then
+  those only the objects ask for, in the order they asked
+  (`Emit.finish`); changed objects reorder that tail by their new
+  requests. Plain C (`Incremental.libc_first`: C sources and no object
+  arguments, which may bind libSystem before compiler_rt,
+  `Emit.libc_first`) still builds. test/link_input/macos_cache.sh checks
+  every relink's bytes and dSYM against a build without the cache.
+  Objects and static libraries answer from their inputs record
+  (`InputsRecord`), as -fPIC builds do
   (docs/slop/cache-scope-macos-pic.md).
   Each function keeps a frame record (`stp x29, x30, [sp, #-16]!; mov
   x29, sp`), so compact unwind's frame mode covers it, and addresses its

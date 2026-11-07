@@ -40,6 +40,7 @@ const Glibc = @import("link/Glibc.zig");
 const Archive = @import("link/Archive.zig");
 const ElfMerge = @import("link/ElfMerge.zig");
 const ElfInput = @import("link/ElfInput.zig");
+const MachOInput = @import("link/MachOInput.zig");
 const ElfShared = @import("link/ElfShared.zig");
 const MachO = @import("link/MachO.zig");
 const MachODylib = @import("link/MachODylib.zig");
@@ -177,6 +178,14 @@ lld: bool = false,
 rdynamic: bool = false,
 /// `Emit.force_undefined`.
 force_undefined: []const []const u8 = &.{},
+/// `--entry`: the entry point's name (`Emit.entry_name`), which an object
+/// may define.
+entry_name: ?[]const u8 = null,
+/// An executable that may resolve libc's names before compiler_rt's
+/// (`Emit.libc_first`): C sources alone, with no object inputs, a
+/// superset of `main.plainC`'s. An aarch64-macos relink with objects
+/// leaves it to a build, as it would need libSystem's exports.
+libc_first: bool = false,
 /// Whether a build that does not relink renews the output's mtime, as a
 /// relink would: `bs run`'s programs are trimmed by it.
 renew_output: bool = false,
@@ -652,7 +661,14 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    if (inc.macos != null) return inc.linkMachO(arena, m, &input, in, values.items, imports.items, out_dir, sub_path, cwd, gathered, checked);
+    if (inc.macos != null) {
+        if (inc.output == .exe and inc.link_objects.len != 0) {
+            var maps: std.ArrayList(Io.File.MemoryMap) = .empty;
+            defer for (maps.items) |*mm| mm.destroy(io);
+            return inc.linkWithInputs(arena, &maps, m, &input, in.numbered, exports.items, imports.items, null, &.{}, out_dir, sub_path, cwd, gathered);
+        }
+        return inc.linkMachO(arena, m, &input, in, values.items, imports.items, out_dir, sub_path, cwd, gathered, checked);
+    }
     var glibc_loaded: ?Glibc = null;
     defer if (glibc_loaded) |*g| g.deinit();
     var dynamic: ElfDynamic.Options = .{};
@@ -776,7 +792,7 @@ fn linkMachO(
     input: *Pack.LinkAtoms,
     in: Manifest.LinkInput,
     values: []const Elf.NumberedValue,
-    elf_imports: []const ElfObject.Import,
+    elf_imports: []ElfObject.Import,
     out_dir: Io.Dir,
     sub_path: []const u8,
     cwd: []const u8,
@@ -787,26 +803,16 @@ fn linkMachO(
     const io = inc.io;
     const macos = inc.macos.?;
     if (inc.output != .exe) return inc.noLink("an aarch64-macos {t} is not relinked yet", .{inc.output});
-    if (inc.link_objects.len != 0) return inc.noLink("aarch64-macos object inputs are not relinked yet", .{});
-    const libs_in = inc.macho_libs orelse if (inc.macho_libs_loader) |l| l.load(l.ctx, arena) catch |err|
-        return inc.noLink("the libraries: {t}", .{err}) else &.{};
-    // In `Emit.finish`'s order, by name.
-    const imports = try arena.alloc(MachO.Import, elf_imports.len);
-    for (imports, elf_imports) |*imp, e| imp.* = .{ .key = e.key, .name = e.name };
-    std.mem.sortUnstable(MachO.Import, imports, {}, struct {
-        fn lessThan(_: void, a: MachO.Import, b: MachO.Import) bool {
+    // In `Emit.finish`'s order: by name, without objects.
+    std.mem.sortUnstable(ElfObject.Import, elf_imports, {}, struct {
+        fn lessThan(_: void, a: ElfObject.Import, b: ElfObject.Import) bool {
             return std.mem.order(u8, a.name, b.name) == .lt;
         }
     }.lessThan);
-    const libs = try Emit.bindMachOImports(arena, libs_in, imports);
+    const imports, const libs = try inc.machoImports(arena, elf_imports) orelse return null;
     const import_numbers = try arena.alloc(u32, imports.len);
     for (import_numbers, imports) |*n, imp| n.* = m.symbol(@backingInt(imp.key)) orelse
         return inc.noLink("import '{s}' has no symbol number", .{imp.name});
-    var rpaths: std.ArrayList([]const u8) = .empty;
-    if (inc.runpath) |r| {
-        var it = std.mem.splitScalar(u8, r, ':');
-        while (it.next()) |p| try rpaths.append(arena, p);
-    }
     const aliases = try externAliases(arena, m, WithInputs{ .pack = input, .extra = &.{}, .overrides = &.empty }, in.numbered) orelse
         return inc.noLink("an extern slot's atom record is damaged", .{});
     const numbered_aliases = try arena.alloc(Elf.NumberedAlias, aliases.len);
@@ -818,7 +824,7 @@ fn linkMachO(
     MachO.linkInput(gpa, io, out_dir, sub_path, input.*, .{
         .entry = @fromBackingInt(m.entry),
         .libs = libs,
-        .rpaths = rpaths.items,
+        .rpaths = try inc.machoRpaths(arena),
         .imports = imports,
         .aliases = aliases,
         .min_os = macos.min,
@@ -847,6 +853,31 @@ fn linkMachO(
     inc.noteOutput(out_dir, sub_path);
     if (input.trusted == null) inc.noteBaseChecked(checked);
     return .{ .atoms = in.refs.len, .gathered = gathered };
+}
+
+/// The imports `elf_imports` as an aarch64-macos link takes them, in the
+/// same order, which numbers them, each bound to its library as
+/// `Emit.link` binds it, and the libraries they bind to; null after
+/// saying why if the libraries cannot be loaded.
+fn machoImports(inc: *const Incremental, arena: Allocator, elf_imports: []const ElfObject.Import) !?struct { []MachO.Import, []const MachO.Lib } {
+    const libs_in = inc.macho_libs orelse if (inc.macho_libs_loader) |l| l.load(l.ctx, arena) catch |err| {
+        _ = inc.noRelink("the libraries: {t}", .{err});
+        return null;
+    } else &.{};
+    const imports = try arena.alloc(MachO.Import, elf_imports.len);
+    for (imports, elf_imports) |*imp, e| imp.* = .{ .key = e.key, .name = e.name };
+    return .{ imports, try Emit.bindMachOImports(arena, libs_in, imports) };
+}
+
+/// The LC_RPATHs of an aarch64-macos link (`runpath`, as `Emit.link`
+/// splits it).
+fn machoRpaths(inc: *const Incremental, arena: Allocator) ![]const []const u8 {
+    var rpaths: std.ArrayList([]const u8) = .empty;
+    if (inc.runpath) |r| {
+        var it = std.mem.splitScalar(u8, r, ':');
+        while (it.next()) |p| try rpaths.append(arena, p);
+    }
+    return rpaths.items;
 }
 
 /// Maps link input `path` into `maps`, its pages read ahead if `populate`,
@@ -938,13 +969,47 @@ fn linkWithInputs(
     cwd: []const u8,
     gathered: Io.Timestamp,
 ) !?Linked {
+    if (inc.macos != null) {
+        var objects: MachOInput = .{ .arena = arena };
+        return inc.linkWithObjects(&objects, arena, maps, m, pack_atoms, numbered, exports, imports, glibc, shared, out_dir, sub_path, cwd, gathered);
+    }
+    var objects: ElfInput = .{ .arena = arena, .dynamic = glibc != null, .shared_libs = shared, .lld = inc.lld, .arch = inc.arch };
+    return inc.linkWithObjects(&objects, arena, maps, m, pack_atoms, numbered, exports, imports, glibc, shared, out_dir, sub_path, cwd, gathered);
+}
+
+/// `linkWithInputs` with the objects in `objects`, an empty `ElfInput` or
+/// `MachOInput`: the two link the objects the same way, through
+/// `Emit.InputResolver`'s rules, apart from where a name nothing defines
+/// goes (glibc's or a shared library's on ELF; on aarch64-macos, every
+/// name is a library's, as `Emit.exportTarget` imports it) and the
+/// linker.
+fn linkWithObjects(
+    inc: *Incremental,
+    objects: anytype,
+    arena: Allocator,
+    maps: *std.ArrayList(Io.File.MemoryMap),
+    m: *Manifest,
+    pack_atoms: *const Pack.LinkAtoms,
+    numbered: []const Elf.NumberedAtom,
+    exports: []const ElfObject.Export,
+    imports: []ElfObject.Import,
+    glibc: ?*const Glibc,
+    shared: []const ElfShared,
+    out_dir: Io.Dir,
+    sub_path: []const u8,
+    cwd: []const u8,
+    gathered: Io.Timestamp,
+) !?Linked {
     const gpa = inc.gpa;
     const io = inc.io;
-    var objects: ElfInput = .{ .arena = arena, .dynamic = glibc != null, .shared_libs = shared, .lld = inc.lld, .arch = inc.arch };
+    const macho = @TypeOf(objects.*) == MachOInput;
+    // Plain C resolves libc's names before compiler_rt's from libSystem's
+    // exports (`Emit.libc_first`), which the relink does not load.
+    if (macho and inc.libc_first) return inc.noLink("plain C on aarch64-macos binds libSystem first", .{});
     for (inc.link_objects, 0..) |path, n| {
         const bytes = try inc.mapInput(arena, maps, path, true) orelse return null;
         const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");
-        (if (is_archive) objects.addArchive(path, bytes, n >= inc.link_runtime_from) else objects.addObject(path, bytes)) catch |err| switch (err) {
+        (if (!is_archive) objects.addObject(path, bytes) else if (macho) objects.addArchive(path, bytes) else objects.addArchive(path, bytes, n >= inc.link_runtime_from)) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             else => return inc.noLink("{s}: {t}", .{ path, err }),
         };
@@ -962,6 +1027,8 @@ fn linkWithInputs(
         requested_imports: *std.array_hash_map.Auto(Atom.SymbolKey, void),
         /// `Incremental.lld`, for `weakImport`.
         lld: bool,
+        /// aarch64-macos, where every name is a library's (`importSym`).
+        macho: bool,
 
         const Self = @This();
         pub fn zigExport(r: Self, name: []const u8) !?Atom.SymbolKey {
@@ -977,6 +1044,10 @@ fn linkWithInputs(
 
         pub fn importSym(r: Self, name: []const u8, weak: bool) !?Atom.SymbolKey {
             _ = weak;
+            if (r.macho) {
+                try r.requested_imports.put(r.arena, Emit.importKey(name), {});
+                return Emit.importKey(name);
+            }
             const g = r.glibc orelse return null;
             if (Glibc.sharedSymbol(r.shared, name) == null and g.get(name) == null) return null;
             try r.requested_imports.put(r.arena, Emit.importKey(name), {});
@@ -1015,6 +1086,7 @@ fn linkWithInputs(
         .arena = arena,
         .requested_imports = &requested_imports,
         .lld = inc.lld,
+        .macho = macho,
     };
     // The archive members the Zig code's externs pull: those of the
     // linked nodes and the link's own atoms.
@@ -1024,19 +1096,49 @@ fn linkWithInputs(
         if (m.node(i).tag != @backingInt(Tag.link) and (m.atoms(i).len == 0 or m.flags(i).unlinked)) continue;
         for (m.nodeRefs(i)) |ref| if (ref.kind == .ext or ref.kind == .ext_weak) try externs.put(arena, m.refName(ref.value), {});
     }
-    for (inc.force_undefined) |name| try externs.put(arena, name, {});
+    // On aarch64-macos, `--force_undefined` names Darwin's symbol, with
+    // its underscore (`Emit.forcedName`); one that names nothing the Zig
+    // code or the objects define is left to a build to bind or report.
+    for (inc.force_undefined) |arg| {
+        const name = if (!macho) arg else if (arg.len > 1 and arg[0] == '_') arg[1..] else return inc.noLink("--force_undefined {s} names no Darwin symbol", .{arg});
+        try externs.put(arena, name, {});
+    }
     _ = try objects.pull(externs.keys(), resolver);
     const converted = try objects.convert(resolver);
     if (objects.errors.items.len != 0) return inc.noLink("{s}", .{objects.errors.items[0]});
+    if (macho) for (inc.force_undefined) |arg| {
+        const name = arg[1..];
+        if (export_keys.get(name) == null and !objects.defs.contains(name) and !objects.commons.contains(name))
+            return inc.noLink("--force_undefined {s}: neither the Zig code nor the objects define it", .{arg});
+    };
     var overrides: std.AutoHashMapUnmanaged(usize, Atom) = .empty;
+    // The manifest's imports are in the last build's order (`Emit.finish`):
+    // the Zig code's, then those only the objects ask for, in the order
+    // they asked. Changed objects may ask in another order, which an
+    // aarch64-macos link's import ordinals follow.
+    var link_imports = imports;
     if (inc.objects_changed) {
         // A damaged pack record (`LinkAtoms.check`): build from scratch.
-        const same = sameObjectRequests(arena, m, pack_atoms, &live, &objects, &requested_imports) catch |err| switch (err) {
+        const objects_only = sameObjectRequests(arena, m, pack_atoms, &live, objects, &requested_imports) catch |err| switch (err) {
             error.InvalidInput => return inc.noLink("{t}", .{err}),
             else => |e| return e,
-        };
-        if (!same) return inc.noLink("the changed objects need other compiler_rt functions or imports than the last build's", .{});
-        const rebound = reboundSlots(arena, m, pack_atoms, numbered, &live, &objects, &export_keys, imports, glibc, shared) catch |err| switch (err) {
+        } orelse return inc.noLink("the changed objects need other compiler_rt functions or imports than the last build's", .{});
+        if (macho) {
+            link_imports = try arena.alloc(ElfObject.Import, imports.len);
+            var n: usize = 0;
+            for (imports) |imp| if (!objects_only.contains(imp.key)) {
+                link_imports[n] = imp;
+                n += 1;
+            };
+            for (requested_imports.keys()) |key| if (objects_only.contains(key)) {
+                for (imports) |imp| if (imp.key == key) {
+                    link_imports[n] = imp;
+                    n += 1;
+                };
+            };
+            if (n != imports.len) return inc.noLink("the manifest's imports do not match the objects' requests", .{});
+        }
+        const rebound = reboundSlots(arena, m, pack_atoms, numbered, &live, objects, &export_keys, imports, glibc, shared) catch |err| switch (err) {
             error.InvalidInput => return inc.noLink("{t}", .{err}),
             else => |e| return e,
         };
@@ -1089,6 +1191,36 @@ fn linkWithInputs(
     const aliases = try externAliases(arena, m, WithInputs{ .pack = pack_atoms, .extra = &.{}, .overrides = &overrides }, numbered) orelse
         return inc.noLink("an extern slot's atom record is damaged", .{});
     var diag: Elf.Diagnostic = .{};
+    const with_inputs: WithInputs = .{ .pack = pack_atoms, .extra = extra.items, .overrides = &overrides };
+    if (macho) {
+        const macho_imports, const libs = try inc.machoImports(arena, link_imports) orelse return null;
+        // An entry C defines inside its section's atom is at an alias
+        // (`Emit.finish`).
+        const entry: Atom.SymbolKey = @fromBackingInt(m.entry);
+        const all_aliases = if (entry != Emit.entry_alias_key) aliases else a: {
+            const t = try objects.lookup(inc.entry_name orelse "main") orelse return inc.noLink("the objects no longer define the entry point", .{});
+            break :a try std.mem.concat(arena, Emit.Alias, &.{ aliases, &.{.{ .key = entry, .target = t.key, .addend = @intCast(t.offset) }} });
+        };
+        const macos = inc.macos.?;
+        MachO.linkInput(gpa, io, out_dir, sub_path, with_inputs, .{
+            .entry = entry,
+            .libs = libs,
+            .rpaths = try inc.machoRpaths(arena),
+            .imports = macho_imports,
+            .values = values.items,
+            .aliases = all_aliases,
+            .min_os = macos.min,
+            .sdk = macos.sdk,
+            .stack_size = inc.stack_size,
+            .comp_dir = cwd,
+            .diag = &diag,
+            .local_symbols = converted.symbols,
+            .unwind = converted.unwind,
+        }) catch |err| return inc.linkFailed(err, diag);
+        inc.noteOutput(out_dir, sub_path);
+        if (pack_atoms.trusted == null) inc.noteBaseChecked(.{ m.id, m.pack_id });
+        return .{ .atoms = numbered.len + extra.items.len, .gathered = gathered };
+    }
     const options: Elf.Options = .{
         .entry = @fromBackingInt(m.entry),
         .arch = inc.arch,
@@ -1102,15 +1234,7 @@ fn linkWithInputs(
         .aliases = aliases,
         .dynamic = if (glibc != null) &dynamic else null,
     };
-    Elf.linkInput(gpa, io, out_dir, sub_path, WithInputs{ .pack = pack_atoms, .extra = extra.items, .overrides = &overrides }, options) catch |err| switch (err) {
-        // A damaged pack or manifest, or objects that no longer fit it:
-        // a build reports what is wrong.
-        error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo, error.UndefinedSymbol, error.DuplicateSymbol, error.InvalidRelocation, error.RelocationOverflow, error.AlignmentTooLarge => return inc.noLink("{t} (atom '{s}')", .{ err, diag.atom }),
-        else => {
-            std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
-            return err;
-        },
-    };
+    Elf.linkInput(gpa, io, out_dir, sub_path, with_inputs, options) catch |err| return inc.linkFailed(err, diag);
     inc.noteOutput(out_dir, sub_path);
     if (pack_atoms.trusted == null) inc.noteBaseChecked(.{ m.id, m.pack_id });
     return .{ .atoms = numbered.len + extra.items.len, .gathered = gathered };
@@ -1121,15 +1245,16 @@ fn linkWithInputs(
 /// `Emit.InputResolver`): the manifest's imports and live compiler_rt
 /// functions that no linked Zig atom references, which stay either way. More would need
 /// what the last build did not generate; fewer would keep what a full
-/// build drops, and the manifest would go on recording them.
+/// build drops, and the manifest would go on recording them. Returns
+/// those, or null if the new objects ask for others.
 fn sameObjectRequests(
     arena: Allocator,
     m: *const Manifest,
     pack_atoms: *const Pack.LinkAtoms,
     live: *const std.bit_set.Dynamic,
-    objects: *const ElfInput,
+    objects: anytype,
     requested_imports: *const std.array_hash_map.Auto(Atom.SymbolKey, void),
-) !bool {
+) !?std.array_hash_map.Auto(Atom.SymbolKey, void) {
     // What the last build's objects asked for: the imports and the live
     // compiler_rt functions, less those the Zig code needs (struck below).
     var old: std.array_hash_map.Auto(Atom.SymbolKey, void) = .empty;
@@ -1177,9 +1302,9 @@ fn sameObjectRequests(
             _ = new.swapRemove(key);
         }
     }
-    if (old.count() != new.count()) return false;
-    for (old.keys()) |key| if (!new.contains(key)) return false;
-    return true;
+    if (old.count() != new.count()) return null;
+    for (old.keys()) |key| if (!new.contains(key)) return null;
+    return old;
 }
 
 /// The Zig code's extern slots bound again against changed link objects,
@@ -1199,7 +1324,7 @@ fn reboundSlots(
     pack_atoms: *const Pack.LinkAtoms,
     numbered: []const Elf.NumberedAtom,
     live: *const std.bit_set.Dynamic,
-    objects: *ElfInput,
+    objects: anytype,
     export_keys: *const std.StringHashMapUnmanaged(Atom.SymbolKey),
     imports: []const ElfObject.Import,
     glibc: ?*const Glibc,
@@ -1232,6 +1357,8 @@ fn reboundSlots(
                 var buf: [128]u8 = undefined;
                 break :t .{ .key = .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl)) };
             }
+            // On aarch64-macos every other name is a library's.
+            if (@TypeOf(objects.*) == MachOInput) break :t .{ .key = Emit.importKey(name) };
             if (glibc) |g| if (Glibc.sharedSymbol(shared, name) != null or g.get(name) != null) break :t .{ .key = Emit.importKey(name) };
             break :t null;
         };
@@ -1255,7 +1382,8 @@ fn reboundSlots(
         }
         var b = a;
         b.targets = try arena.dupe(Atom.SymbolKey, &.{t.key});
-        b.relocs = try arena.dupe(Atom.Reloc, &.{.init(0, if (objects.arch == .aarch64) .aarch64_abs64 else .x86_64_abs64, 0, addend)});
+        const arch: Atom.Unwind.Arch = if (@TypeOf(objects.*) == MachOInput) .aarch64 else objects.arch;
+        b.relocs = try arena.dupe(Atom.Reloc, &.{.init(0, if (arch == .aarch64) .aarch64_abs64 else .x86_64_abs64, 0, addend)});
         try overrides.put(arena, i, b);
     }
     return overrides;
@@ -1302,6 +1430,19 @@ const WithInputs = struct {
     }
 };
 
+/// A link with object inputs that failed: null, saying why, if the pack
+/// or the manifest is damaged or the objects no longer fit it, which a
+/// build then reports.
+fn linkFailed(inc: *const Incremental, err: anyerror, diag: Elf.Diagnostic) anyerror!?Linked {
+    switch (err) {
+        error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo, error.UndefinedSymbol, error.DuplicateSymbol, error.InvalidRelocation, error.RelocationOverflow, error.AlignmentTooLarge => return inc.noLink("{t} (atom '{s}')", .{ err, diag.atom }),
+        else => {
+            std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
+            return err;
+        },
+    }
+}
+
 fn noLink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) ?Linked {
     _ = inc.noRelink(fmt, args);
     return null;
@@ -1329,8 +1470,7 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     // paths. A donor's build is lazy only where `Replay.donorEager` allows;
     // its log then follows the donor's manifest (`finishLazy`).
     const has_inputs = inc.link_objects.len + inc.link_shared.len != 0;
-    // An aarch64-macos relink takes no objects yet (`linkMachO`).
-    const lazy = !std.mem.eql(u8, mode, "eager") and !(inc.macos != null and inc.link_objects.len != 0) and
+    const lazy = !std.mem.eql(u8, mode, "eager") and
         (!has_inputs or (!inc.link_objects_pending and if (inc.donor == null) !try inc.linkInputsChanged(m) else try inc.donorSharesLinkInputs(m)));
     const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy, inc.donor != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

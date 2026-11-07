@@ -709,6 +709,8 @@ pub const Job = struct {
         i.lld = job.opts.c_root;
         i.rdynamic = job.opts.rdynamic;
         i.force_undefined = job.opts.force_undefined;
+        i.entry_name = job.opts.entry;
+        i.libc_first = job.opts.c_root and job.opts.link_inputs.len == 0;
         if (job.opts.link_libc and !job.opts.pic) {
             i.glibc_version = job.opts.glibc_version;
             i.glibc_lib_dir = job.zig_lib_dir;

@@ -1508,9 +1508,8 @@ pub fn finish(emit: *Emit) !bool {
         inline else => |p| if (try p.lookup(entry_name)) |t| Def{ .key = t.key, .offset = t.offset } else null,
     }) |t| {
         if (t.offset == 0) entry = t.key else {
-            const key: SymbolKey = .fromName("bs.entry");
-            try emit.aliases.append(emit.gpa, .{ .key = key, .target = t.key, .addend = @intCast(t.offset) });
-            entry = key;
+            try emit.aliases.append(emit.gpa, .{ .key = entry_alias_key, .target = t.key, .addend = @intCast(t.offset) });
+            entry = entry_alias_key;
         }
     };
     emit.entry = entry;
@@ -2136,6 +2135,10 @@ fn lowerExternSlots(emit: *Emit) !bool {
 }
 
 pub const ExternTarget = struct { key: SymbolKey, addend: i64 = 0 };
+
+/// The entry point's alias when an object defines it inside its
+/// section's atom (`finish`).
+pub const entry_alias_key: SymbolKey = .fromName("bs.entry");
 
 /// Where the link binds external symbol `name`, or null if nothing
 /// defines it: the compilation's export, an input object's definition
