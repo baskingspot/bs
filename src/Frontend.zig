@@ -24,6 +24,8 @@ const Ast = std.zig.Ast;
 const Zir = std.zig.Zir;
 const AstGen = std.zig.AstGen;
 const assert = std.debug.assert;
+const LintConfig = @import("lint/Config.zig");
+const Linter = @import("lint/Linter.zig");
 
 const Frontend = @This();
 
@@ -49,6 +51,10 @@ modules: std.ArrayList(Module) = .empty,
 zon_imports: std.ArrayList(ZonImport) = .empty,
 /// The module whose tests `bs test` runs; `root` outside of tests.
 main_module: Module.Index = .root,
+/// The project's `.ziglint.zon`, if it has one: the files it covers that
+/// this build lowers get their lint findings from the same syntax tree
+/// (`lintFindings`).
+lint: ?*const LintConfig = null,
 /// `Options.root_name`: what `displayName` calls `main_module`.
 root_name: []const u8 = "root",
 /// See `Options.load_std`.
@@ -169,6 +175,8 @@ pub const File = struct {
     /// `Frontend.source`.
     syntax: ?Syntax,
     syntax_mutex: Io.Mutex = .init,
+    /// `Linter.encode`d findings, made while lowering a covered file.
+    lint_facts: ?[]const u8 = null,
 
     pub const Index = enum(u32) { _ };
 };
@@ -427,6 +435,7 @@ fn freeFile(gpa: Allocator, io: Io, f: *File) void {
         s.tree.deinit(gpa);
         gpa.free(s.source);
     }
+    if (f.lint_facts) |b| gpa.free(b);
     gpa.free(f.sub_path);
     gpa.free(f.display_path);
 }
@@ -518,6 +527,56 @@ pub fn familyModule(fe: *const Frontend, from: Module.Index, name: []const u8) ?
     if (std.mem.eql(u8, name, "root")) return m.root_mod;
     if (std.mem.eql(u8, name, "builtin")) return m.builtin_mod;
     return null;
+}
+
+/// The absolute path of file `f`, as the lint config's paths are.
+pub fn absPath(fe: *const Frontend, arena: Allocator, f: *const File) ![]const u8 {
+    const mod = fe.module(f.module);
+    return Io.Dir.path.join(arena, &.{ mod.abs_root_dir orelse mod.root_dir, f.sub_path });
+}
+
+/// Whether file `index` is one the lint config covers.
+pub fn lintCovers(fe: *const Frontend, arena: Allocator, index: File.Index) !bool {
+    const cfg = fe.lint orelse return false;
+    return cfg.covers(try fe.absPath(arena, &fe.files.items[@backingInt(index)]));
+}
+
+/// The syntax pass's findings (`Linter.run`) in covered file `index`, in
+/// `arena`: made while lowering it, else from the cache, which keeps them
+/// by the file's content and name, else from its syntax tree, parsed
+/// again. None for a file that does not parse, whose parse errors the
+/// build reports.
+pub fn lintFindings(fe: *const Frontend, arena: Allocator, index: File.Index) ![]const Linter.Diagnostic {
+    const f = &fe.files.items[@backingInt(index)];
+    if (f.lint_facts) |b| return (try Linter.decode(arena, b)).?;
+    const name = lintFactsName(f);
+    if (fe.blobCache()) |blobs| if (blobs.loadLintFacts(arena, fe.io, name)) |bytes| {
+        if (try Linter.decode(arena, bytes)) |findings| return findings;
+    };
+    const syntax = try fe.syntaxOf(index);
+    if (syntax.tree.errors.len != 0) return &.{};
+    const findings = Linter.run(arena, syntax.source, syntax.tree, f.sub_path);
+    if (fe.blobCache()) |blobs| blobs.saveLintFacts(fe.io, name, try Linter.encode(arena, findings));
+    return findings;
+}
+
+/// What file `f`'s lint findings depend on: its contents, its base name
+/// (Z009, Z012, Z021) and the rules (`Linter.version`).
+pub fn lintKey(f: *const File) Hash {
+    var h: std.crypto.hash.Blake3 = .init(.{});
+    h.update(Linter.facts_magic);
+    h.update(&std.mem.toBytes(Linter.version));
+    h.update(&f.content_hash);
+    h.update(Io.Dir.path.basename(f.sub_path));
+    var out: Hash = undefined;
+    h.final(&out);
+    return out;
+}
+
+/// The cache file name of file `f`'s lint findings: 32 hex digits, so
+/// that the store's maintenance trims it with the ZIR (`Store.maintain`).
+fn lintFactsName(f: *const File) [32]u8 {
+    return std.fmt.bytesToHex(lintKey(f), .lower);
 }
 
 /// The syntax tree of a file, read and parsed again on first use. For error
@@ -950,6 +1009,26 @@ const CacheDir = struct {
             .has_errors = header.flags.has_errors,
             .names = buf.items[layout.summary..][0..header.summary_len],
         } };
+    }
+
+    /// Lint findings saved by `saveLintFacts`, renewed as `loadZir`
+    /// renews ZIR; null if there are none.
+    fn loadLintFacts(cd: *const CacheDir, arena: Allocator, io: Io, name: [32]u8) ?[]const u8 {
+        const f = cd.dir.openFile(io, &name, .{}) catch return null;
+        defer f.close(io);
+        const stat = f.stat(io) catch return null;
+        if (stat.mtime.toNanoseconds() < cd.renew_before_ns) f.setTimestampsNow(io) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
+        const bytes = arena.alloc(u8, stat.size) catch return null;
+        if ((f.readPositionalAll(io, bytes, 0) catch return null) != bytes.len) return null;
+        return bytes;
+    }
+
+    /// Best effort: without it, a later build parses the file again.
+    fn saveLintFacts(cd: *const CacheDir, io: Io, name: [32]u8, bytes: []const u8) void {
+        var af = cd.dir.createFileAtomic(io, &name, .{}) catch return;
+        defer af.deinit(io);
+        af.file.writePositionalAll(io, bytes, 0) catch return;
+        af.link(io) catch {}; // ziglint-ignore: Z026 -- another build wrote the same findings, or it is best effort
     }
 
     fn saveZir(cd: *const CacheDir, gpa: Allocator, io: Io, hash: Hash, zir: *const Zir, summary: Summary) !void {
@@ -1747,6 +1826,10 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
     const zir = try AstGen.generate(arena, ast);
     const summary: Summary = try .of(arena, &zir);
     job.how = .lowered;
+    if (fe.lint) |cfg| if (ast.errors.len == 0 and cfg.covers(try fe.absPath(arena, f))) {
+        f.lint_facts = try Linter.encode(gpa, Linter.run(arena, src, ast, f.sub_path));
+        if (cache != null) fe.blobCache().?.saveLintFacts(io, lintFactsName(f), f.lint_facts.?);
+    };
     if (cache != null) {
         const blobs = fe.blobCache().?;
         if (blobs.saveZir(gpa, io, f.content_hash, &zir, summary)) |_| {

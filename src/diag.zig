@@ -96,6 +96,11 @@ pub const Code = enum(u16) {
     // The linkers.
     @"branch-range",
     @"version-script",
+    // ziglint's rules, with a project's `.ziglint.zon` (`lint/`): the
+    // rule's ID is in `Diagnostic.rule`.
+    style,
+    deprecated,
+    @"lint-config",
 };
 
 /// A location, resolved for rendering.
@@ -137,6 +142,9 @@ pub const CallKind = enum { @"inline", @"comptime", generic };
 
 pub const Diagnostic = struct {
     code: Code = .unclassified,
+    /// The ziglint rule (`Z026`) of a `style` or `deprecated` finding,
+    /// shown with the code: `error[style, Z026]`.
+    rule: ?[]const u8 = null,
     loc: ?Loc,
     msg: []const u8,
     /// Identical messages counted together (ErrorBundle's `count`).
@@ -773,7 +781,9 @@ pub fn toBundle(wip: *std.zig.ErrorBundle.Wip, diags: []const Diagnostic, ref_li
         if (d.refs.len != 0) traced = true;
         const shown = @min(limit, d.refs.len);
         const hidden = d.refs.len - shown;
-        const msg = if (d.code == .unclassified)
+        const msg = if (d.rule) |r|
+            try wip.printString("[{t} {s}] {s}", .{ d.code, r, d.msg })
+        else if (d.code == .unclassified)
             try wip.addString(d.msg)
         else
             try wip.printString("[{t}] {s}", .{ d.code, d.msg });
@@ -870,7 +880,7 @@ const max_source_line = 160;
 fn renderText(w: *Writer, d: Diagnostic) Writer.Error!void {
     if (d.loc) |l| try w.print("{s}:{d}:{d}: ", .{ l.path, l.line, l.col });
     try w.writeAll("error");
-    if (d.code != .unclassified) try w.print("[{t}]", .{d.code});
+    if (d.rule) |r| try w.print("[{t}, {s}]", .{ d.code, r }) else if (d.code != .unclassified) try w.print("[{t}]", .{d.code});
     try w.print(": {s}", .{d.msg});
     if (d.count > 1) try w.print(" ({d} times)", .{d.count});
     try w.writeByte('\n');
@@ -1013,6 +1023,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
     }
     const obj: struct {
         code: ?Code,
+        rule: ?[]const u8,
         file: ?[]const u8 = null,
         line: ?u32 = null,
         col: ?u32 = null,
@@ -1028,6 +1039,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
         ref: ?[]const JsonRef,
     } = .{
         .code = if (d.code == .unclassified) null else d.code,
+        .rule = d.rule,
         .file = if (d.loc) |l| l.path else null,
         .line = if (d.loc) |l| l.line else null,
         .col = if (d.loc) |l| l.col else null,

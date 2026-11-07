@@ -1,8 +1,10 @@
 # ziglint's rules as bs compile errors
 
 Status: approved by the owner (2026-11-07), with the decisions listed
-at the end. Written from main 457f2c4 and ziglint v0.8.1
-(rockorager/ziglint f6a3fc2).
+at the end; being built. Written from main 457f2c4 and ziglint v0.8.1
+(rockorager/ziglint f6a3fc2). What is built, and where it departs from
+this note, is in docs/slop/architecture.md ("ziglint's rules as compile
+errors") and in "Built so far" below.
 
 The owner's request: bs reads `.ziglint.zon` and enforces ziglint's
 rules as compile errors. There is no escape hatch: no flag or environment
@@ -116,11 +118,17 @@ same bytes can live under two names. So the pass records:
   - for Z021, the top-level `@This()` aliases;
   - for Z012 and Z015, the type names a `pub fn` signature names, which
     are compared with the file stem.
+
+  (As built, the facts are keyed by the file's base name as well as its
+  contents, so the pass computes these rules itself. Two files with the
+  same contents and different names are rare.)
 - The ignore table: for each line that an ignore comment covers, the set
   of rule IDs it names. The table is built from the raw source with
   ziglint's exact rule: the line itself, plus the run of `//` lines
   directly above it, stopping at the first other line. It is empty for a
   file without the text `ziglint-ignore`, which one `memmem` decides.
+  (As built, the pass applies it to its own findings, since both depend
+  only on the contents; the table is for the Sema rules' findings.)
 - The per-file inputs of the Sema rules that read syntax. These are the
   syntactic verdicts of the hybrid rules (below), and the root-level path
   aliases Z035 matches against. One rule reads doc comments: a
@@ -129,7 +137,9 @@ same bytes can live under two names. So the pass records:
 Facts go in `<global cache>/bs/zir/<hash>.lint`, beside the ZIR file
 with the same content hash. They follow the same mtime renewal and the
 same trimming and superseding rules. A lint version salts the name, so a
-new rule invalidates facts and not ZIR.
+new rule invalidates facts and not ZIR. (As built, the name is 32 hex
+digits of a hash of the contents, the base name and the lint version,
+which the store's maintenance trims with the ZIR.)
 
 When the pass runs:
 
@@ -286,6 +296,8 @@ its own directory.
   happens once per compilation.
 - Under `bs build`, each compile step does the same from its root
   module's file. The root package's steps find the build root's config.
+  The configure script's root file is in the zig lib directory, so it
+  starts from its `@build` module, the project's `build.zig`.
 - A step whose root file is in a dependency (in the global package cache
   `<global cache>/p/`, or in the project's `zig-pkg/` directory where
   0.17 fetches packages) finds none, because discovery never reads a
@@ -359,6 +371,19 @@ key, so editing it never makes a cold build.
   change. It never relinks the last good output while findings remain.
 - `BS_CACHE_CHECK` compares replayed findings with a fresh build's,
   byte for byte, as it does for errors.
+
+**As built in the first branch.** Failing builds still record nothing
+(Diagnostics, "Errors and the cache", step 6 is not built), so the
+manifest never holds a build with findings. The config's part is a file
+of its own, `<compilation dir>/lint`, rather than manifest inputs and
+absent probes: discovery runs on every build (a few `access` calls), and
+the file holds a hash of the config, the paths' `.gitignore`s, and the
+covered files' lint keys after a successful build. A config whose hash
+differs turns off the no-change skips, so adding, editing or removing a
+config builds and reports. A listed file had no findings under the same
+config, so an edit build reads the facts of the edited files alone. The
+coverage comparison above (re-analyzing only the files that join
+coverage) matters only for the Sema rules, and comes with them.
 
 ## 3. What a finding looks like
 
@@ -638,3 +663,13 @@ logged in `parity.py` as `sema-type`.
 Still in force: no escape hatch, never lint std or dependencies, and
 the standalone ziglint job stays in CI until parity, when the owner
 decides whether to drop it.
+
+## Built so far
+
+1. Branch `lint-1-syntax` (2026-11-07): the config (discovery,
+   coverage, `error[lint-config]`), the syntax pass (ziglint's `Linter`
+   in simple mode, plus the resolver's file-local answers), the report
+   step, the codes, the facts cache and `<compilation dir>/lint`, and
+   `test/lint/`. Not yet: the Sema rules and hybrid verdicts (Z011,
+   Z027; Sema's types for Z006, Z010, Z012, Z015, Z023, Z029, Z032,
+   Z033, Z034), fixes and notes, the ported suite and `parity.py`.

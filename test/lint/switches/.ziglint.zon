@@ -1,0 +1,7 @@
+.{
+    .rules = .{
+        .Z001 = .{ .enabled = false },
+        .Z033 = .{ .enabled = true },
+        .Z024 = .{ .max_length = 100 },
+    },
+}

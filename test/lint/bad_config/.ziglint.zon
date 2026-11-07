@@ -1,0 +1,1 @@
+.{ .rules = .{ .Z036 = .{ .enabled = false } } }

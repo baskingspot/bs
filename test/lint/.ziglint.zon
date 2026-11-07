@@ -1,0 +1,8 @@
+// The config of the cases in this directory: ziglint's defaults, but for
+// line length, which the expected output's comment lines would break.
+// A directory with its own `.ziglint.zon` is a case with that config.
+.{
+    .rules = .{
+        .Z024 = .{ .enabled = false },
+    },
+}

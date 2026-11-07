@@ -9164,8 +9164,8 @@ The owner's review (2026-11-03) settled:
    when a file cannot be lowered, so since 2026-11-04 bs analyzes
    after the others too, with replay; see "AstGen" below.)
 4. No error limit.
-5. No bs-only checks other than the opt-in ziglint rules
-   (docs/slop/ziglint-in-bs.md), and no `-fanalyze-unreferenced`
+5. No bs-only checks other than the opt-in ziglint rules ("ziglint's
+   rules as compile errors", below), and no `-fanalyze-unreferenced`
    for now. Their measurements stay below as background, marked not
    adopted.
 6. A failing build commits the manifest for the units that succeeded, so
@@ -9795,6 +9795,70 @@ unchanged:
    wrong locations on upstream's compile-error cases. (Harness done; no
    crashes left.)
 8. Later: `bs explain` and `bs fix` (applies exact fixes).
+
+## ziglint's rules as compile errors (designed and owner-approved 2026-11-07; being built)
+
+A project opts in with a `.ziglint.zon`: bs then reports ziglint
+0.8.1's rules as compile errors in the files the config covers, never in
+std or dependencies. The design, its rule-by-rule placement and the
+owner's decisions are in docs/slop/ziglint-in-bs.md. What is built:
+
+- **Config** (`src/lint/Config.zig`). Discovery walks up from the root
+  module's root source file (`bs test`: the module under test's;
+  `bs build`'s configure script: the `@build` module's `build.zig`) to
+  the nearest directory with a `build.zig`, and only the file's own
+  directory without one; a root in the zig lib directory, the global
+  package cache's `p/` or a `zig-pkg/` directory finds none. `paths` are
+  relative to the config's directory, `.` when there are none. A file is
+  covered as ziglint's walk would take it: a `paths` file, or a `.zig`
+  file under a `paths` directory with no component starting with `.` or
+  named `zig-cache` or `zig-out`, and none that directory's `.gitignore`
+  matches (ziglint's matching), and not in an excluded directory. Only
+  files the build loads are checked. A config that does not parse, an
+  unknown rule ID included, is an `error[lint-config]` at its location.
+- **The syntax pass** (`src/lint/Linter.zig`) is ziglint's `Linter`,
+  ported with its copyright notice, in its simple mode (no
+  `TypeResolver`): every rule but Z003 (bs's parse error), Z011 and Z027.
+  Where ziglint's resolver answers from the file alone, the pass answers
+  the same: an `@import` of std, builtin or a `.zig` file and a builtin
+  that returns a type are types (Z012, Z015), and a root error set is
+  one (Z010). The other resolver answers are Sema's to give (later
+  work), so the hybrid rules (Z006, Z010, Z012, Z015, Z023, Z032, Z033,
+  Z034) take ziglint's syntactic fallback for now. It runs every rule,
+  whatever the config, and applies `// ziglint-ignore:` comments, so its
+  findings depend only on the file's contents and base name. A covered
+  file the build lowers is linted in the lowering worker, from the same
+  AST; the findings (`Linter.encode`) go to `<global cache>/bs/zir/<lint
+  key>`, where the key (`Frontend.lintKey`) hashes the contents, the
+  base name and `Linter.version`, as 32 hex digits, so that the store's
+  maintenance renews and trims them with the ZIR. A covered file whose
+  ZIR came from the cache reads them, or is parsed once to make them.
+  Z024's findings are every line over 80 bytes; a limit below that makes
+  the report step scan the source.
+- **The report step** (`LintConfig.report`, from `main.lintDiagnostics`
+  after the frontend) drops the rules the config turns off and the lines
+  within Z024's limit, and makes `diag.Diagnostic`s with code `style`
+  (`deprecated` for Z011) and the rule ID in `Diagnostic.rule`:
+  `error[style, Z026]` in text, `"rule"` in JSON, `[style Z026]` over
+  `--listen=-`. They are reported after AstGen's errors and with Sema's,
+  and fail the build as any error does: nothing is emitted or recorded.
+- **The cache.** The config is not part of the compilation key.
+  `<compilation dir>/lint` (`main.LintState`) holds, after a successful
+  build, a hash of the config's path, contents and the `.gitignore`s its
+  paths read, then the lint keys of the files it covered, sorted; there
+  is no file without a config. A build whose config hash differs (a
+  config added, edited or removed) does not take the no-change skips
+  (`Incremental.relinkIfUnchanged`, `InputsRecord`). With the same
+  config, a covered file whose key is listed had no findings, since that
+  build succeeded, so an edit build reads the findings of the edited
+  files alone. The config file is reported as an input
+  (`file_system_inputs`).
+- Cost on bs's own build (`bs build-exe` of src/main.zig, ReleaseFast
+  bs, 2026-11-07): the pass costs about 2.2 times the parse of a file
+  (104 ms over bs's 79 `src` files on one thread), spread over the
+  lowering workers: the cold frontend went from 231 to 265 ms (median of
+  3) of a 4.1 s build. An edit build's lint step is 0.1 ms; without a
+  config nothing runs but discovery's few `access` calls.
 
 ## Deliberate differences from upstream
 

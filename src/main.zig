@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const diag = @import("diag.zig");
 const Frontend = @import("Frontend.zig");
+const LintConfig = @import("lint/Config.zig");
+const Linter = @import("lint/Linter.zig");
 const BlockCache = @import("BlockCache.zig");
 const BuildWeb = @import("BuildWeb.zig");
 const Zcu = @import("Zcu.zig");
@@ -766,6 +768,24 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     var rec: ?InputsRecord = if (inc_opt == null and out_path != null and !job.cacheable() and !job.opts.c_only and !job.opts.dump_ir and
         !std.mem.eql(u8, job.environ_map.get("BS_CACHE") orelse "", "off")) InputsRecord.open(init.arena.allocator(), job) else null;
     defer if (rec) |*r| r.close(init.io);
+    // The project's `.ziglint.zon` makes ziglint's rules compile errors in
+    // the files it covers. A build whose config is not the last successful
+    // build's builds (`LintState`).
+    const lint_cfg: ?*const LintConfig = switch (try findLintConfig(init, job)) {
+        .none => null,
+        .ok => |c| c,
+        .err => |d| return .{ .errors = try dupeDiagnostics(init.arena.allocator(), &.{d}) },
+    };
+    var lint_state: LintState = .of(lint_cfg);
+    if (lint_cfg) |cfg| if (inputs) |list| try appendInput(init.arena.allocator(), list, cfg.path);
+    if (inc_opt) |i| {
+        try lint_state.load(init.arena.allocator(), init.io, i.dir);
+        i.lint_changed = !lint_state.same;
+    }
+    if (rec) |*r| {
+        try lint_state.load(init.arena.allocator(), init.io, r.dir);
+        if (!lint_state.same) r.forget(init.io);
+    }
     if (rec) |*r| {
         // As `Incremental.renew_output`.
         const renew = job.opts.command == .run or (job.opts.command == .@"test" and job.opts.emit_bin == .default and !job.opts.listen);
@@ -791,7 +811,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
         i.link_runtime_from = job.link_objects.len;
         i.link_archives_from = i.link_objects.len - b.archives.len;
     };
-    while (true) return compileReplaying(init, job, inc_opt, if (rec) |*r| r else null, out_path, alt_path, prog, inputs, replay_mode, &pins, c_batch) catch |err| switch (err) {
+    while (true) return compileReplaying(init, job, inc_opt, if (rec) |*r| r else null, out_path, alt_path, prog, inputs, replay_mode, &pins, c_batch, lint_cfg, &lint_state) catch |err| switch (err) {
         error.LazyFallback => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             replay_mode = "eager";
@@ -1198,7 +1218,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
     });
 }
 
-fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, rec: ?*InputsRecord, out_path: ?[]const u8, alt_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8, pins: *?*const Zcu.NamePins, c_batch: ?*CSource.Batch) !Outcome {
+fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, rec: ?*InputsRecord, out_path: ?[]const u8, alt_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8, pins: *?*const Zcu.NamePins, c_batch: ?*CSource.Batch, lint_cfg: ?*const LintConfig, lint_state: *LintState) !Outcome {
     const arena = init.arena.allocator();
     const opts = job.opts;
     const env = init.environ_map;
@@ -1262,6 +1282,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .zigc = linksMusl(&opts),
     });
     defer fe.deinit();
+    fe.lint = lint_cfg;
     try fe.enableCache(job.cache_dirs);
     var errors: std.zig.ErrorBundle.Wip = try .init(init.gpa);
     defer errors.deinit();
@@ -1287,6 +1308,13 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         try diag.fromBundle(arena, paths, bundle, &diags);
         if (!ok) return .{ .errors = try dupeDiagnostics(arena, diags.items) };
         astgen_errors = diags.items;
+    }
+    // The lint findings fail the build with AstGen's errors, and are
+    // reported after them.
+    if (lint_cfg) |cfg| {
+        const findings = try lintDiagnostics(arena, &fe, cfg, paths, lint_state);
+        stages.mark("lint");
+        if (findings.len != 0) astgen_errors = try std.mem.concat(arena, diag.Diagnostic, &.{ astgen_errors, findings });
     }
 
     var zcu: Zcu = try .init(init.gpa, init.io, &fe);
@@ -1548,7 +1576,11 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         i.finishRecord(linked);
         if (linked) i.noteOutput(Io.Dir.cwd(), bin_path);
     };
-    if (rec) |r| if (linked) try r.write(arena, init.io, job, &fe, &zcu, if (c_batch) |b| (try b.wait()).inputs else "", bin_path);
+    if (linked) if (inc_opt) |i| lint_state.record(init.io, i.dir);
+    if (rec) |r| if (linked) {
+        try r.write(arena, init.io, job, &fe, &zcu, if (c_batch) |b| (try b.wait()).inputs else "", bin_path);
+        lint_state.record(init.io, r.dir);
+    };
     stages.mark("cache record (after the link)");
     stages.print();
     if (stages.on) emit.codegen_stats.print("bs: codegen");
@@ -1663,6 +1695,135 @@ fn dupeDiagnostics(arena: std.mem.Allocator, diags: []const diag.Diagnostic) ![]
         d.log = log;
     }
     return out;
+}
+
+/// The `.ziglint.zon` of a compilation (`LintConfig.discover`) from its
+/// root source file (under `bs test`, the module under test's; for
+/// `bs build`'s configure script, whose root is in the zig lib directory,
+/// the `@build` module's, the project's `build.zig`), read; a C root has
+/// none.
+fn findLintConfig(init: std.process.Init, job: *const Job) !union(enum) { none, ok: *const LintConfig, err: diag.Diagnostic } {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const opts = &job.opts;
+    if (opts.c_root or opts.c_only) return .none;
+    const cwd = Io.Dir.cwd();
+    const lib = cwd.realPathFileAlloc(io, job.zig_lib_dir, arena) catch try Io.Dir.path.resolveAlloc(arena, &.{job.zig_lib_dir});
+    const global = cwd.realPathFileAlloc(io, job.cache_dirs.global, arena) catch try Io.Dir.path.resolveAlloc(arena, &.{job.cache_dirs.global});
+    const excluded = try arena.dupe([]const u8, &.{ lib, try Io.Dir.path.join(arena, &.{ global, "p" }) });
+    var root = opts.root_src_path;
+    for (opts.modules) |m| if (std.mem.eql(u8, m.name, "@build")) {
+        root = m.path;
+    };
+    const path = try LintConfig.discover(arena, io, root, excluded) orelse return .none;
+    switch (try LintConfig.read(arena, io, path, excluded, try .init(arena, io, job.zig_lib_dir))) {
+        .ok => |c| {
+            const cfg = try arena.create(LintConfig);
+            cfg.* = c;
+            return .{ .ok = cfg };
+        },
+        .err => |d| return .{ .err = d },
+    }
+}
+
+/// The lint config a successful build had, as `<compilation dir>/lint`:
+/// a hash of the config's path, its contents and the `.gitignore`s its
+/// paths read, which decide what it reports, then the lint keys
+/// (`Frontend.lintKey`) of the files it covered, sorted; no file without a
+/// config. The no-change skips (`Incremental.relinkIfUnchanged`,
+/// `InputsRecord`) do not skip a build whose config is not the last one's:
+/// adding, editing or removing a `.ziglint.zon` builds, and reports. With
+/// the same config, a covered file with a key of the last build has no
+/// findings, as that build had none: an edit build reads the findings of
+/// the edited files alone.
+const LintState = struct {
+    hash: ?Frontend.Hash,
+    /// After `load`: the record is of this config.
+    same: bool = false,
+    /// After `load`, with `same`: the last build's covered files' keys.
+    clean: []const Frontend.Hash = &.{},
+    /// The keys of the files this build covers (`lintDiagnostics`).
+    covered: std.ArrayList(Frontend.Hash) = .empty,
+
+    const file_name = "lint";
+
+    fn of(cfg_opt: ?*const LintConfig) LintState {
+        const cfg = cfg_opt orelse return .{ .hash = null };
+        var h: std.crypto.hash.Blake3 = .init(.{});
+        for ([_][]const u8{ cfg.path, cfg.source }) |part| {
+            h.update(part);
+            h.update(&.{0});
+        }
+        for (cfg.paths) |p| {
+            h.update(p.abs);
+            h.update(if (p.dir) "/\x00" else "\x00");
+            h.update(p.gitignore orelse "");
+            h.update(&.{0});
+        }
+        var out: Frontend.Hash = undefined;
+        h.final(&out);
+        return .{ .hash = out };
+    }
+
+    fn load(s: *LintState, arena: std.mem.Allocator, io: Io, dir: Io.Dir) !void {
+        const bytes = dir.readFileAllocOptions(io, file_name, arena, .limited(1 << 26), .of(Frontend.Hash), null) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => {
+                s.same = s.hash == null;
+                return;
+            },
+        };
+        const want = s.hash orelse return;
+        if (bytes.len < want.len or bytes.len % want.len != 0 or !std.mem.eql(u8, bytes[0..want.len], &want)) return;
+        s.same = true;
+        s.clean = @ptrCast(bytes[want.len..]);
+    }
+
+    /// Whether a file with lint key `key` had no findings in the last build.
+    fn isClean(s: *const LintState, key: Frontend.Hash) bool {
+        return std.sort.binarySearch(Frontend.Hash, s.clean, key, order) != null;
+    }
+
+    fn order(a: Frontend.Hash, b: Frontend.Hash) std.math.Order {
+        return std.mem.order(u8, &a, &b);
+    }
+
+    fn lessThan(_: void, a: Frontend.Hash, b: Frontend.Hash) bool {
+        return order(a, b) == .lt;
+    }
+
+    /// After a successful build. Best effort: a state it fails to write
+    /// costs the next build its skip.
+    fn record(s: *LintState, io: Io, dir: Io.Dir) void {
+        const h = s.hash orelse {
+            dir.deleteFile(io, file_name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
+            return;
+        };
+        std.mem.sortUnstable(Frontend.Hash, s.covered.items, {}, lessThan);
+        cache.writeReplace(io, dir, file_name, &.{ &h, @ptrCast(s.covered.items) }) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
+    }
+};
+
+/// The lint config's findings in the files it covers that this build
+/// loaded, by file and offset. Notes the files' keys in `state`.
+fn lintDiagnostics(arena: std.mem.Allocator, fe: *const Frontend, cfg: *const LintConfig, paths: diag.Paths, state: *LintState) ![]const diag.Diagnostic {
+    var out: std.ArrayList(diag.Diagnostic) = .empty;
+    for (fe.files.items, 0..) |*f, i| {
+        const index: Frontend.File.Index = @fromBackingInt(@intCast(i));
+        if (!try fe.lintCovers(arena, index)) continue;
+        const key = Frontend.lintKey(f);
+        try state.covered.append(arena, key);
+        if (state.isClean(key)) continue;
+        const findings = try arena.dupe(Linter.Diagnostic, try fe.lintFindings(arena, index));
+        if (!cfg.reportsAny(findings)) continue;
+        std.mem.sortUnstable(Linter.Diagnostic, findings, {}, struct {
+            fn lessThan(_: void, a: Linter.Diagnostic, b: Linter.Diagnostic) bool {
+                return a.offset < b.offset or (a.offset == b.offset and @backingInt(a.rule) < @backingInt(b.rule));
+            }
+        }.lessThan);
+        try cfg.report(arena, paths, f.display_path, try fe.source(index), findings, &out);
+    }
+    return out.items;
 }
 
 fn appendInput(arena: std.mem.Allocator, list: *std.ArrayList(u8), path: []const u8) !void {

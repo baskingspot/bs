@@ -118,6 +118,7 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&inputs.step);
     }
     addDiagTests(b, exe, test_step, upstream_step, std_zir);
+    addLintTests(b, exe, test_step, upstream_step, std_zir);
     const build_test_step = addBuildTest(b, exe, build_web_wasm, translate_c);
     spreadBsUsers(b, &exe.step, &zir.step, &.{ test_step, build_test_step });
 
@@ -997,6 +998,91 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         up.addCheck(.{ .expect_term = .{ .exited = 1 } });
         upstream_step.dependOn(&up.step);
     }
+}
+
+/// The ziglint rules as compile errors, with a project's `.ziglint.zon`
+/// (`src/lint/`). Each `test/lint/*.zig` file is a case under
+/// test/lint/.ziglint.zon, and each directory one under its own config,
+/// with `main.zig` as its root file. The root file ends with a `// error`
+/// block of bs's exact standard error, as a test/diag case's: `test` runs
+/// `bs build-obj -fno-emit-bin` on it; `test-upstream` checks that
+/// upstream zig, which reads no config, accepts it.
+fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
+    const io = b.graph.io;
+    b.dependOnDirectoryContents(b.path("test/lint"));
+    var dir = b.root.openDir(io, "test/lint", .{ .iterate = true }) catch |err|
+        std.debug.panic("unable to open test/lint: {t}", .{err});
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch |err| std.debug.panic("unable to list test/lint: {t}", .{err})) |entry| {
+        const case_dir, const file = switch (entry.kind) {
+            .directory => .{ b.fmt("test/lint/{s}", .{entry.name}), "main.zig" },
+            .file => if (std.mem.endsWith(u8, entry.name, ".zig")) .{ "test/lint", b.dupe(entry.name) } else continue,
+            else => continue,
+        };
+        const src_path = b.fmt("{s}/{s}", .{ case_dir, file });
+        const source = dir.readFileAlloc(io, src_path["test/lint/".len..], b.allocator, .limited(1 << 20)) catch |err|
+            std.debug.panic("unable to read {s}: {t}", .{ src_path, err });
+        const block = std.mem.findLast(u8, source, "\n// error\n") orelse
+            std.debug.panic("{s}: missing '// error' block", .{src_path});
+        var expected: std.ArrayList(u8) = .empty;
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, source[block + "\n// error\n".len ..], "\n"), '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "//")) std.debug.panic("{s}: non-comment line after '// error'", .{src_path});
+            expected.appendSlice(b.allocator, if (line.len > 2) line[3..] else "") catch @panic("OOM");
+            expected.append(b.allocator, '\n') catch @panic("OOM");
+        }
+        const name = if (entry.kind == .directory) entry.name else file;
+        const run = b.addRunArtifact(bs);
+        run.setName(b.fmt("lint {s}", .{name}));
+        run.setCwd(b.path(case_dir));
+        run.addArgs(&.{ "build-obj", "-target", "x86_64-linux", "-fno-emit-bin", file });
+        run.setEnvironmentVariable("BS_CACHE", "off");
+        run.addCheck(.{ .expect_stderr_exact = expected.items });
+        run.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        takes(b, &run.step, 2);
+        test_step.dependOn(&run.step);
+
+        const up = b.addSystemCommand(&.{ upstreamZig(b), "test", "-fno-emit-bin", file });
+        up.setName(b.fmt("lint {s} (upstream accepts)", .{name}));
+        up.setCwd(b.path(case_dir));
+        up.expectExitCode(0);
+        upstream_step.dependOn(&up.step);
+    }
+
+    // The cache: a build with no config that succeeded does not let a
+    // build that has one skip as unchanged, and the build after the
+    // config is gone builds again.
+    const added = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -e
+        \\bs=$(realpath "$2")
+        \\mkdir -p "$1/g/bs"; cp -r "$3/bs/zir" "$1/g/bs"
+        \\cd "$1"
+        \\: > build.zig
+        \\printf 'pub fn main() void {}\nfn Bad() void {}\ntest {\n    _ = &Bad;\n}\n' > main.zig
+        \\c="--cache-dir l --global-cache-dir g -target x86_64-linux"
+        \\"$bs" build-exe main.zig $c
+        \\printf '.{}\n' > .ziglint.zon
+        \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with a config passed"; exit 1; fi
+        \\grep -q "main.zig:2:4: error\[style, Z001\]: function 'Bad' should be camelCase" log || { cat log; exit 1; }
+        \\if "$bs" build-exe main.zig $c 2>log; then echo "the build again passed"; exit 1; fi
+        \\printf '.{ .rules = .{ .Z001 = .{ .enabled = false } } }\n' > .ziglint.zon
+        \\"$bs" build-exe main.zig $c
+        \\printf '.{}\n' > .ziglint.zon
+        \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with Z001 on again passed"; exit 1; fi
+        \\rm .ziglint.zon
+        \\"$bs" build-exe main.zig $c
+        ,
+        "sh",
+    });
+    added.setName("lint config added and removed (cache)");
+    _ = added.addOutputDirectoryArg("lint-cache");
+    added.addArtifactArg(bs);
+    added.addDirectoryArg(std_zir);
+    added.expectExitCode(0);
+    takes(b, &added.step, 5);
+    test_step.dependOn(&added.step);
 }
 
 /// `bs build-obj`: test/obj/lib.zig, linked into test/obj/main.zig by

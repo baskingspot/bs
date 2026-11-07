@@ -193,6 +193,9 @@ renew_output: bool = false,
 /// by building again in full (`full`, the build's own environment then),
 /// which compares its nodes with the edit build's (`verifyNodes`).
 verify: enum { off, replay, full } = .off,
+/// The lint config is not the last successful build's (`main.LintState`):
+/// the build must build, to report what the config now reports.
+lint_changed: bool = false,
 /// For `verify`: the command line and environment to build again with.
 verify_argv: []const []const u8 = &.{},
 verify_environ: ?*std.process.Environ.Map = null,
@@ -340,6 +343,7 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     // `NamesRerun`): the donor's output is another compilation's.
     if (inc.donor != null) return inc.noRelink("the manifest is a donor's", .{});
     if (inc.verify == .full) return inc.noRelink("verifying an edit build", .{});
+    if (inc.lint_changed) return inc.noRelink("the lint config changed", .{});
     if (m.output != inc.output) return inc.noRelink("the manifest links another kind of output", .{});
     if (m.entry == 0 and inc.output == .exe) return inc.noRelink("no entry point", .{});
     // The same link inputs, in order: a C source's object can move.

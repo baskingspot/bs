@@ -1,0 +1,4 @@
+// Only `covered` and the root file are covered; `uncovered.zig` has the
+// same finding, which is not reported, and so does `covered/.hidden.zig`,
+// which ziglint's walk skips.
+.{ .paths = .{ "covered", "main.zig" }, .rules = .{ .Z024 = .{ .enabled = false } } }

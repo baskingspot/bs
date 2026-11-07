@@ -1,0 +1,1 @@
+pub fn Bad() void {}
