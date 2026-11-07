@@ -1,6 +1,9 @@
 # Scope: the cache on aarch64-macos, and for position-independent outputs
 
-Status: scoping note (2026-11-05), not started. Two builds skip the
+Status: scoping note (2026-11-05). aarch64-macos step 1 (executables
+of Zig only) landed on 2026-11-07 (branch macos-cache): one shared
+binding function (`Emit.bindMachOImports`) instead of recorded library
+indices, and builds with inputs replay eagerly until step 2. Two builds skip the
 per-declaration cache today (`Job.cacheable` in main.zig): every
 aarch64-macos build, and on x86_64-linux every position-independent
 object or library. This note says what each would need, where the

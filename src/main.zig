@@ -628,6 +628,9 @@ pub const Job = struct {
         } else if (opts.bs_target == .aarch64_macos) {
             try compile_args.append(arena, try arena.print("--bs-native=macos,{f},{f},{?f}", .{ opts.macos_version.min, opts.macos_version.max, job_opts.macos_sdk }));
         };
+        // The SDK version an aarch64-macos link writes (LC_BUILD_VERSION),
+        // which a target named on the command line leaves to the SDK found.
+        if (!opts.native_os and opts.bs_target == .aarch64_macos) try compile_args.append(arena, try arena.print("--bs-macos-sdk={?f}", .{job_opts.macos_sdk}));
         // The files the object and library arguments name, which `-l`
         // finds in the `-L` directories: the cache's link-only inputs,
         // objects and archives, then shared libraries.
@@ -672,9 +675,14 @@ pub const Job = struct {
         // -fPIE and -dynamic imply -fPIC (and -lc on objects and
         // libraries). A library of C only has no Zig to cache; its
         // objects have their records.
-        // aarch64-macos does not use the cache yet: its relink would need
-        // the Mach-O linker's inputs in the manifest.
-        return !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and job.opts.bs_target.os() == .linux and
+        // On aarch64-macos only executables (`Incremental.macos`): its
+        // objects and static libraries keep the inputs record.
+        const os_ok = switch (job.opts.bs_target.os()) {
+            .linux => true,
+            .macos => !job.opts.command.isObj() and job.opts.command != .build_lib,
+            else => false,
+        };
+        return !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and os_ok and
             !std.mem.eql(u8, job.environ_map.get("BS_CACHE") orelse "", "off");
     }
 
@@ -705,6 +713,11 @@ pub const Job = struct {
             i.glibc_version = job.opts.glibc_version;
             i.glibc_lib_dir = job.zig_lib_dir;
             i.runpath = job.opts.runpath;
+        }
+        if (job.opts.bs_target == .aarch64_macos) {
+            i.macos = .{ .min = job.opts.macos_version.min, .sdk = job.opts.macos_sdk };
+            i.runpath = job.opts.runpath;
+            i.macho_libs_loader = .{ .ctx = job, .load = loadJobMachoLibs };
         }
         i.output = switch (job.opts.command) {
             .build_obj, .test_obj => .obj,
@@ -1380,26 +1393,8 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     }
     if (macos) {
         emit.runpath = opts.runpath;
-        var libs: std.ArrayList(MachODylib) = try .initCapacity(arena, opts.shared_libs.len);
-        // Each library's re-exports, which only stubs list.
-        const pending = try arena.alloc([]const []const u8, opts.shared_libs.len);
-        for (opts.shared_libs, pending) |path, *reexports| {
-            const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
-                fatal("unable to read '{s}': {t}", .{ path, err });
-            reexports.* = &.{};
-            libs.appendAssumeCapacity(if (std.mem.startsWith(u8, bytes, "--- !tapi-tbd")) lib: {
-                const lib, reexports.* = Tbd.dylib(arena, path, bytes) catch |err| switch (err) {
-                    error.OutOfMemory => |e| return e,
-                    error.InvalidTbd => fatal("'{s}': a text-based stub without an install name", .{path}),
-                };
-                break :lib lib;
-            } else MachODylib.parse(arena, path, bytes) catch |err| switch (err) {
-                error.OutOfMemory => |e| return e,
-                error.InvalidDylib => fatal("'{s}' is not an arm64 Mach-O dynamic library", .{path}),
-            });
-        }
-        try readTbds(arena, init.io, &libs, pending, opts.lib_dirs, opts.framework_dirs);
-        emit.macho_libs = libs.items;
+        emit.macho_libs = try machoLibs(arena, init.io, &opts);
+        if (inc_opt) |i| i.macho_libs = emit.macho_libs;
     }
     const shared_libs = try arena.alloc(ElfShared, if (macos) 0 else opts.shared_libs.len);
     for (shared_libs, opts.shared_libs[0..shared_libs.len], opts.shared_names[0..shared_libs.len]) |*lib, path, name| {
@@ -2922,6 +2917,38 @@ const LibQuery = struct {
         return null;
     }
 };
+
+/// The libraries an aarch64-macos link binds imports to: the shared
+/// library arguments, then the public libraries their stubs re-export
+/// (`readTbds`).
+fn machoLibs(arena: std.mem.Allocator, io: Io, opts: *const Options) ![]const MachODylib {
+    var libs: std.ArrayList(MachODylib) = try .initCapacity(arena, opts.shared_libs.len);
+    // Each library's re-exports, which only stubs list.
+    const pending = try arena.alloc([]const []const u8, opts.shared_libs.len);
+    for (opts.shared_libs, pending) |path, *reexports| {
+        const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited) catch |err|
+            fatal("unable to read '{s}': {t}", .{ path, err });
+        reexports.* = &.{};
+        libs.appendAssumeCapacity(if (std.mem.startsWith(u8, bytes, "--- !tapi-tbd")) lib: {
+            const lib, reexports.* = Tbd.dylib(arena, path, bytes) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.InvalidTbd => fatal("'{s}': a text-based stub without an install name", .{path}),
+            };
+            break :lib lib;
+        } else MachODylib.parse(arena, path, bytes) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.InvalidDylib => fatal("'{s}' is not an arm64 Mach-O dynamic library", .{path}),
+        });
+    }
+    try readTbds(arena, io, &libs, pending, opts.lib_dirs, opts.framework_dirs);
+    return libs.items;
+}
+
+/// `Incremental.macho_libs_loader`'s: `machoLibs` of a `Job`.
+fn loadJobMachoLibs(ctx: *const anyopaque, arena: std.mem.Allocator) anyerror![]const MachODylib {
+    const job: *const Job = @ptrCast(@alignCast(ctx));
+    return machoLibs(arena, job.io, &job.opts);
+}
 
 /// A macOS SDK stub (`-lz`'s `libz.tbd`, `-framework Cocoa`'s
 /// `Cocoa.tbd`) as the library it describes. The libraries it re-exports

@@ -41,6 +41,8 @@ const Archive = @import("link/Archive.zig");
 const ElfMerge = @import("link/ElfMerge.zig");
 const ElfInput = @import("link/ElfInput.zig");
 const ElfShared = @import("link/ElfShared.zig");
+const MachO = @import("link/MachO.zig");
+const MachODylib = @import("link/MachODylib.zig");
 const Replay = @import("Replay.zig");
 const compiler_rt_exports = @import("compiler_rt_exports.zig");
 
@@ -152,8 +154,23 @@ link_shared_names: []const []const u8 = &.{},
 /// The parsed `link_shared`, if the build parsed them (main.zig does in
 /// every build, for CodeGen's `exportTarget`).
 shared: ?[]const ElfShared = null,
-/// Such an executable's DT_RUNPATH (`Options.runpath` in main.zig).
+/// Such an executable's DT_RUNPATH (`Options.runpath` in main.zig), or
+/// an aarch64-macos one's LC_RPATHs, separated by ':'.
 runpath: ?[]const u8 = null,
+/// An aarch64-macos build: a relink writes a Mach-O executable with
+/// LC_BUILD_VERSION's minimum macOS and SDK (both in the compilation's
+/// key), whose imports bind to the libraries as `Emit.link` binds them
+/// (`Emit.bindMachOImports`). The library files the command names are
+/// `link_shared`, so a build after one changed replays eagerly.
+macos: ?struct { min: std.SemanticVersion, sdk: ?std.SemanticVersion } = null,
+/// The libraries an aarch64-macos executable links against, if the build
+/// parsed them (main.zig does in every build that compiles), else how to
+/// parse them (`loadMachOLibs`).
+macho_libs: ?[]const MachODylib = null,
+macho_libs_loader: ?struct {
+    ctx: *const anyopaque,
+    load: *const fn (ctx: *const anyopaque, arena: Allocator) anyerror![]const MachODylib,
+} = null,
 /// `Emit.lld`.
 lld: bool = false,
 /// `-rdynamic` (`Glibc.dynamicOptions`).
@@ -586,7 +603,9 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     const files = try gpa.alloc([]const u8, m.fileCount());
     defer gpa.free(files);
     for (files, 0..) |*f, i| f.* = m.file(@intCast(i));
-    var input = try pack.linkAtoms(gpa, inc.arch, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files });
+    // A stripped Mach-O executable has no dSYM (`Emit.link`).
+    const debug_atoms = if (inc.macos != null and inc.strip) &.{} else in.debug_atoms;
+    var input = try pack.linkAtoms(gpa, inc.arch, in.refs, debug_atoms, .{ .of = in.debug_files, .names = files });
     defer input.deinit(gpa);
     input.names = in.names;
     const checked: [2]Hash = .{ m.id, m.pack_id };
@@ -616,7 +635,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
                 try imports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls });
                 // A dynamic executable's imports get their addresses from
                 // the linker (`Symbols.dynamic_imports`).
-                if (inc.glibc_version == null) if (m.symbol(ls.key)) |n| values.appendAssumeCapacity(.{ .symbol = n, .value = 0 });
+                if (inc.glibc_version == null and inc.macos == null) if (m.symbol(ls.key)) |n| values.appendAssumeCapacity(.{ .symbol = n, .value = 0 });
             },
             _ => return inc.noLink("unknown link symbol kind", .{}),
         }
@@ -633,6 +652,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    if (inc.macos != null) return inc.linkMachO(arena, m, &input, in, values.items, imports.items, out_dir, sub_path, cwd, gathered, checked);
     var glibc_loaded: ?Glibc = null;
     defer if (glibc_loaded) |*g| g.deinit();
     var dynamic: ElfDynamic.Options = .{};
@@ -746,6 +766,88 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
 }
 
 const Linked = struct { atoms: usize, gathered: Io.Timestamp };
+
+/// `linkFrom`'s link of an aarch64-macos executable, as `Emit.link`
+/// links one: its imports bound to the libraries, numbered.
+fn linkMachO(
+    inc: *Incremental,
+    arena: Allocator,
+    m: *Manifest,
+    input: *Pack.LinkAtoms,
+    in: Manifest.LinkInput,
+    values: []const Elf.NumberedValue,
+    elf_imports: []const ElfObject.Import,
+    out_dir: Io.Dir,
+    sub_path: []const u8,
+    cwd: []const u8,
+    gathered: Io.Timestamp,
+    checked: [2]Hash,
+) !?Linked {
+    const gpa = inc.gpa;
+    const io = inc.io;
+    const macos = inc.macos.?;
+    if (inc.output != .exe) return inc.noLink("an aarch64-macos {t} is not relinked yet", .{inc.output});
+    if (inc.link_objects.len != 0) return inc.noLink("aarch64-macos object inputs are not relinked yet", .{});
+    const libs_in = inc.macho_libs orelse if (inc.macho_libs_loader) |l| l.load(l.ctx, arena) catch |err|
+        return inc.noLink("the libraries: {t}", .{err}) else &.{};
+    // In `Emit.finish`'s order, by name.
+    const imports = try arena.alloc(MachO.Import, elf_imports.len);
+    for (imports, elf_imports) |*imp, e| imp.* = .{ .key = e.key, .name = e.name };
+    std.mem.sortUnstable(MachO.Import, imports, {}, struct {
+        fn lessThan(_: void, a: MachO.Import, b: MachO.Import) bool {
+            return std.mem.order(u8, a.name, b.name) == .lt;
+        }
+    }.lessThan);
+    const libs = try Emit.bindMachOImports(arena, libs_in, imports);
+    const import_numbers = try arena.alloc(u32, imports.len);
+    for (import_numbers, imports) |*n, imp| n.* = m.symbol(@backingInt(imp.key)) orelse
+        return inc.noLink("import '{s}' has no symbol number", .{imp.name});
+    var rpaths: std.ArrayList([]const u8) = .empty;
+    if (inc.runpath) |r| {
+        var it = std.mem.splitScalar(u8, r, ':');
+        while (it.next()) |p| try rpaths.append(arena, p);
+    }
+    const aliases = try externAliases(arena, m, WithInputs{ .pack = input, .extra = &.{}, .overrides = &.empty }, in.numbered) orelse
+        return inc.noLink("an extern slot's atom record is damaged", .{});
+    const numbered_aliases = try arena.alloc(Elf.NumberedAlias, aliases.len);
+    for (numbered_aliases, aliases) |*n, a| n.* = .{
+        .symbol = m.symbol(@backingInt(a.key)).?,
+        .target = m.symbol(@backingInt(a.target)) orelse return inc.noLink("an extern slot's target has no symbol number", .{}),
+    };
+    var diag: Elf.Diagnostic = .{};
+    MachO.linkInput(gpa, io, out_dir, sub_path, input.*, .{
+        .entry = @fromBackingInt(m.entry),
+        .libs = libs,
+        .rpaths = rpaths.items,
+        .imports = imports,
+        .aliases = aliases,
+        .min_os = macos.min,
+        .sdk = macos.sdk,
+        .stack_size = inc.stack_size,
+        .comp_dir = cwd,
+        .diag = &diag,
+        .symbols = .{
+            .atoms = in.numbered,
+            .targets = in.targets,
+            .targets_tail = in.targets_tail,
+            .values = values,
+            .imports = import_numbers,
+            .aliases = numbered_aliases,
+            .entry = m.entry_symbol,
+            .len = m.symbolLen(),
+        },
+    }) catch |err| switch (err) {
+        // A damaged pack or manifest: build from scratch instead.
+        error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo => return inc.noLink("{t} (atom '{s}')", .{ err, diag.atom }),
+        else => {
+            std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
+            return err;
+        },
+    };
+    inc.noteOutput(out_dir, sub_path);
+    if (input.trusted == null) inc.noteBaseChecked(checked);
+    return .{ .atoms = in.refs.len, .gathered = gathered };
+}
 
 /// Maps link input `path` into `maps`, its pages read ahead if `populate`,
 /// or returns null after saying why.
@@ -1227,7 +1329,8 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     // paths. A donor's build is lazy only where `Replay.donorEager` allows;
     // its log then follows the donor's manifest (`finishLazy`).
     const has_inputs = inc.link_objects.len + inc.link_shared.len != 0;
-    const lazy = !std.mem.eql(u8, mode, "eager") and
+    // An aarch64-macos relink takes no objects yet (`linkMachO`).
+    const lazy = !std.mem.eql(u8, mode, "eager") and !(inc.macos != null and inc.link_objects.len != 0) and
         (!has_inputs or (!inc.link_objects_pending and if (inc.donor == null) !try inc.linkInputsChanged(m) else try inc.donorSharesLinkInputs(m)));
     const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy, inc.donor != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

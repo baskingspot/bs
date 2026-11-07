@@ -120,10 +120,7 @@ FORMAT = 1
 # aarch64-macos (see selfHostedBackendIsAsRobustAsLlvm in src/target.zig).
 TARGETS = {
     "x86_64-linux": {"zig_target": "x86_64-linux-none", "host": ("Linux", "x86_64")},
-    # bs does not use the cache there yet (`Job.cacheable` in main.zig), so
-    # --edit-verify and BS_CACHE_VERIFY check nothing; --sched-check
-    # compares cache-off builds.
-    "aarch64-macos": {"zig_target": "aarch64-macos-none", "host": ("Darwin", "arm64"), "cache": False},
+    "aarch64-macos": {"zig_target": "aarch64-macos-none", "host": ("Darwin", "arm64")},
     # LLVM is upstream's Debug default here too. An x86_64-linux host runs
     # the binaries under qemu's user-mode emulator as a Cortex-A53, an
     # ARMv8.0 core like the target's generic baseline, so newer instructions
@@ -724,16 +721,6 @@ def sched_check(compiler, unit, cfg, args, workdir):
         (f"BS_SCHED_FUZZ=sema:{seed}", {"BS_SCHED_FUZZ": f"sema:{seed}"}),
         ("BS_COMPTIME_EVAL=1", {"BS_COMPTIME_EVAL": "1"}),
     )
-    if not cfg.get("cache", True):
-        # Without the cache nothing seeds the error codes, which are
-        # numbered as names are first used, so a shuffled analysis order
-        # numbers them differently: four threads with random delays
-        # (BS_SCHED_FUZZ=<seed>) instead, which must not change the order.
-        builds = (
-            builds[:2]
-            + ((f"BS_THREADS=4 BS_SCHED_FUZZ={seed}", {"BS_THREADS": "4", "BS_SCHED_FUZZ": str(seed)}),)
-            + builds[3:]
-        )
     # The unit's own command line, so its compilation and the manifest its
     # last build wrote.
     return order_check(

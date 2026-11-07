@@ -95,11 +95,10 @@ pub fn build(b: *std.Build) void {
         tc_sdk.addCheck(.{ .expect_stdout_match = "pub const CFAllocatorRef = ?*const struct___CFAllocator;" });
         takes(b, &tc_sdk.step, 13);
         test_step.dependOn(&tc_sdk.step);
-        // A build that changed nothing answers from its inputs record:
-        // test/obj/macos_record.sh.
+        // The cache and the inputs record: test/obj/macos_cache.sh.
         const rec = b.addSystemCommand(&.{"sh"});
-        rec.setName("bs inputs record on aarch64-macos");
-        rec.addFileArg(b.path("test/obj/macos_record.sh"));
+        rec.setName("bs cache and inputs record on aarch64-macos");
+        rec.addFileArg(b.path("test/obj/macos_cache.sh"));
         rec.addArtifactArg(exe);
         _ = rec.addOutputDirectoryArg("work");
         rec.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -267,8 +266,9 @@ pub fn build(b: *std.Build) void {
 ///   //! targets: <target> ...   the targets the program is for (default
 ///                               x86_64-linux); with aarch64-macos, an
 ///                               aarch64-macos host also builds it for
-///                               that target and checks it (not the
-///                               rebuild headers); with aarch64-linux, an
+///                               that target and checks it, with its
+///                               `rebuild-without` edits as aarch64-linux
+///                               does (not lib edits); with aarch64-linux, an
 ///                               aarch64-linux host, or an x86_64-linux
 ///                               host with qemu's user-mode emulator
 ///                               (`qemu-aarch64-static` or `qemu-aarch64`
@@ -675,10 +675,47 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             (if (upstream) upstream_step else test_step).dependOn(&run.step);
         }
         if (expect.aarch64_macos and host_runs_macos_output) {
-            const compile = b.addRunArtifact(bs);
-            compile.addArgs(&.{ "build-exe", "-target", "aarch64-macos" });
-            compile.addFileArg(b.path(src_path));
-            const bin = compile.addPrefixedOutputFileArg("-femit-bin=", name);
+            if (expect.lib_edit != null) std.debug.panic("{s}: aarch64-macos rebuilds take no lib edits", .{src_path});
+            // With rebuild headers, as on aarch64-linux: the earlier
+            // version, then this one as an edit build checked against a
+            // full build, then a relink that must give the bytes of a
+            // build without the cache (at a path with the same file name,
+            // the code signature's identifier), signed.
+            const bin = if (expect.rebuild_without.items.len != 0) blk: {
+                const files = b.addWriteFiles();
+                const before = files.add(file, earlierVersion(b, source, expect.rebuild_without.items, src_path));
+                const r = b.addSystemCommand(&.{
+                    "sh", "-c",
+                    b.fmt(
+                        \\set -e
+                        \\out=$3 compiler=$4
+                        \\mkdir -p "$out.d"
+                        \\cp "$1" "$out.d/{[file]s}"
+                        \\bs() {{ "$compiler" build-exe -target aarch64-macos "$out.d/{[file]s}" -femit-bin="$1" 2>"$out.d/log" || {{ cat "$out.d/log" >&2; exit 1; }}; }}
+                        \\bs "$out"
+                        \\cp "$2" "$out.d/{[file]s}"
+                        \\BS_CACHE_VERIFY=1 BS_CACHE_CHECK=1 bs "$out"
+                        \\rm "$out"
+                        \\bs "$out"
+                        \\codesign --verify --strict "$out" >&2
+                        \\mkdir -p "$out.d/full"
+                        \\BS_CACHE=off bs "$out.d/full/{[name]s}"
+                        \\cmp "$out" "$out.d/full/{[name]s}" >&2
+                    , .{ .file = file, .name = name }),
+                    "sh",
+                });
+                r.addFileArg(before);
+                r.addFileArg(b.path(src_path));
+                const out = r.addOutputFileArg(name);
+                r.addArtifactArg(bs);
+                takes(b, &r.step, if (std.mem.find(u8, source, "@import(\"std\")") != null) 4 else 1);
+                break :blk out;
+            } else blk: {
+                const compile = b.addRunArtifact(bs);
+                compile.addArgs(&.{ "build-exe", "-target", "aarch64-macos" });
+                compile.addFileArg(b.path(src_path));
+                break :blk compile.addPrefixedOutputFileArg("-femit-bin=", name);
+            };
             const run = std.Build.Step.Run.create(b, b.fmt("run {s} (aarch64-macos)", .{name}));
             run.addFileArg(bin);
             if (expect.stdout) |out| run.addCheck(.{ .expect_stdout_exact = out });

@@ -1,5 +1,5 @@
 //! signal: ABRT
-//! targets: x86_64-linux aarch64-linux
+//! targets: x86_64-linux aarch64-linux aarch64-macos
 //! rebuild-without: "// Moved down by the edit.\n"
 //! stderr-contains: "panic: boom\n"
 //! stderr-contains: "panic_inline.zig:23:16: 0x"

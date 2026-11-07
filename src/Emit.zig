@@ -1650,32 +1650,9 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         }
         const imports = try emit.gpa.alloc(MachO.Import, emit.imports.count());
         defer emit.gpa.free(imports);
-        // Each import binds to the first library that exports its name, the
-        // linked ones before the implicit ones (`MachODylib.implicit`),
-        // which get load commands only if an import binds to them.
-        const ordinals = try emit.gpa.alloc(u16, emit.macho_libs.len);
-        defer emit.gpa.free(ordinals);
-        @memset(ordinals, 0);
-        var n_libs: u16 = 0;
-        for (emit.macho_libs, ordinals) |lib, *o| if (!lib.implicit) {
-            n_libs += 1;
-            o.* = n_libs;
-        };
-        for (imports, emit.imports.keys()) |*imp, name| {
-            const i = for (emit.macho_libs, 0..) |l, i| {
-                if (l.exports.contains(name)) break i;
-            } else null;
-            if (i) |k| if (ordinals[k] == 0) {
-                n_libs += 1;
-                ordinals[k] = n_libs;
-            };
-            imp.* = .{ .key = importKey(name), .name = name, .lib = if (i) |k| ordinals[k] else 0 };
-        }
-        const libs = try emit.gpa.alloc(MachO.Lib, n_libs);
+        for (imports, emit.imports.keys()) |*imp, name| imp.* = .{ .key = importKey(name), .name = name };
+        const libs = try bindMachOImports(emit.gpa, emit.macho_libs, imports);
         defer emit.gpa.free(libs);
-        for (emit.macho_libs, ordinals) |lib, o| if (o != 0) {
-            libs[o - 1] = .{ .install_name = lib.install_name, .current_version = lib.current_version, .compatibility_version = lib.compatibility_version };
-        };
         var rpaths: std.ArrayList([]const u8) = .empty;
         defer rpaths.deinit(emit.gpa);
         if (emit.runpath) |r| {
@@ -1965,6 +1942,38 @@ fn parseExternSlot(slot: []const u8) struct { []const u8, i64 } {
 }
 
 /// The key relocations name an imported symbol by (see `useImport`).
+/// Binds each of `imports` (`lib` 0) to the first of `libs` that exports
+/// its name, the linked ones before the implicit ones
+/// (`MachODylib.implicit`), which get load commands only if an import
+/// binds to them; an import no library exports stays libSystem's. Returns
+/// the libraries the load commands name, in order (`MachO.Options.libs`),
+/// owned by the caller. A relink binds the same way (`Incremental`).
+pub fn bindMachOImports(gpa: Allocator, libs: []const MachODylib, imports: []MachO.Import) ![]MachO.Lib {
+    const ordinals = try gpa.alloc(u16, libs.len);
+    defer gpa.free(ordinals);
+    @memset(ordinals, 0);
+    var n_libs: u16 = 0;
+    for (libs, ordinals) |lib, *o| if (!lib.implicit) {
+        n_libs += 1;
+        o.* = n_libs;
+    };
+    for (imports) |*imp| {
+        const i = for (libs, 0..) |l, i| {
+            if (l.exports.contains(imp.name)) break i;
+        } else null;
+        if (i) |k| if (ordinals[k] == 0) {
+            n_libs += 1;
+            ordinals[k] = n_libs;
+        };
+        imp.lib = if (i) |k| ordinals[k] else 0;
+    }
+    const out = try gpa.alloc(MachO.Lib, n_libs);
+    for (libs, ordinals) |lib, o| if (o != 0) {
+        out[o - 1] = .{ .install_name = lib.install_name, .current_version = lib.current_version, .compatibility_version = lib.compatibility_version };
+    };
+    return out;
+}
+
 pub fn importKey(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
     return .fromName(std.mem.print(&buf, "import.{s}", .{name}) catch name);

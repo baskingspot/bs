@@ -958,10 +958,19 @@ comptime arguments are run-time values in the lowered code (uucode's
   and qr corpus tests, unchanged; std's tests compile in the same 2.3 s
   with 32 KB less code. A load that `plan` forwards
   shares the stored value's home, and a removed instruction's constant
-  pointers still request their symbols (`keepSymbols`), as on x86_64. aarch64-macos builds use no cache yet:
-  a relink would need the Mach-O linker's inputs in the manifest. Until
-  then a build that changed nothing answers from its inputs record, as
-  -fPIC builds do (`InputsRecord`).
+  pointers still request their symbols (`keepSymbols`), as on x86_64. aarch64-macos executables use the cache
+  as Linux's do (since 2026-11-07): `Incremental.linkFrom` relinks them
+  through the numbered Mach-O link (`linkMachO`), with each import bound
+  to its library as `Emit.link` binds it (`Emit.bindMachOImports`,
+  over the libraries main.zig parses in every build, which are link-only
+  inputs, `link_shared`), the minimum macOS and the SDK version from the
+  compilation's key (`--bs-macos-sdk` for a named target), and the
+  rpaths, stack size and `-fstrip` from the command. A relink signs the
+  new file and rewrites the dSYM as every Mach-O link does. Builds with
+  object, archive or C inputs replay eagerly and link through
+  `Emit.link`, and objects and static libraries answer from their inputs
+  record (`InputsRecord`), as -fPIC builds do
+  (docs/slop/cache-scope-macos-pic.md).
   Each function keeps a frame record (`stp x29, x30, [sp, #-16]!; mov
   x29, sp`), so compact unwind's frame mode covers it, and addresses its
   slots from sp above a fixed outgoing argument area (the most any call
@@ -7553,13 +7562,8 @@ state. Built for step 1:
   built), so with the cache off a shuffled build numbers them
   differently (behavior's fn_delegation.zig: two entries of the error
   name table swap), while `BS_CACHE_VERIFY=full` seeds them from the
-  last build as edit builds do. aarch64-macos does not use the cache
-  yet (`Job.cacheable`), so there `--sched-check` drops the shuffle
-  for four threads with random delays (`BS_SCHED_FUZZ=<seed>`) and
-  compares binaries only, as std's tier swap there does (baseline
-  `std-aarch64-macos.json`); `--edit-verify` checks nothing beyond the
-  builds and their tests. aarch64-linux uses the cache, so its checks
-  are x86_64-linux's. The eager-resolve mode stays planned.
+  last build as edit builds do. aarch64-macos and aarch64-linux use
+  the cache, so their checks are x86_64-linux's. The eager-resolve mode stays planned.
 - `zig build -Dsanitize-thread -Doptimize=ReleaseFast`: a
   ThreadSanitizer build of bs, linked with libc so that the allocator is
   malloc, which ThreadSanitizer intercepts. (std's SafeAllocator, the

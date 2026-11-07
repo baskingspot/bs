@@ -1,5 +1,5 @@
 //! signal: ABRT
-//! targets: x86_64-linux aarch64-linux
+//! targets: x86_64-linux aarch64-linux aarch64-macos
 //! rebuild-without: "y: u16 = 2,\n"
 //! stderr-contains: "panic: boom\n"
 //! stderr-contains: "edit_field_lines.zig:23:16: 0x"
