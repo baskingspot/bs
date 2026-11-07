@@ -17,6 +17,11 @@ cd "$work"
 cp "$src"/macho_main.c "$src"/macho_member.c "$src"/macho_other.c "$src"/tls.c "$src"/libc_main.zig "$src"/libc.c "$src"/force_undefined.c "$src"/force_undefined.zig .
 export BS_ZIG="$zig"
 
+# In-place `sed` that BSD's (macOS) and GNU's (CI's Nix shell) both take.
+subst() {
+    sed "$1" "$2" >"$2.new" && mv "$2.new" "$2"
+}
+
 fail() {
     echo "bs aarch64-macos link input cache check failed: $1" >&2
     [ -f log ] && cat log >&2
@@ -97,24 +102,24 @@ build "no manifest" "126 712 hello 42 7"
 build "not relinking" "126 712 hello 42 7"
 rm -rf main main.dSYM
 build "no input changed; relinked" "126 712 hello 42 7"
-sed -i '' 's/{d} {d} {s} {d}\\n/{d} {d} {s} {d}!\\n/' main.zig
+subst 's/{d} {d} {s} {d}\\n/{d} {d} {s} {d}!\\n/' main.zig
 build "inputs changed, first $work/main.zig" "126 712 hello 42 7!"
 lazy "the Zig code changed"
 # Only an object changed: it relinks with the last build's atoms.
-sed -i '' 's/hello %d/HELLO %d/' greet.c
+subst 's/hello %d/HELLO %d/' greet.c
 objects
 build "1 link inputs changed and nothing else; relinked" "126 712 HELLO 42 7!"
 # An archive member changed.
-sed -i '' 's/second = 41/second = 40/' macho_member.c
+subst 's/second = 41/second = 40/' macho_member.c
 objects
 build "1 link inputs changed and nothing else; relinked" "123 712 HELLO 42 7!"
 # The changed object imports another name: a build.
-sed -i '' 's/return buf; }/puts(""); return buf; }/' greet.c
+subst 's/return buf; }/puts(""); return buf; }/' greet.c
 objects
 build "not relinking: the changed objects need other" "123 712 HELLO 42 7!"
 # Without BS_CACHE_VERIFY, a lazy edit build leaves a log; a relink from
 # it links what the edit build did.
-sed -i '' 's/{d}!\\n/{d}?\\n/' main.zig
+subst 's/{d}!\\n/{d}?\\n/' main.zig
 BS_CACHE_TIMING=1 "$bs" $args --cache-dir local --global-cache-dir global -femit-bin=main >cached.log 2>&1 || fail "an edit without verifying"
 lazy "an edit without verifying"
 mkdir edited
@@ -128,18 +133,18 @@ codesign --verify --strict main 2>>log || fail "the relink from the log's signat
 # A C source with -lc: its object is a link input.
 args="build-exe -lc libc_main.zig libc.c"
 build "no manifest" "1 123"
-sed -i '' 's/return 2 \* x/return 3 * x/' libc_main.zig
+subst 's/return 2 \* x/return 3 * x/' libc_main.zig
 build "inputs changed, first $work/libc_main.zig" "x=21 twice=63"
 lazy "-lc: the Zig code changed"
-sed -i '' 's/x=%d/X=%d/' libc.c
+subst 's/x=%d/X=%d/' libc.c
 build "1 link inputs changed and nothing else; relinked" "X=21 twice=63"
 # The relink bound the extern slots again without recording them: the
 # next edit build replays eagerly, which records them, rather than fail a
 # lazy link first; the one after it is lazy.
-sed -i '' 's/return 3 \* x/return 4 * x/' libc_main.zig
+subst 's/return 3 \* x/return 4 * x/' libc_main.zig
 build "replaying eagerly: the last relink bound the extern slots" "X=21 twice=84"
 eager "-lc: a Zig edit after a C edit's relink"
-sed -i '' 's/return 4 \* x/return 3 * x/' libc_main.zig
+subst 's/return 4 \* x/return 3 * x/' libc_main.zig
 build "inputs changed, first $work/libc_main.zig" "X=21 twice=63"
 lazy "-lc: a second Zig edit after a C edit's relink"
 
@@ -155,7 +160,7 @@ args="build-exe -lc cmain.o"
 build "no manifest" "c main 42"
 rm -rf main main.dSYM
 build "no input changed; relinked" "c main 42"
-sed -i '' 's/x \* 2/x * 3/' cmain.c
+subst 's/x \* 2/x * 3/' cmain.c
 "$zig" cc -O2 -c cmain.c -o cmain.o
 build "1 link inputs changed and nothing else; relinked" "c main 63"
 
@@ -167,6 +172,6 @@ args="build-exe -lc force_undefined.zig libfu.a --force_undefined _keep_me --for
 build "no manifest" "pulled, keep_me 42"
 rm -rf main main.dSYM
 build "no input changed; relinked" "pulled, keep_me 42"
-sed -i '' 's/return 42/return 40 + 2/' force_undefined.zig
+subst 's/return 42/return 40 + 2/' force_undefined.zig
 build "inputs changed, first $work/force_undefined.zig" "pulled, keep_me 42"
 lazy "--force_undefined: the Zig code changed"
