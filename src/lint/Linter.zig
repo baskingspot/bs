@@ -3452,3 +3452,3389 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !?[]const Diagnostic 
     }
     return list.items;
 }
+
+// Tests: ziglint 0.8.1's Linter tests (src/Linter.zig), ported as they are
+// but for `TestLinter`, which gives them ziglint's API over `run`. The
+// tests of ziglint's semantic mode (Z011, Z027 and the resolver's answers)
+// and the one of a helper bs does not have are listed in test/lint/README.md.
+
+/// ziglint's per-rule switches, for the tests that set them.
+const Config = struct { rules: rules.Rule.Config = .{} };
+
+/// ziglint's `Linter` test API: `init`, `lint`, `diagnostics`,
+/// `diagnosticCount`, `deinit`. A parse error is a Z003 finding, and the
+/// config's switches (ziglint's defaults without one) drop findings, as
+/// ziglint's report does.
+const TestLinter = struct {
+    arena: *std.heap.ArenaAllocator,
+    source: [:0]const u8,
+    path: []const u8,
+    config: Config,
+    diagnostics: std.ArrayList(Diagnostic) = .empty,
+
+    fn init(gpa: std.mem.Allocator, source: [:0]const u8, path: []const u8, config: ?*const Config) TestLinter {
+        const arena = gpa.create(std.heap.ArenaAllocator) catch @panic("OOM");
+        arena.* = .init(gpa);
+        return .{ .arena = arena, .source = source, .path = path, .config = if (config) |c| c.* else .{} };
+    }
+
+    fn deinit(t: *TestLinter) void {
+        const gpa = t.arena.child_allocator;
+        t.arena.deinit();
+        gpa.destroy(t.arena);
+        t.* = undefined;
+    }
+
+    fn lint(t: *TestLinter) void {
+        const a = t.arena.allocator();
+        const tree = Ast.parse(a, t.source, .{ .mode = .zig }) catch @panic("OOM");
+        if (tree.errors.len != 0) {
+            for (tree.errors) |err| {
+                var message: std.Io.Writer.Allocating = .init(a);
+                tree.renderError(err, &message.writer) catch @panic("OOM");
+                const loc = tree.tokenLocation(0, err.token);
+                t.diagnostics.append(a, .{ .line = @intCast(loc.line + 1), .column = @intCast(loc.column + 1), .offset = @intCast(loc.line_start + loc.column), .rule = .Z003, .context = message.written() }) catch @panic("OOM");
+            }
+            return;
+        }
+        for (run(a, t.source, tree, t.path)) |d| {
+            const on = switch (d.rule) {
+                inline else => |r| @field(t.config.rules, @tagName(r)).enabled,
+            };
+            const long = d.rule == .Z024 and (std.fmt.parseInt(u32, d.context, 10) catch 0) <= t.config.rules.Z024.max_length;
+            if (on and !long) t.diagnostics.append(a, d) catch @panic("OOM");
+        }
+        // Z024 below the facts' minimum, as the report step does it.
+        if (t.config.rules.Z024.enabled and t.config.rules.Z024.max_length < long_line_min) {
+            var kept: std.ArrayList(Diagnostic) = .empty;
+            for (t.diagnostics.items) |d| if (d.rule != .Z024) kept.append(a, d) catch @panic("OOM");
+            kept.appendSlice(a, longLines(a, t.source, t.config.rules.Z024.max_length)) catch @panic("OOM");
+            t.diagnostics = kept;
+        }
+    }
+
+    fn diagnosticCount(t: *const TestLinter, rule: rules.Rule) usize {
+        var count: usize = 0;
+        for (t.diagnostics.items) |d| count += @intFromBool(d.rule == rule);
+        return count;
+    }
+};
+
+test "Z001: detect PascalCase function" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn MyFunc() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z001));
+}
+
+test "Z001: allow camelCase function" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn myFunc() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
+}
+
+test "Z001: detect snake_case function" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn my_func() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z001));
+}
+
+test "Z001: allow underscore prefix (private)" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn _privateFunc() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
+}
+
+test "Z001: allow single lowercase letter" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn f() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
+}
+
+test "Z002: detect initialized named discard" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() void { const _x = 1; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z002));
+}
+
+test "Z002: allow plain discard _" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() void { _ = bar(); }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z002);
+    }
+}
+
+test "Z002: detect used initialized variable with underscore prefix" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() u32 { const _x = 1; return _x; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z002));
+}
+
+test "Z002: allow double underscore __" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() void { const __x = 1; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z002);
+    }
+}
+
+test "Z003: detect parse error" {
+    var linter: TestLinter = .init(std.testing.allocator, "const x = ", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expect(linter.diagnostics.items.len > 0);
+    try std.testing.expectEqual(rules.Rule.Z003, linter.diagnostics.items[0].rule);
+    try std.testing.expect(linter.diagnostics.items[0].context.len > 0);
+}
+
+test "Z003: valid code no parse error" {
+    var linter: TestLinter = .init(std.testing.allocator, "const x: u32 = 42;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z003));
+}
+
+test "Z004: detect explicit struct init" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Foo = struct {}; fn bar() void { const x = Foo{}; _ = x; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z004));
+}
+
+test "Z004: detect explicit struct init with fields" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Foo = struct { x: u32 }; fn bar() void { const f = Foo{ .x = 1 }; _ = f; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z004));
+}
+
+test "Z004: diagnostic includes declaration name and actual type" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Foo = struct {}; fn bar() void { var item = Foo{}; _ = &item; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |diagnostic| {
+        if (diagnostic.rule == .Z004) {
+            try std.testing.expectEqualStrings("item\x00Foo", diagnostic.context);
+        }
+    }
+}
+
+test "Z004: allow anonymous struct init with type annotation" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Foo = struct {}; fn bar() void { const x: Foo = .{}; _ = x; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z004));
+}
+
+test "Z004: allow anonymous struct init with fields" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Foo = struct { x: u32 }; fn bar() void { const f: Foo = .{ .x = 1 }; _ = f; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z004));
+}
+
+test "Z005: detect lowercase type function" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn myType() type { return struct {}; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z005));
+}
+
+test "Z005: detect snake_case type function" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn my_type() type { return struct {}; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z005));
+}
+
+test "Z005: allow PascalCase type function" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn MyType() type { return struct {}; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z005));
+}
+
+test "Z005: allow PascalCase generic type function" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn ArrayList(comptime T: type) type { return struct {}; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z005));
+}
+
+test "Z006: detect camelCase variable" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() void { const myVar = 1; _ = myVar; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow @Vector type alias" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const chunk_bytes = 32;
+        \\const Chunk = @Vector(chunk_bytes, u8);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow @Frame type alias" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn runner() void {}
+        \\const Runner = @Frame(runner);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow @Struct type alias" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Fields = @Struct(.auto, null, &.{}, &.{}, &.{});
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow @Fn type alias" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn cb(x: u32) void { _ = x; }
+        \\const Callback = @Fn(.auto, .{}, cb, .{});
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z012: pub fn returning @Struct alias is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const Fields = @Struct(.auto, null, &.{}, &.{}, &.{});
+        \\pub fn get() Fields {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn returning @Vector alias is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const Chunk = @Vector(4, u8);
+        \\pub fn get() Chunk {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn returning Self = @This() is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const Self = @This();
+        \\pub fn get() Self {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn returning @TypeOf alias is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn probe() u32 { return 1; }
+        \\pub const Ret = @TypeOf(probe());
+        \\pub fn get() Ret {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z006: detect PascalCase variable (not type)" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() void { const MyVar = 1; _ = MyVar; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow snake_case variable" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() void { const my_var = 1; _ = my_var; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow single lowercase letter" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() void { const x = 1; _ = x; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow underscore prefix" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() void { const _unused: u32 = undefined; _ = _unused; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z006);
+    }
+}
+
+test "Z006: allow type alias with @This()" {
+    var linter: TestLinter = .init(std.testing.allocator, "const MyType = @This();", "MyType.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with @import()" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Foo = @import(\"foo.zig\");", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z006);
+    }
+}
+
+test "Z006: allow type alias with @Type()" {
+    var linter: TestLinter = .init(std.testing.allocator, "const MyType = @Type(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with @TypeOf()" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo(value: anytype) void { const T = @TypeOf(value); _ = T; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with @Int" {
+    // 0.16 replaced @Type with fine-grained constructors; @Int is the one
+    // real code hits most (e.g. a vector mask sized by a comptime constant).
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const vector_chunk_len = 32;
+        \\const VectorMask = @Int(.unsigned, vector_chunk_len);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with @Pointer, @Enum, @Union, @Fn" {
+    // These take 3+ args, so they exercise the .builtin_call path, not just
+    // .builtin_call_two.
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const attrs = .{};
+        \\const SliceT = @Pointer(.slice, attrs, u8, null);
+        \\const LevelT = @Enum(u8, .exhaustive, &.{ "info" }, &.{ 0 });
+        \\const OptT = @Union(.auto, null, &.{ "a" }, &.{ u8 }, &@splat(.{}));
+        \\const FnT = @Fn(.unspecified, .auto, &.{ u8 }, void);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z006);
+    }
+}
+
+test "Z006: allow type alias with @Struct, @Tuple, @FieldType, @EnumLiteral" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const RecT = @Struct(.auto, null, &.{ "a" }, &.{ u8 }, &@splat(.{}));
+        \\const PairT = @Tuple(&.{ u8, u16 });
+        \\const base = struct { x: u32 };
+        \\const XT = @FieldType(base, "x");
+        \\const ScopeT = @EnumLiteral();
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z006);
+    }
+}
+
+test "Z006: flag PascalCase @typeInfo result" {
+    // @typeInfo returns a std.builtin.Type value, not a type: a PascalCase
+    // binding here is a misnamed variable, not a type alias.
+    var linter: TestLinter = .init(std.testing.allocator, "const Info = @typeInfo(u8);", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with struct" {
+    var linter: TestLinter = .init(std.testing.allocator, "const MyStruct = struct { x: u32 };", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with enum" {
+    var linter: TestLinter = .init(std.testing.allocator, "const MyEnum = enum { a, b, c };", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with union" {
+    var linter: TestLinter = .init(std.testing.allocator, "const MyUnion = union { x: u32, y: f32 };", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow error set type" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Oom = error{OutOfMemory};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type function call" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn GenericType(comptime T: type) type { return struct {}; } const MyType = GenericType(u32);", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z006);
+    }
+}
+
+test "Z006: allow type alias with field access ending in PascalCase" {
+    var linter: TestLinter = .init(std.testing.allocator, "const std = @import(\"std\"); const Ast = std.zig.Ast;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: detect field access ending in snake_case" {
+    var linter: TestLinter = .init(std.testing.allocator, "const std = @import(\"std\"); const Thing = std.some_value;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow PascalCase identifier assignment" {
+    var linter: TestLinter = .init(std.testing.allocator, "const MyType = SomeType;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with primitive type" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Days = i32; const Nanoseconds = i128; const Float = f64;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow PascalCase labeled block type alias" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Config = blk: {
+        \\    break :blk @Type(.{ .@"struct" = .{
+        \\        .layout = .auto,
+        \\        .fields = &.{},
+        \\        .decls = &.{},
+        \\        .is_tuple = false,
+        \\    } });
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: detect camelCase labeled block (not type)" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const myValue = blk: {
+        \\    break :blk 42;
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: detect snake_case identifier assignment" {
+    var linter: TestLinter = .init(std.testing.allocator, "const MyThing = some_value;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with array type" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Buffer = [8192]u8;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with sentinel array type" {
+    var linter: TestLinter = .init(std.testing.allocator, "const CString = [*:0]const u8;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with pointer type" {
+    var linter: TestLinter = .init(std.testing.allocator, "const BytePtr = *const u8;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with optional type" {
+    var linter: TestLinter = .init(std.testing.allocator, "const MaybeInt = ?i32;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with error union type" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Result = anyerror!i32;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with function pointer type" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Handler = *const fn (*u8) anyerror!void;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with bare function type" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Callback = fn (i32) void;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow PascalCase comptime if type alias" {
+    var linter: TestLinter = .init(std.testing.allocator, "const ThreadPool = if (true) u32 else void;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: detect camelCase comptime if (not type)" {
+    var linter: TestLinter = .init(std.testing.allocator, "const threadPool = if (true) u32 else void;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow PascalCase switch type alias" {
+    var linter: TestLinter = .init(std.testing.allocator, "const MyType = switch (x) { .a => u32, .b => i32 };", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: detect camelCase switch (not type)" {
+    var linter: TestLinter = .init(std.testing.allocator, "const myValue = switch (x) { .a => 1, .b => 2 };", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow camelCase function alias" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn fooBar() void {} const myAlias = fooBar;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow camelCase function alias with field access" {
+    var linter: TestLinter = .init(std.testing.allocator, "const std = @import(\"std\"); const myAlias = std.someFunc;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "inline ignore: single rule" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() void { const myVar = 1; _ = myVar; } // ziglint-ignore: Z006", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "inline ignore: multiple rules" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn MyFunc() void { const myVar = 1; _ = myVar; } // ziglint-ignore: Z001 Z006", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "inline ignore: only ignores specified rule" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn MyFunc() void {} // ziglint-ignore: Z006", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z001));
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "inline ignore: multiline - only affects that line" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn MyFunc() void {} // ziglint-ignore: Z001
+        \\fn AnotherBad() void {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z001));
+}
+
+test "inline ignore: preceding line comment" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\// ziglint-ignore: Z001
+        \\fn MyFunc() void {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
+}
+
+test "inline ignore: preceding line only affects next line" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\// ziglint-ignore: Z001
+        \\fn MyFunc() void {}
+        \\fn AnotherBad() void {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z001));
+}
+
+test "inline ignore: multiple preceding comment lines" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\// ziglint-ignore: Z001
+        \\// ziglint-ignore: Z006
+        \\fn MyFunc() void { const myVar = 1; _ = myVar; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "inline ignore: multiple preceding with other comments" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\// ziglint-ignore: Z001
+        \\// This function does something important
+        \\// ziglint-ignore: Z006
+        \\fn MyFunc() void { const myVar = 1; _ = myVar; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z007: duplicate import" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const std2 = @import("std");
+        \\const x = std;
+        \\const y = std2;
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var z007_count: usize = 0;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z007) z007_count += 1;
+    }
+    try std.testing.expectEqual(1, z007_count);
+}
+
+test "Z007: different imports allowed" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const foo = @import("foo.zig");
+        \\const x = std;
+        \\const y = foo;
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z007);
+    }
+}
+
+test "Z007: multiple duplicates" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const std2 = @import("std");
+        \\const std3 = @import("std");
+        \\const x = std;
+        \\const y = std2;
+        \\const z = std3;
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var z007_count: usize = 0;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z007) z007_count += 1;
+    }
+    try std.testing.expectEqual(2, z007_count);
+}
+
+test "Z009: file with top-level fields needs PascalCase name" {
+    var linter: TestLinter = .init(std.testing.allocator, "foo: u32 = 0,", "my_module.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z009, linter.diagnostics.items[0].rule);
+}
+
+test "Z009: file with top-level fields and PascalCase name is ok" {
+    var linter: TestLinter = .init(std.testing.allocator, "foo: u32 = 0,", "MyModule.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "Z009: file without top-level fields can be lowercase" {
+    var linter: TestLinter = .init(std.testing.allocator, "const x: u32 = 0;", "main.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z009));
+}
+
+test "Z010: detect explicit struct in return" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() Foo { return Foo{}; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: allow anonymous struct in return" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() Foo { return .{}; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: detect explicit struct in function arg" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn bar(x: Foo) void {} fn foo() void { bar(Foo{}); }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: allow anonymous struct in function arg" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn bar(x: Foo) void {} fn foo() void { bar(.{}); }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: allow explicit struct in anytype function arg" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {};
+        \\fn consume(value: anytype) void { _ = value; }
+        \\fn useFoo() void { consume(Foo{}); }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: allow explicit struct in generic function arg" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {};
+        \\fn consume(comptime T: type, value: T) void { _ = value; }
+        \\fn useFoo() void { consume(Foo, Foo{}); }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: detect explicit enum in return" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() Mode { return Mode.fast; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: allow anonymous enum in return" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo() Mode { return .fast; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: allow field access on non-type (self.field)" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn foo(self: *Self) u32 { return self.value; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z010);
+    }
+}
+
+test "Z011: without semantic context, no Z011 warnings" {
+    const source =
+        \\const MyType = struct {
+        \\    /// Deprecated
+        \\    pub fn oldMethod(self: *@This()) void { _ = self; }
+        \\};
+        \\pub fn main() void {
+        \\    var x: MyType = .{};
+        \\    x.oldMethod();
+        \\}
+    ;
+
+    var linter: TestLinter = .init(std.testing.allocator, source, "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z011);
+    }
+}
+
+test "containsDeprecated" {
+    try std.testing.expect(containsDeprecated("Deprecated: use X instead"));
+    try std.testing.expect(containsDeprecated("deprecated; use X instead"));
+    try std.testing.expect(containsDeprecated("Deprecated, use X instead"));
+    try std.testing.expect(containsDeprecated("Summary\nDeprecated in favor of X"));
+    try std.testing.expect(containsDeprecated("This function is deprecated; use X"));
+    try std.testing.expect(!containsDeprecated("This function is useful"));
+    try std.testing.expect(!containsDeprecated("This function is not deprecated"));
+    try std.testing.expect(!containsDeprecated("Handles deprecated data formats"));
+    try std.testing.expect(!containsDeprecated("deprecation details"));
+}
+
+test "Z012: pub fn returning private type" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\pub fn getPrivate() Private { return .{}; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
+test "Z012: pub fn accepting private type parameter" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\pub fn usePrivate(p: Private) void { _ = p; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
+test "Z012: pub fn returning optional private type" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\pub fn maybePrivate() ?Private { return null; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
+test "Z012: pub fn returning error union with private type" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\pub fn getPrivateOrError() !Private {
+        \\    if (false) return error.Fail;
+        \\    return .{};
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
+test "Z015: pub fn returning private error set" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Oom = error{OutOfMemory};
+        \\pub fn doThing() Oom!void {
+        \\    return error.OutOfMemory;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z015, linter.diagnostics.items[0].rule);
+}
+
+test "Z015: pub error set merged with || is public" {
+    // Composed error sets (`A || B || error{...}`) are pub const type decls;
+    // they were never added to public_types, so every use read as private.
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const frame = @import("frame.zig");
+        \\pub const ParseError = frame.EncodeError || error{ Unexpected };
+        \\pub fn parse() ParseError!void {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z015));
+}
+
+test "Z015: pub error set merged from named aliases is public" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const AcceptError = error{ Bad };
+        \\pub const FlightError = error{ Worse };
+        \\pub const HandleError = AcceptError || FlightError;
+        \\pub fn handle() HandleError!void {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z015));
+}
+
+test "Z015: runtime boolean || is not a type decl" {
+    // A non-pub `||` expression of runtime values must not sneak into
+    // public_types; the exposed set below is still private.
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const ready = true;
+        \\const done = ready || false;
+        \\const Set = error{Bad};
+        \\pub fn f() Set!void {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z015));
+}
+
+test "Z012: pub fn returning public type is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const Public = struct {};
+        \\pub fn getPublic() Public { return .{}; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn using pub type from enclosing struct is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    pub const Inner = struct {};
+        \\    pub fn a(i: Inner) void { _ = i; }
+        \\    pub fn getInner() Inner { return .{}; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn using non-pub type from enclosing struct is error" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    const Inner = struct {};
+        \\    pub fn a(i: Inner) void { _ = i; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
+test "Z012: pub fn in nested container using outer pub types is ok" {
+    // Methods of Connection.Io reference types pub in the *outer* container
+    // (Connection, and Io itself); only the immediate container was searched.
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const Connection = struct {
+        \\    pub const Config = struct { retries: u32 };
+        \\    pub const Io = struct {
+        \\        pub fn get(self: Io, cfg: Config) Config {
+        \\            _ = self;
+        \\            return cfg;
+        \\        }
+        \\    };
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn in nested container using outer non-pub type is error" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const Connection = struct {
+        \\    const Hidden = struct {};
+        \\    pub const Io = struct {
+        \\        pub fn get(h: Hidden) Hidden {
+        \\            return h;
+        \\        }
+        \\    };
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn exposing private type through pointer is error" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Hidden = struct {};
+        \\pub fn take(h: *Hidden) void { _ = h; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn exposing private type through slice and array is error" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Hidden = struct {};
+        \\pub fn take(h: []Hidden) void { _ = h; }
+        \\pub fn takeArr(h: [4]Hidden) void { _ = h; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: self receiver pointer in non-pub container is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    pub fn bar(self: *Foo) void { _ = self; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: non-pub container self reference by value is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    pub fn bar(s: Foo) Foo { return s; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn in tagged union using sibling pub type is ok" {
+    // getContainerMembers only handled struct-shaped containers, so types
+    // pub inside a union(enum) were invisible to the ancestor search.
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const State = union(enum) {
+        \\    idle,
+        \\    pub const Close = struct { backend: bool = false };
+        \\    pub fn extract(self: *const State) Close {
+        \\        _ = self;
+        \\        return .{};
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: Self alias of @This() in enclosing container is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Addr = struct {
+        \\    const Self = @This();
+        \\    port: u16,
+        \\    pub fn format(self: Self) void { _ = self; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn returning builtin type is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn getValue() u32 { return 42; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: non-pub fn returning private type is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\fn getPrivate() Private { return .{}; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: generic parameter with comptime T: type is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn genericFn(comptime T: type) T { return undefined; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public pointer type alias is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const Queue = *anyopaque;
+        \\pub fn getMain() Queue { return undefined; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public comptime block type is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const Key = key: { break :key u32; };
+        \\pub fn getKey() Key { return 0; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public switch type alias is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const MyType = switch (true) { true => u32, false => i32 };
+        \\pub fn getValue() MyType { return 0; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public generic type instantiation is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\pub const MyList = std.ArrayList(u32);
+        \\pub fn getList() MyList { return undefined; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public field access type alias is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\pub const Allocator = std.mem.Allocator;
+        \\pub fn getAllocator() Allocator { return undefined; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public error set is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const MyError = error{ OutOfMemory, InvalidInput };
+        \\pub fn toInt(err: MyError) u32 { _ = err; return 0; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public if expression type is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const MyType = if (true) u32 else i32;
+        \\pub fn getValue() MyType { return 0; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z013: detect unused import" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const foo = @import("foo.zig");
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z013, linter.diagnostics.items[0].rule);
+}
+
+test "Z013: import used via field access is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const mem = std.mem;
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z013);
+    }
+}
+
+test "Z013: discarded import at root should warn" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const _ = @import("foo.zig");
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z013, linter.diagnostics.items[0].rule);
+}
+
+test "Z013: discarded import in test block is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\test {
+        \\    _ = @import("foo.zig");
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z013);
+    }
+}
+
+test "Z013: pub re-export is not unused" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const foo = @import("foo.zig");
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z013);
+    }
+}
+
+test "Z013: import used as identifier is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const foo = @import("foo.zig");
+        \\const bar = foo;
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z013);
+    }
+}
+
+test "Z035: flag qualified use when alias is used elsewhere" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+        \\test "uses alias" {
+        \\    try testing.expect(true);
+        \\}
+        \\
+        \\test "uses long form" {
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+    var found = false;
+    for (linter.diagnostics.items) |diag| {
+        if (diag.rule != .Z035) continue;
+        found = true;
+        try std.testing.expectEqual(9, diag.line);
+        try std.testing.expectEqualStrings("testing\x00std.testing", diag.context);
+    }
+    try std.testing.expect(found);
+}
+
+test "Z035: alias declaration is not reported" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: alias used by name is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+        \\test "example" {
+        \\    try testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: no alias means no diagnostic" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\
+        \\test "example" {
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: alias of a function is matched at full path" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const expect = std.testing.expect;
+        \\
+        \\test "example" {
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+    try std.testing.expectEqualStrings("expect\x00std.testing.expect", linter.diagnostics.items[0].context);
+}
+
+test "Z035: nested aliases produce one diagnostic" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\const expect = std.testing.expect;
+        \\
+        \\test "example" {
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+    try std.testing.expectEqualStrings("expect\x00std.testing.expect", linter.diagnostics.items[0].context);
+}
+
+test "Z035: skip alias-vs-source comparisons in a call" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\
+        \\test "alias matches source" {
+        \\    try std.testing.expect(Allocator == std.mem.Allocator);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: skip alias-vs-source equality outside a call" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\const same = Allocator == std.mem.Allocator;
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: skip comparisons nested inside an assertion call" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+        \\test "alias matches source" {
+        \\    compare(@tagName(std.testing), @tagName(testing));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: mixed use in a call is still reported" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+        \\fn example() void {
+        \\    consume(std.testing.expect);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: mixed use in a declaration is still reported" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+        \\fn example() void {
+        \\    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+        \\    _ = failing;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: namespace alias in a type position" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const mem = std.mem;
+        \\
+        \\fn clone(allocator: std.mem.Allocator) void {
+        \\    _ = allocator;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+    try std.testing.expectEqualStrings("mem\x00std.mem", linter.diagnostics.items[0].context);
+}
+
+test "Z035: pub alias is still usable" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\pub const testing = std.testing;
+        \\
+        \\test "example" {
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: local aliases are not tracked" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\
+        \\test "example" {
+        \\    const testing = std.testing;
+        \\    try testing.expect(true);
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z014: detect snake_case error set" {
+    var linter: TestLinter = .init(std.testing.allocator, "const my_error = error{OutOfMemory};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z014));
+}
+
+test "Z014: allow PascalCase error set" {
+    var linter: TestLinter = .init(std.testing.allocator, "const Oom = error{OutOfMemory};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z014);
+    }
+}
+
+test "Z016: detect compound assert with and" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn foo() void {
+        \\    std.debug.assert(a and b);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z016) {
+            found = true;
+            try std.testing.expectEqualStrings("and", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z016: assert with or is ok (different semantics)" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const assert = @import("std").debug.assert;
+        \\fn foo() void {
+        \\    assert(x or y);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z016);
+    }
+}
+
+test "Z016: simple assert is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn foo() void {
+        \\    std.debug.assert(a);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z016);
+    }
+}
+
+test "Z016: user-defined assert is not rewritten" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn assert(value: bool) void { _ = value; }
+        \\fn check(a: bool, b: bool) void { assert(a and b); }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z016));
+}
+
+test "Z016: user-defined assert method is not rewritten" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Recorder = struct { fn assert(value: bool) void { _ = value; } };
+        \\fn check(a: bool, b: bool) void { Recorder.assert(a and b); }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z016));
+}
+
+test "Z016: detect std debug assert alias" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const assert = @import("std").debug.assert;
+        \\fn check(a: bool, b: bool) void { assert(a and b); }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z016));
+}
+
+test "Z017: detect try in return" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn bar() !u32 {
+        \\    return 1;
+        \\}
+        \\fn foo() !u32 {
+        \\    return try bar();
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z017));
+}
+
+test "Z017: advise hoisting try when optional return payload may need coercion" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Thing = struct {};
+        \\fn allocThing() !Thing {
+        \\    return .{};
+        \\}
+        \\fn foo() !?Thing {
+        \\    return try allocThing();
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z017));
+    for (linter.diagnostics.items) |diagnostic| {
+        if (diagnostic.rule == .Z017) {
+            try std.testing.expectEqualStrings("allocThing()", diagnostic.context);
+        }
+    }
+}
+
+test "Z019: @This() in named struct should warn" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    const Self = @This();
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z019) {
+            found = true;
+            try std.testing.expectEqualStrings("Foo", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z019: @This() in anonymous struct is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn Generic(comptime T: type) type {
+        \\    _ = T;
+        \\    return struct {
+        \\        const Self = @This();
+        \\    };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z019);
+    }
+}
+
+test "Z019: nested named struct should warn" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Outer = struct {
+        \\    const Inner = struct {
+        \\        const Self = @This();
+        \\    };
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z019) {
+            found = true;
+            try std.testing.expectEqualStrings("Inner", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z019: @This() in local struct (inside fn) is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    const Local = struct {
+        \\        const Self = @This();
+        \\    };
+        \\    _ = Local;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z019);
+    }
+}
+
+test "Z019: @This() in local struct (inside test) is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\test {
+        \\    const Local = struct {
+        \\        const Self = @This();
+        \\    };
+        \\    _ = Local;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z019);
+    }
+}
+
+test "Z019: @This() in local struct inside nested if blocks is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    if (true) {
+        \\        if (true) {
+        \\            if (true) {
+        \\                const Local = struct {
+        \\                    const Self = @This();
+        \\                };
+        \\                _ = Local;
+        \\            }
+        \\        }
+        \\    }
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z019);
+    }
+}
+
+test "Z020: inline @This() should warn" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn method() @This() { return undefined; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z020) {
+            found = true;
+            try std.testing.expectEqualStrings("Foo", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z020: inline @This() in anonymous struct recommends Self" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn Wrapper() type {
+        \\    return struct { fn method() @This() { return undefined; } };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z020));
+    for (linter.diagnostics.items) |diagnostic| {
+        if (diagnostic.rule == .Z020) {
+            try std.testing.expectEqualStrings("", diagnostic.context);
+        }
+    }
+}
+
+test "Z020: @This() as function argument is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\test {
+        \\    std.testing.refAllDecls(@This());
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z020);
+    }
+}
+
+test "Z021: file-struct @This() alias should match filename or Self" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const SelfType = @This();
+        \\value: u32,
+    , "Writer.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z021) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z021: file-struct @This() alias matching filename is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Writer = @This();
+        \\value: u32,
+    , "Writer.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z021);
+    }
+}
+
+test "Z021: file-struct @This() alias Self is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Self = @This();
+        \\value: u32,
+    , "Writer.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z021);
+    }
+}
+
+test "Z022: anonymous struct @This() alias should be Self" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn Generic(comptime T: type) type {
+        \\    _ = T;
+        \\    return struct {
+        \\        const This = @This();
+        \\    };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z022) {
+            found = true;
+            try std.testing.expectEqualStrings("This", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z022: anonymous struct @This() alias Self is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn Generic(comptime T: type) type {
+        \\    _ = T;
+        \\    return struct {
+        \\        const Self = @This();
+        \\    };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z022);
+    }
+}
+
+test "Z022: local struct @This() alias should be Self" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    const Local = struct {
+        \\        const This = @This();
+        \\    };
+        \\    _ = Local;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z022) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: argument order - allocator before type param" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn bad(allocator: std.mem.Allocator, comptime T: type) void {
+        \\    _ = .{ allocator, T };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: argument order - io before allocator" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn bad(io: std.Io, allocator: std.mem.Allocator) void {
+        \\    _ = .{ io, allocator };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: argument order - correct order is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn good(comptime T: type, comptime size: usize, allocator: std.mem.Allocator, io: std.Io, value: u32) void {
+        \\    _ = .{ T, size, allocator, io, value };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: receiver param with @This() is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Foo = struct {
+        \\    pub fn bar(self: *@This(), alloc: std.mem.Allocator) void {
+        \\        _ = .{ self, alloc };
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: receiver param with Self is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Foo = struct {
+        \\    const Self = @This();
+        \\    pub fn bar(self: *Self, alloc: std.mem.Allocator) void {
+        \\        _ = .{ self, alloc };
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: non-receiver first param still checked" {
+    // A non-receiver first param does not disable checking of the rest;
+    // the runtime value is position-free, the structural inversion is not.
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn bad(value: u32, io: std.Io, gpa: std.mem.Allocator) void {
+        \\    _ = .{ value, io, gpa };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: multiple violations reported" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn bad(io: std.Io, comptime T: type, alloc: std.mem.Allocator) void {
+        \\    _ = .{ io, T, alloc };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var count: usize = 0;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) count += 1;
+    }
+    try std.testing.expect(count >= 2);
+}
+
+test "Z023: comptime value after allocator is bad" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn bad(alloc: std.mem.Allocator, comptime size: usize) void {
+        \\    _ = .{ alloc, size };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z023));
+}
+
+test "Z023: comptime value before allocator is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn good(comptime size: usize, alloc: std.mem.Allocator) void {
+        \\    _ = .{ size, alloc };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: runtime value before comptime param is ok" {
+    // std.fmt.format(writer, comptime fmt, args): runtime value params take
+    // any position; the rule orders structural params, not prose.
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn writeMetric(writer: u32, comptime name: []const u8) void {
+        \\    _ = .{ writer, name };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z023));
+}
+
+test "Z023: ctx before comptime callback is ok" {
+    // Registration APIs read best as (ctx, comptime cb); the rule must not
+    // force the callback before the context it closes over.
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn watch(ctx: anytype, comptime cb: fn (@TypeOf(ctx)) void) void {
+        \\    _ = .{ ctx, cb };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z023));
+}
+
+test "Z023: io param after runtime value is ok" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn good(path: []const u8, io: std.Io) void {
+        \\    _ = .{ path, io };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z023));
+}
+
+test "Z024: detect line exceeding 120 bytes" {
+    // Line with 121 bytes (11 + 108 + 2)
+    var linter: TestLinter = .init(std.testing.allocator, "const x = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\n", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z024) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z024: allow line with exactly 120 bytes" {
+    // Line with exactly 120 bytes (11 + 107 + 2)
+    var linter: TestLinter = .init(std.testing.allocator, "const x = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\n", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z024) {
+            // Should not find Z024 for exactly 120 bytes
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z024: do not count CRLF terminator" {
+    var linter: TestLinter = .init(std.testing.allocator, "const x = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\r\n", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
+}
+
+test "Z024: allow short line" {
+    var linter: TestLinter = .init(std.testing.allocator, "const x = 1;\n", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z024) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z025: detect catch return" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return bar() catch |err| return err;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z025) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z025: allow catch with different body" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return bar() catch |err| {
+        \\        log.err("{}", .{err});
+        \\        return err;
+        \\    };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z025) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z025: allow catch without payload" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return bar() catch return;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z025) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z025: allow catch returning different value" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return bar() catch |err| return error.Other;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z025) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z025: detect catch return in assignment context" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    const x = bar() catch |err| return err;
+        \\    return x;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z025));
+}
+
+test "Z025: allow catch with discard payload" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return bar() catch |_| return error.Other;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z025));
+}
+
+test "Z025: no false positive on clean code" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return try bar();
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z025));
+}
+
+test "Z026: detect empty catch block" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch {};
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z026: detect empty catch with payload" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch |_| {};
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z026: allow catch in defer" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    defer writer.flush() catch {};
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z026: allow catch in errdefer" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    errdefer writer.flush() catch {};
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z026: allow non-empty catch" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch |err| {
+        \\        log.err("{}", .{err});
+        \\    };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z026: allow catch with @panic" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch |err| {
+        \\        @panic("unexpected");
+        \\    };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z026));
+}
+
+test "Z026: allow catch with unreachable" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch |err| {
+        \\        unreachable;
+        \\    };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z026));
+}
+
+test "Z026: no false positive on clean code" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    try bar();
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z026));
+}
+
+test "Z026: detect multiple empty catches" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch {};
+        \\    baz() catch {};
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z026));
+}
+
+test "Z027: no warning without semantic context" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    const bar = 42;
+        \\};
+        \\const instance: Foo = .{};
+        \\pub fn main() void {
+        \\    _ = instance.bar;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z027) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z029: detect redundant @as in call arg" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo(x: u32) void {
+        \\    _ = x;
+        \\}
+        \\pub fn main() void {
+        \\    foo(@as(u32, 1));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: allow @as with different type in call arg" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo(x: u32) void {
+        \\    _ = x;
+        \\}
+        \\pub fn main() void {
+        \\    foo(@as(u16, 1));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as in array init" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const xs = [_]u32{@as(u32, 1)};
+        \\    _ = xs;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: allow @as with different type in array init" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const xs = [_]u32{@as(u16, 1)};
+        \\    _ = xs;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: multiple args with redundant @as" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn bar(a: u32, b: u32) void {
+        \\    _ = a;
+        \\    _ = b;
+        \\}
+        \\pub fn main() void {
+        \\    bar(@as(u32, 1), @as(u32, 2));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as in struct field init" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    x: u32,
+        \\    y: u32,
+        \\};
+        \\pub fn main() void {
+        \\    const f: Foo = .{ .x = @as(u32, 1), .y = 2 };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: allow @as with different type in struct field init" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    x: u32,
+        \\};
+        \\pub fn main() void {
+        \\    const f: Foo = .{ .x = @as(u16, 1) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as in explicit struct init" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    x: u32,
+        \\};
+        \\pub fn main() void {
+        \\    const f = Foo{ .x = @as(u32, 1) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: no false positive on clean call args" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo(x: u32) void {
+        \\    _ = x;
+        \\}
+        \\pub fn main() void {
+        \\    foo(42);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: skip unresolvable function call" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    unknown_fn(@as(u32, 1));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: skip call with anytype param" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo(x: anytype) void {
+        \\    _ = x;
+        \\}
+        \\pub fn main() void {
+        \\    foo(@as(u32, 1));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect multiple redundant @as in array init" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const xs = [_]u32{ @as(u32, 1), @as(u32, 2), 3 };
+        \\    _ = xs;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: skip array init without type annotation" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const xs = .{ @as(u32, 1), @as(u32, 2) };
+        \\    _ = xs;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect in sized array init" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const xs = [2]u32{ @as(u32, 1), @as(u32, 2) };
+        \\    _ = xs;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: skip struct init without known type" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const f = .{ .x = @as(u32, 1) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect multiple redundant @as in struct fields" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    x: u32,
+        \\    y: u32,
+        \\};
+        \\pub fn main() void {
+        \\    const f: Foo = .{ .x = @as(u32, 1), .y = @as(u32, 2) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: skip struct field with unknown type in container" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const f: UnknownType = .{ .x = @as(u32, 1) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: mixed match and mismatch in call args" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo(a: u32, b: u16) void {
+        \\    _ = a;
+        \\    _ = b;
+        \\}
+        \\pub fn main() void {
+        \\    foo(@as(u32, 1), @as(u32, 2));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z028: inline import in switch" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const builtin = @import("builtin");
+        \\const Backend = switch (builtin.os.tag) {
+        \\    .linux => @import("linux.zig"),
+        \\    .macos => @import("macos.zig"),
+        \\    else => @compileError("unsupported"),
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: inline import in function call" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn foo(x: anytype) void {
+        \\    _ = x;
+        \\}
+        \\pub fn main() void {
+        \\    foo(@import("bar.zig").baz);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: allow top-level const import" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const other = @import("other.zig");
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: disallow import inside function" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const std = @import("std");
+        \\    _ = std;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: allow discard import for pulling in tests" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\test {
+        \\    _ = @import("other.zig");
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: disallow discard import in function" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn load() void {
+        \\    _ = @import("other.zig");
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: allow const import in test block" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\test "example" {
+        \\    const testing = @import("testing.zig");
+        \\    testing.check();
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: allow field access on import" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Rule = @import("rules.zig").Rule;
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: allow chained call on import" {
+    // `@import("log.zig").scoped(.mod)` — the std.log-style scoped logger
+    // idiom with a project-local module. The import still lands in a
+    // top-level const, so it is not inline.
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const log = @import("log.zig").scoped(.my_module);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: import as call argument is still inline" {
+    // The import chain is an *argument* of foo, not the callee —
+    // it must stay flagged even though a call sits in the parent chain.
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const z = foo(@import("bar.zig").baz);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: chained call on import inside function is still inline" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const log = @import("log.zig").scoped(.my_module);
+        \\    _ = log;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z028));
+}
+
+test "Z030: detect missing self.* = undefined in deinit" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        _ = self;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow deinit with self.* = undefined at end" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        self.a = 0;
+        \\        self.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow deinit that destroys self" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator) void {
+        \\        allocator.destroy(self);
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow invalidation before destroying self" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator) void {
+        \\        self.* = undefined;
+        \\        allocator.destroy(self);
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: reject invalidation after destroying self" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator) void {
+        \\        allocator.destroy(self);
+        \\        self.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: reject deferred invalidation when destroying self" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator) void {
+        \\        defer self.* = undefined;
+        \\        allocator.destroy(self);
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: reject deferred invalidation when statements follow self destruction" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator) void {
+        \\        defer self.* = undefined;
+        \\        allocator.destroy(self);
+        \\        cleanup();
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: reject deferred invalidation with self destruction in nested branch" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator, condition: bool) void {
+        \\        if (condition) {
+        \\            defer self.* = undefined;
+        \\            allocator.destroy(self);
+        \\            return;
+        \\        }
+        \\        allocator.destroy(self);
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: reject invalidation after conditional self destruction" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator, condition: bool) void {
+        \\        if (condition) allocator.destroy(self);
+        \\        self.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow return after branch destroys self" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator, condition: bool) void {
+        \\        if (condition) {
+        \\            allocator.destroy(self);
+        \\            return;
+        \\        }
+        \\        allocator.destroy(self);
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow deinit with defer self.* = undefined" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        defer self.* = undefined;
+        \\        cleanup();
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: detect early return without defer" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        if (self.a == 0) return;
+        \\        self.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow early return with defer" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        defer self.* = undefined;
+        \\        if (self.a == 0) return;
+        \\        cleanup();
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow early return after branch invalidation" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        if (self.a == 0) {
+        \\            self.* = undefined;
+        \\            return;
+        \\        }
+        \\        self.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: skip non-pointer receiver deinit" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: Foo) void {
+        \\        _ = self;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: skip non-deinit functions" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn close(self: *Foo) void {
+        \\        _ = self;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: handle different self parameter names" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(s: *Foo) void {
+        \\        s.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: diagnostic uses receiver parameter name" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(value: *Foo) void { _ = value; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+    for (linter.diagnostics.items) |diagnostic| {
+        if (diagnostic.rule == .Z030) {
+            try std.testing.expectEqualStrings("value\x00", diagnostic.context);
+        }
+    }
+}
+
+test "Z031: detect underscore prefix in function" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn _privateFunc() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z031));
+}
+
+test "Z031: detect underscore prefix in variable" {
+    var linter: TestLinter = .init(std.testing.allocator, "const _privateVar: u32 = undefined;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z031));
+}
+
+test "Z031: allow single underscore discard" {
+    var linter: TestLinter = .init(std.testing.allocator, "const _ = 42;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z031));
+}
+
+test "Z031: allow double underscore prefix" {
+    var linter: TestLinter = .init(std.testing.allocator, "const __builtin = 42;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z031));
+}
+
+test "Z031: allow normal names" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn myFunc() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z031));
+}
+
+test "Z032: detect XMLParser" {
+    var linter: TestLinter = .init(std.testing.allocator, "const XMLParser = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: detect HTTPSConnection" {
+    var linter: TestLinter = .init(std.testing.allocator, "const HTTPSConnection = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: detect function with acronym" {
+    var linter: TestLinter = .init(std.testing.allocator, "fn parseXML() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: allow XmlParser" {
+    var linter: TestLinter = .init(std.testing.allocator, "const XmlParser = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: allow two-letter at start" {
+    var linter: TestLinter = .init(std.testing.allocator, "const IoError = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: detect IOError" {
+    var linter: TestLinter = .init(std.testing.allocator, "const IOError = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z032));
+}
+
+test "Z033: disabled by default" {
+    var linter: TestLinter = .init(std.testing.allocator, "const DataManager = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z033));
+}
+
+test "Z033: detect Data when enabled" {
+    const config: Config = .{ .rules = .{ .Z033 = .{ .enabled = true } } };
+    var linter: TestLinter = .init(std.testing.allocator, "const UserData = struct {};", "test.zig", &config);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z033));
+}
+
+test "Z033: detect Manager when enabled" {
+    const config: Config = .{ .rules = .{ .Z033 = .{ .enabled = true } } };
+    var linter: TestLinter = .init(std.testing.allocator, "const StateManager = struct {};", "test.zig", &config);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z033));
+}
+
+test "Z033: detect Context when enabled" {
+    const config: Config = .{ .rules = .{ .Z033 = .{ .enabled = true } } };
+    var linter: TestLinter = .init(std.testing.allocator, "const AppContext = struct {};", "test.zig", &config);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z033));
+}
+
+test "Z033: allow vague words in function names" {
+    const config: Config = .{ .rules = .{ .Z033 = .{ .enabled = true } } };
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn processData() void {}
+        \\fn updateState() void {}
+    , "test.zig", &config);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z033));
+}
+
+test "Z033: allow normal names when enabled" {
+    const config: Config = .{ .rules = .{ .Z033 = .{ .enabled = true } } };
+    var linter: TestLinter = .init(std.testing.allocator, "const Parser = struct {};", "test.zig", &config);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z033));
+}
+
+test "Z034: detect print with literal and empty args" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        \\    try writer.print("hello\n", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect multiline literal" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        \\    try writer.print(
+        \\        \\hello
+        \\        \\world
+        \\    , .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect escaped braces" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        \\    try writer.print("{{}}", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect Io alias" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Io = std.Io;
+        \\fn render(writer: *Io.Writer) !void {
+        \\    try writer.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect top-level typed writer" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\var out: *std.Io.Writer = undefined;
+        \\fn render() !void {
+        \\    try out.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect self.writer field" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Renderer = struct {
+        \\    writer: *std.Io.Writer,
+        \\    fn render(self: *Renderer) !void {
+        \\        try self.writer.print("hello", .{});
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow format placeholders" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) !void {
+        \\    try writer.print("{s}", .{"x"});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow non-empty args" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) !void {
+        \\    try writer.print("hello", .{1});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow writeAll" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) !void {
+        \\    try writer.writeAll("hello");
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow std.debug.print" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render() void {
+        \\    std.debug.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow non-writer print method" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(stringify: *std.json.Stringify) !void {
+        \\    try stringify.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow anytype receiver" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn render(writer: anytype) !void {
+        \\    try writer.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect call in switch prong" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer, value: u32) !void {
+        \\    switch (value) {
+        \\        1 => try writer.print("one", .{}),
+        \\        else => try writer.print("other", .{}),
+        \\    }
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect annotated local writer" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render() !void {
+        \\    var writer: *std.Io.Writer = undefined;
+        \\    try writer.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+// ziglint's doc tests (src/doc_tests.zig): each `zig` block of the rules'
+// docs (docs/rules/*.md at v0.8.1, copied to src/lint/docs/ with
+// ziglint's license) yields the rules its `// expect: ZNNN` lines name,
+// or nothing without one. The `compile-test` probes, which check that a
+// documented replacement compiles, are not run.
+
+const doc_files = [_]struct { []const u8, []const u8 }{
+    .{ "Z001.md", @embedFile("docs/Z001.md") },
+    .{ "Z002.md", @embedFile("docs/Z002.md") },
+    .{ "Z003.md", @embedFile("docs/Z003.md") },
+    .{ "Z004.md", @embedFile("docs/Z004.md") },
+    .{ "Z005.md", @embedFile("docs/Z005.md") },
+    .{ "Z006.md", @embedFile("docs/Z006.md") },
+    .{ "Z007.md", @embedFile("docs/Z007.md") },
+    .{ "Z009.md", @embedFile("docs/Z009.md") },
+    .{ "Z010.md", @embedFile("docs/Z010.md") },
+    .{ "Z011.md", @embedFile("docs/Z011.md") },
+    .{ "Z012.md", @embedFile("docs/Z012.md") },
+    .{ "Z013.md", @embedFile("docs/Z013.md") },
+    .{ "Z014.md", @embedFile("docs/Z014.md") },
+    .{ "Z015.md", @embedFile("docs/Z015.md") },
+    .{ "Z016.md", @embedFile("docs/Z016.md") },
+    .{ "Z017.md", @embedFile("docs/Z017.md") },
+    .{ "Z018.md", @embedFile("docs/Z018.md") },
+    .{ "Z019.md", @embedFile("docs/Z019.md") },
+    .{ "Z020.md", @embedFile("docs/Z020.md") },
+    .{ "Z021.md", @embedFile("docs/Z021.md") },
+    .{ "Z022.md", @embedFile("docs/Z022.md") },
+    .{ "Z023.md", @embedFile("docs/Z023.md") },
+    .{ "Z024.md", @embedFile("docs/Z024.md") },
+    .{ "Z025.md", @embedFile("docs/Z025.md") },
+    .{ "Z026.md", @embedFile("docs/Z026.md") },
+    .{ "Z027.md", @embedFile("docs/Z027.md") },
+    .{ "Z028.md", @embedFile("docs/Z028.md") },
+    .{ "Z029.md", @embedFile("docs/Z029.md") },
+    .{ "Z030.md", @embedFile("docs/Z030.md") },
+    .{ "Z031.md", @embedFile("docs/Z031.md") },
+    .{ "Z032.md", @embedFile("docs/Z032.md") },
+    .{ "Z033.md", @embedFile("docs/Z033.md") },
+    .{ "Z034.md", @embedFile("docs/Z034.md") },
+    .{ "Z035.md", @embedFile("docs/Z035.md") },
+};
+
+test "doc tests" {
+    const gpa = std.testing.allocator;
+    var blocks: usize = 0;
+    var failed: usize = 0;
+    var semantic: usize = 0;
+    for (doc_files) |doc| {
+        const name, const content = doc;
+        var pos: usize = 0;
+        while (std.mem.findPos(u8, content, pos, "```zig\n")) |start| {
+            const code_start = start + 7;
+            const end = std.mem.findPos(u8, content, code_start, "\n```") orelse break;
+            pos = end + 4;
+            const code = content[code_start..end];
+            var expected: std.ArrayList(rules.Rule) = .empty;
+            defer expected.deinit(gpa);
+            var lines = std.mem.splitScalar(u8, code, '\n');
+            while (lines.next()) |line| {
+                const at = std.mem.find(u8, line, "// expect:") orelse continue;
+                var it = std.mem.splitScalar(u8, line[at + 10 ..], ',');
+                while (it.next()) |e| {
+                    if (std.meta.stringToEnum(rules.Rule, std.mem.trim(u8, e, " "))) |r| try expected.append(gpa, r);
+                }
+            }
+            blocks += 1;
+            // Z011's and Z027's examples need Sema (test/lint/README.md).
+            if (std.mem.findScalar(rules.Rule, expected.items, .Z011) != null or std.mem.findScalar(rules.Rule, expected.items, .Z027) != null) {
+                semantic += 1;
+                continue;
+            }
+            const source = try gpa.dupeSentinel(u8, code, 0);
+            defer gpa.free(source);
+            var linter: TestLinter = .init(gpa, source, "doc_test.zig", null);
+            defer linter.deinit();
+            linter.lint();
+            for (expected.items) |r| if (linter.diagnosticCount(r) == 0) {
+                std.debug.print("{s}: expected {s} but got no diagnostic:\n{s}\n", .{ name, r.code(), code });
+                failed += 1;
+            };
+            if (expected.items.len == 0 and linter.diagnostics.items.len != 0) {
+                std.debug.print("{s}: expected no diagnostics:\n{s}\n", .{ name, code });
+                for (linter.diagnostics.items) |d| std.debug.print("  - {s}: {s}\n", .{ d.rule.code(), d.context });
+                failed += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(146, blocks);
+    try std.testing.expectEqual(2, semantic);
+    try std.testing.expectEqual(0, failed);
+}

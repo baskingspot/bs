@@ -3294,6 +3294,8 @@ test {
     _ = @import("diag.zig");
     _ = Ir;
     _ = Emit;
+    _ = Linter;
+    _ = @import("lint/rules.zig");
 }
 
 test "a stub's re-exports are found by name in -F and -L directories first" {
