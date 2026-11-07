@@ -1,7 +1,7 @@
 # ziglint's rules as bs compile errors
 
-Status: design note (2026-11-07), for the owner's review. Nothing is
-built. Written from main 457f2c4 and ziglint v0.8.1
+Status: approved by the owner (2026-11-07), with the decisions listed
+at the end. Written from main 457f2c4 and ziglint v0.8.1
 (rockorager/ziglint f6a3fc2).
 
 The owner's request: bs reads `.ziglint.zon` and enforces ziglint's
@@ -15,7 +15,7 @@ compiles exactly as upstream accepts it.
 This note says where each rule runs, how the config is found and enters
 the cache, what a finding looks like, how parity with ziglint is
 measured, what it may cost, and what changes in AGENTS.md and in bs's CI.
-Open questions for the owner are collected at the end.
+The owner's decisions on the questions it raised are at the end.
 
 ## What ziglint is, in the terms that matter here
 
@@ -173,8 +173,8 @@ referenced code. A function nothing references gets no type-based
 findings. ziglint lints every declaration in a file, so on unreferenced
 code bs reports fewer findings. Code in an untaken comptime branch (`if
 (builtin.os.tag == .windows)` on Linux) is the same. The syntax rules see
-everything. Open question 1 asks whether to analyze unreferenced code in
-covered files.
+everything. Decision 1: bs accepts this gap in v1 and does not analyze
+unreferenced code.
 
 | Rule | What it checks | Where | Difference from ziglint |
 |---|---|---|---|
@@ -294,21 +294,22 @@ its own directory.
 This differs from ziglint, which walks up without limit from its first
 argument, or reads only `./.ziglint.zon` when it has no arguments. The
 `build.zig` boundary keeps a stray `~/.ziglint.zon` from covering every
-project under `~`. Open question 3.
+project under `~`. Decision 3.
 
 **Coverage.** A file is covered when all of the following hold:
 
 1. it is under the config's directory;
 2. it is in the file set ziglint computes from `paths`, using ziglint's
-   own walk rules (dot components, `zig-cache`, `zig-out`, the root
-   `.gitignore` with ziglint's matching);
+   own walk rules (dot components, `zig-cache`, `zig-out`, and the
+   `.gitignore` of the `paths` directory being walked, with ziglint's
+   matching);
 3. it is not under the zig lib directory, the global package cache, or a
    `zig-pkg/` directory;
 4. the build reaches it.
 
 `paths` are taken relative to the config file's directory. ziglint takes
 them relative to the working directory, which is the same thing for a
-config at the root, where every config in the org sits. Open question 2.
+config at the root, where every config in the org sits. Decision 2.
 
 **Dependencies.** No config applies to a dependency's files, neither the
 root package's nor the dependency's own.
@@ -316,8 +317,8 @@ root package's nor the dependency's own.
 **Reached files only.** bs lints the files the build reaches. A covered
 file that no compilation reaches (a stray script, a tool with its own
 `main` that nothing builds) is never checked. ziglint checks it. Under
-`bs build`, the union of all steps is what counts. Open question 4 asks
-whether bs needs a way to check unreached covered files.
+`bs build`, the union of all steps is what counts. Decision 4: such
+files go unchecked in v1; a `bs lint` command can come later.
 
 **A config bs cannot read is a compile error.** That covers a parse
 error, an unknown field, or a rule ID bs does not know. The error points
@@ -385,8 +386,8 @@ src/link/Elf.zig:88:5: error[style, Z017]: avoid try in return; hoist it to pres
   bs-only]`). Z011 is `deprecated`. Every other rule is `style`. An agent
   grepping `Z026` finds the rule, and the ignore comment needs the ID.
   JSON lines gain `"rule": "Z026"`, with `"code": "style"`. Over
-  `--listen=-` the prefix is `[style Z026]`. Open question 5 asks about
-  the code names.
+  `--listen=-` the prefix is `[style Z026]`. Decision 5 settled these
+  code names.
 - **The location** is the span ziglint reports at, with its column. ziglint
   prints no column.
 - **The facts:**
@@ -482,7 +483,7 @@ file and the improvements spot-checked by hand. The trees:
   aho-corasick, bencode, json5, toml, cli, testingx, stdx, fastmem,
   docgen, html, zigdoc-poc, incubate-probe. The proposal is to add those
   that build with 0.17.1 to the corpus, pinned like the others, as the
-  parity set. Open question 6.
+  parity set. Decision 6.
 - **Wider precision, not a gate.** A synthesized default config
   (`paths = .{"src"}`, every rule on) over every corpus project. It
   reports `bug` differences across far more code than the org writes.
@@ -617,34 +618,23 @@ at bs, is the owner's call after parity. This note assumes neither.
 Each of these is a deliberate difference from ziglint and would be
 logged in `parity.py` as `sema-type`.
 
-## Open questions for the owner
+## The owner's decisions (2026-11-07)
 
-1. **Unreferenced code and the type rules.** Sema analyzes only what is
-   referenced, so Z010, Z011, Z027, Z029 and Z034 miss unreferenced
-   functions and untaken comptime branches, which ziglint lints.
-   Accepting that keeps the cost at zero. The alternative is to analyze
-   unreferenced non-generic functions in covered files in a lint-only
-   mode: their semantic errors discarded, no code generated. That is the
-   `-fanalyze-unreferenced` idea from the Diagnostics section, which was
-   not adopted. On libvaxis it found 4 real latent bugs among 27 errors.
-   It would cost a share of a full analysis of the covered files.
-   Recommendation: accept the gap for the first version, and measure the
-   lint-only mode's cost on bs's tree.
-2. **`paths` relative to the config's directory** rather than the working
-   directory (ziglint's behavior). It is the same for every config in the
-   org today.
-3. **The discovery boundary** at the nearest `build.zig`. ziglint has none.
-4. **Unreached covered files.** bs lints compilations, not files. Is a
-   covered file that no step builds acceptable to leave unchecked? Or
-   should bs gain a `bs lint` command that runs the syntax rules on every
-   covered file? Such a command only adds checks, so it is not an escape
-   hatch.
-5. **Codes:** `error[deprecated, Z011]` and `error[style, ZNNN]`, a
-   kebab-case code plus the rule ID. Or the bare rule ID
-   (`error[Z026]`), or one code per rule (`error[empty-catch, Z026]`).
-6. **The parity corpus:** add the baskingspot repositories that have a
-   `.ziglint.zon` and build with 0.17.1 to `tools/corpus/manifest.json`.
-7. **Configs bs cannot read** fail the build instead of falling back to
-   defaults as ziglint does. Should a config with a rule ID from a newer
-   ziglint fail too (proposed), or be accepted with that rule
-   unenforced?
+1. **Unreferenced code and the type rules.** v1 accepts that the type
+   rules (Z010, Z011, Z027, Z029, Z034) see only the code Sema
+   analyzes. There is no lint-only analysis of unreferenced code.
+2. **`paths`** are relative to the config's directory.
+3. **Discovery** walks up from the root file and stops at the nearest
+   `build.zig`.
+4. **Unreached covered files** (no step builds them) go unchecked in v1.
+   A `bs lint` command can come later.
+5. **Codes** are `style` or `deprecated` plus the rule ID:
+   `error[style, Z026]`, `error[deprecated, Z011]`.
+6. **The parity corpus:** the baskingspot repositories that have a
+   `.ziglint.zon` and build with 0.17.1 join `tools/corpus` as the
+   parity set.
+7. **A config naming a rule bs does not know** fails the build.
+
+Still in force: no escape hatch, never lint std or dependencies, and
+the standalone ziglint job stays in CI until parity, when the owner
+decides whether to drop it.

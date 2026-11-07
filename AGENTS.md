@@ -57,10 +57,17 @@ not track upstream: it compiles exactly one pinned Zig release (currently
 - bs's main users are coding agents. Shape compile errors for them, not for
   humans: exact locations, the facts an agent needs to fix the error, and
   fixes where bs knows them, in a form a program can parse.
-- bs may reject more than upstream: extra compile errors that catch real
-  mistakes are allowed. Everything else upstream accepts must still mean the
-  same, and upstream's std and `test/behavior` must still compile, since
-  they are the conformance measure.
+- bs may reject more than upstream in two ways. Extra compile errors that
+  catch real mistakes are allowed. And a project opts in to ziglint's
+  style rules with a `.ziglint.zon`: bs then enforces those rules as
+  compile errors on the files the config's `paths` cover, never on std or
+  on dependencies. `// ziglint-ignore:` comments, part of the config
+  language, are the only exception, and no flag or environment variable
+  reports a finding without failing. ziglint 0.8.1 is the oracle for
+  those rules, as upstream zig is for the language. Without a
+  `.ziglint.zon`, everything upstream accepts must still compile and mean
+  the same, and upstream's std and `test/behavior` must still compile,
+  since they are the conformance measure.
 
 ## Architecture decisions
 
@@ -110,6 +117,11 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   update it in the same change when a boundary moves.
 - Time bs built with `-Doptimize=ReleaseFast`; a Debug build of bs is about
   10x slower and says nothing about bs's speed.
+- The ziglint rules have their own conformance measure: the ported
+  ziglint suite in `test/lint/` and `tools/lint/parity.py` against
+  ziglint 0.8.1 on bs's tree and the corpus's configured projects. Keep
+  both visible. A ziglint release with new rules is ported deliberately,
+  with its tests, by bumping the oracle version.
 - Linux work runs in orbs. Verify aarch64-macos output on a real Mac (a Mac
   satellite for this project), not by inspection alone.
 - The justfile is the command interface: `just test`, `just lint`,

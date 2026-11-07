@@ -9164,8 +9164,10 @@ The owner's review (2026-11-03) settled:
    when a file cannot be lowered, so since 2026-11-04 bs analyzes
    after the others too, with replay; see "AstGen" below.)
 4. No error limit.
-5. No bs-only checks and no `-fanalyze-unreferenced` for now. Their
-   measurements stay below as background, marked not adopted.
+5. No bs-only checks other than the opt-in ziglint rules
+   (docs/slop/ziglint-in-bs.md), and no `-fanalyze-unreferenced`
+   for now. Their measurements stay below as background, marked not
+   adopted.
 6. A failing build commits the manifest for the units that succeeded, so
    the build after an error isn't cold.
 
@@ -9640,7 +9642,8 @@ or a person knows why upstream accepts the program. Checks:
 - have a source-level way out that is valid upstream Zig and states the
   intent (listed per check), plus `-fno-check=<code>` for a whole build.
   There are no suppression comments: ZIR doesn't see comments, and
-  suppressions rot.
+  suppressions rot. (The opt-in ziglint rules are the exception: their
+  `// ziglint-ignore:` comments are part of ziglint's config language.)
 - must cost under 2% of Sema time on the libvaxis workload (a linear
   pass over IR), measured with `BS_TIMING`.
 
