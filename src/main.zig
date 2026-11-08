@@ -536,9 +536,11 @@ pub fn notYetSupported(choice: language.Choice) noreturn {
 /// Exits (`notYetSupported`) unless bs compiles `choice`'s language.
 /// `BS_TEST_LANGUAGE_KEYS` lets a test compile in a language bs cannot
 /// compile yet, with the newest one's frontend and Sema, to check that
-/// its caches are its own (test/language/keys.sh).
+/// its caches are its own (test/language/keys.sh). Until bs compiles Zig
+/// 0.16 in full, `BS_UNFINISHED_0_16` lets the conformance suite and its
+/// tests compile it (docs/slop/zig-0.16.md, phase 2).
 pub fn checkSupported(env: *const std.process.Environ.Map, choice: language.Choice) void {
-    if (choice.language != language.Language.newest and env.get("BS_TEST_LANGUAGE_KEYS") == null) notYetSupported(choice);
+    if (choice.language != language.Language.newest and env.get("BS_TEST_LANGUAGE_KEYS") == null and env.get("BS_UNFINISHED_0_16") == null) notYetSupported(choice);
 }
 
 fn inlining(env: *const std.process.Environ.Map) struct { budget: u32, safe: bool } {

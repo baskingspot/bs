@@ -2340,6 +2340,8 @@ def use_zig_0_16(args):
         args.zig = oracle
     os.environ["BS_ZIG_0_16"] = args.zig
     os.environ["BS_ZIG_VERSION"] = "0.16"
+    # bs refuses 0.16 until it compiles; this measures it meanwhile.
+    os.environ["BS_UNFINISHED_0_16"] = "1"
     if args.test_runner is None and not args.default_runner:
         args.test_runner = HERE / "test_runner_0_16.zig"
 
