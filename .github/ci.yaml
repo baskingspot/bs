@@ -1,7 +1,8 @@
 # x86_64 Linux is first class: tests, lint, and ziglint block. The macOS lane
 # runs the same tests on a real Apple Silicon Mac and does not block until it
 # passes. The conformance measure shows its results and never blocks: it
-# reports a share, not a pass.
+# reports a share, not a pass. It measures upstream's test/behavior and its
+# std tests on every target the runner can run (aarch64-linux under qemu).
 jobs:
   - recipe: test
   - recipe: lint
@@ -10,5 +11,8 @@ jobs:
     blocking: false
   - recipe: ziglint
   - recipe: conformance
+    runners: [ubuntu-26.04, macos-26]
+    blocking: false
+  - recipe: conformance --std
     runners: [ubuntu-26.04, macos-26]
     blocking: false
