@@ -7,11 +7,12 @@
 //! is the synchronization point once function bodies run in parallel.
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
-const Ast = std.zig.Ast;
-const Zir = std.zig.Zir;
+const Ast = frontend.Ast;
+const Zir = frontend.Zir;
 
 const Frontend = @import("Frontend.zig");
 const Language = @import("language.zig").Language;

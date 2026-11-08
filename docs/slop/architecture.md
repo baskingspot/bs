@@ -19,7 +19,15 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
 
 ### Frontend (`src/Frontend.zig`)
 
-- Uses `std.zig.Ast.parse` and `std.zig.AstGen.generate` unchanged.
+- Uses upstream's `Ast.parse` and `AstGen.generate` unchanged, vendored
+  under `frontend/` (the `frontend` module, outside `src/` so that
+  ziglint does not check upstream's code) rather than taken from bs's own
+  std, so that bs can compile a second Zig release
+  (docs/slop/zig-0.16.md). Everything that reads syntax trees or ZIR
+  (Frontend, Sema, the caches, diag, the Linter, fmt, ast-check) takes
+  `frontend.Ast` and `frontend.Zir`; `frontend.errors` holds the
+  ErrorBundle helpers that take them. Configuration files bs reads itself
+  (build.zig.zon's language, `.ziglint.zon`) still parse with std's.
 - Like upstream, lowers every file reachable through `@import` eagerly, so
   syntax errors in unreferenced files are reported the same way upstream
   reports them.
@@ -38,7 +46,10 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
   else the global cache (always for `run`); `--global-cache-dir`,
   `ZIG_GLOBAL_CACHE_DIR`, or `~/.cache/zig`.
   - `<32 hex digits>` (global cache): one source text's ZIR, named by a
-    128-bit hash of the source salted with the Zig version. A header and
+    128-bit hash of the source salted with a hash of the frontend's
+    sources (tools/frontend_hash.zig, run by build.zig) and the Zig
+    version that built bs, so a bs with another AstGen never reads this
+    one's ZIR. A header and
     the file's import names and error flag come first, then the ZIR arrays
     at their natural alignment, so the file is mapped and used in place.
     Written to an unnamed temporary file and linked into place; never

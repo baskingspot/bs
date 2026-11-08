@@ -29,6 +29,7 @@
 //! 64-bit extended values that are truncated back.
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const InternPool = @import("../../InternPool.zig");
@@ -8168,7 +8169,7 @@ pub const GlobalAsm = struct {
     cg: CodeGen,
     locals: LocalLabels = .{},
 
-    pub const Src = struct { file: u32, span: std.zig.Ast.Span };
+    pub const Src = struct { file: u32, span: frontend.Ast.Span };
 
     pub fn init(emit: *Emit, src: Src) GlobalAsm {
         var cg: CodeGen = undefined;

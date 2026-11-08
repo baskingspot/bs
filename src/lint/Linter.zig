@@ -32,7 +32,8 @@
 //! SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 const std = @import("std");
-const Ast = std.zig.Ast;
+const frontend = @import("frontend");
+const Ast = frontend.Ast;
 const rules = @import("rules.zig");
 
 const Linter = @This();

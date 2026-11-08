@@ -18,6 +18,7 @@
 //! the units it does not re-analyze.
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const cache = @import("cache.zig");
@@ -2291,7 +2292,7 @@ pub const Keyer = struct {
         return k.unit_buf.written();
     }
 
-    fn source(file: u32, inst: std.zig.Zir.Inst.Index) Manifest.Source {
+    fn source(file: u32, inst: frontend.Zir.Inst.Index) Manifest.Source {
         return .{ .input = file, .inst = @backingInt(inst) };
     }
 
@@ -2300,7 +2301,7 @@ pub const Keyer = struct {
         return source(ns.file, k.zcu.ip.containerType(ns.owner_type).?.zir_inst);
     }
 
-    fn srcHash(k: *Keyer, file: u32, inst: std.zig.Zir.Inst.Index) Hash {
+    fn srcHash(k: *Keyer, file: u32, inst: frontend.Zir.Inst.Index) Hash {
         return seeds.srcHash(&k.zcu.file(file).zir, inst);
     }
 

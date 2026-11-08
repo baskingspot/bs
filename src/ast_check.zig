@@ -5,11 +5,12 @@
 //! contributors. MIT licensed (see LICENSE-ZIG).
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Io = std.Io;
 const mem = std.mem;
 const process = std.process;
 const Allocator = std.mem.Allocator;
-const Ast = std.zig.Ast;
+const Ast = frontend.Ast;
 const Color = std.zig.Color;
 const fatal = std.process.fatal;
 
@@ -88,14 +89,14 @@ pub fn run(arena: Allocator, io: Io, args: []const []const u8) !void {
     var wip_errors: std.zig.ErrorBundle.Wip = try .init(arena);
     switch (mode) {
         .zig => {
-            const zir = try std.zig.AstGen.generate(arena, tree);
+            const zir = try frontend.AstGen.generate(arena, tree);
             if (zir.hasCompileErrors())
-                try wip_errors.addZirErrorMessages(zir, tree, source, display_path);
+                try frontend.errors.addZirErrorMessages(&wip_errors, zir, tree, source, display_path);
         },
         .zon => {
-            const zoir = try std.zig.ZonGen.generate(arena, tree, .{});
+            const zoir = try frontend.ZonGen.generate(arena, tree, .{});
             if (zoir.hasCompileErrors())
-                try wip_errors.addZoirErrorMessages(zoir, tree, source, display_path);
+                try frontend.errors.addZoirErrorMessages(&wip_errors, zoir, tree, source, display_path);
         },
     }
     var error_bundle = try wip_errors.toOwnedBundle("");

@@ -31,6 +31,34 @@ pub fn build(b: *std.Build) void {
         .link_libc = if (sanitize_thread) true else null,
     });
     exe_mod.addOptions("build_options", options);
+    // Upstream's parser and AstGen, vendored (frontend/frontend.zig): a
+    // module of their own, outside src/, which ziglint checks as bs's code.
+    const frontend: std.Build.Module.Import = .{ .name = "frontend", .module = b.createModule(.{
+        .root_source_file = b.path("frontend/frontend.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) };
+    exe_mod.addImport(frontend.name, frontend.module);
+    // A hash of the frontend's sources, which the ZIR cache's keys include:
+    // ZIR one AstGen wrote is not reused by a bs with another.
+    const frontend_hash = b.addRunArtifact(b.addExecutable(.{ .name = "frontend_hash", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/frontend_hash.zig"),
+        .target = b.graph.host,
+    }) }));
+    frontend_hash.addDirectoryArg(b.path("frontend"));
+    const frontend_hash_zig = frontend_hash.addOutputFileArg("frontend_hash.zig");
+    _ = frontend_hash.addDepFileOutputArg("frontend_hash.d");
+    frontend.module.addAnonymousImport("frontend_hash", .{ .root_source_file = frontend_hash_zig });
+    // The same for the ReleaseFast tools below: a module's own optimize mode
+    // decides its unions' layout, and std's runtime_safety follows the
+    // root's, so a Debug frontend under a ReleaseFast root fails Ast's
+    // size check.
+    const frontend_fast: std.Build.Module.Import = .{ .name = "frontend", .module = b.createModule(.{
+        .root_source_file = b.path("frontend/frontend.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }) };
+    frontend_fast.module.addAnonymousImport("frontend_hash", .{ .root_source_file = frontend_hash_zig });
     // The autodocs viewer `-femit-docs` writes (src/Docs.zig).
     const docs_wasm = docsWasm(b, zig_lib_dir);
     exe_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
@@ -65,6 +93,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = if (sanitize_thread) true else null,
     });
     test_mod.addOptions("build_options", options);
+    test_mod.addImport(frontend.name, frontend.module);
     test_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
     test_mod.addAnonymousImport("build_web_wasm", .{ .root_source_file = build_web_wasm });
     test_mod.addImport("fetch", fetch);
@@ -161,17 +190,20 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/bench_link.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .imports = &.{frontend_fast},
     }) });
     const bench_intern = b.addExecutable(.{ .name = "bench-intern", .root_module = b.createModule(.{
         .root_source_file = b.path("src/bench_intern.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .imports = &.{frontend_fast},
     }) });
     b.step("bench-intern", "Measure InternPool get() throughput on a Sema-like key mix").dependOn(&b.addRunArtifact(bench_intern).step);
     const bench_cache = b.addExecutable(.{ .name = "bench-cache", .root_module = b.createModule(.{
         .root_source_file = b.path("src/bench_cache.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .imports = &.{frontend_fast},
     }) });
     b.step("bench-cache", "Measure cache storage: manifest, pack, relink from the pack, global store").dependOn(&b.addRunArtifact(bench_cache).step);
     const bench_link_run = b.addRunArtifact(bench_link);
@@ -186,6 +218,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     bench_bs_mod.addOptions("build_options", options);
+    bench_bs_mod.addImport(frontend_fast.name, frontend_fast.module);
     bench_bs_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
     bench_bs_mod.addAnonymousImport("build_web_wasm", .{ .root_source_file = build_web_wasm });
     bench_bs_mod.addImport("fetch", fetch);

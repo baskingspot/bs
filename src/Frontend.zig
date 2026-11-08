@@ -1,5 +1,5 @@
-//! Source to ZIR. Loads the root file, parses it with `std.zig.Ast`, lowers it
-//! with `std.zig.AstGen`, and follows its `@import`s until every reachable
+//! Source to ZIR. Loads the root file, parses it with `frontend.Ast`, lowers it
+//! with `frontend.AstGen`, and follows its `@import`s until every reachable
 //! file has ZIR. Like upstream, this happens eagerly for all reachable files;
 //! semantic analysis later touches only what it references.
 //!
@@ -17,12 +17,13 @@
 //! which thread lowered what.
 
 const std = @import("std");
+const frontend = @import("frontend");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const Ast = std.zig.Ast;
-const Zir = std.zig.Zir;
-const AstGen = std.zig.AstGen;
+const Ast = frontend.Ast;
+const Zir = frontend.Zir;
+const AstGen = frontend.AstGen;
 const assert = std.debug.assert;
 const LintConfig = @import("lint/Config.zig");
 const Linter = @import("lint/Linter.zig");
@@ -1238,8 +1239,8 @@ comptime {
 }
 
 /// The seed of the hashes that name cached ZIR and index it by path: the
-/// Zig version whose AstGen produced it.
-const zir_salt = std.hash.Wyhash.hash(0, "bs zir " ++ builtin.zig_version_string);
+/// sources of the AstGen that produced it, and the Zig that built them.
+const zir_salt = std.hash.Wyhash.hash(frontend.source_hash, "bs zir " ++ builtin.zig_version_string);
 
 /// Names cached ZIR: two seeded Wyhash passes, salted with `zir_salt`. Not
 /// cryptographic; twice as fast as Blake3, which took 5% of a cold build's
@@ -1711,7 +1712,7 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
         // Not `f.zir.hasCompileErrors()`: that would fault in a page of every file.
         if (!job.has_errors) continue;
         const syntax = try fe.syntaxOf(@fromBackingInt(@intCast(index)));
-        try errors.addZirErrorMessages(f.zir, syntax.tree, syntax.source, f.display_path);
+        try frontend.errors.addZirErrorMessages(errors, f.zir, syntax.tree, syntax.source, f.display_path);
         if (f.zir.loweringFailed()) ok = false;
     }
 
@@ -1750,9 +1751,9 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
     return ok;
 }
 
-/// A file's key in the stat index, salted with `zir_salt`: a bs built
-/// with another Zig release (another AstGen) keeps its own entries rather
-/// than taking this one's content hash for a file it hashes differently.
+/// A file's key in the stat index, salted with `zir_salt`: a bs with
+/// another AstGen keeps its own entries rather than taking this one's
+/// content hash for a file it hashes differently.
 fn pathHash(mod: *const Module, sub_path: []const u8) u64 {
     var h: std.hash.Wyhash = .init(zir_salt);
     h.update(mod.abs_root_dir.?);
@@ -2103,7 +2104,7 @@ fn tokenLoc(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, job: *const Job, to
         else => return .none,
     };
     defer gpa.free(src);
-    var tokenizer: std.zig.Tokenizer = .init(src);
+    var tokenizer: frontend.Tokenizer = .init(src);
     var tok = tokenizer.next();
     for (0..t) |_| tok = tokenizer.next();
     const lc = std.zig.findLineColumn(src, tok.loc.start);

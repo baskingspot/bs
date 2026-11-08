@@ -4,6 +4,7 @@
 //! LICENSE-ZIG).
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Io = std.Io;
 const mem = std.mem;
 const process = std.process;
@@ -121,7 +122,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8) !
         };
         defer gpa.free(source_code);
 
-        var tree = std.zig.Ast.parse(gpa, source_code, .{
+        var tree = frontend.Ast.parse(gpa, source_code, .{
             .mode = if (force_zon) .zon else .zig,
         }) catch |err| {
             fatal("error parsing stdin: {}", .{err});
@@ -130,26 +131,26 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8) !
 
         if (check_ast_flag) {
             if (!force_zon) {
-                var zir = try std.zig.AstGen.generate(gpa, tree);
+                var zir = try frontend.AstGen.generate(gpa, tree);
                 defer zir.deinit(gpa);
 
                 if (zir.hasCompileErrors()) {
                     var wip_errors: std.zig.ErrorBundle.Wip = try .init(gpa);
                     defer wip_errors.deinit();
-                    try wip_errors.addZirErrorMessages(zir, tree, source_code, "<stdin>");
+                    try frontend.errors.addZirErrorMessages(&wip_errors, zir, tree, source_code, "<stdin>");
                     var error_bundle = try wip_errors.toOwnedBundle("");
                     defer error_bundle.deinit(gpa);
                     error_bundle.renderToStderr(io, .{}, color) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
                     process.exit(2);
                 }
             } else {
-                const zoir = try std.zig.ZonGen.generate(gpa, tree, .{});
+                const zoir = try frontend.ZonGen.generate(gpa, tree, .{});
                 defer zoir.deinit(gpa);
 
                 if (zoir.hasCompileErrors()) {
                     var wip_errors: std.zig.ErrorBundle.Wip = try .init(gpa);
                     defer wip_errors.deinit();
-                    try wip_errors.addZoirErrorMessages(zoir, tree, source_code, "<stdin>");
+                    try frontend.errors.addZoirErrorMessages(&wip_errors, zoir, tree, source_code, "<stdin>");
                     var error_bundle = try wip_errors.toOwnedBundle("");
                     defer error_bundle.deinit(gpa);
                     error_bundle.renderToStderr(io, .{}, color) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
@@ -157,7 +158,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8) !
                 }
             }
         } else if (tree.errors.len != 0) {
-            std.zig.printAstErrorsToStderr(gpa, io, tree, "<stdin>", color) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
+            frontend.errors.printAstErrorsToStderr(gpa, io, tree, "<stdin>", color) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
             process.exit(2);
         }
         const formatted = try tree.renderAlloc(gpa);
@@ -310,17 +311,17 @@ fn fmtPathFile(
     // Add to set after no longer possible to get error.IsDir.
     if (try fmt.seen.fetchPut(stat.inode, {})) |_| return;
 
-    const mode: std.zig.Ast.Mode = mode: {
+    const mode: frontend.Ast.Mode = mode: {
         if (fmt.force_zon) break :mode .zon;
         if (mem.endsWith(u8, sub_path, ".zon")) break :mode .zon;
         break :mode .zig;
     };
 
-    var tree = try std.zig.Ast.parse(gpa, source_code, .{ .mode = mode });
+    var tree = try frontend.Ast.parse(gpa, source_code, .{ .mode = mode });
     defer tree.deinit(gpa);
 
     if (tree.errors.len != 0) {
-        try std.zig.printAstErrorsToStderr(gpa, io, tree, file_path, fmt.color);
+        try frontend.errors.printAstErrorsToStderr(gpa, io, tree, file_path, fmt.color);
         fmt.any_error = true;
         return;
     }
@@ -331,13 +332,13 @@ fn fmtPathFile(
 
         switch (mode) {
             .zig => {
-                var zir = try std.zig.AstGen.generate(gpa, tree);
+                var zir = try frontend.AstGen.generate(gpa, tree);
                 defer zir.deinit(gpa);
 
                 if (zir.hasCompileErrors()) {
                     var wip_errors: std.zig.ErrorBundle.Wip = try .init(gpa);
                     defer wip_errors.deinit();
-                    try wip_errors.addZirErrorMessages(zir, tree, source_code, file_path);
+                    try frontend.errors.addZirErrorMessages(&wip_errors, zir, tree, source_code, file_path);
                     var error_bundle = try wip_errors.toOwnedBundle("");
                     defer error_bundle.deinit(gpa);
                     try error_bundle.renderToStderr(io, .{}, fmt.color);
@@ -345,13 +346,13 @@ fn fmtPathFile(
                 }
             },
             .zon => {
-                var zoir = try std.zig.ZonGen.generate(gpa, tree, .{});
+                var zoir = try frontend.ZonGen.generate(gpa, tree, .{});
                 defer zoir.deinit(gpa);
 
                 if (zoir.hasCompileErrors()) {
                     var wip_errors: std.zig.ErrorBundle.Wip = try .init(gpa);
                     defer wip_errors.deinit();
-                    try wip_errors.addZoirErrorMessages(zoir, tree, source_code, file_path);
+                    try frontend.errors.addZoirErrorMessages(&wip_errors, zoir, tree, source_code, file_path);
                     var error_bundle = try wip_errors.toOwnedBundle("");
                     defer error_bundle.deinit(gpa);
                     try error_bundle.renderToStderr(io, .{}, fmt.color);

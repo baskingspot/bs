@@ -11,6 +11,7 @@
 //! (see "Parallel function bodies" in docs/slop/architecture.md).
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Allocator = std.mem.Allocator;
 const InternPool = @import("InternPool.zig");
 const Index = InternPool.Index;
@@ -1423,7 +1424,7 @@ pub fn exportsView(emit: *const Emit) ExportsView {
 }
 
 /// `Zcu.addError`, from CodeGen: a worker keeps the error for the merge.
-pub fn addError(emit: *Emit, file_index: u32, span: std.zig.Ast.Span, comptime fmt: []const u8, args: anytype) !void {
+pub fn addError(emit: *Emit, file_index: u32, span: frontend.Ast.Span, comptime fmt: []const u8, args: anytype) !void {
     if (!emit.is_worker) {
         const zcu = emit.zcu;
         return zcu.errors.append(zcu.gpa, .{

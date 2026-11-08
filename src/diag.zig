@@ -4,6 +4,7 @@
 //! docs/slop/architecture.md for the output form and its rules.
 
 const std = @import("std");
+const frontend = @import("frontend");
 const build_options = @import("build_options");
 const Writer = std.Io.Writer;
 
@@ -637,7 +638,7 @@ pub fn typeInfoFix(arena: std.mem.Allocator, name: []const u8, names: []const []
         } else try snake.append(arena, c);
     }
     for (names) |n| if (std.mem.eql(u8, n, snake.items)) {
-        const text = if (std.zig.Token.getKeyword(n) != null) try arena.print("@\"{s}\"", .{n}) else n;
+        const text = if (frontend.Token.getKeyword(n) != null) try arena.print("@\"{s}\"", .{n}) else n;
         const fix = try rawFix(arena, .exact, &.{.{ .start = start, .end = @intCast(start + name.len), .text = text }});
         return fix;
     };
@@ -1060,7 +1061,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
 // ---------------------------------------------------------------------------
 // Fixes (step 5)
 
-const Ast = std.zig.Ast;
+const Ast = frontend.Ast;
 
 /// The fix for AstGen error `code` with message `msg` at byte `main` of
 /// `tree`'s source, if bs knows one.
@@ -1202,7 +1203,7 @@ pub fn tryFix(arena: std.mem.Allocator, tree: *const Ast, start: u32, end: u32, 
 /// an optional, `catch` for an `orelse` of an error union. Null when `at`
 /// is not that keyword, or for a `catch` with an error capture, whose body
 /// needs the error.
-pub fn keywordFix(arena: std.mem.Allocator, tree: *const Ast, at: u32, from: std.zig.Token.Tag, to: []const u8) !?RawFix {
+pub fn keywordFix(arena: std.mem.Allocator, tree: *const Ast, at: u32, from: frontend.Token.Tag, to: []const u8) !?RawFix {
     const tok = tokenAt(tree, at) orelse return null;
     if (tree.tokenTag(tok) != from or (tok + 1 < tree.tokens.len and tree.tokenTag(tok + 1) == .pipe)) return null;
     const fix = try rawFix(arena, .maybe, &.{.{ .start = at, .end = tokenEnd(tree, tok), .text = to }});
@@ -2665,9 +2666,9 @@ test "every Sema, linker and backend error format has a code" {
     var missing: usize = 0;
     inline for (.{ "Sema.zig", "Zcu.zig", "Emit.zig" }) |name| {
         const src: [:0]const u8 = @embedFile(name);
-        var tokens: std.ArrayList(std.zig.Token) = .empty;
+        var tokens: std.ArrayList(frontend.Token) = .empty;
         defer tokens.deinit(gpa);
-        var it: std.zig.Tokenizer = .init(src);
+        var it: frontend.Tokenizer = .init(src);
         while (true) {
             const t = it.next();
             if (t.tag == .eof) break;

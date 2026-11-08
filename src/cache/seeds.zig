@@ -27,8 +27,9 @@
 //! - without the old ZIR, every node of the input is a seed.
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Allocator = std.mem.Allocator;
-const Zir = std.zig.Zir;
+const Zir = frontend.Zir;
 const Frontend = @import("../Frontend.zig");
 const Manifest = @import("Manifest.zig");
 const Tag = @import("../Incremental.zig").Tag;

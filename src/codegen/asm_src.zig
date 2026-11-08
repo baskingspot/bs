@@ -3,8 +3,9 @@
 //! function (both backends' `fail`).
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Allocator = std.mem.Allocator;
-const Ast = std.zig.Ast;
+const Ast = frontend.Ast;
 const InternPool = @import("../InternPool.zig");
 const Zcu = @import("../Zcu.zig");
 const Atom = @import("../link/Atom.zig");
@@ -58,7 +59,7 @@ pub fn find(zcu: *Zcu, func: InternPool.Index, inl: ?Atom.Debug.Inline, files: [
 }
 
 /// The token that closes the parentheses after `asm` token `t`.
-fn closes(tags: []const std.zig.Token.Tag, t: u32) u32 {
+fn closes(tags: []const frontend.Token.Tag, t: u32) u32 {
     var k = t + 1;
     if (k < tags.len and tags[k] == .keyword_volatile) k += 1;
     var depth: u32 = 0;

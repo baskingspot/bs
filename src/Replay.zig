@@ -12,9 +12,10 @@
 //! a whole new manifest from it as a full build does.
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const Zir = std.zig.Zir;
+const Zir = frontend.Zir;
 const cache = @import("cache.zig");
 const inline_ir = @import("codegen/inline.zig");
 const Manifest = cache.Manifest;

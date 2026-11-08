@@ -4,6 +4,7 @@
 //! Sema gives inline calls. Target-independent; Emit schedules it.
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Allocator = std.mem.Allocator;
 const InternPool = @import("../InternPool.zig");
 const Index = InternPool.Index;
@@ -12,7 +13,7 @@ const Inst = Ir.Inst;
 const Type = @import("../Type.zig");
 const Zcu = @import("../Zcu.zig");
 const Incremental = @import("../Incremental.zig");
-const Zir = std.zig.Zir;
+const Zir = frontend.Zir;
 
 /// The most instructions with hot code (`Scan.size`) a body inlined at a
 /// call outside loops has, after its own callees are inlined.

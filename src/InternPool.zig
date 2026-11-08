@@ -17,10 +17,11 @@
 //! `static_len` is also an InternPool index.
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
-const Zir = std.zig.Zir;
+const Zir = frontend.Zir;
 const BigIntConst = std.math.big.int.Const;
 const Limb = std.math.big.Limb;
 

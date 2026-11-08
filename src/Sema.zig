@@ -11,12 +11,13 @@
 //! "Comptime memory" section.
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
-const Ast = std.zig.Ast;
+const Ast = frontend.Ast;
 const Linter = @import("lint/Linter.zig");
 const lint_rules = @import("lint/rules.zig");
-const Zir = std.zig.Zir;
+const Zir = frontend.Zir;
 const BigInt = std.math.big.int.Managed;
 const BigIntConst = std.math.big.int.Const;
 
@@ -7753,7 +7754,7 @@ fn importZon(sema: *Sema, block: *Block, src: Src, path: []const u8, dep: ?Front
         try sema.zcu.addEmbedError(@intCast(index), .{ .start = start, .main = start, .end = start }, .syntax, "{s}", .{msg.written()});
         return sema.failedHere();
     }
-    const zoir = try std.zig.ZonGen.generate(gpa, tree, .{});
+    const zoir = try frontend.ZonGen.generate(gpa, tree, .{});
     defer zoir.deinit(gpa);
     if (zoir.hasCompileErrors()) {
         const e = zoir.compile_errors[0];
@@ -7789,14 +7790,14 @@ const Zon = struct {
     block: *Block,
     /// The import.
     src: Src,
-    zoir: *const std.zig.Zoir,
+    zoir: *const frontend.Zoir,
     tree: *const Ast,
     /// The file's `Zcu.embed_files` index.
     embed: u32,
     /// The file's stable key, `module:sub_path`.
     key: []const u8,
 
-    const Node = std.zig.Zoir.Node.Index;
+    const Node = frontend.Zoir.Node.Index;
     const Error = CompileError || error{WrongType};
 
     /// Reports an error at `node` in the ZON file, with a note at the
@@ -7993,7 +7994,7 @@ const Zon = struct {
                 const has_fields = ip.structInfo(ty).field_types.len != 0;
                 if (has_fields) try sema.resolveStructDefaults(z.block, z.src, ty);
                 const info = ip.structInfo(ty);
-                const names: []const std.zig.Zoir.NullTerminatedString, const vals: ?std.zig.Zoir.Node.Index.Range = switch (node.get(z.zoir)) {
+                const names: []const frontend.Zoir.NullTerminatedString, const vals: ?frontend.Zoir.Node.Index.Range = switch (node.get(z.zoir)) {
                     .struct_literal => |f| .{ f.names, f.vals },
                     .empty_literal => .{ &.{}, null },
                     else => return error.WrongType,
@@ -8040,7 +8041,7 @@ const Zon = struct {
     }
 
     /// The elements of an array literal or `.{}`.
-    fn elemNodes(z: *const Zon, node: Node) ?std.zig.Zoir.Node.Index.Range {
+    fn elemNodes(z: *const Zon, node: Node) ?frontend.Zoir.Node.Index.Range {
         return switch (node.get(z.zoir)) {
             .array_literal => |nodes| nodes,
             .empty_literal => .{ .start = node, .len = 0 },

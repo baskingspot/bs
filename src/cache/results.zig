@@ -26,8 +26,9 @@
 //! unit again (`Encoder.fallbacks` counts them by kind).
 
 const std = @import("std");
+const frontend = @import("frontend");
 const Allocator = std.mem.Allocator;
-const Zir = std.zig.Zir;
+const Zir = frontend.Zir;
 const InternPool = @import("../InternPool.zig");
 const Zcu = @import("../Zcu.zig");
 const print = @import("../Ir/print.zig");

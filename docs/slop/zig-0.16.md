@@ -277,7 +277,7 @@ Recommended: bs owns its frontend, with a superset Ast and a superset ZIR.
   - Vendor 0.17.1's `tokenizer`, `Ast`, `Parse`, `AstGen`,
     `AstRlAnnotate`, `BuiltinFn`, `Zir`, `Zoir` and `ZonGen`, plus
     `string_literal`, `number_literal` and `primitives`, under
-    `src/frontend/`, with upstream's MIT notice.
+    `frontend/`, with upstream's MIT notice.
   - Vendor 0.16.0's `tokenizer`, `Parse`, `AstGen`, `AstRlAnnotate` and
     `BuiltinFn` beside them.
   - 0.16's files are written in Zig 0.16, so they need a mechanical port
@@ -563,7 +563,7 @@ starting with `@typeInfo`. The compile-error and diag work can also grow
 once the 0.16 frontend lets the cases run with their real std.
 
 Dropping 0.16 when 0.18 ships is the same work in reverse:
-- delete `src/frontend/v0_16` and the 0.16 handlers;
+- delete `frontend/v0_16` and the 0.16 handlers;
 - the branch sites become 0.17-or-0.18 sites;
 - the extended opcodes shrink.
 
@@ -603,7 +603,7 @@ Scope, the rejection item, changed:
 Architecture decisions, the frontend item replaced:
 
 > - Frontend: upstream's tokenizer, Parse, AstGen and Zir for each
->   supported release, vendored under `src/frontend/` with upstream's
+>   supported release, vendored under `frontend/` with upstream's
 >   notice. They are ported only as far as compiling under bs's own Zig
 >   needs, plus one bs-owned superset Ast and superset ZIR that both
 >   releases' AstGen produce (see `docs/slop/zig-0.16.md`). Do not
