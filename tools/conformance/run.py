@@ -154,6 +154,15 @@ def exec_argv(bin_path, *args):
     return exec_prefix + [str(bin_path), *args]
 
 
+# std tests that hang on a host with fewer than 4 CPUs, in upstream's build
+# too: Io.Threaded's async_limit is cpu_count - 1, so with 3 CPUs the
+# test's last group.async runs its task inline, under the blocked cancel
+# protection of the task that spawns it, and Group.cancel waits out its
+# 100,000 s sleep (lib/std/Io/test.zig:575). --std leaves them out of both
+# counts there instead of waiting out the run timeout.
+FEW_CPU_HANGS = frozenset({"Io.test.test.tasks spawned in group after Group.cancel are canceled"})
+MIN_CPUS = 4
+
 ROOT_UNIT = "behavior.zig"
 ROOT_TEST_RE = re.compile(r"^behavior\.(test\.|test_\d+$)")
 PROTOCOL_PREFIX = "@bs-test "
@@ -594,7 +603,49 @@ def parse_terminal(err, names):
     return out
 
 
-def run_unit_default(bin_path, owns, args, workdir):
+def run_server(bin_path, names, start, skip, by_index, args, workdir):
+    """Runs tests `start` onward one at a time through the server protocol,
+    except those named in `skip`, into `by_index`; a crash or timeout marks
+    the test and a new process takes the rest. Returns (status, log)."""
+    while start < len(names):
+        s = ServerSession(bin_path, workdir)
+        current = None
+        try:
+            tag, _ = s.receive(time.monotonic() + args.run_timeout)
+            for i in range(start, len(names)):
+                if names[i] in skip:
+                    continue
+                current = i
+                s.send(CLIENT_RUN_TEST, i.to_bytes(4, "little"))
+                deadline = time.monotonic() + args.run_timeout
+                while True:
+                    tag, body = s.receive(deadline)
+                    if tag == SERVER_TEST_RESULTS:
+                        break
+                flags = int.from_bytes(body[4:12], "little")
+                st = ("pass", "fail", "skip", "fail")[flags & 3]
+                leaks = (flags >> 33) & ((1 << 31) - 1)
+                by_index[i] = ["leak" if st == "pass" and leaks else st, None]
+            s.close()
+            break
+        except (EOFError, TimeoutError, OSError) as e:
+            timed = isinstance(e, TimeoutError)
+            serr = s.kill()
+            if current is None:
+                return "incomplete", "the test runner did not answer on --listen=-\n" + tail(serr)
+            code = s.proc.returncode
+            by_index[current] = [
+                "timeout" if timed else "crash",
+                describe_exit(code, timed, args.run_timeout) + "\n" + tail(serr, 1500),
+            ]
+            start = current + 1
+    return "ok", None
+
+
+def run_unit_default(bin_path, owns, args, workdir, skip=frozenset()):
+    """Runs a test binary with upstream's default test runner. Tests named
+    in `skip` are not run, so then every test runs through the server
+    protocol, which runs them by index."""
     names, err = query_test_names(bin_path, args, workdir)
     if names is None:
         return {
@@ -603,55 +654,29 @@ def run_unit_default(bin_path, owns, args, workdir):
             "tests": {},
         }
     by_index = {}
-    code, _out, err, timed_out = run_process(exec_argv(bin_path), workdir, args.run_timeout)
-    parsed = parse_terminal(err, names)
-    for i, (outcome, detail) in parsed.items():
-        by_index[i] = [outcome, detail]
     status, log = "ok", None
-    finished = (
-        TERMINAL_SUMMARY_RE.search(err) is not None and len(parsed) == len(names) and all(o for o, _ in parsed.values())
-    )
-    if not finished:
-        how = describe_exit(code, timed_out, args.run_timeout)
-        if not parsed or by_index[max(parsed)][0] is not None:
-            if len(parsed) != len(names):
-                status, log = "incomplete", how + "\n" + tail(err)
-        else:
-            last = max(parsed)
-            by_index[last] = ["timeout" if timed_out else "crash", how + "\n" + crash_log(by_index[last][1] or "")]
-            # The rest, one at a time through the server protocol.
-            start = last + 1
-            while start < len(names):
-                s = ServerSession(bin_path, workdir)
-                current = None
-                try:
-                    tag, _ = s.receive(time.monotonic() + args.run_timeout)
-                    for i in range(start, len(names)):
-                        current = i
-                        s.send(CLIENT_RUN_TEST, i.to_bytes(4, "little"))
-                        deadline = time.monotonic() + args.run_timeout
-                        while True:
-                            tag, body = s.receive(deadline)
-                            if tag == SERVER_TEST_RESULTS:
-                                break
-                        flags = int.from_bytes(body[4:12], "little")
-                        st = ("pass", "fail", "skip", "fail")[flags & 3]
-                        leaks = (flags >> 33) & ((1 << 31) - 1)
-                        by_index[i] = ["leak" if st == "pass" and leaks else st, None]
-                    s.close()
-                    break
-                except (EOFError, TimeoutError, OSError) as e:
-                    timed = isinstance(e, TimeoutError)
-                    serr = s.kill()
-                    if current is None:
-                        status, log = "incomplete", "the test runner did not answer on --listen=-\n" + tail(serr)
-                        break
-                    code = s.proc.returncode
-                    by_index[current] = [
-                        "timeout" if timed else "crash",
-                        describe_exit(code, timed, args.run_timeout) + "\n" + tail(serr, 1500),
-                    ]
-                    start = current + 1
+    if skip.intersection(names):
+        status, log = run_server(bin_path, names, 0, skip, by_index, args, workdir)
+    else:
+        code, _out, err, timed_out = run_process(exec_argv(bin_path), workdir, args.run_timeout)
+        parsed = parse_terminal(err, names)
+        for i, (outcome, detail) in parsed.items():
+            by_index[i] = [outcome, detail]
+        finished = (
+            TERMINAL_SUMMARY_RE.search(err) is not None
+            and len(parsed) == len(names)
+            and all(o for o, _ in parsed.values())
+        )
+        if not finished:
+            how = describe_exit(code, timed_out, args.run_timeout)
+            if not parsed or by_index[max(parsed)][0] is not None:
+                if len(parsed) != len(names):
+                    status, log = "incomplete", how + "\n" + tail(err)
+            else:
+                last = max(parsed)
+                by_index[last] = ["timeout" if timed_out else "crash", how + "\n" + crash_log(by_index[last][1] or "")]
+                # The rest, one at a time through the server protocol.
+                status, log = run_server(bin_path, names, last + 1, skip, by_index, args, workdir)
     tests, details = {}, {}
     for i in sorted(by_index):
         name = names[i]
@@ -1142,6 +1167,13 @@ def std_target(compiler, cfg, args, workdir):
         shutil.rmtree(cache, ignore_errors=True)
         argv += ["--cache-dir", str(cache / "local"), "--global-cache-dir", str(cache / "global")]
     timeout = args.compile_timeout * 4
+    cpus = os.cpu_count() or 1
+    skip = FEW_CPU_HANGS if suite == "std" and cpus < MIN_CPUS else frozenset()
+    for name in sorted(skip):
+        print(
+            f"{cfg['name']} {suite}: not run on this {cpus}-CPU host: {name} (Io.Threaded's async_limit = "
+            f"cpu_count - 1 makes it hang below {MIN_CPUS} CPUs, upstream too)"
+        )
     start = time.monotonic()
     code, out, err, timed_out = run_process(argv, workdir, timeout)
     compile_s = time.monotonic() - start
@@ -1155,7 +1187,7 @@ def std_target(compiler, cfg, args, workdir):
         run_args = argparse.Namespace(**vars(args))
         run_args.run_timeout = max(args.run_timeout, 600)
         try:
-            r = run_unit_default(bin_path, lambda _name: True, run_args, workdir)
+            r = run_unit_default(bin_path, lambda _name: True, run_args, workdir, skip)
         finally:
             if not args.keep_binaries:
                 bin_path.unlink(missing_ok=True)
@@ -1194,6 +1226,8 @@ def std_target(compiler, cfg, args, workdir):
     merged = {}
     passed = expected = 0
     for key, up in baseline["tests"].items():
+        if key in skip:
+            continue
         got = r["tests"].get(key, "not_run")
         merged[key] = {"upstream": up, "bs": got}
         if up == "pass":
