@@ -152,10 +152,14 @@ pub fn plan(cg: *CodeGen) Error!void {
         if (tags[si] != .shr or fate[si] != .normal or uses[si] != 1) continue;
         if (lowers(cg, sh) != .pair or amount(cg, datas[si].bin_op.rhs).? < 64) continue;
         if (datas[si].bin_op.lhs.toIndex()) |x| {
-            const xi = @backingInt(x);
+            // A forwarded load is its value stored (`Live.fwd`), which
+            // lives as long as the shift would have: through the loops
+            // around the truncation that do not contain the shift.
+            var xi = @backingInt(x);
+            if (fwd[xi] != Ssa.no_tie) xi = fwd[xi];
             if (fate[xi] != .normal or share[xi] != Ssa.no_tie) continue;
-            end[xi] = @max(end[xi], def[vi]);
-            crosses[xi] = crosses[xi] or cl[def[vi]][0] != cl[def[xi]][0] or cl[def[vi]][1] != cl[def[xi]][1];
+            end[xi] = @max(end[xi], end[si]);
+            crosses[xi] = crosses[xi] or cl[end[si]][0] != cl[def[xi]][0] or cl[end[si]][1] != cl[def[xi]][1];
         }
         fate[si] = .dead;
         reg[si] = Ssa.no_reg;
