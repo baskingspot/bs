@@ -49,4 +49,5 @@ build 0.16 fresh16 "replaying donor"
 for lang in 0.17 0.16; do
     BS_ZIG_VERSION=$lang BS_TEST_LANGUAGE_KEYS=1 "$bs" run main.zig --zig-lib-dir "$lib" --cache-dir run --global-cache-dir global >log 2>&1 || fail "bs run in $lang"
 done
-[ "$(find run/bs/o -name main -type f | wc -l)" -eq 2 ] || fail "bs run: expected a binary per language"
+# On macOS each binary has a main.dSYM beside it, holding another `main`.
+[ "$(find run/bs/o -name main -type f -not -path '*.dSYM/*' | wc -l)" -eq 2 ] || fail "bs run: expected a binary per language"
