@@ -34,8 +34,8 @@ const Zcu = @This();
 gpa: Allocator,
 io: Io,
 fe: *Frontend,
-/// The Zig language of the compilation (`Frontend.language`), fixed for
-/// its lifetime.
+/// The Zig language the compilation's sources are in
+/// (`Frontend.syntax_language`), fixed for its lifetime.
 language: Language,
 ip: InternPool,
 /// Root struct type of each file, `.none` until imported.
@@ -549,7 +549,7 @@ pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
         .gpa = gpa,
         .io = io,
         .fe = fe,
-        .language = fe.language,
+        .language = fe.syntax_language,
         .ip = try .init(gpa, io, 1),
         .arena = .init(gpa),
         .deprecations_arena = .init(gpa),

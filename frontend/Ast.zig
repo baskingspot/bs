@@ -1,7 +1,10 @@
 //! Vendored from upstream Zig 0.17.1 (lib/std/zig/Ast.zig) by bs, which
-//! compiles two Zig releases (docs/slop/zig-0.16.md); changed only to
-//! import its siblings here instead of std.zig. Copyright (c) Zig
-//! contributors. MIT licensed (see LICENSE-ZIG).
+//! compiles two Zig releases (docs/slop/zig-0.16.md); changed to import its
+//! siblings here instead of std.zig, and to hold Zig 0.16's syntax too:
+//! `ParseOptions.language` picks 0.16's parser (v0_16/Parse.zig), and the
+//! node and error tags marked "Zig 0.16 only" come from 0.16.0's
+//! lib/std/zig/Ast.zig. Copyright (c) Zig contributors. MIT licensed (see
+//! LICENSE-ZIG).
 //!
 //! Abstract Syntax Tree for Zig source code.
 //! For Zig syntax, the root node is at nodes[0] and contains the list of
@@ -18,6 +21,8 @@ const Token = frontend.Token;
 const Ast = @This();
 const Allocator = std.mem.Allocator;
 const Parse = @import("Parse.zig");
+const Parse16 = @import("v0_16/Parse.zig");
+const Language = frontend.Language;
 const Writer = std.Io.Writer;
 
 /// Reference to externally-owned data.
@@ -27,6 +32,9 @@ tokens: TokenList.Slice,
 nodes: NodeList.Slice,
 extra_data: []u32,
 mode: Mode = .zig,
+/// The Zig release whose grammar this tree is in; AstGen lowers it with
+/// that release's rules.
+language: Language = .newest,
 
 errors: []const Error,
 
@@ -148,6 +156,8 @@ pub const Mode = enum { zig, zon };
 pub const ParseOptions = struct {
     recover: bool = true,
     mode: Mode = .zig,
+    /// Zig 0.16's grammar has no `recover` option: it always recovers.
+    language: Language = .newest,
 };
 
 /// Result should be freed with tree.deinit() when there are
@@ -160,7 +170,7 @@ pub fn parse(gpa: Allocator, source: [:0]const u8, options: ParseOptions) Alloca
     const estimated_token_count = source.len / 8;
     try tokens.ensureTotalCapacity(gpa, estimated_token_count);
 
-    var tokenizer = frontend.Tokenizer.init(source);
+    var tokenizer = frontend.Tokenizer.initLanguage(source, options.language);
     while (true) {
         const token = tokenizer.next();
         try tokens.append(gpa, .{
@@ -181,7 +191,20 @@ pub fn parseTokens(
     tokens: Ast.TokenList.Slice,
     options: ParseOptions,
 ) Allocator.Error!Ast {
-    var parser: Parse = .{
+    return switch (options.language) {
+        .zig_0_16 => parseTokensWith(Parse16, gpa, source, tokens, options),
+        .zig_0_17 => parseTokensWith(Parse, gpa, source, tokens, options),
+    };
+}
+
+fn parseTokensWith(
+    comptime P: type,
+    gpa: Allocator,
+    source: [:0]const u8,
+    tokens: Ast.TokenList.Slice,
+    options: ParseOptions,
+) Allocator.Error!Ast {
+    var parser: P = if (P == Parse) .{
         .source = source,
         .gpa = gpa,
         .tokens = tokens,
@@ -191,6 +214,15 @@ pub fn parseTokens(
         .scratch = .empty,
         .tok_i = 0,
         .recover = options.recover,
+    } else .{
+        .source = source,
+        .gpa = gpa,
+        .tokens = tokens,
+        .errors = .empty,
+        .nodes = .empty,
+        .extra_data = .empty,
+        .scratch = .empty,
+        .tok_i = 0,
     };
     defer parser.errors.deinit(gpa);
     defer parser.nodes.deinit(gpa);
@@ -214,6 +246,7 @@ pub fn parseTokens(
     return .{
         .source = source,
         .mode = options.mode,
+        .language = options.language,
         .tokens = tokens,
         .nodes = parser.nodes.toOwnedSlice(),
         .extra_data = parser.extra_data.toOwnedSliceAssert(),
@@ -342,6 +375,26 @@ pub fn rootDecls(tree: Ast) []const Node.Index {
 
 pub fn renderError(tree: Ast, parse_error: Error, w: *Writer) Writer.Error!void {
     switch (parse_error.tag) {
+        .asterisk_after_ptr_deref => {
+            // Note that the token will point at the `.*` but ideally the source
+            // location would point to the `*` after the `.*`.
+            return w.writeAll("'.*' cannot be followed by '*'; are you missing a space?");
+        },
+        .extra_allowzero_qualifier => {
+            return w.writeAll("extra allowzero qualifier");
+        },
+        .extra_const_qualifier => {
+            return w.writeAll("extra const qualifier");
+        },
+        .extra_volatile_qualifier => {
+            return w.writeAll("extra volatile qualifier");
+        },
+        .extra_for_capture => {
+            return w.writeAll("extra capture in for loop");
+        },
+        .for_input_not_captured => {
+            return w.writeAll("for input is not captured");
+        },
         .chained_comparison_operators => {
             return w.writeAll("comparison operators cannot be chained");
         },
@@ -598,6 +651,7 @@ pub fn firstToken(tree: Ast, node: Node.Index) TokenIndex {
 
         .test_decl,
         .@"errdefer",
+        .errdefer_payload,
         .@"defer",
         .bool_not,
         .negation,
@@ -683,6 +737,7 @@ pub fn firstToken(tree: Ast, node: Node.Index) TokenIndex {
         .add,
         .sub,
         .array_cat,
+        .array_mult,
         .add_wrap,
         .sub_wrap,
         .add_sat,
@@ -919,6 +974,7 @@ pub fn lastToken(tree: Ast, node: Node.Index) TokenIndex {
         .add,
         .sub,
         .array_cat,
+        .array_mult,
         .add_wrap,
         .sub_wrap,
         .add_sat,
@@ -943,6 +999,7 @@ pub fn lastToken(tree: Ast, node: Node.Index) TokenIndex {
 
         .test_decl => n = tree.nodeData(n).opt_token_and_node[1],
         .@"defer", .@"errdefer" => n = tree.nodeData(n).node,
+        .errdefer_payload => n = tree.nodeData(n).token_and_node[1],
         .anyframe_type => n = tree.nodeData(n).token_and_node[1],
 
         .switch_case_one,
@@ -2100,7 +2157,8 @@ fn fullFnProtoComponents(tree: Ast, info: full.FnProto.Components) full.FnProto 
 
 fn fullPtrTypeComponents(tree: Ast, info: full.PtrType.Components) full.PtrType {
     const size: std.lang.Type.Pointer.Size = switch (tree.tokenTag(info.main_token)) {
-        .asterisk => .one,
+        // Zig 0.16: `**T` is two pointer types sharing the `**` token.
+        .asterisk, .asterisk_asterisk => .one,
         .l_bracket => switch (tree.tokenTag(info.main_token + 1)) {
             .asterisk => if (tree.tokenTag(info.main_token + 2) == .identifier) .c else .many,
             else => .slice,
@@ -2846,6 +2904,14 @@ pub const Error = struct {
     } = .{ .none = {} },
 
     pub const Tag = enum {
+        // Zig 0.16 only; 0.17 reports these in AstGen or not at all.
+        asterisk_after_ptr_deref,
+        extra_allowzero_qualifier,
+        extra_const_qualifier,
+        extra_volatile_qualifier,
+        extra_for_capture,
+        for_input_not_captured,
+
         chained_comparison_operators,
         decl_between_fields,
         expected_block,
@@ -3062,6 +3128,14 @@ pub const Node = struct {
         ///
         /// The `main_token` field is the `errdefer` token.
         @"errdefer",
+        /// Zig 0.16 only: `errdefer |payload| expr`.
+        ///
+        /// The `data` field is a `.token_and_node`:
+        ///   1. a `TokenIndex` to the payload identifier.
+        ///   2. a `Node.Index` to the deferred expression.
+        ///
+        /// The `main_token` field is the `errdefer` token.
+        errdefer_payload,
         /// `defer expr`.
         ///
         /// The `data` field is a `.node` to the deferred expression.
@@ -3186,6 +3260,8 @@ pub const Node = struct {
         sub,
         /// `lhs ++ rhs`. The `main_token` field is the `++` token.
         array_cat,
+        /// Zig 0.16 only: `lhs ** rhs`. The `main_token` field is the `**` token.
+        array_mult,
         /// `lhs +% rhs`. The `main_token` field is the `+%` token.
         add_wrap,
         /// `lhs -% rhs`. The `main_token` field is the `-%` token.

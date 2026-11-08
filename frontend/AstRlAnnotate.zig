@@ -1,7 +1,9 @@
 //! Vendored from upstream Zig 0.17.1 (lib/std/zig/AstRlAnnotate.zig) by bs, which
-//! compiles two Zig releases (docs/slop/zig-0.16.md); changed only to
-//! import its siblings here instead of std.zig. Copyright (c) Zig
-//! contributors. MIT licensed (see LICENSE-ZIG).
+//! compiles two Zig releases (docs/slop/zig-0.16.md); changed to import its
+//! siblings here instead of std.zig, and to annotate Zig 0.16's syntax too
+//! (`errdefer |e|`, `**`, `@cImport` and friends, from 0.16.0's
+//! lib/std/zig/AstRlAnnotate.zig). Copyright (c) Zig contributors. MIT
+//! licensed (see LICENSE-ZIG).
 //!
 //! AstRlAnnotate is a simple pass which runs over the AST before AstGen to
 //! determine which expressions require result locations.
@@ -25,11 +27,13 @@ const Ast = frontend.Ast;
 const Allocator = std.mem.Allocator;
 const AutoHashMapUnmanaged = std.AutoHashMapUnmanaged;
 const BuiltinFn = frontend.BuiltinFn;
+const Language = frontend.Language;
 const assert = std.debug.assert;
 
 gpa: Allocator,
 arena: Allocator,
 tree: *const Ast,
+language: Language,
 
 /// Certain nodes are placed in this set under the following conditions:
 /// * if-else: either branch consumes the result location
@@ -67,11 +71,12 @@ const Block = struct {
     consumes_res_ptr: bool,
 };
 
-pub fn annotate(gpa: Allocator, arena: Allocator, tree: Ast) Allocator.Error!RlNeededSet {
+pub fn annotate(gpa: Allocator, arena: Allocator, tree: Ast, language: Language) Allocator.Error!RlNeededSet {
     var astrl: AstRlAnnotate = .{
         .gpa = gpa,
         .arena = arena,
         .tree = &tree,
+        .language = language,
     };
     defer astrl.deinit(gpa);
 
@@ -149,6 +154,10 @@ fn expr(astrl: *AstRlAnnotate, node: Ast.Node.Index, block: ?*Block, ri: ResultI
 
         .@"defer", .@"errdefer" => {
             _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
+            return false;
+        },
+        .errdefer_payload => {
+            _ = try astrl.expr(tree.nodeData(node).token_and_node[1], block, ResultInfo.none);
             return false;
         },
 
@@ -272,6 +281,13 @@ fn expr(astrl: *AstRlAnnotate, node: Ast.Node.Index, block: ?*Block, ri: ResultI
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             _ = try astrl.expr(lhs, block, ResultInfo.none);
             _ = try astrl.expr(rhs, block, ResultInfo.none);
+            return false;
+        },
+
+        .array_mult => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            _ = try astrl.expr(lhs, block, ResultInfo.none);
+            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
             return false;
         },
 
@@ -807,12 +823,21 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
     const tree = astrl.tree;
     const builtin_token = tree.nodeMainToken(node);
     const builtin_name = tree.tokenSlice(builtin_token);
-    const info = BuiltinFn.list.get(builtin_name) orelse return false;
+    const info = BuiltinFn.get(astrl.language, builtin_name) orelse return false;
     if (info.param_count) |expected| {
         if (expected != args.len) return false;
     }
     switch (info.tag) {
         .import => return false,
+        .c_import => {
+            _ = try astrl.expr(args[0], block, ResultInfo.none);
+            return false;
+        },
+        .c_define => {
+            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[1], block, ResultInfo.none);
+            return false;
+        },
         .branch_hint => {
             _ = try astrl.expr(args[0], block, ResultInfo.type_only);
             return false;
@@ -900,6 +925,8 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
         .error_name,
         .set_runtime_safety,
         .Tuple,
+        .c_undef,
+        .c_include,
         .wasm_memory_size,
         .splat,
         .set_float_mode,

@@ -62,8 +62,12 @@ lint: ?*const LintConfig = null,
 root_name: []const u8 = "root",
 /// See `Options.load_std`.
 load_std: bool,
-/// The Zig language of the compilation (`Options.language`).
+/// The Zig language of the compilation (`Options.language`), which keys
+/// the caches.
 language: Language,
+/// The language sources are parsed and lowered in: `language`, but for
+/// `Options.syntax_language`.
+syntax_language: Language,
 /// The root module of the fuzzer's family (`Options.fuzzer_builtin_dir`),
 /// whose `=std@fuzzer` and `=builtin@fuzzer` follow it. Their names hold
 /// an '=', which no `-M` name can, so no other module's keys are theirs.
@@ -217,6 +221,9 @@ pub const Options = struct {
     root_src_path: []const u8,
     /// The Zig language of the compilation (`language.resolve`).
     language: Language = .newest,
+    /// Parse and lower in this language instead, with `language`'s caches
+    /// (test/language/keys.sh).
+    syntax_language: ?Language = null,
     /// The root module's directory when it is not the root file's own:
     /// upstream roots translate-c, whose root file imports `../util.zig`,
     /// at `lib/compiler`. `root_src_path` starts with it and a '/'.
@@ -270,7 +277,7 @@ pub fn testsStd(gpa: Allocator, zig_lib_dir: []const u8, main_src_path: []const 
 }
 
 pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !Frontend {
-    var fe: Frontend = .{ .gpa = gpa, .io = io, .zig_lib_dir = zig_lib_dir, .load_std = options.load_std, .root_name = options.root_name, .language = options.language };
+    var fe: Frontend = .{ .gpa = gpa, .io = io, .zig_lib_dir = zig_lib_dir, .load_std = options.load_std, .root_name = options.root_name, .language = options.language, .syntax_language = options.syntax_language orelse options.language };
     errdefer fe.deinit();
     // The root module and the module under test are named by their roles,
     // not their `-M` name (`root_name`): cache keys name modules
@@ -492,7 +499,7 @@ fn mapOrLower(fe: *const Frontend, f: *File) Allocator.Error!void {
     };
     if (!std.mem.eql(u8, &hashSource(src), &f.content_hash))
         std.process.fatal("'{s}' changed during compilation", .{f.display_path});
-    const ast = try Ast.parse(arena, src, .{ .mode = .zig });
+    const ast = try Ast.parse(arena, src, .{ .mode = .zig, .language = fe.syntax_language });
     const zir = try AstGen.generate(arena, ast);
     if (fe.blobCache()) |blobs| blobs.saveZir(gpa, io, f.content_hash, &zir, try .of(arena, &zir)) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     var insts = try zir.instructions.toMultiArrayList().clone(gpa);
@@ -639,7 +646,7 @@ fn syntaxOf(fe: *const Frontend, index: File.Index) Allocator.Error!*const Synta
     // Spans into a different source than the ZIR came from would be wrong.
     if (!std.mem.eql(u8, &hashSource(src), &f.content_hash))
         std.process.fatal("'{s}' changed during compilation", .{f.display_path});
-    f.syntax = .{ .source = src, .tree = try Ast.parse(fe.gpa, src, .{ .mode = .zig }) };
+    f.syntax = .{ .source = src, .tree = try Ast.parse(fe.gpa, src, .{ .mode = .zig, .language = fe.syntax_language }) };
     return &f.syntax.?;
 }
 
@@ -1859,7 +1866,7 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
         }
     }
 
-    const ast = try Ast.parse(arena, src, .{ .mode = .zig });
+    const ast = try Ast.parse(arena, src, .{ .mode = .zig, .language = fe.syntax_language });
     const zir = try AstGen.generate(arena, ast);
     const summary: Summary = try .of(arena, &zir);
     job.how = .lowered;

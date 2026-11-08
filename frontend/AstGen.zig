@@ -1,7 +1,11 @@
 //! Vendored from upstream Zig 0.17.1 (lib/std/zig/AstGen.zig) by bs, which
-//! compiles two Zig releases (docs/slop/zig-0.16.md); changed only to
-//! import its siblings here instead of std.zig. Copyright (c) Zig
-//! contributors. MIT licensed (see LICENSE-ZIG).
+//! compiles two Zig releases (docs/slop/zig-0.16.md); changed to import its
+//! siblings here instead of std.zig, and to lower Zig 0.16 trees too
+//! (`Ast.language`). A 0.16 tree gets 0.17's ZIR shapes, with 0.16's
+//! meaning where the releases differ: each such place tests
+//! `tree.language` and does what 0.16.0's lib/std/zig/AstGen.zig does,
+//! using the extended opcodes Zir.zig marks "Zig 0.16 only". Copyright (c)
+//! Zig contributors. MIT licensed (see LICENSE-ZIG).
 //!
 //! Ingests an AST and produces ZIR code.
 const AstGen = @This();
@@ -21,6 +25,7 @@ const isPrimitive = std.zig.primitives.isPrimitive;
 const Zir = frontend.Zir;
 const BuiltinFn = frontend.BuiltinFn;
 const AstRlAnnotate = frontend.AstRlAnnotate;
+const SimpleComptimeReason = frontend.SimpleComptimeReason;
 
 gpa: Allocator,
 tree: *const Ast,
@@ -103,7 +108,7 @@ fn setExtra(astgen: *AstGen, index: usize, extra: anytype) void {
             Zir.Inst.Ref,
             Zir.Inst.Index,
             Zir.Inst.Declaration.Name,
-            std.zig.SimpleComptimeReason,
+            SimpleComptimeReason,
             Zir.NullTerminatedString,
             // Ast.TokenIndex is missing because it is a u32.
             Ast.OptionalTokenIndex,
@@ -152,7 +157,7 @@ pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    var nodes_need_rl = try AstRlAnnotate.annotate(gpa, arena.allocator(), tree);
+    var nodes_need_rl = try AstRlAnnotate.annotate(gpa, arena.allocator(), tree, tree.language);
     defer nodes_need_rl.deinit(gpa);
 
     var astgen: AstGen = .{
@@ -435,7 +440,7 @@ fn reachableExprComptime(
     node: Ast.Node.Index,
     reachable_node: Ast.Node.Index,
     /// If `null`, the expression is not evaluated in a comptime context.
-    comptime_reason: ?std.zig.SimpleComptimeReason,
+    comptime_reason: ?SimpleComptimeReason,
 ) InnerError!Zir.Inst.Ref {
     const result_inst = if (comptime_reason) |r|
         try comptimeExpr(gz, scope, ri, node, r)
@@ -513,6 +518,7 @@ fn lvalExpr(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Ins
         .less_than,
         .less_or_equal,
         .array_cat,
+        .array_mult,
         .bool_and,
         .bool_or,
         .@"asm",
@@ -549,6 +555,7 @@ fn lvalExpr(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Ins
         .char_literal,
         .@"defer",
         .@"errdefer",
+        .errdefer_payload,
         .@"catch",
         .error_union,
         .merge_error_sets,
@@ -618,7 +625,7 @@ fn lvalExpr(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Ins
             const builtin_name = tree.tokenSlice(builtin_token);
             // If the builtin is an invalid name, we don't cause an error here; instead
             // let it pass, and the error will be "invalid builtin function" later.
-            if (BuiltinFn.list.get(builtin_name)) |info| {
+            if (BuiltinFn.get(tree.language, builtin_name)) |info| {
                 if (!info.allows_lvalue) {
                     return astgen.failNode(node, "invalid left-hand side to assignment", .{});
                 }
@@ -659,7 +666,7 @@ fn expr(gz: *GenZir, scope: *Scope, ri: ResultInfo, node: Ast.Node.Index) InnerE
         .simple_var_decl => unreachable, // Handled in `blockExpr`.
         .aligned_var_decl => unreachable, // Handled in `blockExpr`.
         .@"defer" => unreachable, // Handled in `blockExpr`.
-        .@"errdefer" => unreachable, // Handled in `blockExpr`.
+        .@"errdefer", .errdefer_payload => unreachable, // Handled in `blockExpr`.
 
         .switch_case => unreachable, // Handled in `switchExpr`.
         .switch_case_inline => unreachable, // Handled in `switchExpr`.
@@ -782,6 +789,24 @@ fn expr(gz: *GenZir, scope: *Scope, ri: ResultInfo, node: Ast.Node.Index) InnerE
         .less_or_equal    => return simpleBinOp(gz, scope, ri, node, .cmp_lte),
         .array_cat        => return simpleBinOp(gz, scope, ri, node, .array_cat),
 
+        // Zig 0.16 only.
+        .array_mult => {
+            // This syntax form does not currently use the result type in the language specification.
+            // However, the result type can be used to emit more optimal code for large multiplications by
+            // having Sema perform a coercion before the multiplication operation.
+            const lhs_node, const rhs_node = tree.nodeData(node).node_and_node;
+            const res_ty = if (try ri.rl.resultType(gz, node)) |t| t else .none;
+            const lhs = try expr(gz, scope, .{ .rl = .none }, lhs_node);
+            const rhs = try comptimeExpr(gz, scope, .{ .rl = .{ .coerced_ty = .usize_type } }, rhs_node, .array_mul_factor);
+            const result = try gz.addExtendedPayload(.array_mul, Zir.Inst.ArrayMul{
+                .node = gz.nodeIndexToRelative(node),
+                .res_ty = res_ty,
+                .lhs = lhs,
+                .rhs = rhs,
+            });
+            return rvalue(gz, ri, result, node);
+        },
+
         .error_union, .merge_error_sets => |tag| {
             const inst_tag: Zir.Inst.Tag = switch (tag) {
                 .error_union => .error_union_type,
@@ -887,6 +912,8 @@ fn expr(gz: *GenZir, scope: *Scope, ri: ResultInfo, node: Ast.Node.Index) InnerE
                 const cursor = maybeAdvanceSourceCursorToMainToken(gz, node);
                 const len = try expr(gz, scope, .{ .rl = .{ .coerced_ty = .usize_type } }, full.ast.end.unwrap().?);
                 const sentinel = if (full.ast.sentinel.unwrap()) |sentinel| s: {
+                    // Zig 0.16 does not coerce this sentinel.
+                    if (tree.language == .zig_0_16) break :s try expr(gz, scope, .{ .rl = .none }, sentinel);
                     const sentinel_ty = try gz.addUnNode(.slice_sentinel_ty, lhs, node);
                     break :s try expr(gz, scope, .{ .rl = .{ .coerced_ty = sentinel_ty } }, sentinel);
                 } else .none;
@@ -936,6 +963,25 @@ fn expr(gz: *GenZir, scope: *Scope, ri: ResultInfo, node: Ast.Node.Index) InnerE
 
         .deref => {
             const lhs = try expr(gz, scope, .{ .rl = .none }, tree.nodeData(node).node);
+            // Zig 0.16 dereferences only single-item and C pointers, not
+            // slices, and has no null check for C pointers.
+            if (tree.language == .zig_0_16) {
+                _ = try gz.addExtendedPayload(.validate_deref, Zir.Inst.UnNode{
+                    .node = gz.nodeIndexToRelative(node),
+                    .operand = lhs,
+                });
+                switch (ri.rl) {
+                    .ref,
+                    .ref_coerced_ty,
+                    .ref_const,
+                    => return lhs,
+
+                    else => {
+                        const result = try gz.addUnNode(.load, lhs, node);
+                        return rvalue(gz, ri, result, node);
+                    },
+                }
+            }
             switch (ri.rl) {
                 .ref,
                 .ref_coerced_ty,
@@ -1203,7 +1249,7 @@ fn nameStratExpr(
         => {
             const builtin_token = tree.nodeMainToken(node);
             const builtin_name = tree.tokenSlice(builtin_token);
-            const info = BuiltinFn.list.get(builtin_name) orelse return null;
+            const info = BuiltinFn.get(tree.language, builtin_name) orelse return null;
             switch (info.tag) {
                 .Enum, .Struct, .Union => {
                     var buf: [2]Ast.Node.Index = undefined;
@@ -1998,7 +2044,7 @@ fn comptimeExpr(
     scope: *Scope,
     ri: ResultInfo,
     node: Ast.Node.Index,
-    reason: std.zig.SimpleComptimeReason,
+    reason: SimpleComptimeReason,
 ) InnerError!Zir.Inst.Ref {
     return comptimeExpr2(gz, scope, ri, node, node, reason);
 }
@@ -2011,7 +2057,7 @@ fn comptimeExpr2(
     ri: ResultInfo,
     node: Ast.Node.Index,
     src_node: Ast.Node.Index,
-    reason: std.zig.SimpleComptimeReason,
+    reason: SimpleComptimeReason,
 ) InnerError!Zir.Inst.Ref {
     if (gz.is_comptime) {
         // No need to change anything!
@@ -2599,7 +2645,7 @@ fn blockExprStmts(gz: *GenZir, parent_scope: *Scope, statements: []const Ast.Nod
                 .assign_destructure => scope = try assignDestructureMaybeDecls(gz, scope, statement, block_arena_allocator),
 
                 .@"defer"    => scope = try deferStmt(gz, scope, statement, block_arena_allocator, .defer_normal),
-                .@"errdefer" => scope = try deferStmt(gz, scope, statement, block_arena_allocator, .defer_error),
+                .@"errdefer", .errdefer_payload => scope = try deferStmt(gz, scope, statement, block_arena_allocator, .defer_error),
 
                 .assign => try assign(gz, scope, statement),
 
@@ -2909,6 +2955,7 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
                 .disable_intrinsics,
                 .set_float_mode,
                 .branch_hint,
+                .validate_deref, // Zig 0.16 only.
                 => break :b true,
                 else => break :b false,
             },
@@ -3002,12 +3049,40 @@ fn anyErrdefers(outer_scope: *Scope, inner_scope: *Scope) bool {
     return false;
 }
 
+/// Whether an `errdefer |err|` (Zig 0.16 only) in scope captures the error
+/// code, so that leaving the scope with an error needs the code.
+fn anyErrdeferCaptures(outer_scope: *Scope, inner_scope: *Scope) bool {
+    var scope = inner_scope;
+    while (scope != outer_scope) {
+        switch (scope.unwrap()) {
+            .gen_zir => |gen_zir| scope = gen_zir.parent,
+            .local_val => |local_val| scope = local_val.parent,
+            .local_ptr => |local_ptr| scope = local_ptr.parent,
+            .defer_normal => |defer_normal| scope = defer_normal.parent,
+            .defer_error => |defer_error| {
+                if (defer_error.remapped_err_code != .none) return true;
+                scope = defer_error.parent;
+            },
+            .namespace => unreachable,
+            .top => unreachable,
+        }
+    }
+    return false;
+}
+
 fn genDefers(
     gz: *GenZir,
     outer_scope: *Scope,
     inner_scope: *Scope,
-    which_ones: enum { normal_only, normal_and_error },
+    which_ones: union(enum) {
+        normal_only,
+        normal_and_error,
+        /// As `normal_and_error`, giving `errdefer |err|` captures (Zig
+        /// 0.16 only) this error code.
+        normal_and_error_code: Zir.Inst.Ref,
+    },
 ) InnerError!void {
+    const gpa = gz.astgen.gpa;
     var scope = inner_scope;
     while (scope != outer_scope) {
         switch (scope.unwrap()) {
@@ -3024,6 +3099,31 @@ fn genDefers(
                     .normal_only => continue,
                     .normal_and_error => {
                         try gz.addDefer(defer_scope.index, defer_scope.len);
+                    },
+                    .normal_and_error_code => |err_code| {
+                        if (defer_scope.remapped_err_code.unwrap()) |remapped_err_code| {
+                            try gz.instructions.ensureUnusedCapacity(gpa, 1);
+                            try gz.astgen.instructions.ensureUnusedCapacity(gpa, 1);
+
+                            const payload_index = try gz.astgen.addExtra(Zir.Inst.DeferErrCode{
+                                .err_code = err_code,
+                                .remapped_err_code = remapped_err_code,
+                                .index = defer_scope.index,
+                                .len = defer_scope.len,
+                            });
+                            const new_index: Zir.Inst.Index = @fromBackingInt(@intCast(gz.astgen.instructions.len));
+                            gz.astgen.instructions.appendAssumeCapacity(.{
+                                .tag = .extended,
+                                .data = .{ .extended = .{
+                                    .opcode = .defer_err_code,
+                                    .small = undefined,
+                                    .operand = payload_index,
+                                } },
+                            });
+                            gz.instructions.appendAssumeCapacity(new_index);
+                        } else {
+                            try gz.addDefer(defer_scope.index, defer_scope.len);
+                        }
                     },
                 }
             },
@@ -3087,17 +3187,44 @@ fn deferStmt(
     defer defer_gen.unstack();
 
     const tree = gz.astgen.tree;
-    const expr_node = tree.nodeData(node).node;
-    _ = try unusedResultExpr(&defer_gen, &defer_gen.base, expr_node);
-    try checkUsed(gz, scope, &defer_gen.base);
+    var local_val_scope: Scope.LocalVal = undefined;
+    var opt_remapped_err_code: Zir.Inst.OptionalIndex = .none;
+    const sub_scope, const expr_node = if (tree.nodeTag(node) != .errdefer_payload)
+        .{ &defer_gen.base, tree.nodeData(node).node }
+    else blk: {
+        // Zig 0.16 only: `errdefer |err|`.
+        const payload_token, const expr_node = tree.nodeData(node).token_and_node;
+        const ident_name = try gz.astgen.identAsString(payload_token);
+        if (std.mem.eql(u8, tree.tokenSlice(payload_token), "_")) {
+            try gz.astgen.appendErrorTok(payload_token, "discard of error capture; omit it instead", .{});
+            break :blk .{ &defer_gen.base, expr_node };
+        }
+        const remapped_err_code: Zir.Inst.Index = @fromBackingInt(@intCast(gz.astgen.instructions.len));
+        opt_remapped_err_code = remapped_err_code.toOptional();
+        _ = try gz.astgen.appendPlaceholder();
+        const remapped_err_code_ref = remapped_err_code.toRef();
+        local_val_scope = .{
+            .parent = &defer_gen.base,
+            .gen_zir = gz,
+            .name = ident_name,
+            .inst = remapped_err_code_ref,
+            .token_src = payload_token,
+            .id_cat = .capture,
+        };
+        try gz.addDbgVar(.dbg_var_val, ident_name, remapped_err_code_ref);
+        break :blk .{ &local_val_scope.base, expr_node };
+    };
+    _ = try unusedResultExpr(&defer_gen, sub_scope, expr_node);
+    try checkUsed(gz, scope, sub_scope);
     _ = try defer_gen.addBreak(.break_inline, @fromBackingInt(@intCast(0)), .void_value);
 
     const body = defer_gen.instructionsSlice();
-    const body_len = gz.astgen.countBodyLenAfterFixupsExtraRefs(body, &.{});
+    const extra_insts: []const Zir.Inst.Index = if (opt_remapped_err_code.unwrap()) |ec| &.{ec} else &.{};
+    const body_len = gz.astgen.countBodyLenAfterFixupsExtraRefs(body, extra_insts);
 
     const index: u32 = @intCast(gz.astgen.extra.items.len);
     try gz.astgen.extra.ensureUnusedCapacity(gz.astgen.gpa, body_len);
-    gz.astgen.appendBodyWithFixupsExtraRefsArrayList(&gz.astgen.extra, body, &.{});
+    gz.astgen.appendBodyWithFixupsExtraRefsArrayList(&gz.astgen.extra, body, extra_insts);
 
     const defer_scope = try block_arena.create(Scope.Defer);
 
@@ -3106,6 +3233,7 @@ fn deferStmt(
         .parent = scope,
         .index = index,
         .len = body_len,
+        .remapped_err_code = opt_remapped_err_code,
     };
     return &defer_scope.base;
 }
@@ -3148,12 +3276,18 @@ fn varDecl(
         return astgen.failTok(tree.nodeMainToken(section_node), "cannot set section of local variable '{s}'", .{ident_name_raw});
     }
 
+    // Zig 0.16 evaluates the alignment first, as a runtime expression.
+    const align_0_16: Zir.Inst.Ref = if (tree.language != .zig_0_16) .none else if (var_decl.ast.align_node.unwrap()) |align_node|
+        try expr(gz, scope, coerced_align_ri, align_node)
+    else
+        .none;
+
     const type_inst: Zir.Inst.Ref = if (var_decl.ast.type_node.unwrap()) |type_node|
         try typeExpr(gz, scope, type_node)
     else
         .none;
 
-    const align_inst: Zir.Inst.Ref = if (var_decl.ast.align_node.unwrap()) |align_node|
+    const align_inst: Zir.Inst.Ref = if (tree.language == .zig_0_16) align_0_16 else if (var_decl.ast.align_node.unwrap()) |align_node|
         try comptimeExpr(gz, scope, coerced_align_ri, align_node, .@"align")
     else
         .none;
@@ -3499,12 +3633,18 @@ fn assignDestructureMaybeDecls(
                 // We also mark `const`s as comptime if the RHS is definitely comptime-known.
                 const this_variable_comptime = is_comptime or (is_const and value_is_comptime);
 
+                // Zig 0.16 evaluates the alignment first, as a runtime expression.
+                const align_0_16: Zir.Inst.Ref = if (tree.language != .zig_0_16) .none else if (full_var_decl.ast.align_node.unwrap()) |align_node|
+                    try expr(gz, scope, coerced_align_ri, align_node)
+                else
+                    .none;
+
                 const type_inst = if (full_var_decl.ast.type_node.unwrap()) |type_node|
                     try typeExpr(gz, scope, type_node)
                 else
                     .none;
 
-                const align_inst: Zir.Inst.Ref = if (full_var_decl.ast.align_node.unwrap()) |align_node|
+                const align_inst: Zir.Inst.Ref = if (tree.language == .zig_0_16) align_0_16 else if (full_var_decl.ast.align_node.unwrap()) |align_node|
                     try comptimeExpr(gz, scope, coerced_align_ri, align_node, .@"align")
                 else
                     .none;
@@ -3512,7 +3652,11 @@ fn assignDestructureMaybeDecls(
                 if (type_inst != .none) {
                     // Typed alloc
                     const ptr = if (align_inst == .none) ptr: {
-                        const tag: Zir.Inst.Tag = if (this_variable_comptime)
+                        // Zig 0.16 makes a typed `const` runtime even when
+                        // its value is comptime-known.
+                        const tag: Zir.Inst.Tag = if (tree.language == .zig_0_16 and is_const)
+                            .alloc
+                        else if (this_variable_comptime)
                             .alloc_comptime_mut
                         else if (is_const)
                             .alloc
@@ -5863,7 +6007,7 @@ fn tryExpr(
         else => Zir.Inst.Tag.err_union_code,
     };
     const err_code = try else_scope.addUnNode(err_tag, operand, node);
-    try genDefers(&else_scope, &fn_block.base, scope, .normal_and_error);
+    try genDefers(&else_scope, &fn_block.base, scope, .{ .normal_and_error_code = err_code });
     try emitDbgStmt(&else_scope, try_lc);
     _ = try else_scope.addUnNode(.ret_node, err_code, node);
 
@@ -6643,13 +6787,14 @@ fn whileExpr(
                 .operand = undefined,
             } },
         });
-        if (!continue_scope.is_comptime) {
+        // Zig 0.16 does not restore the error return trace index between iterations.
+        if (!continue_scope.is_comptime and astgen.tree.language != .zig_0_16) {
             _ = try continue_scope.addRestoreErrRetIndex(.{ .block = continue_block }, .always, then_node);
         }
         _ = try continue_scope.addBreak(break_tag, continue_block, .void_value);
     }
     try continue_scope.setBlockBody(continue_block);
-    if (!then_scope.is_comptime) {
+    if (!then_scope.is_comptime and astgen.tree.language != .zig_0_16) {
         const cont_node = while_full.ast.cont_expr.unwrap() orelse then_node;
         _ = try then_scope.addRestoreErrRetIndex(.{ .block = cond_block }, .always, cont_node);
     }
@@ -6697,7 +6842,7 @@ fn whileExpr(
 
         try checkUsed(parent_gz, &else_scope.base, sub_scope);
         if (!else_scope.endsWithNoReturn()) {
-            if (!else_scope.is_comptime) {
+            if (!else_scope.is_comptime and astgen.tree.language != .zig_0_16) {
                 _ = try else_scope.addRestoreErrRetIndex(.{ .block = loop_block }, .always, else_node);
             }
             _ = try else_scope.addBreakWithSrcNode(break_tag, loop_block, else_result, else_node);
@@ -6977,7 +7122,8 @@ fn forExpr(
     });
 
     const break_tag: Zir.Inst.Tag = if (is_inline) .break_inline else .@"break";
-    if (!then_scope.is_comptime) {
+    // Zig 0.16 does not restore the error return trace index between iterations.
+    if (!then_scope.is_comptime and astgen.tree.language != .zig_0_16) {
         _ = try then_scope.addRestoreErrRetIndex(.{ .block = cond_block }, .always, then_node);
     }
     _ = try then_scope.addBreak(break_tag, cond_block, .void_value);
@@ -6997,7 +7143,7 @@ fn forExpr(
             _ = try addEnsureResult(&else_scope, else_result, else_node);
         }
         if (!else_scope.endsWithNoReturn()) {
-            if (!else_scope.is_comptime) {
+            if (!else_scope.is_comptime and astgen.tree.language != .zig_0_16) {
                 _ = try else_scope.addRestoreErrRetIndex(.{ .block = loop_block }, .always, else_node);
             }
             _ = try else_scope.addBreakWithSrcNode(break_tag, loop_block, else_result, else_node);
@@ -7529,7 +7675,8 @@ fn switchExpr(
                         const ident_name = try astgen.identAsString(ident_token);
                         const ident_name_str = tree.tokenSlice(ident_token);
                         if (mem.eql(u8, "_", ident_name_str)) {
-                            if (non_err_is_ref != .no) return astgen.failTok(payload_token, "pointer modifier invalid on discard", .{});
+                            // Zig 0.16 accepts `|*_|` here.
+                            if (non_err_is_ref != .no and tree.language != .zig_0_16) return astgen.failTok(payload_token, "pointer modifier invalid on discard", .{});
                             break :scope &scratch_scope.base;
                         }
                         non_err_capture = if (non_err_is_ref != .no) .by_ref else .by_val;
@@ -8022,6 +8169,17 @@ fn ret(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Inst.Ref
         // for detecting whether to add something to the function's inferred error set.
         const ident_token = tree.nodeMainToken(operand_node) + 2;
         const err_name_str_index = try astgen.identAsString(ident_token);
+        if (anyErrdeferCaptures(defer_outer, scope)) {
+            // Zig 0.16 only: an `errdefer |err|` needs the error code.
+            const err_code = try gz.addExtendedPayload(.ret_err_value_code, Zir.Inst.RetErrValueCode{
+                .name = err_name_str_index,
+                .src_tok = gz.tokenIndexToRelative(ident_token),
+            });
+            try genDefers(gz, defer_outer, scope, .{ .normal_and_error_code = err_code });
+            try emitDbgStmt(gz, ret_lc);
+            _ = try gz.addUnNode(.ret_node, err_code, node);
+            return .unreachable_value;
+        }
         try genDefers(gz, defer_outer, scope, .normal_and_error);
         try emitDbgStmt(gz, ret_lc);
         _ = try gz.addStrTok(.ret_err_value, err_name_str_index, ident_token);
@@ -8052,7 +8210,12 @@ fn ret(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Inst.Ref
         },
         .always => {
             // Value is always an error. Emit both error defers and regular defers.
-            try genDefers(gz, defer_outer, scope, .normal_and_error);
+            if (anyErrdeferCaptures(defer_outer, scope)) {
+                const err_code = if (ri.rl == .ptr) try gz.addUnNode(.load, ri.rl.ptr.inst, node) else operand;
+                try genDefers(gz, defer_outer, scope, .{ .normal_and_error_code = err_code });
+            } else {
+                try genDefers(gz, defer_outer, scope, .normal_and_error);
+            }
             try emitDbgStmt(gz, ret_lc);
             try gz.addRet(ri, operand, node);
             return Zir.Inst.Ref.unreachable_value;
@@ -8090,7 +8253,12 @@ fn ret(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Inst.Ref
             var else_scope = gz.makeSubBlock(scope);
             defer else_scope.unstack();
 
-            try genDefers(&else_scope, defer_outer, scope, .normal_and_error);
+            if (anyErrdeferCaptures(defer_outer, scope)) {
+                const err_code = try else_scope.addUnNode(.err_union_code, result, node);
+                try genDefers(&else_scope, defer_outer, scope, .{ .normal_and_error_code = err_code });
+            } else {
+                try genDefers(&else_scope, defer_outer, scope, .normal_and_error);
+            }
             try emitDbgStmt(&else_scope, ret_lc);
             try else_scope.addRet(ri, operand, node);
 
@@ -8124,7 +8292,7 @@ fn parseBitCount(buf: []const u8) std.fmt.ParseIntError!u16 {
 
 const ComptimeBlockInfo = struct {
     src_node: Ast.Node.Index,
-    reason: std.zig.SimpleComptimeReason,
+    reason: SimpleComptimeReason,
 };
 
 fn identifier(
@@ -8156,8 +8324,14 @@ fn identifier(
                 'i' => .signed,
                 else => break :int_type,
             };
-            // `u0` already handled by `primitive_instrs`
-            if (std.mem.eql(u8, ident_name_raw, "i0")) {
+            // Zig 0.16 has `i0`, and rejects a leading zero before the
+            // bit count is parsed.
+            if (tree.language == .zig_0_16) {
+                if (ident_name_raw.len >= 3 and ident_name_raw[1] == '0') {
+                    return astgen.failNode(ident, "primitive integer type '{s}' has leading zero", .{ident_name_raw});
+                }
+            } else if (std.mem.eql(u8, ident_name_raw, "i0")) {
+                // `u0` already handled by `primitive_instrs`
                 return astgen.failNode(ident, "signed integer cannot have bit width 0", .{});
             }
             const bit_count = parseBitCount(ident_name_raw[1..]) catch |err| switch (err) {
@@ -8168,7 +8342,7 @@ fn identifier(
                 ),
                 error.InvalidCharacter => break :int_type,
             };
-            if (ident_name_raw[1] == '0') {
+            if (tree.language != .zig_0_16 and ident_name_raw[1] == '0') {
                 assert(ident_name_raw.len >= 3); // `u0` and `i0` handled
                 return astgen.failNode(
                     ident,
@@ -8856,7 +9030,7 @@ fn ptrCast(
 
         const builtin_token = tree.nodeMainToken(node);
         const builtin_name = tree.tokenSlice(builtin_token);
-        const info = BuiltinFn.list.get(builtin_name) orelse break;
+        const info = BuiltinFn.get(tree.language, builtin_name) orelse break;
         if (args.len == 1) {
             if (info.param_count != 1) break;
 
@@ -8960,6 +9134,7 @@ fn typeOf(
         var typeof_scope = gz.makeSubBlock(scope);
         typeof_scope.is_comptime = false;
         typeof_scope.is_typeof = true;
+        typeof_scope.c_import = false;
         defer typeof_scope.unstack();
 
         const ty_expr = try reachableExpr(&typeof_scope, &typeof_scope.base, .{ .rl = .none }, args[0], node);
@@ -9062,7 +9237,7 @@ fn builtinCall(
     // on the function. For example, `@as` and others participate in result location semantics.
     // Also, some builtins have a variable number of parameters.
 
-    const info = BuiltinFn.list.get(builtin_name) orelse {
+    const info = BuiltinFn.get(tree.language, builtin_name) orelse {
         return astgen.failNode(node, "invalid builtin function: '{s}'", .{
             builtin_name,
         });
@@ -9082,6 +9257,21 @@ fn builtinCall(
         return astgen.failNode(node, "'{s}' outside function scope", .{builtin_name});
 
     switch (info.tag) {
+        // Zig 0.16 only.
+        .c_import => return cImport(gz, scope, node, params[0]),
+        .c_undef => return simpleCBuiltin(gz, scope, ri, node, params[0], .c_undef),
+        .c_include => return simpleCBuiltin(gz, scope, ri, node, params[0], .c_include),
+        .c_define => {
+            if (!gz.c_import) return gz.astgen.failNode(node, "C define valid only inside C import block", .{});
+            const name = try comptimeExpr(gz, scope, .{ .rl = .{ .coerced_ty = .slice_const_u8_type } }, params[0], .operand_cDefine_macro_name);
+            const value = try comptimeExpr(gz, scope, .{ .rl = .none }, params[1], .operand_cDefine_macro_value);
+            const result = try gz.addExtendedPayload(.c_define, Zir.Inst.BinNode{
+                .node = gz.nodeIndexToRelative(node),
+                .lhs = name,
+                .rhs = value,
+            });
+            return rvalue(gz, ri, result, node);
+        },
         .branch_hint => {
             if (!allow_branch_hint) {
                 return astgen.failNode(node, "'@branchHint' must appear as the first statement in a function or conditional branch", .{});
@@ -9969,6 +10159,78 @@ fn divBuiltin(
     return rvalue(gz, ri, result, node);
 }
 
+/// Zig 0.16 only: `@cUndef` and `@cInclude`.
+fn simpleCBuiltin(
+    gz: *GenZir,
+    scope: *Scope,
+    ri: ResultInfo,
+    node: Ast.Node.Index,
+    operand_node: Ast.Node.Index,
+    tag: Zir.Inst.Extended,
+) InnerError!Zir.Inst.Ref {
+    const name: []const u8 = if (tag == .c_undef) "C undef" else "C include";
+    if (!gz.c_import) return gz.astgen.failNode(node, "{s} valid only inside C import block", .{name});
+    const operand = try comptimeExpr(
+        gz,
+        scope,
+        .{ .rl = .{ .coerced_ty = .slice_const_u8_type } },
+        operand_node,
+        if (tag == .c_undef) .operand_cUndef_macro_name else .operand_cInclude_file_name,
+    );
+    _ = try gz.addExtendedPayload(tag, Zir.Inst.UnNode{
+        .node = gz.nodeIndexToRelative(node),
+        .operand = operand,
+    });
+    return rvalue(gz, ri, .void_value, node);
+}
+
+/// Zig 0.16 only: `@cImport`, a comptime block lowered as an extended
+/// `c_import` instruction whose payload holds the body.
+fn cImport(
+    gz: *GenZir,
+    scope: *Scope,
+    node: Ast.Node.Index,
+    body_node: Ast.Node.Index,
+) InnerError!Zir.Inst.Ref {
+    const astgen = gz.astgen;
+    const gpa = astgen.gpa;
+
+    if (gz.c_import) return gz.astgen.failNode(node, "cannot nest @cImport", .{});
+
+    var block_scope = gz.makeSubBlock(scope);
+    block_scope.is_comptime = true;
+    block_scope.c_import = true;
+    defer block_scope.unstack();
+
+    const block_inst: Zir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
+    try astgen.instructions.append(gpa, .{
+        .tag = .extended,
+        .data = .{ .extended = .{
+            .opcode = .c_import,
+            .small = 0,
+            .operand = undefined,
+        } },
+    });
+    const block_result = try fullBodyExpr(&block_scope, &block_scope.base, .{ .rl = .none }, body_node, .normal);
+    _ = try gz.addUnNode(.ensure_result_used, block_result, node);
+    if (!gz.refIsNoReturn(block_result)) {
+        _ = try block_scope.addBreak(.break_inline, block_inst, .void_value);
+    }
+    const body = block_scope.instructionsSlice();
+    const body_len = astgen.countBodyLenAfterFixups(body);
+    try astgen.extra.ensureUnusedCapacity(gpa, @typeInfo(Zir.Inst.CImport).@"struct".field_names.len + body_len);
+    astgen.instructions.items(.data)[@backingInt(block_inst)].extended.operand = astgen.addExtraAssumeCapacity(Zir.Inst.CImport{
+        .node = gz.nodeIndexToRelative(node),
+        .body_len = body_len,
+    });
+    astgen.appendBodyWithFixups(body);
+    block_scope.unstack();
+    // block_scope unstacked now, can add new instructions to gz
+    try gz.instructions.append(gpa, block_inst);
+
+    return block_inst.toRef();
+}
+
 fn offsetOf(
     gz: *GenZir,
     scope: *Scope,
@@ -10374,6 +10636,7 @@ fn nodeMayEvalToError(tree: *const Ast, start_node: Ast.Node.Index) BuiltinFn.Ev
             .aligned_var_decl,
             .@"defer",
             .@"errdefer",
+            .errdefer_payload,
             .address_of,
             .optional_type,
             .negation,
@@ -10416,6 +10679,7 @@ fn nodeMayEvalToError(tree: *const Ast, start_node: Ast.Node.Index) BuiltinFn.Ev
             .add_wrap,
             .add_sat,
             .array_cat,
+            .array_mult,
             .assign,
             .assign_destructure,
             .assign_bit_and,
@@ -10520,7 +10784,7 @@ fn nodeMayEvalToError(tree: *const Ast, start_node: Ast.Node.Index) BuiltinFn.Ev
                 const builtin_name = tree.tokenSlice(builtin_token);
                 // If the builtin is an invalid name, we don't cause an error here; instead
                 // let it pass, and the error will be "invalid builtin function" later.
-                const builtin_info = BuiltinFn.list.get(builtin_name) orelse return .maybe;
+                const builtin_info = BuiltinFn.get(tree.language, builtin_name) orelse return .maybe;
                 return builtin_info.eval_to_error;
             },
         }
@@ -11255,6 +11519,9 @@ const Scope = struct {
         parent: *Scope,
         index: u32,
         len: u32,
+        /// The placeholder an `errdefer |err|` (Zig 0.16 only) body uses
+        /// for the error code.
+        remapped_err_code: Zir.Inst.OptionalIndex = .none,
     };
 
     /// Represents a global scope that has any number of declarations in it.
@@ -11307,6 +11574,8 @@ const GenZir = struct {
     /// This is set to true for a `GenZir` of a `block_inline`, indicating that
     /// exits from this block should use `break_inline` rather than `break`.
     is_inline: bool = false,
+    /// Zig 0.16 only: inside a `@cImport` block.
+    c_import: bool = false,
     /// The containing decl AST node.
     src_baseline: Ast.Node.Index,
     /// The containing decl line index, absolute.
@@ -11394,6 +11663,7 @@ const GenZir = struct {
         return .{
             .is_comptime = gz.is_comptime,
             .is_typeof = gz.is_typeof,
+            .c_import = gz.c_import,
             .src_baseline = gz.src_baseline,
             .decl_line = gz.decl_line,
             .parent = scope,
@@ -11504,7 +11774,7 @@ const GenZir = struct {
 
     /// Assumes nothing stacked on `gz`. Unstacks `gz`.
     /// Asserts `inst` is a `block_comptime`.
-    fn setBlockComptimeBody(gz: *GenZir, inst: Zir.Inst.Index, comptime_reason: std.zig.SimpleComptimeReason) !void {
+    fn setBlockComptimeBody(gz: *GenZir, inst: Zir.Inst.Index, comptime_reason: SimpleComptimeReason) !void {
         const astgen = gz.astgen;
         const gpa = astgen.gpa;
         const body = gz.instructionsSlice();

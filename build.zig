@@ -105,6 +105,8 @@ pub fn build(b: *std.Build) void {
     takes(b, &unit_tests.step, 7);
     const test_step = b.step("test", "Run bs's unit tests and run tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    const frontend_tests = b.addTest(.{ .root_module = frontend.module });
+    test_step.dependOn(&b.addRunArtifact(frontend_tests).step);
     const upstream_step = b.step("test-upstream", "Run the run tests with upstream zig, the oracle");
     // A global cache holding the ZIR of the std files that every build
     // lowers, which the tests that need an empty global cache start from

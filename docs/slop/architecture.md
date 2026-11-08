@@ -19,11 +19,15 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
 
 ### Frontend (`src/Frontend.zig`)
 
-- Uses upstream's `Ast.parse` and `AstGen.generate` unchanged, vendored
-  under `frontend/` (the `frontend` module, outside `src/` so that
-  ziglint does not check upstream's code) rather than taken from bs's own
-  std, so that bs can compile a second Zig release
-  (docs/slop/zig-0.16.md). Everything that reads syntax trees or ZIR
+- Uses upstream's `Ast.parse` and `AstGen.generate`, vendored under
+  `frontend/` (the `frontend` module, outside `src/` so that ziglint does
+  not check upstream's code) rather than taken from bs's own std, so that
+  bs can compile a second Zig release (docs/slop/zig-0.16.md). They are
+  0.17.1's, widened to hold Zig 0.16 too: `Ast.parse` takes the
+  compilation's language (0.16's own parser is frontend/v0_16/Parse.zig),
+  the tree records it, and AstGen lowers a 0.16 tree into the same ZIR
+  with 0.16's meaning, using extended opcodes for what 0.17 has no
+  instruction for. A 0.17 tree's ZIR is byte-identical to upstream's. Everything that reads syntax trees or ZIR
   (Frontend, Sema, the caches, diag, the Linter, fmt, ast-check) takes
   `frontend.Ast` and `frontend.Zir`; `frontend.errors` holds the
   ErrorBundle helpers that take them. Configuration files bs reads itself

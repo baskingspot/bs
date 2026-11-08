@@ -278,11 +278,12 @@ Recommended: bs owns its frontend, with a superset Ast and a superset ZIR.
     `AstRlAnnotate`, `BuiltinFn`, `Zir`, `Zoir` and `ZonGen`, plus
     `string_literal`, `number_literal` and `primitives`, under
     `frontend/`, with upstream's MIT notice.
-  - Vendor 0.16.0's `tokenizer`, `Parse`, `AstGen`, `AstRlAnnotate` and
-    `BuiltinFn` beside them.
-  - 0.16's files are written in Zig 0.16, so they need a mechanical port
-    to compile under bs's own zig 0.17.1: `@typeInfo` loops,
-    `std.builtin` → `std.lang`, the `Optimize` names. That's about a day.
+  - From 0.16.0, vendor only `Parse` (frontend/v0_16/Parse.zig) and
+    `BuiltinFn`'s table (frontend/v0_16/BuiltinFn.zig), ported to build
+    with zig 0.17.1. The tokenizer, AstRlAnnotate and AstGen are 0.17's
+    with 0.16's differences folded in behind a language test (see the
+    superset ZIR below); `Ast.parse` takes the language and records it in
+    the tree.
 - **The superset Ast** is 0.17's Ast plus two appended node tags,
   `array_mult` and `errdefer_payload` (0.16's `errdefer |e|` with
   `.opt_token_and_node` data), plus 0.16's six extra error tags.
@@ -297,14 +298,23 @@ Recommended: bs owns its frontend, with a superset Ast and a superset ZIR.
   - The 0.16 additions: `array_mul`, `c_import`, `c_include`, `c_define`,
     `c_undef`, `defer_err_code`, `ret_err_value_code`, `validate_deref`
     and `builtin_value`.
-  - 0.16's AstGen is ported to produce 0.17's payload shapes (`src_line`,
-    `src_column`, `findTrackableFields`).
-  - It lowers `i0` to an `int_type` instruction instead of a static ref,
-    so static ref numbering stays 0.17's.
-  - 0.17's AstGen stays upstream's, with only its imports changed.
-- **Selection** happens once per compilation. `Frontend.loadAll`/`load`
-  pick the AstGen; the cache thread would make the lowering loop generic
-  over a comptime `Lang`.
+  - One AstGen lowers both languages: 0.17's, where each place 0.16
+    means something different tests `tree.language` and does what
+    0.16.0's AstGen does. Built while doing phase 1, this replaced the
+    plan to port 0.16's AstGen beside 0.17's: diffing the two showed
+    about 20 language differences (`**`, `errdefer |e|`, `@cImport`,
+    `.*` on slices, `i0`, loop error-trace restores, alignment and
+    destructure allocation rules, the slice-length sentinel) against
+    many more ZIR shape changes (`src_column`, field baselines,
+    `findTrackableFields`, terminating breaks in `callconv`/return-type
+    bodies, declaration body order). A port would have had to redo every
+    shape change by hand; the merge gets them for free, and a 0.17 tree
+    takes exactly today's path.
+  - `i0` lowers to an `int_type` instruction, as 0.16 does, so static ref
+    numbering stays 0.17's.
+- **Selection** happens once per compilation: Frontend parses every file
+  with the compilation's language, and AstGen follows the tree. No
+  generic lowering loop is needed.
   - Every other Frontend path (`collectImports`, the blob encoding,
     `Zir.Inst.Data` layout) sees the superset types.
   - The per-file cost is nothing.

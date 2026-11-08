@@ -28,6 +28,7 @@ const assert = std.debug.assert;
 const BigIntConst = std.math.big.int.Const;
 const BigIntMutable = std.math.big.int.Mutable;
 const Ast = frontend.Ast;
+const SimpleComptimeReason = frontend.SimpleComptimeReason;
 
 instructions: std.MultiArrayList(Inst).Slice,
 /// In order to store references to strings in fewer bytes, we copy all
@@ -84,7 +85,7 @@ pub fn extraData(code: Zir, comptime T: type, index: usize) ExtraData(T) {
             Inst.Ref,
             Inst.Index,
             Inst.Declaration.Name,
-            std.zig.SimpleComptimeReason,
+            SimpleComptimeReason,
             NullTerminatedString,
             // Ast.TokenIndex is missing because it is a u32.
             Ast.OptionalTokenIndex,
@@ -2193,6 +2194,41 @@ pub const Inst = struct {
         /// `operand` is payload index to `UnNode`.
         float_op_result_ty,
 
+        // Zig 0.16 only (bs's superset ZIR, docs/slop/zig-0.16.md): what
+        // 0.16's AstGen emits that 0.17's has no instruction for. 0.16's
+        // own ZIR has the first five as plain tags, which no longer fit in
+        // `Tag`; 0.17's AstGen never emits any of them.
+
+        /// `lhs ** rhs`: array multiplication.
+        /// `operand` is payload index to `ArrayMul`.
+        array_mul,
+        /// Checks that the operand of `x.*` is a single-item or C pointer.
+        /// 0.17's `deref` and `ref_deref` do this as they load.
+        /// `operand` is payload index to `UnNode`.
+        validate_deref,
+        /// `@cImport`: a comptime block whose body runs `@cInclude`,
+        /// `@cDefine` and `@cUndef` and yields the translated C code's
+        /// struct type.
+        /// `operand` is payload index to `CImport`.
+        c_import,
+        /// `@cInclude` in a `@cImport` block.
+        /// `operand` is payload index to `UnNode`.
+        c_include,
+        /// `@cDefine` in a `@cImport` block.
+        /// `operand` is payload index to `BinNode`.
+        c_define,
+        /// `@cUndef` in a `@cImport` block.
+        /// `operand` is payload index to `UnNode`.
+        c_undef,
+        /// The error code of `return error.Foo` when an `errdefer |err|`
+        /// in scope captures it.
+        /// `operand` is payload index to `RetErrValueCode`.
+        ret_err_value_code,
+        /// Runs an `errdefer |err|` body with its capture bound to an error
+        /// code: 0.16's `defer_err_code` tag.
+        /// `operand` is payload index to `DeferErrCode`.
+        defer_err_code,
+
         pub const InstData = struct {
             opcode: Extended,
             small: u16,
@@ -2707,7 +2743,7 @@ pub const Inst = struct {
     /// Trailing:
     /// * inst: Index // for each `body_len`
     pub const BlockComptime = struct {
-        reason: std.zig.SimpleComptimeReason,
+        reason: SimpleComptimeReason,
         body_len: u32,
     };
 
@@ -3223,6 +3259,41 @@ pub const Inst = struct {
     pub const Bin = struct {
         lhs: Ref,
         rhs: Ref,
+    };
+
+    /// Zig 0.16's `array_mul` (see `Extended.array_mul`).
+    pub const ArrayMul = struct {
+        node: Ast.Node.Offset,
+        /// The result type of the array multiplication operation, or `.none` if none was available.
+        res_ty: Ref,
+        lhs: Ref,
+        rhs: Ref,
+    };
+
+    /// Zig 0.16's `c_import` (see `Extended.c_import`). Trailing: the body,
+    /// `body_len` instructions.
+    pub const CImport = struct {
+        node: Ast.Node.Offset,
+        body_len: u32,
+    };
+
+    /// Zig 0.16's `ret_err_value_code` (see `Extended.ret_err_value_code`).
+    pub const RetErrValueCode = struct {
+        /// The error's name.
+        name: NullTerminatedString,
+        /// The token of `Foo` in `error.Foo`, relative to the containing
+        /// declaration's first token.
+        src_tok: Ast.TokenOffset,
+    };
+
+    /// Zig 0.16's `defer_err_code` (see `Extended.defer_err_code`): the
+    /// `errdefer |err|` body is `index`'s `len` extra words, as `defer`'s,
+    /// with `remapped_err_code` standing for the capture.
+    pub const DeferErrCode = struct {
+        err_code: Ref,
+        remapped_err_code: Index,
+        index: u32,
+        len: u32,
     };
 
     pub const BinNode = struct {
@@ -4447,7 +4518,29 @@ fn findTrackableInner(
                 .astgen_error,
                 .float_op_result_ty,
                 .round_op_ty,
+                .array_mul,
+                .validate_deref,
+                .c_include,
+                .c_define,
+                .c_undef,
+                .ret_err_value_code,
                 => return,
+
+                // Zig 0.16 only: `@cImport` has a body.
+                .c_import => {
+                    const extra = zir.extraData(Zir.Inst.CImport, extended.operand);
+                    const body = zir.bodySlice(extra.end, extra.data.body_len);
+                    try zir.findTrackableBody(gpa, contents, defers, body);
+                },
+                // Zig 0.16 only: as `defer`.
+                .defer_err_code => {
+                    const extra = zir.extraData(Zir.Inst.DeferErrCode, extended.operand).data;
+                    const gop = try defers.getOrPut(gpa, extra.index);
+                    if (!gop.found_existing) {
+                        const body = zir.bodySlice(extra.index, extra.len);
+                        try zir.findTrackableBody(gpa, contents, defers, body);
+                    }
+                },
 
                 // `@TypeOf` has a body.
                 .typeof_peer => {

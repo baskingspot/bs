@@ -1294,6 +1294,8 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     const fe_node = prog.start("Load Sources", 0);
     var fe: Frontend = try .init(init.gpa, init.io, job.zig_lib_dir, .{
         .language = opts.language.language,
+        // With 0.17's frontend and Sema, as test/language/keys.sh says.
+        .syntax_language = if (init.environ_map.get("BS_TEST_LANGUAGE_KEYS") != null) .newest else null,
         .root_src_path = if (is_test) test_runner else if (opts.c_root) try Builtin.writeCMain(arena, init.io, try Io.Dir.path.join(arena, &.{ job.cache_dirs.global, "bs" }), plain) else opts.root_src_path,
         .root_dir = opts.root_dir,
         .builtin_dir = job.builtin_dir,

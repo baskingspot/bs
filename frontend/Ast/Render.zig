@@ -1,7 +1,8 @@
 //! Vendored from upstream Zig 0.17.1 (lib/std/zig/Ast/Render.zig) by bs, which
-//! compiles two Zig releases (docs/slop/zig-0.16.md); changed only to
-//! import its siblings here instead of std.zig. Copyright (c) Zig
-//! contributors. MIT licensed (see LICENSE-ZIG).
+//! compiles two Zig releases (docs/slop/zig-0.16.md); changed to import its
+//! siblings here instead of std.zig, and to render Zig 0.16's syntax too
+//! (`errdefer |e|`, `**` and `**T`, from 0.16.0's lib/std/zig/Ast/Render.zig).
+//! Copyright (c) Zig contributors. MIT licensed (see LICENSE-ZIG).
 
 const std = @import("std");
 const frontend = @import("../frontend.zig");
@@ -405,6 +406,18 @@ fn renderExpression(r: *Render, node: Ast.Node.Index, space: Space) Error!void {
             return renderBlock(r, node, statements, space);
         },
 
+        // Zig 0.16 only.
+        .errdefer_payload => {
+            const defer_token = tree.nodeMainToken(node);
+            const payload_token, const expr = tree.nodeData(node).token_and_node;
+
+            try renderToken(r, defer_token, .maybe_space);
+            try renderToken(r, payload_token - 1, .none); // |
+            try renderIdentifier(r, payload_token, .none, .preserve_when_shadowing); // identifier
+            try renderToken(r, payload_token + 1, .maybe_space); // |
+            return renderExpression(r, expr, space);
+        },
+
         .@"defer",
         .@"errdefer",
         .@"comptime",
@@ -519,6 +532,7 @@ fn renderExpression(r: *Render, node: Ast.Node.Index, space: Space) Error!void {
         .add_wrap,
         .add_sat,
         .array_cat,
+        .array_mult,
         .bang_equal,
         .bit_and,
         .bit_or,
@@ -1037,6 +1051,17 @@ fn renderArrayType(
 fn renderPtrType(r: *Render, ptr_type: Ast.full.PtrType, space: Space) Error!void {
     const tree = r.tree;
     const main_token = ptr_type.ast.main_token;
+
+    // Zig 0.16: since ** tokens exist and the same token is shared by two
+    // nested pointer types, we check to see if we are the parent
+    // in such a relationship. If so, skip rendering anything for
+    // this pointer type and rely on the child to render our asterisk
+    // as well when it renders the ** token.
+    if (tree.tokenTag(main_token) == .asterisk_asterisk and
+        main_token == tree.nodeMainToken(ptr_type.ast.child_type))
+    {
+        return renderExpression(r, ptr_type.ast.child_type, space);
+    }
 
     switch (ptr_type.size) {
         .one => {

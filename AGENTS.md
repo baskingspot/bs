@@ -87,14 +87,15 @@ the oldest.
 
 ## Architecture decisions
 
-- Frontend: upstream's tokenizer, Parse, AstGen and Zir for each
-  supported release, vendored under `frontend/` (the `frontend` module,
-  outside `src/` so that ziglint does not hold upstream's code to bs's
-  rules) with upstream's notice, ported only as far as compiling under
-  bs's own Zig needs, plus one bs-owned superset Ast and superset ZIR that
-  both releases' AstGen produce (see `docs/slop/zig-0.16.md`). Do not
-  reimplement them. Sema branches on the language only where meaning
-  differs.
+- Frontend: upstream's tokenizer, Ast, Parse, AstGen and Zir of the
+  newest supported release, vendored under `frontend/` (the `frontend`
+  module, outside `src/` so that ziglint does not hold upstream's code to
+  bs's rules) with upstream's notice, widened into one Ast and one ZIR
+  that hold every supported release. An older release adds its own
+  vendored Parse and builtin table, and AstGen lowers its trees with that
+  release's meaning wherever the two differ, as upstream's AstGen of that
+  release does (see `docs/slop/zig-0.16.md`). Do not reimplement them.
+  Sema branches on the language only where meaning differs.
 - Everything after ZIR is bs's own code: semantic analysis and comptime
   (Sema), the typed IR, the backends, and the linkers.
 - Speed comes from architecture, not micro-tuning:

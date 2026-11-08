@@ -1,6 +1,8 @@
 //! Vendored from upstream Zig 0.17.1 (lib/std/zig/BuiltinFn.zig) by bs, which
-//! compiles two Zig releases (docs/slop/zig-0.16.md); changed only to
-//! import its siblings here instead of std.zig. Copyright (c) Zig
+//! compiles two Zig releases (docs/slop/zig-0.16.md); changed to import its
+//! siblings here instead of std.zig, and to hold Zig 0.16's builtins too:
+//! `Tag` has both releases' tags and `get` looks a name up in the
+//! language's own table (0.16's is v0_16/BuiltinFn.zig). Copyright (c) Zig
 //! contributors. MIT licensed (see LICENSE-ZIG).
 
 pub const Tag = enum {
@@ -26,6 +28,11 @@ pub const Tag = enum {
     offset_of,
     call,
     clz,
+    // Zig 0.16 only.
+    c_define,
+    c_import,
+    c_include,
+    c_undef,
     cmpxchg_strong,
     cmpxchg_weak,
     compile_error,
@@ -154,6 +161,16 @@ illegal_outside_function: bool = false,
 /// The number of parameters to this builtin function. `null` means variable number
 /// of parameters.
 param_count: ?u8,
+
+/// The builtin named `name` (with its `@`) in `language`.
+pub fn get(language: Language, name: []const u8) ?BuiltinFn {
+    return switch (language) {
+        .zig_0_16 => list_0_16.get(name),
+        .zig_0_17 => list.get(name),
+    };
+}
+
+pub const list_0_16 = @import("v0_16/BuiltinFn.zig").list;
 
 pub const list = list: {
     @setEvalBranchQuota(3000);
@@ -1079,3 +1096,4 @@ pub const list = list: {
 
 const std = @import("std");
 const BuiltinFn = @This();
+const Language = @import("language.zig").Language;

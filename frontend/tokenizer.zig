@@ -1,9 +1,12 @@
 //! Vendored from upstream Zig 0.17.1 (lib/std/zig/tokenizer.zig) by bs, which
-//! compiles two Zig releases (docs/slop/zig-0.16.md); changed only to
-//! import its siblings here instead of std.zig. Copyright (c) Zig
+//! compiles two Zig releases (docs/slop/zig-0.16.md); changed to import its
+//! siblings here instead of std.zig, and to tokenize Zig 0.16 too, whose
+//! `**` (array multiplication) 0.17 removed (`Tokenizer.language`; the
+//! 0.16 code is from 0.16.0's lib/std/zig/tokenizer.zig). Copyright (c) Zig
 //! contributors. MIT licensed (see LICENSE-ZIG).
 
 const std = @import("std");
+const Language = @import("language.zig").Language;
 
 pub const Token = struct {
     tag: Tag,
@@ -69,6 +72,8 @@ pub const Token = struct {
 
     pub const Tag = enum {
         invalid,
+        /// Zig 0.16 only: `.**`.
+        invalid_periodasterisks,
         identifier,
         string_literal,
         multiline_string_literal_line,
@@ -112,6 +117,8 @@ pub const Token = struct {
         minus_pipe,
         minus_pipe_equal,
         asterisk,
+        /// Zig 0.16 only.
+        asterisk_asterisk,
         asterisk_equal,
         asterisk_percent,
         asterisk_percent_equal,
@@ -200,6 +207,7 @@ pub const Token = struct {
                 .container_doc_comment,
                 => null,
 
+                .invalid_periodasterisks => ".**",
                 .bang => "!",
                 .pipe => "|",
                 .pipe_pipe => "||",
@@ -237,6 +245,7 @@ pub const Token = struct {
                 .minus_pipe => "-|",
                 .minus_pipe_equal => "-|=",
                 .asterisk => "*",
+                .asterisk_asterisk => "**",
                 .asterisk_equal => "*=",
                 .asterisk_percent => "*%",
                 .asterisk_percent_equal => "*%=",
@@ -330,6 +339,8 @@ pub const Token = struct {
 pub const Tokenizer = struct {
     buffer: [:0]const u8,
     index: usize,
+    /// Zig 0.16 has a `**` token; 0.17 reads it as two `*`.
+    language: Language = .newest,
 
     /// For debugging purposes.
     pub fn dump(self: *Tokenizer, token: *const Token) void {
@@ -337,10 +348,15 @@ pub const Tokenizer = struct {
     }
 
     pub fn init(buffer: [:0]const u8) Tokenizer {
+        return initLanguage(buffer, .newest);
+    }
+
+    pub fn initLanguage(buffer: [:0]const u8, language: Language) Tokenizer {
         // Skip the UTF-8 BOM if present.
         return .{
             .buffer = buffer,
             .index = if (std.mem.startsWith(u8, buffer, "\xEF\xBB\xBF")) 3 else 0,
+            .language = language,
         };
     }
 
@@ -571,6 +587,12 @@ pub const Tokenizer = struct {
                     },
                     '%' => continue :state .asterisk_percent,
                     '|' => continue :state .asterisk_pipe,
+                    '*' => if (self.language == .zig_0_16) {
+                        result.tag = .asterisk_asterisk;
+                        self.index += 1;
+                    } else {
+                        result.tag = .asterisk;
+                    },
                     else => result.tag = .asterisk,
                 }
             },
@@ -914,6 +936,10 @@ pub const Tokenizer = struct {
                     '*' => {
                         result.tag = .period_asterisk;
                         self.index += 1;
+                        // 0.16: `.*` before `*`, as in `.**`, is an error.
+                        if (self.language == .zig_0_16 and self.buffer[self.index] == '*') {
+                            result.tag = .invalid_periodasterisks;
+                        }
                     },
                     else => result.tag = .period,
                 }
@@ -1315,6 +1341,21 @@ test "line comment followed by identifier" {
         .identifier,
         .comma,
     });
+}
+
+test "Zig 0.16: `**` and `.**`" {
+    const cases = .{
+        .{ "\"b\".* ** 10", &[_]Token.Tag{ .string_literal, .period_asterisk, .asterisk_asterisk, .number_literal } },
+        .{ "(\"b\".*)** 10", &[_]Token.Tag{ .l_paren, .string_literal, .period_asterisk, .r_paren, .asterisk_asterisk, .number_literal } },
+        .{ "\"b\".*** 10", &[_]Token.Tag{ .string_literal, .invalid_periodasterisks, .asterisk_asterisk, .number_literal } },
+    };
+    inline for (cases) |c| {
+        var tokenizer = Tokenizer.initLanguage(c[0], .zig_0_16);
+        for (c[1]) |expected| try std.testing.expectEqual(expected, tokenizer.next().tag);
+        try std.testing.expectEqual(Token.Tag.eof, tokenizer.next().tag);
+    }
+    // 0.17 reads the same text as single `*`s.
+    try testTokenize("a ** b .** c", &.{ .identifier, .asterisk, .asterisk, .identifier, .period_asterisk, .asterisk, .identifier });
 }
 
 test "UTF-8 BOM is recognized and skipped" {

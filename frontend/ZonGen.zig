@@ -1,6 +1,7 @@
 //! Vendored from upstream Zig 0.17.1 (lib/std/zig/ZonGen.zig) by bs, which
-//! compiles two Zig releases (docs/slop/zig-0.16.md); changed only to
-//! import its siblings here instead of std.zig. Copyright (c) Zig
+//! compiles two Zig releases (docs/slop/zig-0.16.md); changed to import its
+//! siblings here instead of std.zig, and to reject the shared Ast's Zig
+//! 0.16 node tags as it does their 0.17 neighbors. Copyright (c) Zig
 //! contributors. MIT licensed (see LICENSE-ZIG).
 //!
 //! Ingests an `Ast` and produces a `Zoir`.
@@ -119,6 +120,7 @@ fn expr(zg: *ZonGen, node: Ast.Node.Index, dest_node: Zoir.Node.Index) Allocator
         .aligned_var_decl => unreachable,
         .@"defer" => unreachable,
         .@"errdefer" => unreachable,
+        .errdefer_payload => unreachable,
         .switch_case => unreachable,
         .switch_case_inline => unreachable,
         .switch_case_one => unreachable,
@@ -171,6 +173,7 @@ fn expr(zg: *ZonGen, node: Ast.Node.Index, dest_node: Zoir.Node.Index) Allocator
         .less_than,
         .less_or_equal,
         .array_cat,
+        .array_mult,
         .bool_and,
         .bool_or,
         .bool_not,
