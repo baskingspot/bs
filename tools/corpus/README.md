@@ -120,6 +120,11 @@ zigdoc-poc, whose build.zig does not configure under 0.17.1 (`b.args`,
 `b.graph.random_seed`), and hparse, release-probe and zigdoc-wip, which
 have no `.ziglint.zon`. websocket's `install` step builds examples with
 `@cImport`, which 0.17.1 removed, so its entry builds `test`.
+testingx's and fastmem's `test` steps also run checks that fail outside
+their own CI, under upstream zig too (testingx reads PMU counters;
+fastmem's checks run llvm-readelf, llvm-nm and llvm-objdump), so their
+entries build steps that compile the same tests without running them
+(`check`; `test-unit-bin` and `test-bin`).
 
 ## Scope
 

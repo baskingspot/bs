@@ -4100,7 +4100,7 @@
    "ref": "main",
    "build": [
     "install",
-    "test"
+    "check"
    ]
   },
   {
@@ -4120,7 +4120,8 @@
    "ref": "main",
    "build": [
     "install",
-    "test"
+    "test-unit-bin",
+    "test-bin"
    ]
   }
  ]
