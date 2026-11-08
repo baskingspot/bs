@@ -49,7 +49,7 @@ lint:
 ziglint:
     ziglint
 
-[doc("bs's ziglint findings against ziglint's (tools/lint/parity.py), with bs at zig-out/bin/bs: on this tree, on 84c75e56 (a tree with findings of every kind), and on the baskingspot parity set. Exits nonzero on a `bug` difference")]
+[doc("bs's ziglint findings against ziglint's (tools/lint/parity.py), with bs at zig-out/bin/bs: on this tree, on 84c75e56 (a tree with findings of every kind), and on the baskingspot parity set. Exits nonzero on a `bug` difference or a `build-failed` build")]
 [group("lint")]
 lint-parity:
     #!/usr/bin/env bash

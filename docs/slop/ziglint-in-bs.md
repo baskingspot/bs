@@ -494,7 +494,11 @@ and classifies every difference:
   prong or a return expression; its own comments name the gaps.
 - `bug`: anything else, to be fixed.
 
-The bar is zero `bug`, with every other class counted in the results
+A tree or project whose build fails for another reason (an error that is
+not a finding) is `build-failed`, with its first error: the findings of
+what it did not compile would otherwise read as matched or unreached.
+
+The bar is zero `bug` and zero `build-failed`, with every other class counted in the results
 file and the improvements spot-checked by hand. The trees:
 
 - **bs's own tree.** On main it has 0 findings (ziglint 0.8.1, 6.5 s,
@@ -611,8 +615,8 @@ Two passages of `docs/slop/architecture.md` change with it:
 
 **At parity.** Parity means:
 - the suite passes;
-- `parity.py` shows zero `bug` differences on bs's tree, on 84c75e56 and
-  on the baskingspot set;
+- `parity.py` shows zero `bug` differences and no `build-failed` build on
+  bs's tree, on 84c75e56 and on the baskingspot set;
 - the cost budget holds.
 
 bs's own CI can then enforce the rules with bs. The test job builds bs
@@ -778,7 +782,7 @@ decides whether to drop it.
    - `just lint-parity` runs `parity.py` on bs's tree, on 84c75e56 (a
      worktree under `.zig-cache/lint-parity`, fetched when missing) and
      on the parity set (`-j2`; a wider run ran an orb out of memory), and
-     fails only on a `bug` difference. Locally (2026-11-08) it took 6
+     fails on a `bug` difference or a `build-failed` build (item 7). Locally (2026-11-08) it took 6
      minutes: this tree 0 findings on both sides, 84c75e56 1080 matched,
      0 bugs on all three.
    - `just lint-bs` builds every program in the config's paths with bs:

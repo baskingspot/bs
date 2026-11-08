@@ -22,6 +22,11 @@ and line, and classifies every difference (docs/slop/ziglint-in-bs.md,
                 or every finding in it is of the classes above
   bug           anything else, to be fixed
 
+A build that fails for a reason other than a finding (an error that is
+not a finding, or a nonzero exit with no finding) hides the findings of
+everything it did not compile: that tree or project counts as
+`build-failed`, with the first such error.
+
 sema-type and unanalyzed are told apart by side alone; spot-check them
 with --list.
 
@@ -39,7 +44,7 @@ tools/corpus/.work/src/).
 
 A finding that several compile steps report counts once.
 
-Exits 1 if there is a `bug` difference.
+Exits 1 if there is a `bug` difference or a `build-failed` build.
 
     python3 tools/lint/parity.py --bs zig-out/bin/bs --ziglint ziglint [--tree DIR] [-- build args]
     python3 tools/lint/parity.py --bs zig-out/bin/bs --ziglint ziglint --corpus [--projects a,b] [--list]
@@ -47,6 +52,7 @@ Exits 1 if there is a `bug` difference.
 
 import argparse
 import collections
+import itertools
 import json
 import os
 import re
@@ -68,6 +74,8 @@ BS_LINE = re.compile(
 
 # The end of one compilation's errors: the build runner's, or bs's own.
 BLOCK_END = re.compile(r"^(?:error: )?\d+ (?:compilation )?errors?$")
+# Any error, located or not; a finding or a block's end is not a failure.
+ANY_ERROR = re.compile(r"^(?:.+?:\d+:\d+: )?error\b")
 
 
 def ziglint_findings(ziglint, tree):
@@ -81,29 +89,42 @@ def ziglint_findings(ziglint, tree):
 
 
 def bs_run(bs, tree, args):
+    """Returns the findings, and the first error that is not one (or the
+    exit status, when the run failed with no error at all), or None."""
     out = subprocess.run([bs, *args], check=False, cwd=tree, capture_output=True, text=True)
+    lines = (out.stdout + out.stderr).splitlines()
     # Each compile step that covers a file reports its findings: count a
     # finding (rule and column) as often as one compilation reports it.
     # A compilation's errors end with their count.
     most = collections.Counter()
     block = collections.Counter()
-    for line in (out.stdout + out.stderr).splitlines() + ["1 error"]:
+    failure = None
+    for i, line in enumerate(lines + ["1 error"]):
         m = BS_LINE.match(line)
         if m:
             block[(m.group(4) or m.group(5), os.path.normpath(m.group(1)), int(m.group(2)), int(m.group(3)))] += 1
         elif BLOCK_END.match(line):
             most |= block
             block = collections.Counter()
+        elif failure is None and ANY_ERROR.match(line):
+            # With the notes that follow it, which say what failed when
+            # the error itself does not (translate-c's "translation
+            # failure").
+            notes = list(itertools.takewhile(lambda n: n.startswith(" ") or "note:" in n, lines[i + 1 : i + 6]))
+            failure = "\n".join([line, *notes])
     found = collections.Counter()
     for key, n in most.items():
         found[key[:3]] += n
-    return found
+    if failure is None and out.returncode != 0 and not found:
+        failure = f"exit status {out.returncode}" + (f": {lines[-1]}" if lines else "")
+    return found, failure
 
 
 def bs_findings(bs, tree, args):
-    found = bs_run(bs, tree, args)
-    if not any(k[1] == "build.zig" for k in found):
-        return found
+    """Returns the findings and the first failure (bs_run)."""
+    found, failure = bs_run(bs, tree, args)
+    if failure or not any(k[1] == "build.zig" for k in found):
+        return found, failure
     # The build script's findings fail the configure step, before any other
     # step runs: run again with each of them ignored by a comment at the end
     # of its line (which keeps the line numbers), and restore the files.
@@ -122,12 +143,12 @@ def bs_findings(bs, tree, args):
                 text[line - 1] += " // ziglint-ignore: " + " ".join(sorted(rules | {"Z024"}))
             with open(full, "w") as f:
                 f.write("\n".join(text))
-        rest = bs_run(bs, tree, args)
+        rest, failure = bs_run(bs, tree, args)
     finally:
         for full, text in originals.items():
             with open(full, "w") as f:
                 f.write(text)
-    return found + rest
+    return found + rest, failure
 
 
 def classify(key, side, bs_files):
@@ -148,7 +169,7 @@ def classify(key, side, bs_files):
 def compare(bs, ziglint, tree, args, list_all, indent=""):
     """Prints the comparison on `tree`; returns the differences' classes."""
     zl = ziglint_findings(ziglint, tree)
-    ours = bs_findings(bs, tree, args)
+    ours, failure = bs_findings(bs, tree, args)
     bs_files = {path for _, path, _ in ours}
     only_zl = zl - ours
     only_bs = ours - zl
@@ -170,6 +191,9 @@ def compare(bs, ziglint, tree, args, list_all, indent=""):
     classes = collections.Counter()
     for cls, side, key, n in diffs:
         classes[cls] += n
+    if failure:
+        classes["build-failed"] += 1
+        print(f"{indent}build-failed: " + failure.replace("\n", "\n" + indent + "  "))
     print(f"{indent}differences: " + (", ".join(f"{c} {n}" for c, n in sorted(classes.items())) or "none"))
     for cls, side, (rule, path, line), n in sorted(diffs, key=lambda d: (d[0], d[2])):
         if cls == "bug" or list_all:
@@ -201,7 +225,7 @@ def corpus(opts, bs):
         sums = [sums[0] + zl, sums[1] + ours, sums[2] + both]
     print(f"parity set: {len(projects)} projects; ziglint: {sums[0]} findings; bs: {sums[1]}; matched: {sums[2]}")
     print("differences: " + (", ".join(f"{c} {n}" for c, n in sorted(total.items())) or "none"))
-    return 1 if total["bug"] else 0
+    return 1 if total["bug"] or total["build-failed"] else 0
 
 
 def main():
@@ -219,7 +243,7 @@ def main():
     if opts.corpus:
         return corpus(opts, bs)
     classes = compare(bs, opts.ziglint, opts.tree, opts.args, opts.list)[0]
-    return 1 if classes["bug"] else 0
+    return 1 if classes["bug"] or classes["build-failed"] else 0
 
 
 if __name__ == "__main__":
