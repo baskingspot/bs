@@ -3023,6 +3023,9 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
      the loads in the layout, is not emitted, nor is its store; each load
      is that value (`Live.fwd`) and shares its home, so the value's
      interval grows over the loads' intervals and the loops around them.
+     A backend pass that has a later instruction read a load (x86_64's
+     folded `mulWide` casts, rotates and 128-bit shifts) lengthens the
+     value's interval, not the load's.
      Sema makes such an alloc for every `const` local and capture, which
      promotion gave a register and a move of their own.
      A `var` local is forwarded the same way when its one store of a

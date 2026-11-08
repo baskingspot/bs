@@ -1,10 +1,11 @@
 //! exit: 0
-//! stdout: "15452995756747027501\n8521359185914962729\n12943501610297713215\n16208769155697429837\n11990335419632110704\n7138415690893298235\n11752689941954008201\n17063800578687887122\n230792525718168017\n14276831381786596470\n"
+//! stdout: "15452995756747027501\n8521359185914962729\n12943501610297713215\n16208769155697429837\n11990335419632110704\n7138415690893298235\n11752689941954008201\n17063800578687887122\n230792525718168017\n14276831381786596470\n1266778133760337184\n"
 //! A 128-bit product of two unsigned values of at most 64 bits is one
 //! `mul` (Wyhash's mum, std.math.mulWide), with its halves read straight
 //! from rdx:rax. Factors narrower than 64 bits, constants with the top
 //! bit set, a product used whole, a shift by 64 that is kept, a product
-//! live across a call, and near misses that must stay 128-bit
+//! live across a call, a factor read from a forwarded variable or cast
+//! before a loop, and near misses that must stay 128-bit
 //! arithmetic (signed factors, a factor over 64 bits, a shift by 63).
 //! Each case prints what upstream's ReleaseSafe build prints.
 const std = @import("std");
@@ -56,6 +57,22 @@ noinline fn by63(a: u64, b: u64) u64 {
     const x = @as(u128, a) *% b;
     return @truncate(x >> 63);
 }
+/// A factor read from a forwarded variable (`Live.fwd`): the value
+/// stored, not the load, lives until the product.
+noinline fn forwarded(x: u16, y: u8) u64 {
+    var k: u64 = 0;
+    _ = &k;
+    var b: u48 = 0x800000000020;
+    _ = &b;
+    var c: u8 = y;
+    _ = &c;
+    var a: u64 = x;
+    _ = &a;
+    k ^= @as(u64, @truncate((@as(u128, c) * 86400) >> 64));
+    const p = @as(u128, a) * b;
+    if (p >> 64 != 0) k +%= 1 else k ^= @as(u64, @truncate(p));
+    return k ^ @as(u64, @truncate((@as(u128, b) *% b) >> 64));
+}
 
 fn main() callconv(.c) noreturn {
     var a: u64 = 0x9e3779b97f4a7c15;
@@ -72,5 +89,6 @@ fn main() callconv(.c) noreturn {
     rt.printInt(signed(@bitCast(a), @bitCast(b)));
     rt.printInt(wide(@as(u128, a) << 32 | b, b));
     rt.printInt(by63(a, b));
+    rt.printInt(forwarded(@truncate(b), @truncate(a)));
     rt.exit(0);
 }

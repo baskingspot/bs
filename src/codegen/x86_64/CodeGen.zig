@@ -3661,6 +3661,7 @@ fn planRotates(cg: *CodeGen) Error!void {
     const def = live.items(.def);
     const end = live.items(.end);
     const crosses = live.items(.crosses);
+    const fwd = live.items(.fwd);
     const cl = f.clobbers.items;
     for (f.values.items(.inst)) |v| {
         const vi = @backingInt(v);
@@ -3685,9 +3686,11 @@ fn planRotates(cg: *CodeGen) Error!void {
         const sb = datas[@backingInt(s)].bin_op;
         const rb = datas[@backingInt(r)].bin_op;
         if (sb.lhs != rb.lhs) continue;
-        // A load sharing a variable's register holds its value only until
+        // A forwarded load is its value stored, which is what lives on. A
+        // load sharing a variable's register holds its value only until
         // its end (`Live.share`).
-        if (sb.lhs.toIndex()) |x| if (fate[@backingInt(x)] != .normal or live.items(.share)[@backingInt(x)] != Ssa.no_tie) continue;
+        const xv: ?u32 = if (sb.lhs.toIndex()) |x| if (fwd[@backingInt(x)] != Ssa.no_tie) fwd[@backingInt(x)] else @backingInt(x) else null;
+        if (xv) |xi| if (fate[xi] != .normal or live.items(.share)[xi] != Ssa.no_tie) continue;
         for ([_]Inst.Index{ s, r }) |x| {
             if (uses[@backingInt(x)] != 1 or fate[@backingInt(x)] != .normal or cg.homes[@backingInt(x)] != .none) break;
         } else {
@@ -3702,8 +3705,7 @@ fn planRotates(cg: *CodeGen) Error!void {
                 cg.homes[@backingInt(x)] = .dead;
             }
             live.items(.tie)[vi] = Ssa.no_tie;
-            if (sb.lhs.toIndex()) |x| {
-                const xi = @backingInt(x);
+            if (xv) |xi| {
                 end[xi] = @max(end[xi], def[vi]);
                 crosses[xi] = crosses[xi] or cl[def[vi]][0] != cl[def[xi]][0] or cl[def[vi]][1] != cl[def[xi]][1];
                 live.items(.tie)[vi] = xi;
@@ -3816,6 +3818,7 @@ fn planMulWide(cg: *CodeGen) Error!void {
     const end = live.items(.end);
     const crosses = live.items(.crosses);
     const share = live.items(.share);
+    const fwd = live.items(.fwd);
     const cl = f.clobbers.items;
     const extend = struct {
         fn run(e: []u32, d: []const u32, c: []bool, clob: []const [2]u32, x: u32, to: u32) void {
@@ -3839,7 +3842,9 @@ fn planMulWide(cg: *CodeGen) Error!void {
                     if (uses[ci] != 1 or fate[ci] != .normal or cg.homes[ci] != .none) continue;
                     const src = datas[ci].ty_op.operand;
                     if (src.toIndex()) |x| {
-                        const xi = @backingInt(x);
+                        // A forwarded load is its value stored (`Live.fwd`).
+                        var xi = @backingInt(x);
+                        if (fwd[xi] != Ssa.no_tie) xi = fwd[xi];
                         if (fate[xi] != .normal or share[xi] != Ssa.no_tie) continue;
                         extend(end, def, crosses, cl, xi, def[vi]);
                     }

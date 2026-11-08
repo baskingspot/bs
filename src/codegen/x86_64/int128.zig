@@ -135,6 +135,7 @@ pub fn plan(cg: *CodeGen) Error!void {
     const end = live.items(.end);
     const crosses = live.items(.crosses);
     const share = live.items(.share);
+    const fwd = live.items(.fwd);
     const cl = f.clobbers.items;
     for (f.values.items(.inst)) |v| {
         const vi = @backingInt(v);
@@ -144,7 +145,9 @@ pub fn plan(cg: *CodeGen) Error!void {
         if (tags[si] != .shr or fate[si] != .normal or uses[si] != 1 or cg.homes[si] != .none) continue;
         if (lowers(cg, sh) != .pair or amount(cg, datas[si].bin_op.rhs).? < 64) continue;
         if (datas[si].bin_op.lhs.toIndex()) |x| {
-            const xi = @backingInt(x);
+            // A forwarded load is its value stored (`Live.fwd`).
+            var xi = @backingInt(x);
+            if (fwd[xi] != Ssa.no_tie) xi = fwd[xi];
             if (fate[xi] != .normal or share[xi] != Ssa.no_tie) continue;
             end[xi] = @max(end[xi], def[vi]);
             crosses[xi] = crosses[xi] or cl[def[vi]][0] != cl[def[xi]][0] or cl[def[vi]][1] != cl[def[xi]][1];
