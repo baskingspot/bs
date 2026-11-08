@@ -1881,6 +1881,15 @@ fn addBuildTest(b: *std.Build, bs: *std.Build.Step.Compile, build_web_wasm: std.
 /// that finished either would run the step otherwise. (A step that waits
 /// for another of them, as test/build's parts do, runs on that one's
 /// thread.)
+///
+/// Each of them also runs bs with one CodeGen worker beside the Sema
+/// thread (`BS_THREADS=2`) unless it sets its own count: the steps keep
+/// every CPU busy already, and a Debug bs with a worker per CPU spends a
+/// third more CPU on the same build (six builds on a 4-CPU orb: 54 s of
+/// CPU at 4, 42 s at 2, 37 s at 1), much of it the system time of
+/// unmapping freed memory under SafeAllocator. Two keeps CodeGen on a
+/// worker, as any count above one does; the output is the same for
+/// every count.
 fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roots: []const *std.Build.Step) void {
     const Step = std.Build.Step;
     const workers = @max(1, (std.Thread.getCpuCount() catch 1) -| 1);
@@ -1913,6 +1922,9 @@ fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roo
         }.heavier);
         @memset(loads, 0);
         for (users.items) |s| {
+            if (s.cast(Step.Run)) |run| {
+                if (run.getEnvMap().get("BS_THREADS") == null) run.setEnvironmentVariable("BS_THREADS", "2");
+            }
             const least = std.mem.findMin(usize, loads);
             for (s.dependencies.items) |*d| {
                 if (d.* == bs or d.* == first) d.* = gates[least];
