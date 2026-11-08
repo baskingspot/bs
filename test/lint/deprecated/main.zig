@@ -29,6 +29,7 @@ pub fn OldList(comptime T: type) type {
 pub const DeprecatedAlias = OldList;
 
 const find = std.mem.indexOfScalar;
+const dir_path = std.Io.Dir.path;
 
 const S = struct {
     field: OldList(u8),
@@ -61,7 +62,11 @@ export fn entry() void {
     _ = std.ArrayListUnmanaged(u8);
     _ = std.fs.path.basename("a/b");
     // The same namespace, by a path that is not deprecated.
+    // ziglint-ignore: Z035
     _ = std.Io.Dir.path.basename("a/b");
+    // And through an alias of it: std's own alias of it to the deprecated
+    // `std.fs.path` is not followed.
+    _ = dir_path.basename("a/b");
     _ = find(u8, "ab", 'b');
     _ = lib.Color.get();
     _ = std.meta.fieldInfo(S, .field);
@@ -74,35 +79,35 @@ test {
 }
 
 // error
-// main.zig:34:12: error[deprecated, Z011]: 'OldList' is deprecated: Deprecated: use NewList instead
+// main.zig:35:12: error[deprecated, Z011]: 'OldList' is deprecated: Deprecated: use NewList instead
 //   | field: OldList(u8),
-// main.zig:37:21: error[deprecated, Z011]: 'OldList' is deprecated: Deprecated: use NewList instead
+// main.zig:38:21: error[deprecated, Z011]: 'OldList' is deprecated: Deprecated: use NewList instead
 //   | fn typePositions(x: OldList(u8)) ?OldList(u8) {
-// main.zig:37:35: error[deprecated, Z011]: 'OldList' is deprecated: Deprecated: use NewList instead
+// main.zig:38:35: error[deprecated, Z011]: 'OldList' is deprecated: Deprecated: use NewList instead
 //   | fn typePositions(x: OldList(u8)) ?OldList(u8) {
-// main.zig:39:25: error[deprecated, Z011]: 'OldList' is deprecated: Deprecated: use NewList instead
+// main.zig:40:25: error[deprecated, Z011]: 'OldList' is deprecated: Deprecated: use NewList instead
 //   | const arr = [_]type{OldList(u8)};
-// main.zig:51:7: error[deprecated, Z011]: 'oldMethod' is deprecated: Deprecated: use newMethod instead
+// main.zig:52:7: error[deprecated, Z011]: 'oldMethod' is deprecated: Deprecated: use newMethod instead
 //   | p.oldMethod();
-// main.zig:55:14: error[deprecated, Z011]: 'oldMethod' is deprecated: Deprecated: use newMethod instead
+// main.zig:56:14: error[deprecated, Z011]: 'oldMethod' is deprecated: Deprecated: use newMethod instead
 //   | instance.oldMethod();
-// main.zig:57:5: error[deprecated, Z011]: 'oldFunc' is deprecated: Deprecated: use newFunc instead
+// main.zig:58:5: error[deprecated, Z011]: 'oldFunc' is deprecated: Deprecated: use newFunc instead
 //   | oldFunc();
-// main.zig:58:5: error[deprecated, Z011]: 'aliasFunc' is deprecated: Deprecated: use newFunc instead
+// main.zig:59:5: error[deprecated, Z011]: 'aliasFunc' is deprecated: Deprecated: use newFunc instead
 //   | aliasFunc();
-// main.zig:59:9: error[deprecated, Z011]: 'OldList' is deprecated: Deprecated: use NewList instead
+// main.zig:60:9: error[deprecated, Z011]: 'OldList' is deprecated: Deprecated: use NewList instead
 //   | _ = OldList(u8);
-// main.zig:60:9: error[deprecated, Z011]: 'DeprecatedAlias' is deprecated: Deprecated: use NewList instead
+// main.zig:61:9: error[deprecated, Z011]: 'DeprecatedAlias' is deprecated: Deprecated: use NewList instead
 //   | _ = DeprecatedAlias(u8);
-// main.zig:61:13: error[deprecated, Z011]: 'ArrayListUnmanaged' is deprecated: Deprecated; use `ArrayList`.
+// main.zig:62:13: error[deprecated, Z011]: 'ArrayListUnmanaged' is deprecated: Deprecated; use `ArrayList`.
 //   | _ = std.ArrayListUnmanaged(u8);
-// main.zig:62:21: error[deprecated, Z011]: 'std.fs.path' is deprecated: Deprecated, use `std.Io.Dir.path`.
+// main.zig:63:21: error[deprecated, Z011]: 'std.fs.path' is deprecated: Deprecated, use `std.Io.Dir.path`.
 //   | _ = std.fs.path.basename("a/b");
-// main.zig:65:9: error[deprecated, Z011]: 'find' is deprecated: Deprecated in favor of `findScalar`.
+// main.zig:70:9: error[deprecated, Z011]: 'find' is deprecated: Deprecated in favor of `findScalar`.
 //   | _ = find(u8, "ab", 'b');
-// main.zig:66:19: error[deprecated, Z011]: 'get' is deprecated: Deprecated: use fromEnvironment instead
+// main.zig:71:19: error[deprecated, Z011]: 'get' is deprecated: Deprecated: use fromEnvironment instead
 //   | _ = lib.Color.get();
-// main.zig:67:18: error[deprecated, Z011]: 'fieldInfo' is deprecated: Deprecated in favor of `@typeInfo`.
+// main.zig:72:18: error[deprecated, Z011]: 'fieldInfo' is deprecated: Deprecated in favor of `@typeInfo`.
 //
 // To be removed after 0.17.0 is tagged.
 //   | _ = std.meta.fieldInfo(S, .field);

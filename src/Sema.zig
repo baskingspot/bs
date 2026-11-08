@@ -20618,11 +20618,14 @@ fn lintCall(sema: *Sema, block: *Block, src: Src, nav: InternPool.NavIndex, call
 }
 
 /// Reports Z011 at the call at `src` if declaration `nav`, or one it
-/// aliases (`const find = std.mem.indexOfScalar;`), is deprecated.
+/// aliases (`const find = std.mem.indexOfScalar;`), is deprecated. As
+/// ziglint's `findStdlibAliasDecl`, std's own aliases are not followed:
+/// `std.Io.Dir.path`, the replacement, is `std.fs.path`, the deprecated.
 fn lintAliases(sema: *Sema, block: *Block, src: Src, nav: InternPool.NavIndex, display: ?[]const u8) CompileError!bool {
     var n = nav;
     for (0..8) |_| {
         if (try sema.lintDeprecatedNav(src, n, display)) return true;
+        if (sema.zcu.file(sema.ip.getNav(n).file).module == .std) break;
         n = try sema.aliasOf(block, src, n) orelse break;
     }
     return false;
