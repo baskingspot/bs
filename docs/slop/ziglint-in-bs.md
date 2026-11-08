@@ -740,3 +740,35 @@ decides whether to drop it.
      messages have no escape codes.
    - `LintState.sema_sig` also hashes which Sema rules the config
      reports, since Sema checks them all and the report filters.
+5. Branch `lint-5-corpus`: the parity set (decision 6) and the hybrid
+   rules' file-local answers.
+   - The parity set is `tools/corpus/manifest.json`'s `lint` list: 18
+     baskingspot projects with a `.ziglint.zon` that build with 0.17.1
+     (tools/corpus/README.md lists the ones left out and why), compared
+     by `tools/lint/parity.py --corpus`. `parity.py` now counts a finding
+     several compile steps report once, and gets past the build script's
+     findings with ignore comments rather than by editing the config's
+     paths (`src/build/*.zig` is under `src`).
+   - Hybrid verdicts (the owner's decision, 2026-11-08): C, then A. The
+     parity set showed one hybrid difference in built code, 3 Z023
+     findings in baskingspot/metrics (`fn Storage(comptime mode: Mode,
+     comptime T: type)`), where ziglint's resolver takes a first parameter
+     of one of the file's types for a receiver. That is an answer from the
+     file alone, not a type question, and Sema's exact verdict would not
+     match it, so the syntax pass now ports ziglint's resolver as far as
+     the file answers it (`Linter.typeOf`). Afterwards the parity set has
+     no hybrid difference, so A is not built. The answers that need
+     another file remain (test/lint/README.md, "The hybrid rules").
+   - Parity set (2026-11-08): ziglint 223 findings, bs 209, 177 matched;
+     32 `sema-type` (25 Z011 in build scripts, `b.lazyDependency` and Run
+     step methods; 7 Z029, each checked redundant), 3 `unanalyzed`, 43
+     `unreached` (Z011 in benches and examples the steps do not build, and
+     compatibility shims whose deprecated call is in a comptime branch
+     Sema does not take), 0 hybrid (Z006, Z023 and Z032 match exactly),
+     0 bugs. On bs's tree at 84c75e56 nothing changed: 1080 matched, the
+     26 hybrid differences all in files bs does not build.
+   - The parity set found a false Z011 from lint-3: Sema followed std's
+     own alias `std.Io.Dir.path = std.fs.path` to the deprecated
+     declaration, so 16 calls through `const path = Io.Dir.path;` in tls
+     were reported. As ziglint's `findStdlibAliasDecl`, aliases are no
+     longer followed past a std declaration (`deprecated/` covers it).

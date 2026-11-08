@@ -106,6 +106,21 @@ recording their commands.
   `--listen`), an incremental one for bs.
 - Results go to `.work/results.json` and `.work/scoreboard.md`.
 
+## The lint parity set
+
+`manifest.json`'s `lint` list is the parity set of bs's ziglint rules
+(docs/slop/ziglint-in-bs.md): baskingspot's projects that have a
+`.ziglint.zon` and build with zig 0.17.1, each at a pinned commit, with
+the `zig build` steps to build (`build`, a list of step names). run.py and
+steps.py do not build them;
+`python3 tools/lint/parity.py --bs zig-out/bin/bs --ziglint ziglint --corpus`
+checks each out as run.py does and compares bs's findings with ziglint
+0.8.1's. Left out (2026-11-08): image, encoding, docgen, html and
+zigdoc-poc, whose build.zig does not configure under 0.17.1 (`b.args`,
+`b.graph.random_seed`), and hparse, release-probe and zigdoc-wip, which
+have no `.ziglint.zon`. websocket's `install` step builds examples with
+`@cImport`, which 0.17.1 removed, so its entry builds `test`.
+
 ## Scope
 
 bs compiles no C itself: C sources go to upstream's `zig cc`, the same

@@ -25,22 +25,35 @@ and line, and classifies every difference (docs/slop/ziglint-in-bs.md,
 sema-type and unanalyzed are told apart by side alone; spot-check them
 with --list.
 
-Findings in build.zig fail the build's configure step, which hides every
-other step's, so when bs reports any there, it runs again with build.zig
-left out of the config's paths (the tree's .ziglint.zon is restored), and
-takes build.zig's findings from the first run.
+Findings in the build script (build.zig and the files it imports) fail
+the build's configure step, which hides every other step's, so when bs
+reports any there, it runs again with an ignore comment appended to each
+of their lines (the files are restored), and takes them from the first
+run.
+
+With --corpus, it compares on the parity set instead: the baskingspot
+projects in tools/corpus/manifest.json's `lint` list, which have a
+.ziglint.zon and build with zig 0.17.1, each at its pinned commit with its
+`build` steps (checked out by tools/corpus/run.py under
+tools/corpus/.work/src/).
+
+A finding that several compile steps report counts once.
 
 Exits 1 if there is a `bug` difference.
 
     python3 tools/lint/parity.py --bs zig-out/bin/bs --ziglint ziglint [--tree DIR] [-- build args]
+    python3 tools/lint/parity.py --bs zig-out/bin/bs --ziglint ziglint --corpus [--projects a,b] [--list]
 """
 
 import argparse
 import collections
+import json
 import os
 import re
 import subprocess
 import sys
+
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 SEMA = {"Z010", "Z011", "Z029", "Z034"}
 LANGUAGE = {"Z027"}
@@ -50,8 +63,11 @@ ZIGLINT_LINE = re.compile(r"^(Z\d{3}): (.+?):(\d+): ")
 # Text output (`error[style, Z026]`) and the build runner's rendering of
 # the compiler protocol's (`error: [style Z026]`).
 BS_LINE = re.compile(
-    r"^(.+?):(\d+):\d+: error(?:\[(?:style|deprecated), (Z\d{3})\]|: \[(?:style|deprecated) (Z\d{3})\])"
+    r"^(.+?):(\d+):(\d+): error(?:\[(?:style|deprecated), (Z\d{3})\]|: \[(?:style|deprecated) (Z\d{3})\])"
 )
+
+# The end of one compilation's errors: the build runner's, or bs's own.
+BLOCK_END = re.compile(r"^(?:error: )?\d+ (?:compilation )?errors?$")
 
 
 def ziglint_findings(ziglint, tree):
@@ -66,30 +82,52 @@ def ziglint_findings(ziglint, tree):
 
 def bs_run(bs, tree, args):
     out = subprocess.run([bs, *args], check=False, cwd=tree, capture_output=True, text=True)
-    found = collections.Counter()
-    for line in (out.stdout + out.stderr).splitlines():
+    # Each compile step that covers a file reports its findings: count a
+    # finding (rule and column) as often as one compilation reports it.
+    # A compilation's errors end with their count.
+    most = collections.Counter()
+    block = collections.Counter()
+    for line in (out.stdout + out.stderr).splitlines() + ["1 error"]:
         m = BS_LINE.match(line)
         if m:
-            found[(m.group(3) or m.group(4), os.path.normpath(m.group(1)), int(m.group(2)))] += 1
+            block[(m.group(4) or m.group(5), os.path.normpath(m.group(1)), int(m.group(2)), int(m.group(3)))] += 1
+        elif BLOCK_END.match(line):
+            most |= block
+            block = collections.Counter()
+    found = collections.Counter()
+    for key, n in most.items():
+        found[key[:3]] += n
     return found
 
 
 def bs_findings(bs, tree, args):
     found = bs_run(bs, tree, args)
-    in_build = collections.Counter({k: n for k, n in found.items() if k[1] == "build.zig"})
-    if not in_build:
+    if not any(k[1] == "build.zig" for k in found):
         return found
-    config = os.path.join(tree, ".ziglint.zon")
-    with open(config) as f:
-        original = f.read()
+    # The build script's findings fail the configure step, before any other
+    # step runs: run again with each of them ignored by a comment at the end
+    # of its line (which keeps the line numbers), and restore the files.
+    lines = collections.defaultdict(lambda: collections.defaultdict(set))
+    for rule, path, line in found:
+        lines[path][line].add(rule)
+    originals = {}
     try:
-        with open(config, "w") as f:
-            f.write(re.sub(r'"build\.zig"\s*,?\s*', "", original))
+        for path, by_line in lines.items():
+            full = os.path.join(tree, path)
+            with open(full) as f:
+                originals[full] = f.read()
+            text = originals[full].split("\n")
+            for line, rules in by_line.items():
+                # The comment makes the line longer.
+                text[line - 1] += " // ziglint-ignore: " + " ".join(sorted(rules | {"Z024"}))
+            with open(full, "w") as f:
+                f.write("\n".join(text))
         rest = bs_run(bs, tree, args)
     finally:
-        with open(config, "w") as f:
-            f.write(original)
-    return in_build + rest
+        for full, text in originals.items():
+            with open(full, "w") as f:
+                f.write(text)
+    return found + rest
 
 
 def classify(key, side, bs_files):
@@ -107,18 +145,10 @@ def classify(key, side, bs_files):
     return "bug"
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--bs", required=True)
-    ap.add_argument("--ziglint", default="ziglint")
-    ap.add_argument("--tree", default=".")
-    ap.add_argument("--list", action="store_true", help="list every difference, not only bugs")
-    ap.add_argument("args", nargs="*", default=["build"], help="bs's arguments (default: build)")
-    opts = ap.parse_args()
-    bs = os.path.abspath(opts.bs)
-
-    zl = ziglint_findings(opts.ziglint, opts.tree)
-    ours = bs_findings(bs, opts.tree, opts.args)
+def compare(bs, ziglint, tree, args, list_all, indent=""):
+    """Prints the comparison on `tree`; returns the differences' classes."""
+    zl = ziglint_findings(ziglint, tree)
+    ours = bs_findings(bs, tree, args)
     bs_files = {path for _, path, _ in ours}
     only_zl = zl - ours
     only_bs = ours - zl
@@ -134,16 +164,61 @@ def main():
             rows[key[0]][f"{side}: {cls}"] += n
             diffs.append((cls, side, key, n))
 
-    print(f"ziglint: {sum(zl.values())} findings; bs: {sum(ours.values())}; matched: {sum(both.values())}")
+    print(f"{indent}ziglint: {sum(zl.values())} findings; bs: {sum(ours.values())}; matched: {sum(both.values())}")
     for rule in sorted(rows):
-        print(f"  {rule}: " + ", ".join(f"{k} {v}" for k, v in sorted(rows[rule].items())))
+        print(f"{indent}  {rule}: " + ", ".join(f"{k} {v}" for k, v in sorted(rows[rule].items())))
     classes = collections.Counter()
     for cls, side, key, n in diffs:
         classes[cls] += n
-    print("differences: " + (", ".join(f"{c} {n}" for c, n in sorted(classes.items())) or "none"))
+    print(f"{indent}differences: " + (", ".join(f"{c} {n}" for c, n in sorted(classes.items())) or "none"))
     for cls, side, (rule, path, line), n in sorted(diffs, key=lambda d: (d[0], d[2])):
-        if cls == "bug" or opts.list:
-            print(f"  {cls}: {side}: {rule} {path}:{line}" + (f" ({n} times)" if n > 1 else ""))
+        if cls == "bug" or list_all:
+            print(f"{indent}  {cls}: {side}: {rule} {path}:{line}" + (f" ({n} times)" if n > 1 else ""))
+    return classes, sum(zl.values()), sum(ours.values()), sum(both.values())
+
+
+def corpus(opts, bs):
+    """The parity set: tools/corpus/manifest.json's `lint` projects, each
+    checked out at its pinned commit by tools/corpus/run.py and compared
+    with its `build` steps."""
+    sys.path.insert(0, os.path.join(REPO_DIR, "tools", "corpus"))
+    import run as corpus_run
+
+    with open(os.path.join(REPO_DIR, "tools", "corpus", "manifest.json")) as f:
+        projects = json.load(f)["lint"]
+    if opts.projects:
+        names = set(opts.projects.split(","))
+        projects = [p for p in projects if p["name"] in names]
+    total = collections.Counter()
+    sums = [0, 0, 0]
+    for proj in projects:
+        src = corpus_run.checkout(proj, opts.zig)
+        print(f"{proj['name']} ({' '.join(proj['build'])}):")
+        # Two jobs: the projects' compile steps in parallel exhaust an
+        # orb's memory.
+        classes, zl, ours, both = compare(bs, opts.ziglint, src, ["build", "-j2", *proj["build"]], opts.list, "  ")
+        total += classes
+        sums = [sums[0] + zl, sums[1] + ours, sums[2] + both]
+    print(f"parity set: {len(projects)} projects; ziglint: {sums[0]} findings; bs: {sums[1]}; matched: {sums[2]}")
+    print("differences: " + (", ".join(f"{c} {n}" for c, n in sorted(total.items())) or "none"))
+    return 1 if total["bug"] else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--bs", required=True)
+    ap.add_argument("--ziglint", default="ziglint")
+    ap.add_argument("--tree", default=".")
+    ap.add_argument("--list", action="store_true", help="list every difference, not only bugs")
+    ap.add_argument("--corpus", action="store_true", help="compare on the parity set instead of --tree")
+    ap.add_argument("--projects", help="with --corpus: only these projects (comma-separated)")
+    ap.add_argument("--zig", default="zig", help="with --corpus: upstream zig, for fetching")
+    ap.add_argument("args", nargs="*", default=["build"], help="bs's arguments (default: build)")
+    opts = ap.parse_args()
+    bs = os.path.abspath(opts.bs)
+    if opts.corpus:
+        return corpus(opts, bs)
+    classes = compare(bs, opts.ziglint, opts.tree, opts.args, opts.list)[0]
     return 1 if classes["bug"] else 0
 
 
