@@ -770,7 +770,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, run_step: *std.Build.
             // error return trace of the program built without inlining
             // (docs/slop/architecture.md, "Synthetic panic frames"),
             // addresses aside.
-            if (!upstream and host_runs_bs_output and isTraceChecked(file)) traceCheck(b, test_step, bs, src_path, name, "x86_64-linux", &.{});
+            if (!upstream and host_runs_bs_output and isTraceChecked(file)) traceCheck(b, test_step, bs, src_path, name, "x86_64-linux", &.{}, bin);
             if (!upstream and !host_runs_bs_output) {
                 // bs emits x86_64-linux executables; elsewhere only check
                 // that they compile.
@@ -837,8 +837,8 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, run_step: *std.Build.
         }
         // The x86_64 programs' traces check aarch64's stubs too.
         if (isTraceChecked(file)) {
-            if (host_runs_macos_output) traceCheck(b, test_step, bs, src_path, name, "aarch64-macos", &.{});
-            if (aarch64_linux_runner) |runner| traceCheck(b, test_step, bs, src_path, name, "aarch64-linux", runner);
+            if (host_runs_macos_output) traceCheck(b, test_step, bs, src_path, name, "aarch64-macos", &.{}, null);
+            if (aarch64_linux_runner) |runner| traceCheck(b, test_step, bs, src_path, name, "aarch64-linux", runner, null);
         }
         if (expect.aarch64_linux) for ([_]bool{ false, true }) |upstream| {
             const rebuild = !upstream and expect.rebuild_without.items.len != 0;
@@ -923,10 +923,15 @@ fn earlierVersion(b: *std.Build, source: []const u8, edits: []const [2][]const u
 /// Checks that `src_path`'s stack or error return trace built for `target`
 /// is that of the program built without inlining (docs/slop/architecture.md,
 /// "Synthetic panic frames"), addresses and thread ids aside; `runner`
-/// prefixes the runs.
-fn traceCheck(b: *std.Build, test_step: *std.Build.Step, bs: *std.Build.Step.Compile, src_path: []const u8, name: []const u8, target: []const u8, runner: []const []const u8) void {
+/// prefixes the runs. `inlined` is the program as built for `target`
+/// already, if a run test built it.
+fn traceCheck(b: *std.Build, test_step: *std.Build.Step, bs: *std.Build.Step.Compile, src_path: []const u8, name: []const u8, target: []const u8, runner: []const []const u8, inlined: ?std.Build.LazyPath) void {
     var out: [2]std.Build.LazyPath = undefined;
     for (&out, [_]?[]const u8{ null, "0" }) |*o, inline_env| {
+        if (inline_env == null) if (inlined) |bin| {
+            o.* = bin;
+            continue;
+        };
         const c = b.addRunArtifact(bs);
         c.setName(b.fmt("compile {s} for {s}{s}", .{ name, target, if (inline_env != null) " (BS_INLINE=0)" else "" }));
         c.addArgs(&.{ "build-exe", "-target", target });
