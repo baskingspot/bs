@@ -1,0 +1,11 @@
+.{
+    .name = .hello16,
+    .version = "0.0.0",
+    .fingerprint = 0x1a528fd486593ea4,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .dep = .{ .path = "dep" },
+        .lazy = .{ .url = "file://LAZY_TARBALL", .hash = "LAZY_HASH", .lazy = true },
+    },
+    .paths = .{""},
+}

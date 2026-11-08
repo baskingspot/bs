@@ -38,6 +38,10 @@ pub fn build(b: *std.Build) void {
     // (src/BuildWeb.zig).
     const build_web_wasm = buildWebWasm(b, zig_lib_dir);
     exe_mod.addAnonymousImport("build_web_wasm", .{ .root_source_file = build_web_wasm });
+    // Upstream 0.17.1's package fetcher, for `bs build` of Zig 0.16
+    // projects (src/Build16.zig).
+    const fetch = fetchModule(b, zig_lib_dir);
+    exe_mod.addImport("fetch", fetch);
 
     const exe = b.addExecutable(.{ .name = "bs", .root_module = exe_mod });
     // Comptime evaluation recurses on the native stack: a 1000-deep
@@ -63,6 +67,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addOptions("build_options", options);
     test_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
     test_mod.addAnonymousImport("build_web_wasm", .{ .root_source_file = build_web_wasm });
+    test_mod.addImport("fetch", fetch);
     addMachOInputs(b, test_mod);
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     // After bs, as one of its users (`spreadBsUsers`), so that it does
@@ -183,6 +188,7 @@ pub fn build(b: *std.Build) void {
     bench_bs_mod.addOptions("build_options", options);
     bench_bs_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
     bench_bs_mod.addAnonymousImport("build_web_wasm", .{ .root_source_file = build_web_wasm });
+    bench_bs_mod.addImport("fetch", fetch);
     const bench_bs = b.addExecutable(.{ .name = "bs", .root_module = bench_bs_mod });
     bench_bs.stack_size = exe.stack_size;
     const bench_codegen_run = b.addRunArtifact(bench_bs);
@@ -1784,6 +1790,16 @@ fn addBuildTest(b: *std.Build, bs: *std.Build.Step.Compile, build_web_wasm: std.
         if (std.mem.eql(u8, part, "shape")) if (translate_c) |tc| run.step.dependOn(tc);
         step.dependOn(&run.step);
     }
+    // `bs build` of a Zig 0.16 project: test/build16/check.sh.
+    const v0_16 = b.addSystemCommand(&.{"sh"});
+    v0_16.setName("bs build test/build16 (Zig 0.16)");
+    v0_16.addFileArg(b.path("test/build16/check.sh"));
+    v0_16.addArtifactArg2(bs, .{});
+    v0_16.addDirectoryArg2(b.path("test/build16"), .{});
+    _ = v0_16.addOutputDirectoryArg2("work", .{});
+    v0_16.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    takes(b, &v0_16.step, 30);
+    step.dependOn(&v0_16.step);
     return step;
 }
 
@@ -1923,6 +1939,20 @@ fn buildWebWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
     cmd.addArgs(&.{ "--dep", "Walk" });
     cmd.addPrefixedFileArg("-Mhtml_render=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "html_render.zig" }) });
     return cmd.addOutputFileArg2("build-web.wasm", .{ .prefix = "-femit-bin=" });
+}
+
+/// lib/compiler/Maker/Fetch.zig of `zig_lib_dir` and the files it
+/// imports, as a module rooted at src/build16/Maker.zig, which stands in
+/// for the Maker.zig they import: upstream 0.17.1's package fetcher,
+/// unchanged, which bs runs for `bs build` of Zig 0.16 projects, whose
+/// packages 0.16's compiler fetched in the same format (src/Build16.zig).
+fn fetchModule(b: *std.Build, zig_lib_dir: []const u8) *std.Build.Module {
+    const files = b.addWriteFiles();
+    for ([_][]const u8{ "Fetch.zig", "Fetch/git.zig", "Package.zig", "Package/Manifest.zig" }) |sub| {
+        _ = files.addCopyFile(.{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "compiler", "Maker", sub }) }, b.pathJoin(&.{ "Maker", sub }));
+    }
+    const root = files.addCopyFile(b.path("src/build16/Maker.zig"), "Maker.zig");
+    return b.createModule(.{ .root_source_file = root });
 }
 
 /// Upstream zig, the oracle the tests compare bs with: the zig running

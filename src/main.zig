@@ -298,8 +298,12 @@ const forwarded_commands: std.StaticStringMap(void) = .initComptime(.{ .{"cc"}, 
 /// handler, so a ReleaseFast bs keeps no signal stack: each process saves
 /// mapping, zeroing and unmapping it, which was 0.3 ms and 68 of the 282
 /// page faults of a `zig build` compile step that the cache answers.
+///
+/// The package fetcher's debug log (`bs build` of a Zig 0.16 project,
+/// Build16.zig) stays off, as in upstream's ReleaseSafe build runner.
 pub const std_options: std.Options = .{
     .signal_stack_size = if (std.debug.default_enable_segfault_handler) 1 << 18 else null,
+    .log_scope_levels = &.{.{ .scope = .fetch, .level = .info }},
 };
 
 /// The general-purpose allocator of a ReleaseSafe bs: std's SafeAllocator,
@@ -529,6 +533,14 @@ pub fn notYetSupported(choice: language.Choice) noreturn {
     fatal("Zig {s} is selected{s}{s}, but bs does not compile Zig {s} yet", .{ choice.language.name(), if (choice.source == .zon) " by the minimum_zig_version of " else "", by, choice.language.name() });
 }
 
+/// Exits (`notYetSupported`) unless bs compiles `choice`'s language.
+/// `BS_TEST_LANGUAGE_KEYS` lets a test compile in a language bs cannot
+/// compile yet, with the newest one's frontend and Sema, to check that
+/// its caches are its own (test/language/keys.sh).
+pub fn checkSupported(env: *const std.process.Environ.Map, choice: language.Choice) void {
+    if (choice.language != language.Language.newest and env.get("BS_TEST_LANGUAGE_KEYS") == null) notYetSupported(choice);
+}
+
 fn inlining(env: *const std.process.Environ.Map) struct { budget: u32, safe: bool } {
     const budget = if (env.get("BS_INLINE")) |v| std.fmt.parseInt(u32, v, 10) catch fatal("invalid BS_INLINE '{s}': expected a number", .{v}) else inline_ir.budget;
     return .{ .budget = budget, .safe = env.get("BS_INLINE_SAFE") != null };
@@ -570,10 +582,7 @@ pub const Job = struct {
         });
         const lib = try toolchain.libDir(arena, init_.io, init_.environ_map, cache_dirs.global, opts.zig_lib_dir, opts.language.language);
         const zig_lib_dir = lib.path;
-        // `BS_TEST_LANGUAGE_KEYS` lets a test compile in a language bs
-        // cannot compile yet, with the newest one's frontend and Sema, to
-        // check that its caches are its own (test/language/keys.sh).
-        if (opts.language.language != language.Language.newest and init_.environ_map.get("BS_TEST_LANGUAGE_KEYS") == null) notYetSupported(opts.language);
+        checkSupported(init_.environ_map, opts.language);
         const is_test = command.isTest();
         const builtin_opts: Builtin.Options = .{
             .language = opts.language.language,
@@ -1964,7 +1973,10 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     var server: std.zig.Server = .{ .in = &in.interface, .out = &out.interface };
     // The release whose build runner asks: it fails the step on another.
     try server.serveStringMessage(.zig_version, opts.language.language.versionString());
-    try server.serveConfig(.{ .flags = .{
+    // Zig 0.16's protocol has no `config` message, and its runner knows
+    // four path prefixes, without 0.17's `build_root` (`prefixInputs`).
+    const v0_16 = opts.language.language == .zig_0_16;
+    if (!v0_16) try server.serveConfig(.{ .flags = .{
         .output_mode = switch (opts.command) {
             .build_obj, .test_obj => .Obj,
             .build_lib => .Lib,
@@ -2062,7 +2074,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
                 if (compiler_id) |p| try appendInput(arena, &inputs, p);
                 if (outcome == .ok and outcome.ok.at_alt) current = 1 - current;
                 const docs_path = outs[current].docs;
-                const prefixed = try prefixInputs(arena, io, inputs.items, .{ .zig_lib_dir = j.zig_lib_dir, .trusted_lib = j.trusted_lib, .cache_dirs = j.cache_dirs, .build_root = j.opts.build_root });
+                const prefixed = try prefixInputs(arena, io, inputs.items, .{ .zig_lib_dir = j.zig_lib_dir, .trusted_lib = j.trusted_lib, .cache_dirs = j.cache_dirs, .build_root = if (v0_16) null else j.opts.build_root });
                 if (prefixed.len != 0) try server.serveStringMessage(.file_system_inputs, prefixed);
                 switch (outcome) {
                     .ok => |r| {
@@ -2089,7 +2101,7 @@ fn serveFailure(init: std.process.Init, lang: language.Language, diags: []const 
     var out = Io.File.stdout().writerStreaming(io, &out_buf);
     var server: std.zig.Server = .{ .in = &in.interface, .out = &out.interface };
     try server.serveStringMessage(.zig_version, lang.versionString());
-    try server.serveConfig(.{ .flags = .{ .output_mode = output_mode, .link_mode = .static, .link_libc = false, .link_libcpp = false, .link_libunwind = false, .pie = false } });
+    if (lang != .zig_0_16) try server.serveConfig(.{ .flags = .{ .output_mode = output_mode, .link_mode = .static, .link_libc = false, .link_libcpp = false, .link_libunwind = false, .pie = false } });
     while (true) {
         const hdr = server.receiveMessage() catch |err| switch (err) {
             error.EndOfStream => return cleanExit(io),

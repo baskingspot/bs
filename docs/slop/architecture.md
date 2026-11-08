@@ -7995,6 +7995,34 @@ state. Built for step 1:
   runner configures and compiles again; programs still see upstream's
   version. The no-change cost is a read of the file and a stat per
   manifest (test/build/check.sh, `compiler`).
+- **Zig 0.16 projects** (src/Build16.zig, phase 6 of
+  docs/slop/zig-0.16.md, 2026-11-08). 0.16 keeps in the compiler what
+  0.17 moved into the runner, so `bs build` of a project whose
+  build.zig.zon selects 0.16 ports 0.16's `cmdBuild`: it parses 0.16's
+  `zig build` options (`--zig-lib-dir`, `--build-runner`, `--fork=`,
+  `--system`, `--fetch[=]`, `--seed`, …), fetches the packages with
+  upstream 0.17.1's fetcher (lib/compiler/Maker/Fetch.zig and what it
+  imports, copied from the lib directory by build.zig's `fetchModule` and
+  compiled into bs beside a stand-in Maker.zig, src/build16/Maker.zig:
+  the package format, hashes, `zig-pkg` and the generated
+  `dependencies.zig` did not change), writes `dependencies.zig` to
+  `<local cache>/o/<hash>/`, compiles 0.16's
+  `lib/compiler/build_runner.zig` in 0.16 with `--dep @build --dep
+  @dependencies` and a `-M` module per package build.zig into `<local
+  cache>/bs/build-runner/build` (in process, `BuildRunner.compileTool`;
+  bs's cache makes an unchanged one a no-change build), and runs it with
+  0.16's arguments (bs, lib, build root, local and global cache,
+  `--seed`, `-Z<nonce>`, the user's). Exit code 3 means lazy packages are
+  missing, their hashes in `<local cache>/tmp/<nonce>`: bs adds them to
+  the fetch and runs the runner again. `BS_ZIG_VERSION` in the runner's
+  environment puts every compilation it asks for in 0.16. `serve` speaks
+  0.16's protocol to it: version "0.16.0", no `config` message, no
+  `build_root` path prefix (0.16 knows four). `--webui`, `--fuzz` and
+  `--time-report` start 0.16's web UI, which bs does not serve, and are
+  refused. `BS_TEST_RUNNER_ZIG` (test only) has an upstream zig 0.16
+  compile the runner until bs compiles 0.16's std.Build
+  (test/build16/check.sh). The fetcher costs bs's binary its HTTP, TLS,
+  git and archive code.
 - **The compiler protocol** (`main.serve`, std's `std.zig.Server`): bs
   sends `zig_version` and the step's `config` (static, no libc), then
   answers each `update` with `file_system_inputs` (every file the build

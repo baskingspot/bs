@@ -224,7 +224,8 @@ fn serve(init: std.process.Init, req: *const Request) !void {
     var out = Io.File.stdout().writerStreaming(io, &out_buf);
     var server: std.zig.Server = .{ .in = &in.interface, .out = &out.interface };
     try server.serveStringMessage(.zig_version, req.language.versionString());
-    try server.serveConfig(.{ .flags = .{
+    // Zig 0.16's protocol has no `config` message.
+    if (req.language != .zig_0_16) try server.serveConfig(.{ .flags = .{
         .output_mode = .Obj,
         .link_mode = if (req.link_libc and !req.musl) .dynamic else .static,
         .link_libc = req.link_libc,

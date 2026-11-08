@@ -1,0 +1,6 @@
+.{
+    .name = .lazy,
+    .version = "0.0.0",
+    .fingerprint = 0xe5a86e54e6779fa5,
+    .paths = .{""},
+}

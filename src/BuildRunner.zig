@@ -19,6 +19,7 @@ const Frontend = @import("Frontend.zig");
 const Incremental = @import("Incremental.zig");
 const toolchain = @import("toolchain.zig");
 const language = @import("language.zig");
+const Build16 = @import("Build16.zig");
 
 pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const arena = init.arena.allocator();
@@ -37,8 +38,9 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     // The root package's language is every compilation's (`BS_ZIG_VERSION`
     // for the compilations the runner asks for).
     const choice: language.Choice = if (try buildRoot(arena, io, cwd, user_args)) |root| try language.forBuild(arena, io, env, root) else .{ .language = .newest, .source = .default };
+    // Zig 0.16 fetches and runs its build runner from the compiler.
+    if (choice.language == .zig_0_16) return Build16.run(init, args, choice);
     const lib = try toolchain.libDir(arena, io, env, global, lib_override, choice.language);
-    if (choice.language != language.Language.newest) main.notYetSupported(choice);
     if (choice.source == .zon) try env.put("BS_ZIG_VERSION", choice.language.name());
     const zig_lib_dir = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, lib.path });
 
