@@ -20411,6 +20411,14 @@ fn zirCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const extra = sema.code.extraData(Zir.Inst.Call, data.payload_index);
     const callee = sema.resolveInst(extra.data.callee);
     const modifier: std.lang.CallModifier = @fromBackingInt(@intCast(extra.data.flags.packed_modifier));
+    // A call of a declaration by its name.
+    if (sema.zcu.lintCovers(sema.file)) if (extra.data.callee.toIndex()) |ci| switch (sema.code.instructions.items(.tag)[@backingInt(ci)]) {
+        .decl_val, .decl_ref => {
+            const str = sema.code.instructions.items(.data)[@backingInt(ci)].str_tok;
+            try sema.lintCall(block, src, try sema.lookupName(block, src, str.get(sema.code.*)), callee, .none);
+        },
+        else => {},
+    };
     const result = try sema.analyzeCall(block, src, callee, .none, .{ .zir = .{ .call_inst = inst, .extra_end = extra.end, .args_len = extra.data.flags.args_len } }, modifier);
     if (extra.data.flags.ensure_result_used) try sema.ensureResultUsed(block, src, sema.typeOf(result));
     return result;
@@ -20437,6 +20445,7 @@ fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     if (obj_ty == .type_type) {
         // Errors about the lookup point at the callee, as upstream.
         const callee = try sema.fieldVal(block, src.callFunc(), obj, name);
+        try sema.lintDeclCall(block, src, obj, extra.data.obj_ptr, name, callee);
         return sema.analyzeCall(block, src, callee, .none, args, modifier);
     }
     // `obj` points to the object; find the container of the method.
@@ -20444,7 +20453,9 @@ fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     var self_ptr = obj;
     var container = Type.ptrInfo(ip, obj_ty).child;
     if (container == .type_type) {
-        const callee = try sema.fieldVal(block, src.callFunc(), try sema.analyzeLoad(block, src, obj), name);
+        const ty = try sema.analyzeLoad(block, src, obj);
+        const callee = try sema.fieldVal(block, src.callFunc(), ty, name);
+        try sema.lintDeclCall(block, src, ty, extra.data.obj_ptr, name, callee);
         return sema.analyzeCall(block, src, callee, .none, args, modifier);
     }
     if (Type.class(ip, container) == .pointer and Type.ptrInfo(ip, container).flags.size == .one) {
@@ -20452,7 +20463,9 @@ fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         container = Type.ptrInfo(ip, container).child;
         // A pointer to a type: a call of one of its declarations.
         if (container == .type_type) {
-            const callee = try sema.fieldVal(block, src.callFunc(), try sema.analyzeLoad(block, src, self_ptr), name);
+            const ty = try sema.analyzeLoad(block, src, self_ptr);
+            const callee = try sema.fieldVal(block, src.callFunc(), ty, name);
+            try sema.lintDeclCall(block, src, ty, extra.data.obj_ptr, name, callee);
             return sema.analyzeCall(block, src, callee, .none, args, modifier);
         }
     }
@@ -20513,7 +20526,171 @@ fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         return err;
     }
     const self: Ref = if (by_ptr.?) self_ptr else try sema.analyzeLoad(block, src, self_ptr);
+    try sema.lintCall(block, src, nav, callee, .none);
     return sema.analyzeCall(block, src, callee, self, args, modifier);
+}
+
+/// `lintCall` for a call of declaration `name` of type `ty`, which ZIR
+/// `receiver` evaluates, if it names one, whose value is `callee`.
+fn lintDeclCall(sema: *Sema, block: *Block, src: Src, ty: Ref, receiver: Zir.Inst.Ref, name: []const u8, callee: Ref) CompileError!void {
+    if (!sema.zcu.lintCovers(sema.file)) return;
+    const t = sema.resolveValue(ty) orelse return;
+    const nav = try sema.lookupInType(t, name) orelse return;
+    return sema.lintCall(block, src, nav, callee, receiver);
+}
+
+/// Z011 for a call at `src` in a covered file (docs/slop/ziglint-in-bs.md):
+/// of declaration `nav`, whose value is `callee`, or of a std namespace on
+/// the path `receiver` spells, if any (ZIR `std.fs.path` in
+/// `std.fs.path.basename(p)`). As ziglint, the function the declaration
+/// names comes first, then the declaration and those it aliases
+/// (`std.mem.indexOfScalar`), then the namespaces, innermost first.
+fn lintCall(sema: *Sema, block: *Block, src: Src, nav: InternPool.NavIndex, callee: Ref, receiver: Zir.Inst.Ref) CompileError!void {
+    const zcu = sema.zcu;
+    const ip = sema.ip;
+    if (!zcu.lintCovers(sema.file)) return;
+    if (sema.resolveValue(callee)) |v| if (ip.keyTag(v) == .func) {
+        const owner = ip.keyPayload(.func, v).owner_nav;
+        if (owner != nav and try sema.lintDeprecatedNav(src, owner, null)) return;
+    };
+    if (try sema.lintAliases(block, src, nav, null)) return;
+    // The receiver's path, as written: a name, then fields.
+    var chain: [16]Zir.Inst.Index = undefined;
+    var len: usize = 0;
+    if (receiver == .none) return;
+    var cur = receiver.toIndex() orelse return;
+    const tags = sema.code.instructions.items(.tag);
+    const datas = sema.code.instructions.items(.data);
+    while (len < chain.len) {
+        chain[len] = cur;
+        len += 1;
+        switch (tags[@backingInt(cur)]) {
+            .field_ptr, .field_ptr_load => cur = sema.code.extraData(Zir.Inst.Field, datas[@backingInt(cur)].pl_node.payload_index).data.lhs.toIndex() orelse return,
+            .decl_val, .decl_ref => break,
+            else => return,
+        }
+    } else return;
+    std.mem.reverse(Zir.Inst.Index, chain[0..len]);
+    // Each name's declaration, and the namespace it names.
+    var navs: [16]InternPool.NavIndex = undefined;
+    var ty: Index = .none;
+    for (chain[0..len], 0..) |inst, i| {
+        navs[i] = if (i == 0)
+            try sema.lookupName(block, src, datas[@backingInt(inst)].str_tok.get(sema.code.*))
+        else
+            try sema.lookupInType(ty, sema.zirString(sema.code.extraData(Zir.Inst.Field, datas[@backingInt(inst)].pl_node.payload_index).data.field_name_start)) orelse return;
+        try sema.ensureNavVal(block, src, navs[i]);
+        ty = ip.getNav(navs[i]).val;
+        if (ip.typeOf(ty) != .type_type or ip.containerType(ty) == null) return;
+    }
+    // ziglint checks the namespaces of a std receiver, named by their path
+    // in std: the first name's type's (`Io` for `const Io = std.Io`),
+    // then the fields.
+    if (zcu.file(ip.containerType(ty).?.file).module != .std) return;
+    const root = ip.getNav(navs[0]).val;
+    var path: std.Io.Writer.Allocating = .init(sema.arena);
+    path.writer.writeAll("std") catch return error.OutOfMemory;
+    if (root != try zcu.fileRootType(zcu.moduleRootFile(.std) orelse return)) {
+        if (zcu.file(ip.containerType(root).?.file).module != .std) return;
+        path.writer.writeByte('.') catch return error.OutOfMemory;
+        print.writeTypeName(ip, root, &path.writer, .read) catch return error.OutOfMemory;
+    }
+    var ends: [16]usize = undefined;
+    ends[0] = path.written().len;
+    for (chain[1..len], 1..) |inst, i| {
+        const name = sema.zirString(sema.code.extraData(Zir.Inst.Field, datas[@backingInt(inst)].pl_node.payload_index).data.field_name_start);
+        path.writer.print(".{s}", .{name}) catch return error.OutOfMemory;
+        ends[i] = path.written().len;
+    }
+    var i = len;
+    while (i > 1) {
+        i -= 1;
+        if (try sema.lintDeprecatedNav(src, navs[i], path.written()[0..ends[i]])) return;
+    }
+    _ = try sema.lintAliases(block, src, navs[0], path.written()[0..ends[0]]);
+}
+
+/// Reports Z011 at the call at `src` if declaration `nav`, or one it
+/// aliases (`const find = std.mem.indexOfScalar;`), is deprecated.
+fn lintAliases(sema: *Sema, block: *Block, src: Src, nav: InternPool.NavIndex, display: ?[]const u8) CompileError!bool {
+    var n = nav;
+    for (0..8) |_| {
+        if (try sema.lintDeprecatedNav(src, n, display)) return true;
+        n = try sema.aliasOf(block, src, n) orelse break;
+    }
+    return false;
+}
+
+/// Reports Z011 at the call at `src` if declaration `nav` is deprecated.
+fn lintDeprecatedNav(sema: *Sema, src: Src, nav: InternPool.NavIndex, display: ?[]const u8) CompileError!bool {
+    try sema.declareDependency(.{ .deprecation = nav });
+    const doc = try sema.zcu.deprecation(nav);
+    if (doc.len == 0) return false;
+    try sema.lintDeprecated(src, display, doc);
+    return true;
+}
+
+/// The declaration `const` declaration `nav` names, if its value is one
+/// by name (`std.mem.indexOfScalar`), read from its ZIR: Sema keeps only
+/// the value.
+fn aliasOf(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) CompileError!?InternPool.NavIndex {
+    const ip = sema.ip;
+    const nav = ip.getNav(nav_index);
+    const zir = &sema.zcu.file(nav.file).zir;
+    const decl = zir.getDeclaration(nav.zir_inst);
+    if (decl.kind != .@"const" or decl.type_body != null) return null;
+    const body = decl.value_body orelse return null;
+    if (body.len < 2 or body.len > 9) return null;
+    const tags = zir.instructions.items(.tag);
+    const datas = zir.instructions.items(.data);
+    const last = body[body.len - 1];
+    if (tags[@backingInt(last)] != .break_inline or datas[@backingInt(last)].@"break".operand.toIndex() != body[body.len - 2]) return null;
+    // Each instruction a name: the declaration it finds.
+    var found: [8]InternPool.NavIndex = undefined;
+    for (body[0 .. body.len - 1], 0..) |inst, i| {
+        const data = datas[@backingInt(inst)];
+        found[i] = switch (tags[@backingInt(inst)]) {
+            .decl_val, .decl_ref => find: {
+                const name = try sema.getString(data.str_tok.get(zir.*));
+                var ns = nav.namespace;
+                while (ns != Zcu.Namespace.none) : (ns = sema.zcu.namespacePtr(ns).parent) {
+                    try sema.declareDependency(.{ .namespace_name = .{ .namespace = ns, .name = name } });
+                    if (try sema.zcu.findDecl(ns, name)) |d| break :find d;
+                }
+                return null;
+            },
+            .field_ptr, .field_ptr_load => find: {
+                const extra = zir.extraData(Zir.Inst.Field, data.pl_node.payload_index).data;
+                const lhs = extra.lhs.toIndex() orelse return null;
+                const at = std.mem.findScalar(Zir.Inst.Index, body[0..i], lhs) orelse return null;
+                try sema.ensureNavVal(block, src, found[at]);
+                const val = ip.getNav(found[at]).val;
+                if (ip.typeOf(val) != .type_type) return null;
+                break :find try sema.lookupInType(val, zir.nullTerminatedString(extra.field_name_start)) orelse return null;
+            },
+            else => return null,
+        };
+    }
+    return found[body.len - 2];
+}
+
+/// Reports a Z011 finding at the call at `src`, named `display` or else by
+/// the callee's name as the call spells it.
+fn lintDeprecated(sema: *Sema, src: Src, display: ?[]const u8, doc: []const u8) CompileError!void {
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    var buf: [1]Ast.Node.Index = undefined;
+    const node = src.loc.node.toAbsolute(src.base);
+    const token = if (tree.fullCall(&buf, node)) |call| switch (tree.nodeTag(call.ast.fn_expr)) {
+        .field_access => tree.nodeData(call.ast.fn_expr).node_and_token[1],
+        else => tree.nodeMainToken(call.ast.fn_expr),
+    } else tree.nodeMainToken(node);
+    const name = display orelse tree.tokenSlice(token);
+    try sema.zcu.lint_findings.append(sema.gpa, .{
+        .file = sema.file,
+        .offset = tree.tokenStart(token),
+        .rule = .Z011,
+        .context = try sema.zcu.arena.allocator().print("'{s}' is deprecated: {s}", .{ name, doc }),
+    });
 }
 
 /// Whether `ty` is a single-item (or, with `c`, a C) pointer to `child`.

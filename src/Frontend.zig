@@ -560,6 +560,35 @@ pub fn lintFindings(fe: *const Frontend, arena: Allocator, index: File.Index) ![
     return findings;
 }
 
+/// File `index`'s deprecated declarations (`Linter.deprecations`), which
+/// Z011 reads, in `arena`: from the cache, which keeps them by the
+/// file's content, else from its syntax tree, parsed again. Any file, std
+/// included, as Sema calls into it. Thread-safe.
+pub fn deprecations(fe: *const Frontend, arena: Allocator, index: File.Index) ![]const Linter.Deprecation {
+    const f = &fe.files.items[@backingInt(index)];
+    if (try fe.cachedDeprecations(arena, f.content_hash)) |table| return table;
+    const syntax = try fe.syntaxOf(index);
+    const table = try Linter.deprecations(arena, &syntax.tree);
+    if (fe.blobCache()) |blobs| blobs.saveLintFacts(fe.io, deprecationsName(f.content_hash), try Linter.encodeDeprecations(arena, table));
+    return table;
+}
+
+/// The deprecation table of contents `content_hash`, if the cache has it.
+pub fn cachedDeprecations(fe: *const Frontend, arena: Allocator, content_hash: Hash) !?[]const Linter.Deprecation {
+    const blobs = fe.blobCache() orelse return null;
+    const bytes = blobs.loadLintFacts(arena, fe.io, deprecationsName(content_hash)) orelse return null;
+    return Linter.decodeDeprecations(arena, bytes);
+}
+
+fn deprecationsName(content_hash: Hash) [32]u8 {
+    var h: std.crypto.hash.Blake3 = .init(.{});
+    h.update(Linter.deprecations_magic);
+    h.update(&content_hash);
+    var key: Hash = undefined;
+    h.final(&key);
+    return std.fmt.bytesToHex(key, .lower);
+}
+
 /// What file `f`'s lint findings depend on: its contents, its base name
 /// (Z009, Z012, Z021) and the rules (`Linter.version`).
 pub fn lintKey(f: *const File) Hash {

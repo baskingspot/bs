@@ -682,3 +682,30 @@ decides whether to drop it.
    all 444 matched, none bs-only; ziglint-only: 745 sema-pending (Z011),
    38 hybrid, 42 in files `bs build` does not reach (tools/, bench/), and
    0 bugs. On main (2ba77df and later) both report 0.
+3. Branch `lint-3-sema`: Z011 in Sema (docs/slop/architecture.md,
+   "Sema's rules"), and the `deprecated/` case for ziglint's Z011 tests
+   and doc example. As built, against the design above:
+   - The deprecation table is a cache file of its own beside the
+     syntax pass's findings, keyed by the contents alone, and it maps
+     each deprecated declaration's line (its ZIR declaration's
+     `src_line`) to its doc comment. The `deprecation` dependee is as
+     designed.
+   - The namespace form follows the receiver's path as written (ZIR),
+     not its type's name: `std.Io.Dir.path` is an alias of the
+     deprecated `std.fs.path`, and ziglint does not report a call
+     through the former, so neither does bs. An alias declaration is
+     followed from its ZIR, since Sema keeps only its value.
+   - bs reports more than ziglint on bs's own tree: 266 calls through
+     locals, fields and aliases that ziglint's resolver cannot type (250
+     Run step methods and `Build.dupe` in build.zig, 16
+     `ArrayList.getLast`, `getLastOrNull` and `fs.path` in src). The
+     branch fixes them first, so `bs build` of bs stays clean.
+   - `parity.py` on 84c75e56 with that tree's config (2026-11-08, `bs
+     build`, which now runs again without build.zig in the config's
+     paths when build.zig has findings, since they fail the configure
+     step): ziglint 1269 findings, bs 1308, 1083 matched. Z011: 639
+     matched; 225 bs-only (`sema-type`, spot-checked: all calls of
+     deprecated declarations through fields, locals and aliases);
+     ziglint-only 79 `unanalyzed` (each in a test block, a test helper,
+     an unreferenced function or an untaken macOS branch) and 27
+     unreached. The rest as before: 38 hybrid, 42 unreached, 0 bugs.

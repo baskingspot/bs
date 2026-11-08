@@ -2779,12 +2779,102 @@ fn checkCallArgs(self: *Linter, node: Ast.Node.Index) void {
     }
 }
 
-/// Reports every deprecated call in the file.
-///
-/// Z011 sweeps the node table instead of the recursive `visitNode` walk. That
-/// walk stops at function signatures, container fields, and type-only
-/// positions, so `std.meta.Int()` in a return type or struct field would
-/// otherwise go unreported.
+/// The doc comment of the declaration at `node`, its lines without their
+/// `/// ` joined by newlines, in `arena`; null if it has none. ziglint's
+/// `doc_comments.getDocComment` (src/doc_comments.zig), which Z011 quotes.
+pub fn docComment(arena: std.mem.Allocator, tree: *const Ast, node: Ast.Node.Index) !?[]const u8 {
+    const first = tree.firstToken(node);
+    var token = first;
+    // Back over the doc comments, and any `pub` among them.
+    while (token > 0) switch (tree.tokenTag(token - 1)) {
+        .doc_comment, .keyword_pub => token -= 1,
+        else => break,
+    };
+    var out: std.ArrayList(u8) = .empty;
+    var any = false;
+    for (token..first) |t| {
+        if (tree.tokenTag(@intCast(t)) != .doc_comment) continue;
+        if (any) try out.append(arena, '\n');
+        any = true;
+        const slice = tree.tokenSlice(@intCast(t));
+        const content = if (std.mem.startsWith(u8, slice, "/// ")) slice[4..] else if (std.mem.startsWith(u8, slice, "///")) slice[3..] else slice;
+        try out.appendSlice(arena, content);
+    }
+    return if (any) out.items else null;
+}
+
+/// A declaration whose doc comment marks it deprecated (Z011): the
+/// 0-based line of its first token, as its ZIR declaration's `src_line`,
+/// and the doc comment.
+pub const Deprecation = struct { line: u32, doc: []const u8 };
+
+/// The deprecated declarations of `tree`, by line, in `arena`: Z011's
+/// table of a file (`Frontend.deprecations`).
+pub fn deprecations(arena: std.mem.Allocator, tree: *const Ast) ![]const Deprecation {
+    const At = struct { offset: u32, doc: []const u8 };
+    var found: std.ArrayList(At) = .empty;
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        switch (tree.nodeTag(node)) {
+            .fn_decl, .fn_proto_simple, .fn_proto_multi, .fn_proto_one, .fn_proto, .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {},
+            else => continue,
+        }
+        const doc = try docComment(arena, tree, node) orelse continue;
+        if (!containsDeprecated(doc)) continue;
+        try found.append(arena, .{ .offset = tree.tokenStart(tree.firstToken(node)), .doc = doc });
+    }
+    std.mem.sortUnstable(At, found.items, {}, struct {
+        fn lessThan(_: void, a: At, b: At) bool {
+            return a.offset < b.offset;
+        }
+    }.lessThan);
+    // A function's prototype starts where the function does.
+    var out: std.ArrayList(Deprecation) = .empty;
+    var line: u32 = 0;
+    var pos: usize = 0;
+    for (found.items, 0..) |f, i| {
+        if (i > 0 and found.items[i - 1].offset == f.offset) continue;
+        line += @intCast(std.mem.count(u8, tree.source[pos..f.offset], "\n"));
+        pos = f.offset;
+        try out.append(arena, .{ .line = line, .doc = f.doc });
+    }
+    return out.items;
+}
+
+/// `deprecations` as the frontend caches them: `deprecations_magic`, then
+/// per declaration its line and doc comment length as little-endian u32s,
+/// and the doc comment.
+pub const deprecations_magic = "bsdepr01";
+
+pub fn encodeDeprecations(gpa: std.mem.Allocator, table: []const Deprecation) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, deprecations_magic);
+    for (table) |d| {
+        for ([_]u32{ d.line, @intCast(d.doc.len) }) |v| try out.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(u32, v)));
+        try out.appendSlice(gpa, d.doc);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// The table `encodeDeprecations` wrote into `bytes`, its doc comments
+/// pointing into it; null if `bytes` is not such a record.
+pub fn decodeDeprecations(arena: std.mem.Allocator, bytes: []const u8) !?[]const Deprecation {
+    if (!std.mem.startsWith(u8, bytes, deprecations_magic)) return null;
+    var list: std.ArrayList(Deprecation) = .empty;
+    var pos: usize = deprecations_magic.len;
+    while (pos < bytes.len) {
+        if (bytes.len - pos < 8) return null;
+        const line = std.mem.readInt(u32, bytes[pos..][0..4], .little);
+        const len = std.mem.readInt(u32, bytes[pos + 4 ..][0..4], .little);
+        pos += 8;
+        if (bytes.len - pos < len) return null;
+        try list.append(arena, .{ .line = line, .doc = bytes[pos..][0..len] });
+        pos += len;
+    }
+    return list.items;
+}
+
 /// Whether doc comment `text` marks its declaration deprecated (Z011).
 pub fn containsDeprecated(text: []const u8) bool {
     var lines = std.mem.splitScalar(u8, text, '\n');

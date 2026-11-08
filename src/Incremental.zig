@@ -196,6 +196,10 @@ verify: enum { off, replay, full } = .off,
 /// The lint config is not the last successful build's (`main.LintState`):
 /// the build must build, to report what the config now reports.
 lint_changed: bool = false,
+/// `main.LintState.sema_sig` of this build, if Sema checks lint rules in
+/// any file: a donor is usable only if recorded with the same, and a
+/// donor this build publishes is marked with it (`lint_sig_name`).
+lint_sig: ?[16]u8 = null,
 /// For `verify`: the command line and environment to build again with.
 verify_argv: []const []const u8 = &.{},
 verify_environ: ?*std.process.Environ.Map = null,
@@ -1696,6 +1700,11 @@ pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
         }
         var d = donors.openDir(io, name, .{}) catch continue;
         defer d.close(io);
+        if (inc.lint_sig) |want| {
+            var sig: [16]u8 = undefined;
+            const got = d.readFile(io, lint_sig_name, &sig) catch continue;
+            if (!std.mem.eql(u8, got, &want)) continue;
+        }
         const stat = d.statFile(io, "manifest", .{}) catch continue;
         var m = (Manifest.open(gpa, io, d) catch continue) orelse continue;
         var c: Candidate = .{
@@ -1826,6 +1835,9 @@ fn dropDonorBase(inc: *Incremental) void {
 /// the packs it names, which keep them alive when the store merges or
 /// trims them. Built under a temporary name and renamed into place, so
 /// readers only see complete donors.
+/// A donor's `lint_sig`, in its directory; none if recorded without.
+const lint_sig_name = "lintsig";
+
 fn publishDonor(inc: *Incremental, base_names: []const []const u8) !void {
     if (!inc.donors or inc.verify == .full) return;
     const gpa = inc.gpa;
@@ -1844,6 +1856,7 @@ fn publishDonor(inc: *Incremental, base_names: []const []const u8) !void {
         errdefer donors.deleteTree(io, &tmp_name) catch {};
         try linkOrCopy(inc.dir, "manifest", tmp, io);
         for (base_names) |n| try linkOrCopy(inc.dir, n, tmp, io);
+        if (inc.lint_sig) |sig| try tmp.writeFile(io, .{ .sub_path = lint_sig_name, .data = &sig });
     }
     donors.rename(&tmp_name, donors, &name, io) catch |err| {
         donors.deleteTree(io, &tmp_name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
@@ -1927,6 +1940,7 @@ pub const Tag = enum(u8) {
     embed_file,
     struct_defaults,
     func_inline,
+    deprecation,
 };
 
 /// Keys that are hashes already.
@@ -1979,6 +1993,7 @@ pub const DependeeContext = struct {
             .namespace => |ns| mix(6, ns),
             .embed_file => |i| mix(7, i),
             .struct_defaults => |t| mix(8, @backingInt(t)),
+            .deprecation => |n| mix(10, @backingInt(n)),
         };
     }
     pub fn eql(_: DependeeContext, a: Zcu.Dependee, b: Zcu.Dependee) bool {
@@ -2075,7 +2090,7 @@ pub const Recorder = struct {
             // With an edge to the unit that produces them.
             .nav_ty => |nav| try r.addUnit(.{ .nav_val = nav }),
             .func_ies, .func_inline => |func| try r.addUnit(.{ .func = func }),
-            .func_body, .namespace_name, .namespace, .embed_file => no_node,
+            .func_body, .namespace_name, .namespace, .embed_file, .deprecation => no_node,
         };
         const gop = try r.dependees.getOrPut(r.gpa, d);
         if (!gop.found_existing) {
@@ -2146,6 +2161,7 @@ pub const Recorder = struct {
             .namespace_name => .namespace_name,
             .namespace => .namespace,
             .embed_file => .embed_file,
+            .deprecation => .deprecation,
         };
         const index, const new = try r.node(info.key, tag);
         info.node = index;
@@ -2378,6 +2394,17 @@ pub const Keyer = struct {
                     h = cache.hash(@as(u64, @truncate(h)) ^ @intFromBool(k.zcu.declIsPub(ns, i)), ip.stringSlice(name)) ^ h;
                 }
                 return .{ .key = try k.keyOf(.namespace, &.{ns.key}), .result_hash = h, .source = k.namespaceSource(ns) };
+            },
+            // The doc comment, if it marks the declaration deprecated:
+            // an edit to it changes no source hash.
+            .deprecation => |nav_index| {
+                const nav = ip.getNav(nav_index);
+                const doc = try k.zcu.deprecation(nav_index);
+                return .{
+                    .key = try k.keyOf(.deprecation, &.{ip.stringSlice(nav.key)}),
+                    .result_hash = if (doc.len != 0) cache.hash(4, doc) else 0,
+                    .source = source(nav.file, nav.zir_inst),
+                };
             },
             // The file's contents, by its path in its module.
             .embed_file => |i| {
@@ -4286,7 +4313,7 @@ fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.
     for (r.dependee_list.items, ranges[r.unit_list.items.len..]) |d, *range| {
         const subject: results.Subject = switch (d) {
             .nav_val, .type_layout, .struct_defaults => unreachable, // Units.
-            .nav_ty => |nav| .{ .nav = nav },
+            .nav_ty, .deprecation => |nav| .{ .nav = nav },
             .func_body, .func_ies, .func_inline => |func| .{ .func = func },
             .namespace_name => |nn| .{ .namespace_name = .{ .owner = zcu.namespacePtr(nn.namespace).owner_type, .name = ip.stringSlice(nn.name) } },
             .namespace => |ns| .{ .namespace = zcu.namespacePtr(ns).owner_type },
@@ -5230,7 +5257,7 @@ fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const resul
         d.miss = .{};
         const want: results.Subject = switch (dep) {
             .nav_val, .type_layout, .struct_defaults => unreachable,
-            .nav_ty => |nav| .{ .nav = nav },
+            .nav_ty, .deprecation => |nav| .{ .nav = nav },
             .func_body, .func_ies, .func_inline => |func| .{ .func = func },
             .namespace_name => |nn| .{ .namespace_name = .{ .owner = zcu.namespacePtr(nn.namespace).owner_type, .name = ip.stringSlice(nn.name) } },
             .namespace => |ns| .{ .namespace = zcu.namespacePtr(ns).owner_type },
@@ -5377,7 +5404,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
             };
             for (rec.dependee_list.items, rec.dependee_info) |d, info| if (info.node == ni) {
                 switch (d) {
-                    .nav_ty => |nav| w.writeAll(z.ip.stringSlice(z.ip.getNav(nav).key)) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
+                    .nav_ty, .deprecation => |nav| w.writeAll(z.ip.stringSlice(z.ip.getNav(nav).key)) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
                     .func_body, .func_ies, .func_inline => |f| z.unitKey(.{ .func = f }, w) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
                     .namespace_name => |nn| w.print("{s} {s}", .{ z.namespacePtr(nn.namespace).key, z.ip.stringSlice(nn.name) }) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
                     .namespace => |ns| w.writeAll(z.namespacePtr(ns).key) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
@@ -5419,7 +5446,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         fn isDependee(tag: u8) bool {
             const t = std.enums.fromInt(Tag, tag) orelse return false;
             return switch (t) {
-                .nav_ty, .func_body, .func_ies, .func_inline, .namespace_name, .namespace, .embed_file => true,
+                .nav_ty, .func_body, .func_ies, .func_inline, .namespace_name, .namespace, .embed_file, .deprecation => true,
                 else => false,
             };
         }
@@ -5522,7 +5549,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
     for (r.dependee_list.items, r.dependee_info) |dep, info| {
         const pi = m.find(r.nodes.items[info.node].key) orelse continue;
         const index: InternPool.Index = switch (dep) {
-            .nav_ty => |nav| r.zcu.namespacePtr(ip.getNav(nav).namespace).owner_type,
+            .nav_ty, .deprecation => |nav| r.zcu.namespacePtr(ip.getNav(nav).namespace).owner_type,
             .func_body, .func_ies, .func_inline => |f| f,
             .namespace_name => |nn| r.zcu.namespacePtr(nn.namespace).owner_type,
             .namespace => |ns| r.zcu.namespacePtr(ns).owner_type,

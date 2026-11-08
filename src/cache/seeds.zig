@@ -20,6 +20,9 @@
 //!   them); a `namespace_name`
 //!   node, if the name it looks up appeared, disappeared, or changed
 //!   `pub`;
+//! - a `deprecation` node, if its declaration's deprecation (a doc
+//!   comment, which no source hash covers) differs between the old and
+//!   new contents' deprecation tables (`Frontend.deprecations`);
 //! - an embedded file's node is a seed if the file changed;
 //! - without the old ZIR, every node of the input is a seed.
 
@@ -29,6 +32,7 @@ const Zir = std.zig.Zir;
 const Frontend = @import("../Frontend.zig");
 const Manifest = @import("Manifest.zig");
 const Tag = @import("../Incremental.zig").Tag;
+const Linter = @import("../lint/Linter.zig");
 
 /// An input whose content changed since the manifest was written.
 pub const Changed = struct {
@@ -71,7 +75,12 @@ pub fn compute(gpa: Allocator, m: *const Manifest, fe: *const Frontend, changed:
         new: ?*const Zir = null,
         map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Zir.Inst.Index) = .empty,
         names: NameIndex = .{},
+        /// The old and new contents' deprecation tables, once a
+        /// `deprecation` node needs them; null for either if not to be had.
+        deprecations: ?[2]?[]const Linter.Deprecation = null,
     };
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
     const ctxs = try gpa.alloc(Ctx, changed.len);
     defer {
         for (ctxs) |*c| {
@@ -100,7 +109,19 @@ pub fn compute(gpa: Allocator, m: *const Manifest, fe: *const Frontend, changed:
 
     for (nodes) |i| {
         const src = m.source(i);
-        const ctx = &ctxs[by_input.get(src.input).?];
+        const ci = by_input.get(src.input).?;
+        const ctx = &ctxs[ci];
+        if (m.node(i).tag == @backingInt(Tag.deprecation)) {
+            if (ctx.deprecations == null) {
+                const file = changed[ci].file;
+                ctx.deprecations = .{
+                    if (file != null and ctx.old != null) try fe.cachedDeprecations(arena_state.allocator(), @bitCast(m.input(src.input)[0].content_hash)) else null,
+                    if (file) |f| try fe.deprecations(arena_state.allocator(), f) else null,
+                };
+            }
+            if (deprecationChanged(src, ctx.old, ctx.new, &ctx.map, ctx.deprecations.?)) try seeds.append(gpa, i);
+            continue;
+        }
         if (try isSeed(gpa, m, i, src, ctx.old, ctx.new, &ctx.map, &ctx.names)) try seeds.append(gpa, i);
     }
     if (maps) |out| for (changed, ctxs) |c, *ctx| {
@@ -151,8 +172,32 @@ fn isSeed(
             if (o == null or w == null) return (o == null) != (w == null);
             return o.? != w.?;
         },
-        .nav_ty, .func_ies, .func_inline, .content, .link, .embed_file => return true,
+        .nav_ty, .func_ies, .func_inline, .content, .link, .embed_file, .deprecation => return true,
     }
+}
+
+/// Whether the declaration of a `deprecation` node at `src` may have
+/// changed its deprecation: its doc comment in the old and new tables.
+fn deprecationChanged(
+    src: Manifest.Source,
+    old_zir: ?Frontend.OldZir,
+    new_zir: ?*const Zir,
+    map: *const std.AutoHashMapUnmanaged(Zir.Inst.Index, Zir.Inst.Index),
+    tables: [2]?[]const Linter.Deprecation,
+) bool {
+    const old = &(old_zir orelse return true).zir;
+    const new = new_zir orelse return true;
+    if (src.inst == Manifest.Source.no_inst or src.inst >= old.instructions.len) return true;
+    const old_inst: Zir.Inst.Index = @fromBackingInt(src.inst);
+    const new_inst = map.get(old_inst) orelse return true;
+    const old_doc = docAt(tables[0] orelse return true, old.getDeclaration(old_inst).src_line);
+    const new_doc = docAt(tables[1] orelse return true, new.getDeclaration(new_inst).src_line);
+    return !std.mem.eql(u8, old_doc, new_doc);
+}
+
+fn docAt(table: []const Linter.Deprecation, line: u32) []const u8 {
+    for (table) |d| if (d.line == line) return d.doc;
+    return "";
 }
 
 /// Instruction `inst`'s source hash, as nodes record it

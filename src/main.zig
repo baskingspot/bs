@@ -1218,7 +1218,8 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
     });
 }
 
-fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, rec: ?*InputsRecord, out_path: ?[]const u8, alt_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8, pins: *?*const Zcu.NamePins, c_batch: ?*CSource.Batch, lint_cfg: ?*const LintConfig, lint_state: *LintState) !Outcome {
+fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, rec: ?*InputsRecord, out_path: ?[]const u8, alt_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode_in: []const u8, pins: *?*const Zcu.NamePins, c_batch: ?*CSource.Batch, lint_cfg: ?*const LintConfig, lint_state: *LintState) !Outcome {
+    var replay_mode = replay_mode_in;
     const arena = init.arena.allocator();
     const opts = job.opts;
     const env = init.environ_map;
@@ -1339,6 +1340,14 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // not counting the units each analyzed in turn.
     if (env.get("BS_UNIT_TIMING")) |v| zcu.unit_timing = .{ .top = std.fmt.parseInt(u32, v, 10) catch 20 };
     // A first build replays another compilation's graph, if one was published.
+    // A unit the cache keeps had no Sema lint findings only if the build
+    // that recorded it checked the same files with the same Sema rules
+    // (`LintState.sema_sig`): else the build analyzes everything, or
+    // takes a donor recorded so.
+    if (inc_opt) |i| if (lint_state.sema_sig) |sig| {
+        i.lint_sig = sig;
+        if (i.prev != null and !std.meta.eql(lint_state.prev_sema_sig, sig)) replay_mode = "off";
+    };
     if (inc_opt) |i| if (!std.mem.eql(u8, replay_mode, "off")) try i.useDonor(&fe);
     if (inc_opt) |i| try i.seedErrors(&zcu);
     if (opts.dump_ir) {
@@ -1501,6 +1510,8 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         }
         emit.inputs = target_inputs;
     }
+    try zcu.lint_covered.resize(init.gpa, fe.files.items.len, false);
+    for (lint_state.covered_files.items) |i| zcu.lint_covered.set(i);
     try zcu.analyzeAll(&emit);
     try zcu.checkExportCollisions();
     if (bench_runs != 0) try emit.benchCodegen(bench_runs);
@@ -1512,6 +1523,11 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         if (inc_opt) |i| i.endReplay();
         return error.NamesRerun;
     }
+    // Sema's lint findings fail the build with AstGen's errors and the
+    // syntax pass's findings.
+    if (lint_cfg) |cfg| if (zcu.lint_findings.items.len != 0) {
+        astgen_errors = try std.mem.concat(arena, diag.Diagnostic, &.{ astgen_errors, try semaLintDiagnostics(arena, &fe, &zcu, cfg, paths) });
+    };
     if (zcu.failed()) if (inc_opt) |i| try i.checkLazyErrors();
     // A lazy edit build leaves the test list as the last build linked it.
     if (is_test and !(if (zcu.replay) |r| r.lazy else false)) Sema.populateTestFunctions(&zcu) catch |err| switch (err) {
@@ -1728,7 +1744,8 @@ fn findLintConfig(init: std.process.Init, job: *const Job) !union(enum) { none, 
 
 /// The lint config a successful build had, as `<compilation dir>/lint`:
 /// a hash of the config's path, its contents and the `.gitignore`s its
-/// paths read, which decide what it reports, then the lint keys
+/// paths read, which decide what it reports, then its `sema_sig` (zero
+/// for none), then the lint keys
 /// (`Frontend.lintKey`) of the files it covered, sorted; no file without a
 /// config. The no-change skips (`Incremental.relinkIfUnchanged`,
 /// `InputsRecord`) do not skip a build whose config is not the last one's:
@@ -1744,6 +1761,14 @@ const LintState = struct {
     clean: []const Frontend.Hash = &.{},
     /// The keys of the files this build covers (`lintDiagnostics`).
     covered: std.ArrayList(Frontend.Hash) = .empty,
+    /// Those files' indices, for Sema's rules (`Zcu.lint_covered`).
+    covered_files: std.ArrayList(u32) = .empty,
+    /// What decides Sema's lint findings in a unit, with the Sema rules
+    /// on and some file covered: the covered files' paths in their
+    /// modules. Null otherwise: no unit can have any.
+    sema_sig: ?Frontend.Hash = null,
+    /// After `load`: the last successful build's.
+    prev_sema_sig: ?Frontend.Hash = null,
 
     const file_name = "lint";
 
@@ -1774,9 +1799,11 @@ const LintState = struct {
             },
         };
         const want = s.hash orelse return;
-        if (bytes.len < want.len or bytes.len % want.len != 0 or !std.mem.eql(u8, bytes[0..want.len], &want)) return;
+        if (bytes.len < 2 * want.len or bytes.len % want.len != 0) return;
+        if (!std.mem.allEqual(u8, bytes[want.len..][0..want.len], 0)) s.prev_sema_sig = bytes[want.len..][0..want.len].*;
+        if (!std.mem.eql(u8, bytes[0..want.len], &want)) return;
         s.same = true;
-        s.clean = @ptrCast(bytes[want.len..]);
+        s.clean = @ptrCast(bytes[2 * want.len ..]);
     }
 
     /// Whether a file with lint key `key` had no findings in the last build.
@@ -1800,7 +1827,8 @@ const LintState = struct {
             return;
         };
         std.mem.sortUnstable(Frontend.Hash, s.covered.items, {}, lessThan);
-        cache.writeReplace(io, dir, file_name, &.{ &h, @ptrCast(s.covered.items) }) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
+        const sig: Frontend.Hash = s.sema_sig orelse @splat(0);
+        cache.writeReplace(io, dir, file_name, &.{ &h, &sig, @ptrCast(s.covered.items) }) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
     }
 };
 
@@ -1808,11 +1836,14 @@ const LintState = struct {
 /// loaded, by file and offset. Notes the files' keys in `state`.
 fn lintDiagnostics(arena: std.mem.Allocator, fe: *const Frontend, cfg: *const LintConfig, paths: diag.Paths, state: *LintState) ![]const diag.Diagnostic {
     var out: std.ArrayList(diag.Diagnostic) = .empty;
+    state.covered_files.clearRetainingCapacity();
+    defer state.sema_sig = semaSig(fe, state.covered_files.items);
     for (fe.files.items, 0..) |*f, i| {
         const index: Frontend.File.Index = @fromBackingInt(@intCast(i));
         if (!try fe.lintCovers(arena, index)) continue;
         const key = Frontend.lintKey(f);
         try state.covered.append(arena, key);
+        if (cfg.semaRules()) try state.covered_files.append(arena, @intCast(i));
         if (state.isClean(key)) continue;
         const findings = try arena.dupe(Linter.Diagnostic, try fe.lintFindings(arena, index));
         if (!cfg.reportsAny(findings)) continue;
@@ -1822,6 +1853,62 @@ fn lintDiagnostics(arena: std.mem.Allocator, fe: *const Frontend, cfg: *const Li
             }
         }.lessThan);
         try cfg.report(arena, paths, f.display_path, try fe.source(index), findings, &out);
+    }
+    return out.items;
+}
+
+/// `LintState.sema_sig` of covered files `files` (indices, ascending):
+/// the Sema rules' version and the files' module names and paths.
+fn semaSig(fe: *const Frontend, files: []const u32) ?Frontend.Hash {
+    if (files.len == 0) return null;
+    var h: std.crypto.hash.Blake3 = .init(.{});
+    h.update(&std.mem.toBytes(Linter.version));
+    for (files) |i| {
+        const f = &fe.files.items[i];
+        h.update(fe.module(f.module).name);
+        h.update(":");
+        h.update(f.sub_path);
+        h.update(&.{0});
+    }
+    var out: Frontend.Hash = undefined;
+    h.final(&out);
+    return out;
+}
+
+/// Sema's lint findings (`Zcu.lint_findings`) that the config reports, by
+/// file and offset, each once, without those an ignore comment covers.
+fn semaLintDiagnostics(arena: std.mem.Allocator, fe: *Frontend, zcu: *const Zcu, cfg: *const LintConfig, paths: diag.Paths) ![]const diag.Diagnostic {
+    const all = try arena.dupe(Zcu.LintFinding, zcu.lint_findings.items);
+    std.mem.sortUnstable(Zcu.LintFinding, all, {}, struct {
+        fn lessThan(_: void, a: Zcu.LintFinding, b: Zcu.LintFinding) bool {
+            if (a.file != b.file) return a.file < b.file;
+            if (a.offset != b.offset) return a.offset < b.offset;
+            return @backingInt(a.rule) < @backingInt(b.rule);
+        }
+    }.lessThan);
+    var out: std.ArrayList(diag.Diagnostic) = .empty;
+    var start: usize = 0;
+    while (start < all.len) {
+        const file = all[start].file;
+        var end = start;
+        while (end < all.len and all[end].file == file) end += 1;
+        defer start = end;
+        const index: Frontend.File.Index = @fromBackingInt(file);
+        const source = try fe.source(index);
+        var line_starts: std.ArrayList(u32) = .empty;
+        if (std.mem.find(u8, source, "// ziglint-ignore:") != null) {
+            try line_starts.append(arena, 0);
+            for (source, 0..) |c, i| if (c == '\n') try line_starts.append(arena, @intCast(i + 1));
+        }
+        var findings: std.ArrayList(Linter.Diagnostic) = .empty;
+        for (all[start..end], start..) |f, i| {
+            if (i > start and all[i - 1].offset == f.offset and all[i - 1].rule == f.rule) continue;
+            const line = std.mem.count(u8, source[0..f.offset], "\n");
+            if (line_starts.items.len != 0 and Linter.ignoredAt(source, line_starts.items, line, f.rule)) continue;
+            const line_start = if (std.mem.findScalarLast(u8, source[0..f.offset], '\n')) |nl| nl + 1 else 0;
+            try findings.append(arena, .{ .line = @intCast(line + 1), .column = @intCast(f.offset - line_start + 1), .offset = f.offset, .rule = f.rule, .context = f.context });
+        }
+        try cfg.report(arena, paths, fe.files.items[file].display_path, source, findings.items, &out);
     }
     return out.items;
 }

@@ -23,6 +23,8 @@ const diag = @import("diag.zig");
 const print = @import("Ir/print.zig");
 const Incremental = @import("Incremental.zig");
 const cpu_mod = @import("cpu.zig");
+const Linter = @import("lint/Linter.zig");
+const lint_rules = @import("lint/rules.zig");
 
 const Zcu = @This();
 
@@ -186,6 +188,20 @@ errors: std.ArrayList(ErrorMsg) = .empty,
 /// `@compileLog` lines in analysis order (`Sema.zirCompileLog`). Like an
 /// error, any fails the build.
 compile_logs: std.ArrayList(CompileLog) = .empty,
+/// The files the project's `.ziglint.zon` covers, a bit per file index;
+/// empty without one. Sema checks the ziglint rules it answers in code
+/// from these files (docs/slop/ziglint-in-bs.md).
+lint_covered: std.bit_set.Dynamic = .{},
+/// Those rules' findings, in analysis order, possibly repeated (an
+/// instance of a generic function finds what another did). Like an error,
+/// any fails the build, after analysis.
+lint_findings: std.ArrayList(LintFinding) = .empty,
+/// The deprecated declarations of each file Z011 looked one up in
+/// (`deprecation`), in `deprecations_arena`, under `deprecations_mutex`:
+/// the cache's record reads them on every core.
+deprecations: std.AutoHashMapUnmanaged(u32, []const Linter.Deprecation) = .empty,
+deprecations_arena: std.heap.ArenaAllocator,
+deprecations_mutex: Io.Mutex = .init,
 /// Which units' analysis evaluated a container declaration or `@import`
 /// whose namespace has `effects` (`Sema.createContainerType`). The cache
 /// makes an edit build analyze such a unit again rather than load it,
@@ -432,6 +448,10 @@ pub const Dependee = union(enum) {
     embed_file: u32,
     /// The default values of a struct's non-`comptime` fields.
     struct_defaults: InternPool.Index,
+    /// Whether a declaration's doc comment marks it deprecated, and how
+    /// (`deprecation`): Z011 reads it, and doc comments are not in ZIR,
+    /// so no source hash covers them.
+    deprecation: InternPool.NavIndex,
 };
 
 /// A file read by `@embedFile`.
@@ -521,6 +541,7 @@ pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
         .fe = fe,
         .ip = try .init(gpa, io, 1),
         .arena = .init(gpa),
+        .deprecations_arena = .init(gpa),
     };
     errdefer zcu.deinit();
     try zcu.file_root_types.appendNTimes(gpa, .none, fe.files.items.len);
@@ -581,6 +602,10 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.errors.deinit(gpa);
     zcu.dep_stack.deinit(gpa);
     zcu.compile_logs.deinit(gpa);
+    zcu.lint_covered.deinit(gpa);
+    zcu.lint_findings.deinit(gpa);
+    zcu.deprecations.deinit(gpa);
+    zcu.deprecations_arena.deinit();
     zcu.file_root_types.deinit(gpa);
     zcu.ip.deinit();
     zcu.arena.deinit();
@@ -608,6 +633,38 @@ pub fn embedFile(zcu: *Zcu, module: Frontend.Module.Index, sub_path: []const u8)
 
 pub fn file(zcu: *const Zcu, index: u32) *const Frontend.File {
     return zcu.fe.file(@fromBackingInt(index));
+}
+
+/// A ziglint finding of Sema's: rule `rule` at byte `offset` of file
+/// `file`, with `Linter.Diagnostic`'s context (in `arena`).
+pub const LintFinding = struct { file: u32, offset: u32, rule: lint_rules.Rule, context: []const u8 };
+
+/// Whether the lint config covers file `index`.
+pub fn lintCovers(zcu: *const Zcu, index: u32) bool {
+    return index < zcu.lint_covered.bit_length and zcu.lint_covered.isSet(index);
+}
+
+/// Declaration `nav`'s doc comment if it marks it deprecated (Z011), else
+/// empty, from its file's table (`Frontend.deprecations`). Thread-safe.
+pub fn deprecation(zcu: *Zcu, nav_index: InternPool.NavIndex) ![]const u8 {
+    const nav = zcu.ip.getNav(nav_index);
+    const table = table: {
+        zcu.deprecations_mutex.lockUncancelable(zcu.io);
+        defer zcu.deprecations_mutex.unlock(zcu.io);
+        const gop = try zcu.deprecations.getOrPut(zcu.gpa, nav.file);
+        if (!gop.found_existing) gop.value_ptr.* = zcu.fe.deprecations(zcu.deprecations_arena.allocator(), @fromBackingInt(nav.file)) catch |err| {
+            zcu.deprecations.removeByPtr(gop.key_ptr);
+            return err;
+        };
+        break :table gop.value_ptr.*;
+    };
+    const line = zcu.file(nav.file).zir.getDeclaration(nav.zir_inst).src_line;
+    const i = std.sort.lowerBound(Linter.Deprecation, table, line, struct {
+        fn order(l: u32, d: Linter.Deprecation) std.math.Order {
+            return std.math.order(l, d.line);
+        }
+    }.order);
+    return if (i < table.len and table[i].line == line) table[i].doc else "";
 }
 
 /// The stable unit-key prefix of a file: module name and path within it,

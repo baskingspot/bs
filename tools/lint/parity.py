@@ -6,13 +6,25 @@ tree's build (`bs build` by default), matches the findings by rule, file
 and line, and classifies every difference (docs/slop/ziglint-in-bs.md,
 "The conformance measure"):
 
-  sema-pending  Z011 and Z027, which need Sema; bs does not check them yet
+  sema-type     a Z011 finding only bs has: Sema resolves calls ziglint's
+                resolver cannot (through locals, parameters, pointers)
+  unanalyzed    a Z011 finding only ziglint has, in a file bs reached: in
+                code Sema did not analyze (nothing references it)
+  sema-pending  Z027, which needs Sema; bs does not check it yet
   hybrid        a rule ziglint answers with its type resolver, which bs
                 answers from the syntax for now (Z006, Z010, Z012, Z015,
                 Z023, Z029, Z032, Z033, Z034)
   unreached     a file bs reported nothing in: no compilation reached it,
                 or every finding in it is of the classes above
   bug           anything else, to be fixed
+
+sema-type and unanalyzed are told apart by side alone; spot-check them
+with --list.
+
+Findings in build.zig fail the build's configure step, which hides every
+other step's, so when bs reports any there, it runs again with build.zig
+left out of the config's paths (the tree's .ziglint.zon is restored), and
+takes build.zig's findings from the first run.
 
 Exits 1 if there is a `bug` difference.
 
@@ -26,7 +38,8 @@ import re
 import subprocess
 import sys
 
-SEMA = {"Z011", "Z027"}
+SEMA = {"Z011"}
+PENDING = {"Z027"}
 HYBRID = {"Z006", "Z010", "Z012", "Z015", "Z023", "Z029", "Z032", "Z033", "Z034"}
 
 ZIGLINT_LINE = re.compile(r"^(Z\d{3}): (.+?):(\d+): ")
@@ -47,7 +60,7 @@ def ziglint_findings(ziglint, tree):
     return found
 
 
-def bs_findings(bs, tree, args):
+def bs_run(bs, tree, args):
     out = subprocess.run([bs, *args], check=False, cwd=tree, capture_output=True, text=True)
     found = collections.Counter()
     for line in (out.stdout + out.stderr).splitlines():
@@ -57,9 +70,31 @@ def bs_findings(bs, tree, args):
     return found
 
 
-def classify(key, bs_files):
+def bs_findings(bs, tree, args):
+    found = bs_run(bs, tree, args)
+    in_build = collections.Counter({k: n for k, n in found.items() if k[1] == "build.zig"})
+    if not in_build:
+        return found
+    config = os.path.join(tree, ".ziglint.zon")
+    with open(config) as f:
+        original = f.read()
+    try:
+        with open(config, "w") as f:
+            f.write(re.sub(r'"build\.zig"\s*,?\s*', "", original))
+        rest = bs_run(bs, tree, args)
+    finally:
+        with open(config, "w") as f:
+            f.write(original)
+    return in_build + rest
+
+
+def classify(key, side, bs_files):
     rule, path, _ = key
-    if rule in SEMA:
+    if rule in SEMA and side == "bs only":
+        return "sema-type"
+    if rule in SEMA and path in bs_files:
+        return "unanalyzed"
+    if rule in PENDING:
         return "sema-pending"
     if rule in HYBRID:
         return "hybrid"
@@ -91,7 +126,7 @@ def main():
     diffs = []
     for side, counter in (("ziglint only", only_zl), ("bs only", only_bs)):
         for key, n in counter.items():
-            cls = classify(key, bs_files)
+            cls = classify(key, side, bs_files)
             rows[key[0]][f"{side}: {cls}"] += n
             diffs.append((cls, side, key, n))
 

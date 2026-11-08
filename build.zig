@@ -1073,6 +1073,23 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with Z001 on again passed"; exit 1; fi
         \\rm .ziglint.zon
         \\"$bs" build-exe main.zig $c
+        \\# Z011 is Sema's: a unit recorded without the config is analyzed
+        \\# again once the config covers its file.
+        \\printf 'const lib = @import("lib.zig");\npub fn main() void {\n    lib.thing();\n}\n' > main.zig
+        \\printf '/// Deprecated: gone soon.\npub fn thing() void {}\n' > lib.zig
+        \\"$bs" build-exe main.zig $c
+        \\printf '.{}\n' > .ziglint.zon
+        \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with a config passed"; exit 1; fi
+        \\grep -q "main.zig:3:9: error\[deprecated, Z011\]: 'thing' is deprecated: Deprecated: gone soon." log || { cat log; exit 1; }
+        \\# And it reads doc comments, which no source hash covers:
+        \\# deprecating a callee in another file fails the next edit build.
+        \\printf '/// Does a thing.\npub fn thing() void {}\n' > lib.zig
+        \\"$bs" build-exe main.zig $c
+        \\printf '/// Deprecated: gone soon.\npub fn thing() void {}\n' > lib.zig
+        \\if "$bs" build-exe main.zig $c 2>log; then echo "the build after deprecating passed"; exit 1; fi
+        \\grep -q "main.zig:3:9: error\[deprecated, Z011\]: 'thing' is deprecated: Deprecated: gone soon." log || { cat log; exit 1; }
+        \\printf '/// Does it again.\npub fn thing() void {}\n' > lib.zig
+        \\"$bs" build-exe main.zig $c
         ,
         "sh",
     });

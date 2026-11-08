@@ -182,6 +182,11 @@ pub fn enabled(cfg: *const Config, rule: Rule) bool {
     }
 }
 
+/// Whether any rule Sema answers is on (`Zcu.lint_covered`).
+pub fn semaRules(cfg: *const Config) bool {
+    return cfg.enabled(.Z011);
+}
+
 /// Whether a file's findings (`Linter.run`) need its source to report:
 /// any of them is reported, or Z024's limit is below the facts' minimum.
 pub fn reportsAny(cfg: *const Config, findings: []const Linter.Diagnostic) bool {

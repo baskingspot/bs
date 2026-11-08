@@ -9948,6 +9948,39 @@ owner's decisions are in docs/slop/ziglint-in-bs.md. What is built:
   build succeeded, so an edit build reads the findings of the edited
   files alone. The config file is reported as an input
   (`file_system_inputs`).
+- **Sema's rules.** Z011 (deprecated calls) is Sema's: in code from a
+  covered file (`Zcu.lint_covered`, a bit per file, empty without a config
+  or with Z011 off), `zirCall` (a declaration called by name) and
+  `zirFieldCall` (a declaration of a type, or a method) look the callee
+  up in its file's deprecation table (`Zcu.deprecation`). The table
+  (`Frontend.deprecations`, `Linter.deprecations`) lists the file's
+  declarations whose doc comments mark them deprecated, by ziglint's
+  `getDocComment` and `containsDeprecated`, by the line their ZIR
+  declaration records; it is made from the syntax tree once per content,
+  std's files included, and kept in `<global cache>/bs/zir` beside the
+  syntax pass's findings, named by a hash of the contents. As ziglint, the
+  function the declaration names comes first, then the declaration and
+  the declarations it aliases (`Sema.aliasOf`, from the alias's ZIR, since
+  Sema keeps only its value), then, for a namespace call into std, each
+  namespace on the receiver's path as written (`std.fs.path`, but not the
+  same namespace as `std.Io.Dir.path`). A finding (`Zcu.LintFinding`)
+  does not fail its unit; after analysis, `main.semaLintDiagnostics`
+  drops repeats (generic instances) and ignored lines and reports the
+  rest with the syntax pass's, which fails the build. Doc comments are
+  not in ZIR, so no source hash covers them: a covered unit records a
+  `deprecation` dependee for each declaration it checks, whose result
+  hash is the hash of its deprecation text (0 for none) and whose source
+  is the declaration, so editing a doc comment re-checks exactly its
+  callers. A green unit had no findings if the build that recorded it
+  checked the same files with the same rules: `main.LintState.sema_sig`
+  hashes the covered files' paths in their modules and the rules'
+  version, null when no file is covered or Z011 is off (no unit can
+  have a finding then). `<compilation dir>/lint` keeps the last
+  successful build's; a build whose signature differs analyzes
+  everything, and a first build takes only a donor published with its
+  signature (`Incremental.lint_sig`, the donor's `lintsig` file). So
+  worktrees of one project share donors, and a build that covers no file
+  takes any.
 - Cost on bs's own build (`bs build-exe` of src/main.zig, ReleaseFast
   bs, 2026-11-07): the pass costs about 2.2 times the parse of a file
   (104 ms over bs's 79 `src` files on one thread), spread over the

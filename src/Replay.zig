@@ -1095,6 +1095,7 @@ fn decodeDependee(r: *Replay, d: u32, tag: Tag) !?Zcu.Dependee {
     return switch (tag) {
         .nav_val => .{ .nav_val = if (s == .nav) s.nav else return null },
         .nav_ty => .{ .nav_ty = if (s == .nav) s.nav else return null },
+        .deprecation => .{ .deprecation = if (s == .nav) s.nav else return null },
         .type_layout => .{ .type_layout = if (s == .ty) s.ty else return null },
         .struct_defaults => .{ .struct_defaults = if (s == .ty) s.ty else return null },
         .func, .func_body => .{ .func_body = if (s == .func) s.func else return null },
@@ -1145,7 +1146,7 @@ fn ensure(r: *Replay, dep: Zcu.Dependee) bool {
             defer zcu.speculating -= 1;
             if ((r.emit.inlineFate(func) catch return false) != .fate) return false;
         },
-        .func_body, .namespace_name, .namespace, .embed_file => {},
+        .func_body, .namespace_name, .namespace, .embed_file, .deprecation => {},
     }
     return true;
 }
@@ -1440,7 +1441,7 @@ fn addRefer(
 ) !void {
     const gpa = r.gpa;
     const target: Zcu.AnalUnit = switch (d) {
-        .nav_val, .nav_ty => |nav| .{ .nav_val = nav },
+        .nav_val, .nav_ty, .deprecation => |nav| .{ .nav_val = nav },
         .type_layout => |ty| .{ .type_layout = ty },
         .struct_defaults => |ty| .{ .struct_defaults = ty },
         .func_ies, .func_inline => |func| .{ .func = func },
