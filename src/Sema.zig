@@ -16058,8 +16058,9 @@ fn fieldPtrAlignment(sema: *Sema, block: *Block, src: Src, ptr_align: u6, aggreg
     }
     const field_align = if (explicit != 0) explicit else Type.abiAlignment(ip, field_ty);
     if (aggregate_align < field_align) return flag(aggregate_align);
-    if (explicit == 0) return 0;
-    return if (field_align == Type.abiAlignment(ip, field_ty)) 0 else flag(field_align);
+    // An explicit `align(n)` on the field shows in the pointer type even
+    // when n is the natural alignment, as upstream's Type.fieldPtrAlign.
+    return if (explicit == 0) 0 else flag(field_align);
 }
 
 /// A pointer to a comptime field's value `val`, through a pointer to its

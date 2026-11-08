@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n42\n12\n42\nb\n4\n42\n7\n24\n42\n199\nhello\n74\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n15\n1\n2\n7\n1\n8\n2\n42\n42\n12\n42\nb\n4\n42\n7\n24\n42\n199\nhello\n74\nabc\n40\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -507,6 +507,40 @@ fn externLanguage(comptime name: []const u8) u32 {
     return ext();
 }
 
+// tls (stdx buffer.zig): a field's explicit `align(n)` shows in its
+// pointer type even when n is the natural alignment, so a switch on
+// `@TypeOf(&self.buffer)` takes the aligned prong.
+fn AlignedBuf(comptime T: type, comptime a: usize, comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+        buffer: [cap]T align(a),
+        len: usize,
+        fn slice(self: *Self) switch (@TypeOf(&self.buffer)) {
+            *align(a) [cap]T => []align(a) T,
+            *align(a) const [cap]T => []align(a) const T,
+            else => unreachable,
+        } {
+            return self.buffer[0..self.len];
+        }
+    };
+}
+const FieldAligns = struct { a: [4]u8 align(1), b: u32 align(4), c: u32 };
+fn fieldAlignKinds() u32 {
+    var f: FieldAligns = undefined;
+    _ = &f;
+    const exact = [_]bool{
+        @TypeOf(&f.a) == *align(1) [4]u8,
+        @TypeOf(&f.b) == *align(4) u32,
+        @TypeOf(&f.c) == *u32,
+        @TypeOf(f.a[0..2]) == *align(1) [2]u8,
+    };
+    const natural = [_]bool{ @TypeOf(&f.a) == *[4]u8, @TypeOf(&f.b) == *u32 };
+    var n: u32 = 0;
+    for (exact) |b| n += if (b) 10 else 0;
+    for (natural) |b| n += if (b) 1 else 0;
+    return n;
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -638,5 +672,9 @@ fn main() callconv(.c) noreturn {
     rt.print(titled.title[0..titleLen(&titled.title)]);
     rt.print("\n");
     rt.printInt(titled.lens());
+    var abuf: AlignedBuf(u8, 1, 8) = .{ .buffer = "abcdefgh".*, .len = 3 };
+    rt.print(abuf.slice());
+    rt.print("\n");
+    rt.printInt(fieldAlignKinds());
     rt.exit(0);
 }
