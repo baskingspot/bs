@@ -1217,6 +1217,13 @@ def std_target(compiler, cfg, args, workdir):
         f"{cfg['name']} {suite}: {passed}/{expected} {suite} tests pass ({pct:.1f}% of upstream){status}{note}; "
         f"compiled in {compile_s:.1f}s (upstream baseline {baseline['compile_seconds']:.1f}s) -> {rel(out_path)}"
     )
+    # The tests upstream passes and bs does not, so a log shows which.
+    details = r.get("details", {})
+    for key, t in merged.items():
+        if t["upstream"] == "pass" and t["bs"] != "pass":
+            print(f"  {t['bs']}: {key}")
+            for line in (details.get(key) or "").strip().splitlines()[:20]:
+                print(f"    {line}")
     if failure:
         print(failure["log"])
 
