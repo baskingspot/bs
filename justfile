@@ -60,10 +60,12 @@ lint-parity:
     echo "== this tree"
     python3 tools/lint/parity.py --bs "$bs" -- build --prefix .zig-cache/lint-parity/out || status=1
     echo "== 84c75e56"
+    # CI's checkout is shallow, and git fetches only a full SHA.
+    sha=84c75e5642202b81b30b1742aad79fff40972826
     old=.zig-cache/lint-parity/84c75e56
     if [ ! -d "$old" ]; then
-        git cat-file -e 84c75e56^{commit} 2>/dev/null || git fetch --quiet origin 84c75e56 || exit 1
-        git worktree add --quiet --detach "$old" 84c75e56 || exit 1
+        git cat-file -e "$sha^{commit}" 2>/dev/null || git fetch --quiet --depth=1 origin "$sha" || exit 1
+        git worktree add --quiet --detach "$old" "$sha" || exit 1
     fi
     python3 tools/lint/parity.py --bs "$bs" --tree "$old" -- build --prefix "$PWD/.zig-cache/lint-parity/out-84c" || status=1
     echo "== the parity set"
