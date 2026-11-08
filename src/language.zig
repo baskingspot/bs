@@ -46,7 +46,7 @@ pub const Language = enum(u8) {
     pub fn fromVersion(v: []const u8) ?Language {
         // `0.16` is short for `0.16.0`.
         var buf: [32]u8 = undefined;
-        const full = if (std.mem.countScalar(u8, v, '.') == 1) std.fmt.bufPrint(&buf, "{s}.0", .{v}) catch return null else v;
+        const full = if (std.mem.countScalar(u8, v, '.') == 1) std.mem.print(&buf, "{s}.0", .{v}) catch return null else v;
         const sv = std.SemanticVersion.parse(full) catch return null;
         if (sv.major != 0) return null;
         return switch (sv.minor) {
@@ -118,7 +118,8 @@ pub fn discover(arena: Allocator, io: Io, root_file: []const u8) !?[]const u8 {
     var dir: []const u8 = cwd.realPathFileAlloc(io, Io.Dir.path.dirname(root_file) orelse ".", arena) catch return null;
     while (true) {
         if (cwd.access(io, try Io.Dir.path.join(arena, &.{ dir, "build.zig" }), .{})) |_| {
-            return try Io.Dir.path.join(arena, &.{ dir, "build.zig.zon" });
+            const zon = try Io.Dir.path.join(arena, &.{ dir, "build.zig.zon" });
+            return zon;
         } else |_| {}
         dir = Io.Dir.path.dirname(dir) orelse return null;
     }
