@@ -3,6 +3,7 @@
 //! (docs/slop/zig-0.16.md). Everything in bs that reads syntax trees or
 //! ZIR takes these types, not std.zig's.
 
+pub const Language = @import("language.zig").Language;
 pub const tokenizer = @import("tokenizer.zig");
 pub const Token = tokenizer.Token;
 pub const Tokenizer = tokenizer.Tokenizer;
