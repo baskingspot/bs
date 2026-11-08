@@ -129,7 +129,7 @@ pub fn plan(cg: *CodeGen) Error!void {
     }
     // A right shift by 64 or more that only a truncation reads is not
     // emitted: the truncation shifts the high half (`gen`), which lives
-    // until it.
+    // as long as the shift would have.
     const datas = cg.ir.instructions.items(.data);
     const def = live.items(.def);
     const end = live.items(.end);
@@ -149,8 +149,8 @@ pub fn plan(cg: *CodeGen) Error!void {
             var xi = @backingInt(x);
             if (fwd[xi] != Ssa.no_tie) xi = fwd[xi];
             if (fate[xi] != .normal or share[xi] != Ssa.no_tie) continue;
-            end[xi] = @max(end[xi], def[vi]);
-            crosses[xi] = crosses[xi] or cl[def[vi]][0] != cl[def[xi]][0] or cl[def[vi]][1] != cl[def[xi]][1];
+            end[xi] = @max(end[xi], end[si]);
+            crosses[xi] = crosses[xi] or cl[end[si]][0] != cl[def[xi]][0] or cl[end[si]][1] != cl[def[xi]][1];
         }
         fate[si] = .dead;
         reg[si] = Ssa.no_reg;

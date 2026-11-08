@@ -3706,8 +3706,11 @@ fn planRotates(cg: *CodeGen) Error!void {
             }
             live.items(.tie)[vi] = Ssa.no_tie;
             if (xv) |xi| {
-                end[xi] = @max(end[xi], def[vi]);
-                crosses[xi] = crosses[xi] or cl[def[vi]][0] != cl[def[xi]][0] or cl[def[vi]][1] != cl[def[xi]][1];
+                // As long as the shifts would have, which covers the loops
+                // around the `or` that do not contain them.
+                const to = @max(end[@backingInt(s)], end[@backingInt(r)]);
+                end[xi] = @max(end[xi], to);
+                crosses[xi] = crosses[xi] or cl[to][0] != cl[def[xi]][0] or cl[to][1] != cl[def[xi]][1];
                 live.items(.tie)[vi] = xi;
             }
             continue;
@@ -3803,7 +3806,9 @@ fn mulHigh(cg: *CodeGen, inst: Inst.Index) ?Inst.Index {
 
 /// Before allocation: a `mulWide` product reads its factors' 64-bit
 /// values, so a widening `intcast` only it reads is not emitted, and the
-/// value cast lives until the product instead. A shift by 64 that only a
+/// value cast lives as long as the cast would have instead: until the
+/// product, and through the loops around the product that do not
+/// contain the cast. A shift by 64 that only a
 /// `mulPart` truncation reads is not emitted either: the truncation reads
 /// the product's high half, which lives until it.
 fn planMulWide(cg: *CodeGen) Error!void {
@@ -3846,7 +3851,7 @@ fn planMulWide(cg: *CodeGen) Error!void {
                         var xi = @backingInt(x);
                         if (fwd[xi] != Ssa.no_tie) xi = fwd[xi];
                         if (fate[xi] != .normal or share[xi] != Ssa.no_tie) continue;
-                        extend(end, def, crosses, cl, xi, def[vi]);
+                        extend(end, def, crosses, cl, xi, end[ci]);
                     }
                     fate[ci] = .dead;
                     reg[ci] = Ssa.no_reg;
@@ -3857,7 +3862,7 @@ fn planMulWide(cg: *CodeGen) Error!void {
             .trunc => {
                 if (reg[vi] != Ssa.want_reg) continue;
                 const part = cg.mulPart(v) orelse continue;
-                extend(end, def, crosses, cl, @backingInt(part.m), def[vi]);
+                extend(end, def, crosses, cl, @backingInt(part.m), end[@backingInt(datas[vi].ty_op.operand.toIndex().?)]);
                 if (!part.hi) continue;
                 const sh = @backingInt(datas[vi].ty_op.operand.toIndex().?);
                 if (uses[sh] != 1 or fate[sh] != .normal or cg.homes[sh] != .none) continue;

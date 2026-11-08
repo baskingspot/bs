@@ -1,11 +1,11 @@
 //! exit: 0
-//! stderr: "10 2468acf13579bdfffffffffffffffd0 fdb97530eca864200000000000000030 369d0369d0369cfffffffffffffffe00 20 123456789abcdefffffffffffffffff 8123456676543211fedcba987654321f 7edcba9a7654320e0123456789abcdff \n10 fdb97530eca864200000000000000030 2468acf13579bdfffffffffffffffd0 369d0369d0369cfffffffffffffffe00 20 fedcba9876543210000000000000002f 7edcba9989abcdee0123456789abcdcf 8123456989abcdee0123456789abcdcf \n123456789abcdeffffffffffffffff1 123456789abcdeefffffffffffffff1 8acf135789abcdefffffffeffffffff0 ddc927501a9e732fedcba98765432110 123456789abcdf0fffffffffffffff0 7edcba987654320f8000000000000010 \nfdb97530eca864200000000000000040 100000000000000000 200000000000000000 400000000000000000 0 7f6e5d4c3b2a19080000000000000010 fedcba9876543210 fedcba9 fffffffff6e5d4c3b2a19087f6e5d4c4 ffffffffffffffffffffffffdb97530e ffffffffffffffffffffffffedcba987 ffffffffffffffffffffffffffffffff \n110001110001 110001110001 001101001100 010110010111 \n123456789abcdeffffffffffffffff0 deadbeefcafebabe ffffffffffffffffffffffffffffffb3 ffffffffedcba9876543210fedcba988 ffffffff 19400000000000000000 ffffffffffffffffffffffffffffff88 \n84eea2ede509f5e59223703b7d266e40\n11 2468acf13579bdfffffffffffffffd1 a3d70a3d70a3d6fffffffffffffffa01 1 ffffffffdb97530eca86421fdb97530f de 0 1 2 90fd0056bbeb9f92d0546341327b60 \nff0123456789abce000000000000001e feb851eb851eb8520000000000000022 147ae147ae147adfffffffffffffff41 1 2468acf13579bde02468acf1 6f 0 0 2 121fa00ad77d73f25a0a8c68264f6c \n39f7e3b890d7814b79825911e87d70b6\n369d0369d0369cfffffffffffffffe00 2468acf13579bdfffffffffffffffd0\n"
+//! stderr: "10 2468acf13579bdfffffffffffffffd0 fdb97530eca864200000000000000030 369d0369d0369cfffffffffffffffe00 20 123456789abcdefffffffffffffffff 8123456676543211fedcba987654321f 7edcba9a7654320e0123456789abcdff \n10 fdb97530eca864200000000000000030 2468acf13579bdfffffffffffffffd0 369d0369d0369cfffffffffffffffe00 20 fedcba9876543210000000000000002f 7edcba9989abcdee0123456789abcdcf 8123456989abcdee0123456789abcdcf \n123456789abcdeffffffffffffffff1 123456789abcdeefffffffffffffff1 8acf135789abcdefffffffeffffffff0 ddc927501a9e732fedcba98765432110 123456789abcdf0fffffffffffffff0 7edcba987654320f8000000000000010 \nfdb97530eca864200000000000000040 100000000000000000 200000000000000000 400000000000000000 0 7f6e5d4c3b2a19080000000000000010 fedcba9876543210 fedcba9 fffffffff6e5d4c3b2a19087f6e5d4c4 ffffffffffffffffffffffffdb97530e ffffffffffffffffffffffffedcba987 ffffffffffffffffffffffffffffffff \n110001110001 110001110001 001101001100 010110010111 \n123456789abcdeffffffffffffffff0 deadbeefcafebabe ffffffffffffffffffffffffffffffb3 ffffffffedcba9876543210fedcba988 ffffffff 19400000000000000000 ffffffffffffffffffffffffffffff88 \n84eea2ede509f5e59223703b7d266e40\n11 2468acf13579bdfffffffffffffffd1 a3d70a3d70a3d6fffffffffffffffa01 1 ffffffffdb97530eca86421fdb97530f de 0 1 2 90fd0056bbeb9f92d0546341327b60 \nff0123456789abce000000000000001e feb851eb851eb8520000000000000022 147ae147ae147adfffffffffffffff41 1 2468acf13579bde02468acf1 6f 0 0 2 121fa00ad77d73f25a0a8c68264f6c \n39f7e3b890d7814b79825911e87d70b6\n369d0369d0369cfffffffffffffffe00 2468acf13579bdfffffffffffffffd0\n6a23bb3dcede7315 6a23bb3dcede7315\n"
 //! 128-bit integers in register pairs (`int128`): each operation with
 //! register, memory and constant operands, constants whose halves do
 //! not fit an immediate, carries and borrows across the halves, shifts
 //! on both sides of 64, signed and unsigned comparisons that differ only
-//! in the high half or only in the low one, and enough live values that
-//! some stay in memory.
+//! in the high half or only in the low one, enough live values that
+//! some stay in memory, and a truncation in a loop of a shift before it.
 const std = @import("std");
 
 const big: u128 = 0x8000_0001_ffff_fffe_0123_4567_89ab_cdef;
@@ -104,6 +104,39 @@ noinline fn dot(l: [3]u64, r: [3]u64) u128 {
     return acc;
 }
 
+/// A truncation inside a loop of a right shift before it: the shifted
+/// value lives through the loop, also when it is a variable's (which
+/// `Ssa.plan` forwards).
+inline fn truncLoop(s: u128, g: u64, n: usize) u64 {
+    var k: u64 = 0;
+    for (0..n) |i| {
+        const t: u64 = @as(u32, @truncate(s));
+        const c1 = g *% (i +% 1);
+        const c2 = g *% (i +% 2);
+        const c3 = g *% (i +% 3);
+        const c4 = g *% (i +% 4);
+        const c5 = g *% (i +% 5);
+        const c6 = g *% (i +% 6);
+        const c7 = g *% (i +% 7);
+        const c8 = g *% (i +% 8);
+        const c9 = g *% (i +% 9);
+        const c10 = g *% (i +% 10);
+        const c11 = g *% (i +% 11);
+        const c12 = g *% (i +% 12);
+        k +%= t ^ (c1 *% c2) ^ (c3 *% c4) ^ (c5 *% c6) ^ (c7 *% c8) ^ (c9 *% c10) ^ (c11 *% c12);
+    }
+    return k;
+}
+noinline fn shrBeforeLoop(a: u128, b: u128, g: u64, n: usize) u64 {
+    const w = a ^ b;
+    return truncLoop(w >> 70, g, n);
+}
+noinline fn shrBeforeLoopVar(a: u128, b: u128, g: u64, n: usize) u64 {
+    var w = a ^ b;
+    _ = &w;
+    return truncLoop(w >> 70, g, n);
+}
+
 const Pair = struct { x: u128, y: u128 };
 noinline fn fields(p: *const Pair, q: *Pair) void {
     q.x = p.x *% p.y;
@@ -118,7 +151,8 @@ pub fn main() void {
     var w: u64 = 0xdead_beef_cafe_babe;
     var v: i64 = -77;
     var n: u7 = 101;
-    _ = .{ &a, &b, &x, &y, &w, &v, &n };
+    var iters: usize = 3;
+    _ = .{ &a, &b, &x, &y, &w, &v, &n, &iters };
     for (arith(a, b)) |r| std.debug.print("{x} ", .{r});
     std.debug.print("\n", .{});
     for (arith(b, a)) |r| std.debug.print("{x} ", .{r});
@@ -145,4 +179,5 @@ pub fn main() void {
     var q: Pair = undefined;
     fields(&p, &q);
     std.debug.print("{x} {x}\n", .{ q.x, q.y });
+    std.debug.print("{x} {x}\n", .{ shrBeforeLoop(a, b, w, iters), shrBeforeLoopVar(a, b, w, iters) });
 }

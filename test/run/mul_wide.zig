@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "15452995756747027501\n8521359185914962729\n12943501610297713215\n16208769155697429837\n11990335419632110704\n7138415690893298235\n11752689941954008201\n17063800578687887122\n230792525718168017\n14276831381786596470\n1266778133760337184\n"
+//! stdout: "15452995756747027501\n8521359185914962729\n12943501610297713215\n16208769155697429837\n11990335419632110704\n7138415690893298235\n11752689941954008201\n17063800578687887122\n230792525718168017\n14276831381786596470\n1266778133760337184\n16978570595183030144\n"
 //! A 128-bit product of two unsigned values of at most 64 bits is one
 //! `mul` (Wyhash's mum, std.math.mulWide), with its halves read straight
 //! from rdx:rax. Factors narrower than 64 bits, constants with the top
@@ -73,6 +73,24 @@ noinline fn forwarded(x: u16, y: u8) u64 {
     if (p >> 64 != 0) k +%= 1 else k ^= @as(u64, @truncate(p));
     return k ^ @as(u64, @truncate((@as(u128, b) *% b) >> 64));
 }
+/// A factor cast before a loop and a product inside it: the value cast
+/// lives through the loop.
+noinline fn castBeforeLoop(x: u16, g: u64, n: usize) u64 {
+    const wa: u128 = x;
+    var k: u64 = 0;
+    for (0..n) |i| {
+        const p = wa * (g +% i);
+        const c1 = g *% (i + 7);
+        const c2 = g *% (i + 9);
+        const c3 = g *% (i + 11);
+        const c4 = g *% (i + 13);
+        const c5 = g *% (i + 15);
+        const c6 = g *% (i + 17);
+        const c7 = g *% (i + 19);
+        k +%= @as(u64, @truncate(p >> 64)) ^ @as(u64, @truncate(p)) ^ c1 ^ (c2 +% c3) ^ (c4 *% c5) ^ (c6 -% c7);
+    }
+    return k;
+}
 
 fn main() callconv(.c) noreturn {
     var a: u64 = 0x9e3779b97f4a7c15;
@@ -90,5 +108,8 @@ fn main() callconv(.c) noreturn {
     rt.printInt(wide(@as(u128, a) << 32 | b, b));
     rt.printInt(by63(a, b));
     rt.printInt(forwarded(@truncate(b), @truncate(a)));
+    var n: usize = 3;
+    _ = &n;
+    rt.printInt(castBeforeLoop(0x8000, 0x800000000020, n));
     rt.exit(0);
 }
