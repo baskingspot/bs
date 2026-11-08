@@ -732,7 +732,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             return inc.noLink("export '{s}' has no symbol number", .{x.name});
     }
 
-    const aliases = try externAliases(arena, m, WithInputs{ .pack = &input, .extra = &.{}, .overrides = &.empty }, in.numbered) orelse
+    const aliases = try externAliases(arena, m, .{ .pack = &input, .extra = &.{}, .overrides = &.empty }, in.numbered) orelse
         return inc.noLink("an extern slot's atom record is damaged", .{});
     const numbered_aliases = try arena.alloc(Elf.NumberedAlias, aliases.len);
     for (numbered_aliases, aliases) |*n, a| n.* = .{
@@ -841,7 +841,7 @@ fn linkMachO(
     const import_numbers = try arena.alloc(u32, imports.len);
     for (import_numbers, imports) |*n, imp| n.* = m.symbol(@backingInt(imp.key)) orelse
         return inc.noLink("import '{s}' has no symbol number", .{imp.name});
-    const aliases = try externAliases(arena, m, WithInputs{ .pack = input, .extra = &.{}, .overrides = &.empty }, in.numbered) orelse
+    const aliases = try externAliases(arena, m, .{ .pack = input, .extra = &.{}, .overrides = &.empty }, in.numbered) orelse
         return inc.noLink("an extern slot's atom record is damaged", .{});
     const numbered_aliases = try arena.alloc(Elf.NumberedAlias, aliases.len);
     for (numbered_aliases, aliases) |*n, a| n.* = .{
@@ -1216,7 +1216,7 @@ fn linkWithObjects(
         };
         dynamic.runpath = inc.runpath;
     }
-    const aliases = try externAliases(arena, m, WithInputs{ .pack = pack_atoms, .extra = &.{}, .overrides = &overrides }, numbered) orelse
+    const aliases = try externAliases(arena, m, .{ .pack = pack_atoms, .extra = &.{}, .overrides = &overrides }, numbered) orelse
         return inc.noLink("an extern slot's atom record is damaged", .{});
     var diag: Elf.Diagnostic = .{};
     const with_inputs: WithInputs = .{ .pack = pack_atoms, .extra = extra.items, .overrides = &overrides };

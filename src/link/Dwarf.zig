@@ -1021,7 +1021,7 @@ pub const ChunkWriter = struct {
             w.foreign_at += 1 + n_files;
             w.piece(fk, addr + f.low, addr + f.high);
             if (fk == k) continue;
-            w.line[fk] = w.line[fk][writeForeignSequence(w.line[fk], debug, lines, patches, addr + f.low, addr + f.high, ForeignFiles{ .c = w.c, .map = map })..];
+            w.line[fk] = w.line[fk][writeForeignSequence(w.line[fk], debug, lines, patches, addr + f.low, addr + f.high, .{ .c = w.c, .map = map })..];
         }
         if (size > pos) w.piece(k, addr + pos, addr + size);
     }
