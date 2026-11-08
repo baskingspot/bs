@@ -4420,7 +4420,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
             // A call to a `noreturn` function, or a block all of whose paths
             // are `noreturn`, ends the body.
             if (!block.is_comptime) {
-                if (block.instructions.items.len == 0 or !sema.isNoReturnInst(block.instructions.getLast())) {
+                if (block.instructions.items.len == 0 or !sema.isNoReturnInst(block.instructions.items[block.instructions.items.len - 1])) {
                     _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
                 }
             }
@@ -4442,7 +4442,7 @@ fn addDbgStmt(sema: *Sema, block: *Block, line: u32, column: u32) !void {
     sema.dbg_column = column;
     // Consecutive statements without code between them collapse into one.
     if (block.instructions.items.len != 0) {
-        const last = block.instructions.getLast();
+        const last = block.instructions.items[block.instructions.items.len - 1];
         if (sema.ir_insts.items(.tag)[@backingInt(last)] == .dbg_stmt) {
             sema.ir_insts.items(.data)[@backingInt(last)] = .{ .dbg_stmt = .{ .line = line, .column = column } };
             return;
@@ -4514,7 +4514,7 @@ fn resolveBlock(sema: *Sema, parent: *Block, src: Src, child: *Block, merges: *B
         try parent.instructions.appendSlice(gpa, child.instructions.items);
         return .unreachable_value;
     }
-    if (results.len == 1 and child.instructions.items.len != 0 and child.instructions.getLast() == merges.brs.items[0]) {
+    if (results.len == 1 and child.instructions.items.len != 0 and child.instructions.items[child.instructions.items.len - 1] == merges.brs.items[0]) {
         // The only exit is the end of the body: no block needed.
         try parent.instructions.appendSlice(gpa, child.instructions.items[0 .. child.instructions.items.len - 1]);
         return results[0];
@@ -21118,7 +21118,7 @@ fn endDbgInline(sema: *Sema, child: *Block) !void {
     }
     const end = try sema.reserveInst();
     sema.ir_insts.set(@backingInt(end), .{ .tag = .dbg_inline_end, .data = .{ .no_op = {} } });
-    const last = insts.getLast();
+    const last = insts.items[insts.items.len - 1];
     const before_last = switch (sema.ir_insts.items(.tag)[@backingInt(last)]) {
         .br, .repeat, .ret, .unreach, .trap => true,
         else => false,
@@ -21646,7 +21646,7 @@ fn bcLogNode(sema: *Sema, id: u32, node: *MutValue) !void {
 fn bcEvent(sema: *Sema, comptime tag: Ir.Inst.Tag, index: u32) Allocator.Error!void {
     var b = sema.bc_block orelse return;
     while (b.is_comptime) b = b.parent orelse return;
-    if (b.instructions.items.len != 0 and sema.isNoReturnInst(b.instructions.getLast())) return;
+    if (b.instructions.items.len != 0 and sema.isNoReturnInst(b.instructions.items[b.instructions.items.len - 1])) return;
     try sema.ir_insts.append(sema.gpa, .{ .tag = tag, .data = .{ .dep = index } });
     try b.instructions.append(sema.gpa, @fromBackingInt(@intCast(sema.ir_insts.len - 1)));
 }

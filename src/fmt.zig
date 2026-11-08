@@ -6,7 +6,6 @@
 const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
-const fs = std.fs;
 const process = std.process;
 const Allocator = std.mem.Allocator;
 const Color = std.zig.Color;
@@ -260,7 +259,7 @@ fn fmtPathDir(
         if (mem.startsWith(u8, entry.name, ".")) continue;
 
         if (is_dir or entry.kind == .file and (mem.endsWith(u8, entry.name, ".zig") or mem.endsWith(u8, entry.name, ".zon"))) {
-            const full_path = try fs.path.join(fmt.gpa, &[_][]const u8{ file_path, entry.name });
+            const full_path = try Io.Dir.path.join(fmt.gpa, &[_][]const u8{ file_path, entry.name });
             defer fmt.gpa.free(full_path);
 
             if (is_dir) {

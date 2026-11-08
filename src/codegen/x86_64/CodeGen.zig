@@ -571,7 +571,7 @@ fn beginInline(cg: *CodeGen, func: Index, site: Ir.DbgInline) Error!void {
         .call_column = site.column,
         .low = @intCast(cg.e.code.items.len),
         .high = @intCast(cg.e.code.items.len),
-        .parent = if (cg.dbg_open.getLastOrNull()) |o| o.index else Atom.Debug.Inline.none,
+        .parent = if (cg.dbg_open.last()) |o| o.index else Atom.Debug.Inline.none,
         .unit = try cg.emit.inlineUnit(cg.gpa, &cg.dbg_inline_units, own_file, nav.file, site.flags.backend),
     });
     try cg.dbg_open.append(cg.gpa, .{ .index = index, .line = cg.dbg_line, .column = cg.dbg_column, .backend = site.flags.backend });
@@ -583,7 +583,7 @@ fn beginInline(cg: *CodeGen, func: Index, site: Ir.DbgInline) Error!void {
 fn endInline(cg: *CodeGen) Error!void {
     const open = cg.dbg_open.pop().?;
     cg.dbg_inlines.items[open.index].high = @intCast(cg.e.code.items.len);
-    if (cg.dbg_open.getLastOrNull()) |parent| {
+    if (cg.dbg_open.last()) |parent| {
         try cg.e.switchLines(cg.dbg_inlines.items[parent.index].file, parent.index + 1);
     } else {
         try cg.e.switchLines(0, 0);
@@ -600,7 +600,7 @@ fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
     }
     const ip = cg.ip;
     const nav = ip.getNav(ip.keyPayload(.func, cg.ir.func).owner_nav);
-    if (cg.asm_line) |line| if (try asm_src.find(cg.emit.zcu, cg.ir.func, if (cg.dbg_open.getLastOrNull()) |o| cg.dbg_inlines.items[o.index] else null, cg.dbg_files.items, cg.dbg_line, cg.dbg_column, line)) |at| {
+    if (cg.asm_line) |line| if (try asm_src.find(cg.emit.zcu, cg.ir.func, if (cg.dbg_open.last()) |o| cg.dbg_inlines.items[o.index] else null, cg.dbg_files.items, cg.dbg_line, cg.dbg_column, line)) |at| {
         try cg.emit.addError(at.file, at.span, "bs codegen: " ++ fmt, args);
         return error.CodegenFail;
     };
@@ -5232,7 +5232,7 @@ fn emitBlocks(cg: *CodeGen) Error!void {
             var copy = cg.dbg_inlines.items[o.index];
             copy.low = pc;
             copy.high = pc;
-            copy.parent = if (cg.dbg_open.getLastOrNull()) |p| p.index else Atom.Debug.Inline.none;
+            copy.parent = if (cg.dbg_open.last()) |p| p.index else Atom.Debug.Inline.none;
             // Copied first: `append` may take the element by reference and
             // read it after growing (and freeing) the buffer.
             const callee = cg.dbg_inline_callees.items[o.index];
@@ -5240,7 +5240,7 @@ fn emitBlocks(cg: *CodeGen) Error!void {
             try cg.dbg_open.append(cg.gpa, .{ .index = @intCast(cg.dbg_inlines.items.len), .line = o.line, .column = o.column, .backend = o.backend });
             try cg.dbg_inlines.append(cg.gpa, copy);
         }
-        if (cg.dbg_open.getLastOrNull()) |o| {
+        if (cg.dbg_open.last()) |o| {
             try cg.e.switchLines(cg.dbg_inlines.items[o.index].file, o.index + 1);
         } else {
             try cg.e.switchLines(0, 0);
