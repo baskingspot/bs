@@ -3766,10 +3766,12 @@ fn rvoEarlyLoad(cg: *CodeGen, l: Inst.Index, a: Inst.Index) bool {
 ///   pointer is live across the aggregate's lowering, which clobbers, so
 ///   it is not in a register the lowering writes. The elements are values
 ///   already computed, and none is read from memory lazily (a deferred
-///   load's only user is a call or `ret`), so writing the memory early
-///   changes nothing. So is one that a `ret` right after it returns, in
-///   this function's result memory, which nothing else in the function
-///   points to (`planRetCalls` keeps its values out of it there).
+///   load's only user is a call or `ret`, and an aggregate with an element
+///   read in place, `.deferred` or `.view`, is not built in place), so
+///   writing the memory early changes nothing. So is one that a `ret`
+///   right after it returns, in this function's result memory, which
+///   nothing else in the function points to (`planRetCalls` keeps its
+///   values out of it there).
 /// - A call that returns in memory, whose only user is a store right after
 ///   it to a fresh `var`, writes its result there: the alloc comes right
 ///   before the call, so nothing has its address yet, the callee included.
@@ -4405,6 +4407,24 @@ fn storeInPlace(cg: *CodeGen, st: Inst.Index, before: []const Inst.Index) Error!
     } else if (tags[vi] != .aggregate_init and tags[vi] != .union_init and !unwrap and !(tags[vi] == .bitcast and vector.bitcastInPlace(cg, v))) return;
     if (!cg.buildsInPlace(v, before)) return;
     if (Type.ptrInfo(ip, cg.typeOf(bin.lhs)).flags.is_volatile) return;
+    // An element read in place (`view.plan`) would read the memory after
+    // earlier elements wrote it.
+    var one: [1]Ref = undefined;
+    const elems: []const Ref = switch (tags[vi]) {
+        .aggregate_init => elems: {
+            const agg = ir.extraData(Ir.Aggregate, datas[vi].ty_pl.payload);
+            break :elems ir.refSlice(agg.end, agg.data.len);
+        },
+        .union_init => elems: {
+            one[0] = ir.extraData(Ir.StructField, datas[vi].ty_pl.payload).data.operand;
+            break :elems &one;
+        },
+        else => &.{},
+    };
+    for (elems) |e| if (e.toIndex()) |ei| switch (cg.homes[@backingInt(ei)]) {
+        .deferred, .view => return,
+        else => {},
+    };
     try cg.in_place.put(cg.gpa, vi, bin.lhs);
 }
 
