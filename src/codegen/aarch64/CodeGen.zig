@@ -4919,7 +4919,28 @@ const AsmOperand = union(enum) {
     vreg: struct { reg: VReg, arr: ?Arrangement },
     /// A list of consecutive SIMD registers (`{v3.16b}`).
     vlist: struct { first: VReg, len: u3, arr: ?Arrangement },
+    /// The shift or extension of the register before it (`lsl #2`,
+    /// `uxtw`, `sxtw #3`), or of an immediate (`lsl #12`).
+    modifier: struct { op: Modifier, amount: ?u8 },
 };
+
+/// A register operand's shift (lsl, lsr, asr, ror) or extension (the
+/// rest), in Encoder.Shift's and Encoder.Extend's orders.
+const Modifier = enum { lsl, lsr, asr, ror, uxtb, uxth, uxtw, uxtx, sxtb, sxth, sxtw, sxtx };
+
+/// `tok` as a shift or extension: its name, any case, then an amount,
+/// with or without `#`, which extensions may leave out.
+fn parseModifier(tok: []const u8) ?AsmOperand {
+    const sp = std.mem.findAny(u8, tok, " \t") orelse tok.len;
+    if (sp != 3 and sp != 4) return null;
+    var buf: [4]u8 = undefined;
+    const op = std.meta.stringToEnum(Modifier, std.ascii.lowerString(&buf, tok[0..sp])) orelse return null;
+    var amount_tok = std.mem.trim(u8, tok[sp..], " \t");
+    if (amount_tok.len == 0) return .{ .modifier = .{ .op = op, .amount = null } };
+    if (amount_tok[0] == '#') amount_tok = amount_tok[1..];
+    const amount = std.fmt.parseInt(u8, amount_tok, 0) catch return null;
+    return .{ .modifier = .{ .op = op, .amount = amount } };
+}
 
 /// A vector register's arrangement suffix (`.16b`, `.4s`, ...).
 const Arrangement = enum {
@@ -5094,6 +5115,7 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
     }
     if (parseReg(tok)) |r| return .{ .reg = r };
     if (parseVReg(tok)) |v| return v;
+    if (parseModifier(tok)) |m| return m;
     if (tok[0] == '-' or std.ascii.isDigit(tok[0])) {
         return .{ .imm = std.fmt.parseInt(i64, tok, 0) catch return cg.fail("bad asm immediate '{s}'", .{tok}) };
     }
@@ -5102,6 +5124,85 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
 
 fn asmUnsupported(cg: *CodeGen, line: []const u8) Error {
     return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
+}
+
+fn asmBadSp(cg: *CodeGen, line: []const u8) Error {
+    return cg.fail("inline assembly: sp is not a valid operand there (register 31 is zr in that position): '{s}'", .{line});
+}
+
+/// The last operand of an add or sub (and cmp, cmn, neg): an immediate,
+/// below 4096 and shifted left by 0 or 12; a register, shifted by lsl, lsr
+/// or asr; or a register extended and shifted left by 0 to 4. `width` is
+/// the instruction's, `sp` whether it names sp, where `lsl` is `uxtx` (or
+/// `uxtw`), as assemblers read it. Errors as upstream's assembler (LLVM)
+/// rejects the operand.
+fn asmAddOperand(cg: *CodeGen, width: Encoder.Width, sp: bool, ops: []const AsmOperand, line: []const u8) Error!Encoder.AddOperand {
+    if (ops.len > 2 or (ops.len == 2 and ops[1] != .modifier)) return cg.asmUnsupported(line);
+    const mod = if (ops.len == 2) ops[1].modifier else null;
+    switch (ops[0]) {
+        .imm => |v| {
+            if (v < 0 or v >= 4096) return cg.asmUnsupported(line);
+            const m = mod orelse return .{ .imm = @intCast(v) };
+            if (m.op != .lsl or (m.amount != 0 and m.amount != 12)) return cg.fail("inline assembly: an add or sub immediate shifts by 'lsl #0' or 'lsl #12': '{s}'", .{line});
+            return .{ .imm = @as(u32, @intCast(v)) << @intCast(m.amount.?) };
+        },
+        .reg => |r| {
+            if (r.reg == .sp) return cg.asmBadSp(line);
+            const m = mod orelse {
+                if (r.width != width) return cg.fail("inline assembly: {s} register among {t} registers needs an extension such as 'uxtw': '{s}'", .{ if (r.width == .x) "an x" else "a w", width, line });
+                return .r(r.reg);
+            };
+            const k = @backingInt(m.op);
+            if (k < @backingInt(Modifier.uxtb)) {
+                if (sp) {
+                    // The extended form: lsl is uxtx (uxtw for w registers).
+                    if (m.op != .lsl or m.amount.? > 4 or r.width != width) return cg.fail("inline assembly: with sp, a register shifts by 'lsl' 0 to 4 only: '{s}'", .{line});
+                    return .{ .extended = .{ .reg = r.reg, .extend = if (width == .x) .uxtx else .uxtw, .amount = @intCast(m.amount.?) } };
+                }
+                if (m.op == .ror or m.amount == null or m.amount.? >= width.bits() or r.width != width)
+                    return cg.fail("inline assembly: an add or sub register shifts by 'lsl', 'lsr' or 'asr' 0 to {d}: '{s}'", .{ width.bits() - 1, line });
+                return .{ .reg = .{ .reg = r.reg, .shift = @fromBackingInt(@intCast(k)), .amount = @intCast(m.amount.?) } };
+            }
+            const ext: Encoder.Extend = @fromBackingInt(@intCast(k - @backingInt(Modifier.uxtb)));
+            // An x register for uxtx and sxtx of x registers, else w.
+            const reg_width: Encoder.Width = if (width == .x and (ext == .uxtx or ext == .sxtx)) .x else .w;
+            if ((m.amount orelse 0) > 4 or r.width != reg_width) return cg.fail("inline assembly: '{t}' here extends {s} register, shifted left by 0 to 4: '{s}'", .{ m.op, if (reg_width == .x) "an x" else "a w", line });
+            return .{ .extended = .{ .reg = r.reg, .extend = ext, .amount = @intCast(m.amount orelse 0) } };
+        },
+        else => return cg.asmUnsupported(line),
+    }
+}
+
+/// A logical instruction `op` (also tst and mvn) with last operands `ops`:
+/// a bitmask immediate (inverted for bic, bics, orn and eon, as their
+/// aliases of and, ands, orr and eor), or a register shifted by lsl, lsr,
+/// asr or ror.
+fn asmLogic(cg: *CodeGen, op: Encoder.LogicOp, width: Encoder.Width, d: Reg, n: Reg, ops: []const AsmOperand, line: []const u8) Error!void {
+    if (ops.len > 2 or (ops.len == 2 and ops[1] != .modifier)) return cg.asmUnsupported(line);
+    // Only the immediate forms other than ands write sp, and none reads it.
+    if (n == .sp or (d == .sp and (ops[0] != .imm or op == .ands or op == .bics))) return cg.asmBadSp(line);
+    switch (ops[0]) {
+        .imm => |v| {
+            if (ops.len != 1) return cg.asmUnsupported(line);
+            const inverts = @backingInt(op) >= 4;
+            const bits: u64 = if (inverts) ~@as(u64, @bitCast(v)) else @bitCast(v);
+            const imm = if (width == .w) bits & 0xffff_ffff else bits;
+            if (Encoder.bitmaskImm(width, imm) == null) return cg.asmUnsupported(line);
+            return cg.e.logic(if (inverts) @fromBackingInt(@intCast(@backingInt(op) - 4)) else op, width, d, n, .{ .imm = imm });
+        },
+        .reg => |r| {
+            if (r.reg == .sp) return cg.asmBadSp(line);
+            const m = if (ops.len == 2) ops[1].modifier else {
+                if (r.width != width) return cg.fail("inline assembly: {s} register among {t} registers: '{s}'", .{ if (r.width == .x) "an x" else "a w", width, line });
+                return cg.e.logic(op, width, d, n, .r(r.reg));
+            };
+            const k = @backingInt(m.op);
+            if (k >= @backingInt(Modifier.uxtb) or m.amount == null or m.amount.? >= width.bits() or r.width != width)
+                return cg.fail("inline assembly: a logical instruction's register shifts by 'lsl', 'lsr', 'asr' or 'ror' 0 to {d}: '{s}'", .{ width.bits() - 1, line });
+            return cg.e.logic(op, width, d, n, .{ .reg = .{ .reg = r.reg, .shift = @fromBackingInt(@intCast(k)), .amount = @intCast(m.amount.?) } });
+        },
+        else => return cg.asmUnsupported(line),
+    }
 }
 
 fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []const u8) Error!void {
@@ -5237,22 +5338,23 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
     for (arith) |a| if (eql(u8, mnemonic, a[0])) {
         const d = reg(ops, 0) orelse return cg.asmUnsupported(line);
         const n = reg(ops, 1) orelse return cg.asmUnsupported(line);
-        if (ops.len != 3) return cg.asmUnsupported(line);
-        return switch (ops[2]) {
-            .reg => |m| e.addSub(a[1], d.width, d.reg, n.reg, .r(m.reg)),
-            .imm => |v| if (v >= 0 and v < 4096) e.addSub(a[1], d.width, d.reg, n.reg, .{ .imm = @intCast(v) }) else cg.asmUnsupported(line),
-            else => cg.asmUnsupported(line),
-        };
+        if (ops.len < 3) return cg.asmUnsupported(line);
+        // The flag-setting forms write zr where the others write sp.
+        if (d.reg == .sp and (a[1] == .adds or a[1] == .subs)) return cg.asmBadSp(line);
+        return e.addSub(a[1], d.width, d.reg, n.reg, try cg.asmAddOperand(d.width, d.reg == .sp or n.reg == .sp, ops[2..], line));
     };
     if (eql(u8, mnemonic, "cmp") or eql(u8, mnemonic, "cmn")) {
         const n = reg(ops, 0) orelse return cg.asmUnsupported(line);
-        if (ops.len != 2) return cg.asmUnsupported(line);
-        const rhs: Encoder.AddOperand = switch (ops[1]) {
-            .reg => |m| .r(m.reg),
-            .imm => |v| if (v >= 0 and v < 4096) .{ .imm = @intCast(v) } else return cg.asmUnsupported(line),
-            else => return cg.asmUnsupported(line),
-        };
+        if (ops.len < 2) return cg.asmUnsupported(line);
+        const rhs = try cg.asmAddOperand(n.width, n.reg == .sp, ops[1..], line);
         return if (mnemonic[2] == 'p') e.cmp(n.width, n.reg, rhs) else e.cmn(n.width, n.reg, rhs);
+    }
+    if (eql(u8, mnemonic, "neg") or eql(u8, mnemonic, "negs")) {
+        // sub(s) from zr, of a shifted register.
+        const d = reg(ops, 0) orelse return cg.asmUnsupported(line);
+        if (ops.len < 2 or ops[1] != .reg) return cg.asmUnsupported(line);
+        if (d.reg == .sp) return cg.asmBadSp(line);
+        return e.addSub(if (mnemonic.len == 3) .sub else .subs, d.width, d.reg, .zr, try cg.asmAddOperand(d.width, false, ops[1..], line));
     }
     if (std.meta.stringToEnum(Encoder.Shift, mnemonic)) |op| {
         const d = reg(ops, 0) orelse return cg.asmUnsupported(line);
@@ -5271,17 +5373,27 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         if (ops.len != 2) return cg.asmUnsupported(line);
         return if (x[2]) e.sxt(x[1], d.width, d.reg, n.reg) else e.uxt(x[1], d.reg, n.reg);
     };
-    const logic = [_]struct { []const u8, Encoder.LogicOp }{ .{ "and", .@"and" }, .{ "orr", .orr }, .{ "eor", .eor }, .{ "ands", .ands } };
+    const logic = [_]struct { []const u8, Encoder.LogicOp }{
+        .{ "and", .@"and" }, .{ "orr", .orr }, .{ "eor", .eor }, .{ "ands", .ands },
+        .{ "bic", .bic },    .{ "orn", .orn }, .{ "eon", .eon }, .{ "bics", .bics },
+    };
     for (logic) |l| if (eql(u8, mnemonic, l[0])) {
         const d = reg(ops, 0) orelse return cg.asmUnsupported(line);
         const n = reg(ops, 1) orelse return cg.asmUnsupported(line);
-        if (ops.len != 3) return cg.asmUnsupported(line);
-        return switch (ops[2]) {
-            .reg => |m| e.logic(l[1], d.width, d.reg, n.reg, .r(m.reg)),
-            .imm => |v| if (Encoder.bitmaskImm(d.width, @bitCast(v)) != null) e.logic(l[1], d.width, d.reg, n.reg, .{ .imm = @bitCast(v) }) else cg.asmUnsupported(line),
-            else => cg.asmUnsupported(line),
-        };
+        if (ops.len < 3) return cg.asmUnsupported(line);
+        return cg.asmLogic(l[1], d.width, d.reg, n.reg, ops[2..], line);
     };
+    if (eql(u8, mnemonic, "tst")) {
+        const n = reg(ops, 0) orelse return cg.asmUnsupported(line);
+        if (ops.len < 2) return cg.asmUnsupported(line);
+        return cg.asmLogic(.ands, n.width, .zr, n.reg, ops[1..], line);
+    }
+    if (eql(u8, mnemonic, "mvn")) {
+        // orn from zr, of a shifted register.
+        const d = reg(ops, 0) orelse return cg.asmUnsupported(line);
+        if (ops.len < 2 or ops[1] != .reg) return cg.asmUnsupported(line);
+        return cg.asmLogic(.orn, d.width, d.reg, .zr, ops[1..], line);
+    }
     return cg.asmUnsupported(line);
 }
 
