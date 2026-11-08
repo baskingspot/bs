@@ -5385,6 +5385,15 @@ The other direction, bs's own relocatable output, is new:
   (`compiler_rt::memcmp`, as `Zcu.fileKey` names a module root). The
   stack protector's functions are left out: builds with C objects root
   compiler_rt/ssp.zig, so they are the compilation's own exports.
+  There is one table per Zig language (`zig_0_17`, `zig_0_16`), each
+  generated with that release's zig and lib directory; 0.16 keeps
+  compiler_rt in 270 files where 0.17 has 140, so 165 exports live
+  elsewhere. The backends name helpers by 0.17's declaration
+  (`udivmod.zig`'s `__divti3`); `Emit.requestCompilerRt` moves a 0.16
+  compilation's request to the declaration exporting the same symbol
+  (`Zcu.compilerRtDecl`: `comparef.zig`'s `__cmptf2` becomes
+  `cmptf2.zig`'s, `sqrt.zig`'s `sqrtq` stays, as 0.16 exports it under
+  that name).
   Function multiversioning's CPU model (fmv.zig, which
   `__builtin_cpu_init` and `__builtin_cpu_supports` use) is declared in
   a nested struct, which its key names
@@ -9093,6 +9102,21 @@ options, as upstream's.
   libunwind.a; a static library or object only takes the flags, as
   upstream links the runtime libraries only into executables and shared
   libraries. Like C sources, `-lc++` roots ubsan_rt and ssp.
+- **Per language** (`CSource.Recipe`, 2026-11-08): a compilation's C
+  goes through its language's upstream zig (`toolchain.findZigFor`,
+  checked for that version) and lib directory, with the recipe of that
+  release. 0.16's differs from 0.17's in: musl's source list (0.16's has
+  33 sources that 0.17 replaced with zigc), `-fomit-frame-pointer` for
+  musl, no unwind tables for musl's and libc_nonshared.a's objects
+  (`build_crt_file`), no CPU features for assembly sources, no
+  `_LIBCPP_ASSERTION_SEMANTIC_DEFAULT`, no `-fno-sanitize=function`
+  with ReleaseSafe's trapping UBSan, and only the LLVM features
+  0.16's std.Target knows, so that Clang 21 does not warn about newer
+  ones. The lists come from the two source trees
+  (tools/upstream_lists.py writes src/upstream_lists.zig and checks that
+  libc++'s, libc++abi's and libunwind's lists are the same in both). Checked against upstream 0.16's `--verbose-cc` on
+  x86_64 and aarch64 Linux, glibc and musl, with libc++: every compile
+  line is the same up to paths and the CPU (bs clamps the native one).
 - **Runtime libraries** (`CSource.runtime_libs`, copied from upstream's
   `src/libs/libcxx.zig` and `libunwind.zig` with their MIT notice): each
   source with upstream's sub-compilation flags (ReleaseFast, PIC, no
@@ -9175,7 +9199,8 @@ to it. `-dynamic` with musl is `[unsupported]`. The glibc paths do not
 change.
 
 - **libc.a and crt1.o** (`src/Musl.zig`, copied from upstream's
-  `src/libs/musl.zig` with its notice): the source list (1053 files on
+  `src/libs/musl.zig` with its notice): the source list (generated per
+  language into src/upstream_lists.zig; 1053 files on
   x86_64, where an architecture's directory replaces the generic source
   of the same name), compiled by upstream's Clang as runtime libraries
   (`CSource.musl_crt1`, `musl_libc`). They use the flags of upstream's
@@ -9282,7 +9307,9 @@ and `zig build -Dtarget=aarch64-macos`.
   build links against, as upstream's linker reads it: the system SDK's
   for a native build when Xcode or the Command Line Tools are installed,
   else the zig lib directory's (27.0) (`CSource.darwinSdkVersion`);
-  objects record none, as upstream's.
+  objects record none, as upstream's. A 0.16 compilation reads
+  `MinimalDisplayName`, as 0.16's linker does (its lib directory's file
+  has no `Version`).
 - Conformance is measured per test: the number of `upstream/test/behavior`
   tests bs compiles and passes, divided by the number upstream 0.17.1 passes
   on the same target with the same backend.

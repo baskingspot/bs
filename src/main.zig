@@ -614,7 +614,7 @@ pub const Job = struct {
         }
         var job_opts = opts;
         job_opts.modules = modules;
-        if (opts.bs_target == .aarch64_macos) job_opts.macos_sdk = try CSource.darwinSdkVersion(arena, init_.io, init_.environ_map, cache_dirs.global, zig_lib_dir, opts.native_os);
+        if (opts.bs_target == .aarch64_macos) job_opts.macos_sdk = try CSource.darwinSdkVersion(arena, init_.io, init_.environ_map, cache_dirs.global, zig_lib_dir, opts.native_os, opts.language.language);
         // An executable or test that fuzzes links the fuzzer, whose
         // module family has a builtin of its own, as upstream's separate
         // compilation of it (a static library) does. A program other
@@ -1213,6 +1213,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
     // `Module.create`.
     const macos = opts.bs_target == .aarch64_macos;
     return CSource.start(init.gpa, init.io, init.environ_map, opts.c_sources, .{
+        .language = opts.language.language,
         .zig_lib_dir = job.zig_lib_dir,
         .local_cache = job.cache_dirs.local,
         .glibc_version = if (macos) null else opts.glibc_version,
@@ -1226,7 +1227,6 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .musl = if (opts.linux) |t| t.abi == .musl else false,
         .musl_libc = linksMusl(opts),
         .global_cache = job.cache_dirs.global,
-        .language = opts.language.language,
         .single_threaded = opts.single_threaded,
         .stack_protector = opts.c_only or opts.c_root or opts.use_llvm or opts.bs_target != .x86_64_linux or opts.optimize != .debug,
         .pic = opts.dynamic,
@@ -3416,6 +3416,7 @@ test {
     _ = @import("link/MachOMerge.zig");
     _ = @import("link/MachOObject.zig");
     _ = @import("link/Tbd.zig");
+    _ = @import("Zcu.zig");
     _ = @import("codegen/aarch64/Encoder.zig");
     _ = @import("codegen/Ssa.zig");
     _ = @import("codegen/rewrite.zig");

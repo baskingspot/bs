@@ -46,7 +46,6 @@ const ElfShared = @import("link/ElfShared.zig");
 const MachO = @import("link/MachO.zig");
 const MachODylib = @import("link/MachODylib.zig");
 const Replay = @import("Replay.zig");
-const compiler_rt_exports = @import("compiler_rt_exports.zig");
 
 const Incremental = @This();
 
@@ -179,6 +178,10 @@ lld: bool = false,
 rdynamic: bool = false,
 /// `Emit.force_undefined`.
 force_undefined: []const []const u8 = &.{},
+/// The compilation's Zig language (`open`'s `lang`), whose compiler_rt a
+/// relink with objects resolves their references against
+/// (`Zcu.compilerRtExport`).
+language: Language,
 /// `--entry`: the entry point's name (`Emit.entry_name`), which an object
 /// may define.
 entry_name: ?[]const u8 = null,
@@ -236,6 +239,7 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .dir = dir,
         .lock = lock,
         .store_seed = store_seed,
+        .language = lang,
         .donor_key = try donorKey(gpa, io, store_seed, zig_lib_dir, root_name, tests_std, args),
         .donor_tag_seed = donorTagSeed(args),
         .arch = if (std.mem.startsWith(u8, target, "aarch64")) .aarch64 else .x86_64,
@@ -1061,15 +1065,17 @@ fn linkWithObjects(
         lld: bool,
         /// aarch64-macos, where every name is a library's (`importSym`).
         macho: bool,
+        /// Whose compiler_rt (`rtExport`).
+        language: Language,
 
         const Self = @This();
         pub fn zigExport(r: Self, name: []const u8) !?Atom.SymbolKey {
             return r.exports.get(name);
         }
 
-        pub fn rtExport(_: Self, name: []const u8) !?Atom.SymbolKey {
+        pub fn rtExport(r: Self, name: []const u8) !?Atom.SymbolKey {
             if (Emit.arrayBound(name)) |key| return key;
-            const e = Zcu.compilerRtExport(name) orelse return null;
+            const e = Zcu.compilerRtExport(r.language, name) orelse return null;
             var buf: [128]u8 = undefined;
             return .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl));
         }
@@ -1119,6 +1125,7 @@ fn linkWithObjects(
         .requested_imports = &requested_imports,
         .lld = inc.lld,
         .macho = macho,
+        .language = inc.language,
     };
     // The archive members the Zig code's externs pull: those of the
     // linked nodes and the link's own atoms.
@@ -1151,7 +1158,7 @@ fn linkWithObjects(
     var link_imports = imports;
     if (inc.objects_changed or inc.baseRebound(.{ m.id, m.pack_id })) {
         // A damaged pack record (`LinkAtoms.check`): build from scratch.
-        const objects_only = sameObjectRequests(arena, m, pack_atoms, &live, objects, &requested_imports) catch |err| switch (err) {
+        const objects_only = sameObjectRequests(arena, inc.language, m, pack_atoms, &live, objects, &requested_imports) catch |err| switch (err) {
             error.InvalidInput => return inc.noLink("{t}", .{err}),
             else => |e| return e,
         } orelse return inc.noLink("the changed objects need other compiler_rt functions or imports than the last build's", .{});
@@ -1170,7 +1177,7 @@ fn linkWithObjects(
             };
             if (n != imports.len) return inc.noLink("the manifest's imports do not match the objects' requests", .{});
         }
-        const rebound = reboundSlots(arena, m, pack_atoms, numbered, &live, objects, &export_keys, imports, glibc, shared) catch |err| switch (err) {
+        const rebound = reboundSlots(arena, inc.language, m, pack_atoms, numbered, &live, objects, &export_keys, imports, glibc, shared) catch |err| switch (err) {
             error.InvalidInput => return inc.noLink("{t}", .{err}),
             else => |e| return e,
         };
@@ -1281,6 +1288,7 @@ fn linkWithObjects(
 /// those, or null if the new objects ask for others.
 fn sameObjectRequests(
     arena: Allocator,
+    language: Language,
     m: *const Manifest,
     pack_atoms: *const Pack.LinkAtoms,
     live: *const std.bit_set.Dynamic,
@@ -1291,7 +1299,7 @@ fn sameObjectRequests(
     // compiler_rt functions, less those the Zig code needs (struck below).
     var old: std.array_hash_map.Auto(Atom.SymbolKey, void) = .empty;
     for (m.link_symbols) |ls| if (ls.kind == .import) try old.put(arena, @fromBackingInt(ls.key), {});
-    for (compiler_rt_exports.exports) |e| {
+    for (Zcu.compilerRtExports(language)) |e| {
         var buf: [128]u8 = undefined;
         const key: Atom.SymbolKey = .fromName(Zcu.compilerRtKey(&buf, e[1], e[2]));
         const n = m.symbol(@backingInt(key)) orelse continue;
@@ -1302,7 +1310,7 @@ fn sameObjectRequests(
     for (requested_imports.keys()) |key| try new.put(arena, key, {});
     var names: std.ArrayList([]const u8) = .empty;
     try objects.undefinedSince(0, &names, arena);
-    for (names.items) |name| if (Zcu.compilerRtExport(name)) |e| {
+    for (names.items) |name| if (Zcu.compilerRtExport(language, name)) |e| {
         var buf: [128]u8 = undefined;
         try new.put(arena, .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl)), {});
     };
@@ -1352,6 +1360,7 @@ fn sameObjectRequests(
 /// the link then does not find.
 fn reboundSlots(
     arena: Allocator,
+    language: Language,
     m: *const Manifest,
     pack_atoms: *const Pack.LinkAtoms,
     numbered: []const Elf.NumberedAtom,
@@ -1385,7 +1394,7 @@ fn reboundSlots(
         const target: ?Emit.ExternTarget = if (export_keys.get(name)) |k| .{ .key = k } else if (in_object) |t|
             .{ .key = t.key, .addend = @intCast(t.offset) }
         else if (Emit.sectionBound(name) orelse Emit.arrayBound(name)) |k| .{ .key = k } else t: {
-            if (Zcu.compilerRtExport(name)) |e| {
+            if (Zcu.compilerRtExport(language, name)) |e| {
                 var buf: [128]u8 = undefined;
                 break :t .{ .key = .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl)) };
             }

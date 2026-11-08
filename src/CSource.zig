@@ -22,12 +22,13 @@ const cache = @import("cache.zig");
 const diag = @import("diag.zig");
 const ToolRecord = @import("ToolRecord.zig");
 const toolchain = @import("toolchain.zig");
+const Language = @import("language.zig").Language;
 const cpu_mod = @import("cpu.zig");
 const ar = @import("link/Archive.zig");
 const Incremental = @import("Incremental.zig");
-const Language = @import("language.zig").Language;
 const main = @import("main.zig");
 const Musl = @import("Musl.zig");
+const upstream_lists = @import("upstream_lists.zig");
 
 const CSource = @This();
 
@@ -137,8 +138,68 @@ pub const Flags = struct {
     }
 };
 
+/// What upstream's C recipes (`src/libs`, `Compilation.addCCArgs`) do
+/// differently in each Zig language, beside the lib directory and the
+/// `zig` that compiles them. libc++'s, libc++abi's, libunwind's and
+/// libc_nonshared's sources are the same in both (tools/upstream_lists.py
+/// checks the first three).
+pub const Recipe = struct {
+    /// musl's libc.a sources (`Musl.sources`): 0.17 moved some to zigc.
+    musl_sources: []const []const u8,
+    /// 0.16 builds musl with `-fomit-frame-pointer`.
+    musl_omit_frame_pointer: bool,
+    /// The unwind tables of musl's and libc_nonshared.a's objects
+    /// (`build_crt_file`): the compilation's (null) in 0.17, none in 0.16.
+    crt_unwind_tables: ?std.lang.UnwindTables,
+    /// The CPU and its features for assembly sources (`-Xclangas`), new
+    /// in 0.17's `addCCArgs`; 0.16 gives them none.
+    asm_cpu_features: bool,
+    /// libc++'s `_LIBCPP_ASSERTION_SEMANTIC_DEFAULT`, new in 0.17's
+    /// `addCxxArgs`.
+    cxx_assertion_semantic: bool,
+    /// `-fno-sanitize=function` with trapping UBSan (ReleaseSafe), new
+    /// in 0.17's `addCCArgs`.
+    trap_no_function_sanitizer: bool,
+    /// The LLVM feature names the language's Clang knows, per
+    /// architecture, or null for bs's own std.Target's (0.17's): the CPU
+    /// features passed to Clang are only those, as the language's
+    /// std.Target lists them, so that an older Clang does not warn about
+    /// newer ones.
+    llvm_features: ?struct { x86: []const []const u8, aarch64: []const []const u8 },
+
+    pub const zig_0_17: Recipe = .{
+        .musl_sources = &upstream_lists.musl_src_files_0_17,
+        .musl_omit_frame_pointer = false,
+        .crt_unwind_tables = null,
+        .asm_cpu_features = true,
+        .cxx_assertion_semantic = true,
+        .trap_no_function_sanitizer = true,
+        .llvm_features = null,
+    };
+    pub const zig_0_16: Recipe = .{
+        .musl_sources = &upstream_lists.musl_src_files_0_16,
+        .musl_omit_frame_pointer = true,
+        .crt_unwind_tables = .none,
+        .asm_cpu_features = false,
+        .cxx_assertion_semantic = false,
+        .trap_no_function_sanitizer = false,
+        .llvm_features = .{ .x86 = &upstream_lists.llvm_features_0_16_x86, .aarch64 = &upstream_lists.llvm_features_0_16_aarch64 },
+    };
+
+    pub fn of(language: Language) *const Recipe {
+        return switch (language) {
+            .zig_0_16 => &zig_0_16,
+            .zig_0_17 => &zig_0_17,
+        };
+    }
+};
+
 /// The compilation-wide settings of the C compiles.
 pub const Options = struct {
+    /// The compilation's Zig language, whose upstream zig compiles the C
+    /// (`toolchain.findZigFor`) with its recipe, and which keys the batch
+    /// summary (`Summary.path`) as it keys bs's own caches.
+    language: Language = .newest,
     zig_lib_dir: []const u8,
     local_cache: []const u8,
     /// The target's glibc: with `-lc` the linked one; without, the native
@@ -168,9 +229,6 @@ pub const Options = struct {
     musl_libc: bool = false,
     /// Where the runtime libraries go: `<global>/bs/o/<key>/`.
     global_cache: []const u8 = "",
-    /// The compilation's Zig language, which keys the batch summary
-    /// (`Summary.path`) as it keys bs's own caches.
-    language: Language = .newest,
     single_threaded: bool = false,
     /// Upstream's default stack protector for the compilation's C in
     /// Debug and ReleaseSafe: with libc, unless its Zig code goes through
@@ -199,6 +257,10 @@ pub const Options = struct {
     macos: bool = false,
     /// With `macos`: the macOS versions (`-mmacos-version-min`).
     macos_version: std.SemanticVersion.Range = undefined,
+
+    fn recipe(o: Options) *const Recipe {
+        return Recipe.of(o.language);
+    }
 };
 
 /// The compiles of one build, running while it analyzes.
@@ -641,7 +703,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     const local = try Io.Dir.path.resolveAlloc(s, &.{ cwd_path, o.local_cache });
     const start_ns = Io.Clock.real.now(io).toNanoseconds();
 
-    const zig = toolchain.findZig(s, io, environ);
+    const zig = toolchain.findZigFor(s, io, environ, o.language);
     // Upstream zig's identity goes into the key: another Clang compiles
     // other bytes.
     const zig_id = if (zig.found) |p| id: {
@@ -694,7 +756,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         if (found) {
             runtime.shrinkRetainingCapacity(first);
             try archives.append(ra, .{ .path = path, .object = rl.object });
-        } else if (is_nonshared and sources.len == 0 and !o.cxx_runtime and try checkZig(s, io, zig.found.?) != null) {
+        } else if (is_nonshared and sources.len == 0 and !o.cxx_runtime and try checkZig(s, io, zig.found.?, o.language) != null) {
             // A build of Zig only does not fail for want of upstream zig
             // 0.17.1; it links without libc_nonshared.a, as before.
             runtime.shrinkRetainingCapacity(first);
@@ -807,9 +869,9 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     // Only a build that compiles C needs upstream zig, and checks its
     // version once.
     b.zig = if (misses == 0) .{ .path = "" } else if (zig.found) |p|
-        if (try checkZig(s, io, p)) |msg| .{ .missing = try gpa.dupe(u8, msg) } else .{ .path = try gpa.dupe(u8, p) }
+        if (try checkZig(s, io, p, o.language)) |msg| .{ .missing = try gpa.dupe(u8, msg) } else .{ .path = try gpa.dupe(u8, p) }
     else
-        .{ .missing = try gpa.print("compiling C sources needs upstream zig 0.17.1; bs looked for it in BS_ZIG, as 'zig' on PATH, and in {s}", .{zig.looked}) };
+        .{ .missing = try gpa.print("compiling C sources needs upstream zig {s}; bs looked for it in {s}, as 'zig' on PATH, and in {s}", .{ o.language.versionString(), toolchain.envVar(o.language), zig.looked }) };
     b.misses = misses;
     const workers = @min(misses, std.Thread.getCpuCount() catch 1);
     for (0..workers) |_| b.group.concurrent(io, Batch.worker, .{b}) catch break;
@@ -879,7 +941,20 @@ const Common = struct {
     features: []const []const u8,
     /// The same for the assembler (`-Xclangas`), for assembly sources.
     asm_features: []const []const u8,
+    /// `Recipe.asm_cpu_features`.
+    asm_cpu_features: bool,
+    /// `Recipe.trap_no_function_sanitizer`.
+    trap_no_function_sanitizer: bool,
 };
+
+/// Whether sorted `list` holds `name`.
+fn sortedContains(list: []const []const u8, name: []const u8) bool {
+    return std.sort.binarySearch([]const u8, list, name, struct {
+        fn order(n: []const u8, item: []const u8) std.math.Order {
+            return std.mem.order(u8, n, item);
+        }
+    }.order) != null;
+}
 
 fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, target: *const std.Target, lib: []const u8, o: Options) !Common {
     var libc_includes: std.ArrayList([]const u8) = .empty;
@@ -895,9 +970,11 @@ fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Envi
     var asm_features: std.ArrayList([]const u8) = .empty;
     try features.appendSlice(arena, &.{ "-Xclang", "-target-cpu", "-Xclang", target.cpu.model.llvm_name.? });
     try asm_features.appendSlice(arena, &.{ "-Xclangas", "-target-cpu", "-Xclangas", target.cpu.model.llvm_name.? });
+    const known: ?[]const []const u8 = if (o.recipe().llvm_features) |f| if (target.cpu.arch == .aarch64) f.aarch64 else f.x86 else null;
     for (target.cpu.arch.allFeaturesList(), 0..) |feature, i| {
         const name = feature.llvm_name orelse continue;
         if (std.mem.startsWith(u8, name, "soft-float") or std.mem.startsWith(u8, name, "hard-float") or std.mem.startsWith(u8, name, "x32")) continue;
+        if (known) |k| if (!sortedContains(k, name)) continue;
         const on = target.cpu.features.isEnabled(@intCast(i));
         const f = try arena.print("{c}{s}", .{ "-+"[@intFromBool(on)], name });
         try features.appendSlice(arena, &.{ "-Xclang", "-target-feature", "-Xclang", f });
@@ -924,8 +1001,8 @@ fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Envi
         "-D_LIBCPP_HAS_NO_STD_MODULES",
         "-D_LIBCPP_PSTL_BACKEND_SERIAL",
         "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE",
-        "-D_LIBCPP_ASSERTION_SEMANTIC_DEFAULT=_LIBCPP_ASSERTION_SEMANTIC_IGNORE",
     });
+    if (o.recipe().cxx_assertion_semantic) try cxx.append(arena, "-D_LIBCPP_ASSERTION_SEMANTIC_DEFAULT=_LIBCPP_ASSERTION_SEMANTIC_IGNORE");
     // Linux only, as upstream's `addCxxArgs`.
     if (!o.macos) try cxx.append(arena, "-D_LIBCPP_HAS_TIME_ZONE_DATABASE");
     // glibc 2.16 introduced aligned_alloc.
@@ -947,6 +1024,8 @@ fn commonArgs(arena: std.mem.Allocator, io: Io, environ: *const std.process.Envi
         .cxx_defines = cxx.items,
         .features = features.items,
         .asm_features = asm_features.items,
+        .asm_cpu_features = o.recipe().asm_cpu_features,
+        .trap_no_function_sanitizer = o.recipe().trap_no_function_sanitizer,
     };
 }
 
@@ -959,6 +1038,8 @@ const Mode = struct {
     optimize: std.lang.Optimize = .debug,
     sanitize_c: std.zig.SanitizeC,
     red_zone: bool,
+    /// `-fomit-frame-pointer` (`Recipe.musl_omit_frame_pointer`).
+    omit_frame_pointer: bool = false,
     no_builtin: bool,
     /// `-fstack-protector-strong` with upstream's buffer size.
     stack_protector: bool = false,
@@ -992,7 +1073,7 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
     // Assembly as is takes no preprocessor or code generation flags, only
     // the assembler's CPU features.
     if (m.lang == .assembly) {
-        try argv.appendSlice(arena, common.asm_features);
+        if (common.asm_cpu_features) try argv.appendSlice(arena, common.asm_features);
         return dep_at;
     }
     try argv.appendSlice(arena, &.{ "-fhosted", "-nostdinc" });
@@ -1022,9 +1103,12 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
         }
         switch (m.sanitize_c) {
             .off => {},
-            // As upstream: no function sanitizer, which calls through C
+            // As upstream 0.17: no function sanitizer, which calls through C
             // ABI pointers of compatible but different types trip.
-            .trap => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fsanitize-trap=undefined", "-fno-sanitize=function" }),
+            .trap => {
+                try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fsanitize-trap=undefined" });
+                if (common.trap_no_function_sanitizer) try argv.append(arena, "-fno-sanitize=function");
+            },
             .full => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fno-sanitize=vptr", "-fno-sanitize=function" }),
         }
         try argv.append(arena, switch (m.optimize) {
@@ -1033,7 +1117,7 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
             .small => "-Os",
         });
     }
-    try argv.appendSlice(arena, &.{ if (m.red_zone) "-mred-zone" else "-mno-red-zone", "-fno-omit-frame-pointer" });
+    try argv.appendSlice(arena, &.{ if (m.red_zone) "-mred-zone" else "-mno-red-zone", if (m.omit_frame_pointer) "-fomit-frame-pointer" else "-fno-omit-frame-pointer" });
     // Upstream's Debug backend for Zig code has no stack protector, which
     // turns it off for the compilation's C too (`Module.create`); the
     // runtime libraries have none either.
@@ -1046,8 +1130,8 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
         .sync => try argv.appendSlice(arena, &.{ "-fno-asynchronous-unwind-tables", "-funwind-tables" }),
         .async => try argv.append(arena, "-fasynchronous-unwind-tables"),
     }
-    try argv.appendSlice(arena, common.features);
-    if (m.lang == .asm_cpp) try argv.appendSlice(arena, common.asm_features);
+    if (m.lang != .asm_cpp or common.asm_cpu_features) try argv.appendSlice(arena, common.features);
+    if (m.lang == .asm_cpp and common.asm_cpu_features) try argv.appendSlice(arena, common.asm_features);
     return dep_at;
 }
 
@@ -1247,7 +1331,7 @@ fn nonsharedJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), comm
             .pie = false,
             .function_sections = true,
             .data_sections = true,
-            .unwind_tables = o.unwind_tables,
+            .unwind_tables = o.recipe().crt_unwind_tables orelse o.unwind_tables,
             .link_libc = false,
             .libcpp = false,
             .libunwind = false,
@@ -1275,7 +1359,7 @@ const musl_libc: RuntimeLib = .{ .name = "c", .dir = "libc", .files = &.{}, .mus
 /// `-fno-builtin`, sections, the compilation's PIC, which is off, and
 /// unwind tables, no libc), then musl's own (`Musl.ccArgs`).
 fn muslJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: RuntimeLib, common: Common, lib: []const u8, o: Options) !void {
-    const files = if (rl.object) rl.files else try Musl.sources(arena, o.cpu.arch);
+    const files = if (rl.object) rl.files else try Musl.sources(arena, o.cpu.arch, o.recipe().musl_sources);
     for (files) |file| {
         const lang: Lang = if (std.mem.endsWith(u8, file, ".S")) .asm_cpp else if (std.mem.endsWith(u8, file, ".s")) .assembly else .c;
         var argv: std.ArrayList([]const u8) = .empty;
@@ -1284,12 +1368,13 @@ fn muslJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Runti
             .optimize = .fast,
             .sanitize_c = .off,
             .red_zone = true,
+            .omit_frame_pointer = o.recipe().musl_omit_frame_pointer,
             .no_builtin = true,
             .pic = false,
             .pie = false,
             .function_sections = true,
             .data_sections = true,
-            .unwind_tables = o.unwind_tables,
+            .unwind_tables = o.recipe().crt_unwind_tables orelse o.unwind_tables,
             .link_libc = false,
             .libcpp = false,
             .libunwind = false,
@@ -1423,16 +1508,20 @@ pub fn darwinSdk(arena: std.mem.Allocator, io: Io, environ: *const std.process.E
 }
 
 /// The version of the SDK an aarch64-macos build links against, as
-/// upstream's linker reads it from `SDKSettings.json`: the system SDK's
+/// `language`'s upstream linker reads it from `SDKSettings.json` (0.17's
+/// `Version`, 0.16's `MinimalDisplayName`): the system SDK's
 /// (`darwinSdk`) for the `native` target when one is installed, else the
 /// zig lib directory's (`libc/darwin`). Null when the file names none.
-pub fn darwinSdkVersion(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8, lib: []const u8, native: bool) !?std.SemanticVersion {
+pub fn darwinSdkVersion(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, global_cache: []const u8, lib: []const u8, native: bool, language: Language) !?std.SemanticVersion {
     const sdk = if (native) try darwinSdk(arena, io, environ, global_cache) else null;
     const path = if (sdk) |dir| try Io.Dir.path.join(arena, &.{ dir, "SDKSettings.json" }) else try Io.Dir.path.join(arena, &.{ lib, "libc", "darwin", "SDKSettings.json" });
     const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 24)) catch return null;
     const settings = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch return null;
     if (settings != .object) return null;
-    const version = settings.object.get("Version") orelse return null;
+    const version = settings.object.get(switch (language) {
+        .zig_0_16 => "MinimalDisplayName",
+        .zig_0_17 => "Version",
+    }) orelse return null;
     if (version != .string) return null;
     return std.Target.Query.parseVersion(version.string) catch null;
 }
@@ -1581,21 +1670,22 @@ fn runCc(arena: std.mem.Allocator, io: Io, argv: []const []const u8, env: *const
 pub fn forward(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, args: []const []const u8) !void {
     const zig = toolchain.findZig(arena, io, environ);
     const path = zig.found orelse main.fatal("'{s}' runs upstream zig 0.17.1; bs looked for it in BS_ZIG, as 'zig' on PATH, and in {s}", .{ args[0], zig.looked });
-    if (try checkZig(arena, io, path)) |msg| main.fatal("{s}", .{msg});
+    if (try checkZig(arena, io, path, .newest)) |msg| main.fatal("{s}", .{msg});
     const argv = try std.mem.concat(arena, []const u8, &.{ &.{path}, args });
     const err = std.process.replace(io, .{ .argv = argv });
     main.fatal("unable to run '{s}': {t}", .{ path, err });
 }
 
-/// Null when `zig` is upstream's 0.17.1, else why not.
-fn checkZig(arena: std.mem.Allocator, io: Io, zig: []const u8) !?[]const u8 {
+/// Null when `zig` is the upstream release of `language`, else why not.
+fn checkZig(arena: std.mem.Allocator, io: Io, zig: []const u8, language: Language) !?[]const u8 {
+    const want = language.versionString();
     const res = std.process.run(arena, io, .{ .argv = &.{ zig, "version" } }) catch |err| {
-        const why = try arena.print("compiling C sources needs upstream zig 0.17.1; unable to run '{s}': {t}", .{ zig, err });
+        const why = try arena.print("compiling C sources needs upstream zig {s}; unable to run '{s}': {t}", .{ want, zig, err });
         return why;
     };
     const version = std.mem.trim(u8, res.stdout, " \n");
-    if (res.term.success() and std.mem.eql(u8, version, "0.17.1")) return null;
-    const why = try arena.print("compiling C sources needs upstream zig 0.17.1; '{s}' is version '{s}' (set BS_ZIG to upstream 0.17.1)", .{ zig, version });
+    if (res.term.success() and std.mem.eql(u8, version, want)) return null;
+    const why = try arena.print("compiling C sources needs upstream zig {s}; '{s}' is version '{s}' (set {s} to upstream {s})", .{ want, zig, version, toolchain.envVar(language), want });
     return why;
 }
 

@@ -1096,7 +1096,7 @@ const InputResolver = struct {
     /// compiler_rt's, and the bounds of the init and fini arrays.
     pub fn rtExport(r: InputResolver, name: []const u8) !?SymbolKey {
         if (arrayBound(name)) |key| return key;
-        if (Zcu.compilerRtExport(name) == null or r.emit.libcFirst(name)) return null;
+        if (Zcu.compilerRtExport(r.emit.zcu.language, name) == null or r.emit.libcFirst(name)) return null;
         return r.emit.rtExport(name);
     }
 
@@ -1883,18 +1883,20 @@ fn addContentUse(emit: *Emit, key: SymbolKey) !void {
     if (emit.uav_capturing != 0) try emit.uav_uses.append(emit.gpa, key);
 }
 
-/// `Zcu.requestCompilerRt` on behalf of the current unit.
+/// `Zcu.requestCompilerRt` on behalf of the current unit, for the
+/// declaration as 0.17's compiler_rt names it (`Zcu.compilerRtDecl`).
 pub fn requestCompilerRt(emit: *Emit, file_name: []const u8, name: []const u8) ![]const u8 {
     try emit.syncPending();
+    const d = Zcu.compilerRtDecl(emit.zcu.language, file_name, name);
     var buf: [128]u8 = undefined;
-    const key = try emit.requestRtKey(Zcu.compilerRtKey(&buf, file_name, name));
+    const key = try emit.requestRtKey(Zcu.compilerRtKey(&buf, d.file, d.decl));
     try emit.addRef(.{ .rt = key });
     return key;
 }
 
 /// `Zcu.requestCompilerRtExport` on behalf of the current unit.
 pub fn requestCompilerRtExport(emit: *Emit, name: []const u8) !?[]const u8 {
-    const e = Zcu.compilerRtExport(name) orelse return null;
+    const e = Zcu.compilerRtExport(emit.zcu.language, name) orelse return null;
     const result = try emit.requestCompilerRt(e.file, e.decl);
     return result;
 }
@@ -2285,7 +2287,7 @@ fn libcFirst(emit: *const Emit, name: []const u8) bool {
 
 /// The compiler_rt function exported as `name`, requested, or null.
 fn rtExport(emit: *Emit, name: []const u8) !?SymbolKey {
-    const e = Zcu.compilerRtExport(name) orelse return null;
+    const e = Zcu.compilerRtExport(emit.zcu.language, name) orelse return null;
     var buf: [128]u8 = undefined;
     return .fromName(try emit.requestRtKey(Zcu.compilerRtKey(&buf, e.file, e.decl)));
 }

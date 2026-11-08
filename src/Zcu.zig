@@ -15,6 +15,7 @@ const Zir = std.zig.Zir;
 
 const Frontend = @import("Frontend.zig");
 const Language = @import("language.zig").Language;
+const compiler_rt_exports = @import("compiler_rt_exports.zig");
 const cache = @import("cache.zig");
 const InternPool = @import("InternPool.zig");
 const Ir = @import("Ir.zig");
@@ -1745,21 +1746,76 @@ pub fn requestCompilerRtKey(zcu: *Zcu, key: []const u8) ![]const u8 {
 
 pub const RtExport = struct { file: []const u8, decl: []const u8 };
 
-/// The compiler_rt function or variable exporting `name` (`__eqtf2`,
-/// `__udivti3`, `sinf`, `sqrtf128`, `memcpy`, `__cpu_model`, ...), or null
-/// if compiler_rt does not export `name`. For `@extern` references and C objects, which upstream
-/// resolves against the compiler_rt it links. The table is upstream's
-/// export list (src/compiler_rt_exports.zig); the memory functions are the
-/// ones upstream exports in Debug builds (not `.small`).
-pub fn compilerRtExport(name: []const u8) ?RtExport {
-    const map = comptime blk: {
-        const list = @import("compiler_rt_exports.zig").exports;
-        @setEvalBranchQuota(100 * list.len);
-        var kvs: [list.len]struct { []const u8, RtExport } = undefined;
-        for (&kvs, list) |*kv, e| kv.* = .{ e[0], .{ .file = e[1], .decl = e[2] } };
-        break :blk std.StaticStringMap(RtExport).initComptime(kvs);
+/// `language`'s compiler_rt exports (src/compiler_rt_exports.zig).
+pub fn compilerRtExports(language: Language) []const compiler_rt_exports.Export {
+    return switch (language) {
+        .zig_0_16 => &compiler_rt_exports.zig_0_16,
+        .zig_0_17 => &compiler_rt_exports.zig_0_17,
     };
-    return map.get(name);
+}
+
+/// The compiler_rt function or variable exporting `name` (`__eqtf2`,
+/// `__udivti3`, `sinf`, `sqrtf128`, `memcpy`, `__cpu_model`, ...) in
+/// `language`'s lib directory, or null if its compiler_rt does not export
+/// `name`. For `@extern` references and C objects, which upstream
+/// resolves against the compiler_rt it links. The tables are upstream's
+/// export lists (src/compiler_rt_exports.zig); the memory functions are
+/// the ones upstream exports in Debug builds (not `.small`).
+pub fn compilerRtExport(language: Language, name: []const u8) ?RtExport {
+    const maps = comptime blk: {
+        var m: [2]std.StaticStringMap(RtExport) = undefined;
+        for (&m, [2]Language{ .zig_0_16, .zig_0_17 }) |*map, l| {
+            const list = compilerRtExports(l);
+            @setEvalBranchQuota(200 * list.len);
+            var kvs: [list.len]struct { []const u8, RtExport } = undefined;
+            for (&kvs, list) |*kv, e| kv.* = .{ e[0], .{ .file = e[1], .decl = e[2] } };
+            map.* = .initComptime(kvs);
+        }
+        break :blk m;
+    };
+    return maps[@backingInt(language)].get(name);
+}
+
+/// The declaration in `language`'s compiler_rt of function `name` in
+/// `file_name`, as the backends name it in 0.17's (`compilerRtKey`): the
+/// same in 0.17; in 0.16, which keeps compiler_rt in other files, the
+/// declaration exporting the same symbol. A declaration of `language`'s
+/// own (a key from the cache's manifest) stays as it is.
+pub fn compilerRtDecl(language: Language, file_name: []const u8, name: []const u8) RtExport {
+    const same: RtExport = .{ .file = file_name, .decl = name };
+    if (language == .zig_0_17) return same;
+    for (compilerRtExports(language)) |e| if (std.mem.eql(u8, e[1], file_name) and std.mem.eql(u8, e[2], name)) return same;
+    // A declaration is named after the symbol it exports (`sqrtq`, which
+    // 0.17 exports as `sqrtf128` only), else after one of its aliases
+    // (`__cmptf2` for `__lttf2`).
+    if (compilerRtExport(language, name)) |e| return e;
+    for (compilerRtExports(.zig_0_17)) |e| if (std.mem.eql(u8, e[1], file_name) and std.mem.eql(u8, e[2], name)) {
+        if (compilerRtExport(language, e[0])) |found| return found;
+    };
+    return same;
+}
+test compilerRtDecl {
+    // Every function 0.17's backends can name has its 0.16 declaration:
+    // the one exporting the same symbol, in 0.16's other files.
+    const t = std.testing;
+    for (compilerRtExports(.zig_0_17)) |e| {
+        const d = compilerRtDecl(.zig_0_16, e[1], e[2]);
+        const in_0_16 = for (compilerRtExports(.zig_0_16)) |o| {
+            if (std.mem.eql(u8, o[1], d.file) and std.mem.eql(u8, o[2], d.decl)) break true;
+        } else false;
+        if (!in_0_16) {
+            // Only what 0.16 does not have at all.
+            try t.expect(compilerRtExport(.zig_0_16, e[0]) == null);
+            try t.expect(compilerRtExport(.zig_0_16, e[2]) == null);
+        }
+    }
+    const lt = compilerRtDecl(.zig_0_16, "comparef.zig", "__cmptf2");
+    try t.expectEqualStrings("cmptf2.zig", lt.file);
+    const sqrt = compilerRtDecl(.zig_0_16, "sqrt.zig", "sqrtq");
+    try t.expectEqualStrings("sqrtq", sqrt.decl);
+    const float = compilerRtDecl(.zig_0_16, "float_from_int.zig", "__floatsidf");
+    try t.expectEqualStrings("floatsidf.zig", float.file);
+    try t.expectEqualStrings("comparef.zig", compilerRtDecl(.zig_0_17, "comparef.zig", "__cmptf2").file);
 }
 
 /// The files analysis starts from: builtin, std (whose start code imports
