@@ -56,6 +56,10 @@ parent_map: []Ast.Node.OptionalIndex = &.{},
 /// file that has an ignore comment; empty for one that has none.
 line_starts: std.ArrayList(u32) = .empty,
 has_ignores: bool = false,
+/// The root declarations by name, the first of each (`rootDecl`); built
+/// on first use.
+root_decls: std.StringHashMapUnmanaged(Ast.Node.Index) = .empty,
+root_decls_built: bool = false,
 /// ziglint's simple mode in full, for the ported tests. bs's build
 /// (`run`) leaves the forms Sema answers with types to Sema: Z010 in
 /// returns and call arguments, Z029 in call arguments, and Z034
@@ -64,7 +68,7 @@ simple: bool = false,
 
 /// The rules' version, in the name of the frontend's cached findings
 /// (`Frontend.lintFindings`): bump it when a rule changes.
-pub const version: u32 = 2;
+pub const version: u32 = 3;
 
 /// Z024's facts record every line longer than this, whatever the config's
 /// limit; a config with a lower one makes the report step scan the source
@@ -972,10 +976,12 @@ fn buildPublicTypesMap(self: *Linter) void {
 fn isImportedType(self: *Linter, var_decl: Ast.full.VarDecl) bool {
     const init_node = var_decl.ast.init_node.unwrap() orelse return false;
 
-    // ziglint's resolver answers these from the file alone: an `@import`
-    // of std, builtin or a `.zig` file (which must exist for the program
-    // to compile), and a builtin that returns a type.
-    if (self.isFileLocalType(init_node)) return true;
+    // Use type resolver if available (as far as the file answers it).
+    // Unresolved is not a negative answer.
+    switch (self.typeOf(init_node)) {
+        .type_type, .std_type, .user_type, .module => return true,
+        else => {},
+    }
 
     // Fallback: check if it's a field access ending in PascalCase
     const tag = self.tree.nodeTag(init_node);
@@ -989,25 +995,206 @@ fn isImportedType(self: *Linter, var_decl: Ast.full.VarDecl) bool {
     };
 }
 
-/// Whether `node` is one of the type expressions whose type ziglint's
-/// `TypeResolver.typeOf` answers without another file: `@import("std")`,
-/// `@import("builtin")`, `@import("<path>.zig")`, or a builtin call that
-/// returns a type.
-fn isFileLocalType(self: *Linter, node: Ast.Node.Index) bool {
-    switch (self.tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
-        else => return false,
+/// What ziglint's `TypeResolver.typeOf` answers about an expression, as
+/// far as the file alone answers it (`typeOf`).
+const FileType = union(enum) {
+    unknown,
+    /// The type `type`.
+    type_type,
+    /// A container of this file (ziglint's `user_type` in this module).
+    user_type,
+    /// Another `.zig` file, imported (ziglint's `user_type` naming it).
+    module,
+    /// A declaration of std, by its path below std (`mem.Allocator`).
+    std_type: []const u8,
+    /// Anything else ziglint types: a function, a primitive, a literal.
+    other,
+};
+
+/// ziglint's `TypeResolver.typeOf` (src/TypeResolver.zig,
+/// `resolveNodeType`) where the file alone answers it: names of the file's
+/// root declarations, std's paths through `@import("std")`, the file's
+/// functions' return types, and builtins. What another file would answer
+/// (a member of an imported `.zig` file, a method's return type) is
+/// `unknown`, as ziglint's own answer is for what it cannot resolve; the
+/// rules then fall back to the syntax.
+fn typeOf(self: *Linter, node: Ast.Node.Index) FileType {
+    return self.typeOfDepth(node, 0);
+}
+
+fn typeOfDepth(self: *Linter, node: Ast.Node.Index, depth: u8) FileType {
+    // Aliases chain through root declarations; a cycle does not compile.
+    if (depth > 32) return .unknown;
+    const tree = &self.tree;
+    switch (tree.nodeTag(node)) {
+        .identifier => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            if (isPrimitiveType(name) or std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) return .other;
+            if (std.mem.eql(u8, name, "type")) return .type_type;
+            if (std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined")) return .unknown;
+            const decl = self.rootDecl(name) orelse return .unknown;
+            if (tree.fullVarDecl(decl)) |var_decl| {
+                if (var_decl.ast.type_node.unwrap()) |t| return self.typeOfDepth(t, depth + 1);
+                const init = var_decl.ast.init_node.unwrap() orelse return .unknown;
+                if (isContainerDeclTag(tree.nodeTag(init))) return .user_type;
+                if (self.isThisBuiltin(init)) return .user_type;
+                return self.typeOfDepth(init, depth + 1);
+            }
+            var buf: [1]Ast.Node.Index = undefined;
+            const proto = tree.fullFnProto(&buf, decl) orelse return .unknown;
+            const ret = proto.ast.return_type.unwrap() orelse return .other;
+            if (tree.nodeTag(ret) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(ret)), "type")) return .type_type;
+            return .other;
+        },
+        .field_access => {
+            const data = tree.nodeData(node).node_and_token;
+            const field = tree.tokenSlice(data[1]);
+            switch (self.typeOfDepth(data[0], depth + 1)) {
+                .std_type => |path| return .{ .std_type = if (path.len == 0) field else self.stdTypePath(node) },
+                // ziglint's quirk: a member of one of the file's types is
+                // a std path, which names nothing.
+                .user_type => return .{ .std_type = self.stdTypePath(node) },
+                .unknown => if (tree.nodeTag(data[0]) == .identifier) {
+                    const lhs = tree.tokenSlice(tree.nodeMainToken(data[0]));
+                    if (std.mem.eql(u8, lhs, "std") or self.isStdImportName(lhs)) return .{ .std_type = field };
+                },
+                else => {},
+            }
+            return .unknown;
+        },
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            var buf: [2]Ast.Node.Index = undefined;
+            const params = tree.builtinCallParams(&buf, node) orelse return .unknown;
+            if (std.mem.eql(u8, name, "@import")) {
+                if (params.len == 0) return .unknown;
+                const raw = tree.tokenSlice(tree.nodeMainToken(params[0]));
+                if (raw.len < 2 or raw[0] != '"') return .unknown;
+                const path = raw[1 .. raw.len - 1];
+                if (std.mem.eql(u8, path, "std")) return .{ .std_type = "" };
+                if (std.mem.eql(u8, path, "builtin")) return .{ .std_type = "builtin" };
+                // The file must exist for the program to compile.
+                if (std.mem.endsWith(u8, path, ".zig")) return .module;
+            }
+            if (isTypeReturningBuiltin(name)) return .type_type;
+            if (std.mem.eql(u8, name, "@as") and params.len > 0) return self.typeOfDepth(params[0], depth + 1);
+            return .unknown;
+        },
+        .call_one, .call_one_comma, .call, .call_comma => {
+            var buf: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buf, node) orelse return .unknown;
+            if (tree.nodeTag(call.ast.fn_expr) != .identifier) return .unknown;
+            // ziglint's `resolveCallByName`: the first function of the name.
+            const decl = self.rootFn(tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr))) orelse return .unknown;
+            var proto_buf: [1]Ast.Node.Index = undefined;
+            const proto = tree.fullFnProto(&proto_buf, decl) orelse return .unknown;
+            const ret = proto.ast.return_type.unwrap() orelse return .unknown;
+            return self.typeOfDepth(ret, depth + 1);
+        },
+        .error_set_decl, .merge_error_sets, .number_literal, .string_literal, .multiline_string_literal, .char_literal, .unreachable_literal => return .other,
+        .optional_type, .error_union, .array_type, .array_type_sentinel, .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => return .other,
+        .fn_decl => return .other,
+        else => return .unknown,
     }
-    const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
-    if (isTypeReturningBuiltin(name)) return true;
-    if (!std.mem.eql(u8, name, "@import")) return false;
+}
+
+/// ziglint's `buildStdTypePath`: the path of field access `node` after the
+/// name of std (`fs.File` in `std.fs.File`), or its last name.
+fn stdTypePath(self: *Linter, node: Ast.Node.Index) []const u8 {
+    const tree = &self.tree;
+    var root = node;
+    while (tree.nodeTag(root) == .field_access) root = tree.nodeData(root).node_and_token[0];
+    if (tree.nodeTag(root) == .identifier) {
+        const name = tree.tokenSlice(tree.nodeMainToken(root));
+        if (!std.mem.eql(u8, name, "std") and !self.isStdImportName(name)) return "";
+    }
+    // The first field after the std name.
+    var start = node;
+    while (tree.nodeTag(start) == .field_access) {
+        const lhs = tree.nodeData(start).node_and_token[0];
+        if (tree.nodeTag(lhs) == .identifier) {
+            const name = tree.tokenSlice(tree.nodeMainToken(lhs));
+            if (std.mem.eql(u8, name, "std") or self.isStdImportName(name)) break;
+        }
+        start = lhs;
+    }
+    const last = tree.nodeData(node).node_and_token[1];
+    if (tree.nodeTag(start) != .field_access) return tree.tokenSlice(last);
+    const from = tree.tokenStart(tree.nodeData(start).node_and_token[1]);
+    return tree.source[from .. tree.tokenStart(last) + tree.tokenSlice(last).len];
+}
+
+/// Whether `name` is a root declaration of `@import("std")` (ziglint's
+/// `isStdImportAlias`).
+fn isStdImportName(self: *Linter, name: []const u8) bool {
+    const tree = &self.tree;
+    const var_decl = tree.fullVarDecl(self.rootDecl(name) orelse return false) orelse return false;
+    const init = var_decl.ast.init_node.unwrap() orelse return false;
+    if (tree.nodeTag(init) != .builtin_call_two and tree.nodeTag(init) != .builtin_call_two_comma) return false;
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(init)), "@import")) return false;
     var buf: [2]Ast.Node.Index = undefined;
-    const params = self.tree.builtinCallParams(&buf, node) orelse return false;
-    if (params.len == 0) return false;
-    const raw = self.tree.tokenSlice(self.tree.nodeMainToken(params[0]));
-    if (raw.len < 2 or raw[0] != '"') return false;
-    const path = raw[1 .. raw.len - 1];
-    return std.mem.eql(u8, path, "std") or std.mem.eql(u8, path, "builtin") or std.mem.endsWith(u8, path, ".zig");
+    const params = tree.builtinCallParams(&buf, init) orelse return false;
+    return params.len != 0 and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(params[0])), "\"std\"");
+}
+
+/// The first root variable or function declaration named `name`, as
+/// ziglint's resolver finds it by walking them in order.
+fn rootDecl(self: *Linter, name: []const u8) ?Ast.Node.Index {
+    if (!self.root_decls_built) {
+        self.root_decls_built = true;
+        const tree = &self.tree;
+        for (tree.rootDecls()) |decl| {
+            const decl_name = if (tree.fullVarDecl(decl)) |var_decl| tree.tokenSlice(var_decl.ast.mut_token + 1) else if (tree.nodeTag(decl) == .fn_decl) fn_name: {
+                var buf: [1]Ast.Node.Index = undefined;
+                const proto = tree.fullFnProto(&buf, decl) orelse continue;
+                break :fn_name tree.tokenSlice(proto.name_token orelse continue);
+            } else continue;
+            const gop = self.root_decls.getOrPut(self.allocator, decl_name) catch return null;
+            if (!gop.found_existing) gop.value_ptr.* = decl;
+        }
+    }
+    return self.root_decls.get(name);
+}
+
+/// The first root function named `name`; a variable of the name before it
+/// does not hide it, as in ziglint's `resolveCallByName`.
+fn rootFn(self: *Linter, name: []const u8) ?Ast.Node.Index {
+    const decl = self.rootDecl(name) orelse return null;
+    if (self.tree.nodeTag(decl) == .fn_decl) return decl;
+    // Rare: a variable and a function of one name do not compile.
+    for (self.tree.rootDecls()) |d| {
+        if (self.tree.nodeTag(d) != .fn_decl) continue;
+        var buf: [1]Ast.Node.Index = undefined;
+        const proto = self.tree.fullFnProto(&buf, d) orelse continue;
+        const name_token = proto.name_token orelse continue;
+        if (std.mem.eql(u8, self.tree.tokenSlice(name_token), name)) return d;
+    }
+    return null;
+}
+
+fn isThisBuiltin(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
+    if (tag != .builtin_call_two and tag != .builtin_call_two_comma) return false;
+    return std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(node)), "@This");
+}
+
+fn isContainerDeclTag(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        => true,
+        else => false,
+    };
 }
 
 fn isPublicDecl(self: *Linter, node: Ast.Node.Index) bool {
@@ -1317,6 +1504,10 @@ fn classifyParam(self: *Linter, param: Ast.full.FnProto.Param) ParamKind {
 fn isReceiverParam(self: *Linter, param: Ast.full.FnProto.Param) bool {
     const type_node = param.type_expr orelse return false;
 
+    // A container of this file, as far as the file answers ziglint's
+    // resolver.
+    if (self.typeOf(self.unwrapPointerType(type_node)) == .user_type) return true;
+
     // Fallback: check for @This() or Self
     return self.typeRefersToThis(type_node);
 }
@@ -1357,6 +1548,13 @@ fn classifyTypeNode(self: *Linter, type_node: Ast.Node.Index) ParamKind {
     if (self.tree.nodeTag(type_node) == .identifier) {
         const type_name = self.tree.tokenSlice(self.tree.nodeMainToken(type_node));
         if (std.mem.eql(u8, type_name, "type")) return .type_param;
+    }
+
+    // Use TypeResolver for semantic type resolution (handles aliases), as
+    // far as the file answers it.
+    switch (self.typeOf(type_node)) {
+        .std_type => |path| return self.classifyPath(path),
+        else => {},
     }
 
     // Fallback: check for field access chains like std.mem.Allocator or std.Io
@@ -3282,6 +3480,11 @@ fn isPrimitiveType(name: []const u8) bool {
 
 fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
     const init_node = var_decl.ast.init_node.unwrap() orelse return false;
+
+    // With a module graph, ask the resolver instead of guessing from callee
+    // name shape (as far as the file answers it): a camelCase type-fn
+    // still yields a type. Only a positive answer counts.
+    if (self.typeOf(init_node) == .type_type) return true;
 
     const tag = self.tree.nodeTag(init_node);
     return switch (tag) {
@@ -5616,6 +5819,103 @@ test "Z023: io param after runtime value is ok" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z023));
+}
+
+// ziglint's semantic-mode tests whose resolver answers come from the file
+// alone (`typeOf`), ported with `TestLinter` for its module graph.
+
+test "Z023: argument order - aliased Allocator" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Alloc = std.mem.Allocator;
+        \\fn bad(alloc: Alloc, comptime size: usize) void {
+        \\    _ = .{ alloc, size };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: argument order - aliased Io" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const MyIo = std.Io;
+        \\fn bad(io: MyIo, gpa: std.mem.Allocator) void {
+        \\    _ = .{ io, gpa };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: receiver param with struct name is ok (semantic)" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Foo = struct {
+        \\    pub fn bar(self: *Foo, alloc: std.mem.Allocator) void {
+        \\        _ = .{ self, alloc };
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: file-as-struct receiver is ok (semantic)" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Terminal = @This();
+        \\pub fn deinit(self: *Terminal, alloc: std.mem.Allocator) void {
+        \\    _ = .{ self, alloc };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+// bs: ziglint's resolver takes a first parameter of one of the file's types
+// for a receiver, even a comptime one (baskingspot/metrics, storage.zig).
+test "Z023: first param of a file's type is skipped as a receiver" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\pub const Mode = enum { local, atomic };
+        \\pub fn Storage(comptime mode: Mode, comptime T: type) type {
+        \\    _ = mode;
+        \\    return T;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z023));
+}
+
+// bs: and its answer for a call of one of the file's functions that
+// returns `type`, whatever the function's name.
+test "Z006: resolver sees a file's camelCase type-fn call as type alias" {
+    var linter: TestLinter = .init(std.testing.allocator,
+        \\fn withContext(comptime T: type) type {
+        \\    return T;
+        \\}
+        \\const ConnLog = withContext(u8);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
 }
 
 test "Z024: detect line exceeding 120 bytes" {

@@ -7,7 +7,7 @@ and in `src/lint/` as follows. `zig build test` runs all of them.
 
 | ziglint | Tests | In bs |
 |---|---:|---|
-| `src/Linter.zig` | 305 | 276 ported unchanged as unit tests at the end of `src/lint/Linter.zig`, through `TestLinter`, which gives them ziglint's API over the syntax pass. 28 test ziglint's semantic mode: the 12 of Z011 are adapted as the case `deprecated/` (below), but for one that does nothing on Zig 0.16 and later; the 9 of Z010, Z027 and Z029 as the case `sema/`; 7 wait for the hybrid rules. 1 tests a helper bs does not have (`getContainerMembers: members outlive the call`). |
+| `src/Linter.zig` | 305 | 276 ported unchanged as unit tests at the end of `src/lint/Linter.zig`, through `TestLinter`, which gives them ziglint's API over the syntax pass. 28 test ziglint's semantic mode: the 12 of Z011 are adapted as the case `deprecated/` (below), but for one that does nothing on Zig 0.16 and later; the 9 of Z010, Z027 and Z029 as the case `sema/`; 4 of Z023, whose resolver answers come from the file alone, are ported as unit tests; 3 need another file's answers (below). 1 tests a helper bs does not have (`getContainerMembers: members outlive the call`). |
 | `src/rules.zig` | 11 | Ported unchanged, in `src/lint/rules.zig`. |
 | `src/doc_tests.zig` | 2 | `doc tests` is ported in `src/lint/Linter.zig`: 144 of the 146 `zig` blocks of `docs/rules/*.md` (copied to `src/lint/docs/` with ziglint's license) run; the Z011 example is in the case `deprecated/`; the Z027 one does not compile in Zig 0.17.1 (below). The `compile-test` probes, which check that a documented replacement compiles, and `parse compile test probe` are not ported. |
 | `src/Config.zig` | 6 | Replaced by the cases here: the defaults (`rules.zig`), `max_length` and rule switches (`switches/`, `short_lines/`), `paths` (`paths/`). `runtime rule check` and `set rule enabled` test ziglint's `Config` API, which bs does not have. A config error is `bad_config/`. |
@@ -83,15 +83,21 @@ set's `E.y`, and `Defaults.point` returned as a `Point`, whose suggested
 types differ between instances (`widen`); and nothing in an unreferenced
 function.
 
-## Waiting for the hybrid rules
+## The hybrid rules
 
-These ziglint tests build a module graph and need its `TypeResolver`.
-They become cases with the type-aware parts of Z006, Z012 and Z023:
+The syntax pass answers the hybrid rules' type questions as ziglint's
+resolver does where the file alone answers them (`Linter.typeOf`), so
+ziglint's `Z023: argument order - aliased Allocator`, `- aliased Io`,
+`receiver param with struct name is ok (semantic)` and `file-as-struct
+receiver is ok (semantic)` run as unit tests. These three need what
+another file answers, which the syntax pass, keyed by one file's
+contents, cannot read; Sema's verdicts would answer them (design A in
+docs/slop/ziglint-in-bs.md), built when the parity set shows such a
+difference in code bs builds:
 
-- `Z012: member-of-module type alias is imported, not private`
-- `Z012: bare module-name import falls back to syntax`
-- `Z006: resolver sees camelCase type-fn call as type alias`
-- `Z023: argument order - aliased Allocator`
-- `Z023: argument order - aliased Io`
-- `Z023: receiver param with struct name is ok (semantic)`
-- `Z023: file-as-struct receiver is ok (semantic)`
+- `Z012: member-of-module type alias is imported, not private` (passes by
+  the syntactic fallback)
+- `Z012: bare module-name import falls back to syntax` (passes by the
+  syntactic fallback)
+- `Z006: resolver sees camelCase type-fn call as type alias` (the type
+  function is in another file; bs reports Z006)

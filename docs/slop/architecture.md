@@ -9919,13 +9919,16 @@ owner's decisions are in docs/slop/ziglint-in-bs.md. What is built:
   unknown rule ID included, is an `error[lint-config]` at its location.
 - **The syntax pass** (`src/lint/Linter.zig`) is ziglint's `Linter`,
   ported with its copyright notice, in its simple mode (no
-  `TypeResolver`): every rule but Z003 (bs's parse error), Z011 and Z027.
+  `TypeResolver`): every rule but Z003 (bs's parse error), Z011 and Z027,
+  and but the forms Sema answers (Z010, Z029's call arguments, Z034).
   Where ziglint's resolver answers from the file alone, the pass answers
-  the same: an `@import` of std, builtin or a `.zig` file and a builtin
-  that returns a type are types (Z012, Z015), and a root error set is
-  one (Z010). The other resolver answers are Sema's to give (later
-  work), so the hybrid rules (Z006, Z010, Z012, Z015, Z023, Z032, Z033,
-  Z034) take ziglint's syntactic fallback for now. It runs every rule,
+  the same (`Linter.typeOf`, a port of `TypeResolver.resolveNodeType`
+  limited to the file: its root declarations by name, std's paths through
+  `@import("std")`, its functions' return types, builtins), for the
+  hybrid rules' type questions (Z006, Z012, Z015, Z023, Z032, Z033). What
+  another file would answer (a member of an imported `.zig` file) takes
+  ziglint's syntactic fallback; on the parity set
+  (`tools/lint/parity.py --corpus`) that leaves no difference. It runs every rule,
   whatever the config, and applies `// ziglint-ignore:` comments, so its
   findings depend only on the file's contents and base name. A covered
   file the build lowers is linted in the lowering worker, from the same
