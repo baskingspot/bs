@@ -20,6 +20,11 @@ release-build TARGET DIR:
 test *ARGS:
     zig build test --summary failures {{ ARGS }}
 
+[doc("Some of the parts of `just test`, as CI's test jobs run them: test-unit, test-run, test-edit, test-cache, test-link, test-diag (`zig build --help` describes each)")]
+[group("test")]
+test-steps +STEPS:
+    zig build {{ STEPS }} --summary failures
+
 [doc("The conformance measure: upstream's test/behavior compiled by bs (tools/conformance/run.py)")]
 [group("test")]
 conformance *ARGS:
