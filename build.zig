@@ -174,6 +174,18 @@ pub fn build(b: *std.Build) void {
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
         test_step.dependOn(&run.step);
     }
+    // A Zig 0.16 program means what it means in 0.16: test/language/zig016.sh.
+    {
+        const z16 = b.addSystemCommand(&.{"sh"});
+        z16.setName("bs Zig 0.16 meanings");
+        z16.addFileArg(b.path("test/language/zig016.sh"));
+        z16.addArtifactArg2(exe, .{});
+        z16.addFileArg(b.path("test/language/zig016.zig"));
+        _ = z16.addOutputDirectoryArg2("work", .{});
+        z16.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &z16.step, 5);
+        test_step.dependOn(&z16.step);
+    }
     // Each language's caches are its own: test/language/keys.sh.
     {
         const keys = b.addSystemCommand(&.{"sh"});
