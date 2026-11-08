@@ -81,6 +81,22 @@ pub fn build(b: *std.Build) void {
     exe.stack_size = 60 << 20;
     b.installArtifact(exe);
 
+    // The bs the tests run. A Debug build on x86_64 runs a ReleaseSafe bs
+    // from zig's own backend instead, as fast to build: the same safety
+    // and leak checks, in a third to a half less CPU time per compile (a
+    // Debug bs's SafeAllocator takes its memory from page_allocator).
+    const test_bs = if (optimize == .debug and target.result.cpu.arch == .x86_64 and !sanitize_thread) test_bs: {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        });
+        for (exe_mod.import_table.keys(), exe_mod.import_table.values()) |name, m| mod.addImport(name, m);
+        const t = b.addExecutable(.{ .name = "bs", .root_module = mod, .use_llvm = false });
+        t.stack_size = exe.stack_size;
+        break :test_bs t;
+    } else exe;
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
@@ -104,7 +120,7 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     // After bs, as one of its users (`spreadBsUsers`), so that it does
     // not hold a worker when bs's users start.
-    unit_tests.step.dependOn(&exe.step);
+    unit_tests.step.dependOn(&test_bs.step);
     takes(b, &unit_tests.step, 7);
     // `test` runs every test. Its parts are steps of their own, which CI
     // runs as parallel jobs (.github/ci.yaml, `just test-steps`).
@@ -124,20 +140,20 @@ pub fn build(b: *std.Build) void {
     // A global cache holding the ZIR of the std files that every build
     // lowers, which the tests that need an empty global cache start from
     // instead of spending 5 s of CPU each on AstGen.
-    const zir = b.addRunArtifact(exe);
+    const zir = b.addRunArtifact(test_bs);
     zir.setName("bs: global cache with std's ZIR");
     zir.addArgs(&.{ "build-exe", "-fno-emit-bin", "-target", "x86_64-linux" });
     zir.addFileArg(b.path("test/run/corpus.zig"));
     zir.addArg("--global-cache-dir");
     const std_zir = zir.addOutputDirectoryArg2("global", .{});
-    addRunTests(b, exe, run_step, edit_step, upstream_step, std_zir);
-    addObjAndRunTests(b, exe, link_step, edit_step, cache_step, std_zir);
-    const translate_c = addLinkInputTests(b, exe, link_step, cache_step, std_zir);
+    addRunTests(b, test_bs, run_step, edit_step, upstream_step, std_zir);
+    addObjAndRunTests(b, test_bs, link_step, edit_step, cache_step, std_zir);
+    const translate_c = addLinkInputTests(b, test_bs, link_step, cache_step, std_zir);
     if (b.graph.host.result.os.tag == .macos) {
         // On macOS, libc's headers are the SDK's, frameworks included, as
         // upstream's (`xcrun --show-sdk-path`); the lib directory has no
         // frameworks. bs links translate-c itself here, a large program.
-        const tc_sdk = b.addRunArtifact(exe);
+        const tc_sdk = b.addRunArtifact(test_bs);
         tc_sdk.setName("bs translate-c takes libc's headers and frameworks from the macOS SDK");
         tc_sdk.addArg("translate-c");
         tc_sdk.addFileArg(b.path("test/link_input/tc_sdk/s.h"));
@@ -148,7 +164,7 @@ pub fn build(b: *std.Build) void {
         const rec = b.addSystemCommand(&.{"sh"});
         rec.setName("bs cache and inputs record on aarch64-macos");
         rec.addFileArg(b.path("test/obj/macos_cache.sh"));
-        rec.addArtifactArg2(exe, .{});
+        rec.addArtifactArg2(test_bs, .{});
         _ = rec.addOutputDirectoryArg2("work", .{});
         rec.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &rec.step, 10);
@@ -158,7 +174,7 @@ pub fn build(b: *std.Build) void {
         const inputs = b.addSystemCommand(&.{"sh"});
         inputs.setName("bs build-exe with link inputs, cached, on aarch64-macos");
         inputs.addFileArg(b.path("test/link_input/macos_cache.sh"));
-        inputs.addArtifactArg2(exe, .{});
+        inputs.addArtifactArg2(test_bs, .{});
         inputs.addArg(upstreamZig(b));
         inputs.addDirectoryArg2(b.path("test/link_input"), .{});
         _ = inputs.addOutputDirectoryArg2("work", .{});
@@ -166,7 +182,7 @@ pub fn build(b: *std.Build) void {
         takes(b, &inputs.step, 30);
         cache_step.dependOn(&inputs.step);
     }
-    addDiagTests(b, exe, diag_step, edit_step, upstream_step, std_zir);
+    addDiagTests(b, test_bs, diag_step, edit_step, upstream_step, std_zir);
     // The language a compilation is in (src/language.zig): a version bs
     // does not compile is an error, at the build.zig.zon's field or the
     // flag.
@@ -174,7 +190,7 @@ pub fn build(b: *std.Build) void {
         .{ &.{}, "build.zig.zon:5:28: minimum_zig_version '0.15.2' is not supported: bs compiles Zig 0.16 and 0.17" },
         .{ &.{ "--zig-version", "0.18" }, "--zig-version '0.18': bs compiles Zig 0.16 and 0.17" },
     }) |case| {
-        const run = b.addRunArtifact(exe);
+        const run = b.addRunArtifact(test_bs);
         run.setName(b.fmt("bs refuses {s}", .{if (case[0].len == 0) "an unsupported minimum_zig_version" else "an unsupported --zig-version"}));
         run.setEnvironmentVariable("BS_ZON_SELECTS", "1");
         run.addArgs(&.{ "build-exe", "-fno-emit-bin" });
@@ -189,7 +205,7 @@ pub fn build(b: *std.Build) void {
         const z16 = b.addSystemCommand(&.{"sh"});
         z16.setName("bs Zig 0.16 meanings");
         z16.addFileArg(b.path("test/language/zig016.sh"));
-        z16.addArtifactArg2(exe, .{});
+        z16.addArtifactArg2(test_bs, .{});
         z16.addFileArg(b.path("test/language/zig016.zig"));
         _ = z16.addOutputDirectoryArg2("work", .{});
         z16.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -201,16 +217,16 @@ pub fn build(b: *std.Build) void {
         const keys = b.addSystemCommand(&.{"sh"});
         keys.setName("bs language cache keys");
         keys.addFileArg(b.path("test/language/keys.sh"));
-        keys.addArtifactArg2(exe, .{});
+        keys.addArtifactArg2(test_bs, .{});
         keys.addFileArg(b.path("bench/workloads/hello/hello.zig"));
         _ = keys.addOutputDirectoryArg2("work", .{});
         keys.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &keys.step, 15);
         cache_step.dependOn(&keys.step);
     }
-    addLintTests(b, exe, diag_step, cache_step, upstream_step, std_zir);
-    const build_test_step = addBuildTest(b, exe, build_web_wasm, translate_c);
-    spreadBsUsers(b, &exe.step, &zir.step, &(test_parts ++ [_]*std.Build.Step{build_test_step}));
+    addLintTests(b, test_bs, diag_step, cache_step, upstream_step, std_zir);
+    const build_test_step = addBuildTest(b, test_bs, build_web_wasm, translate_c);
+    spreadBsUsers(b, &test_bs.step, &zir.step, &(test_parts ++ [_]*std.Build.Step{build_test_step}));
 
     // Always ReleaseFast: a Debug build of bs says nothing about its speed.
     const bench_link = b.addExecutable(.{ .name = "bench-link", .root_module = b.createModule(.{
@@ -1882,10 +1898,13 @@ fn addBuildTest(b: *std.Build, bs: *std.Build.Step.Compile, build_web_wasm: std.
 /// Instead each step that runs bs waits for one of `-j` gates, which wait
 /// for bs and then `first`, so that each gate's thread runs its share,
 /// dealt heaviest first to the gate with the least work so far by `takes`
-/// (the runner shuffles the order each gate runs them in). Their waits on bs and `first` move to the gate: the thread
-/// that finished either would run the step otherwise. (A step that waits
-/// for another of them, as test/build's parts do, runs on that one's
-/// thread.)
+/// (the runner shuffles the order each gate runs them in). The gate is the
+/// last of a step's dependencies to finish, so its thread runs the step,
+/// not the thread that finished bs or `first`. bs stays a direct
+/// dependency: the build runner's configuration numbers steps breadth
+/// first, and a step's arguments need the artifact it runs numbered by
+/// then. (A step that waits for another of them, as test/build's parts
+/// do, runs on that one's thread.)
 ///
 /// Each of them also runs bs with one CodeGen worker beside the Sema
 /// thread (`BS_THREADS=2`) unless it sets its own count: the steps keep
@@ -1931,9 +1950,7 @@ fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roo
                 if (run.getEnvMap().get("BS_THREADS") == null) run.setEnvironmentVariable("BS_THREADS", "2");
             }
             const least = std.mem.findMin(usize, loads);
-            for (s.dependencies.items) |*d| {
-                if (d.* == bs or d.* == first) d.* = gates[least];
-            }
+            s.dependOn(gates[least]);
             loads[least] += stepSeconds(s);
         }
     }
