@@ -49,29 +49,6 @@ lint:
 ziglint:
     ziglint
 
-[doc("bs's ziglint findings against ziglint's (tools/lint/parity.py), with bs at zig-out/bin/bs: on this tree, on 84c75e56 (a tree with findings of every kind), and on the baskingspot parity set. Exits nonzero on a `bug` difference or a `build-failed` build")]
-[group("lint")]
-lint-parity:
-    #!/usr/bin/env bash
-    set -uo pipefail
-    zig build || exit 1
-    bs=$PWD/zig-out/bin/bs
-    status=0
-    echo "== this tree"
-    python3 tools/lint/parity.py --bs "$bs" -- build --prefix .zig-cache/lint-parity/out || status=1
-    echo "== 84c75e56"
-    # CI's checkout is shallow, and git fetches only a full SHA.
-    sha=84c75e5642202b81b30b1742aad79fff40972826
-    old=.zig-cache/lint-parity/84c75e56
-    if [ ! -d "$old" ]; then
-        git cat-file -e "$sha^{commit}" 2>/dev/null || git fetch --quiet --depth=1 origin "$sha" || exit 1
-        git worktree add --quiet --detach "$old" "$sha" || exit 1
-    fi
-    python3 tools/lint/parity.py --bs "$bs" --tree "$old" -- build --prefix "$PWD/.zig-cache/lint-parity/out-84c" || status=1
-    echo "== the parity set"
-    python3 tools/lint/parity.py --bs "$bs" --corpus || status=1
-    exit $status
-
 [doc("ziglint's rules enforced by bs: bs builds every program in the files .ziglint.zon covers (not emitting binaries where it can), so a finding fails the recipe. bench/realworld/vaxis_render.zig (needs libvaxis) and bench/workloads/vaxis-build (its own build root, where bs finds no config) stay unchecked")]
 [group("lint")]
 lint-bs:

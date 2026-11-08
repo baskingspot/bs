@@ -9974,8 +9974,8 @@ owner's decisions are in docs/slop/ziglint-in-bs.md. What is built:
   `@import("std")`, its functions' return types, builtins), for the
   hybrid rules' type questions (Z006, Z012, Z015, Z023, Z032, Z033). What
   another file would answer (a member of an imported `.zig` file) takes
-  ziglint's syntactic fallback; on the parity set
-  (`tools/lint/parity.py --corpus`) that leaves no difference. It runs every rule,
+  ziglint's syntactic fallback; on the projects bs was compared with
+  ziglint on, until 2026-11-08, that left no difference. It runs every rule,
   whatever the config, and applies `// ziglint-ignore:` comments, so its
   findings depend only on the file's contents and base name. A covered
   file the build lowers is linted in the lowering worker, from the same

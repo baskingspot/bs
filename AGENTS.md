@@ -117,11 +117,10 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   update it in the same change when a boundary moves.
 - Time bs built with `-Doptimize=ReleaseFast`; a Debug build of bs is about
   10x slower and says nothing about bs's speed.
-- The ziglint rules have their own conformance measure: the ported
-  ziglint suite in `test/lint/` and `tools/lint/parity.py` against
-  ziglint 0.8.1 on bs's tree and the corpus's configured projects. Keep
-  both visible. A ziglint release with new rules is ported deliberately,
-  with its tests, by bumping the oracle version.
+- The ziglint rules have their own conformance measure: ziglint 0.8.1's
+  test suite, ported in `test/lint/`. Keep it visible. A ziglint release
+  with new rules is ported deliberately, with its tests, by bumping the
+  oracle version.
 - Linux work runs in orbs. Verify aarch64-macos output on a real Mac (a Mac
   satellite for this project), not by inspection alone.
 - The justfile is the command interface: `just test`, `just lint`,

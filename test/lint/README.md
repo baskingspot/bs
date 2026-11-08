@@ -3,7 +3,10 @@
 ziglint 0.8.1 (rockorager/ziglint f6a3fc2) is the oracle for the rules
 bs enforces with a project's `.ziglint.zon` (docs/slop/ziglint-in-bs.md).
 Its 372 tests, and the 146 examples in its rules' docs, are ported here
-and in `src/lint/` as follows. `zig build test` runs all of them.
+and in `src/lint/` as follows. `zig build test` runs all of them. This
+suite is the rules' conformance measure (AGENTS.md). Parity with
+ziglint's findings on real trees was measured until 2026-11-08, then
+dropped for this suite.
 
 | ziglint | Tests | In bs |
 |---|---:|---|
@@ -92,8 +95,8 @@ ziglint's `Z023: argument order - aliased Allocator`, `- aliased Io`,
 receiver is ok (semantic)` run as unit tests. These three need what
 another file answers, which the syntax pass, keyed by one file's
 contents, cannot read; Sema's verdicts would answer them (design A in
-docs/slop/ziglint-in-bs.md), built when the parity set shows such a
-difference in code bs builds:
+docs/slop/ziglint-in-bs.md), not built: comparing with ziglint on real
+projects until 2026-11-08 showed no such difference in code bs builds:
 
 - `Z012: member-of-module type alias is imported, not private` (passes by
   the syntactic fallback)

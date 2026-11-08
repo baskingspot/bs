@@ -15,7 +15,7 @@ cover, never to std or to dependencies. A program without a config
 compiles exactly as upstream accepts it.
 
 This note says where each rule runs, how the config is found and enters
-the cache, what a finding looks like, how parity with ziglint is
+the cache, what a finding looks like, how conformance with ziglint is
 measured, what it may cost, and what changes in AGENTS.md and in bs's CI.
 The owner's decisions on the questions it raised are at the end.
 
@@ -453,7 +453,7 @@ src/link/Elf.zig:88:5: error[style, Z017]: avoid try in return; hoist it to pres
 ## 4. The conformance measure
 
 ziglint 0.8.1 is the oracle for these rules, as upstream zig is for the
-language. Three measures, kept visible like the behavior share:
+language. The measure, kept visible like the behavior share:
 
 **The suite.** ziglint's tests, ported to `test/lint/`, one case per
 test. Each case is a source file with a `.ziglint.zon` and bs's expected
@@ -482,41 +482,13 @@ stderr, run by `zig build test` the way `test/diag` runs.
   - The adapted cases are listed in the suite's README with ziglint's
     original test name.
 
-**Identical findings on real trees.** `tools/lint/parity.py` runs
-ziglint 0.8.1 and bs on a tree, matches findings by rule, file and line,
-and classifies every difference:
-
-- `sema-type`: Sema's real types. bs is more precise, by the per-rule
-  reasons above. Logged as improvements.
-- `unanalyzed`: code bs did not analyze.
-- `unreached`: files no compilation reaches.
-- `ziglint-walk`: ziglint's walk does not descend there, as for a switch
-  prong or a return expression; its own comments name the gaps.
-- `bug`: anything else, to be fixed.
-
-A tree or project whose build fails for another reason (an error that is
-not a finding) is `build-failed`, with its first error: the findings of
-what it did not compile would otherwise read as matched or unreached.
-
-The bar is zero `bug` and zero `build-failed`, with every other class counted in the results
-file and the improvements spot-checked by hand. The trees:
-
-- **bs's own tree.** On main it has 0 findings (ziglint 0.8.1, 6.5 s,
-  with 93 ignore comments), which tests the ignores and little else. So
-  the tree as it was before the cleanup, main 84c75e56, also runs: 1269
-  findings from 0.8.1 with that tree's own `.ziglint.zon` (measured
-  2026-11-07).
-- **The corpus.** None of the corpus's 115 projects (tools/corpus) has a
-  `.ziglint.zon` at its pinned commit (checked 2026-11-07 for each
-  project's commit). 23 baskingspot repositories have one: protobuf, tls,
-  quic, http, websocket, image, prometheus, utf, compress, encoding, text,
-  aho-corasick, bencode, json5, toml, cli, testingx, stdx, fastmem,
-  docgen, html, zigdoc-poc, incubate-probe. The proposal is to add those
-  that build with 0.17.1 to the corpus, pinned like the others, as the
-  parity set. Decision 6.
-- **Wider precision, not a gate.** A synthesized default config
-  (`paths = .{"src"}`, every rule on) over every corpus project. It
-  reports `bug` differences across far more code than the org writes.
+**Parity on real trees** was measured until 2026-11-08, then dropped
+for the ported suite (owner, 2026-11-08). `tools/lint/parity.py`
+compared bs's findings with ziglint's on bs's tree, on main 84c75e56 (the
+tree before its ziglint cleanup, 1269 findings) and on 18 baskingspot
+projects with a `.ziglint.zon`, and classified every difference. At the
+end it showed no difference it could not explain ("Built so far", 2 to
+6, has the numbers).
 
 ## 5. What it may cost
 
@@ -550,14 +522,11 @@ file and the improvements spot-checked by hand. The trees:
 - `bench/bench.py` runs A/B on the same binary, with the config present
   and with it renamed away:
   - bs's own tree under `bs build` (cold and edit);
-  - the baskingspot parity set (cold and edit);
   - the existing hello, vaxis and zig workloads, which have no config
     and must show no change.
   - Median of 10, and the spread is reported.
 - Callgrind instruction counts on the same builds give an exact A/B for
   the no-config case. It must be identical except for the discovery stats.
-- `tools/corpus/run.py --samples 3` on the parity set, for the edit
-  builds the corpus already defines.
 - A unit test checks that a build without a config opens no `.lint` file
   and runs no hook. A counter in `BS_TIMING` must read zero.
 
@@ -589,13 +558,13 @@ Proposed:
 > the same, and upstream's std and `test/behavior` must still compile,
 > since they are the conformance measure.
 
-A new bullet under Development:
+A new bullet under Development (as amended when parity was dropped,
+2026-11-08):
 
-> The ziglint rules have their own conformance measure: the ported
-> ziglint suite in `test/lint/` and `tools/lint/parity.py` against
-> ziglint 0.8.1 on bs's tree and the corpus's configured projects. Keep
-> both visible. A ziglint release with new rules is ported deliberately,
-> with its tests, by bumping the oracle version.
+> The ziglint rules have their own conformance measure: ziglint 0.8.1's
+> test suite, ported in `test/lint/`. Keep it visible. A ziglint release
+> with new rules is ported deliberately, with its tests, by bumping the
+> oracle version.
 
 Two passages of `docs/slop/architecture.md` change with it:
 
@@ -606,28 +575,14 @@ Two passages of `docs/slop/architecture.md` change with it:
 
 ## 7. bs's CI ziglint job, and ziglint the tool
 
-**While bs is building toward parity.**
-- The `ziglint` CI job stays as it is. It is blocking once
-  `ci-block-ziglint` lands, running ziglint 0.8.1 from mattware.
-- A non-blocking `lint-parity` job runs `tools/lint/parity.py` on bs's
-  tree, on 84c75e56 and on the parity set, and reports the counts
-  (built: "Built so far", 6).
-
-**At parity.** Parity means:
-- the suite passes;
-- `parity.py` shows zero `bug` differences and no `build-failed` build on
-  bs's tree, on 84c75e56 and on the baskingspot set;
-- the cost budget holds.
-
-bs's own CI can then enforce the rules with bs. The test job builds bs
-with upstream zig, so the check needs a bs compile of bs's own programs:
-a `just lint-bs` recipe (built) that runs bs for every program the
-config's `paths` cover, with `-fno-emit-bin` where the build allows it.
-Two things make the ziglint job redundant:
-- that recipe blocks for a release cycle;
-- `parity.py` stays at zero `bug` on main for that cycle.
-
-The owner then decides whether to drop the ziglint job.
+- The `ziglint` CI job stays, blocking, running ziglint 0.8.1 from
+  mattware.
+- bs's own CI could enforce the rules with bs instead. The test job
+  builds bs with upstream zig, so that needs a bs compile of bs's own
+  programs: `just lint-bs` (built: "Built so far", 6) runs bs for every
+  program the config's `paths` cover, with `-fno-emit-bin` where the
+  build allows it. Whether it becomes a CI job, and whether the ziglint
+  job is then dropped, is the owner's call.
 
 **ziglint the tool** stays standalone. It is the owner's, it serves
 projects that do not build with bs, and it supports Zig 0.16, which bs
@@ -637,7 +592,7 @@ never will. bs tracks it:
   with it.
 
 Whether ziglint keeps growing rules independently, or freezes and points
-at bs, is the owner's call after parity. This note assumes neither.
+at bs, is the owner's call. This note assumes neither.
 
 ## Later work, not in the first version
 
@@ -646,8 +601,8 @@ at bs, is the owner's call after parity. This note assumes neither.
 - Z035 without the false positive on a shadowed path root.
 - Z016 recognizing `std.debug.assert` through any alias.
 
-Each of these is a deliberate difference from ziglint and would be
-logged in `parity.py` as `sema-type`.
+Each of these is a deliberate difference from ziglint; the suite's
+cases record it.
 
 ## The owner's decisions (2026-11-07)
 
@@ -663,12 +618,12 @@ logged in `parity.py` as `sema-type`.
    `error[style, Z026]`, `error[deprecated, Z011]`.
 6. **The parity corpus:** the baskingspot repositories that have a
    `.ziglint.zon` and build with 0.17.1 join `tools/corpus` as the
-   parity set.
+   parity set. (Dropped with parity, 2026-11-08.)
 7. **A config naming a rule bs does not know** fails the build.
 
 Still in force: no escape hatch, never lint std or dependencies, and
-the standalone ziglint job stays in CI until parity, when the owner
-decides whether to drop it.
+the standalone ziglint job stays in CI until the owner decides to drop
+it.
 
 ## Built so far
 
@@ -782,7 +737,7 @@ decides whether to drop it.
    - `just lint-parity` runs `parity.py` on bs's tree, on 84c75e56 (a
      worktree under `.zig-cache/lint-parity`, fetched when missing) and
      on the parity set (`-j2`; a wider run ran an orb out of memory), and
-     fails on a `bug` difference or a `build-failed` build (item 7). Locally (2026-11-08) it took 6
+     fails on a `bug` difference or a `build-failed` build. Locally (2026-11-08) it took 6
      minutes: this tree 0 findings on both sides, 84c75e56 1080 matched,
      0 bugs on all three.
    - `just lint-bs` builds every program in the config's paths with bs:
@@ -794,3 +749,7 @@ decides whether to drop it.
      bench/workloads/vaxis-build (its own build root, so no config is
      found). It is not a CI job yet; making it block is the owner's call
      after a release cycle.
+7. Branch `drop-parity` (2026-11-08): the owner dropped parity for the
+   ported suite. Removed `tools/lint/parity.py`, the `lint-parity` CI job
+   and recipe, the corpus's `lint` list, and OpenSSL in the dev shell,
+   which only the parity set needed. `just lint-bs` stays.

@@ -1,9 +1,7 @@
 # x86_64 Linux is first class: tests, lint, and ziglint block. The macOS lane
 # runs the same tests on a real Apple Silicon Mac and does not block until it
 # passes. The conformance measure shows its results and never blocks: it
-# reports a share, not a pass. lint-parity compares bs's ziglint rules with
-# ziglint's and does not block while bs works toward parity
-# (docs/slop/ziglint-in-bs.md, section 7).
+# reports a share, not a pass.
 jobs:
   - recipe: test
   - recipe: lint
@@ -11,8 +9,6 @@ jobs:
     runners: [macos-26]
     blocking: false
   - recipe: ziglint
-  - recipe: lint-parity
-    blocking: false
   - recipe: conformance
     runners: [ubuntu-26.04, macos-26]
     blocking: false
