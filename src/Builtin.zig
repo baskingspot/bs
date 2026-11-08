@@ -228,6 +228,81 @@ pub fn writeCMain(gpa: Allocator, io: Io, cache_dir: []const u8, no_panic: bool)
 }
 
 pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
+    const text = try generateNewest(gpa, opts);
+    return switch (opts.language) {
+        .zig_0_16 => zig016(gpa, text),
+        .zig_0_17 => text,
+    };
+}
+
+/// The builtin module of Zig 0.16 for the 0.17 text `newest`, which it
+/// frees, as upstream 0.16.0's `--show-builtin` prints it: `std.builtin`
+/// for `std.lang`, `mode` of type `OptimizeMode` for `optimize`, a doc
+/// comment on `zig_version`, none of 0.17's deprecation comments, and
+/// 0.16's default OS version ranges.
+fn zig016(gpa: Allocator, newest: []u8) Allocator.Error![]u8 {
+    defer gpa.free(newest);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var lines = std.mem.splitScalar(u8, newest, '\n');
+    // Where in the OS version range the line is: 0.17's default range
+    // becomes 0.16's (`std.Target.Os.VersionRange.default`), Linux
+    // 5.10...7.2 becoming 5.10...6.19 and macOS 15.0...27.0 becoming
+    // 13.0...15.6. Ranges given with `-target` stay.
+    var range: enum { none, linux_max_major, linux_max_minor, macos_min_major, macos_max_major, macos_max_minor } = .none;
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "/// Deprecated")) continue;
+        if (std.mem.eql(u8, line, "pub const mode = optimize;")) continue;
+        if (std.mem.startsWith(u8, line, "pub const zig_version = ")) try out.appendSlice(gpa,
+            \\/// Zig version. When writing code that supports multiple versions of Zig, prefer
+            \\/// feature detection (i.e. with `@hasDecl` or `@hasField`) over version checks.
+            \\
+        );
+        if (std.mem.startsWith(u8, line, "pub const optimize: std.lang.Optimize = .")) {
+            const tag = std.meta.stringToEnum(std.lang.Optimize, line["pub const optimize: std.lang.Optimize = .".len .. line.len - 1]).?;
+            try out.print(gpa, "pub const mode: std.builtin.OptimizeMode = .{s};\n", .{switch (tag) {
+                .debug => "Debug",
+                .safe => "ReleaseSafe",
+                .fast => "ReleaseFast",
+                .small => "ReleaseSmall",
+            }});
+            continue;
+        }
+        const trimmed = std.mem.trimStart(u8, line, " ");
+        if (std.mem.eql(u8, trimmed, ".version_range = .{ .linux = .{")) range = .linux_max_major;
+        if (std.mem.eql(u8, trimmed, ".version_range = .{ .semver = .{")) range = .macos_min_major;
+        if (std.mem.eql(u8, line, "};")) range = .none;
+        const want: []const u8, const fixed: []const u8, const next: @TypeOf(range) = switch (range) {
+            .none => .{ "", "", .none },
+            .linux_max_major => .{ ".major = 7,", "6,", .linux_max_minor },
+            .linux_max_minor => .{ ".minor = 2,", "19,", .none },
+            .macos_min_major => .{ ".major = 15,", "13,", .macos_max_major },
+            .macos_max_major => .{ ".major = 27,", "15,", .macos_max_minor },
+            .macos_max_minor => .{ ".minor = 0,", "6,", .none },
+        };
+        if (range != .none and std.mem.eql(u8, trimmed, want)) {
+            range = next;
+            try out.appendSlice(gpa, line[0 .. line.len - trimmed.len + std.mem.findScalar(u8, trimmed, '=').? + 2]);
+            try out.appendSlice(gpa, fixed);
+        } else {
+            try appendReplacing(gpa, &out, line, "std.lang.", "std.builtin.");
+        }
+        if (lines.peek() != null) try out.append(gpa, '\n');
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn appendReplacing(gpa: Allocator, out: *std.ArrayList(u8), line: []const u8, from: []const u8, to: []const u8) Allocator.Error!void {
+    var rest = line;
+    while (std.mem.find(u8, rest, from)) |i| {
+        try out.appendSlice(gpa, rest[0..i]);
+        try out.appendSlice(gpa, to);
+        rest = rest[i + from.len ..];
+    }
+    try out.appendSlice(gpa, rest);
+}
+
+fn generateNewest(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     // As upstream: every enabled feature, in the feature list's order.
     var features: std.ArrayList(u8) = .empty;
     defer features.deinit(gpa);

@@ -585,7 +585,8 @@ pub const Job = struct {
         checkSupported(init_.environ_map, opts.language);
         const is_test = command.isTest();
         const builtin_opts: Builtin.Options = .{
-            .language = opts.language.language,
+            // The newest under BS_TEST_LANGUAGE_KEYS, as the frontend's.
+            .language = if (init_.environ_map.get("BS_TEST_LANGUAGE_KEYS") != null) .newest else opts.language.language,
             .output_mode = switch (command) {
                 .build_obj, .test_obj => .Obj,
                 .build_lib => .Lib,
@@ -631,6 +632,7 @@ pub const Job = struct {
         // fuzzer calls back itself (upstream's test/standalone/libfuzzer).
         const fuzzer_builtin_dir: ?[]const u8 = if (opts.fuzz and (is_test or command == .build_exe or command == .run))
             try Builtin.writeToCache(arena, init_.io, try Io.Dir.path.join(arena, &.{ cache_dirs.global, "bs" }), .{
+                .language = builtin_opts.language,
                 .output_mode = .Lib,
                 .is_test = false,
                 .single_threaded = opts.single_threaded,
