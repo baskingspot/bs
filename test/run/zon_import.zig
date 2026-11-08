@@ -5,6 +5,7 @@
 //! inf and nan) and without one (anonymous structs and tuples of comptime
 //! fields).
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"

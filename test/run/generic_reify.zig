@@ -6,6 +6,7 @@
 //! the noreturn tag of an empty enum, and a struct in a generic return
 //! type, which is the same type wherever a call instantiates it.
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"
         :

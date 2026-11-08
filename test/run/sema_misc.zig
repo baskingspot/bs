@@ -6,6 +6,7 @@
 //! `.ptr`/`.len` of a pointer to an array reached through a parameter,
 //! and `/` on vectors of signed integers.
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"

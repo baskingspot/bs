@@ -3,6 +3,7 @@
 //! Container type identity follows upstream: the same ZIR instruction with
 //! equal captures is the same type, whatever made it.
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"
         :

@@ -5,6 +5,7 @@
 //! 60 MiB stack, not std's 16 MiB default (on which a Debug bs overflows
 //! from about 2000 operands, a ReleaseSafe one from about 8000).
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"

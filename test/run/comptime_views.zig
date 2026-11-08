@@ -5,6 +5,7 @@
 //! arrays, `++` of such slices, indexing a pointer to a tuple, and
 //! `@fieldParentPtr` of a field's first element cast back to the field.
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"

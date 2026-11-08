@@ -6,6 +6,7 @@
 //! `inline else` on a tagged union whose tag enum is non-exhaustive, and an
 //! inline function whose return type uses a runtime `anytype` parameter.
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"

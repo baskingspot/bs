@@ -3,6 +3,7 @@
 //! @embedFile of a file next to this one, and comptime @errorName, both
 //! string literals.
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"
