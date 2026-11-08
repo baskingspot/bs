@@ -74,8 +74,11 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{ .name = "bs", .root_module = exe_mod });
     // Comptime evaluation recurses on the native stack: a 1000-deep
     // comptime recursion (the default branch quota) needs more than the
-    // usual 8 MiB. Upstream links zig with the same size.
-    exe.stack_size = 46 * 1024 * 1024;
+    // usual 8 MiB. The main thread gets what a worker gets (src/main.zig,
+    // `thread_stack_size`), not upstream's 46 MiB: it lowers a file
+    // whose ZIR is not ready when it first asks for it, and AstGen
+    // recurses once per operand of a long `++` chain.
+    exe.stack_size = 60 << 20;
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
