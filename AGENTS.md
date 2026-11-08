@@ -1,11 +1,25 @@
 # bs
 
 bs is an independent Zig compiler aimed at Go-class compile speed. It does
-not track upstream: it compiles exactly one pinned Zig release (currently
-0.17.1) and the std library shipped with it.
+not track upstream: it compiles two pinned Zig releases, the current one
+and the one before it (today 0.17.1 and 0.16.0), each with the std
+library shipped with it. When a new release ships, bs adds it and drops
+the oldest.
 
 ## Scope
 
+- Language version: each compilation is in exactly one of the supported
+  languages. `bs build` takes it from the root package's `build.zig.zon`
+  `minimum_zig_version` (0.16.x → 0.16, 0.17.x or none → 0.17; anything
+  else is an error), and dependencies use the root's language.
+  `build-exe`, `test` and `run` take `--zig-version`, else the
+  `build.zig.zon` beside the nearest `build.zig` above the root source
+  file, else the newest. Each language is complete: its syntax, ZIR,
+  semantics, std, compile errors and build system, all through bs's own
+  Sema, backends and linkers; C and C++ go through the matching release's
+  `zig cc`. 0.16 is being built in phases (`docs/slop/zig-0.16.md`); until
+  it compiles, `build.zig.zon` selects a language only with
+  `BS_ZON_SELECTS` set, and selecting 0.16 stops with an error.
 - Targets: `x86_64-linux` (static ELF first), `aarch64-macos` (Mach-O,
   dynamically linked against libSystem, ad-hoc code signed), and
   `aarch64-linux` (static ELF, reusing the aarch64 backend and the ELF
@@ -67,14 +81,20 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   per-line exception, and no flag or environment variable reports a
   finding without failing. ziglint 0.8.1 is the oracle for those rules,
   as upstream zig is for the language. With lint turned off, everything
-  upstream accepts must still compile and mean the same, and upstream's
-  std and `test/behavior` must still compile, since they are the
-  conformance measure.
+  a supported release accepts must still compile and mean the same in
+  that language, and each release's std and `test/behavior` must
+  compile, since they are the conformance measure.
 
 ## Architecture decisions
 
-- Frontend: reuse `std.zig.Ast` (`Ast.parse`) and `std.zig.AstGen.generate` to
-  produce ZIR. Do not fork or reimplement them.
+- Frontend: upstream's tokenizer, Parse, AstGen and Zir for each
+  supported release, vendored under `src/frontend/` with upstream's
+  notice, ported only as far as compiling under bs's own Zig needs, plus
+  one bs-owned superset Ast and superset ZIR that both releases' AstGen
+  produce (see `docs/slop/zig-0.16.md`). Do not reimplement them. Sema
+  branches on the language only where meaning differs. (Until the
+  frontend phase lands, the newest release's frontend is still taken from
+  bs's own std.)
 - Everything after ZIR is bs's own code: semantic analysis and comptime
   (Sema), the typed IR, the backends, and the linkers.
 - Speed comes from architecture, not micro-tuning:
@@ -89,31 +109,39 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   especially in formats and interfaces (Atoms, cache entries, IR) that get
   harder to change once other code depends on them.
 - Compile-time speed is a feature. Track it with benchmarks against upstream
-  `zig` 0.17.1 Debug builds (self-hosted x86_64 backend), and do not land
+  `zig` Debug builds of the same release (self-hosted x86_64 backend), and do not land
   regressions without saying so. Track the speed of the code bs generates
   against upstream Debug and ReleaseSafe builds the same way, and report
   each backend change's compile-time cost next to its run-time win.
 
 ## Upstream reference
 
-- `.agents/setup` installs upstream `zig` 0.17.1 on `PATH` in orbs. On a Mac
-  satellite it leaves the owner's `zig` alone; use
-  `~/.cache/bs/zig-aarch64-macos-0.17.1/zig` there. It also symlinks
-  that release's source tree at `upstream/` (gitignored), which contains
-  `upstream/src/Sema.zig`, `upstream/test/behavior/` and more.
-- Upstream `zig` 0.17.1 is the oracle. When semantics are unclear, write a
-  small program and compare bs's behavior and output with upstream's. Do not
-  guess from memory.
-- Conformance measure: the share of `upstream/test/behavior` that bs compiles
-  and passes on each target. Keep that number visible. Measure it with
-  `tools/conformance/run.py` (see `docs/slop/architecture.md`).
+- `.agents/setup` installs upstream `zig` 0.17.1 on `PATH` and zig 0.16.0
+  at `~/.cache/bs/zig-<host>-0.16.0` in orbs, and symlinks their source
+  trees at `upstream/` and `upstream-0.16/` (gitignored), which contain
+  `src/Sema.zig`, `test/behavior/` and more. On a Mac satellite it leaves
+  the owner's `zig` alone; use `~/.cache/bs/zig-aarch64-macos-0.17.1/zig`
+  there.
+- Upstream `zig` of the same release is the oracle for each language.
+  When semantics are unclear, write a small program and compare bs's
+  behavior and output with that release's. Do not guess from memory.
+- Conformance measure: per language, the share of that release's
+  `test/behavior` (and std, compile errors, cases, langref, c-abi) that bs
+  compiles and passes on each target. Keep both languages' numbers
+  visible. Measure them with `tools/conformance/run.py` (see
+  `docs/slop/architecture.md`).
 - Upstream is MIT licensed. Copying upstream code is allowed, but keep the
   upstream copyright notice with the copied code. Never send changes upstream;
   Zig does not accept LLM-authored contributions.
 
 ## Development
 
-- bs is written in Zig 0.17.1. Build with `zig build`; test with `zig build test`.
+- bs is written in Zig 0.17.1, independently of the languages it
+  compiles; its own Zig moves to the newest supported release when that
+  release is added. Build with `zig build`; test with `zig build test`.
+- A change to Sema, the frontend or the caches runs the check chain in
+  both languages, once 0.16 has numbers, and reports 0.17 compile-time
+  numbers.
 - `docs/slop/architecture.md` fixes the boundaries between stages (analysis units,
   InternPool stable hashes, typed IR, Atoms, cache model). Follow it, and
   update it in the same change when a boundary moves.
