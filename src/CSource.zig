@@ -1220,9 +1220,10 @@ fn nonsharedJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), comm
         if (a64) "" else try join(arena, &.{ sd, "x86" }),
         try join(arena, &.{ sd, "generic" }),
         g,
-        try join(arena, &.{ lib, "libc", "include", if (a64) "aarch64-linux-gnu" else "x86_64-linux-gnu" }),
+        // Named for x86 as a whole (`glibcArchNameHeaders`, `osArchName`).
+        try join(arena, &.{ lib, "libc", "include", if (a64) "aarch64-linux-gnu" else "x86-linux-gnu" }),
         try join(arena, &.{ lib, "libc", "include", "generic-glibc" }),
-        try join(arena, &.{ lib, "libc", "include", if (a64) "aarch64-linux-any" else "x86_64-linux-any" }),
+        try join(arena, &.{ lib, "libc", "include", if (a64) "aarch64-linux-any" else "x86-linux-any" }),
         try join(arena, &.{ lib, "libc", "include", "any-linux-any" }),
     }) |d| if (d.len != 0) try includes.appendSlice(arena, &.{ "-I", d });
     for ([3][]const []const u8{ nonshared_lib.files, if (old_stat) &nonshared_stat_files else &.{}, if (old_init) &.{"csu/elf-init-2.33.c"} else &.{} }) |files| for (files) |file| {
@@ -1235,8 +1236,8 @@ fn nonsharedJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), comm
             .no_builtin = false,
             .pic = true,
             .pie = false,
-            .function_sections = false,
-            .data_sections = false,
+            .function_sections = true,
+            .data_sections = true,
             .unwind_tables = o.unwind_tables,
             .link_libc = false,
             .libcpp = false,

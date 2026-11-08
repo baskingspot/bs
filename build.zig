@@ -2176,9 +2176,11 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     }
     // C command lines: flags that upstream 0.17.1's `--verbose-cc` passes
     // for the same build, in its order. Fresh caches, so that every
-    // source compiles and prints.
+    // source (the runtime libraries' too) compiles and prints.
     const cc_cases = [_]struct { what: []const u8, args: []const []const u8, flags: []const []const u8 }{
-        .{ .what = "-OReleaseSafe", .args = &.{"-OReleaseSafe"}, .flags = &.{"-fsanitize=undefined -fsanitize-trap=undefined -fno-sanitize=function"} },
+        .{ .what = "-OReleaseSafe", .args = &.{ "-target", "x86_64-linux-gnu", "-OReleaseSafe" }, .flags = &.{" -fsanitize=undefined -fsanitize-trap=undefined -fno-sanitize=function "} },
+        // libc_nonshared.a: glibc's x86 headers, and sections.
+        .{ .what = "-target x86_64-linux-gnu", .args = &.{ "-target", "x86_64-linux-gnu" }, .flags = &.{ "libc/glibc/stdlib/atexit.c ", " -ffunction-sections -fdata-sections ", "/libc/include/x86-linux-gnu ", "/libc/include/x86-linux-any " } },
     };
     for (cc_cases) |case| {
         const vcc = b.addRunArtifact(bs);
@@ -2193,7 +2195,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         vcc.addArg("--global-cache-dir");
         _ = vcc.addOutputDirectoryArg("global");
         vcc.setEnvironmentVariable("BS_ZIG", zig);
-        for (case.flags) |f| vcc.addCheck(.{ .expect_stderr_match = b.fmt(" {s} ", .{f}) });
+        for (case.flags) |f| vcc.addCheck(.{ .expect_stderr_match = f });
         vcc.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&vcc.step);
     }
