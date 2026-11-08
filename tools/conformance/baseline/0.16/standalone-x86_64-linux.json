@@ -1,0 +1,275 @@
+{
+ "format": 1,
+ "target": "x86_64-linux",
+ "compiler": "zig 0.16.0",
+ "projects": {
+  "c_compiler": {
+   "steps": "17/17",
+   "status": "pass"
+  },
+  "c_embed_path": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "child_process": {
+   "steps": "6/6",
+   "status": "pass"
+  },
+  "cmakedefine": {
+   "steps": "12/12",
+   "status": "pass"
+  },
+  "coff_dwarf": {
+   "steps": "4/5",
+   "status": "pass"
+  },
+  "compile_asm": {
+   "steps": "2/2",
+   "status": "pass"
+  },
+  "compiler_rt_panic": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "config_header": {
+   "steps": "1/1",
+   "status": "pass"
+  },
+  "debug_io_color": {
+   "steps": "35/35",
+   "status": "pass"
+  },
+  "dep_diamond": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "dep_duplicate_module": {
+   "steps": "5/5",
+   "status": "pass"
+  },
+  "dep_lazypath": {
+   "steps": "5/5",
+   "status": "pass"
+  },
+  "dep_mutually_recursive": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "dep_recursive": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "dep_shared_builtin": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "dep_triangle": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "depend_on_main_mod": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "dependencyFromBuildZig": {
+   "steps": "1/1",
+   "status": "pass"
+  },
+  "dependency_options": {
+   "steps": "1/1",
+   "status": "pass"
+  },
+  "dirname": {
+   "steps": "11/11",
+   "status": "pass"
+  },
+  "embed_generated_file": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "emit_asm_and_bin": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "emit_asm_no_bin": {
+   "steps": "2/2",
+   "status": "pass"
+  },
+  "emit_llvm_no_bin": {
+   "steps": "2/2",
+   "status": "pass"
+  },
+  "empty_env": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "empty_global_error_set": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "entry_point": {
+   "steps": "5/5",
+   "status": "pass"
+  },
+  "env_vars": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "extern": {
+   "steps": "7/7",
+   "status": "pass"
+  },
+  "glibc_compat": {
+   "steps": "46/46",
+   "status": "pass"
+  },
+  "global_linkage": {
+   "steps": "7/7",
+   "status": "pass"
+  },
+  "install_headers": {
+   "steps": "13/13",
+   "status": "pass"
+  },
+  "install_raw_hex": {
+   "steps": "4/4",
+   "status": "pass"
+  },
+  "ios": {
+   "steps": "0/4",
+   "status": "fail",
+   "log": "test\n+- CheckObject\n   +- compile exe main Debug aarch64-ios\n      +- fail failure\nerror: no iOS SDK found\n\nBuild Summary: 0/4 steps succeeded (1 failed)\ntest transitive failure\n+- CheckObject transitive failure\n   +- compile exe main Debug aarch64-ios transitive failure\n      +- fail failure\n\nerror: the following build command failed with exit code 1:\n.zig-cache/o/e536a3de5604dec16d9e9008e9611948/build /home/user/.cache/bs/zig-x86_64-linux-0.16.0/zig /home/user/.cache/bs/zig-x86_64-linux-0.16.0/lib /tmp/wt-z7/.zig-cache/conformance-0.16/standalone/ios .zig-cache /tmp/wt-z7/.zig-cache/conformance-0.16/standalone-global --seed 0x833f5f88 -Z15d68872578271c0 --summary all\n"
+  },
+  "issue_11595": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "issue_12706": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "issue_339": {
+   "steps": "2/2",
+   "status": "pass"
+  },
+  "issue_5825": {
+   "steps": "1/1",
+   "status": "pass"
+  },
+  "issue_794": {
+   "steps": "2/2",
+   "status": "pass"
+  },
+  "libcxx": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "libfuzzer": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "load_dynamic_library": {
+   "steps": "4/4",
+   "status": "pass"
+  },
+  "mix_c_files": {
+   "steps": "9/9",
+   "status": "pass"
+  },
+  "mix_o_files": {
+   "steps": "5/5",
+   "status": "pass"
+  },
+  "pkg_import": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "posix": {
+   "steps": "31/31",
+   "status": "pass"
+  },
+  "run_cwd": {
+   "steps": "7/7",
+   "status": "pass"
+  },
+  "run_output_caching": {
+   "steps": "14/14",
+   "status": "pass"
+  },
+  "run_output_paths": {
+   "steps": "6/6",
+   "status": "pass"
+  },
+  "self_exe_symlink": {
+   "steps": "5/5",
+   "status": "pass"
+  },
+  "shared_library": {
+   "steps": "9/9",
+   "status": "pass"
+  },
+  "simple": {
+   "steps": "18/18",
+   "status": "pass"
+  },
+  "static_c_lib": {
+   "steps": "5/5",
+   "status": "pass"
+  },
+  "strip_empty_loop": {
+   "steps": "2/2",
+   "status": "pass"
+  },
+  "strip_struct_init": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "test_obj_link_run": {
+   "steps": "5/5",
+   "status": "pass"
+  },
+  "test_runner_module_imports": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "test_runner_path": {
+   "steps": "3/3",
+   "status": "pass"
+  },
+  "tsan": {
+   "status": "timeout"
+  },
+  "windows_argv": {
+   "steps": "1/1",
+   "status": "pass"
+  },
+  "windows_bat_args": {
+   "steps": "1/1",
+   "status": "pass"
+  },
+  "windows_entry_points": {
+   "steps": "9/9",
+   "status": "pass"
+  },
+  "windows_paths": {
+   "steps": "1/1",
+   "status": "pass"
+  },
+  "windows_resources": {
+   "steps": "8/10",
+   "status": "pass"
+  },
+  "windows_spawn": {
+   "steps": "1/1",
+   "status": "pass"
+  },
+  "zerolength_check": {
+   "steps": "5/9",
+   "status": "pass"
+  }
+ },
+ "summary": {
+  "projects": 66,
+  "pass": 64
+ }
+}

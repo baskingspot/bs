@@ -11,6 +11,13 @@ backend. Upstream's per-test results are committed in baseline/<target>.json.
 Each run prints one summary line per target to stdout and writes a per-file,
 per-test JSON breakdown (bs: .zig-cache/conformance/<target>.json).
 
+With --zig-version 0.16, every measure is the same for bs's second
+language (docs/slop/zig-0.16.md): upstream 0.16.0's tree at upstream-0.16/
+(its test/, and its lib/ for --std), its baselines in baseline/0.16/, zig
+0.16.0 as the oracle (BS_ZIG_0_16, else where .agents/setup installs it),
+test_runner_0_16.zig as the runner, a scratch directory of its own
+(.zig-cache/conformance-0.16), and bs run with BS_ZIG_VERSION=0.16.
+
 Every file that upstream/test/behavior.zig imports is compiled and run on its
 own (see "units" below), so one file that fails to compile or crashes does not
 hide the others. Tests are identified by the fully qualified names that
@@ -111,6 +118,8 @@ REPO = HERE.parent.parent
 UPSTREAM_TEST = REPO / "upstream" / "test"
 UPSTREAM_LIB = REPO / "upstream" / "lib"
 BASELINE_DIR = HERE / "baseline"
+# Measuring Zig 0.16 (`--zig-version 0.16`, `use_zig_0_16`).
+ZIG_0_16 = False
 FORMAT = 1
 
 # bs's targets, the `-target` both compilers get, and the host that can run
@@ -1138,10 +1147,15 @@ def std_target(compiler, cfg, args, workdir):
     bin_path.parent.mkdir(parents=True, exist_ok=True)
     bin_path.unlink(missing_ok=True)
     if args.c_abi:
+        # 0.16's cfuncs.c compiles its bool-vector functions only for the
+        # backends that pass them (its test/tests.zig defines this for
+        # x86_64's self-hosted backend); 0.17's has no such switch.
+        defines = ["-DZIG_BACKEND_STAGE2_X86_64"] if ZIG_0_16 and cfg["name"].startswith("x86_64-") else []
         sources = [
             str(UPSTREAM_TEST / "c_abi" / "main.zig"),
             "-cflags",
             "-std=c99",
+            *defines,
             "--",
             str(UPSTREAM_TEST / "c_abi" / "cfuncs.c"),
         ]
@@ -2303,6 +2317,33 @@ def incremental_target(compiler, cfg, args, workdir):
 # ---------------------------------------------------------------- main
 
 
+def use_zig_0_16(args):
+    """Points the measures at bs's 0.16 language: upstream-0.16/'s tree,
+    baseline/0.16/, zig 0.16.0 as the oracle (bs finds the same one), its
+    test runner, and BS_ZIG_VERSION for every bs run. bs itself is still
+    built with --zig, the 0.17.1 that builds bs."""
+    global UPSTREAM_TEST, UPSTREAM_LIB, BASELINE_DIR, CASES_DIR, CASES_ROOT, STANDALONE_ROOT, INCREMENTAL_ROOT, ZIG_0_16
+    ZIG_0_16 = True
+    UPSTREAM_TEST = REPO / "upstream-0.16" / "test"
+    UPSTREAM_LIB = REPO / "upstream-0.16" / "lib"
+    BASELINE_DIR = HERE / "baseline" / "0.16"
+    CASES_DIR = UPSTREAM_TEST / "cases" / "compile_errors"
+    CASES_ROOT = UPSTREAM_TEST / "cases"
+    STANDALONE_ROOT = UPSTREAM_TEST / "standalone"
+    INCREMENTAL_ROOT = UPSTREAM_TEST / "incremental"
+    host = {"Linux-x86_64": "x86_64-linux", "Darwin-arm64": "aarch64-macos"}.get(
+        f"{platform.system()}-{platform.machine()}", ""
+    )
+    oracle = os.environ.get("BS_ZIG_0_16") or str(Path.home() / ".cache" / "bs" / f"zig-{host}-0.16.0" / "zig")
+    args.bs_zig = "zig"
+    if args.zig == "zig":
+        args.zig = oracle
+    os.environ["BS_ZIG_0_16"] = args.zig
+    os.environ["BS_ZIG_VERSION"] = "0.16"
+    if args.test_runner is None and not args.default_runner:
+        args.test_runner = HERE / "test_runner_0_16.zig"
+
+
 def main():
     global exec_prefix
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -2314,7 +2355,9 @@ def main():
     )
     p.add_argument("--bs", type=Path, help="bs executable (default: build bs with -Doptimize=ReleaseSafe)")
     p.add_argument(
-        "--zig", default="zig", help="upstream zig 0.17.1, used for --upstream and to build bs (default: zig on PATH)"
+        "--zig",
+        default="zig",
+        help="upstream zig 0.17.1, used for --upstream and to build bs (default: zig on PATH); with --zig-version 0.16, the 0.16.0 oracle (default: BS_ZIG_0_16, else where .agents/setup installs it), and bs is built with zig on PATH",
     )
     p.add_argument(
         "--test-runner",
@@ -2380,7 +2423,13 @@ def main():
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
     p.add_argument("--compile-timeout", type=float, default=300, help="seconds per file compile")
     p.add_argument("--run-timeout", type=float, default=60, help="seconds per test binary run")
-    p.add_argument("--workdir", type=Path, default=REPO / ".zig-cache" / "conformance", help="scratch directory")
+    p.add_argument(
+        "--zig-version",
+        choices=("0.16", "0.17"),
+        default="0.17",
+        help="the Zig language to measure: its upstream tree, baselines, oracle zig and test runner (default 0.17)",
+    )
+    p.add_argument("--workdir", type=Path, help="scratch directory (default .zig-cache/conformance, -0.16 for 0.16)")
     p.add_argument("--out", type=Path, help="JSON output path (only with one --target)")
     p.add_argument("--keep-binaries", action="store_true", help="keep test binaries in the workdir")
     p.add_argument(
@@ -2398,6 +2447,11 @@ def main():
     )
     p.add_argument("-v", "--verbose", action="store_true", help="print each file's result to stderr")
     args = p.parse_args()
+    args.bs_zig = args.zig
+    if args.zig_version == "0.16":
+        use_zig_0_16(args)
+    if args.workdir is None:
+        args.workdir = REPO / ".zig-cache" / ("conformance-0.16" if args.zig_version == "0.16" else "conformance")
 
     if args.test_runner is not None:
         args.test_runner = args.test_runner.resolve()
@@ -2411,7 +2465,7 @@ def main():
     # Upstream's own tree turns lint off with a .bs.zon at its root and
     # beside each build.zig, written by .agents/setup and the flake
     # (`lint_off`).
-    for d in (REPO / "upstream", REPO / "upstream" / "doc" / "langref"):
+    for d in (UPSTREAM_TEST.parent, UPSTREAM_TEST.parent / "doc" / "langref"):
         if not (d / ".bs.zon").exists():
             sys.exit(f"error: {d / '.bs.zon'} is missing; run .agents/setup")
     lint_off(args.workdir)
@@ -2424,7 +2478,7 @@ def main():
         if args.upstream:
             compiler = shutil.which(args.zig) or sys.exit(f"error: {args.zig} not found")
         else:
-            compiler = args.bs.resolve() if args.bs else build_bs(args.workdir, args.zig)
+            compiler = args.bs.resolve() if args.bs else build_bs(args.workdir, args.bs_zig)
     try:
         for name in targets:
             cfg = dict(TARGETS[name], name=name)
