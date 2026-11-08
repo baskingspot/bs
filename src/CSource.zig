@@ -168,9 +168,11 @@ pub const Options = struct {
     /// Where the runtime libraries go: `<global>/bs/o/<key>/`.
     global_cache: []const u8 = "",
     single_threaded: bool = false,
-    /// Upstream's default stack protector for the compilation's C: with
-    /// libc, unless its Zig code goes through the self-hosted backend,
-    /// which has none (`Module.create`): a library of C only, or `-fllvm`.
+    /// Upstream's default stack protector for the compilation's C in
+    /// Debug and ReleaseSafe: with libc, unless its Zig code goes through
+    /// the self-hosted backend, which has none (`Module.create`). That is
+    /// a compilation of C only, `-fllvm`, a release mode, or a target
+    /// other than x86_64-linux (`Config`'s `use_llvm`).
     stack_protector: bool = false,
     /// A shared library's sources are position-independent, as upstream
     /// requires (`requiresPIC`).
@@ -725,7 +727,10 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .sanitize_c = src.flags.sanitizeC(),
             .red_zone = src.flags.red_zone orelse true,
             .no_builtin = src.flags.no_builtin orelse false,
-            .stack_protector = o.link_libc and (src.flags.stack_protector orelse o.stack_protector),
+            .stack_protector = o.link_libc and (src.flags.stack_protector orelse (o.stack_protector and switch (src.flags.optimize orelse .debug) {
+                .debug, .safe => true,
+                .fast, .small => false,
+            })),
             // glibc and shared libraries require PIC (`requiresPic`); else
             // (musl too) the module's, default off.
             .pic = (o.link_libc and !o.musl) or o.pic or (src.flags.pic orelse false),

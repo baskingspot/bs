@@ -8308,7 +8308,15 @@ compile.
   `-D__GLIBC_MINOR__=N`, and `-MD -MV -MF <depfile>`, whose header list
   goes into its cache manifest (`man.addDiscoveredDepFile`). translate-c
   gets the same include and target flags (`addCommonCCArgs(.aro)`) and the
-  same depfile.
+  same depfile. The stack protector is off only because x86_64-linux
+  Debug Zig code goes through the self-hosted backend (`Module.create`):
+  C of a release build, an aarch64 target, `-fllvm`, or C only gets
+  `-fstack-protector-strong --param ssp-buffer-size=4` in Debug and
+  ReleaseSafe. ReleaseSafe's trapping UBSan adds
+  `-fno-sanitize=function`. libc_nonshared.a's sub-compilation has
+  `-ffunction-sections -fdata-sections` and, on x86_64, glibc's
+  `x86-linux-gnu` and `x86-linux-any` headers. The build.zig checks
+  "bs --verbose-cc ... passes upstream's C flags" hold bs to these.
 
 ### Decision 1: where crt1.o, libc_nonshared.a and libc.so come from
 

@@ -1224,7 +1224,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .musl_libc = linksMusl(opts),
         .global_cache = job.cache_dirs.global,
         .single_threaded = opts.single_threaded,
-        .stack_protector = opts.c_only or opts.c_root or opts.use_llvm or macos,
+        .stack_protector = opts.c_only or opts.c_root or opts.use_llvm or opts.bs_target != .x86_64_linux or opts.optimize != .debug,
         .pic = opts.dynamic,
         .pie = opts.c_pie or macos,
         .function_sections = opts.function_sections,

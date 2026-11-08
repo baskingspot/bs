@@ -2178,7 +2178,11 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     // for the same build, in its order. Fresh caches, so that every
     // source (the runtime libraries' too) compiles and prints.
     const cc_cases = [_]struct { what: []const u8, args: []const []const u8, flags: []const []const u8 }{
-        .{ .what = "-OReleaseSafe", .args = &.{ "-target", "x86_64-linux-gnu", "-OReleaseSafe" }, .flags = &.{" -fsanitize=undefined -fsanitize-trap=undefined -fno-sanitize=function "} },
+        // ReleaseSafe: UBSan traps, and the stack protector of the LLVM
+        // backend upstream compiles release builds' Zig code with.
+        .{ .what = "-OReleaseSafe", .args = &.{ "-target", "x86_64-linux-gnu", "-OReleaseSafe" }, .flags = &.{ "libc.c ", " -fsanitize=undefined -fsanitize-trap=undefined -fno-sanitize=function ", " -fstack-protector-strong --param ssp-buffer-size=4 " } },
+        // aarch64-linux, whose Zig code upstream compiles with LLVM.
+        .{ .what = "-target aarch64-linux-gnu", .args = &.{ "-target", "aarch64-linux-gnu" }, .flags = &.{ "libc.c ", " -fstack-protector-strong --param ssp-buffer-size=4 " } },
         // libc_nonshared.a: glibc's x86 headers, and sections.
         .{ .what = "-target x86_64-linux-gnu", .args = &.{ "-target", "x86_64-linux-gnu" }, .flags = &.{ "libc/glibc/stdlib/atexit.c ", " -ffunction-sections -fdata-sections ", "/libc/include/x86-linux-gnu ", "/libc/include/x86-linux-any " } },
     };
