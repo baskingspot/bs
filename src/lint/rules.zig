@@ -109,9 +109,9 @@ pub const Rule = enum(u16) {
                 const preferred = context[0..sep];
                 const original = if (sep < context.len) context[sep + 1 ..] else context;
                 try writer.print("prefer {s}`{s}", .{ d, r });
-                try writeHighlightedStructInit(writer, preferred, m, d, r);
+                try writeHighlightedStructInit(writer, preferred, m, y, d, r);
                 try writer.print("{s}`{s} over {s}`{s}", .{ d, r, d, r });
-                try writeHighlightedStructInit(writer, original, m, d, r);
+                try writeHighlightedStructInit(writer, original, m, y, d, r);
                 try writer.print("{s}`{s}", .{ d, r });
             },
             .Z011 => try writer.print("{s}", .{context}),
@@ -258,8 +258,9 @@ pub const Rule = enum(u16) {
     }
 };
 
-fn writeHighlightedStructInit(writer: *std.Io.Writer, code: []const u8, type_color: []const u8, dim: []const u8, reset: []const u8) !void {
-    const yellow = "\x1b[33m";
+/// bs: the field names' colour is a parameter, so that a message without
+/// colour has none (ziglint 0.8.1 writes them yellow regardless).
+fn writeHighlightedStructInit(writer: *std.Io.Writer, code: []const u8, type_color: []const u8, yellow: []const u8, dim: []const u8, reset: []const u8) !void {
     // Handle truncated case: "Type{" -> "Type{...}"
     const is_truncated = std.mem.endsWith(u8, code, "{");
 
