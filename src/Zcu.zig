@@ -14,6 +14,7 @@ const Ast = std.zig.Ast;
 const Zir = std.zig.Zir;
 
 const Frontend = @import("Frontend.zig");
+const Language = @import("language.zig").Language;
 const cache = @import("cache.zig");
 const InternPool = @import("InternPool.zig");
 const Ir = @import("Ir.zig");
@@ -31,6 +32,9 @@ const Zcu = @This();
 gpa: Allocator,
 io: Io,
 fe: *Frontend,
+/// The Zig language of the compilation (`Frontend.language`), fixed for
+/// its lifetime.
+language: Language,
 ip: InternPool,
 /// Root struct type of each file, `.none` until imported.
 file_root_types: std.ArrayList(InternPool.Index) = .empty,
@@ -543,6 +547,7 @@ pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
         .gpa = gpa,
         .io = io,
         .fe = fe,
+        .language = fe.language,
         .ip = try .init(gpa, io, 1),
         .arena = .init(gpa),
         .deprecations_arena = .init(gpa),

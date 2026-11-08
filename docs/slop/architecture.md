@@ -8022,6 +8022,31 @@ Nothing else in a bs binary depends on where it was built: C and C++
 compiles find upstream zig as above, and the docs viewer and build web
 UI wasm are embedded.
 
+**Per language** (docs/slop/zig-0.16.md, phase 0, 2026-11-08). The lib
+directory and upstream zig are those of the compilation's language
+(`language.Language`, `toolchain.findZigFor`, `toolchain.libDir`'s
+`language`):
+
+- The language comes from `--zig-version`, else `BS_ZIG_VERSION` (which
+  `bs build` sets for the compilations it runs when its root package's
+  `build.zig.zon` chose), else the `minimum_zig_version` of the
+  `build.zig.zon` beside the nearest `build.zig` above the root source
+  file, else the newest (`language.resolve`; `language.forBuild` for
+  `bs build`, which reads its build root's and ignores the environment).
+  A version outside 0.16 and 0.17 is an error at the field or the flag.
+  Until 0.16 compiles, `build.zig.zon` is read only with
+  `BS_ZON_SELECTS` set, so projects that name another release keep
+  compiling as 0.17, and a compilation that selects 0.16 stops after its
+  lib directory is found (`main.notYetSupported`).
+- 0.16's zig is `BS_ZIG_0_16`, else `~/.cache/bs/zig-<host>-0.16.0/zig`
+  (where `.agents/setup` installs it, never on PATH), else `zig` on
+  PATH, which is usually 0.17.1's and then fails the version check with
+  an error that says where to install 0.16.0. Its `zig env` answer is
+  kept as 0.17.1's, with the version in the key. The build tree's lib
+  directory is a fallback for the newest language only.
+- The language reaches `Frontend.language`, `Zcu.language` and
+  `Builtin.Options.language` (`builtin.zig_version`).
+
 ## Fuzzing (designed and built 2026-11-03; x86_64-linux)
 
 Goal: upstream 0.17.1's built-in fuzzer works with bs on x86_64-linux:

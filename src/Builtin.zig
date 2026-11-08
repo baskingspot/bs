@@ -16,6 +16,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const InternPool = @import("InternPool.zig");
 const cpu_mod = @import("cpu.zig");
+const Language = @import("language.zig").Language;
 
 pub const OutputMode = enum { Exe, Obj, Lib };
 
@@ -24,6 +25,9 @@ pub const OutputMode = enum { Exe, Obj, Lib };
 pub const macos_default: std.SemanticVersion.Range = .{ .min = .{ .major = 15, .minor = 0, .patch = 0 }, .max = .{ .major = 27, .minor = 0, .patch = 0 } };
 
 pub const Options = struct {
+    /// The Zig language of the compilation, whose release's version
+    /// `builtin.zig_version` reports.
+    language: Language = .newest,
     output_mode: OutputMode,
     is_test: bool,
     single_threaded: bool = false,
@@ -233,7 +237,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     if (opts.target == .aarch64_macos) return gpa.print(
         \\const std = @import("std");
         \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
-        \\pub const zig_version_string = "0.17.1";
+        \\pub const zig_version_string = "{s}";
         \\pub const zig_backend = std.lang.CompilerBackend.stage2_llvm;
         \\
         \\pub const output_mode: std.lang.OutputMode = .{s};
@@ -292,6 +296,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
         \\
     , .{
+        opts.language.versionString(),
         @tagName(opts.output_mode),
         @tagName(opts.unwind_tables),
         if (opts.is_test) "true" else "false",
@@ -336,7 +341,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     try out.print(gpa,
         \\const std = @import("std");
         \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
-        \\pub const zig_version_string = "0.17.1";
+        \\pub const zig_version_string = "{s}";
         \\pub const zig_backend = std.lang.CompilerBackend.{s};
         \\
         \\pub const output_mode: std.lang.OutputMode = .{s};
@@ -379,6 +384,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\}};
         \\
     , .{
+        opts.language.versionString(),
         // Upstream's Debug default: its own backend on x86_64-linux, LLVM
         // on aarch64-linux.
         if (opts.target == .x86_64_linux) "stage2_x86_64" else "stage2_llvm",

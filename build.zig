@@ -118,6 +118,23 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&inputs.step);
     }
     addDiagTests(b, exe, test_step, upstream_step, std_zir);
+    // The language a compilation is in (src/language.zig): a version bs
+    // does not compile is an error, at the build.zig.zon's field or the
+    // flag.
+    for ([_]struct { []const []const u8, []const u8 }{
+        .{ &.{}, "build.zig.zon:5:28: minimum_zig_version '0.15.2' is not supported: bs compiles Zig 0.16 and 0.17" },
+        .{ &.{ "--zig-version", "0.18" }, "--zig-version '0.18': bs compiles Zig 0.16 and 0.17" },
+    }) |case| {
+        const run = b.addRunArtifact(exe);
+        run.setName(b.fmt("bs refuses {s}", .{if (case[0].len == 0) "an unsupported minimum_zig_version" else "an unsupported --zig-version"}));
+        run.setEnvironmentVariable("BS_ZON_SELECTS", "1");
+        run.addArgs(&.{ "build-exe", "-fno-emit-bin" });
+        run.addFileArg(b.path("test/language/old/main.zig"));
+        run.addArgs(case[0]);
+        run.addCheck(.{ .expect_stderr_match = case[1] });
+        run.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        test_step.dependOn(&run.step);
+    }
     addLintTests(b, exe, test_step, upstream_step, std_zir);
     const build_test_step = addBuildTest(b, exe, build_web_wasm, translate_c);
     spreadBsUsers(b, &exe.step, &zir.step, &.{ test_step, build_test_step });

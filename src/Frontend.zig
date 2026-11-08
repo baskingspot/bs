@@ -26,6 +26,7 @@ const AstGen = std.zig.AstGen;
 const assert = std.debug.assert;
 const LintConfig = @import("lint/Config.zig");
 const Linter = @import("lint/Linter.zig");
+const Language = @import("language.zig").Language;
 
 const Frontend = @This();
 
@@ -59,6 +60,8 @@ lint: ?*const LintConfig = null,
 root_name: []const u8 = "root",
 /// See `Options.load_std`.
 load_std: bool,
+/// The Zig language of the compilation (`Options.language`).
+language: Language,
 /// The root module of the fuzzer's family (`Options.fuzzer_builtin_dir`),
 /// whose `=std@fuzzer` and `=builtin@fuzzer` follow it. Their names hold
 /// an '=', which no `-M` name can, so no other module's keys are theirs.
@@ -210,6 +213,8 @@ pub const Stats = struct {
 pub const Options = struct {
     /// Root source file of the root module (the test runner under `bs test`).
     root_src_path: []const u8,
+    /// The Zig language of the compilation (`language.resolve`).
+    language: Language = .newest,
     /// The root module's directory when it is not the root file's own:
     /// upstream roots translate-c, whose root file imports `../util.zig`,
     /// at `lib/compiler`. `root_src_path` starts with it and a '/'.
@@ -263,7 +268,7 @@ pub fn testsStd(gpa: Allocator, zig_lib_dir: []const u8, main_src_path: []const 
 }
 
 pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !Frontend {
-    var fe: Frontend = .{ .gpa = gpa, .io = io, .zig_lib_dir = zig_lib_dir, .load_std = options.load_std, .root_name = options.root_name };
+    var fe: Frontend = .{ .gpa = gpa, .io = io, .zig_lib_dir = zig_lib_dir, .load_std = options.load_std, .root_name = options.root_name, .language = options.language };
     errdefer fe.deinit();
     // The root module and the module under test are named by their roles,
     // not their `-M` name (`root_name`): cache keys name modules

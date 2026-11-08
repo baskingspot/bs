@@ -28,6 +28,7 @@ const BuildRunner = @import("BuildRunner.zig");
 const ToolRecord = @import("ToolRecord.zig");
 const CSource = @import("CSource.zig");
 const toolchain = @import("toolchain.zig");
+const language = @import("language.zig");
 const InternPool = @import("InternPool.zig");
 const builtin = @import("builtin");
 
@@ -179,7 +180,11 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         .native_includes = native_includes,
         .native_abi = std.mem.eql(u8, target, "native"),
         .listen = opts.listen,
-        .zig_lib = try toolchain.libDir(arena, io, init.environ_map, cache_dirs.global, opts.zig_lib_dir),
+        .zig_lib = try toolchain.libDir(arena, io, init.environ_map, cache_dirs.global, opts.zig_lib_dir, lang: {
+            const choice = try language.resolve(arena, io, init.environ_map, null, null);
+            if (choice.language != language.Language.newest) main.notYetSupported(choice);
+            break :lang choice.language;
+        }),
         .cache_dirs = cache_dirs,
         .build_root = opts.build_root,
         .unsupported = opts.unsupported,

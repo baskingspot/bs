@@ -27,6 +27,7 @@ const Docs = @import("Docs.zig");
 const Glibc = @import("link/Glibc.zig");
 const CSource = @import("CSource.zig");
 const toolchain = @import("toolchain.zig");
+const language = @import("language.zig");
 const cpu_mod = @import("cpu.zig");
 const InternPool = @import("InternPool.zig");
 const BuildRunner = @import("BuildRunner.zig");
@@ -104,6 +105,10 @@ pub const Options = struct {
     /// The target `target` names (`checkTarget`).
     bs_target: InternPool.Target = .x86_64_linux,
     zig_lib_dir: ?[]const u8 = null,
+    /// `--zig-version`, as given.
+    zig_version: ?[]const u8 = null,
+    /// The Zig language the compilation is in, and why (`language.resolve`).
+    language: language.Choice = .{ .language = .newest, .source = .default },
     /// `--cache-dir` and `--global-cache-dir`.
     cache_dir: ?[]const u8 = null,
     global_cache_dir: ?[]const u8 = null,
@@ -512,6 +517,18 @@ fn forwarding(env: *const std.process.Environ.Map) bool {
 /// How calls are inlined (docs/slop/architecture.md, "Inlining within a
 /// budget"): `BS_INLINE=<budget>` sets the budget, 0 turns inlining off,
 /// and `BS_INLINE_SAFE=1` inlines only callees that cannot panic.
+/// Exits: bs selects a language whose compilation is not built yet
+/// (docs/slop/zig-0.16.md).
+pub fn notYetSupported(choice: language.Choice) noreturn {
+    const by = switch (choice.source) {
+        .default => "",
+        .flag => " by --zig-version",
+        .env => " by BS_ZIG_VERSION",
+        .zon => |p| p,
+    };
+    fatal("Zig {s} is selected{s}{s}, but bs does not compile Zig {s} yet", .{ choice.language.name(), if (choice.source == .zon) " by the minimum_zig_version of " else "", by, choice.language.name() });
+}
+
 fn inlining(env: *const std.process.Environ.Map) struct { budget: u32, safe: bool } {
     const budget = if (env.get("BS_INLINE")) |v| std.fmt.parseInt(u32, v, 10) catch fatal("invalid BS_INLINE '{s}': expected a number", .{v}) else inline_ir.budget;
     return .{ .budget = budget, .safe = env.get("BS_INLINE_SAFE") != null };
@@ -551,10 +568,12 @@ pub const Job = struct {
             .global = opts.global_cache_dir,
             .local_is_global = command == .run,
         });
-        const lib = try toolchain.libDir(arena, init_.io, init_.environ_map, cache_dirs.global, opts.zig_lib_dir);
+        const lib = try toolchain.libDir(arena, init_.io, init_.environ_map, cache_dirs.global, opts.zig_lib_dir, opts.language.language);
         const zig_lib_dir = lib.path;
+        if (opts.language.language != language.Language.newest) notYetSupported(opts.language);
         const is_test = command.isTest();
         const builtin_opts: Builtin.Options = .{
+            .language = opts.language.language,
             .output_mode = switch (command) {
                 .build_obj, .test_obj => .Obj,
                 .build_lib => .Lib,
@@ -1261,6 +1280,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     const plain = try plainC(arena, &opts, c_batch);
     const fe_node = prog.start("Load Sources", 0);
     var fe: Frontend = try .init(init.gpa, init.io, job.zig_lib_dir, .{
+        .language = opts.language.language,
         .root_src_path = if (is_test) test_runner else if (opts.c_root) try Builtin.writeCMain(arena, init.io, try Io.Dir.path.join(arena, &.{ job.cache_dirs.global, "bs" }), plain) else opts.root_src_path,
         .root_dir = opts.root_dir,
         .builtin_dir = job.builtin_dir,
@@ -1626,7 +1646,7 @@ fn printEnv(init: std.process.Init) !void {
     const env = init.environ_map;
     const cwd = try std.process.currentPathAlloc(io, arena);
     const dirs = Frontend.resolveCacheDirs(arena, io, env, .{ .local_is_global = true });
-    const lib_dir = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, (try toolchain.libDir(arena, io, env, dirs.global, null)).path });
+    const lib_dir = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, (try toolchain.libDir(arena, io, env, dirs.global, null, .newest)).path });
     var buf: [4096]u8 = undefined;
     var out = Io.File.stdout().writerStreaming(io, &buf);
     var serializer: std.zon.Serializer = .{ .writer = &out.interface };
@@ -2511,6 +2531,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             mcpu = if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {
             opts.zig_lib_dir = nextArg(args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--zig-version")) {
+            opts.zig_version = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--cache-dir")) {
             opts.cache_dir = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--global-cache-dir")) {
@@ -2803,6 +2825,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             opts.c_only = true;
     }
     opts.root_src_path = root orelse if (opts.unsupported != null or opts.c_only or opts.c_root) "" else fatal("expected a root source file", .{});
+    opts.language = try language.resolve(arena, io, environ_map, opts.zig_version, root);
     opts.test_filters = test_filters.items;
     opts.force_undefined = force_undefined.items;
     // As upstream: `-L` directories that do not exist are left out, and
@@ -3369,6 +3392,7 @@ test {
     _ = Frontend;
     _ = BlockCache;
     _ = @import("cache.zig");
+    _ = @import("language.zig");
     _ = @import("cpu.zig");
     _ = @import("link/Atom.zig");
     _ = @import("link/Elf.zig");

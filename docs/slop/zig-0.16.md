@@ -1,7 +1,14 @@
 # Two Zig languages: 0.17.1 and 0.16.0
 
-Status: design note with an estimate, for the owner's decision. Nothing
-in it is built. It was written from main b92b0c65, upstream 0.17.1 (`upstream/`),
+Status: approved by the owner (2026-11-08) with every recommendation in
+"Open questions" taken as decided; being built in the phases below.
+Phase 0 (selection and plumbing) is described in docs/slop/architecture.md,
+"Finding the zig lib directory at run time". Until 0.16 compiles,
+`build.zig.zon` selects a language only with `BS_ZON_SELECTS` set, so
+that projects which name another release keep compiling as 0.17; the
+branch that makes 0.16 usable drops the variable.
+
+The note was written from main b92b0c65, upstream 0.17.1 (`upstream/`),
 and the official 0.16.0 source and x86_64-linux binary tarballs. The cache
 and frontend thread contributed the frontend, cache and `bs build` parts,
 and the link thread the linker and target-library parts. Their file and

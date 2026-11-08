@@ -18,6 +18,7 @@ const cache = @import("cache.zig");
 const Frontend = @import("Frontend.zig");
 const Incremental = @import("Incremental.zig");
 const toolchain = @import("toolchain.zig");
+const language = @import("language.zig");
 
 pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const arena = init.arena.allocator();
@@ -33,7 +34,12 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const cwd = try std.process.currentPathAlloc(io, arena);
     const dirs = Frontend.resolveCacheDirs(arena, io, env, .{ .local_is_global = true });
     const global = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, dirs.global });
-    const lib = try toolchain.libDir(arena, io, env, global, lib_override);
+    // The root package's language is every compilation's (`BS_ZIG_VERSION`
+    // for the compilations the runner asks for).
+    const choice: language.Choice = if (try buildRoot(arena, io, cwd, user_args)) |root| try language.forBuild(arena, io, env, root) else .{ .language = .newest, .source = .default };
+    const lib = try toolchain.libDir(arena, io, env, global, lib_override, choice.language);
+    if (choice.language != language.Language.newest) main.notYetSupported(choice);
+    if (choice.source == .zon) try env.put("BS_ZIG_VERSION", choice.language.name());
     const zig_lib_dir = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, lib.path });
 
     // One runner per bs binary, zig lib directory and mode.
@@ -100,11 +106,9 @@ pub const compiler_file = "bs/compiler";
 
 /// The runner's local cache for `user_args`, as `Maker.zig` finds it:
 /// ZIG_LOCAL_CACHE_DIR or `--cache-dir`, else `.zig-cache` in the build
-/// root, the directory of `--build-file` or the nearest one up from `cwd`
-/// that has `build.zig`. Null if there is none, which the runner reports.
+/// root (`buildRoot`). Null if there is none, which the runner reports.
 fn localCacheDir(arena: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, user_args: []const []const u8) !?[]const u8 {
     var override: ?[]const u8 = std.zig.EnvVar.ZIG_LOCAL_CACHE_DIR.get(env);
-    var build_file: ?[]const u8 = null;
     var i: usize = 0;
     while (i < user_args.len) : (i += 1) {
         const arg = user_args[i];
@@ -115,20 +119,39 @@ fn localCacheDir(arena: std.mem.Allocator, io: Io, env: *const std.process.Envir
             override = user_args[i];
         } else if (std.mem.eql(u8, arg, "--build-file")) {
             i += 1;
-            build_file = user_args[i];
         }
     }
     if (override) |p| {
         const local = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, p });
         return local;
     }
+    const local = try Io.Dir.path.join(arena, &.{ try buildRoot(arena, io, cwd, user_args) orelse return null, ".zig-cache" });
+    return local;
+}
+
+/// The build root for `user_args`, as `Maker.zig` finds it: the directory
+/// of `--build-file`, else the nearest one up from `cwd` that has
+/// `build.zig`. Null if there is none.
+fn buildRoot(arena: std.mem.Allocator, io: Io, cwd: []const u8, user_args: []const []const u8) !?[]const u8 {
+    var build_file: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < user_args.len) : (i += 1) {
+        const arg = user_args[i];
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (i + 1 == user_args.len) break;
+        if (std.mem.eql(u8, arg, "--cache-dir")) {
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--build-file")) {
+            i += 1;
+            build_file = user_args[i];
+        }
+    }
     var dir: []const u8 = if (build_file) |bf| try Io.Dir.path.resolveAlloc(arena, &.{ cwd, Io.Dir.path.dirname(bf) orelse "." }) else cwd;
     while (build_file == null) {
         if (Io.Dir.cwd().access(io, try Io.Dir.path.join(arena, &.{ dir, std.zig.build_zig_basename }), .{})) |_| break else |_| {}
         dir = Io.Dir.path.dirname(dir) orelse return null;
     }
-    const local = try Io.Dir.path.join(arena, &.{ dir, ".zig-cache" });
-    return local;
+    return dir;
 }
 
 /// Writes `id` to `compiler_file` under `local` unless it is there
