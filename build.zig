@@ -796,12 +796,9 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, run_step: *std.Build.
             // (docs/slop/architecture.md, "Synthetic panic frames"),
             // addresses aside.
             if (!upstream and host_runs_bs_output and isTraceChecked(file)) traceCheck(b, test_step, bs, src_path, name, "x86_64-linux", &.{}, bin);
-            if (!upstream and !host_runs_bs_output) {
-                // bs emits x86_64-linux executables; elsewhere only check
-                // that they compile.
-                test_step.dependOn(&compile.step);
-                continue;
-            }
+            // The x86_64-linux build runs only on an x86_64-linux host,
+            // which builds it too; elsewhere it adds nothing.
+            if (!upstream and !host_runs_bs_output) continue;
             const run = std.Build.Step.Run.create(b, b.fmt("run {s}{s}", .{ name, if (upstream) " (upstream)" else "" }));
             run.addFileArg(bin);
             if (expect.stdout) |out| run.addCheck(.{ .expect_stdout_exact = out });
