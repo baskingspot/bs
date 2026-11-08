@@ -3112,7 +3112,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     // runtime's archive would otherwise supply, as upstream links it.
     // For the C++ executable's target, after it, to reuse its libc++.
     {
-        const lib = b.addSystemCommand(&.{ upstreamZig(b), "c++", "-shared", "-fPIC", "-Wl,-soname,libcxxnew.so" });
+        const lib = b.addSystemCommand(&.{ upstreamZig(b), "c++", "-shared", "-fPIC", "-nostdlib++", "-Wl,-soname,libcxxnew.so" });
         lib.addFileArg(b.path("test/link_input/cxx_new.cpp"));
         const lib_file = lib.addOutputFileArg2("libcxxnew.so", .{ .prefix = "-o" });
         const new_exe = b.addRunArtifact(bs);
