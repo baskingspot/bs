@@ -213,7 +213,7 @@ unreferenced code.
 | Z024 | line longer than `max_length` | S plus report (limit) | none |
 | Z025 | `catch \|e\| return e` | S | none |
 | Z026 | empty `catch {}` outside `defer` | S | none |
-| Z027 | declaration accessed through an instance | Sema | ziglint needs `typeOf(lhs)` to be a user type, which fails for locals, parameters and pointers. Sema sees every field access on a value whose name resolves to a declaration and not a field (`fieldVal`, `zirFieldCall`). bs reports more: locals, parameters, pointers, std types. bs reports fewer in unanalyzed code |
+| Z027 | declaration accessed through an instance | the language | As built: Zig 0.17.1 rejects `instance.decl` (`no field named 'decl'`) and `instance.staticFn()` (`'staticFn' is not a member function`), so code that compiles has no finding left, and bs reports the compile error, as upstream. ziglint's remaining findings are methods whose receiver it does not recognize (`self: anytype`, `self: *T` with `const T = @This()`), which are false positives |
 | Z028 | inline `@import` | S | none |
 | Z029 | redundant `@as(T, x)` in a call argument, array or struct init | Sema (call arguments), S for array and struct init | as Z010's argument form: real types instead of identifier text, the callee resolved through any receiver. ziglint looks struct fields up only in the file's root containers. The init forms stay syntactic for parity, and moving them to Sema is later work |
 | Z030 | `deinit` sets `self.* = undefined` | S | none |
@@ -226,6 +226,7 @@ unreferenced code.
 Totals:
 - 22 rules run in the syntax pass only.
 - Five are Sema: Z010 and Z029 for call arguments, Z011, Z027, Z034.
+  (As built, Z027 is the language's, above.)
 - Six are hybrid: Z006, Z012, Z015, Z023, Z032, Z033.
 - Z003 is the existing parse error.
 
@@ -709,3 +710,33 @@ decides whether to drop it.
      ziglint-only 79 `unanalyzed` (each in a test block, a test helper,
      an unreferenced function or an untaken macOS branch) and 27
      unreached. The rest as before: 38 hybrid, 42 unreached, 0 bugs.
+4. Branch `lint-4-sema`: Z010 (returns and call arguments), Z029 (call
+   arguments) and Z034 in Sema, and the case `sema/` for ziglint's
+   semantic-mode tests of Z010, Z027 and Z029. As built, against the
+   design above:
+   - Z010 in returns: at a typed init (`validate_struct_init_ty`,
+     `struct_init_empty`) or a field of a type named by an identifier
+     (`field_ptr_load`) that is a `return`'s whole operand in the syntax
+     tree, when its type is the function's return type, through optionals
+     and error unions, and not an error set. In arguments: an explicit
+     `T{...}` whose type the parameter gives, through optionals and error
+     unions; Z029: `@as(T, x)` with `T` exactly the parameter's type
+     (`Sema.lintArg`, before the argument's coercion). Z034: a `print`
+     method of std's `Io.Writer` (`Sema.lintPrint`). The messages come
+     from the syntax tree, with ziglint's text (`Linter.redundantType`).
+   - Not in a generic function's instances or inline calls, whose types
+     can differ from one to the next (`@as(@Int(.unsigned,
+     @bitSizeOf(T)), x)` to a `u64` parameter is redundant only for a
+     64-bit `T`): a finding must hold for all of them. bs reports fewer
+     there than the design's "once per source location".
+   - bs's tree had 6 findings ziglint's resolver cannot see (3 `WithInputs{...}`
+     arguments in Incremental.zig, one `ForeignFiles{...}` in Dwarf.zig,
+     and 2 deprecated `std.fmt.allocPrint` calls the branch itself
+     added); the branch fixes them.
+   - Z027 needs nothing: see the table.
+   - The syntax pass no longer runs those forms (`Linter.simple` is off),
+     but ziglint's unit tests of them run in its simple mode.
+   - ziglint writes Z010's field names yellow even without colour; bs's
+     messages have no escape codes.
+   - `LintState.sema_sig` also hashes which Sema rules the config
+     reports, since Sema checks them all and the report filters.

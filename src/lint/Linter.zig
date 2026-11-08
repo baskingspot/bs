@@ -56,10 +56,15 @@ parent_map: []Ast.Node.OptionalIndex = &.{},
 /// file that has an ignore comment; empty for one that has none.
 line_starts: std.ArrayList(u32) = .empty,
 has_ignores: bool = false,
+/// ziglint's simple mode in full, for the ported tests. bs's build
+/// (`run`) leaves the forms Sema answers with types to Sema: Z010 in
+/// returns and call arguments, Z029 in call arguments, and Z034
+/// (docs/slop/ziglint-in-bs.md, section 1).
+simple: bool = false,
 
 /// The rules' version, in the name of the frontend's cached findings
 /// (`Frontend.lintFindings`): bump it when a rule changes.
-pub const version: u32 = 1;
+pub const version: u32 = 2;
 
 /// Z024's facts record every line longer than this, whatever the config's
 /// limit; a config with a lower one makes the report step scan the source
@@ -85,8 +90,12 @@ pub const Diagnostic = struct {
 /// Lints `tree`, parsed from `source` without errors, and returns its
 /// findings, in `arena`.
 pub fn run(arena: std.mem.Allocator, source: [:0]const u8, tree: Ast, path: []const u8) []const Diagnostic {
+    return runIn(arena, source, tree, path, false);
+}
+
+fn runIn(arena: std.mem.Allocator, source: [:0]const u8, tree: Ast, path: []const u8, simple: bool) []const Diagnostic {
     std.debug.assert(tree.errors.len == 0);
-    var self: Linter = .{ .allocator = arena, .source = source, .path = path, .tree = tree };
+    var self: Linter = .{ .allocator = arena, .source = source, .path = path, .tree = tree, .simple = simple };
     self.has_ignores = std.mem.find(u8, source, "// ziglint-ignore:") != null;
     self.lint();
     return self.diagnostics.items;
@@ -110,7 +119,7 @@ fn lint(self: *Linter) void {
     self.checkInlineImports();
     self.checkCatchReturnAll();
     self.checkEmptyCatchAll();
-    self.checkPrintLiteralArgs();
+    if (self.simple) self.checkPrintLiteralArgs();
 }
 
 fn collectAllIdentifiers(self: *Linter) void {
@@ -1540,8 +1549,10 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
         },
         .@"return" => self.checkReturn(node),
         .call_one, .call_one_comma, .call, .call_comma => {
-            self.checkCallArgs(node);
-            self.checkRedundantAsInCallArgs(node);
+            if (self.simple) {
+                self.checkCallArgs(node);
+                self.checkRedundantAsInCallArgs(node);
+            }
 
             self.checkCompoundAssert(node);
         },
@@ -2086,7 +2097,7 @@ fn checkDupeImport(self: *Linter, var_decl: Ast.full.VarDecl, name_token: Ast.To
 
 fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
     const return_expr = self.tree.nodeData(node).opt_node.unwrap() orelse return;
-    self.checkRedundantType(return_expr, true);
+    if (self.simple) self.checkRedundantType(return_expr, true);
 
     self.checkReturnTry(node, return_expr);
 
@@ -2171,8 +2182,7 @@ fn checkPrintLiteralArgs(self: *Linter) void {
         const method_token = callee_data[1];
         if (!std.mem.eql(u8, self.tree.tokenSlice(method_token), "print")) continue;
 
-        if (!self.isFormatlessStringLiteral(call.ast.params[0])) continue;
-        if (!self.isEmptyArgsTuple(call.ast.params[1])) continue;
+        if (!isPrintLiteral(&self.tree, call)) continue;
         if (!self.isIoWriterExpr(node, callee_data[0])) continue;
 
         const loc = self.tree.tokenLocation(0, method_token);
@@ -2180,21 +2190,28 @@ fn checkPrintLiteralArgs(self: *Linter) void {
     }
 }
 
+/// Whether `call`'s arguments are Z034's: a format string without
+/// placeholders and an empty args tuple (Sema's `lintPrint`, and above).
+pub fn isPrintLiteral(tree: *const Ast, call: Ast.full.Call) bool {
+    if (call.ast.params.len != 2) return false;
+    return isFormatlessStringLiteral(tree, call.ast.params[0]) and isEmptyArgsTuple(tree, call.ast.params[1]);
+}
+
 /// Returns true when the argument is a string literal with no format
 /// placeholders. Doubled braces are literal braces, not placeholders.
-fn isFormatlessStringLiteral(self: *Linter, node: Ast.Node.Index) bool {
-    return switch (self.tree.nodeTag(node)) {
+fn isFormatlessStringLiteral(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
         .string_literal => blk: {
-            const raw = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+            const raw = tree.tokenSlice(tree.nodeMainToken(node));
             if (raw.len < 2) break :blk false;
             break :blk !hasFormatPlaceholder(raw[1 .. raw.len - 1], true);
         },
         .multiline_string_literal => blk: {
-            const first = self.tree.firstToken(node);
-            const last = self.tree.lastToken(node);
+            const first = tree.firstToken(node);
+            const last = tree.lastToken(node);
             var token = first;
             while (token <= last) : (token += 1) {
-                const raw = self.tree.tokenSlice(token);
+                const raw = tree.tokenSlice(token);
                 // Multiline string bodies do not process backslash escapes.
                 const body = if (std.mem.startsWith(u8, raw, "\\\\")) raw[2..] else raw;
                 if (hasFormatPlaceholder(body, false)) break :blk false;
@@ -2225,9 +2242,9 @@ fn hasFormatPlaceholder(raw: []const u8, escapes: bool) bool {
 
 /// `.{}` is an anonymous empty struct init. A named empty struct (`Foo{}`)
 /// also works as an args tuple but is not what this rule targets.
-fn isEmptyArgsTuple(self: *Linter, node: Ast.Node.Index) bool {
+fn isEmptyArgsTuple(tree: *const Ast, node: Ast.Node.Index) bool {
     var init_buf: [2]Ast.Node.Index = undefined;
-    const struct_init = self.tree.fullStructInit(&init_buf, node) orelse return false;
+    const struct_init = tree.fullStructInit(&init_buf, node) orelse return false;
     return struct_init.ast.fields.len == 0 and struct_init.ast.type_expr.unwrap() == null;
 }
 
@@ -2964,31 +2981,10 @@ fn isDirectStdImport(self: *Linter, node: Ast.Node.Index) bool {
 
 fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: bool) void {
     const tag = self.tree.nodeTag(node);
-
-    if (isExplicitStructInit(tag)) {
-        var buf: [2]Ast.Node.Index = undefined;
-        const struct_init = self.tree.fullStructInit(&buf, node) orelse return;
-        const type_node = struct_init.ast.type_expr.unwrap() orelse return;
-        const type_token = self.tree.nodeMainToken(type_node);
-        const loc = self.tree.tokenLocation(0, type_token);
-        // Get the fields part (everything after the type name)
-        const full_expr = self.getNodeSource(node);
-        const type_name = self.tree.tokenSlice(type_token);
-        // Find where the type name ends and extract the { ... } part
-        const brace_start = std.mem.find(u8, full_expr, "{") orelse return;
-        const fields_part = truncateExpr(full_expr[brace_start..]);
-        const full_truncated = truncateExpr(full_expr);
-        const msg = self.allocator.print(".{s}\x00{s}", .{ fields_part, full_truncated }) catch return;
-        self.allocated_contexts.append(self.allocator, msg) catch {
-            self.allocator.free(msg);
-            return;
-        };
-        _ = type_name;
-        self.report(loc, .Z010, msg);
-    } else if (check_field_access and tag == .field_access) {
+    if (!isExplicitStructInit(tag)) {
+        if (!check_field_access or tag != .field_access) return;
         // Only flag if the LHS is a PascalCase identifier (likely a type/enum)
-        const data = self.tree.nodeData(node).node_and_token;
-        const lhs = data[0];
+        const lhs = self.tree.nodeData(node).node_and_token[0];
         if (self.tree.nodeTag(lhs) != .identifier) return;
         const lhs_name = self.tree.tokenSlice(self.tree.nodeMainToken(lhs));
         if (!isPascalCase(lhs_name)) return;
@@ -3002,19 +2998,37 @@ fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: b
                 else => {},
             }
         };
-
-        const field_token = data[1];
-        const field_name = self.tree.tokenSlice(field_token);
-        const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(lhs));
-        // Full expression is "Type.field"
-        const full_expr = truncateExpr(self.getNodeSource(node));
-        const msg = self.allocator.print(".{s}\x00{s}", .{ field_name, full_expr }) catch return;
-        self.allocated_contexts.append(self.allocator, msg) catch {
-            self.allocator.free(msg);
-            return;
-        };
-        self.report(loc, .Z010, msg);
     }
+    const found = (redundantType(self.allocator, &self.tree, node) catch return) orelse return;
+    self.allocated_contexts.append(self.allocator, found.context) catch {
+        self.allocator.free(found.context);
+        return;
+    };
+    self.report(self.tree.tokenLocation(0, found.token), .Z010, found.context);
+}
+
+/// Z010's finding for an explicit `T{...}` or a `X.y` at `node`, whose type
+/// is known from where it is (Sema's `lintReturn` and `lintArg`, or the
+/// checks above): the token it is reported at and its context, in `gpa`.
+pub fn redundantType(gpa: std.mem.Allocator, tree: *const Ast, node: Ast.Node.Index) !?struct { token: Ast.TokenIndex, context: []const u8 } {
+    if (isExplicitStructInit(tree.nodeTag(node))) {
+        var buf: [2]Ast.Node.Index = undefined;
+        const struct_init = tree.fullStructInit(&buf, node) orelse return null;
+        const type_node = struct_init.ast.type_expr.unwrap() orelse return null;
+        // Get the fields part (everything after the type name)
+        const full_expr = getNodeSourceFromTree(tree, node);
+        // Find where the type name ends and extract the { ... } part
+        const brace_start = std.mem.find(u8, full_expr, "{") orelse return null;
+        const fields_part = truncateExpr(full_expr[brace_start..]);
+        const full_truncated = truncateExpr(full_expr);
+        return .{ .token = tree.nodeMainToken(type_node), .context = try gpa.print(".{s}\x00{s}", .{ fields_part, full_truncated }) };
+    }
+    if (tree.nodeTag(node) != .field_access) return null;
+    const data = tree.nodeData(node).node_and_token;
+    const field_name = tree.tokenSlice(data[1]);
+    // Full expression is "Type.field"
+    const full_expr = truncateExpr(getNodeSourceFromTree(tree, node));
+    return .{ .token = tree.nodeMainToken(data[0]), .context = try gpa.print(".{s}\x00{s}", .{ field_name, full_expr }) };
 }
 
 fn getNodeSource(self: *Linter, node: Ast.Node.Index) []const u8 {
@@ -3587,7 +3601,7 @@ const TestLinter = struct {
             }
             return;
         }
-        for (run(a, t.source, tree, t.path)) |d| {
+        for (runIn(a, t.source, tree, t.path, true)) |d| {
             const on = switch (d.rule) {
                 inline else => |r| @field(t.config.rules, @tagName(r)).enabled,
             };

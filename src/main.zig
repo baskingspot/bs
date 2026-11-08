@@ -1837,7 +1837,7 @@ const LintState = struct {
 fn lintDiagnostics(arena: std.mem.Allocator, fe: *const Frontend, cfg: *const LintConfig, paths: diag.Paths, state: *LintState) ![]const diag.Diagnostic {
     var out: std.ArrayList(diag.Diagnostic) = .empty;
     state.covered_files.clearRetainingCapacity();
-    defer state.sema_sig = semaSig(fe, state.covered_files.items);
+    defer state.sema_sig = semaSig(fe, cfg, state.covered_files.items);
     for (fe.files.items, 0..) |*f, i| {
         const index: Frontend.File.Index = @fromBackingInt(@intCast(i));
         if (!try fe.lintCovers(arena, index)) continue;
@@ -1858,11 +1858,13 @@ fn lintDiagnostics(arena: std.mem.Allocator, fe: *const Frontend, cfg: *const Li
 }
 
 /// `LintState.sema_sig` of covered files `files` (indices, ascending):
-/// the Sema rules' version and the files' module names and paths.
-fn semaSig(fe: *const Frontend, files: []const u32) ?Frontend.Hash {
+/// the Sema rules' version, which of them `cfg` reports, and the files'
+/// module names and paths.
+fn semaSig(fe: *const Frontend, cfg: *const LintConfig, files: []const u32) ?Frontend.Hash {
     if (files.len == 0) return null;
     var h: std.crypto.hash.Blake3 = .init(.{});
     h.update(&std.mem.toBytes(Linter.version));
+    for (LintConfig.sema_rules) |r| h.update(&.{@intFromBool(cfg.enabled(r))});
     for (files) |i| {
         const f = &fe.files.items[i];
         h.update(fe.module(f.module).name);

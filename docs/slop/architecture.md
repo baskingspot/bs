@@ -9951,9 +9951,14 @@ owner's decisions are in docs/slop/ziglint-in-bs.md. What is built:
   build succeeded, so an edit build reads the findings of the edited
   files alone. The config file is reported as an input
   (`file_system_inputs`).
-- **Sema's rules.** Z011 (deprecated calls) is Sema's: in code from a
+- **Sema's rules.** Z010 (returns and call arguments), Z011, Z029 (call
+  arguments) and Z034 are Sema's (`LintConfig.sema_rules`): in code from a
   covered file (`Zcu.lint_covered`, a bit per file, empty without a config
-  or with Z011 off), `zirCall` (a declaration called by name) and
+  or with those rules off), Z010, Z029 and Z034 compare the types Sema has
+  at a typed init, a returned field of a type, an argument before its
+  coercion (`Sema.lintArg`) and a `print` call on `std.Io.Writer`
+  (`Sema.lintPrint`), and take the syntax for their findings' text from
+  the syntax tree. For Z011, `zirCall` (a declaration called by name) and
   `zirFieldCall` (a declaration of a type, or a method) look the callee
   up in its file's deprecation table (`Zcu.deprecation`). The table
   (`Frontend.deprecations`, `Linter.deprecations`) lists the file's
@@ -9977,8 +9982,8 @@ owner's decisions are in docs/slop/ziglint-in-bs.md. What is built:
   callers. A green unit had no findings if the build that recorded it
   checked the same files with the same rules: `main.LintState.sema_sig`
   hashes the covered files' paths in their modules and the rules'
-  version, null when no file is covered or Z011 is off (no unit can
-  have a finding then). `<compilation dir>/lint` keeps the last
+  version and which Sema rules the config reports, null when no file
+  is covered or those rules are off (no unit can have a finding then). `<compilation dir>/lint` keeps the last
   successful build's; a build whose signature differs analyzes
   everything, and a first build takes only a donor published with its
   signature (`Incremental.lint_sig`, the donor's `lintsig` file). So

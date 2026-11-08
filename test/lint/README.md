@@ -7,9 +7,9 @@ and in `src/lint/` as follows. `zig build test` runs all of them.
 
 | ziglint | Tests | In bs |
 |---|---:|---|
-| `src/Linter.zig` | 305 | 276 ported unchanged as unit tests at the end of `src/lint/Linter.zig`, through `TestLinter`, which gives them ziglint's API over the syntax pass. 28 test ziglint's semantic mode: the 12 of Z011 are adapted as the case `deprecated/` (below), but for one that does nothing on Zig 0.16 and later, and 16 wait for the rest of the Sema rules. 1 tests a helper bs does not have (`getContainerMembers: members outlive the call`). |
+| `src/Linter.zig` | 305 | 276 ported unchanged as unit tests at the end of `src/lint/Linter.zig`, through `TestLinter`, which gives them ziglint's API over the syntax pass. 28 test ziglint's semantic mode: the 12 of Z011 are adapted as the case `deprecated/` (below), but for one that does nothing on Zig 0.16 and later; the 9 of Z010, Z027 and Z029 as the case `sema/`; 7 wait for the hybrid rules. 1 tests a helper bs does not have (`getContainerMembers: members outlive the call`). |
 | `src/rules.zig` | 11 | Ported unchanged, in `src/lint/rules.zig`. |
-| `src/doc_tests.zig` | 2 | `doc tests` is ported in `src/lint/Linter.zig`: 144 of the 146 `zig` blocks of `docs/rules/*.md` (copied to `src/lint/docs/` with ziglint's license) run; the Z011 example is in the case `deprecated/`, and the Z027 one waits for that rule. The `compile-test` probes, which check that a documented replacement compiles, and `parse compile test probe` are not ported. |
+| `src/doc_tests.zig` | 2 | `doc tests` is ported in `src/lint/Linter.zig`: 144 of the 146 `zig` blocks of `docs/rules/*.md` (copied to `src/lint/docs/` with ziglint's license) run; the Z011 example is in the case `deprecated/`; the Z027 one does not compile in Zig 0.17.1 (below). The `compile-test` probes, which check that a documented replacement compiles, and `parse compile test probe` are not ported. |
 | `src/Config.zig` | 6 | Replaced by the cases here: the defaults (`rules.zig`), `max_length` and rule switches (`switches/`, `short_lines/`), `paths` (`paths/`). `runtime rule check` and `set rule enabled` test ziglint's `Config` API, which bs does not have. A config error is `bad_config/`. |
 | `src/TypeResolver.zig` | 34 | Not ported: bs answers type questions with Sema. |
 | `src/ModuleGraph.zig` | 4 | Not ported: bs's frontend loads the modules. |
@@ -55,25 +55,43 @@ The case also shows the two ways bs's answer differs from ziglint's
 (`throughPointer`), which ziglint's resolver cannot follow, is reported,
 and a call in a function nothing references (`unreferenced`) is not.
 
-## Waiting for the Sema rules
+Sema also answers Z010 in returns and call arguments, Z029 in call
+arguments, and Z034, with types where ziglint compares spellings. The
+syntax pass leaves those forms to Sema, but the ported unit tests run them
+in ziglint's simple mode (`Linter.simple`), so they still test the port.
+The case `sema/` covers ziglint's semantic-mode tests of these rules, and
+shows where bs's answer differs:
+
+| ziglint test | In `sema/` |
+|---|---|
+| `Z010: allow merged error set members in return` | `oops()` |
+| `Z027: flag instance accessing const` | Not portable: `instance.bar` is a compile error in Zig 0.17.1 (`no field named 'bar'`), so bs reports that instead, as upstream does. The Z027 doc example is the same program. |
+| `Z027: flag instance accessing static fn` | Not portable: `instance.staticFn()` is a compile error (`'staticFn' is not a member function`). |
+| `Z027: allow instance method call` | `foo.getField()` |
+| `Z027: allow field access` | `foo.field` |
+| `Z027: allow type-level access` | `Foo.bar` |
+| `Z027: allow method with Self receiver` | `foo.getFieldSelf()` |
+| `Z027: allow method with named type receiver` | `foo.getFieldNamed()` |
+| `Z029: detect redundant @as in method call arg` | `instance.setValue(@as(u32, 42))`, with a `var` instance, since `setValue` takes a mutable pointer |
+
+So Z027 has nothing left to report in code that compiles: an instance
+reaches only its fields and its methods. Where bs reports more than
+ziglint: a call through a local receiver (`p.move(Point{...})`), `print`
+through a parameter or a field with an inferred type. Fewer: an error
+set's `E.y`, and `Defaults.point` returned as a `Point`, whose suggested
+`.point` would name `Point.point`; nothing in a generic function, whose
+types differ between instances (`widen`); and nothing in an unreferenced
+function.
+
+## Waiting for the hybrid rules
 
 These ziglint tests build a module graph and need its `TypeResolver`.
-They become cases with the rest of the Sema rules (Z027, and the
-type-aware parts of Z006, Z010, Z012, Z023 and Z029):
+They become cases with the type-aware parts of Z006, Z012 and Z023:
 
 - `Z012: member-of-module type alias is imported, not private`
 - `Z012: bare module-name import falls back to syntax`
 - `Z006: resolver sees camelCase type-fn call as type alias`
-- `Z010: allow merged error set members in return`
 - `Z023: argument order - aliased Allocator`
 - `Z023: argument order - aliased Io`
 - `Z023: receiver param with struct name is ok (semantic)`
 - `Z023: file-as-struct receiver is ok (semantic)`
-- `Z027: flag instance accessing const`
-- `Z027: flag instance accessing static fn`
-- `Z027: allow instance method call`
-- `Z027: allow field access`
-- `Z027: allow type-level access`
-- `Z027: allow method with Self receiver`
-- `Z027: allow method with named type receiver`
-- `Z029: detect redundant @as in method call arg`

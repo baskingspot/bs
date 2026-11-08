@@ -6,14 +6,18 @@ tree's build (`bs build` by default), matches the findings by rule, file
 and line, and classifies every difference (docs/slop/ziglint-in-bs.md,
 "The conformance measure"):
 
-  sema-type     a Z011 finding only bs has: Sema resolves calls ziglint's
-                resolver cannot (through locals, parameters, pointers)
-  unanalyzed    a Z011 finding only ziglint has, in a file bs reached: in
-                code Sema did not analyze (nothing references it)
-  sema-pending  Z027, which needs Sema; bs does not check it yet
+  sema-type     a finding of a Sema rule (Z010, Z011, Z029, Z034) only bs
+                has: Sema types what ziglint's resolver cannot (locals,
+                parameters, pointers, aliases)
+  unanalyzed    a finding of a Sema rule only ziglint has, in a file bs
+                reached: in code Sema did not analyze (nothing references
+                it), or where Sema's types say the form is needed (Z010's
+                `Other.decl` returned as a `T`)
+  language      Z027: in code that compiles, ziglint's findings are
+                methods whose receiver it does not recognize
   hybrid        a rule ziglint answers with its type resolver, which bs
-                answers from the syntax for now (Z006, Z010, Z012, Z015,
-                Z023, Z029, Z032, Z033, Z034)
+                answers from the syntax for now (Z006, Z012, Z015, Z023,
+                Z032, Z033)
   unreached     a file bs reported nothing in: no compilation reached it,
                 or every finding in it is of the classes above
   bug           anything else, to be fixed
@@ -38,9 +42,9 @@ import re
 import subprocess
 import sys
 
-SEMA = {"Z011"}
-PENDING = {"Z027"}
-HYBRID = {"Z006", "Z010", "Z012", "Z015", "Z023", "Z029", "Z032", "Z033", "Z034"}
+SEMA = {"Z010", "Z011", "Z029", "Z034"}
+LANGUAGE = {"Z027"}
+HYBRID = {"Z006", "Z012", "Z015", "Z023", "Z032", "Z033"}
 
 ZIGLINT_LINE = re.compile(r"^(Z\d{3}): (.+?):(\d+): ")
 # Text output (`error[style, Z026]`) and the build runner's rendering of
@@ -94,8 +98,8 @@ def classify(key, side, bs_files):
         return "sema-type"
     if rule in SEMA and path in bs_files:
         return "unanalyzed"
-    if rule in PENDING:
-        return "sema-pending"
+    if rule in LANGUAGE:
+        return "language"
     if rule in HYBRID:
         return "hybrid"
     if path not in bs_files:

@@ -1090,6 +1090,15 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         \\grep -q "main.zig:3:9: error\[deprecated, Z011\]: 'thing' is deprecated: Deprecated: gone soon." log || { cat log; exit 1; }
         \\printf '/// Does it again.\npub fn thing() void {}\n' > lib.zig
         \\"$bs" build-exe main.zig $c
+        \\# Sema checks every rule it answers, and the report keeps those the
+        \\# config turns on: a unit recorded with Z029 off is analyzed again
+        \\# when it is turned on.
+        \\printf 'fn take(v: u32) u32 {\n    return v;\n}\npub fn main() void {\n    _ = take(@as(u32, 1));\n}\n' > main.zig
+        \\printf '.{ .rules = .{ .Z029 = .{ .enabled = false } } }\n' > .ziglint.zon
+        \\"$bs" build-exe main.zig $c
+        \\printf '.{}\n' > .ziglint.zon
+        \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with Z029 on passed"; exit 1; fi
+        \\grep -q "main.zig:5:14: error\[style, Z029\]" log || { cat log; exit 1; }
         ,
         "sh",
     });

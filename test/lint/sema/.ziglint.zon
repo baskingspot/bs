@@ -1,0 +1,7 @@
+// ziglint's defaults, but for line length, which the expected output's
+// comment lines would break.
+.{
+    .rules = .{
+        .Z024 = .{ .enabled = false },
+    },
+}

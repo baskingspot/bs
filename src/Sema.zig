@@ -14,6 +14,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const Ast = std.zig.Ast;
+const Linter = @import("lint/Linter.zig");
+const lint_rules = @import("lint/rules.zig");
 const Zir = std.zig.Zir;
 const BigInt = std.math.big.int.Managed;
 const BigIntConst = std.math.big.int.Const;
@@ -4331,6 +4333,8 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
             .validate_array_init_result_ty,
             .set_eval_branch_quota,
             => {
+                if (tags[@backingInt(inst)] == .validate_struct_init_ty and sema.zcu.lintCovers(sema.file))
+                    if (sema.resolveValue(sema.resolveInst(data.un_node.operand))) |ty| try sema.lintReturn(block, block.nodeSrc(data.un_node.src_node), ty);
                 if (tags[@backingInt(inst)] == .set_eval_branch_quota) {
                     const src = block.nodeSrc(data.un_node.src_node);
                     const quota = try sema.resolveInt(block, src, data.un_node.operand, .u32_type, "operand to '@setEvalBranchQuota' must be comptime-known");
@@ -5290,6 +5294,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.pl_node.src_node);
             const name = sema.zirString(extra.field_name_start);
             const lhs = sema.resolveInst(extra.lhs);
+            if (tag == .field_ptr_load and sema.zcu.lintCovers(sema.file)) try sema.lintReturnField(block, src, lhs);
             break :blk if (tag == .field_ptr) sema.fieldPtr(block, src, lhs, name) else sema.fieldPtrLoad(block, src, lhs, name);
         },
         .field_ptr_named, .field_ptr_named_load => blk: {
@@ -5396,6 +5401,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             // `T{}` names its type; the others take their result type.
             const ty_src: Src = if (tag == .struct_init_empty) .{ .base = src.base, .loc = .{ .init_ty = data.un_node.src_node } } else src;
             const result_ty = try sema.resolveType(block, ty_src, data.un_node.operand);
+            if (tag == .struct_init_empty and sema.zcu.lintCovers(sema.file)) try sema.lintReturn(block, src, result_ty);
             if (tag != .struct_init_empty_ref_result) {
                 const base = try sema.structInitType(block, src, sema.unwrapOptEu(result_ty));
                 break :blk sema.coerce(block, result_ty, try sema.structInitEmpty(block, src, base), src);
@@ -20527,6 +20533,7 @@ fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     }
     const self: Ref = if (by_ptr.?) self_ptr else try sema.analyzeLoad(block, src, self_ptr);
     try sema.lintCall(block, src, nav, callee, .none);
+    if (sema.zcu.lintCovers(sema.file) and std.mem.eql(u8, name, "print")) try sema.lintPrint(block, src, container);
     return sema.analyzeCall(block, src, callee, self, args, modifier);
 }
 
@@ -20693,6 +20700,112 @@ fn lintDeprecated(sema: *Sema, src: Src, display: ?[]const u8, doc: []const u8) 
     });
 }
 
+/// Z010 and Z029 for argument `arg` of the call at `src`, the `i`th the
+/// call spells, before its coercion to parameter type `param_ty`: an
+/// explicit `T{...}` whose type the parameter gives (through optionals and
+/// error unions), or `@as(T, x)` with `T` the parameter's type.
+fn lintArg(sema: *Sema, block: *Block, src: Src, i: usize, param_ty: Index, arg: Ref) CompileError!void {
+    if (sema.lintInGeneric(block)) return;
+    const off = src.nodeOffset() orelse return;
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    var call_buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buf, off.toAbsolute(src.base)) orelse return;
+    if (i >= call.ast.params.len) return;
+    const node = call.ast.params[i];
+    switch (tree.nodeTag(node)) {
+        .struct_init, .struct_init_comma, .struct_init_one, .struct_init_one_comma => if (sema.typeOf(arg) == sema.unwrapOptEu(param_ty)) try sema.lintRedundantType(tree, node),
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (sema.typeOf(arg) != param_ty or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return;
+            var buf: [2]Ast.Node.Index = undefined;
+            const params = tree.builtinCallParams(&buf, node) orelse return;
+            if (params.len != 2) return;
+            try sema.lintFinding(tree.tokenStart(tree.nodeMainToken(node)), .Z029, tree.getNodeSource(params[0]));
+        },
+        else => {},
+    }
+}
+
+/// Z010 at the operand of a `return` at `src` (an explicit `T{...}` or
+/// `X.y`) whose type `ty` (`T`, or the type `X` names) is what the function
+/// returns, through optionals and error unions. An error set's `E.y` is
+/// left as it is written, as ziglint does.
+fn lintReturn(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
+    const off = src.nodeOffset() orelse return;
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    const node = off.toAbsolute(src.base);
+    // The whole operand: `return` before it, and the end of the
+    // expression after it.
+    const first = tree.firstToken(node);
+    if (first == 0 or tree.tokenTag(first - 1) != .keyword_return) return;
+    switch (tree.tokenTag(tree.lastToken(node) + 1)) {
+        .semicolon, .comma, .r_paren, .r_brace, .r_bracket, .keyword_else => {},
+        else => return,
+    }
+    const ret_ty = if (block.inlining) |inlining| inlining.ret_ty else sema.fn_ret_ty;
+    if (sema.lintInGeneric(block)) return;
+    if (ret_ty == .none or ty != sema.unwrapOptEu(ret_ty) or Type.class(sema.ip, ty) == .error_set) return;
+    try sema.lintRedundantType(tree, node);
+}
+
+/// `lintReturn` for `lhs.y` at `src`, if `lhs` is a type, or a pointer to
+/// one, and `lhs` is spelled as a name.
+fn lintReturnField(sema: *Sema, block: *Block, src: Src, lhs: Ref) CompileError!void {
+    const off = src.nodeOffset() orelse return;
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    const node = off.toAbsolute(src.base);
+    if (tree.nodeTag(node) != .field_access or tree.nodeTag(tree.nodeData(node).node_and_token[0]) != .identifier) return;
+    const first = tree.firstToken(node);
+    if (first == 0 or tree.tokenTag(first - 1) != .keyword_return) return;
+    const lhs_ty = sema.typeOf(lhs);
+    const t = if (lhs_ty == .type_type)
+        lhs
+    else if (Type.class(sema.ip, lhs_ty) == .pointer and Type.ptrInfo(sema.ip, lhs_ty).child == .type_type)
+        try sema.analyzeLoad(block, src, lhs)
+    else
+        return;
+    try sema.lintReturn(block, src, sema.resolveValue(t) orelse return);
+}
+
+/// Z034 at the call at `src` of `print` on `container`, if it is
+/// `std.Io.Writer` and the call's arguments are a format string without
+/// placeholders and `.{}`.
+fn lintPrint(sema: *Sema, block: *Block, src: Src, container: Index) CompileError!void {
+    if (sema.lintInGeneric(block)) return;
+    const zcu = sema.zcu;
+    const key = sema.ip.containerType(container) orelse return;
+    const f = zcu.file(key.file);
+    if (f.module != .std or !std.mem.eql(u8, f.sub_path, "Io/Writer.zig") or container != try zcu.fileRootType(key.file)) return;
+    const off = src.nodeOffset() orelse return;
+    const tree = try zcu.fe.tree(@fromBackingInt(sema.file));
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buf, off.toAbsolute(src.base)) orelse return;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access or !Linter.isPrintLiteral(tree, call)) return;
+    try sema.lintFinding(tree.tokenStart(tree.nodeData(call.ast.fn_expr).node_and_token[1]), .Z034, "");
+}
+
+/// Whether `block` is in a generic function's instance or inline call,
+/// whose types can differ from one instance or call to the next: Z010,
+/// Z029 and Z034 skip it, since a finding must hold for all of them
+/// (`@as(@Int(.unsigned, @bitSizeOf(T)), x)` is redundant to a `u64`
+/// parameter only when `T` is 64 bits).
+fn lintInGeneric(sema: *Sema, block: *const Block) bool {
+    const ip = sema.ip;
+    var inlining: ?*const Block.Inlining = block.inlining;
+    while (inlining) |i| : (inlining = i.parent) if (Type.fnIsGeneric(ip, ip.keyPayload(.func_type, ip.typeOf(i.func)))) return true;
+    return sema.func != .none and ip.keyPayload(.func, sema.func).generic_owner != .none;
+}
+
+/// A Z010 finding at explicit `T{...}` or `X.y` `node`.
+fn lintRedundantType(sema: *Sema, tree: *const Ast, node: Ast.Node.Index) CompileError!void {
+    const found = try Linter.redundantType(sema.zcu.arena.allocator(), tree, node) orelse return;
+    try sema.lintFinding(tree.tokenStart(found.token), .Z010, found.context);
+}
+
+/// A finding of rule `rule` at byte `offset` of the analyzed file.
+fn lintFinding(sema: *Sema, offset: u32, rule: lint_rules.Rule, context: []const u8) CompileError!void {
+    try sema.zcu.lint_findings.append(sema.gpa, .{ .file = sema.file, .offset = offset, .rule = rule, .context = context });
+}
+
 /// Whether `ty` is a single-item (or, with `c`, a C) pointer to `child`.
 fn isPtrTo(sema: *Sema, ty: Index, child: Index, c: bool) bool {
     if (Type.class(sema.ip, ty) != .pointer) return false;
@@ -20848,6 +20961,7 @@ fn analyzeCall(
                 // are not analyzed.
                 if (sema.typeOf(arg) == .noreturn_type) return .unreachable_value;
                 if (sema.isErrorType(sema.typeOf(arg))) sema.any_arg_is_error = true;
+                if (param_ty != .generic_poison_type and sema.zcu.lintCovers(sema.file)) try sema.lintArg(block, src, k, param_ty, arg);
                 args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerceCtx(block, param_ty, arg, sema.callArgSrc(src, first_arg != .none, arg_i), .{ .param = .{ .func = func, .index = arg_i } });
                 arg_i += 1;
             }

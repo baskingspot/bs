@@ -182,9 +182,13 @@ pub fn enabled(cfg: *const Config, rule: Rule) bool {
     }
 }
 
+/// The rules Sema answers (docs/slop/ziglint-in-bs.md, section 1).
+pub const sema_rules = [_]Rule{ .Z010, .Z011, .Z029, .Z034 };
+
 /// Whether any rule Sema answers is on (`Zcu.lint_covered`).
 pub fn semaRules(cfg: *const Config) bool {
-    return cfg.enabled(.Z011);
+    for (sema_rules) |r| if (cfg.enabled(r)) return true;
+    return false;
 }
 
 /// Whether a file's findings (`Linter.run`) need its source to report:

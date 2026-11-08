@@ -61,10 +61,6 @@ fn order(a: std.mem.Allocator, comptime T: type) T {
     return max;
 }
 
-fn hello(w: *std.Io.Writer) !void {
-    try w.print("hello\n", .{});
-}
-
 const unused_import = @import("builtin");
 
 const Thing = struct {
@@ -88,7 +84,6 @@ test {
     _ = Thing;
     _ = &expose;
     _ = &order;
-    _ = &hello;
     _ = @import("std").math;
 }
 
@@ -133,8 +128,6 @@ test {
 //   | return try value;
 // rules.zig:51:8: error[style, Z012]: public function exposes private type 'Hidden'
 //   | pub fn expose() Hidden {
-// rules.zig:52:12: error[style, Z010]: prefer `.{}` over `Hidden{}`
-//   | return Hidden{};
 // rules.zig:55:13: error[style, Z035]: use alias 'mem' instead of 'std.mem'
 //   | fn order(a: std.mem.Allocator, comptime T: type) T {
 // rules.zig:55:41: error[style, Z023]: 'type' parameter should come before 'Allocator'
@@ -145,14 +138,12 @@ test {
 //   | const list = [_]u32{@as(u32, 2)};
 // rules.zig:60:9: error[style, Z028]: inline @import; assign to a top-level const
 //   | _ = @import("std").math.maxInt(u8);
-// rules.zig:65:11: error[style, Z034]: print() has no format placeholders and empty args; use writeAll() instead
-//   | try w.print("hello\n", .{});
-// rules.zig:68:7: error[style, Z007]: duplicate import '"builtin"'
+// rules.zig:64:7: error[style, Z007]: duplicate import '"builtin"'
 //   | const unused_import = @import("builtin");
-// rules.zig:68:7: error[style, Z013]: unused import 'unused_import'
+// rules.zig:64:7: error[style, Z013]: unused import 'unused_import'
 //   | const unused_import = @import("builtin");
-// rules.zig:73:8: error[style, Z030]: deinit should set t.* = undefined
+// rules.zig:69:8: error[style, Z030]: deinit should set t.* = undefined
 //   | fn deinit(t: *Thing, gpa: std.mem.Allocator) void {
-// rules.zig:73:31: error[style, Z035]: use alias 'mem' instead of 'std.mem'
+// rules.zig:69:31: error[style, Z035]: use alias 'mem' instead of 'std.mem'
 //   | fn deinit(t: *Thing, gpa: std.mem.Allocator) void {
-// 31 errors
+// 29 errors
