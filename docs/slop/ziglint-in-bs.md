@@ -606,7 +606,8 @@ Two passages of `docs/slop/architecture.md` change with it:
 - The `ziglint` CI job stays as it is. It is blocking once
   `ci-block-ziglint` lands, running ziglint 0.8.1 from mattware.
 - A non-blocking `lint-parity` job runs `tools/lint/parity.py` on bs's
-  tree and on 84c75e56, and reports the counts.
+  tree, on 84c75e56 and on the parity set, and reports the counts
+  (built: "Built so far", 6).
 
 **At parity.** Parity means:
 - the suite passes;
@@ -616,7 +617,7 @@ Two passages of `docs/slop/architecture.md` change with it:
 
 bs's own CI can then enforce the rules with bs. The test job builds bs
 with upstream zig, so the check needs a bs compile of bs's own programs:
-a `just lint-bs` recipe that runs `bs build` for every program the
+a `just lint-bs` recipe (built) that runs bs for every program the
 config's `paths` cover, with `-fno-emit-bin` where the build allows it.
 Two things make the ziglint job redundant:
 - that recipe blocks for a release cycle;
@@ -772,3 +773,20 @@ decides whether to drop it.
      declaration, so 16 calls through `const path = Io.Dir.path;` in tls
      were reported. As ziglint's `findStdlibAliasDecl`, aliases are no
      longer followed past a std declaration (`deprecated/` covers it).
+6. Branch `lint-parity-ci`: section 7's non-blocking `lint-parity` CI
+   job and the `just lint-bs` recipe.
+   - `just lint-parity` runs `parity.py` on bs's tree, on 84c75e56 (a
+     worktree under `.zig-cache/lint-parity`, fetched when missing) and
+     on the parity set (`-j2`; a wider run ran an orb out of memory), and
+     fails only on a `bug` difference. Locally (2026-11-08) it took 6
+     minutes: this tree 0 findings on both sides, 84c75e56 1080 matched,
+     0 bugs on all three.
+   - `just lint-bs` builds every program in the config's paths with bs:
+     `bs build` (bs and build.zig), `build-exe -fno-emit-bin` for the
+     benchmark and tool programs, `test --test-no-exec -fno-emit-bin` for
+     the conformance test runners and edithunt's swap project. A Z001
+     put into a file of each kind fails it. Unchecked:
+     bench/realworld/vaxis_render.zig (needs libvaxis) and
+     bench/workloads/vaxis-build (its own build root, so no config is
+     found). It is not a CI job yet; making it block is the owner's call
+     after a release cycle.
