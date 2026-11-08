@@ -17,6 +17,7 @@ const Index = InternPool.Index;
 const Ir = @import("Ir.zig");
 const Type = @import("Type.zig");
 const Zcu = @import("Zcu.zig");
+const Language = @import("language.zig").Language;
 const Frontend = @import("Frontend.zig");
 const Diag = @import("diag.zig");
 const VersionScript = @import("link/VersionScript.zig");
@@ -1679,7 +1680,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         if (emit.shared) for (emit.exports.items) |x| if (x.visibility != .hidden)
             try dylib_exports.append(emit.gpa, .{ .key = x.key, .name = x.name, .offset = x.offset, .weak = x.weak });
         const dylib: MachO.Dylib = .{ .install_name = emit.install_name orelse sub_path, .current_version = emit.dylib_version, .exports = dylib_exports.items };
-        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry orelse undefined, .dylib = if (emit.shared) &dylib else null, .libs = libs, .rpaths = rpaths.items, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = if (emit.strip) &.{} else emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .min_os = emit.macos_min, .sdk = emit.macos_sdk, .aliases = emit.aliases.items, .local_symbols = emit.input_symbols, .unwind = emit.input_unwind }) catch |err| {
+        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry orelse undefined, .dylib = if (emit.shared) &dylib else null, .libs = libs, .rpaths = rpaths.items, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = if (emit.strip) &.{} else emit.debug.items, .comp_dir = cwd, .stabs = machoStabs(emit.zcu.language), .stack_size = emit.stack_size, .min_os = emit.macos_min, .sdk = emit.macos_sdk, .aliases = emit.aliases.items, .local_symbols = emit.input_symbols, .unwind = emit.input_unwind }) catch |err| {
             try emit.linkFailed(err, diag);
             return false;
         };
@@ -1957,6 +1958,12 @@ fn parseExternSlot(slot: []const u8) struct { []const u8, i64 } {
 }
 
 /// The key relocations name an imported symbol by (see `useImport`).
+/// Whether `language`'s std.debug reads a Mach-O executable's debug info
+/// through STABS (`MachO.Options.stabs`) rather than from the dSYM.
+pub fn machoStabs(language: Language) bool {
+    return language == .zig_0_16;
+}
+
 /// Binds each of `imports` (`lib` 0) to the first of `libs` that exports
 /// its name, the linked ones before the implicit ones
 /// (`MachODylib.implicit`), which get load commands only if an import

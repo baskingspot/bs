@@ -867,6 +867,7 @@ fn linkMachO(
         .sdk = macos.sdk,
         .stack_size = inc.stack_size,
         .comp_dir = cwd,
+        .stabs = Emit.machoStabs(inc.language),
         .diag = &diag,
         .symbols = .{
             .atoms = in.numbered,
@@ -1252,6 +1253,7 @@ fn linkWithObjects(
             .sdk = macos.sdk,
             .stack_size = inc.stack_size,
             .comp_dir = cwd,
+            .stabs = Emit.machoStabs(inc.language),
             .diag = &diag,
             .local_symbols = converted.symbols,
             .unwind = converted.unwind,

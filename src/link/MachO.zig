@@ -133,6 +133,13 @@ pub const Options = struct {
     /// The compilation directory that relative `Atom.Debug.file` paths are
     /// relative to (DW_AT_comp_dir).
     comp_dir: []const u8 = ".",
+    /// With a dSYM, STABS that point at it, as ld64's point at the objects
+    /// carrying DWARF: an N_OSO naming the dSYM's DWARF file by absolute
+    /// path, an N_FUN for each function (of a name's first, as the
+    /// symbols must be unique), and a symbol table in the dSYM with the
+    /// same names. Zig 0.16's std.debug reads debug info only this way
+    /// (std/debug/MachOFile.zig); 0.17's finds the dSYM by path.
+    stabs: bool = false,
     /// The input objects' functions' unwind entries (their
     /// `__compact_unwind`), which `__unwind_info` lists between bs's
     /// functions. Not with `symbols`.
@@ -240,7 +247,7 @@ pub fn linkInput(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const 
     var out: Elf.MemoryOutput = .{ .gpa = gpa };
     defer gpa.free(out.buf);
     if (input.debugLen() == 0) {
-        try build(gpa, io, input, o, &out, {});
+        try build(gpa, io, input, o, &out, {}, "");
     } else {
         const dsym_dir = try gpa.print("{s}.dSYM/Contents/Resources/DWARF", .{sub_path});
         defer gpa.free(dsym_dir);
@@ -256,7 +263,9 @@ pub fn linkInput(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const 
         var dsym: DsymFile = .{ .file = try dsym_parent.createFile(io, dsym_name, .{}) };
         defer dsym.file.close(io);
         errdefer dsym_parent.deleteFile(io, dsym_name) catch {};
-        try build(gpa, io, input, o, &out, &dsym);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const oso = if (o.stabs) path_buf[0..try dsym_parent.realPathFile(io, dsym_name, &path_buf)] else "";
+        try build(gpa, io, input, o, &out, &dsym, oso);
     }
     dir.deleteFile(io, sub_path) catch |err| switch (err) {
         error.FileNotFound => {},
@@ -278,7 +287,7 @@ pub fn emit(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options) E
 pub fn emitInput(gpa: Allocator, io: std.Io, input: anytype, options: Options) Error![]u8 {
     var out: Elf.MemoryOutput = .{ .gpa = gpa };
     errdefer gpa.free(out.buf);
-    try build(gpa, io, input, options, &out, {});
+    try build(gpa, io, input, options, &out, {}, "");
     return out.buf;
 }
 
@@ -291,7 +300,8 @@ const DsymFile = struct { file: std.Io.File };
 pub const Emitted = struct { exe: []u8, dsym: []u8 };
 
 /// `emit`, and the DWARF file that `link` writes into the dSYM bundle
-/// (empty without debug info).
+/// (empty without debug info). The N_OSO of `Options.stabs` names no
+/// path.
 pub fn emitWithDsym(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options) Error!Emitted {
     const input: Elf.AtomSlice = .{ .atoms = atoms, .debug_entries = options.debug };
     var out: Elf.MemoryOutput = .{ .gpa = gpa };
@@ -299,9 +309,9 @@ pub fn emitWithDsym(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Op
     var dsym: Elf.MemoryOutput = .{ .gpa = gpa };
     errdefer gpa.free(dsym.buf);
     if (options.debug.len == 0) {
-        try build(gpa, io, input, options, &out, {});
+        try build(gpa, io, input, options, &out, {}, "");
     } else {
-        try build(gpa, io, input, options, &out, &dsym);
+        try build(gpa, io, input, options, &out, &dsym, "");
     }
     return .{ .exe = out.buf, .dsym = dsym.buf };
 }
@@ -451,7 +461,8 @@ const mh_execute_header = "__mh_execute_header";
 /// threads. Mach-O adds a serial pass that writes the GOT and stubs and
 /// links fixups into per-page chains, and a parallel pass that hashes
 /// pages for the code signature.
-fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anytype, dsym_out: anytype) !void {
+/// `oso` is the dSYM's path, for `Options.stabs`.
+fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anytype, dsym_out: anytype, oso: []const u8) !void {
     const Link = LinkOf(@TypeOf(input));
     var unused_diag: Diagnostic = .{};
     const diag = options.diag orelse &unused_diag;
@@ -682,7 +693,36 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         }
         strtab_len += 1 + ls.name.len + 1;
     }
-    const n_locals = std.math.add(u32, n_atom_syms, @intCast(local_atoms.len)) catch return error.OutOfMemory;
+    // `Options.stabs`: the functions with an N_FUN, each name's first, in
+    // address order, and the size of the dSYM's string table. The stabs
+    // follow the local symbols, and N_FUN reuses the function's name.
+    const stabs = options.stabs and @TypeOf(dsym_out) != void;
+    var stab_funcs: std.ArrayList(StabFunc) = .empty;
+    defer stab_funcs.deinit(gpa);
+    var stab_str_len: u32 = 1;
+    if (stabs) {
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(gpa);
+        // Where `copy` writes each atom's name.
+        var strx: u32 = undefined;
+        for (places, 0..) |p, i| {
+            if (i % chunk_len == 0) strx = chunks[i / chunk_len].str;
+            if (p.isDuplicate()) continue;
+            const atom = input.atom(i);
+            const a = Elf.ref(&atom);
+            if (a.name.len == 0) continue;
+            defer strx += @intCast(1 + a.name.len + 1);
+            if (p.section != text or (try seen.getOrPut(gpa, a.name)).found_existing) continue;
+            try stab_funcs.append(gpa, .{ .atom = @intCast(i), .strx = strx, .name = a.name, .size = a.size() });
+            stab_str_len = std.math.add(u32, stab_str_len, @intCast(1 + a.name.len + 1)) catch return error.OutOfMemory;
+        }
+        strtab_len += options.comp_dir.len + 1 + stabUnitName(options).len + 1 + oso.len + 1;
+    }
+    // As ld64's for an object: N_SO with the directory, N_SO with the
+    // unit's name, N_OSO, then N_BNSYM, N_FUN, N_FUN and N_ENSYM per
+    // function, then an N_SO that closes the unit.
+    const n_stabs: u32 = if (stabs) std.math.cast(u32, 4 * stab_funcs.items.len + 4) orelse return error.OutOfMemory else 0;
+    const n_locals = std.math.add(u32, n_atom_syms, @intCast(local_atoms.len + n_stabs)) catch return error.OutOfMemory;
     // A dylib's exports, sorted by name, with their atoms; an executable
     // exports `__mh_execute_header` only.
     const exports = try gpa.alloc(Export, if (dylib) |d| d.exports.len else 0);
@@ -928,7 +968,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         for (seg_present, seg_nsects) |p, n| if (p) {
             segs_size += @sizeOf(macho.segment_command_64) + n * @sizeOf(macho.section_64);
         };
-        dsym_layout = .init(n_segs - 1, segs_size, &dwarf);
+        dsym_layout = .init(n_segs - 1, segs_size, &dwarf, @intCast(stab_funcs.items.len), stab_str_len);
         l.has_dsym = true;
         if (@TypeOf(dsym_out) == *Elf.MemoryOutput) {
             l.dsym = .{ .memory = try dsym_out.buffer(io, dsym_layout.len) };
@@ -1045,6 +1085,37 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             @memcpy(buf[strtab_off + str_off + 1 ..][0..ls.name.len], ls.name);
             buf[strtab_off + str_off + 1 + ls.name.len] = 0;
             str_off += 1 + ls.name.len + 1;
+        }
+        if (stabs) {
+            // ld64's N_OSO holds the object's mtime; 0 keeps the output
+            // a function of the inputs. lldb rejects an N_OSO without the
+            // N_SOs before it.
+            for ([3]struct { u8, u16, []const u8 }{
+                .{ macho.N_SO, 0, options.comp_dir },
+                .{ macho.N_SO, 0, stabUnitName(options) },
+                .{ macho.N_OSO, 1, oso },
+            }) |e| {
+                writeStruct(buf[sym_off..], nlist(@intCast(str_off), e[0], 0, e[1], 0));
+                sym_off += @sizeOf(macho.nlist_64);
+                @memcpy(buf[strtab_off + str_off ..][0..e[2].len], e[2]);
+                buf[strtab_off + str_off + e[2].len] = 0;
+                str_off += e[2].len + 1;
+            }
+            const text_sect = sect_index[text];
+            for (stab_funcs.items) |f| {
+                const addr = l.atomAddr(f.atom);
+                for ([4]macho.nlist_64{
+                    nlist(0, macho.N_BNSYM, text_sect, 0, addr),
+                    nlist(f.strx, macho.N_FUN, text_sect, 0, addr),
+                    nlist(0, macho.N_FUN, 0, 0, f.size),
+                    nlist(0, macho.N_ENSYM, text_sect, 0, f.size),
+                }) |sym| {
+                    writeStruct(buf[sym_off..], sym);
+                    sym_off += @sizeOf(macho.nlist_64);
+                }
+            }
+            writeStruct(buf[sym_off..], nlist(0, macho.N_SO, 0, 0, 0));
+            sym_off += @sizeOf(macho.nlist_64);
         }
         if (dylib == null) {
             writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_SECT | macho.N_EXT, 1, macho.REFERENCED_DYNAMICALLY, base));
@@ -1196,6 +1267,25 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             try l.putDsym(dl.str_off, Dwarf.str);
         }
         try l.putDsym(0, head);
+        if (dl.nsyms > 0) {
+            // The functions' symbols, as the N_FUNs name them, from the
+            // end of the DWARF.
+            const tail = try gpa.alloc(u8, dl.len - dl.dwarf_end);
+            defer gpa.free(tail);
+            @memset(tail[0 .. dl.symoff - dl.dwarf_end], 0);
+            const syms = tail[dl.symoff - dl.dwarf_end ..][0 .. dl.stroff - dl.symoff];
+            const strs = tail[dl.stroff - dl.dwarf_end ..];
+            strs[0] = 0;
+            var strx: u32 = 1;
+            for (stab_funcs.items, 0..) |f, i| {
+                writeStruct(syms[i * @sizeOf(macho.nlist_64) ..], nlist(strx, macho.N_SECT, sect_index[text], 0, l.atomAddr(f.atom)));
+                strs[strx] = '_';
+                @memcpy(strs[strx + 1 ..][0..f.name.len], f.name);
+                strs[strx + 1 + f.name.len] = 0;
+                strx += @intCast(1 + f.name.len + 1);
+            }
+            try l.putDsym(dl.dwarf_end, tail);
+        }
     }
 }
 
@@ -1203,8 +1293,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
 /// UUID and segment and section commands (with no file contents), as
 /// dsymutil's and upstream Zig's dSYMs do, so debuggers match its
 /// addresses to the executable's sections; a __DWARF segment with the
-/// debug sections, after the executable's address space; and an empty
-/// symbol table.
+/// debug sections, after the executable's address space; and a symbol
+/// table, empty but for `Options.stabs`, after the segment.
 const DsymLayout = struct {
     n_exe_segs: u32,
     exe_segs_size: u32,
@@ -1222,11 +1312,18 @@ const DsymLayout = struct {
     aranges_off: u64,
     aranges_size: u64,
     dwarf_off: u64,
+    dwarf_end: u64,
+    /// The symbol table's and string table's offsets and sizes, all 0
+    /// without symbols.
+    symoff: u64,
+    nsyms: u32,
+    stroff: u64,
+    strsize: u32,
     len: u64,
 
     const n_dwarf_sects = 6;
 
-    fn init(n_exe_segs: u32, exe_segs_size: u32, dwarf: *const Dwarf) DsymLayout {
+    fn init(n_exe_segs: u32, exe_segs_size: u32, dwarf: *const Dwarf, nsyms: u32, strsize: u32) DsymLayout {
         const has_debug = dwarf.present();
         const sizeofcmds = @sizeOf(macho.uuid_command) + exe_segs_size + @sizeOf(macho.segment_command_64) +
             @as(u32, if (has_debug) n_dwarf_sects * @sizeOf(macho.section_64) else 0) + @sizeOf(macho.symtab_command);
@@ -1242,6 +1339,9 @@ const DsymLayout = struct {
         const line_off = ranges_off + ranges_size;
         const str_off = line_off + line_size;
         const aranges_off = str_off + str_size;
+        const dwarf_end = aranges_off + aranges_size;
+        const symoff = if (nsyms > 0) std.mem.alignForward(u64, dwarf_end, 8) else 0;
+        const stroff = if (nsyms > 0) symoff + @as(u64, nsyms) * @sizeOf(macho.nlist_64) else 0;
         return .{
             .n_exe_segs = n_exe_segs,
             .exe_segs_size = exe_segs_size,
@@ -1257,10 +1357,24 @@ const DsymLayout = struct {
             .aranges_off = aranges_off,
             .aranges_size = aranges_size,
             .dwarf_off = dwarf_off,
-            .len = aranges_off + aranges_size,
+            .dwarf_end = dwarf_end,
+            .symoff = symoff,
+            .nsyms = nsyms,
+            .stroff = stroff,
+            .strsize = if (nsyms > 0) strsize else 0,
+            .len = if (nsyms > 0) stroff + strsize else dwarf_end,
         };
     }
 };
+
+/// The unit name of `Options.stabs`' N_SO: the output's.
+fn stabUnitName(options: Options) []const u8 {
+    return options.identifier orelse "a.out";
+}
+
+/// A function with an N_FUN (`Options.stabs`): its atom, the offset of
+/// its name in the executable's string table, its name, and its size.
+const StabFunc = struct { atom: u32, strx: u32, name: []const u8, size: u64 };
 
 /// Writes the dSYM's header and load commands, and zeros the padding
 /// before its __DWARF segment. `exe_segs` are the executable's segment and
@@ -1296,7 +1410,7 @@ fn writeDsymHeader(dsym: []u8, dl: DsymLayout, uuid: [16]u8, exe_segs: []const u
             at += @sizeOf(macho.section_64);
         }
     }
-    const dwarf_size = dl.len - dl.dwarf_off;
+    const dwarf_size = dl.dwarf_end - dl.dwarf_off;
     w.put(macho.segment_command_64{
         .cmdsize = @sizeOf(macho.segment_command_64) + @as(u32, if (has_debug) DsymLayout.n_dwarf_sects * @sizeOf(macho.section_64) else 0),
         .segname = name16("__DWARF"),
@@ -1327,7 +1441,7 @@ fn writeDsymHeader(dsym: []u8, dl: DsymLayout, uuid: [16]u8, exe_segs: []const u
             .flags = macho.S_ATTR_DEBUG,
         });
     }
-    w.put(macho.symtab_command{ .symoff = 0, .nsyms = 0, .stroff = 0, .strsize = 0 });
+    w.put(macho.symtab_command{ .symoff = @intCast(dl.symoff), .nsyms = dl.nsyms, .stroff = @intCast(dl.stroff), .strsize = dl.strsize });
     std.debug.assert(w.at == @sizeOf(macho.mach_header_64) + dl.sizeofcmds);
     @memset(dsym[w.at..dl.dwarf_off], 0);
 }
@@ -3577,6 +3691,63 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     const written_dsym = try tmp.dir.readFileAlloc(io, "prog.dSYM/Contents/Resources/DWARF/prog", gpa, .unlimited);
     defer gpa.free(written_dsym);
     try std.testing.expectEqualSlices(u8, one.dsym, written_dsym);
+
+    // With `stabs`, as Zig 0.16's std.debug reads them: N_SOs with the
+    // directory and unit, an N_OSO naming the dSYM by absolute path, then
+    // each function's N_BNSYM, N_FUN (name,
+    // address), N_FUN (size) and N_ENSYM, then an N_SO; the dSYM's symbol
+    // table maps each N_FUN's name, once, to the same address. "helper"
+    // names many functions; only its first gets an N_FUN, and an address
+    // in another resolves through the N_FUN before it to itself.
+    {
+        var o = options;
+        o.stabs = true;
+        try link(gpa, io, tmp.dir, "prog16", atoms.items, o);
+        const exe = try tmp.dir.readFileAlloc(io, "prog16", arena, .unlimited);
+        const dsym = try tmp.dir.readFileAlloc(io, "prog16.dSYM/Contents/Resources/DWARF/prog16", arena, .unlimited);
+        for ([_][]const u8{ "__debug_info", "__debug_line", "__debug_rnglists" }) |name| {
+            const a = testMachOSection(one.dsym, name).?;
+            const b = testMachOSection(dsym, name).?;
+            try std.testing.expectEqualSlices(u8, one.dsym[a.offset..][0..a.size], dsym[b.offset..][0..b.size]);
+        }
+        var in_dsym: std.StringHashMapUnmanaged(u64) = .empty;
+        const dst = testMachOCommand(macho.symtab_command, dsym, .SYMTAB).?;
+        for (std.mem.bytesAsSlice(macho.nlist_64, dsym[dst.symoff..][0 .. dst.nsyms * @sizeOf(macho.nlist_64)])) |sym| {
+            try std.testing.expect(sym.n_type.bits.type == .sect);
+            const gop = try in_dsym.getOrPut(arena, std.mem.sliceTo(dsym[dst.stroff + sym.n_strx ..], 0));
+            try std.testing.expect(!gop.found_existing);
+            gop.value_ptr.* = sym.n_value;
+        }
+        const st = testMachOCommand(macho.symtab_command, exe, .SYMTAB).?;
+        const syms = std.mem.bytesAsSlice(macho.nlist_64, exe[st.symoff..][0 .. st.nsyms * @sizeOf(macho.nlist_64)]);
+        const so = for (syms, 0..) |sym, i| {
+            if (sym.n_type.bits.is_stab != 0) break i;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqualSlices(u8, &.{ macho.N_SO, macho.N_SO, macho.N_OSO }, &.{ @bitCast(syms[so].n_type), @bitCast(syms[so + 1].n_type), @bitCast(syms[so + 2].n_type) });
+        try std.testing.expectEqualStrings("/w", std.mem.sliceTo(exe[st.stroff + syms[so].n_strx ..], 0));
+        try std.testing.expectEqualStrings("prog", std.mem.sliceTo(exe[st.stroff + syms[so + 1].n_strx ..], 0));
+        const first = so + 2;
+        const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", arena);
+        try std.testing.expectEqualStrings(try arena.print("{s}/prog16.dSYM/Contents/Resources/DWARF/prog16", .{tmp_path}), std.mem.sliceTo(exe[st.stroff + syms[first].n_strx ..], 0));
+        var funcs: std.StringHashMapUnmanaged(u64) = .empty;
+        var at = first + 1;
+        while (@as(u8, @bitCast(syms[at].n_type)) == macho.N_BNSYM) : (at += 4) {
+            const fun = syms[at + 1];
+            try std.testing.expectEqualSlices(u8, &.{ macho.N_FUN, macho.N_FUN, macho.N_ENSYM }, &.{ @bitCast(fun.n_type), @bitCast(syms[at + 2].n_type), @bitCast(syms[at + 3].n_type) });
+            try std.testing.expectEqual(syms[at].n_value, fun.n_value);
+            const name = std.mem.sliceTo(exe[st.stroff + fun.n_strx ..], 0);
+            try std.testing.expectEqual(fun.n_value, in_dsym.get(name).?);
+            try std.testing.expect(syms[at + 2].n_value > 0);
+            try funcs.put(arena, name, fun.n_value);
+        }
+        try std.testing.expectEqual(macho.N_SO, @as(u8, @bitCast(syms[at].n_type)));
+        try std.testing.expectEqual(funcs.count(), in_dsym.count());
+        // main, the f's (one of the duplicate's), and "helper".
+        try std.testing.expectEqual(1 + n + 1, funcs.count());
+        try std.testing.expectEqual(testMachOSymbol(one.exe, "helper").?, funcs.get("_helper").?);
+        try std.testing.expectEqual(testMachOSymbol(one.exe, "f17").?, funcs.get("_f17").?);
+    }
+
     const path = try arena.print(".zig-cache/tmp/{s}/prog", .{tmp.sub_path});
     if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
         const result = try std.process.run(gpa, io, .{ .argv = &.{path} });

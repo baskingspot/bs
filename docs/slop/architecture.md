@@ -3782,8 +3782,31 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
   LLVM backend) writes them; ELF units stay DW_LANG_Zig, as upstream's
   Linux default (the self-hosted backend) writes them, and gdb reads.
   std.debug (MachOFile looks for exactly this path and checks the UUID)
-  and lldb read it; neither reads DWARF inside the executable, and a debug
-  map of N_OSO stabs would need object files. The dSYM is a new file each
+  and lldb read it; neither reads DWARF inside the executable. Zig 0.16's
+  std.debug finds no dSYM: it reads only a debug map of STABS
+  (std/debug/MachOFile.zig), so a 0.16 compilation links with
+  `Options.stabs` (`Emit.machoStabs`, which relinks call too), and the
+  map points at the dSYM instead of object files: N_SO (comp dir), N_SO
+  (output name), an N_OSO with the dSYM's absolute path and mtime 0 (the
+  output stays a function of its inputs), then N_BNSYM, N_FUN, N_FUN
+  (size), N_ENSYM for each function, and a closing N_SO, after the local
+  symbols; the dSYM gets a symbol table (after its __DWARF segment) with
+  each N_FUN's name at the same address. That reader rejects a debug
+  object with two symbols of one name, so only a name's first function
+  gets an N_FUN (a serial pass hashes the __text atoms' names, for 0.16
+  only); an address in a later one resolves through the N_FUN before it,
+  and since every name has the same address in both tables, the address
+  it looks up in the DWARF is the address itself, which finds the right
+  unit and row. lldb (with the dSYM, and without it) accepts the map; it
+  needs the N_SOs before the N_OSO. Verified on a Mac satellite: a reader
+  built with zig 0.16 (MachOFile through the STABS) and the same built
+  with 0.17 (through the dSYM) resolve every function of a bs-built std
+  program (1905 functions, 7 names repeated) to the same name, unit, and
+  file:line:col, after a full link, a cache relink, and a relink with a C
+  object. As upstream 0.16's map names its cache's objects, the absolute
+  path means a 0.16 program whose dSYM is moved or deleted prints names
+  without file:line (a copied executable, such as an installed one, still
+  finds it). 0.17 links are unchanged. The dSYM is a new file each
   link, written with pwrite from per-thread buffers: a debugger may have
   the old one mapped. Unwinding uses `__TEXT,__unwind_info`, which
   std.debug's Mach-O unwinder requires (it reads __eh_frame only for
