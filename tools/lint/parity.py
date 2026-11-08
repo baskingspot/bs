@@ -107,10 +107,14 @@ def bs_run(bs, tree, args):
             most |= block
             block = collections.Counter()
         elif failure is None and ANY_ERROR.match(line):
-            # With the notes that follow it, which say what failed when
-            # the error itself does not (translate-c's "translation
-            # failure").
-            notes = list(itertools.takewhile(lambda n: n.startswith(" ") or "note:" in n, lines[i + 1 : i + 6]))
+            # With what follows it up to the compilation's end, which says
+            # what failed when the error itself does not: translate-c's
+            # "translation failure" is followed by the C errors.
+            notes = list(
+                itertools.takewhile(
+                    lambda n: not BLOCK_END.match(n) and not n.startswith("failed command:"), lines[i + 1 : i + 6]
+                )
+            )
             failure = "\n".join([line, *notes])
     found = collections.Counter()
     for key, n in most.items():
