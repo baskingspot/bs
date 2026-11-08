@@ -80,7 +80,7 @@ pub fn build(b: *std.Build) void {
     zir.addArgs(&.{ "build-exe", "-fno-emit-bin", "-target", "x86_64-linux" });
     zir.addFileArg(b.path("test/run/corpus.zig"));
     zir.addArg("--global-cache-dir");
-    const std_zir = zir.addOutputDirectoryArg("global");
+    const std_zir = zir.addOutputDirectoryArg2("global", .{});
     addRunTests(b, exe, test_step, upstream_step, std_zir);
     addObjAndRunTests(b, exe, test_step, std_zir);
     const translate_c = addLinkInputTests(b, exe, test_step, std_zir);
@@ -99,8 +99,8 @@ pub fn build(b: *std.Build) void {
         const rec = b.addSystemCommand(&.{"sh"});
         rec.setName("bs cache and inputs record on aarch64-macos");
         rec.addFileArg(b.path("test/obj/macos_cache.sh"));
-        rec.addArtifactArg(exe);
-        _ = rec.addOutputDirectoryArg("work");
+        rec.addArtifactArg2(exe, .{});
+        _ = rec.addOutputDirectoryArg2("work", .{});
         rec.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &rec.step, 10);
         test_step.dependOn(&rec.step);
@@ -109,10 +109,10 @@ pub fn build(b: *std.Build) void {
         const inputs = b.addSystemCommand(&.{"sh"});
         inputs.setName("bs build-exe with link inputs, cached, on aarch64-macos");
         inputs.addFileArg(b.path("test/link_input/macos_cache.sh"));
-        inputs.addArtifactArg(exe);
+        inputs.addArtifactArg2(exe, .{});
         inputs.addArg(upstreamZig(b));
-        inputs.addDirectoryArg(b.path("test/link_input"));
-        _ = inputs.addOutputDirectoryArg("work");
+        inputs.addDirectoryArg2(b.path("test/link_input"), .{});
+        _ = inputs.addOutputDirectoryArg2("work", .{});
         inputs.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &inputs.step, 30);
         test_step.dependOn(&inputs.step);
@@ -178,7 +178,7 @@ pub fn build(b: *std.Build) void {
             c_exe.addFileArg(b.path("test/link_input/libc.c"));
             c_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
             const c_run = std.Build.Step.Run.create(b, b.fmt("run bs -lc build of a C source on aarch64-macos{s}", .{what}));
-            c_run.addFileArg(c_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            c_run.addFileArg(c_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
             c_run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
             c_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
             c_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -193,7 +193,7 @@ pub fn build(b: *std.Build) void {
         c_exe.addFileArg(b.path("test/link_input/cmain.c"));
         c_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
         const c_run = std.Build.Step.Run.create(b, "run bs -OReleaseSafe -lc build of only C sources on aarch64-macos");
-        c_run.addFileArg(c_exe.addPrefixedOutputFileArg("-femit-bin=", "cmain"));
+        c_run.addFileArg(c_exe.addOutputFileArg2("cmain", .{ .prefix = "-femit-bin=" }));
         c_run.addArg("5");
         c_run.addCheck(.{ .expect_stdout_exact = "argc=2 q=478165905515354922\n" });
         c_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
@@ -209,7 +209,7 @@ pub fn build(b: *std.Build) void {
             objc_exe.addFileArg(b.path(b.fmt("test/link_input/{s}", .{src})));
             objc_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
             const objc_run = std.Build.Step.Run.create(b, b.fmt("run bs -lc build of {s} on aarch64-macos", .{src}));
-            objc_run.addFileArg(objc_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            objc_run.addFileArg(objc_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
             objc_run.addCheck(.{ .expect_term = .{ .exited = 3 } });
             test_step.dependOn(&objc_run.step);
         }
@@ -347,7 +347,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
     var it = dir.iterate();
     while (it.next(io) catch |err| std.debug.panic("unable to list test/run: {t}", .{err})) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig") or std.mem.eql(u8, entry.name, "rt.zig")) continue;
-        names.append(b.allocator, b.dupe(entry.name)) catch @panic("OOM");
+        names.append(b.allocator, b.graph.dupeString(entry.name)) catch @panic("OOM");
     }
     std.mem.sort([]const u8, names.items, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
@@ -643,11 +643,11 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 takes(b, &compile.step, if (edits) (if (uses_std) 10 else 1) else if (expect.donor_libc) 12 else if (expect.donor_without != null) (if (uses_std) 8 else 2) else if (uses_std) 2 else 1);
             }
             const bin = if (!upstream and (expect.rebuild_without.items.len != 0 or expect.lib_edit != null or expect.donor_without != null or expect.donor_libc)) bin: {
-                const out = compile.addOutputFileArg(name);
-                compile.addArtifactArg(bs);
-                compile.addDirectoryArg(std_zir);
+                const out = compile.addOutputFileArg2(name, .{});
+                compile.addArtifactArg2(bs, .{});
+                compile.addDirectoryArg2(std_zir, .{});
                 break :bin out;
-            } else compile.addPrefixedOutputFileArg("-femit-bin=", name);
+            } else compile.addOutputFileArg2(name, .{ .prefix = "-femit-bin=" });
             // CodeGen on worker threads gives the same output as on the
             // Sema thread (`BS_THREADS`); checked on programs that use
             // compiler_rt helpers, constants, error names and generics.
@@ -661,7 +661,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 serial.addFileInput(b.path("test/run/rt.zig"));
                 serial.setEnvironmentVariable("BS_THREADS", "1");
                 serial.setEnvironmentVariable("BS_CACHE", "off");
-                const serial_bin = serial.addPrefixedOutputFileArg("-femit-bin=", name);
+                const serial_bin = serial.addOutputFileArg2(name, .{ .prefix = "-femit-bin=" });
                 const same = b.addSystemCommand(&.{"cmp"});
                 same.setName(b.fmt("{s}: BS_THREADS=4 and 1 build the same", .{name}));
                 same.addFileArg(bin);
@@ -719,15 +719,15 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 });
                 r.addFileArg(before);
                 r.addFileArg(b.path(src_path));
-                const out = r.addOutputFileArg(name);
-                r.addArtifactArg(bs);
+                const out = r.addOutputFileArg2(name, .{});
+                r.addArtifactArg2(bs, .{});
                 takes(b, &r.step, if (std.mem.find(u8, source, "@import(\"std\")") != null) 4 else 1);
                 break :blk out;
             } else blk: {
                 const compile = b.addRunArtifact(bs);
                 compile.addArgs(&.{ "build-exe", "-target", "aarch64-macos" });
                 compile.addFileArg(b.path(src_path));
-                break :blk compile.addPrefixedOutputFileArg("-femit-bin=", name);
+                break :blk compile.addOutputFileArg2(name, .{ .prefix = "-femit-bin=" });
             };
             const run = std.Build.Step.Run.create(b, b.fmt("run {s} (aarch64-macos)", .{name}));
             run.addFileArg(bin);
@@ -777,14 +777,14 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 break :blk r;
             } else if (upstream) b.addSystemCommand(&.{upstreamZig(b)}) else b.addRunArtifact(bs);
             const bin = if (rebuild) blk: {
-                const out = compile.addOutputFileArg(name);
-                compile.addArtifactArg(bs);
+                const out = compile.addOutputFileArg2(name, .{});
+                compile.addArtifactArg2(bs, .{});
                 break :blk out;
             } else blk: {
                 compile.addArgs(if (expect.libc) &.{ "build-exe", "-target", "aarch64-linux-gnu", "-lc" } else &.{ "build-exe", "-target", "aarch64-linux" });
                 if (upstream and expect.upstream_llvm) compile.addArg("-fllvm");
                 compile.addFileArg(b.path(src_path));
-                break :blk compile.addPrefixedOutputFileArg("-femit-bin=", name);
+                break :blk compile.addOutputFileArg2(name, .{ .prefix = "-femit-bin=" });
             };
             const runner = (if (expect.libc) aarch64_linux_glibc_runner else aarch64_linux_runner) orelse {
                 if (!upstream) test_step.dependOn(&compile.step);
@@ -835,7 +835,7 @@ fn traceCheck(b: *std.Build, test_step: *std.Build.Step, bs: *std.Build.Step.Com
         c.addFileArg(b.path(src_path));
         if (inline_env) |v| c.setEnvironmentVariable("BS_INLINE", v);
         c.setEnvironmentVariable("BS_CACHE", "off");
-        o.* = c.addPrefixedOutputFileArg("-femit-bin=", name);
+        o.* = c.addOutputFileArg2(name, .{ .prefix = "-femit-bin=" });
     }
     const same = b.addSystemCommand(&.{
         "sh", "-c",
@@ -853,7 +853,7 @@ fn traceCheck(b: *std.Build, test_step: *std.Build.Step, bs: *std.Build.Step.Com
     same.setName(b.fmt("{s}: the trace for {s} matches BS_INLINE=0's", .{ name, target }));
     same.addFileArg(out[0]);
     same.addFileArg(out[1]);
-    _ = same.addOutputFileArg("trace");
+    _ = same.addOutputFileArg2("trace", .{});
     same.addArgs(runner);
     test_step.dependOn(&same.step);
 }
@@ -893,7 +893,7 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
     var it = dir.iterate();
     while (it.next(io) catch |err| std.debug.panic("unable to list test/diag: {t}", .{err})) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
-        const file = b.dupe(entry.name);
+        const file = b.graph.dupeString(entry.name);
         const src_path = b.fmt("test/diag/{s}", .{file});
         b.dependOnFileContents(b.path(src_path));
         const source = dir.readFileAlloc(io, file, b.allocator, .limited(1 << 20)) catch |err|
@@ -973,9 +973,9 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
             edit.setName(b.fmt("diag {s} (edit build)", .{file}));
             edit.addFileArg(before);
             edit.addFileArg(b.path(src_path));
-            _ = edit.addOutputDirectoryArg("edit");
-            edit.addArtifactArg(bs);
-            edit.addDirectoryArg(std_zir);
+            _ = edit.addOutputDirectoryArg2("edit", .{});
+            edit.addArtifactArg2(bs, .{});
+            edit.addDirectoryArg2(std_zir, .{});
             // Every line but the reference traces, whose frames for units
             // loaded green the edit build lacks (docs/slop/architecture.md).
             var edit_lines = std.mem.splitScalar(u8, expected.items, '\n');
@@ -1017,7 +1017,7 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
     while (it.next(io) catch |err| std.debug.panic("unable to list test/lint: {t}", .{err})) |entry| {
         const case_dir, const file = switch (entry.kind) {
             .directory => .{ b.fmt("test/lint/{s}", .{entry.name}), "main.zig" },
-            .file => if (std.mem.endsWith(u8, entry.name, ".zig")) .{ "test/lint", b.dupe(entry.name) } else continue,
+            .file => if (std.mem.endsWith(u8, entry.name, ".zig")) .{ "test/lint", b.graph.dupeString(entry.name) } else continue,
             else => continue,
         };
         const src_path = b.fmt("{s}/{s}", .{ case_dir, file });
@@ -1077,9 +1077,9 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         "sh",
     });
     added.setName("lint config added and removed (cache)");
-    _ = added.addOutputDirectoryArg("lint-cache");
-    added.addArtifactArg(bs);
-    added.addDirectoryArg(std_zir);
+    _ = added.addOutputDirectoryArg2("lint-cache", .{});
+    added.addArtifactArg2(bs, .{});
+    added.addDirectoryArg2(std_zir, .{});
     added.expectExitCode(0);
     takes(b, &added.step, 5);
     test_step.dependOn(&added.step);
@@ -1098,11 +1098,11 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         obj.setName(b.fmt("bs {s} -target aarch64-linux", .{cmd}));
         obj.addArgs(&.{ cmd, "-target", "aarch64-linux" });
         obj.addFileArg(b.path("test/obj/lib.zig"));
-        const out = obj.addPrefixedOutputFileArg("-femit-bin=", if (cmd[6] == 'l') "liblib.a" else "lib.o");
+        const out = obj.addOutputFileArg2(if (cmd[6] == 'l') "liblib.a" else "lib.o", .{ .prefix = "-femit-bin=" });
         const exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-target", "aarch64-linux" });
         exe.addFileArg(b.path("test/obj/main.zig"));
         exe.addFileArg(out);
-        const bin = exe.addPrefixedOutputFileArg("-femit-bin=", "main");
+        const bin = exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
         for ([_]bool{ false, true }) |panic| {
             const run = std.Build.Step.Run.create(b, b.fmt("run aarch64-linux {s} main{s}", .{ cmd[6..], if (panic) " (panic)" else "" }));
             run.addArgs(runner);
@@ -1125,11 +1125,11 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     const obj = b.addRunArtifact(bs);
     obj.addArg("build-obj");
     obj.addFileArg(b.path("test/obj/lib.zig"));
-    const lib_o = obj.addPrefixedOutputFileArg("-femit-bin=", "lib.o");
+    const lib_o = obj.addOutputFileArg2("lib.o", .{ .prefix = "-femit-bin=" });
     const exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-llvm", "-fno-lld" });
     exe.addFileArg(b.path("test/obj/main.zig"));
     exe.addFileArg(lib_o);
-    const bin = exe.addPrefixedOutputFileArg("-femit-bin=", "main");
+    const bin = exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
 
     const run = std.Build.Step.Run.create(b, "run obj main");
     run.addFileArg(bin);
@@ -1152,12 +1152,12 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     const lc_obj = b.addRunArtifact(bs);
     lc_obj.addArgs(&.{ "build-obj", "-lc", "-target", "x86_64-linux-gnu" });
     lc_obj.addFileArg(b.path("test/obj/lib.zig"));
-    const lc_o = lc_obj.addPrefixedOutputFileArg("-femit-bin=", "lib.o");
+    const lc_o = lc_obj.addOutputFileArg2("lib.o", .{ .prefix = "-femit-bin=" });
     const lc_exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-fPIE", "-target", "x86_64-linux-gnu" });
     lc_exe.addFileArg(b.path("test/obj/main.zig"));
     lc_exe.addFileArg(lc_o);
     const lc_run = std.Build.Step.Run.create(b, "run obj main (-lc object in a PIE)");
-    lc_run.addFileArg(lc_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    lc_run.addFileArg(lc_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     lc_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
     lc_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&lc_run.step);
@@ -1172,14 +1172,14 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         lc_so.addFileArg(b.path(lib_src));
         if (std.mem.eql(u8, name, "so_libc")) lc_so.addFileArg(b.path("test/link_input/so_libc.c"));
         lc_so.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
-        const lc_so_file = lc_so.addPrefixedOutputFileArg("-femit-bin=", b.fmt("lib{s}.so", .{name}));
+        const lc_so_file = lc_so.addOutputFileArg2(b.fmt("lib{s}.so", .{name}), .{ .prefix = "-femit-bin=" });
         const lc_so_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
         lc_so_host.addFileArg(b.path(main_src));
         lc_so_host.addFileArg(lc_so_file);
         const lc_so_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
         lc_so_run.setName(b.fmt("run {s} (bs shared library linking glibc)", .{std.Io.Dir.path.basename(main_src)}));
         lc_so_run.addFileArg(lc_so_file);
-        lc_so_run.addFileArg(lc_so_host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        lc_so_run.addFileArg(lc_so_host.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         if (stderr.len != 0) lc_so_run.addCheck(.{ .expect_stderr_exact = stderr }) else lc_so_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
         lc_so_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&lc_so_run.step);
@@ -1196,11 +1196,11 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         vs_so.addFileArg(b.path("test/link_input/so_version.zig"));
         vs_so.addFileArg(b.path("test/link_input/so_version.c"));
         vs_so.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
-        const vs_file = vs_so.addPrefixedOutputFileArg("-femit-bin=", "libso_version.so");
+        const vs_file = vs_so.addOutputFileArg2("libso_version.so", .{ .prefix = "-femit-bin=" });
         const vs_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc" });
         vs_host.addFileArg(b.path("test/link_input/so_version_main.zig"));
         const vs_run = std.Build.Step.Run.create(b, "run so_version_main (bs shared library with a version script)");
-        vs_run.addFileArg(vs_host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        vs_run.addFileArg(vs_host.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         vs_run.addFileArg(vs_file);
         vs_run.addCheck(.{ .expect_stderr_exact = "ver_old@VER_1.0 1\nver_new@VER_1.1 2\nver_new@VER_1.0 none\nver_c_one@VER_1.0 3\nver_hidden none\nc_local_fn none\nc_local_ptr none\n" });
         vs_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1212,7 +1212,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         vs_bad.addArgs(&.{ "build-lib", "-dynamic", "-target", "x86_64-linux", "--version-script" });
         vs_bad.addFileArg(bad_map);
         vs_bad.addFileArg(b.path("test/link_input/so_version.zig"));
-        _ = vs_bad.addPrefixedOutputFileArg("-femit-bin=", "libbad.so");
+        _ = vs_bad.addOutputFileArg2("libbad.so", .{ .prefix = "-femit-bin=" });
         vs_bad.addCheck(.{ .expect_stderr_match = "bad.map:2:20: error[version-script]: version script assignment of 'VER_1.0' to symbol 'ver_gone' failed: 'libbad.so' defines no such symbol" });
         vs_bad.addCheck(.{ .expect_term = .{ .exited = 1 } });
         test_step.dependOn(&vs_bad.step);
@@ -1223,9 +1223,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     {
         const fu_cc = b.addSystemCommand(&.{ upstreamZig(b), "cc", "-target", "x86_64-linux-gnu", "-c" });
         fu_cc.addFileArg(b.path("test/link_input/force_undefined.c"));
-        const fu_o = fu_cc.addPrefixedOutputFileArg("-o", "force_undefined.o");
+        const fu_o = fu_cc.addOutputFileArg2("force_undefined.o", .{ .prefix = "-o" });
         const fu_ar = b.addSystemCommand(&.{ upstreamZig(b), "ar", "rcs" });
-        const fu_a = fu_ar.addOutputFileArg("libforce_undefined.a");
+        const fu_a = fu_ar.addOutputFileArg2("libforce_undefined.a", .{});
         fu_ar.addFileArg(fu_o);
         for ([_]bool{ true, false }) |forced| {
             const fu_exe = b.addRunArtifact(bs);
@@ -1236,7 +1236,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             fu_exe.addFileArg(fu_a);
             fu_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
             const fu_run = std.Build.Step.Run.create(b, if (forced) "run force_undefined (the member pulled)" else "run force_undefined (no member)");
-            fu_run.addFileArg(fu_exe.addPrefixedOutputFileArg("-femit-bin=", "force_undefined"));
+            fu_run.addFileArg(fu_exe.addOutputFileArg2("force_undefined", .{ .prefix = "-femit-bin=" }));
             fu_run.addCheck(.{ .expect_stderr_exact = if (forced) "pulled, keep_me 42\n" else "" });
             fu_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
             test_step.dependOn(&fu_run.step);
@@ -1250,14 +1250,14 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         so_base.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", "x86_64-linux-gnu", "--name", "so_base" });
         so_base.addFileArg(b.path("test/link_input/so_libc.c"));
         so_base.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
-        const base_file = so_base.addPrefixedOutputFileArg("-femit-bin=", "libso_base.so");
+        const base_file = so_base.addOutputFileArg2("libso_base.so", .{ .prefix = "-femit-bin=" });
         const chain = b.addRunArtifact(bs);
         chain.setName("bs build-lib -dynamic -lc with a shared library input");
         chain.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", "x86_64-linux-gnu", "--name", "so_chain" });
         chain.addFileArg(b.path("test/link_input/so_chain.c"));
         chain.addFileArg(base_file);
         chain.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
-        const chain_file = chain.addPrefixedOutputFileArg("-femit-bin=", "libso_chain.so");
+        const chain_file = chain.addOutputFileArg2("libso_chain.so", .{ .prefix = "-femit-bin=" });
         const chain_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc" });
         chain_host.addFileArg(b.path("test/link_input/so_chain_main.zig"));
         chain_host.addFileArg(chain_file);
@@ -1266,7 +1266,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         chain_run.setName("run so_chain_main.zig (bs shared library linking another)");
         chain_run.addFileArg(chain_file);
         chain_run.addFileArg(base_file);
-        chain_run.addFileArg(chain_host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        chain_run.addFileArg(chain_host.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         chain_run.addCheck(.{ .expect_stderr_exact = "chain c50:1\nc bye\n" });
         chain_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&chain_run.step);
@@ -1278,11 +1278,11 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     const pic = b.addRunArtifact(bs);
     pic.addArgs(&.{ "build-obj", "-fPIC" });
     pic.addFileArg(b.path("test/obj/lib.zig"));
-    const pic_o = pic.addPrefixedOutputFileArg("-femit-bin=", "lib.o");
+    const pic_o = pic.addOutputFileArg2("lib.o", .{ .prefix = "-femit-bin=" });
     const pie = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fPIE", "-fno-llvm", "-fno-lld" });
     pie.addFileArg(b.path("test/obj/main.zig"));
     pie.addFileArg(pic_o);
-    const pie_bin = pie.addPrefixedOutputFileArg("-femit-bin=", "main");
+    const pie_bin = pie.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
     const pie_run = std.Build.Step.Run.create(b, "run obj main (-fPIC object in a PIE)");
     pie_run.addFileArg(pie_bin);
     pie_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
@@ -1299,7 +1299,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     const ar = b.addRunArtifact(bs);
     ar.setName("bs ar rcs (upstream's ar)");
     ar.addArgs(&.{ "ar", "rcs" });
-    const ar_out = ar.addOutputFileArg("libbsar.a");
+    const ar_out = ar.addOutputFileArg2("libbsar.a", .{});
     ar.addFileArg(pic_o);
     const ar_t = b.addRunArtifact(bs);
     ar_t.setName("bs ar t");
@@ -1309,11 +1309,11 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     test_step.dependOn(&ar_t.step);
     const so = b.addSystemCommand(&.{ upstreamZig(b), "build-lib", "-dynamic", "--name", "bspic" });
     so.addFileArg(pic_o);
-    const so_file = so.addPrefixedOutputFileArg("-femit-bin=", "libbspic.so");
+    const so_file = so.addOutputFileArg2("libbspic.so", .{ .prefix = "-femit-bin=" });
     const host_exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
     host_exe.addFileArg(b.path("test/obj/main.zig"));
     host_exe.addFileArg(so_file);
-    const host_bin = host_exe.addPrefixedOutputFileArg("-femit-bin=", "main");
+    const host_bin = host_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
     const so_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
     so_run.setName("run obj main (-fPIC object in a shared object)");
     so_run.addFileArg(so_file);
@@ -1327,11 +1327,11 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     for ([_]bool{ true, false }) |static| {
         const lsys = b.addSystemCommand(&.{ "sh", "-c", "set -e; z=$(realpath \"$1\") so=$(realpath \"$2\") src=$(realpath \"$4\"); cd \"$5\"; \"$z\" build-lib -L\"$(dirname \"$so\")\" -lbspic $3 -femit-bin=liblsys.a \"$src\"; ar t liblsys.a", "sh" });
         lsys.setName(b.fmt("bs build-lib -lbspic{s}", .{if (static) " -static" else ""}));
-        lsys.addArtifactArg(bs);
+        lsys.addArtifactArg2(bs, .{});
         lsys.addFileArg(so_file);
         lsys.addArg(if (static) "-static" else "");
         lsys.addFileArg(b.path("test/obj/lib.zig"));
-        _ = lsys.addOutputDirectoryArg("work");
+        _ = lsys.addOutputDirectoryArg2("work", .{});
         if (static) {
             lsys.addCheck(.{ .expect_stdout_exact = "lib.o\n" });
             lsys.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1347,11 +1347,11 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     const zso = b.addRunArtifact(bs);
     zso.addArgs(&.{ "build-lib", "-dynamic", "--name", "bsso" });
     zso.addFileArg(b.path("test/obj/lib.zig"));
-    const zso_file = zso.addPrefixedOutputFileArg("-femit-bin=", "libbsso.so");
+    const zso_file = zso.addOutputFileArg2("libbsso.so", .{ .prefix = "-femit-bin=" });
     const zso_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
     zso_host.addFileArg(b.path("test/obj/main.zig"));
     zso_host.addFileArg(zso_file);
-    const zso_host_bin = zso_host.addPrefixedOutputFileArg("-femit-bin=", "main");
+    const zso_host_bin = zso_host.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
     const zso_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
     zso_run.setName("run obj main (bs shared object)");
     zso_run.addFileArg(zso_file);
@@ -1361,7 +1361,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     test_step.dependOn(&zso_run.step);
     const dl_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
     dl_host.addFileArg(b.path("test/obj/dl.c"));
-    const dl_bin = dl_host.addPrefixedOutputFileArg("-femit-bin=", "dl");
+    const dl_bin = dl_host.addOutputFileArg2("dl", .{ .prefix = "-femit-bin=" });
     const dl_run = std.Build.Step.Run.create(b, "run dl.c (dlopen of bs shared object)");
     dl_run.addFileArg(dl_bin);
     dl_run.addFileArg(zso_file);
@@ -1373,7 +1373,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     const bs_dl_host = b.addRunArtifact(bs);
     bs_dl_host.addArgs(&.{ "build-exe", "-lc", "-rdynamic" });
     bs_dl_host.addFileArg(b.path("test/obj/dl.c"));
-    const bs_dl_bin = bs_dl_host.addPrefixedOutputFileArg("-femit-bin=", "dl");
+    const bs_dl_bin = bs_dl_host.addOutputFileArg2("dl", .{ .prefix = "-femit-bin=" });
     const bs_dl_run = std.Build.Step.Run.create(b, "run dl.c (bs -rdynamic host, dlopen of bs shared object)");
     bs_dl_run.addFileArg(bs_dl_bin);
     bs_dl_run.addFileArg(zso_file);
@@ -1386,10 +1386,10 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     const pie_main = b.addRunArtifact(bs);
     pie_main.addArgs(&.{ "build-obj", "-fPIE" });
     pie_main.addFileArg(b.path("test/obj/args.zig"));
-    const pie_main_o = pie_main.addPrefixedOutputFileArg("-femit-bin=", "args.o");
+    const pie_main_o = pie_main.addOutputFileArg2("args.o", .{ .prefix = "-femit-bin=" });
     const pie_exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fPIE", "-fno-llvm", "-fno-lld" });
     pie_exe.addFileArg(pie_main_o);
-    const pie_exe_bin = pie_exe.addPrefixedOutputFileArg("-femit-bin=", "args");
+    const pie_exe_bin = pie_exe.addOutputFileArg2("args", .{ .prefix = "-femit-bin=" });
     const pie_main_run = std.Build.Step.Run.create(b, "run args (-fPIE object with main in a static PIE)");
     pie_main_run.addFileArg(pie_exe_bin);
     pie_main_run.addArgs(&.{ "a", "b c" });
@@ -1404,24 +1404,24 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const tls = b.addRunArtifact(bs);
         tls.addArgs(&.{ "build-obj", mode });
         tls.addFileArg(b.path("test/obj/tls.zig"));
-        const tls_o = tls.addPrefixedOutputFileArg("-femit-bin=", "tls.o");
+        const tls_o = tls.addOutputFileArg2("tls.o", .{ .prefix = "-femit-bin=" });
         const tls_run = if (std.mem.eql(u8, mode, "-fPIC")) run: {
             const tls_so = b.addSystemCommand(&.{ upstreamZig(b), "build-lib", "-dynamic", "--name", "bstls" });
             tls_so.addFileArg(tls_o);
-            const tls_so_file = tls_so.addPrefixedOutputFileArg("-femit-bin=", "libbstls.so");
+            const tls_so_file = tls_so.addOutputFileArg2("libbstls.so", .{ .prefix = "-femit-bin=" });
             const tls_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
             tls_host.addFileArg(b.path("test/obj/tls_main.zig"));
             tls_host.addFileArg(tls_so_file);
             const r = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
             r.addFileArg(tls_so_file);
-            r.addFileArg(tls_host.addPrefixedOutputFileArg("-femit-bin=", "tls_main"));
+            r.addFileArg(tls_host.addOutputFileArg2("tls_main", .{ .prefix = "-femit-bin=" }));
             break :run r;
         } else run: {
             const tls_exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-llvm", "-fno-lld", if (std.mem.eql(u8, mode, "-fPIE")) "-fPIE" else "-fno-PIE" });
             tls_exe.addFileArg(b.path("test/obj/tls_main.zig"));
             tls_exe.addFileArg(tls_o);
             const r = std.Build.Step.Run.create(b, "run tls_main");
-            r.addFileArg(tls_exe.addPrefixedOutputFileArg("-femit-bin=", "tls_main"));
+            r.addFileArg(tls_exe.addOutputFileArg2("tls_main", .{ .prefix = "-femit-bin=" }));
             break :run r;
         };
         tls_run.setName(b.fmt("run tls_main (extern threadlocal, {s})", .{mode}));
@@ -1435,11 +1435,11 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const cache = b.addSystemCommand(&.{"sh"});
         cache.setName(b.fmt("bs {s} cache", .{cmd}));
         cache.addFileArg(b.path("test/obj/cache.sh"));
-        cache.addArtifactArg(bs);
+        cache.addArtifactArg2(bs, .{});
         cache.addFileArg(b.path("test/obj/lib.zig"));
-        _ = cache.addOutputDirectoryArg("work");
+        _ = cache.addOutputDirectoryArg2("work", .{});
         cache.addArg(cmd);
-        cache.addDirectoryArg(std_zir);
+        cache.addDirectoryArg2(std_zir, .{});
         cache.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &cache.step, 25);
         test_step.dependOn(&cache.step);
@@ -1450,9 +1450,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const donor = b.addSystemCommand(&.{"sh"});
         donor.setName("bs donor own");
         donor.addFileArg(b.path("test/run/donor_own.sh"));
-        donor.addArtifactArg(bs);
-        _ = donor.addOutputDirectoryArg("work");
-        donor.addDirectoryArg(std_zir);
+        donor.addArtifactArg2(bs, .{});
+        _ = donor.addOutputDirectoryArg2("work", .{});
+        donor.addDirectoryArg2(std_zir, .{});
         donor.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &donor.step, 15);
         test_step.dependOn(&donor.step);
@@ -1463,9 +1463,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const deps = b.addSystemCommand(&.{"sh"});
         deps.setName("bs donor module deps");
         deps.addFileArg(b.path("test/run/donor_module_deps.sh"));
-        deps.addArtifactArg(bs);
-        _ = deps.addOutputDirectoryArg("work");
-        deps.addDirectoryArg(std_zir);
+        deps.addArtifactArg2(bs, .{});
+        _ = deps.addOutputDirectoryArg2("work", .{});
+        deps.addDirectoryArg2(std_zir, .{});
         deps.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &deps.step, 10);
         test_step.dependOn(&deps.step);
@@ -1475,9 +1475,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const dm = b.addSystemCommand(&.{"sh"});
         dm.setName("bs donor across musl's -lc");
         dm.addFileArg(b.path("test/run/donor_musl_libc.sh"));
-        dm.addArtifactArg(bs);
-        _ = dm.addOutputDirectoryArg("work");
-        dm.addDirectoryArg(std_zir);
+        dm.addArtifactArg2(bs, .{});
+        _ = dm.addOutputDirectoryArg2("work", .{});
+        dm.addDirectoryArg2(std_zir, .{});
         dm.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
         dm.addCheck(.{ .expect_term = .{ .exited = 0 } });
         // With a cold global cache, libc.a's thousand sources.
@@ -1490,9 +1490,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const sl = b.addSystemCommand(&.{"sh"});
         sl.setName("bs store entry across layouts");
         sl.addFileArg(b.path("test/run/store_layout.sh"));
-        sl.addArtifactArg(bs);
-        _ = sl.addOutputDirectoryArg("work");
-        sl.addDirectoryArg(std_zir);
+        sl.addArtifactArg2(bs, .{});
+        _ = sl.addOutputDirectoryArg2("work", .{});
+        sl.addDirectoryArg2(std_zir, .{});
         sl.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
         sl.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &sl.step, 15);
@@ -1503,10 +1503,10 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const rt = b.addSystemCommand(&.{"sh"});
         rt.setName("bs compiler_rt edit without old ZIR");
         rt.addFileArg(b.path("test/run/edit_rt_old_zir.sh"));
-        rt.addArtifactArg(bs);
-        _ = rt.addOutputDirectoryArg("work");
+        rt.addArtifactArg2(bs, .{});
+        _ = rt.addOutputDirectoryArg2("work", .{});
         rt.addArg(defaultZigLibDir(b));
-        rt.addDirectoryArg(std_zir);
+        rt.addDirectoryArg2(std_zir, .{});
         rt.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &rt.step, 15);
         test_step.dependOn(&rt.step);
@@ -1516,9 +1516,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const sj = b.addSystemCommand(&.{"sh"});
         sj.setName("bs edit after a function type change");
         sj.addFileArg(b.path("test/run/edit_subject.sh"));
-        sj.addArtifactArg(bs);
-        _ = sj.addOutputDirectoryArg("work");
-        sj.addDirectoryArg(std_zir);
+        sj.addArtifactArg2(bs, .{});
+        _ = sj.addOutputDirectoryArg2("work", .{});
+        sj.addDirectoryArg2(std_zir, .{});
         sj.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &sj.step, 10);
         test_step.dependOn(&sj.step);
@@ -1529,9 +1529,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const ek = b.addSystemCommand(&.{"sh"});
         ek.setName("bs edit of a module with --deps that embeds a file");
         ek.addFileArg(b.path("test/run/edit_embed_dep_key.sh"));
-        ek.addArtifactArg(bs);
-        _ = ek.addOutputDirectoryArg("work");
-        ek.addDirectoryArg(std_zir);
+        ek.addArtifactArg2(bs, .{});
+        _ = ek.addOutputDirectoryArg2("work", .{});
+        ek.addDirectoryArg2(std_zir, .{});
         ek.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &ek.step, 10);
         test_step.dependOn(&ek.step);
@@ -1542,9 +1542,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const zu = b.addSystemCommand(&.{"sh"});
         zu.setName("bs build after an unanalyzed ZON import is deleted");
         zu.addFileArg(b.path("test/run/edit_zon_unreferenced.sh"));
-        zu.addArtifactArg(bs);
-        _ = zu.addOutputDirectoryArg("work");
-        zu.addDirectoryArg(std_zir);
+        zu.addArtifactArg2(bs, .{});
+        _ = zu.addOutputDirectoryArg2("work", .{});
+        zu.addDirectoryArg2(std_zir, .{});
         zu.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &zu.step, 10);
         test_step.dependOn(&zu.step);
@@ -1554,9 +1554,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const rq = b.addSystemCommand(&.{"sh"});
         rq.setName("bs compiler_rt requester edit");
         rq.addFileArg(b.path("test/run/edit_rt_request.sh"));
-        rq.addArtifactArg(bs);
-        _ = rq.addOutputDirectoryArg("work");
-        rq.addDirectoryArg(std_zir);
+        rq.addArtifactArg2(bs, .{});
+        _ = rq.addOutputDirectoryArg2("work", .{});
+        rq.addDirectoryArg2(std_zir, .{});
         rq.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &rq.step, 10);
         test_step.dependOn(&rq.step);
@@ -1566,9 +1566,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const en = b.addSystemCommand(&.{"sh"});
         en.setName("bs test edit adding an error name");
         en.addFileArg(b.path("test/run/edit_error_names_table.sh"));
-        en.addArtifactArg(bs);
-        _ = en.addOutputDirectoryArg("work");
-        en.addDirectoryArg(std_zir);
+        en.addArtifactArg2(bs, .{});
+        _ = en.addOutputDirectoryArg2("work", .{});
+        en.addDirectoryArg2(std_zir, .{});
         en.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &en.step, 10);
         test_step.dependOn(&en.step);
@@ -1578,9 +1578,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const em = b.addSystemCommand(&.{"sh"});
         em.setName("bs edit around a deleted embedded file");
         em.addFileArg(b.path("test/run/edit_embed_gone.sh"));
-        em.addArtifactArg(bs);
-        _ = em.addOutputDirectoryArg("work");
-        em.addDirectoryArg(std_zir);
+        em.addArtifactArg2(bs, .{});
+        _ = em.addOutputDirectoryArg2("work", .{});
+        em.addDirectoryArg2(std_zir, .{});
         em.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &em.step, 10);
         test_step.dependOn(&em.step);
@@ -1591,9 +1591,9 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const ue = b.addSystemCommand(&.{"sh"});
         ue.setName("bs edit with an error in a unit no longer reached");
         ue.addFileArg(b.path("test/run/edit_unreached_error.sh"));
-        ue.addArtifactArg(bs);
-        _ = ue.addOutputDirectoryArg("work");
-        ue.addDirectoryArg(std_zir);
+        ue.addArtifactArg2(bs, .{});
+        _ = ue.addOutputDirectoryArg2("work", .{});
+        ue.addDirectoryArg2(std_zir, .{});
         ue.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &ue.step, 10);
         test_step.dependOn(&ue.step);
@@ -1604,7 +1604,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     bs_run.addArg("run");
     bs_run.addFileArg(b.path("test/obj/args.zig"));
     bs_run.addArg("--global-cache-dir");
-    _ = bs_run.addOutputDirectoryArg("run-cache");
+    _ = bs_run.addOutputDirectoryArg2("run-cache", .{});
     bs_run.addArgs(&.{ "--", "a", "b c", "" });
     bs_run.addCheck(.{ .expect_stdout_exact = "[a][b c][]\n" });
     bs_run.addCheck(.{ .expect_term = .{ .exited = 43 } });
@@ -1619,7 +1619,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     mods.addPrefixedFileArg("-Mversion=", b.path("test/obj/mod/version"));
     mods.addArgs(&.{ "--dep", "app" });
     mods.addPrefixedFileArg("-Mback=", b.path("test/obj/mod/back.zig"));
-    const mods_bin = mods.addPrefixedOutputFileArg("-femit-bin=", "modules");
+    const mods_bin = mods.addOutputFileArg2("modules", .{ .prefix = "-femit-bin=" });
     const mods_run = std.Build.Step.Run.create(b, "run modules");
     mods_run.addFileArg(mods_bin);
     mods_run.addCheck(.{ .expect_stdout_exact = "bs 3 0.17.0-dev 30 31 app\n" });
@@ -1634,7 +1634,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     src_app.addArg("run");
     src_app.addPrefixedFileArg("-Mapp=", b.path("test/obj/mod/srcmod.zig"));
     src_app.addArg("--global-cache-dir");
-    const src_cache = src_app.addOutputDirectoryArg("src-module-cache");
+    const src_cache = src_app.addOutputDirectoryArg2("src-module-cache", .{});
     src_app.addCheck(.{ .expect_stdout_exact = "app\n" });
     takes(b, &src_app.step, 5);
     const src_stem = b.addRunArtifact(bs);
@@ -1642,7 +1642,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     src_stem.addArg("run");
     src_stem.addFileArg(b.path("test/obj/mod/srcmod.zig"));
     src_stem.addArg("--global-cache-dir");
-    src_stem.addDirectoryArg(src_cache);
+    src_stem.addDirectoryArg2(src_cache, .{});
     src_stem.addCheck(.{ .expect_stdout_exact = "srcmod\n" });
     test_step.dependOn(&src_stem.step);
 
@@ -1653,7 +1653,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     no_bin_test.addArgs(&.{ "test", "-fno-emit-bin" });
     no_bin_test.addFileArg(b.path("test/obj/failing_test.zig"));
     no_bin_test.addArg("--global-cache-dir");
-    _ = no_bin_test.addOutputDirectoryArg("no-bin-test-cache");
+    _ = no_bin_test.addOutputDirectoryArg2("no-bin-test-cache", .{});
     no_bin_test.addCheck(.{ .expect_stderr_exact = "" });
     no_bin_test.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&no_bin_test.step);
@@ -1669,7 +1669,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     self_test.addPrefixedFileArg("-Mroot=", b.path("test/obj/mod/self.zig"));
     self_test.addPrefixedFileArg("-Mmain=", b.path("test/obj/mod/seven.zig"));
     self_test.addArg("--global-cache-dir");
-    _ = self_test.addOutputDirectoryArg("self-test-cache");
+    _ = self_test.addOutputDirectoryArg2("self-test-cache", .{});
     self_test.addCheck(.{ .expect_stderr_match = "All 2 tests passed." });
     self_test.addCheck(.{ .expect_term = .{ .exited = 0 } });
     takes(b, &self_test.step, 5);
@@ -1686,7 +1686,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     user_test.addArgs(&.{ "test", "--zig-lib-dir", lib_dir, "--test-filter", "Allocating" });
     user_test.addFileArg(b.path("test/obj/writer_test.zig"));
     user_test.addArg("--global-cache-dir");
-    const std_cache = user_test.addOutputDirectoryArg("std-test-cache");
+    const std_cache = user_test.addOutputDirectoryArg2("std-test-cache", .{});
     user_test.addCheck(.{ .expect_stderr_match = "All 1 tests passed." });
     const std_test = b.addRunArtifact(bs);
     std_test.setName("bs test std after a std user");
@@ -1694,7 +1694,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     std_test.addArgs(&.{ "test", "--zig-lib-dir", lib_dir, "--test-filter", "Allocating" });
     std_test.addFileArg(.{ .cwd_relative = b.pathJoin(&.{ lib_dir, "std", "std.zig" }) });
     std_test.addArg("--global-cache-dir");
-    std_test.addDirectoryArg(std_cache);
+    std_test.addDirectoryArg2(std_cache, .{});
     std_test.addCheck(.{ .expect_stderr_match = "tests passed." });
     std_test.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&std_test.step);
@@ -1714,9 +1714,9 @@ fn addBuildTest(b: *std.Build, bs: *std.Build.Step.Compile, build_web_wasm: std.
         const run = b.addSystemCommand(&.{"sh"});
         run.setName(b.fmt("bs build test/build/hello ({s})", .{part}));
         run.addFileArg(b.path("test/build/check.sh"));
-        run.addArtifactArg(bs);
-        run.addDirectoryArg(b.path("test/build/hello"));
-        _ = run.addOutputDirectoryArg("work");
+        run.addArtifactArg2(bs, .{});
+        run.addDirectoryArg2(b.path("test/build/hello"), .{});
+        _ = run.addOutputDirectoryArg2("work", .{});
         run.addFileArg(build_web_wasm);
         run.addArg(part);
         run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1799,17 +1799,17 @@ fn addMachOInputs(b: *std.Build, m: *std.Build.Module) void {
         const cc = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-macos", "-O2", "-c" });
         cc.addFileArg(b.path(b.fmt("test/link_input/macho_{s}.c", .{stem})));
         cc.addArg("-o");
-        obj.* = cc.addOutputFileArg(out);
+        obj.* = cc.addOutputFileArg2(out, .{});
     }
     const ar = b.addSystemCommand(&.{ zig, "ar", "--format=darwin", "rcs" });
-    const lib = ar.addOutputFileArg("lib.a");
+    const lib = ar.addOutputFileArg2("lib.a", .{});
     ar.addFileArg(objs[1]);
     ar.addFileArg(objs[2]);
     for ([_][]const u8{ "a", "b" }) |x| {
         const cc = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-macos", "-c" });
         cc.addFileArg(b.path(b.fmt("test/link_input/macho_objc_{s}.m", .{x})));
         cc.addArg("-o");
-        m.addAnonymousImport(b.fmt("macho_input_objc_{s}.o", .{x}), .{ .root_source_file = cc.addOutputFileArg(b.fmt("objc_{s}.o", .{x})) });
+        m.addAnonymousImport(b.fmt("macho_input_objc_{s}.o", .{x}), .{ .root_source_file = cc.addOutputFileArg2(b.fmt("objc_{s}.o", .{x}), .{}) });
     }
     m.addAnonymousImport("macho_input_main.o", .{ .root_source_file = objs[0] });
     m.addAnonymousImport("macho_input_lib.a", .{ .root_source_file = lib });
@@ -1838,7 +1838,7 @@ fn docsWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
     });
     cmd.addPrefixedFileArg("-Mroot=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "main.zig" }) });
     cmd.addPrefixedFileArg("-MWalk=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "Walk.zig" }) });
-    return cmd.addPrefixedOutputFileArg("-femit-bin=", "main.wasm");
+    return cmd.addOutputFileArg2("main.wasm", .{ .prefix = "-femit-bin=" });
 }
 
 /// lib/build-web of `zig_lib_dir` compiled as upstream's build runner
@@ -1863,7 +1863,7 @@ fn buildWebWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
     cmd.addPrefixedFileArg("-MWalk=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "Walk.zig" }) });
     cmd.addArgs(&.{ "--dep", "Walk" });
     cmd.addPrefixedFileArg("-Mhtml_render=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "html_render.zig" }) });
-    return cmd.addPrefixedOutputFileArg("-femit-bin=", "build-web.wasm");
+    return cmd.addOutputFileArg2("build-web.wasm", .{ .prefix = "-femit-bin=" });
 }
 
 /// Upstream zig, the oracle the tests compare bs with: the zig running
@@ -1895,7 +1895,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
                 c.addArgs(extra);
                 c.addArg("-c");
                 c.addFileArg(bb.path(bb.fmt("test/link_input/{s}", .{src})));
-                return c.addPrefixedOutputFileArg("-o", bb.fmt("{s}.o", .{src}));
+                return c.addOutputFileArg2(bb.fmt("{s}.o", .{src}), .{ .prefix = "-o" });
             }
         }.f;
         const lib = compile(b, v.cc, "lib.c", &.{"-fcommon"});
@@ -1906,7 +1906,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         var archives: [2]std.Build.LazyPath = undefined;
         for (&archives, [_][]const u8{ "a1.c", "a2.c" }) |*a, src| {
             const ar = b.addSystemCommand(&.{ zig, "ar", "rcs" });
-            a.* = ar.addOutputFileArg(b.fmt("lib{s}.a", .{src[0..2]}));
+            a.* = ar.addOutputFileArg2(b.fmt("lib{s}.a", .{src[0..2]}), .{});
             ar.addFileArg(compile(b, v.cc, src, &.{}));
         }
         const exe = b.addRunArtifact(bs);
@@ -1916,9 +1916,9 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         for ([_]std.Build.LazyPath{ lib, tls, tlsie, archives[0] }) |input| exe.addFileArg(input);
         // The second archive by name (`-l`, `-L`).
         exe.addArg("-la2");
-        exe.addPrefixedDirectoryArg("-L", archives[1].dirname());
+        exe.addDirectoryArg2(archives[1].dirname(), .{ .prefix = "-L" });
         exe.setEnvironmentVariable("BS_CACHE", "off");
-        const bin = exe.addPrefixedOutputFileArg("-femit-bin=", "main");
+        const bin = exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
         const run = std.Build.Step.Run.create(b, b.fmt("run bs link of {s} objects", .{v.name}));
         run.addFileArg(bin);
         run.addCheck(.{ .expect_stderr_exact = expect });
@@ -1933,13 +1933,13 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             lib_c.addArgs(&.{ "build-lib", "-mcpu", "baseline", "--name", stem });
             lib_c.addFileArg(b.path(b.fmt("test/link_input/{s}.c", .{stem})));
             lib_c.setEnvironmentVariable("BS_ZIG", zig);
-            a.* = lib_c.addPrefixedOutputFileArg("-femit-bin=", b.fmt("lib{s}.a", .{stem}));
+            a.* = lib_c.addOutputFileArg2(b.fmt("lib{s}.a", .{stem}), .{ .prefix = "-femit-bin=" });
         }
         // Upstream's archive of the same C is the same bytes, with its own
         // linker (with LLD, it writes llvm-ar's format).
         const up_lib = b.addSystemCommand(&.{ zig, "build-lib", "-fno-llvm", "-fno-lld", "-mcpu", "baseline", "--name", "a1" });
         up_lib.addFileArg(b.path("test/link_input/a1.c"));
-        const up_a1 = up_lib.addPrefixedOutputFileArg("-femit-bin=", "liba1.a");
+        const up_a1 = up_lib.addOutputFileArg2("liba1.a", .{ .prefix = "-femit-bin=" });
         const same = b.addSystemCommand(&.{"cmp"});
         same.setName("bs's archive of C is upstream's");
         same.addFileArg(archives[0]);
@@ -1955,7 +1955,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         src.addFileArg(b.path("test/link_input/main.zig"));
         for (archives) |input| src.addFileArg(input);
         src.setEnvironmentVariable("BS_ZIG", zig);
-        const src_bin = src.addPrefixedOutputFileArg("-femit-bin=", "main");
+        const src_bin = src.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
         const src_run = std.Build.Step.Run.create(b, "run bs build of C sources");
         src_run.addFileArg(src_bin);
         src_run.addCheck(.{ .expect_stderr_exact = expect });
@@ -1988,19 +1988,19 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             if (v.len != 0) c.addArg(v);
             c.addArgs(flags);
             c.addFileArg(b.path(b.fmt("test/link_input/{s}", .{src})));
-            const o = c.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{src}));
+            const o = c.addOutputFileArg2(b.fmt("{s}.o", .{src}), .{ .prefix = "-o" });
             if (src[0] != 'a') {
                 exe.addFileArg(o);
                 continue;
             }
             const ar = b.addSystemCommand(&.{ zig, "ar", "rcs" });
-            const a = ar.addOutputFileArg(b.fmt("lib{s}.a", .{src[0..2]}));
+            const a = ar.addOutputFileArg2(b.fmt("lib{s}.a", .{src[0..2]}), .{});
             ar.addFileArg(o);
             exe.addFileArg(a);
         }
         const run = std.Build.Step.Run.create(b, b.fmt("run bs aarch64-linux link of {s}", .{what}));
         run.addArgs(runner);
-        run.addFileArg(exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        run.addFileArg(exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         run.addCheck(.{ .expect_stderr_exact = expect });
         run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&run.step);
@@ -2019,20 +2019,20 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         for ([_][]const u8{ "a1", "a2" }) |stem| {
             const o = b.addSystemCommand(&.{ zig, "cc", "-c" });
             o.addFileArg(b.path(b.fmt("test/link_input/{s}.c", .{stem})));
-            const o_file = o.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{stem}));
+            const o_file = o.addOutputFileArg2(b.fmt("{s}.o", .{stem}), .{ .prefix = "-o" });
             lib.addFileArg(o_file);
             obj_only.addFileArg(o_file);
         }
         const outputs = [_]std.Build.LazyPath{
-            lib.addPrefixedOutputFileArg("-femit-bin=", "liba12.a"),
-            obj_only.addPrefixedOutputFileArg("-femit-bin=", "a12.o"),
+            lib.addOutputFileArg2("liba12.a", .{ .prefix = "-femit-bin=" }),
+            obj_only.addOutputFileArg2("a12.o", .{ .prefix = "-femit-bin=" }),
         };
         for (outputs, [_][]const u8{ "library", "object" }) |out, what| {
             const exe = b.addSystemCommand(&.{ zig, "build-exe" });
             exe.addFileArg(b.path("test/link_input/a12_main.zig"));
             exe.addFileArg(out);
             const r = std.Build.Step.Run.create(b, b.fmt("run upstream's link of bs's {s} of objects only", .{what}));
-            r.addFileArg(exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            r.addFileArg(exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
             r.addCheck(.{ .expect_stderr_exact = "12\n" });
             r.addCheck(.{ .expect_term = .{ .exited = 0 } });
             test_step.dependOn(&r.step);
@@ -2044,7 +2044,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     // C as -fPIC under -lc.
     const c = b.addSystemCommand(&.{ zig, "cc", "-fPIC", "-c" });
     c.addFileArg(b.path("test/link_input/libc.c"));
-    const libc_o = c.addPrefixedOutputFileArg("-o", "libc.o");
+    const libc_o = c.addOutputFileArg2("libc.o", .{ .prefix = "-o" });
     const exe = b.addRunArtifact(bs);
     exe.setName("bs build-exe -lc with a C object");
     exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
@@ -2053,7 +2053,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     exe.setEnvironmentVariable("BS_CACHE", "off");
     exe.setEnvironmentVariable("BS_ZIG", zig);
     const run = std.Build.Step.Run.create(b, "run bs -lc link of a C object");
-    run.addFileArg(exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    run.addFileArg(exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
     run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -2067,7 +2067,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     src_exe.addFileArg(b.path("test/link_input/libc.c"));
     src_exe.setEnvironmentVariable("BS_ZIG", zig);
     const src_run = std.Build.Step.Run.create(b, "run bs -lc build of a C source");
-    src_run.addFileArg(src_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    src_run.addFileArg(src_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     src_run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
     src_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -2081,7 +2081,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     objc_exe.addFileArg(b.path("test/link_input/objc.m"));
     objc_exe.setEnvironmentVariable("BS_ZIG", zig);
     const objc_run = std.Build.Step.Run.create(b, "run bs -lc build of an Objective-C source");
-    objc_run.addFileArg(objc_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    objc_run.addFileArg(objc_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     objc_run.addCheck(.{ .expect_term = .{ .exited = 3 } });
     test_step.dependOn(&objc_run.step);
     // A C source's strong definition replaces a weak export of the Zig
@@ -2093,7 +2093,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     wdef_exe.addFileArg(b.path("test/link_input/weak_export.c"));
     wdef_exe.setEnvironmentVariable("BS_ZIG", zig);
     const wdef_run = std.Build.Step.Run.create(b, "run bs build with a C definition over a weak Zig export");
-    wdef_run.addFileArg(wdef_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    wdef_run.addFileArg(wdef_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     wdef_run.addCheck(.{ .expect_stderr_exact = "2 20\n" });
     wdef_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&wdef_run.step);
@@ -2119,7 +2119,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             takes(b, &m_exe.step, 40);
             const m_run = std.Build.Step.Run.create(b, b.fmt("run bs {s} {s} build with {s}", .{ target, case.lib, case.what }));
             m_run.addArgs(runner);
-            m_run.addFileArg(m_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            m_run.addFileArg(m_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
             m_run.addArgs(case.args);
             m_run.addCheck(.{ .expect_stdout_exact = case.stdout });
             m_run.addCheck(.{ .expect_stderr_exact = case.stderr });
@@ -2132,7 +2132,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     if (aarch64LinuxGlibcRunner(b)) |runner| {
         const a64c = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux-gnu", "-fPIC", "-c" });
         a64c.addFileArg(b.path("test/link_input/libc.c"));
-        const a64_o = a64c.addPrefixedOutputFileArg("-o", "libc.o");
+        const a64_o = a64c.addOutputFileArg2("libc.o", .{ .prefix = "-o" });
         for ([_]bool{ false, true }) |source| {
             const what = if (source) "a C source" else "a C object";
             const a64_exe = b.addRunArtifact(bs);
@@ -2144,7 +2144,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             a64_exe.setEnvironmentVariable("BS_ZIG", zig);
             const a64_run = std.Build.Step.Run.create(b, b.fmt("run bs aarch64-linux -lc link of {s}", .{what}));
             a64_run.addArgs(runner);
-            a64_run.addFileArg(a64_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            a64_run.addFileArg(a64_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
             a64_run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
             a64_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
             a64_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -2157,7 +2157,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         a64_cexe.setEnvironmentVariable("BS_ZIG", zig);
         const a64_cexe_run = std.Build.Step.Run.create(b, "run bs aarch64-linux -lc build of only C sources");
         a64_cexe_run.addArgs(runner);
-        a64_cexe_run.addFileArg(a64_cexe.addPrefixedOutputFileArg("-femit-bin=", "cmain"));
+        a64_cexe_run.addFileArg(a64_cexe.addOutputFileArg2("cmain", .{ .prefix = "-femit-bin=" }));
         a64_cexe_run.addArg("5");
         a64_cexe_run.addCheck(.{ .expect_stdout_exact = "argc=2 q=478165905515354922\n" });
         a64_cexe_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
@@ -2168,24 +2168,24 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         so.addFileArg(b.path("test/link_input/shared.c"));
         so.addPrefixedFileArg("-Wl,--version-script=", b.path("test/link_input/shared.map"));
         so.addArg("-Wl,-soname,libshared.so");
-        const lib_dir = so.addPrefixedOutputFileArg("-o", "libshared.so").dirname();
+        const lib_dir = so.addOutputFileArg2("libshared.so", .{ .prefix = "-o" }).dirname();
         const user = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux-gnu", "-c" });
         user.addFileArg(b.path("test/link_input/shared_user.c"));
         const so_exe = b.addRunArtifact(bs);
         so_exe.setName("bs build-exe -lc -target aarch64-linux-gnu with a shared library");
         so_exe.addArgs(&.{ "build-exe", "-lc", "-target", "aarch64-linux-gnu", "-lshared" });
-        so_exe.addPrefixedDirectoryArg("-L", lib_dir);
+        so_exe.addDirectoryArg2(lib_dir, .{ .prefix = "-L" });
         so_exe.addFileArg(b.path("test/link_input/shared_main.zig"));
-        so_exe.addFileArg(user.addPrefixedOutputFileArg("-o", "shared_user.o"));
+        so_exe.addFileArg(user.addOutputFileArg2("shared_user.o", .{ .prefix = "-o" }));
         so_exe.setEnvironmentVariable("BS_CACHE", "off");
         // The loader under qemu finds the library through the emulated
         // program's LD_LIBRARY_PATH (QEMU_SET_ENV); a cross build has no
         // DT_RUNPATH, as upstream's.
         const so_run = b.addSystemCommand(&.{ "sh", "-c", "d=$1; shift; LD_LIBRARY_PATH=$d QEMU_SET_ENV=LD_LIBRARY_PATH=$d exec \"$@\"", "sh" });
         so_run.setName("run bs aarch64-linux link of a shared library");
-        so_run.addDirectoryArg(lib_dir);
+        so_run.addDirectoryArg2(lib_dir, .{});
         so_run.addArgs(runner);
-        so_run.addFileArg(so_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        so_run.addFileArg(so_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         so_run.addCheck(.{ .expect_stderr_exact = "42 143 42 143\n" });
         so_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&so_run.step);
@@ -2194,24 +2194,24 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         // through one slot the loader writes (R_AARCH64_TLS_TPREL64).
         const tls_so = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux-gnu", "-shared", "-fPIC", "-Wl,-soname,libsotls.so" });
         tls_so.addFileArg(b.path("test/link_input/so_tls.c"));
-        const tls_dir = tls_so.addPrefixedOutputFileArg("-o", "libsotls.so").dirname();
+        const tls_dir = tls_so.addOutputFileArg2("libsotls.so", .{ .prefix = "-o" }).dirname();
         const tls_exe = b.addRunArtifact(bs);
         tls_exe.setName("bs build-exe -lc -target aarch64-linux-gnu with a shared library's thread-local");
         tls_exe.addArgs(&.{ "build-exe", "-lc", "-target", "aarch64-linux-gnu", "-lsotls" });
-        tls_exe.addPrefixedDirectoryArg("-L", tls_dir);
+        tls_exe.addDirectoryArg2(tls_dir, .{ .prefix = "-L" });
         tls_exe.addFileArg(b.path("test/link_input/so_tls_main.zig"));
         for ([_][]const []const u8{ &.{ "-fPIC", "-DSUFFIX=_gd" }, &.{ "-fPIC", "-DSUFFIX=_desc" }, &.{ "-fPIC", "-ftls-model=initial-exec", "-DSUFFIX=_ie" } }, [_][]const u8{ "gd", "desc", "ie" }) |flags, name| {
             const tls_user = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-linux-gnu", "-c" });
             tls_user.addArgs(flags);
             tls_user.addFileArg(b.path("test/link_input/so_tls_user.c"));
-            tls_exe.addFileArg(tls_user.addPrefixedOutputFileArg("-o", b.fmt("so_tls_{s}.o", .{name})));
+            tls_exe.addFileArg(tls_user.addOutputFileArg2(b.fmt("so_tls_{s}.o", .{name}), .{ .prefix = "-o" }));
         }
         tls_exe.setEnvironmentVariable("BS_CACHE", "off");
         const tls_run = b.addSystemCommand(&.{ "sh", "-c", "d=$1; shift; LD_LIBRARY_PATH=$d QEMU_SET_ENV=LD_LIBRARY_PATH=$d exec \"$@\"", "sh" });
         tls_run.setName("run bs aarch64-linux link of a shared library's thread-local");
-        tls_run.addDirectoryArg(tls_dir);
+        tls_run.addDirectoryArg2(tls_dir, .{});
         tls_run.addArgs(runner);
-        tls_run.addFileArg(tls_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        tls_run.addFileArg(tls_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         tls_run.addCheck(.{ .expect_stderr_exact = "main: 3 3 3 3 103\nset: 1114 1114 1114 1114 1214\nthread: 3 3 3 3 103\nafter: 1114 1114 1114 1114 1214\n" });
         tls_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&tls_run.step);
@@ -2223,11 +2223,11 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         ifunc_exe.setName("bs build-exe -lc -target aarch64-linux-gnu with GNU indirect functions");
         ifunc_exe.addArgs(&.{ "build-exe", "-lc", "-target", "aarch64-linux-gnu" });
         ifunc_exe.addFileArg(b.path("test/link_input/ifunc_main.zig"));
-        ifunc_exe.addFileArg(ifunc_c.addPrefixedOutputFileArg("-o", "ifunc.o"));
+        ifunc_exe.addFileArg(ifunc_c.addOutputFileArg2("ifunc.o", .{ .prefix = "-o" }));
         ifunc_exe.setEnvironmentVariable("BS_CACHE", "off");
         const ifunc_run = std.Build.Step.Run.create(b, "run bs aarch64-linux link of GNU indirect functions");
         ifunc_run.addArgs(runner);
-        ifunc_run.addFileArg(ifunc_exe.addPrefixedOutputFileArg("-femit-bin=", "ifunc"));
+        ifunc_run.addFileArg(ifunc_exe.addOutputFileArg2("ifunc", .{ .prefix = "-femit-bin=" }));
         ifunc_run.addCheck(.{ .expect_stderr_exact = "42 42 6 15 9 true true\n" });
         ifunc_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&ifunc_run.step);
@@ -2239,7 +2239,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         wexe.addArgs(&.{ "build-exe", "-lc", "-target", "aarch64-linux-gnu" });
         wexe.addFileArg(b.path("test/link_input/weak_main.c"));
         wexe.setEnvironmentVariable("BS_ZIG", zig);
-        const weak_exe = wexe.addPrefixedOutputFileArg("-femit-bin=", "weak_main");
+        const weak_exe = wexe.addOutputFileArg2("weak_main", .{ .prefix = "-femit-bin=" });
         const plain = std.Build.Step.Run.create(b, "run weak_main (aarch64-linux)");
         plain.addArgs(runner);
         plain.addFileArg(weak_exe);
@@ -2249,7 +2249,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         def.addFileArg(b.path("test/link_input/weak_def.c"));
         const preload = b.addSystemCommand(&.{ "sh", "-c", "p=$1; shift; LD_PRELOAD=$p QEMU_SET_ENV=LD_PRELOAD=$p exec \"$@\"", "sh" });
         preload.setName("run weak_main with weak_def preloaded (aarch64-linux)");
-        preload.addFileArg(def.addPrefixedOutputFileArg("-o", "libweak_def.so"));
+        preload.addFileArg(def.addOutputFileArg2("libweak_def.so", .{ .prefix = "-o" }));
         preload.addArgs(runner);
         preload.addFileArg(weak_exe);
         preload.addCheck(.{ .expect_stdout_exact = "fn=42 data=7 ptr=0\n" });
@@ -2266,7 +2266,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         cxx_exe.setEnvironmentVariable("BS_ZIG", zig);
         const cxx_run = std.Build.Step.Run.create(b, "run bs aarch64-linux -lc++ build of a C++ source");
         cxx_run.addArgs(runner);
-        cxx_run.addFileArg(cxx_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        cxx_run.addFileArg(cxx_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         cxx_run.addCheck(.{ .expect_stdout_exact = "caught: boom at depth 4\ntype: 7Derived\nctor 42, tls tls42!, sum 6\n" });
         cxx_run.addCheck(.{ .expect_stderr_exact = "result 151, link_libcpp true\n" });
         cxx_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -2294,10 +2294,10 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             tls_exe.addArg("build-exe");
             if (v.lc) tls_exe.addArgs(&.{ "-lc", "-target", "x86_64-linux-gnu" });
             tls_exe.addFileArg(b.path("test/link_input/tlsdesc_main.zig"));
-            tls_exe.addFileArg(obj.addPrefixedOutputFileArg("-o", "tlsdesc.o"));
+            tls_exe.addFileArg(obj.addOutputFileArg2("tlsdesc.o", .{ .prefix = "-o" }));
             tls_exe.setEnvironmentVariable("BS_CACHE", "off");
             const tls_run = std.Build.Step.Run.create(b, b.fmt("run bs{s} link of a {s} -mtls-dialect=gnu2 object", .{ if (v.lc) " -lc" else "", v.name }));
-            tls_run.addFileArg(tls_exe.addPrefixedOutputFileArg("-femit-bin=", "tlsdesc"));
+            tls_run.addFileArg(tls_exe.addOutputFileArg2("tlsdesc", .{ .prefix = "-femit-bin=" }));
             tls_run.addCheck(.{ .expect_stderr_exact = expect_tls });
             tls_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
             test_step.dependOn(&tls_run.step);
@@ -2316,10 +2316,10 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         merge.addArg("build-obj");
         merge.addFileArg(b.path("test/link_input/merge_lib.zig"));
         merge.addFileArg(b.path("test/link_input/merge.c"));
-        merge.addFileArg(tls_o.addPrefixedOutputFileArg("-o", "tls.o"));
+        merge.addFileArg(tls_o.addOutputFileArg2("tls.o", .{ .prefix = "-o" }));
         merge.setEnvironmentVariable("BS_CACHE", "off");
         merge.setEnvironmentVariable("BS_ZIG", zig);
-        const merged = merge.addPrefixedOutputFileArg("-femit-bin=", "merged.o");
+        const merged = merge.addOutputFileArg2("merged.o", .{ .prefix = "-femit-bin=" });
         const up_exe = b.addSystemCommand(&.{ zig, "build-exe" });
         up_exe.addFileArg(b.path("test/link_input/merge_main.zig"));
         up_exe.addFileArg(merged);
@@ -2330,7 +2330,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         bs_exe.setEnvironmentVariable("BS_CACHE", "off");
         for ([_]*std.Build.Step.Run{ up_exe, bs_exe }, [_][]const u8{ "upstream's", "bs's" }) |link, who| {
             const r = std.Build.Step.Run.create(b, b.fmt("run {s} link of bs's merged object", .{who}));
-            r.addFileArg(link.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            r.addFileArg(link.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
             r.addCheck(.{ .expect_stderr_exact = "44 bee 6 712\n" });
             r.addCheck(.{ .expect_term = .{ .exited = 0 } });
             test_step.dependOn(&r.step);
@@ -2343,14 +2343,14 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         for ([_][]const u8{ "merge1", "merge2" }) |stem| {
             const o = b.addSystemCommand(&.{ zig, "c++", "-c" });
             o.addFileArg(b.path(b.fmt("test/link_input/{s}.cpp", .{stem})));
-            cxx.addFileArg(o.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{stem})));
+            cxx.addFileArg(o.addOutputFileArg2(b.fmt("{s}.o", .{stem}), .{ .prefix = "-o" }));
         }
         cxx.setEnvironmentVariable("BS_CACHE", "off");
         cxx.setEnvironmentVariable("BS_ZIG", zig);
         const cxx_link = b.addSystemCommand(&.{ zig, "c++" });
-        cxx_link.addFileArg(cxx.addPrefixedOutputFileArg("-femit-bin=", "merged.o"));
+        cxx_link.addFileArg(cxx.addOutputFileArg2("merged.o", .{ .prefix = "-femit-bin=" }));
         const r = std.Build.Step.Run.create(b, "run upstream's link of bs's merged C++ object");
-        r.addFileArg(cxx_link.addPrefixedOutputFileArg("-o", "main"));
+        r.addFileArg(cxx_link.addOutputFileArg2("main", .{ .prefix = "-o" }));
         r.addCheck(.{ .expect_stdout_exact = "caught neg\n10 8 1 4\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -2365,8 +2365,8 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const desc_o = b.addSystemCommand(if (cc) |gcc| &.{ gcc, "-fPIC", "-mtls-dialect=gnu2", "-c" } else &.{ zig, "cc", "-fPIC", "-c" });
         desc_o.addFileArg(b.path("test/link_input/so_desc.c"));
         const desc_a = b.addSystemCommand(&.{ zig, "ar", "rcs" });
-        const desc_lib = desc_a.addOutputFileArg("libdesc.a");
-        desc_a.addFileArg(desc_o.addPrefixedOutputFileArg("-o", "so_desc.o"));
+        const desc_lib = desc_a.addOutputFileArg2("libdesc.a", .{});
+        desc_a.addFileArg(desc_o.addOutputFileArg2("so_desc.o", .{ .prefix = "-o" }));
         const zso_inputs = b.addRunArtifact(bs);
         zso_inputs.setName("bs build-lib -dynamic with a C source, a C object and an archive");
         zso_inputs.addArgs(&.{ "build-lib", "-dynamic", "--name", "bsinputs" });
@@ -2374,17 +2374,17 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         zso_inputs.addFileArg(b.path("test/link_input/merge.c"));
         zso_inputs.addFileArg(b.path("test/link_input/so_interpose.c"));
         zso_inputs.addFileArg(b.path("test/link_input/so_hidref.c"));
-        zso_inputs.addFileArg(tls_o.addPrefixedOutputFileArg("-o", "tls.o"));
+        zso_inputs.addFileArg(tls_o.addOutputFileArg2("tls.o", .{ .prefix = "-o" }));
         zso_inputs.addFileArg(desc_lib);
         zso_inputs.setEnvironmentVariable("BS_ZIG", zig);
-        const so_file = zso_inputs.addPrefixedOutputFileArg("-femit-bin=", "libbsinputs.so");
+        const so_file = zso_inputs.addOutputFileArg2("libbsinputs.so", .{ .prefix = "-femit-bin=" });
         const so_host = b.addSystemCommand(&.{ zig, "build-exe", "-lc" });
         so_host.addFileArg(b.path("test/link_input/so_main.zig"));
         so_host.addFileArg(so_file);
         const r = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
         r.setName("run so_main (bs shared library with inputs)");
         r.addFileArg(so_file);
-        r.addFileArg(so_host.addPrefixedOutputFileArg("-femit-bin=", "so_main"));
+        r.addFileArg(so_host.addOutputFileArg2("so_main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stderr_exact = "44 bee 6 712 810\nthread: 712 810\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -2396,7 +2396,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const preempt = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
         preempt.setName("run so_preempt (thread-locals, functions and data preempting a bs shared library's)");
         preempt.addFileArg(so_file);
-        preempt.addFileArg(preempt_host.addPrefixedOutputFileArg("-o", "so_preempt"));
+        preempt.addFileArg(preempt_host.addOutputFileArg2("so_preempt", .{ .prefix = "-o" }));
         preempt.addCheck(.{ .expect_stdout_exact = "100012 200310 1000 2003\n32 1 202 4\n" });
         preempt.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&preempt.step);
@@ -2415,7 +2415,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         cexe.addFileArg(b.path("test/link_input/cmain.c"));
         cexe.setEnvironmentVariable("BS_ZIG", zig);
         const cexe_run = std.Build.Step.Run.create(b, b.fmt("run bs -lc build of only C sources ({s})", .{label}));
-        cexe_run.addFileArg(cexe.addPrefixedOutputFileArg("-femit-bin=", "cmain"));
+        cexe_run.addFileArg(cexe.addOutputFileArg2("cmain", .{ .prefix = "-femit-bin=" }));
         cexe_run.addArg("5");
         cexe_run.addCheck(.{ .expect_stdout_exact = "argc=2 q=478165905515354922\n" });
         cexe_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
@@ -2431,7 +2431,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         nexe.addFileArg(b.path("test/link_input/c_nocheck.c"));
         nexe.setEnvironmentVariable("BS_ZIG", zig);
         const r = std.Build.Step.Run.create(b, "run bs -lc build of c_nocheck.c (x86_64-linux-gnu.2.4)");
-        r.addFileArg(nexe.addPrefixedOutputFileArg("-femit-bin=", "c_nocheck"));
+        r.addFileArg(nexe.addOutputFileArg2("c_nocheck", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stdout_exact = "no checks\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -2442,7 +2442,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     {
         const preload = b.addSystemCommand(&.{ zig, "cc", "-shared", "-fPIC" });
         preload.addFileArg(b.path("test/link_input/plain_c_preload.c"));
-        const preload_so = preload.addPrefixedOutputFileArg("-o", "libplain_preload.so");
+        const preload_so = preload.addOutputFileArg2("libplain_preload.so", .{ .prefix = "-o" });
         for ([_]struct { flag: []const u8, out: []const u8 }{ .{ .flag = "-fsanitize-c", .out = "0\n" }, .{ .flag = "-fno-sanitize-c", .out = "42\n" } }) |v| {
             const pexe = b.addRunArtifact(bs);
             pexe.setName(b.fmt("bs build-exe -lc {s} plain_c.c", .{v.flag}));
@@ -2452,7 +2452,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             const r = b.addSystemCommand(&.{ "sh", "-c", "LD_PRELOAD=\"$1\" exec \"$2\"", "sh" });
             r.setName(b.fmt("run plain_c ({s}) with a preloaded memcmp", .{v.flag}));
             r.addFileArg(preload_so);
-            r.addFileArg(pexe.addPrefixedOutputFileArg("-femit-bin=", "plain_c"));
+            r.addFileArg(pexe.addOutputFileArg2("plain_c", .{ .prefix = "-femit-bin=" }));
             r.addCheck(.{ .expect_stdout_exact = v.out });
             r.addCheck(.{ .expect_term = .{ .exited = 0 } });
             test_step.dependOn(&r.step);
@@ -2467,7 +2467,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         nexe.addFileArg(b.path("test/link_input/nonshared_main.zig"));
         nexe.setEnvironmentVariable("BS_ZIG", zig);
         const nexe_run = std.Build.Step.Run.create(b, "run bs -lc build calling libc_nonshared.a from Zig");
-        nexe_run.addFileArg(nexe.addPrefixedOutputFileArg("-femit-bin=", "nonshared"));
+        nexe_run.addFileArg(nexe.addOutputFileArg2("nonshared", .{ .prefix = "-femit-bin=" }));
         nexe_run.addCheck(.{ .expect_stdout_exact = "stat -1 -1\nbye\n" });
         nexe_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&nexe_run.step);
@@ -2480,7 +2480,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         wexe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
         wexe.addFileArg(b.path("test/link_input/weak_main.c"));
         wexe.setEnvironmentVariable("BS_ZIG", zig);
-        const weak_exe = wexe.addPrefixedOutputFileArg("-femit-bin=", "weak_main");
+        const weak_exe = wexe.addOutputFileArg2("weak_main", .{ .prefix = "-femit-bin=" });
         const plain = std.Build.Step.Run.create(b, "run weak_main");
         plain.addFileArg(weak_exe);
         plain.addCheck(.{ .expect_stdout_exact = "fn=-1 data=-1 ptr=0\n" });
@@ -2489,7 +2489,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         def.addFileArg(b.path("test/link_input/weak_def.c"));
         const preload = b.addSystemCommand(&.{ "sh", "-c", "LD_PRELOAD=\"$1\" exec \"$2\"", "sh" });
         preload.setName("run weak_main with weak_def preloaded");
-        preload.addFileArg(def.addPrefixedOutputFileArg("-o", "libweak_def.so"));
+        preload.addFileArg(def.addOutputFileArg2("libweak_def.so", .{ .prefix = "-o" }));
         preload.addFileArg(weak_exe);
         preload.addCheck(.{ .expect_stdout_exact = "fn=42 data=7 ptr=0\n" });
         test_step.dependOn(&preload.step);
@@ -2503,7 +2503,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     {
         const rt_c = b.addSystemCommand(&.{ zig, "cc", "-mcpu=baseline", "-Wno-atomic-alignment", "-c" });
         rt_c.addFileArg(b.path("test/link_input/rt.c"));
-        const rt_o = rt_c.addPrefixedOutputFileArg("-o", "rt.o");
+        const rt_o = rt_c.addOutputFileArg2("rt.o", .{ .prefix = "-o" });
         const rt_exe = b.addRunArtifact(bs);
         rt_exe.setName("bs build-exe with a C object calling compiler_rt");
         rt_exe.addArg("build-exe");
@@ -2511,7 +2511,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         rt_exe.addFileArg(rt_o);
         rt_exe.setEnvironmentVariable("BS_CACHE", "off");
         const rt_run = std.Build.Step.Run.create(b, "run bs link of a C object calling compiler_rt");
-        rt_run.addFileArg(rt_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        rt_run.addFileArg(rt_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         rt_run.addCheck(.{ .expect_stderr_exact = "2.25 1 0 -6 0.375 1024 25 2.5 56\n" });
         rt_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&rt_run.step);
@@ -2523,10 +2523,10 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         for ([_][]const u8{ "undef1", "undef2" }) |name| {
             const u = b.addSystemCommand(&.{ zig, "cc", b.fmt("-DUNDEF={s}", .{name}), "-c" });
             u.addFileArg(b.path("test/link_input/undef.c"));
-            undef.addFileArg(u.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{name})));
+            undef.addFileArg(u.addOutputFileArg2(b.fmt("{s}.o", .{name}), .{ .prefix = "-o" }));
         }
         undef.setEnvironmentVariable("BS_CACHE", "off");
-        _ = undef.addPrefixedOutputFileArg("-femit-bin=", "main");
+        _ = undef.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
         undef.addCheck(.{ .expect_stderr_match = "undef1.o, " });
         undef.addCheck(.{ .expect_stderr_match = "undef2.o)\n" });
         undef.addCheck(.{ .expect_stderr_match = "\n1 error\n" });
@@ -2541,7 +2541,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const expect_ifunc = "42 42 6 15 9 true true\n";
         const o = b.addSystemCommand(&.{ zig, "cc", "-fPIC", "-c" });
         o.addFileArg(b.path("test/link_input/ifunc.c"));
-        const ifunc_o = o.addPrefixedOutputFileArg("-o", "ifunc.o");
+        const ifunc_o = o.addOutputFileArg2("ifunc.o", .{ .prefix = "-o" });
         const ifunc_exe = b.addRunArtifact(bs);
         ifunc_exe.setName("bs build-exe -lc with GNU indirect functions");
         ifunc_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
@@ -2549,7 +2549,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         ifunc_exe.addFileArg(ifunc_o);
         ifunc_exe.setEnvironmentVariable("BS_CACHE", "off");
         const ifunc_exe_run = std.Build.Step.Run.create(b, "run bs's link of GNU indirect functions");
-        ifunc_exe_run.addFileArg(ifunc_exe.addPrefixedOutputFileArg("-femit-bin=", "ifunc"));
+        ifunc_exe_run.addFileArg(ifunc_exe.addOutputFileArg2("ifunc", .{ .prefix = "-femit-bin=" }));
         ifunc_exe_run.addCheck(.{ .expect_stderr_exact = expect_ifunc });
         ifunc_exe_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&ifunc_exe_run.step);
@@ -2558,14 +2558,14 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         ifunc_lib.addArgs(&.{ "build-lib", "-dynamic", "--name", "bsifunc" });
         ifunc_lib.addFileArg(b.path("test/link_input/ifunc_lib.zig"));
         ifunc_lib.addFileArg(ifunc_o);
-        const ifunc_lib_file = ifunc_lib.addPrefixedOutputFileArg("-femit-bin=", "libbsifunc.so");
+        const ifunc_lib_file = ifunc_lib.addOutputFileArg2("libbsifunc.so", .{ .prefix = "-femit-bin=" });
         const ifunc_lib_host = b.addSystemCommand(&.{ zig, "build-exe", "-lc" });
         ifunc_lib_host.addFileArg(b.path("test/link_input/ifunc_main.zig"));
         ifunc_lib_host.addFileArg(ifunc_lib_file);
         const ifunc_lib_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
         ifunc_lib_run.setName("run ifunc_main (bs shared library with GNU indirect functions)");
         ifunc_lib_run.addFileArg(ifunc_lib_file);
-        ifunc_lib_run.addFileArg(ifunc_lib_host.addPrefixedOutputFileArg("-femit-bin=", "ifunc_main"));
+        ifunc_lib_run.addFileArg(ifunc_lib_host.addOutputFileArg2("ifunc_main", .{ .prefix = "-femit-bin=" }));
         ifunc_lib_run.addCheck(.{ .expect_stderr_exact = expect_ifunc });
         ifunc_lib_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&ifunc_lib_run.step);
@@ -2575,7 +2575,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         ifunc_static.addFileArg(b.path("test/link_input/ifunc_main.zig"));
         ifunc_static.addFileArg(ifunc_o);
         ifunc_static.setEnvironmentVariable("BS_CACHE", "off");
-        _ = ifunc_static.addPrefixedOutputFileArg("-femit-bin=", "ifunc");
+        _ = ifunc_static.addOutputFileArg2("ifunc", .{ .prefix = "-femit-bin=" });
         ifunc_static.addCheck(.{ .expect_stderr_match = "ifunc.o: bs links GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) only into executables that link libc and shared libraries, whose loader calls their resolvers: c_triple\n" });
         ifunc_static.addCheck(.{ .expect_term = .{ .exited = 1 } });
         test_step.dependOn(&ifunc_static.step);
@@ -2586,7 +2586,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         dead.addArg("build-exe");
         dead.addFileArg(b.path("test/link_input/dead_load.zig"));
         dead.setEnvironmentVariable("BS_CACHE", "off");
-        _ = dead.addPrefixedOutputFileArg("-femit-bin=", "dead_load");
+        _ = dead.addOutputFileArg2("dead_load", .{ .prefix = "-femit-bin=" });
         dead.addCheck(.{ .expect_stderr_match = "undefined symbol: nope" });
         dead.addCheck(.{ .expect_term = .{ .exited = 1 } });
         test_step.dependOn(&dead.step);
@@ -2601,7 +2601,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     cxx_exe.addFileArg(b.path("test/link_input/cxx.cpp"));
     cxx_exe.setEnvironmentVariable("BS_ZIG", zig);
     const cxx_run = std.Build.Step.Run.create(b, "run bs -lc++ build of a C++ source");
-    cxx_run.addFileArg(cxx_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    cxx_run.addFileArg(cxx_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     cxx_run.addCheck(.{ .expect_stdout_exact = "caught: boom at depth 4\ntype: 7Derived\nctor 42, tls tls42!, sum 6\n" });
     cxx_run.addCheck(.{ .expect_stderr_exact = "result 151, link_libcpp true\n" });
     cxx_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -2613,14 +2613,14 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     so_cxx.addArgs(&.{ "build-lib", "-dynamic", "-lc++", "-target", "x86_64-linux-gnu", "--name", "sxx", "--version", "1.2.3" });
     so_cxx.addFileArg(b.path("test/link_input/so_cxx.cpp"));
     so_cxx.setEnvironmentVariable("BS_ZIG", zig);
-    const so_cxx_file = so_cxx.addPrefixedOutputFileArg("-femit-bin=", "libsxx.so.1.2.3");
+    const so_cxx_file = so_cxx.addOutputFileArg2("libsxx.so.1.2.3", .{ .prefix = "-femit-bin=" });
     const so_cxx_host = b.addSystemCommand(&.{ zig, "build-exe", "-lc" });
     so_cxx_host.addFileArg(b.path("test/link_input/so_cxx_main.zig"));
     so_cxx_host.addFileArg(so_cxx_file);
     const so_cxx_run = b.addSystemCommand(&.{ "sh", "-c", "d=$(mktemp -d) && cp \"$1\" \"$d/libsxx.so.1\" && LD_LIBRARY_PATH=$d \"$2\"; r=$?; rm -rf \"$d\"; exit $r", "sh" });
     so_cxx_run.setName("run so_cxx_main.zig (bs shared library of C++)");
     so_cxx_run.addFileArg(so_cxx_file);
-    so_cxx_run.addFileArg(so_cxx_host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    so_cxx_run.addFileArg(so_cxx_host.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     so_cxx_run.addCheck(.{ .expect_stderr_exact = "sxx 6 9\n" });
     so_cxx_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&so_cxx_run.step);
@@ -2631,7 +2631,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     const tc_native = b.addRunArtifact(bs);
     tc_native.setName("bs translate-c -l<lib> takes the native include directories");
     tc_native.addArgs(&.{ "translate-c", "-lfoo", "-isystem" });
-    tc_native.addDirectoryArg(b.path("test/link_input/tc_native/shadow"));
+    tc_native.addDirectoryArg2(b.path("test/link_input/tc_native/shadow"), .{});
     tc_native.addFileArg(b.path("test/link_input/tc_native/s.h"));
     tc_native.setCwd(b.path("."));
     tc_native.setEnvironmentVariable("NIX_CFLAGS_COMPILE", "-isystem test/link_input/tc_native/sys");
@@ -2675,7 +2675,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     abi_exe.addFileArg(b.path("test/link_input/abi.c"));
     abi_exe.setEnvironmentVariable("BS_ZIG", zig);
     const abi_run = std.Build.Step.Run.create(b, "run bs build with C aggregates");
-    abi_run.addFileArg(abi_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    abi_run.addFileArg(abi_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     abi_run.addCheck(.{ .expect_stdout_exact = "c_s16 1 2 0.5 1.5 4 5 6\nc_mix 7 0.5 3.25 9.5 10 11 12 13 14 15\nc_dsi 5 1 2 3 4 5 6 7 8 9\nptr 30 60\nzig_mix 103 101.5 102.25\nzig_dsi 0.75 1 2 3\nzig_va 55\n" });
     abi_run.addCheck(.{ .expect_stderr_exact = "2 3 | 14 1 6.5 | 1.5 2.5 3.5 | 3 2 1 | 0.25 { 7, 8, 9 }\nc_va 55\nzig_s16 10 20 0.5 0.25 1 2 3\nzig_mix 3 1.5 2.25 4.5 { 1, 2, 3 } 4 5 6\nzig_dsi 9 1 2 3 4 5 6 7 8 9\n" });
     abi_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -2689,7 +2689,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     win_exe.addFileArg(b.path("test/link_input/win64.c"));
     win_exe.setEnvironmentVariable("BS_ZIG", zig);
     const win_run = std.Build.Step.Run.create(b, "run bs build with Win64 calls");
-    win_run.addFileArg(win_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    win_run.addFileArg(win_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     win_run.addCheck(.{ .expect_stdout_exact = "c_win_mix 1 2.5 3 4 5.5 6 7 8 9.5 10.5 11 12.5\nva u64 1\nva f64 2.5\nva u64 3\nva f64 4.5\nzig via ptr 32.5\nzig byref 15 77\nzig va 109.75 42\n" });
     win_run.addCheck(.{ .expect_stderr_exact = "byref 42 9 mix 32.5 s8 2 1 u128 80000000000000000\nzig_win_mix 1 2.5 3 4 5.5 6 7 8 9.5 10.5 11 12.5\nsum 42\n" });
     win_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -2703,7 +2703,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     vb_exe.addFileArg(b.path("test/link_input/vecbool.c"));
     vb_exe.setEnvironmentVariable("BS_ZIG", zig);
     const vb_run = std.Build.Step.Run.create(b, "run bs build with C bool vectors");
-    vb_run.addFileArg(vb_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    vb_run.addFileArg(vb_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     vb_run.addCheck(.{ .expect_stdout_exact = "c_v 10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\nc_iv 1 2 3 4  10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\nc_v7 1 2 3 4 5 6 7  10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\nc_v 10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\n" });
     vb_run.addCheck(.{ .expect_stderr_exact = "zig_v 01001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010\nzig_iv -1 -2 -3 -4 01001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010\nzig_v 01001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010\n" });
     vb_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -2722,7 +2722,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     asm_exe.addFileArg(b.path("test/link_input/asm_plain.s"));
     asm_exe.setEnvironmentVariable("BS_ZIG", zig);
     const asm_run = std.Build.Step.Run.create(b, "run bs build with assembly sources");
-    asm_run.addFileArg(asm_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    asm_run.addFileArg(asm_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     asm_run.addCheck(.{ .expect_stderr_exact = "142 42 1234 1234\n" });
     asm_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&asm_run.step);
@@ -2738,10 +2738,10 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     ir_exe.addFileArg(b.path("test/link_input/llvm_ir_main.zig"));
     ir_exe.addArgs(&.{ "-cflags", "-std=c++20", "-DIR_UNUSED=1", "--" });
     ir_exe.addFileArg(b.path("test/link_input/llvm_ir.ll"));
-    ir_exe.addFileArg(bc.addPrefixedOutputFileArg("-o", "llvm_ir.bc"));
+    ir_exe.addFileArg(bc.addOutputFileArg2("llvm_ir.bc", .{ .prefix = "-o" }));
     ir_exe.setEnvironmentVariable("BS_ZIG", zig);
     const ir_run = std.Build.Step.Run.create(b, "run bs build with LLVM IR sources");
-    ir_run.addFileArg(ir_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    ir_run.addFileArg(ir_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
     ir_run.addCheck(.{ .expect_stderr_exact = "49 42\n" });
     ir_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&ir_run.step);
@@ -2755,10 +2755,10 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const copy_exe = b.addRunArtifact(bs);
         copy_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
         copy_exe.addFileArg(b.path("test/link_input/copy_main.zig"));
-        copy_exe.addFileArg(cc_copy.addPrefixedOutputFileArg("-o", "copy.o"));
+        copy_exe.addFileArg(cc_copy.addOutputFileArg2("copy.o", .{ .prefix = "-o" }));
         copy_exe.setEnvironmentVariable("BS_CACHE", "off");
         const r = std.Build.Step.Run.create(b, "run bs link of copied glibc data");
-        r.addFileArg(copy_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addFileArg(copy_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stdout_exact = "via stdout\n" });
         r.addCheck(.{ .expect_stderr_exact = "1 true\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -2774,17 +2774,17 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         so.addFileArg(b.path("test/link_input/shared.c"));
         so.addPrefixedFileArg("-Wl,--version-script=", b.path("test/link_input/shared.map"));
         so.addArg("-Wl,-soname,libshared.so");
-        const lib_dir = so.addPrefixedOutputFileArg("-o", "libshared.so").dirname();
+        const lib_dir = so.addOutputFileArg2("libshared.so", .{ .prefix = "-o" }).dirname();
         const user = b.addSystemCommand(if (cc) |gcc| &.{ gcc, "-fPIE", "-c" } else &.{ zig, "cc", "-c" });
         user.addFileArg(b.path("test/link_input/shared_user.c"));
         const so_exe = b.addRunArtifact(bs);
         so_exe.addArgs(&.{ "build-exe", "-lc", "-lshared" });
-        so_exe.addPrefixedDirectoryArg("-L", lib_dir);
+        so_exe.addDirectoryArg2(lib_dir, .{ .prefix = "-L" });
         so_exe.addFileArg(b.path("test/link_input/shared_main.zig"));
-        so_exe.addFileArg(user.addPrefixedOutputFileArg("-o", "shared_user.o"));
+        so_exe.addFileArg(user.addOutputFileArg2("shared_user.o", .{ .prefix = "-o" }));
         so_exe.setEnvironmentVariable("BS_CACHE", "off");
         const r = std.Build.Step.Run.create(b, "run bs link of a shared library");
-        r.addFileArg(so_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addFileArg(so_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stderr_exact = "42 143 42 143\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -2797,20 +2797,20 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     {
         const so = b.addSystemCommand(&.{ zig, "cc", "-shared", "-fPIC", "-Wl,-soname,libsotls.so" });
         so.addFileArg(b.path("test/link_input/so_tls.c"));
-        const lib_dir = so.addPrefixedOutputFileArg("-o", "libsotls.so").dirname();
+        const lib_dir = so.addOutputFileArg2("libsotls.so", .{ .prefix = "-o" }).dirname();
         const so_exe = b.addRunArtifact(bs);
         so_exe.addArgs(&.{ "build-exe", "-lc", "-lsotls" });
-        so_exe.addPrefixedDirectoryArg("-L", lib_dir);
+        so_exe.addDirectoryArg2(lib_dir, .{ .prefix = "-L" });
         so_exe.addFileArg(b.path("test/link_input/so_tls_main.zig"));
         for ([_][]const []const u8{ &.{ "-fPIC", "-DSUFFIX=_gd" }, &.{ "-fPIC", "-mtls-dialect=gnu2", "-DSUFFIX=_desc" }, &.{ "-fPIC", "-ftls-model=initial-exec", "-DSUFFIX=_ie" } }, [_][]const u8{ "gd", "desc", "ie" }) |flags, name| {
             const user = b.addSystemCommand(&.{ zig, "cc", "-c" });
             user.addArgs(flags);
             user.addFileArg(b.path("test/link_input/so_tls_user.c"));
-            so_exe.addFileArg(user.addPrefixedOutputFileArg("-o", b.fmt("so_tls_{s}.o", .{name})));
+            so_exe.addFileArg(user.addOutputFileArg2(b.fmt("so_tls_{s}.o", .{name}), .{ .prefix = "-o" }));
         }
         so_exe.setEnvironmentVariable("BS_CACHE", "off");
         const r = std.Build.Step.Run.create(b, "run bs link of a shared library's thread-local");
-        r.addFileArg(so_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addFileArg(so_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stderr_exact = "main: 3 3 3 3 103\nset: 1114 1114 1114 1114 1214\nthread: 3 3 3 3 103\nafter: 1114 1114 1114 1114 1214\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -2831,17 +2831,17 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             ,
             "sh", zig,
         });
-        const lib_dir = libs.addOutputDirectoryArg("needed");
-        libs.addDirectoryArg(b.path("test/link_input"));
+        const lib_dir = libs.addOutputDirectoryArg2("needed", .{});
+        libs.addDirectoryArg2(b.path("test/link_input"), .{});
         const so_exe = b.addRunArtifact(bs);
         so_exe.addArgs(&.{ "build-exe", "-lc", "-lneeded_a", "-lneeded_b", "-lneeded_c", "-lneeded_d" });
-        so_exe.addPrefixedDirectoryArg("-L", lib_dir);
+        so_exe.addDirectoryArg2(lib_dir, .{ .prefix = "-L" });
         so_exe.addFileArg(b.path("test/link_input/needed_main.zig"));
         so_exe.addFileArg(b.path("test/link_input/needed_ref.c"));
         so_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
         so_exe.setEnvironmentVariable("BS_CACHE", "off");
         const r = std.Build.Step.Run.create(b, "run bs link of unneeded shared libraries");
-        r.addFileArg(so_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addFileArg(so_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stdout_exact = "" });
         r.addCheck(.{ .expect_stderr_exact = "42 0\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -2862,13 +2862,13 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             ,
             "sh", upstreamZig(b),
         });
-        const dir = libs.addOutputDirectoryArg("dup");
-        libs.addDirectoryArg(b.path("test/link_input"));
-        libs.addArtifactArg(bs);
+        const dir = libs.addOutputDirectoryArg2("dup", .{});
+        libs.addDirectoryArg2(b.path("test/link_input"), .{});
+        libs.addArtifactArg2(bs, .{});
         for ([_][]const u8{ "dup_main.zig", "dup_main.c" }, [_][]const u8{ "false\n", "true\n" }) |m, want| {
             const r = b.addSystemCommand(&.{ "sh", "-c", "d=$(realpath \"$1\"); cd / && LD_LIBRARY_PATH=\"$d\" exec \"$d/$2.exe\" 2>&1", "sh" });
             r.setName(b.fmt("run bs link of {s} with a library glibc's definitions precede or follow", .{m}));
-            r.addDirectoryArg(dir);
+            r.addDirectoryArg2(dir, .{});
             r.addArg(m);
             r.addCheck(.{ .expect_stdout_exact = want });
             r.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -2881,7 +2881,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     {
         const lib = b.addSystemCommand(&.{ upstreamZig(b), "c++", "-shared", "-fPIC", "-Wl,-soname,libcxxnew.so" });
         lib.addFileArg(b.path("test/link_input/cxx_new.cpp"));
-        const lib_file = lib.addPrefixedOutputFileArg("-o", "libcxxnew.so");
+        const lib_file = lib.addOutputFileArg2("libcxxnew.so", .{ .prefix = "-o" });
         const new_exe = b.addRunArtifact(bs);
         new_exe.addArgs(&.{ "build-exe", "-lc", "-lc++" });
         new_exe.addFileArg(lib_file);
@@ -2891,7 +2891,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const r = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
         r.setName("run bs link of a C++ executable with a shared library's operator new");
         r.addFileArg(lib_file);
-        r.addFileArg(new_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addFileArg(new_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stdout_exact = "42 1\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -2903,7 +2903,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     for (&ctors, [_][]const u8{ "-USECOND", "-DSECOND" }, 0..) |*o, def, i| {
         const cc_ctor = b.addSystemCommand(&.{ zig, "cc", "-fPIC", def, "-c" });
         cc_ctor.addFileArg(b.path("test/link_input/ctor.c"));
-        o.* = cc_ctor.addPrefixedOutputFileArg("-o", b.fmt("ctor{d}.o", .{i}));
+        o.* = cc_ctor.addOutputFileArg2(b.fmt("ctor{d}.o", .{i}), .{ .prefix = "-o" });
     }
     for ([_][]const []const u8{ &.{"build-exe"}, &.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" } }, [_][]const u8{ "", "fini\n" }) |args, fini| {
         const ctor_exe = b.addRunArtifact(bs);
@@ -2912,7 +2912,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         for (ctors) |o| ctor_exe.addFileArg(o);
         ctor_exe.setEnvironmentVariable("BS_CACHE", "off");
         const r = std.Build.Step.Run.create(b, b.fmt("run bs link of C constructors{s}", .{if (fini.len == 0) "" else " with -lc"}));
-        r.addFileArg(ctor_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addFileArg(ctor_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stderr_exact = b.fmt("{{ 101, 150, 200, 1, 2 }}\n{s}", .{fini}) });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -2924,7 +2924,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     for (&comdats, [_][]const u8{ "comdat1.s", "comdat2.s" }) |*o, src| {
         const as = b.addSystemCommand(&.{ zig, "cc", "-c" });
         as.addFileArg(b.path(b.fmt("test/link_input/{s}", .{src})));
-        o.* = as.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{src[0..7]}));
+        o.* = as.addOutputFileArg2(b.fmt("{s}.o", .{src[0..7]}), .{ .prefix = "-o" });
     }
     for ([_][2]usize{ .{ 0, 1 }, .{ 1, 0 } }, [_][]const u8{ "11 11\n", "22 22\n" }) |order, expect_comdat| {
         const comdat_exe = b.addRunArtifact(bs);
@@ -2933,7 +2933,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         for (order) |k| comdat_exe.addFileArg(comdats[k]);
         comdat_exe.setEnvironmentVariable("BS_CACHE", "off");
         const r = std.Build.Step.Run.create(b, b.fmt("run bs link of COMDAT groups ({d} first)", .{order[0] + 1}));
-        r.addFileArg(comdat_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addFileArg(comdat_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stderr_exact = expect_comdat });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -2943,13 +2943,13 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     // stack protector's panics.
     const ub = b.addSystemCommand(&.{ zig, "cc", "-fstack-protector-all", "-fno-sanitize=bounds", "-c" });
     ub.addFileArg(b.path("test/link_input/ub.c"));
-    const ub_o = ub.addPrefixedOutputFileArg("-o", "ub.o");
+    const ub_o = ub.addOutputFileArg2("ub.o", .{ .prefix = "-o" });
     const ub_exe = b.addRunArtifact(bs);
     ub_exe.addArg("build-exe");
     ub_exe.addFileArg(b.path("test/link_input/ub_main.zig"));
     ub_exe.addFileArg(ub_o);
     ub_exe.setEnvironmentVariable("BS_CACHE", "off");
-    const ub_bin = ub_exe.addPrefixedOutputFileArg("-femit-bin=", "main");
+    const ub_bin = ub_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
     // The trace shows the C frame's line, from the object's DWARF, and
     // unwinds through it by its .eh_frame FDE.
     const trace_o = [_][]const u8{ "panic: signed integer overflow: 5 + 2147483647 cannot be represented in type 'int'\n", "ub.c:2:34: 0x", " in c_overflow (", "ub_main.zig:10:63: 0x" };
@@ -2968,12 +2968,12 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         const cache = b.addSystemCommand(&.{"sh"});
         cache.setName(b.fmt("bs build-exe with link inputs, cached ({s})", .{part}));
         cache.addFileArg(b.path("test/link_input/cache.sh"));
-        cache.addArtifactArg(bs);
+        cache.addArtifactArg2(bs, .{});
         cache.addArg(zig);
-        cache.addDirectoryArg(b.path("test/link_input"));
-        _ = cache.addOutputDirectoryArg("work");
+        cache.addDirectoryArg2(b.path("test/link_input"), .{});
+        _ = cache.addOutputDirectoryArg2("work", .{});
         cache.addArg(part);
-        cache.addDirectoryArg(std_zir);
+        cache.addDirectoryArg2(std_zir, .{});
         cache.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &cache.step, if (std.mem.eql(u8, part, "objects")) 38 else 18);
         test_step.dependOn(&cache.step);
@@ -3010,11 +3010,11 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         so.addArgs(if (lc) &.{ "build-lib", "-dynamic", "-lc", "-target", gnu, "--name", "bsso" } else &.{ "build-lib", "-dynamic", "-target", "aarch64-linux", "--name", "bsso" });
         so.addFileArg(b.path("test/obj/lib.zig"));
         so.setEnvironmentVariable("BS_ZIG", zig);
-        const so_file = so.addPrefixedOutputFileArg("-femit-bin=", "libbsso.so");
+        const so_file = so.addOutputFileArg2("libbsso.so", .{ .prefix = "-femit-bin=" });
         const host = b.addSystemCommand(&.{ zig, "build-exe", "-lc", "-rdynamic", "-target", gnu });
         host.addFileArg(b.path("test/obj/main.zig"));
         host.addFileArg(so_file);
-        const r = Run.withLib(b, b.fmt("run obj main (bs aarch64-linux shared object{s})", .{if (lc) ", -lc" else ""}), runner, so_file, host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        const r = Run.withLib(b, b.fmt("run obj main (bs aarch64-linux shared object{s})", .{if (lc) ", -lc" else ""}), runner, so_file, host.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -3023,7 +3023,7 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         dl_host.addFileArg(b.path("test/obj/dl.c"));
         const dl_run = std.Build.Step.Run.create(b, "run dl.c (dlopen of bs aarch64-linux shared object)");
         dl_run.addArgs(runner);
-        dl_run.addFileArg(dl_host.addPrefixedOutputFileArg("-femit-bin=", "dl"));
+        dl_run.addFileArg(dl_host.addOutputFileArg2("dl", .{ .prefix = "-femit-bin=" }));
         dl_run.addFileArg(so_file);
         dl_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
         dl_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -3037,11 +3037,11 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         obj.setName(b.fmt("bs build-obj {s} -target aarch64-linux", .{if (lc) "-lc" else "-fPIC"}));
         obj.addArgs(if (lc) &.{ "build-obj", "-lc", "-target", gnu } else &.{ "build-obj", "-fPIC", "-target", "aarch64-linux" });
         obj.addFileArg(b.path("test/obj/lib.zig"));
-        const o = obj.addPrefixedOutputFileArg("-femit-bin=", "lib.o");
+        const o = obj.addOutputFileArg2("lib.o", .{ .prefix = "-femit-bin=" });
         const pie = b.addSystemCommand(if (lc) &.{ zig, "build-exe", "-fPIE", "-lc", "-target", gnu } else &.{ zig, "build-exe", "-fPIE", "-target", "aarch64-linux" });
         pie.addFileArg(b.path("test/obj/main.zig"));
         pie.addFileArg(o);
-        const pie_bin = pie.addPrefixedOutputFileArg("-femit-bin=", "main");
+        const pie_bin = pie.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
         for ([_]bool{ false, true }) |panic| {
             if (lc and panic) continue;
             const r = std.Build.Step.Run.create(b, b.fmt("run obj main (aarch64-linux {s} object in a PIE{s})", .{ if (lc) "-lc" else "-fPIC", if (panic) ", panic" else "" }));
@@ -3060,11 +3060,11 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         if (lc) continue;
         const so = b.addSystemCommand(&.{ zig, "build-lib", "-dynamic", "-target", "aarch64-linux", "--name", "bspic" });
         so.addFileArg(o);
-        const so_file = so.addPrefixedOutputFileArg("-femit-bin=", "libbspic.so");
+        const so_file = so.addOutputFileArg2("libbspic.so", .{ .prefix = "-femit-bin=" });
         const host = b.addSystemCommand(&.{ zig, "build-exe", "-lc", "-rdynamic", "-target", gnu });
         host.addFileArg(b.path("test/obj/main.zig"));
         host.addFileArg(so_file);
-        const r = Run.withLib(b, "run obj main (aarch64-linux -fPIC object in a shared object)", runner, so_file, host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        const r = Run.withLib(b, "run obj main (aarch64-linux -fPIC object in a shared object)", runner, so_file, host.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -3076,23 +3076,23 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         tls.setName(b.fmt("bs build-obj {s} -target aarch64-linux tls.zig", .{mode}));
         tls.addArgs(&.{ "build-obj", mode, "-target", "aarch64-linux" });
         tls.addFileArg(b.path("test/obj/tls.zig"));
-        const tls_o = tls.addPrefixedOutputFileArg("-femit-bin=", "tls.o");
+        const tls_o = tls.addOutputFileArg2("tls.o", .{ .prefix = "-femit-bin=" });
         const name = b.fmt("run tls_main (aarch64-linux extern threadlocal, {s})", .{mode});
         const r = if (std.mem.eql(u8, mode, "-fPIC")) run: {
             const so = b.addSystemCommand(&.{ zig, "build-lib", "-dynamic", "-target", "aarch64-linux", "--name", "bstls" });
             so.addFileArg(tls_o);
-            const so_file = so.addPrefixedOutputFileArg("-femit-bin=", "libbstls.so");
+            const so_file = so.addOutputFileArg2("libbstls.so", .{ .prefix = "-femit-bin=" });
             const host = b.addSystemCommand(&.{ zig, "build-exe", "-lc", "-rdynamic", "-target", gnu });
             host.addFileArg(b.path("test/obj/tls_main.zig"));
             host.addFileArg(so_file);
-            break :run Run.withLib(b, name, runner, so_file, host.addPrefixedOutputFileArg("-femit-bin=", "tls_main"));
+            break :run Run.withLib(b, name, runner, so_file, host.addOutputFileArg2("tls_main", .{ .prefix = "-femit-bin=" }));
         } else run: {
             const exe = b.addSystemCommand(&.{ zig, "build-exe", "-target", "aarch64-linux", if (std.mem.eql(u8, mode, "-fPIE")) "-fPIE" else "-fno-PIE" });
             exe.addFileArg(b.path("test/obj/tls_main.zig"));
             exe.addFileArg(tls_o);
             const r = std.Build.Step.Run.create(b, name);
             r.addArgs(runner);
-            r.addFileArg(exe.addPrefixedOutputFileArg("-femit-bin=", "tls_main"));
+            r.addFileArg(exe.addOutputFileArg2("tls_main", .{ .prefix = "-femit-bin=" }));
             break :run r;
         };
         r.addCheck(.{ .expect_stdout_exact = "5 6 5 6\n" });
@@ -3107,11 +3107,11 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         so.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", gnu, "--name", name });
         for (srcs) |src| so.addFileArg(b.path(src));
         so.setEnvironmentVariable("BS_ZIG", zig);
-        const so_file = so.addPrefixedOutputFileArg("-femit-bin=", b.fmt("lib{s}.so", .{name}));
+        const so_file = so.addOutputFileArg2(b.fmt("lib{s}.so", .{name}), .{ .prefix = "-femit-bin=" });
         const host = b.addSystemCommand(&.{ zig, "build-exe", "-lc", "-rdynamic", "-target", gnu });
         host.addFileArg(b.path(main_src));
         host.addFileArg(so_file);
-        const r = Run.withLib(b, b.fmt("run {s} (bs aarch64-linux shared library linking glibc)", .{std.Io.Dir.path.basename(main_src)}), runner, so_file, host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        const r = Run.withLib(b, b.fmt("run {s} (bs aarch64-linux shared library linking glibc)", .{std.Io.Dir.path.basename(main_src)}), runner, so_file, host.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stderr_exact = stderr });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
@@ -3125,8 +3125,8 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         const desc_o = b.addSystemCommand(&.{ zig, "cc", "-target", gnu, "-fPIC", "-c" });
         desc_o.addFileArg(b.path("test/link_input/so_desc.c"));
         const desc_a = b.addSystemCommand(&.{ zig, "ar", "rcs" });
-        const desc_lib = desc_a.addOutputFileArg("libdesc.a");
-        desc_a.addFileArg(desc_o.addPrefixedOutputFileArg("-o", "so_desc.o"));
+        const desc_lib = desc_a.addOutputFileArg2("libdesc.a", .{});
+        desc_a.addFileArg(desc_o.addOutputFileArg2("so_desc.o", .{ .prefix = "-o" }));
         const so = b.addRunArtifact(bs);
         so.setName("bs build-lib -dynamic -target aarch64-linux with a C source, a C object and an archive");
         so.addArgs(&.{ "build-lib", "-dynamic", "-target", "aarch64-linux", "--name", "bsinputs" });
@@ -3134,21 +3134,21 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         so.addFileArg(b.path("test/link_input/merge.c"));
         so.addFileArg(b.path("test/link_input/so_interpose.c"));
         so.addFileArg(b.path("test/link_input/so_hidref.c"));
-        so.addFileArg(tls_o.addPrefixedOutputFileArg("-o", "tls.o"));
+        so.addFileArg(tls_o.addOutputFileArg2("tls.o", .{ .prefix = "-o" }));
         so.addFileArg(desc_lib);
         so.setEnvironmentVariable("BS_ZIG", zig);
-        const so_file = so.addPrefixedOutputFileArg("-femit-bin=", "libbsinputs.so");
+        const so_file = so.addOutputFileArg2("libbsinputs.so", .{ .prefix = "-femit-bin=" });
         const host = b.addSystemCommand(&.{ zig, "build-exe", "-lc", "-target", gnu });
         host.addFileArg(b.path("test/link_input/so_main.zig"));
         host.addFileArg(so_file);
-        const r = Run.withLib(b, "run so_main (bs aarch64-linux shared library with inputs)", runner, so_file, host.addPrefixedOutputFileArg("-femit-bin=", "so_main"));
+        const r = Run.withLib(b, "run so_main (bs aarch64-linux shared library with inputs)", runner, so_file, host.addOutputFileArg2("so_main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stderr_exact = "44 bee 6 712 810\nthread: 712 810\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
         const preempt_host = b.addSystemCommand(&.{ zig, "cc", "-target", gnu });
         preempt_host.addFileArg(b.path("test/link_input/so_preempt.c"));
         preempt_host.addFileArg(so_file);
-        const preempt = Run.withLib(b, "run so_preempt (preempting a bs aarch64-linux shared library's exports)", runner, so_file, preempt_host.addPrefixedOutputFileArg("-o", "so_preempt"));
+        const preempt = Run.withLib(b, "run so_preempt (preempting a bs aarch64-linux shared library's exports)", runner, so_file, preempt_host.addOutputFileArg2("so_preempt", .{ .prefix = "-o" }));
         preempt.addCheck(.{ .expect_stdout_exact = "100012 200310 1000 2003\n32 1 202 4\n" });
         preempt.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&preempt.step);
@@ -3161,7 +3161,7 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         so.addArgs(&.{ "build-lib", "-dynamic", "-lc++", "-target", gnu, "--name", "sxx", "--version", "1.2.3" });
         so.addFileArg(b.path("test/link_input/so_cxx.cpp"));
         so.setEnvironmentVariable("BS_ZIG", zig);
-        const so_file = so.addPrefixedOutputFileArg("-femit-bin=", "libsxx.so.1.2.3");
+        const so_file = so.addOutputFileArg2("libsxx.so.1.2.3", .{ .prefix = "-femit-bin=" });
         const host = b.addSystemCommand(&.{ zig, "build-exe", "-lc", "-target", gnu });
         host.addFileArg(b.path("test/link_input/so_cxx_main.zig"));
         host.addFileArg(so_file);
@@ -3169,7 +3169,7 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         r.setName("run so_cxx_main.zig (bs aarch64-linux shared library of C++)");
         r.addFileArg(so_file);
         r.addArgs(runner);
-        r.addFileArg(host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addFileArg(host.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
         r.addCheck(.{ .expect_stderr_exact = "sxx 6 9\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
