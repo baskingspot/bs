@@ -2174,6 +2174,29 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             test_step.dependOn(&m_run.step);
         }
     }
+    // C command lines: flags that upstream 0.17.1's `--verbose-cc` passes
+    // for the same build, in its order. Fresh caches, so that every
+    // source compiles and prints.
+    const cc_cases = [_]struct { what: []const u8, args: []const []const u8, flags: []const []const u8 }{
+        .{ .what = "-OReleaseSafe", .args = &.{"-OReleaseSafe"}, .flags = &.{"-fsanitize=undefined -fsanitize-trap=undefined -fno-sanitize=function"} },
+    };
+    for (cc_cases) |case| {
+        const vcc = b.addRunArtifact(bs);
+        vcc.setName(b.fmt("bs --verbose-cc -lc {s} passes upstream's C flags", .{case.what}));
+        vcc.addArgs(&.{ "build-exe", "-lc", "--verbose-cc" });
+        vcc.addArgs(case.args);
+        vcc.addFileArg(b.path("test/link_input/libc_main.zig"));
+        vcc.addFileArg(b.path("test/link_input/libc.c"));
+        _ = vcc.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
+        vcc.addArg("--cache-dir");
+        _ = vcc.addOutputDirectoryArg("local");
+        vcc.addArg("--global-cache-dir");
+        _ = vcc.addOutputDirectoryArg("global");
+        vcc.setEnvironmentVariable("BS_ZIG", zig);
+        for (case.flags) |f| vcc.addCheck(.{ .expect_stderr_match = b.fmt(" {s} ", .{f}) });
+        vcc.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&vcc.step);
+    }
     // The same for aarch64-linux-gnu, as an -fPIC object and a source, and
     // an executable of C only, run under qemu with aarch64 glibc.
     if (aarch64LinuxGlibcRunner(b)) |runner| {

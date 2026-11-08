@@ -1013,7 +1013,9 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
         }
         switch (m.sanitize_c) {
             .off => {},
-            .trap => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fsanitize-trap=undefined" }),
+            // As upstream: no function sanitizer, which calls through C
+            // ABI pointers of compatible but different types trip.
+            .trap => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fsanitize-trap=undefined", "-fno-sanitize=function" }),
             .full => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fno-sanitize=vptr", "-fno-sanitize=function" }),
         }
         try argv.append(arena, switch (m.optimize) {
