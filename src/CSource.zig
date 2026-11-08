@@ -25,6 +25,7 @@ const toolchain = @import("toolchain.zig");
 const cpu_mod = @import("cpu.zig");
 const ar = @import("link/Archive.zig");
 const Incremental = @import("Incremental.zig");
+const Language = @import("language.zig").Language;
 const main = @import("main.zig");
 const Musl = @import("Musl.zig");
 
@@ -167,6 +168,9 @@ pub const Options = struct {
     musl_libc: bool = false,
     /// Where the runtime libraries go: `<global>/bs/o/<key>/`.
     global_cache: []const u8 = "",
+    /// The compilation's Zig language, which keys the batch summary
+    /// (`Summary.path`) as it keys bs's own caches.
+    language: Language = .newest,
     single_threaded: bool = false,
     /// Upstream's default stack protector for the compilation's C in
     /// Debug and ReleaseSafe: with libc, unless its Zig code goes through
@@ -536,7 +540,7 @@ const Summary = struct {
     const Entry = extern struct { inode: u64, size: u64, mtime: i64, path_len: u32, _pad: u32 = 0 };
 
     fn path(arena: std.mem.Allocator, io: Io, cwd: []const u8, local: []const u8, lib: []const u8, zig_id: []const u8, common: Common, sources: []const CSource, o: Options) ![]const u8 {
-        _, const bs_key = try Incremental.compilationKey(arena, io, &.{}, lib, "c batch");
+        _, const bs_key = try Incremental.compilationKey(arena, io, &.{}, lib, o.language, "c batch");
         var h: std.crypto.hash.Blake3 = .init(.{});
         h.update(std.mem.asBytes(&bs_key));
         h.update(zig_id);

@@ -61,6 +61,9 @@ const Request = struct {
     native_abi: bool = false,
     listen: bool,
     zig_lib: toolchain.LibDir,
+    /// The Zig language of the translation: of the Zig it writes, and of
+    /// the translate-c that writes it.
+    language: language.Language,
     cache_dirs: Frontend.CacheDirs,
     build_root: ?[]const u8,
     unsupported: ?[]const u8,
@@ -168,6 +171,8 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
     // `requiresLibC`, so its headers are always on the include path.
     if (opts.bs_target == .aarch64_macos) opts.link_libc = true;
     const cache_dirs = Frontend.resolveCacheDirs(arena, io, init.environ_map, .{ .local = opts.cache_dir, .global = opts.global_cache_dir });
+    const choice = try language.resolve(arena, io, init.environ_map, null, null);
+    if (choice.language != language.Language.newest) main.notYetSupported(choice);
     return .{
         .source = source orelse if (opts.unsupported != null) "" else main.fatal("expected a C source file to translate", .{}),
         .target = opts.bs_target,
@@ -180,11 +185,8 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         .native_includes = native_includes,
         .native_abi = std.mem.eql(u8, target, "native"),
         .listen = opts.listen,
-        .zig_lib = try toolchain.libDir(arena, io, init.environ_map, cache_dirs.global, opts.zig_lib_dir, lang: {
-            const choice = try language.resolve(arena, io, init.environ_map, null, null);
-            if (choice.language != language.Language.newest) main.notYetSupported(choice);
-            break :lang choice.language;
-        }),
+        .zig_lib = try toolchain.libDir(arena, io, init.environ_map, cache_dirs.global, opts.zig_lib_dir, choice.language),
+        .language = choice.language,
         .cache_dirs = cache_dirs,
         .build_root = opts.build_root,
         .unsupported = opts.unsupported,
@@ -221,7 +223,7 @@ fn serve(init: std.process.Init, req: *const Request) !void {
     var in = Io.File.stdin().readerStreaming(io, &in_buf);
     var out = Io.File.stdout().writerStreaming(io, &out_buf);
     var server: std.zig.Server = .{ .in = &in.interface, .out = &out.interface };
-    try server.serveStringMessage(.zig_version, main.zig_version);
+    try server.serveStringMessage(.zig_version, req.language.versionString());
     try server.serveConfig(.{ .flags = .{
         .output_mode = .Obj,
         .link_mode = if (req.link_libc and !req.musl) .dynamic else .static,
@@ -285,7 +287,7 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
 
     // As the build runner, translate-c from the default lib directory is
     // trusted not to change.
-    const exe, const exe_hash, const use = try ensureBinary(init, lib, global, req.zig_lib.trusted);
+    const exe, const exe_hash, const use = try ensureBinary(init, lib, req.language, global, req.zig_lib.trusted);
     defer if (use) |f| f.close(io);
 
     // Upstream's arguments, with the depfile and output paths left for
@@ -399,10 +401,10 @@ fn mcpuArg(arena: std.mem.Allocator, target: *const std.Target) ![]const u8 {
 /// `translate-c.hash` while the binary stats as the stamp says. Also
 /// returns the directory's use (`cache.useTool`), held while the binary
 /// runs.
-fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, trusted: bool) !struct { []const u8, cache.Hash, ?Io.File } {
+fn ensureBinary(init: std.process.Init, lib: []const u8, lang: language.Language, global: []const u8, trusted: bool) !struct { []const u8, cache.Hash, ?Io.File } {
     const arena = init.arena.allocator();
     const io = init.io;
-    const seed, _ = try Incremental.compilationKey(arena, io, &.{}, lib, "x86_64-linux");
+    const seed, _ = try Incremental.compilationKey(arena, io, &.{}, lib, lang, "x86_64-linux");
     const dir_hash = cache.hash(3, try std.mem.concat(arena, u8, &.{ std.mem.asBytes(&seed), lib }));
     const dir = try arena.print("{s}/bs/o/{x:0>32}", .{ global, dir_hash });
     const exe = try Io.Dir.path.join(arena, &.{ dir, "translate-c" });

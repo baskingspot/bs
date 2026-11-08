@@ -29,6 +29,7 @@ const seeds = cache.seeds;
 const results = cache.results;
 const Hash = cache.Hash;
 const Frontend = @import("Frontend.zig");
+const Language = @import("language.zig").Language;
 const InternPool = @import("InternPool.zig");
 const Zcu = @import("Zcu.zig");
 const Emit = @import("Emit.zig");
@@ -214,10 +215,10 @@ replay: ?*Replay = null,
 /// `zig_lib_dir` is the std that compilation uses, and `trusted_lib`
 /// whether it is the default one (`trustedLib`); `root_name` is
 /// `Frontend.Options.root_name`; `tests_std` is whether it tests the std
-/// module itself (`Frontend.testsStd`).
-pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []const u8, zig_lib_dir: []const u8, trusted_lib: bool, root_name: []const u8, tests_std: bool, target: []const u8, timing: bool) !Incremental {
+/// module itself (`Frontend.testsStd`); `lang` is its Zig language.
+pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []const u8, zig_lib_dir: []const u8, lang: Language, trusted_lib: bool, root_name: []const u8, tests_std: bool, target: []const u8, timing: bool) !Incremental {
     const build_start = Io.Clock.real.now(io);
-    const store_seed, const key = try compilationKey(gpa, io, args, zig_lib_dir, target);
+    const store_seed, const key = try compilationKey(gpa, io, args, zig_lib_dir, lang, target);
 
     const local = try Io.Dir.cwd().createDirPathOpen(io, dirs.local, .{});
     errdefer local.close(io);
@@ -266,10 +267,13 @@ fn trustedLib(gpa: Allocator, io: Io, zig_lib_dir: []const u8, trusted: bool) !?
     };
 }
 
-/// The store seed (the compiler's identity and the target) and the key of
-/// the compilation that `args` describes from the current directory (see
-/// `open`).
-pub fn compilationKey(gpa: Allocator, io: Io, args: []const []const u8, zig_lib_dir: []const u8, target: []const u8) !struct { Hash, Hash } {
+/// The store seed (the compiler's identity, the Zig language and the
+/// target) and the key of the compilation that `args` describes from the
+/// current directory (see `open`). Everything keyed from either is the
+/// language's alone: the language decides what the same source means
+/// (docs/slop/zig-0.16.md), and the per-declaration store's keys are
+/// content hashes that do not tell the languages apart.
+pub fn compilationKey(gpa: Allocator, io: Io, args: []const []const u8, zig_lib_dir: []const u8, lang: Language, target: []const u8) !struct { Hash, Hash } {
     // The compiler's identity: a rebuilt bs must not reuse what an older
     // one cached. The ctime too, which only the kernel sets: a different
     // bs copied over this file in place, keeping its inode, with the same
@@ -281,7 +285,7 @@ pub fn compilationKey(gpa: Allocator, io: Io, args: []const []const u8, zig_lib_
     const st = try exe_stat;
     var id: std.ArrayList(u8) = .empty;
     defer id.deinit(gpa);
-    try id.print(gpa, "bs\x00{d}\x00{d}\x00{d}\x00{d}\x00{s}\x00", .{ st.inode, st.size, st.mtime.toNanoseconds(), st.ctime.toNanoseconds(), target });
+    try id.print(gpa, "bs\x00{d}\x00{d}\x00{d}\x00{d}\x00{s}\x00{s}\x00", .{ st.inode, st.size, st.mtime.toNanoseconds(), st.ctime.toNanoseconds(), lang.versionString(), target });
     const store_seed = cache.hash(0, id.items);
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);

@@ -36,9 +36,21 @@ pub const atoms = @import("cache/atoms.zig");
 pub const seeds = @import("cache/seeds.zig");
 pub const results = @import("cache/results.zig");
 const Incremental = @import("Incremental.zig");
+const Language = @import("language.zig").Language;
 
 /// A 128-bit content or identity hash.
 pub const Hash = u128;
+
+/// A Zig language's ZIR directory under a cache directory's `bs/`
+/// (`Frontend`): each language has its own, with its own stat index, since
+/// the same source lowers differently in each (docs/slop/zig-0.16.md).
+/// 0.17's is `zir`, the one bs used before it had two languages.
+pub fn zirDir(lang: Language) []const u8 {
+    return switch (lang) {
+        .zig_0_16 => "zir-0.16",
+        .zig_0_17 => "zir",
+    };
+}
 
 /// The directory of one compilation's manifest and pack under the local
 /// cache. `key` identifies the compilation: root source path, target,

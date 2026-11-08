@@ -32,7 +32,8 @@
 //! fall out of use.
 //!
 //! The global cache's ZIR (`<global cache>/bs/zir/<32 hex>`, every
-//! project's, `Frontend`) counts and goes with the packs: each file is a
+//! project's, `Frontend`, and the other languages' beside it,
+//! `cache.zirDir`) counts and goes with the packs: each file is a
 //! candidate by its mtime, which a build that maps it renews daily.
 //!
 //! Pack file: `PackHeader`; entries, each 16-byte aligned (`Header`,
@@ -44,6 +45,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const cache = @import("../cache.zig");
+const Language = @import("../language.zig").Language;
 const atoms_codec = @import("atoms.zig");
 const Atom = @import("../link/Atom.zig");
 const Hash = cache.Hash;
@@ -100,8 +102,6 @@ const pack_ext = ".zsp";
 /// trims them with the packs, by last use, counting the manifest and the
 /// linked packs the store itself no longer has.
 pub const donors_dir = "donors";
-/// The global cache's ZIR directory (`Frontend`), relative to the store.
-const zir_dir = ".." ++ Io.Dir.path.sep_str ++ "zir";
 /// A donor being written; `maintain` deletes one older than an hour.
 pub const donor_tmp_prefix = "tmp-";
 
@@ -812,13 +812,15 @@ fn maintainIfDue(store: *const Store, gpa: Allocator, io: Io, new_bytes: u64) vo
     _ = maintain(gpa, io, store.dir, .{ .trim = trim_due, .now = now, .max_bytes = store.max_bytes }) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
 }
 
-const CandidateKind = enum { pack, donor, zir };
+const CandidateKind = union(enum) { pack, donor, zir: Language };
+/// The global cache's ZIR directories, one per language (`cache.zirDir`).
+const ZirDirs = [@typeInfo(Language).@"enum".field_names.len]?Io.Dir;
 
-fn deleteCandidate(io: Io, dir: Io.Dir, donors: ?Io.Dir, zir: ?Io.Dir, kind: CandidateKind, name: []const u8) !void {
+fn deleteCandidate(io: Io, dir: Io.Dir, donors: ?Io.Dir, zirs: *const ZirDirs, kind: CandidateKind, name: []const u8) !void {
     switch (kind) {
         .pack => try dir.deleteFile(io, name),
         .donor => try donors.?.deleteTree(io, name),
-        .zir => try zir.?.deleteFile(io, name),
+        .zir => |lang| try zirs[@backingInt(lang)].?.deleteFile(io, name),
     }
 }
 
@@ -904,9 +906,14 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
             });
         }
     }
-    var zir: ?Io.Dir = dir.openDir(io, zir_dir, .{ .iterate = true }) catch null;
-    defer if (zir) |*d| d.close(io);
-    if (zir) |d| {
+    var zirs: ZirDirs = @splat(null);
+    defer for (&zirs) |*z| if (z.*) |*d| d.close(io);
+    for (&zirs, 0..) |*z, i| {
+        const lang: Language = @fromBackingInt(@as(u8, @intCast(i)));
+        var path_buf: [32]u8 = undefined;
+        const path = std.mem.print(&path_buf, ".." ++ Io.Dir.path.sep_str ++ "{s}", .{cache.zirDir(lang)}) catch unreachable;
+        z.* = dir.openDir(io, path, .{ .iterate = true }) catch null;
+        const d = z.* orelse continue;
         var it = d.iterate();
         while (try it.next(io)) |e| {
             var hash: [16]u8 = undefined;
@@ -919,7 +926,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
                 .mtime = st.mtime,
                 .order = std.math.minInt(i64),
                 .live = null,
-                .kind = .zir,
+                .kind = .{ .zir = lang },
             });
         }
     }
@@ -927,7 +934,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
     var n_kept: usize = 0;
     for (candidates.items) |c| {
         if (options.trim and c.mtime.durationTo(options.now).toNanoseconds() > max_unused_ns) {
-            deleteCandidate(io, dir, donors, zir, c.kind, c.name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
+            deleteCandidate(io, dir, donors, &zirs, c.kind, c.name) catch {}; // ziglint-ignore: Z026 -- cache upkeep is best effort
             result.deleted += 1;
             continue;
         }
@@ -950,7 +957,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
         const target = options.max_bytes - options.max_bytes / 4;
         for (candidates.items) |*c| {
             if (total <= target) break;
-            deleteCandidate(io, dir, donors, zir, c.kind, c.name) catch continue;
+            deleteCandidate(io, dir, donors, &zirs, c.kind, c.name) catch continue;
             total -= c.size;
             result.evicted += 1;
             c.live = null;

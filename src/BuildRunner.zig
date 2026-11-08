@@ -44,7 +44,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
 
     // One runner per bs binary, zig lib directory and mode.
     const mode = "-OReleaseSafe";
-    const seed, _ = try Incremental.compilationKey(arena, io, &.{}, zig_lib_dir, "x86_64-linux");
+    const seed, _ = try Incremental.compilationKey(arena, io, &.{}, zig_lib_dir, choice.language, "x86_64-linux");
     const runner_hash = cache.hash(2, try std.mem.concat(arena, u8, &.{ std.mem.asBytes(&seed), zig_lib_dir, mode }));
     const runner_dir = try arena.print("{s}/bs/o/{x:0>32}", .{ global, runner_hash });
     try Io.Dir.cwd().createDirPath(io, runner_dir);

@@ -27,6 +27,7 @@ const assert = std.debug.assert;
 const LintConfig = @import("lint/Config.zig");
 const Linter = @import("lint/Linter.zig");
 const Language = @import("language.zig").Language;
+const zirDir = @import("cache.zig").zirDir;
 
 const Frontend = @This();
 
@@ -687,8 +688,8 @@ pub fn enableCache(fe: *Frontend, dirs: CacheDirs) !void {
     const start = Io.Clock.awake.now(fe.io);
     defer fe.stats.open_ns = @intCast(start.durationTo(Io.Clock.awake.now(fe.io)).toNanoseconds());
     const same = std.mem.eql(u8, dirs.local, dirs.global);
-    fe.caches[@backingInt(CacheKind.local)] = try .openOrWarn(gpa, fe.io, dirs.local, same);
-    if (!same) fe.caches[@backingInt(CacheKind.global)] = try .openOrWarn(gpa, fe.io, dirs.global, true);
+    fe.caches[@backingInt(CacheKind.local)] = try .openOrWarn(gpa, fe.io, dirs.local, fe.language, same);
+    if (!same) fe.caches[@backingInt(CacheKind.global)] = try .openOrWarn(gpa, fe.io, dirs.global, fe.language, true);
     for (fe.modules.items) |*m| {
         m.abs_root_dir = Io.Dir.cwd().realPathFileAlloc(fe.io, m.root_dir, gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -740,7 +741,10 @@ fn blobCache(fe: *const Frontend) ?*const CacheDir {
     return null;
 }
 
-/// Cache layout, in `<cache dir>/bs/zir/`:
+/// Cache layout, in `<cache dir>/bs/zir/` for 0.17 and in another
+/// directory for each other language (`cache.zirDir`), so that nothing in
+/// it is shared between languages: not the ZIR of the same source text,
+/// nor a path's stats, imports or lint facts:
 /// - `<32 hex digits>`: the ZIR of one source text, named by `hashSource`.
 ///   Written once to a temporary file and linked into place; never changed
 ///   but for its mtime, which a build that maps it renews once a day, so
@@ -764,12 +768,10 @@ const CacheDir = struct {
     /// its mtime renewed when it is mapped.
     renew_before_ns: i96,
 
-    const sub_path = "bs" ++ Io.Dir.path.sep_str ++ "zir";
-
-    /// Opens the cache in `path`, or warns and returns null if it cannot
-    /// (a full disk, for one): the build goes on without it.
-    fn openOrWarn(gpa: Allocator, io: Io, path: []const u8, global: bool) Allocator.Error!?CacheDir {
-        const full = try Io.Dir.path.join(gpa, &.{ path, sub_path });
+    /// Opens `lang`'s cache in `path`, or warns and returns null if it
+    /// cannot (a full disk, for one): the build goes on without it.
+    fn openOrWarn(gpa: Allocator, io: Io, path: []const u8, lang: Language, global: bool) Allocator.Error!?CacheDir {
+        const full = try Io.Dir.path.join(gpa, &.{ path, "bs", zirDir(lang) });
         defer gpa.free(full);
         const dir = Io.Dir.cwd().openDir(io, full, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => Io.Dir.cwd().createDirPathOpen(io, full, .{ .open_options = .{ .iterate = true } }) catch |e| {

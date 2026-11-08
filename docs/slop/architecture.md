@@ -26,7 +26,9 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
 - Files are discovered and lowered from a work queue: lowering a file
   reveals its imports. File indices are assigned afterwards, breadth-first
   in import order from the root, so they do not depend on thread timing.
-- ZIR is cached on disk per file, in `<cache>/bs/zir/`. Every file's
+- ZIR is cached on disk per file, in `<cache>/bs/zir/` (0.17's; each
+  other Zig language has its own directory beside it, `cache.zirDir`,
+  `bs/zir-0.16`, with its own blobs, stat index and lint facts). Every file's
   ZIR is in the global cache, keyed by content, so that a project's ZIR
   outlives its local cache and its worktrees and copies share it; each
   cache's index holds the stats of its own files: the local cache's the
@@ -5503,6 +5505,7 @@ compilation (see "Integration" below).
 <global cache>/bs/store/lock               flock held by maintenance (merging, trimming)
 <global cache>/bs/store/trim               when packs were last trimmed
 <global cache>/bs/zir/<32 hex>             every file's ZIR, by content (Frontend); trimmed with the packs
+<global cache>/bs/zir-0.16/<32 hex>        the same for Zig 0.16 (`cache.zirDir`); trimmed with the packs too
 <local cache>/bs/c/trim                    when compilation directories were last scanned
 <local cache>/bs/c/<32 hex>/               one compilation, keyed by root, target, options, output
     lock          flock held by the build that owns the directory; its mtime is the last use
@@ -5699,9 +5702,10 @@ it and can flush every CPU's TLB.
 ### Integration (`src/Incremental.zig`; built 2026-11-02)
 
 - **Compilation key**: the bs binary's identity (inode, size, mtime), the
-  target, the working directory, the zig lib directory, and the command
-  line. The store seed, part of every store key, is the binary's identity
-  and the target only, so store entries are shared across projects.
+  Zig language, the target, the working directory, the zig lib directory,
+  and the command line. The store seed, part of every store key, is the
+  binary's identity, the language and the target only, so store entries
+  are shared across projects but not across languages.
 - **No-edit builds** (`relinkIfUnchanged`, before the frontend): lock the
   compilation, map the manifest, stat its inputs (every file the frontend
   loaded, with content hashes and the racy-mtime rule); if none changed,
@@ -8046,6 +8050,18 @@ directory and upstream zig are those of the compilation's language
   directory is a fallback for the newest language only.
 - The language reaches `Frontend.language`, `Zcu.language` and
   `Builtin.Options.language` (`builtin.zig_version`).
+- Every cache is the language's alone (phase 0b): the language is in
+  `Incremental.compilationKey`'s root, so in the store seed and the
+  compilation key and everything keyed from them (store entries, donors,
+  outputs, the build runner, the `bs/compiler` identity, translate-c,
+  the C batch summary); in `runBinPath`; and each language has its own
+  ZIR directory (`cache.zirDir`), because content hashes, AstGen's
+  `src_hash`es and paths do not tell the languages apart. 0.17's keys
+  and directory are named as before, so its caches stay warm. The
+  `--listen=-` version (`serve`, translate-c's) is the language's.
+  `BS_TEST_LANGUAGE_KEYS` lets a test compile a language bs cannot
+  compile yet with the newest one's frontend and Sema, which
+  test/language/keys.sh uses to check all of this.
 
 ## Fuzzing (designed and built 2026-11-03; x86_64-linux)
 

@@ -385,7 +385,7 @@ pub fn main(init_std: std.process.Init) !void {
             if (std.mem.eql(u8, a, "--listen=-")) break true;
         } else false;
         const d: []const diag.Diagnostic = &.{.{ .code = .unsupported, .loc = null, .msg = msg }};
-        if (listen) return serveFailure(init, d, .Exe);
+        if (listen) return serveFailure(init, (try language.resolve(arena, init.io, init.environ_map, null, null)).language, d, .Exe);
         printDiagnostics(init.io, d, .text) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
         std.process.exit(1);
     } else fatal("unknown command: {s}", .{cmd});
@@ -413,7 +413,7 @@ pub fn main(init_std: std.process.Init) !void {
         .default => if (run_test)
             try testBinPath(arena, init.io, job.bsLocal(arena), job.stem)
         else if (command == .run or command == .@"test")
-            try runBinPath(arena, init.io, job.bsLocal(arena), job.compile_args, job.zig_lib_dir, job.stem)
+            try runBinPath(arena, init.io, job.bsLocal(arena), job.compile_args, job.zig_lib_dir, job.opts.language.language, job.stem)
         else
             try outputName(arena, command, opts.dynamic, opts.version, job.stem, opts.bs_target == .aarch64_macos),
     };
@@ -570,7 +570,10 @@ pub const Job = struct {
         });
         const lib = try toolchain.libDir(arena, init_.io, init_.environ_map, cache_dirs.global, opts.zig_lib_dir, opts.language.language);
         const zig_lib_dir = lib.path;
-        if (opts.language.language != language.Language.newest) notYetSupported(opts.language);
+        // `BS_TEST_LANGUAGE_KEYS` lets a test compile in a language bs
+        // cannot compile yet, with the newest one's frontend and Sema, to
+        // check that its caches are its own (test/language/keys.sh).
+        if (opts.language.language != language.Language.newest and init_.environ_map.get("BS_TEST_LANGUAGE_KEYS") == null) notYetSupported(opts.language);
         const is_test = command.isTest();
         const builtin_opts: Builtin.Options = .{
             .language = opts.language.language,
@@ -716,7 +719,7 @@ pub const Job = struct {
         const tests_std = job.opts.command.isTest() and
             (Frontend.testsStd(job.gpa, job.zig_lib_dir, job.opts.root_src_path) catch fatal("out of memory", .{}));
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
-        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.trusted_lib, job.opts.root_name, tests_std, job.cache_target, env.get("BS_CACHE_TIMING") != null) catch |err| {
+        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.opts.language.language, job.trusted_lib, job.opts.root_name, tests_std, job.cache_target, env.get("BS_CACHE_TIMING") != null) catch |err| {
             std.log.warn("unable to use the cache: {t}", .{err});
             return null;
         };
@@ -895,7 +898,7 @@ const InputsRecord = struct {
     fn open(arena: std.mem.Allocator, job: *const Job) ?InputsRecord {
         const io = job.io;
         const start = Io.Clock.real.now(io);
-        _, const key = Incremental.compilationKey(arena, io, job.compile_args, job.zig_lib_dir, job.cache_target) catch return null;
+        _, const key = Incremental.compilationKey(arena, io, job.compile_args, job.zig_lib_dir, job.opts.language.language, job.cache_target) catch return null;
         const local = Io.Dir.cwd().createDirPathOpen(io, job.cache_dirs.local, .{}) catch return null;
         defer local.close(io);
         const dir = cache.compilationDir(io, local, key) catch return null;
@@ -1065,7 +1068,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, batch: ?*CSource.Batch,
     const io = init.io;
     // The stamp covers the C objects and the output, not object inputs.
     const stamp_path: ?[]const u8 = if (out_path != null and job.opts.link_inputs.len == 0) path: {
-        _, const key = try Incremental.compilationKey(arena, io, job.compile_args, job.zig_lib_dir, "c archive");
+        _, const key = try Incremental.compilationKey(arena, io, job.compile_args, job.zig_lib_dir, job.opts.language.language, "c archive");
         break :path try Io.Dir.path.join(arena, &.{ job.bsLocal(arena), "car", &std.fmt.bytesToHex(@as([16]u8, @bitCast(key)), .lower) });
     } else null;
     // Object inputs alone (no batch) go into the output every build.
@@ -1223,6 +1226,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .musl = if (opts.linux) |t| t.abi == .musl else false,
         .musl_libc = linksMusl(opts),
         .global_cache = job.cache_dirs.global,
+        .language = opts.language.language,
         .single_threaded = opts.single_threaded,
         .stack_protector = opts.c_only or opts.c_root or opts.use_llvm or opts.bs_target != .x86_64_linux or opts.optimize != .debug,
         .pic = opts.dynamic,
@@ -1958,7 +1962,8 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     var in = Io.File.stdin().readerStreaming(io, &in_buf);
     var out = Io.File.stdout().writerStreaming(io, &out_buf);
     var server: std.zig.Server = .{ .in = &in.interface, .out = &out.interface };
-    try server.serveStringMessage(.zig_version, zig_version);
+    // The release whose build runner asks: it fails the step on another.
+    try server.serveStringMessage(.zig_version, opts.language.language.versionString());
     try server.serveConfig(.{ .flags = .{
         .output_mode = switch (opts.command) {
             .build_obj, .test_obj => .Obj,
@@ -1984,7 +1989,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     const Out = struct { digest: [16]u8, bin: ?[]const u8, docs: ?[]const u8 };
     var outs: [2]Out = undefined;
     if (job) |*j| {
-        _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, j.cache_target);
+        _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, j.opts.language.language, j.cache_target);
         const name = try outputName(arena, opts.command, opts.dynamic, opts.version, j.stem, opts.bs_target == .aarch64_macos);
         // A step without a binary (`-fno-emit-bin`, such as a `check`
         // step) still links one there when the cache can take the build:
@@ -2076,14 +2081,14 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
 
 /// Answers every update with `diags`, for a command bs does not
 /// implement.
-fn serveFailure(init: std.process.Init, diags: []const diag.Diagnostic, output_mode: std.lang.OutputMode) !void {
+fn serveFailure(init: std.process.Init, lang: language.Language, diags: []const diag.Diagnostic, output_mode: std.lang.OutputMode) !void {
     const io = init.io;
     var in_buf: [256]u8 = undefined;
     var out_buf: [4096]u8 = undefined;
     var in = Io.File.stdin().readerStreaming(io, &in_buf);
     var out = Io.File.stdout().writerStreaming(io, &out_buf);
     var server: std.zig.Server = .{ .in = &in.interface, .out = &out.interface };
-    try server.serveStringMessage(.zig_version, zig_version);
+    try server.serveStringMessage(.zig_version, lang.versionString());
     try server.serveConfig(.{ .flags = .{ .output_mode = output_mode, .link_mode = .static, .link_libc = false, .link_libcpp = false, .link_libunwind = false, .pie = false } });
     while (true) {
         const hdr = server.receiveMessage() catch |err| switch (err) {
@@ -2234,13 +2239,16 @@ fn runExe(init: std.process.Init, path: []const u8, run_args: []const []const u8
 }
 
 /// Where `bs run` puts the program: a directory of the cache per
-/// compilation, so that running it again relinks in place.
-fn runBinPath(arena: std.mem.Allocator, io: Io, cache_dir: []const u8, compile_args: []const []const u8, zig_lib_dir: []const u8, stem: []const u8) ![]const u8 {
+/// compilation, so that running it again relinks in place. A program
+/// in another Zig language is another program.
+fn runBinPath(arena: std.mem.Allocator, io: Io, cache_dir: []const u8, compile_args: []const []const u8, zig_lib_dir: []const u8, lang: language.Language, stem: []const u8) ![]const u8 {
     var h: std.hash.Wyhash = .init(0);
     const cwd = try std.process.currentPathAlloc(io, arena);
     h.update(cwd);
     h.update(&.{0});
     h.update(zig_lib_dir);
+    h.update(&.{0});
+    h.update(lang.versionString());
     for (compile_args) |a| {
         h.update(&.{0});
         h.update(a);

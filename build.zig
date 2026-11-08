@@ -135,6 +135,18 @@ pub fn build(b: *std.Build) void {
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
         test_step.dependOn(&run.step);
     }
+    // Each language's caches are its own: test/language/keys.sh.
+    {
+        const keys = b.addSystemCommand(&.{"sh"});
+        keys.setName("bs language cache keys");
+        keys.addFileArg(b.path("test/language/keys.sh"));
+        keys.addArtifactArg2(exe, .{});
+        keys.addFileArg(b.path("bench/workloads/hello/hello.zig"));
+        _ = keys.addOutputDirectoryArg2("work", .{});
+        keys.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &keys.step, 15);
+        test_step.dependOn(&keys.step);
+    }
     addLintTests(b, exe, test_step, upstream_step, std_zir);
     const build_test_step = addBuildTest(b, exe, build_web_wasm, translate_c);
     spreadBsUsers(b, &exe.step, &zir.step, &.{ test_step, build_test_step });
