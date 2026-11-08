@@ -106,10 +106,20 @@ pub fn build(b: *std.Build) void {
     // not hold a worker when bs's users start.
     unit_tests.step.dependOn(&exe.step);
     takes(b, &unit_tests.step, 7);
-    const test_step = b.step("test", "Run bs's unit tests and run tests");
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    // `test` runs every test. Its parts are steps of their own, which CI
+    // runs as parallel jobs (.github/ci.yaml, `just test-steps`).
+    const test_step = b.step("test", "Run all of bs's tests (the test-* steps below)");
+    const unit_step = b.step("test-unit", "Run bs's unit tests");
+    const run_step = b.step("test-run", "Build and run test/run's programs and test/language/zig016.zig");
+    const edit_step = b.step("test-edit", "Edit and donor builds: test/run's programs with those headers, test/run's scripts, test/diag's edit builds");
+    const cache_step = b.step("test-cache", "Link inputs, objects, lint configs and languages through the cache");
+    const link_step = b.step("test-link", "Objects, libraries, C, C++ and libc through bs's linkers");
+    const diag_step = b.step("test-diag", "Compile errors: test/diag, test/lint and unsupported languages");
+    const test_parts = [_]*std.Build.Step{ unit_step, run_step, edit_step, cache_step, link_step, diag_step };
+    for (test_parts) |part| test_step.dependOn(part);
+    unit_step.dependOn(&b.addRunArtifact(unit_tests).step);
     const frontend_tests = b.addTest(.{ .root_module = frontend.module });
-    test_step.dependOn(&b.addRunArtifact(frontend_tests).step);
+    unit_step.dependOn(&b.addRunArtifact(frontend_tests).step);
     const upstream_step = b.step("test-upstream", "Run the run tests with upstream zig, the oracle");
     // A global cache holding the ZIR of the std files that every build
     // lowers, which the tests that need an empty global cache start from
@@ -120,9 +130,9 @@ pub fn build(b: *std.Build) void {
     zir.addFileArg(b.path("test/run/corpus.zig"));
     zir.addArg("--global-cache-dir");
     const std_zir = zir.addOutputDirectoryArg2("global", .{});
-    addRunTests(b, exe, test_step, upstream_step, std_zir);
-    addObjAndRunTests(b, exe, test_step, std_zir);
-    const translate_c = addLinkInputTests(b, exe, test_step, std_zir);
+    addRunTests(b, exe, run_step, edit_step, upstream_step, std_zir);
+    addObjAndRunTests(b, exe, link_step, edit_step, cache_step, std_zir);
+    const translate_c = addLinkInputTests(b, exe, link_step, cache_step, std_zir);
     if (b.graph.host.result.os.tag == .macos) {
         // On macOS, libc's headers are the SDK's, frameworks included, as
         // upstream's (`xcrun --show-sdk-path`); the lib directory has no
@@ -133,7 +143,7 @@ pub fn build(b: *std.Build) void {
         tc_sdk.addFileArg(b.path("test/link_input/tc_sdk/s.h"));
         tc_sdk.addCheck(.{ .expect_stdout_match = "pub const CFAllocatorRef = ?*const struct___CFAllocator;" });
         takes(b, &tc_sdk.step, 13);
-        test_step.dependOn(&tc_sdk.step);
+        link_step.dependOn(&tc_sdk.step);
         // The cache and the inputs record: test/obj/macos_cache.sh.
         const rec = b.addSystemCommand(&.{"sh"});
         rec.setName("bs cache and inputs record on aarch64-macos");
@@ -142,7 +152,7 @@ pub fn build(b: *std.Build) void {
         _ = rec.addOutputDirectoryArg2("work", .{});
         rec.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &rec.step, 10);
-        test_step.dependOn(&rec.step);
+        cache_step.dependOn(&rec.step);
         // Objects, archives and C sources through the cache:
         // test/link_input/macos_cache.sh.
         const inputs = b.addSystemCommand(&.{"sh"});
@@ -154,9 +164,9 @@ pub fn build(b: *std.Build) void {
         _ = inputs.addOutputDirectoryArg2("work", .{});
         inputs.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &inputs.step, 30);
-        test_step.dependOn(&inputs.step);
+        cache_step.dependOn(&inputs.step);
     }
-    addDiagTests(b, exe, test_step, upstream_step, std_zir);
+    addDiagTests(b, exe, diag_step, edit_step, upstream_step, std_zir);
     // The language a compilation is in (src/language.zig): a version bs
     // does not compile is an error, at the build.zig.zon's field or the
     // flag.
@@ -172,7 +182,7 @@ pub fn build(b: *std.Build) void {
         run.addArgs(case[0]);
         run.addCheck(.{ .expect_stderr_match = case[1] });
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
-        test_step.dependOn(&run.step);
+        diag_step.dependOn(&run.step);
     }
     // A Zig 0.16 program means what it means in 0.16: test/language/zig016.sh.
     {
@@ -184,7 +194,7 @@ pub fn build(b: *std.Build) void {
         _ = z16.addOutputDirectoryArg2("work", .{});
         z16.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &z16.step, 5);
-        test_step.dependOn(&z16.step);
+        run_step.dependOn(&z16.step);
     }
     // Each language's caches are its own: test/language/keys.sh.
     {
@@ -196,11 +206,11 @@ pub fn build(b: *std.Build) void {
         _ = keys.addOutputDirectoryArg2("work", .{});
         keys.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &keys.step, 15);
-        test_step.dependOn(&keys.step);
+        cache_step.dependOn(&keys.step);
     }
-    addLintTests(b, exe, test_step, upstream_step, std_zir);
+    addLintTests(b, exe, diag_step, cache_step, upstream_step, std_zir);
     const build_test_step = addBuildTest(b, exe, build_web_wasm, translate_c);
-    spreadBsUsers(b, &exe.step, &zir.step, &.{ test_step, build_test_step });
+    spreadBsUsers(b, &exe.step, &zir.step, &(test_parts ++ [_]*std.Build.Step{build_test_step}));
 
     // Always ReleaseFast: a Debug build of bs says nothing about its speed.
     const bench_link = b.addExecutable(.{ .name = "bench-link", .root_module = b.createModule(.{
@@ -267,7 +277,7 @@ pub fn build(b: *std.Build) void {
             c_run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
             c_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
             c_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
-            test_step.dependOn(&c_run.step);
+            link_step.dependOn(&c_run.step);
         }
         // An executable of C only in ReleaseSafe: Clang's function
         // sanitizer puts a prefix before `main` in its section, so the
@@ -282,7 +292,7 @@ pub fn build(b: *std.Build) void {
         c_run.addArg("5");
         c_run.addCheck(.{ .expect_stdout_exact = "argc=2 q=478165905515354922\n" });
         c_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
-        test_step.dependOn(&c_run.step);
+        link_step.dependOn(&c_run.step);
         // Objective-C sources: one without the runtime, and a class that
         // sends messages through libobjc and Foundation, whose sections
         // the Mach-O linker places for the runtime.
@@ -296,7 +306,7 @@ pub fn build(b: *std.Build) void {
             const objc_run = std.Build.Step.Run.create(b, b.fmt("run bs -lc build of {s} on aarch64-macos", .{src}));
             objc_run.addFileArg(objc_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
             objc_run.addCheck(.{ .expect_term = .{ .exited = 3 } });
-            test_step.dependOn(&objc_run.step);
+            link_step.dependOn(&objc_run.step);
         }
     }
 }
@@ -416,7 +426,9 @@ fn aarch64LinuxGlibcRunner(b: *std.Build) ?[]const []const u8 {
     return std.mem.concat(b.allocator, []const u8, &.{ runner, &.{ "-L", sysroot } }) catch @panic("OOM");
 }
 
-fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
+/// `run_step` takes the programs, and `edit_step` those with rebuild or
+/// donor headers.
+fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, run_step: *std.Build.Step, edit_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     const io = b.graph.io;
     const host = b.graph.host.result;
     const host_runs_bs_output = host.cpu.arch == .x86_64 and host.os.tag == .linux;
@@ -535,6 +547,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
         if (!host_runs_bs_output and for (expect.flags.items, 0..) |f, i| {
             if (i > 0 and std.mem.eql(u8, expect.flags.items[i - 1], "-target") and std.mem.find(u8, f, "native") != null) break true;
         } else false) continue;
+        const test_step = if (expect.rebuild_without.items.len != 0 or expect.lib_edit != null or expect.donor_without != null or expect.donor_libc) edit_step else run_step;
 
         for ([_]bool{ false, true }) |upstream| {
             const compile = if (upstream) blk: {
@@ -969,7 +982,7 @@ fn isThreadChecked(file: []const u8) bool {
 /// `test` runs `bs build-exe -fno-emit-bin <file>` from test/diag and
 /// checks stderr and exit status 1; `test-upstream` checks that upstream
 /// zig rejects the program too.
-fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
+fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, edit_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     const io = b.graph.io;
     b.dependOnDirectoryContents(b.path("test/diag"));
     var dir = b.root.openDir(io, "test/diag", .{ .iterate = true }) catch |err|
@@ -1069,7 +1082,7 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
             }
             edit.addCheck(.{ .expect_term = .{ .exited = 1 } });
             takes(b, &edit.step, 5);
-            test_step.dependOn(&edit.step);
+            edit_step.dependOn(&edit.step);
         }
 
         if (bs_only) continue;
@@ -1092,7 +1105,7 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
 /// block of bs's exact standard error, as a test/diag case's: `test` runs
 /// `bs build-obj -fno-emit-bin` on it; `test-upstream` checks that
 /// upstream zig, which reads no config, accepts it.
-fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
+fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, cache_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     const io = b.graph.io;
     b.dependOnDirectoryContents(b.path("test/lint"));
     var dir = b.root.openDir(io, "test/lint", .{ .iterate = true }) catch |err|
@@ -1197,7 +1210,7 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
     added.addDirectoryArg2(std_zir, .{});
     added.expectExitCode(0);
     takes(b, &added.step, 5);
-    test_step.dependOn(&added.step);
+    cache_step.dependOn(&added.step);
 }
 
 /// `bs build-obj`: test/obj/lib.zig, linked into test/obj/main.zig by
@@ -1205,7 +1218,9 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
 /// stack trace needs the object's debug info, and edited through the cache
 /// as an object and a library (test/obj/cache.sh). `bs run`: test/obj/args.zig,
 /// whose arguments and exit status must pass through.
-fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
+/// `edit_step` takes test/run's scripts, and `cache_step` the objects and
+/// libraries through the cache.
+fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, edit_step: *std.Build.Step, cache_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     // The aarch64-linux object and static library, linked by upstream
     // (with LLD).
     if (aarch64LinuxRunner(b)) |runner| for ([_][]const u8{ "build-obj", "build-lib" }) |cmd| {
@@ -1557,7 +1572,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         cache.addDirectoryArg2(std_zir, .{});
         cache.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &cache.step, 25);
-        test_step.dependOn(&cache.step);
+        cache_step.dependOn(&cache.step);
     }
 
     // Donors kept per program: test/run/donor_own.sh.
@@ -1570,7 +1585,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         donor.addDirectoryArg2(std_zir, .{});
         donor.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &donor.step, 15);
-        test_step.dependOn(&donor.step);
+        edit_step.dependOn(&donor.step);
     }
     // A donor whose modules give an import name another module:
     // test/run/donor_module_deps.sh.
@@ -1583,7 +1598,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         deps.addDirectoryArg2(std_zir, .{});
         deps.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &deps.step, 10);
-        test_step.dependOn(&deps.step);
+        edit_step.dependOn(&deps.step);
     }
     // Donors across musl's -lc: test/run/donor_musl_libc.sh.
     {
@@ -1597,7 +1612,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         dm.addCheck(.{ .expect_term = .{ .exited = 0 } });
         // With a cold global cache, libc.a's thousand sources.
         takes(b, &dm.step, 40);
-        test_step.dependOn(&dm.step);
+        edit_step.dependOn(&dm.step);
     }
     // A store entry across compilations whose types lay out differently:
     // test/run/store_layout.sh.
@@ -1611,7 +1626,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         sl.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
         sl.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &sl.step, 15);
-        test_step.dependOn(&sl.step);
+        edit_step.dependOn(&sl.step);
     }
     // A compiler_rt edit without its old ZIR: test/run/edit_rt_old_zir.sh.
     {
@@ -1624,7 +1639,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         rt.addDirectoryArg2(std_zir, .{});
         rt.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &rt.step, 15);
-        test_step.dependOn(&rt.step);
+        edit_step.dependOn(&rt.step);
     }
     // Edits after a function's type changed: test/run/edit_subject.sh.
     {
@@ -1636,7 +1651,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         sj.addDirectoryArg2(std_zir, .{});
         sj.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &sj.step, 10);
-        test_step.dependOn(&sj.step);
+        edit_step.dependOn(&sj.step);
     }
     // An edit to a module with `--dep`s that embeds a file:
     // test/run/edit_embed_dep_key.sh.
@@ -1649,7 +1664,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         ek.addDirectoryArg2(std_zir, .{});
         ek.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &ek.step, 10);
-        test_step.dependOn(&ek.step);
+        edit_step.dependOn(&ek.step);
     }
     // A deleted ZON file that the program imports but does not analyze:
     // test/run/edit_zon_unreferenced.sh.
@@ -1662,7 +1677,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         zu.addDirectoryArg2(std_zir, .{});
         zu.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &zu.step, 10);
-        test_step.dependOn(&zu.step);
+        edit_step.dependOn(&zu.step);
     }
     // An edit to a compiler_rt helper's requester: test/run/edit_rt_request.sh.
     {
@@ -1674,7 +1689,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         rq.addDirectoryArg2(std_zir, .{});
         rq.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &rq.step, 10);
-        test_step.dependOn(&rq.step);
+        edit_step.dependOn(&rq.step);
     }
     // A test's edit that adds an error name: test/run/edit_error_names_table.sh.
     {
@@ -1686,7 +1701,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         en.addDirectoryArg2(std_zir, .{});
         en.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &en.step, 10);
-        test_step.dependOn(&en.step);
+        edit_step.dependOn(&en.step);
     }
     // A deleted `@embedFile`d file: test/run/edit_embed_gone.sh.
     {
@@ -1698,7 +1713,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         em.addDirectoryArg2(std_zir, .{});
         em.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &em.step, 10);
-        test_step.dependOn(&em.step);
+        edit_step.dependOn(&em.step);
     }
     // An error in a unit a failing edit no longer reaches:
     // test/run/edit_unreached_error.sh.
@@ -1711,7 +1726,7 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         ue.addDirectoryArg2(std_zir, .{});
         ue.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &ue.step, 10);
-        test_step.dependOn(&ue.step);
+        edit_step.dependOn(&ue.step);
     }
 
     const bs_run = b.addRunArtifact(bs);
@@ -1871,33 +1886,39 @@ fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roo
     const workers = @max(1, (std.Thread.getCpuCount() catch 1) -| 1);
     const gates = b.allocator.alloc(*Step, workers) catch @panic("OOM");
     const loads = b.allocator.alloc(usize, workers) catch @panic("OOM");
-    for (gates, loads, 0..) |*g, *load, i| {
+    for (gates, 0..) |*g, i| {
         const gate = b.allocator.create(Step.TopLevel) catch @panic("OOM");
         gate.* = .{ .step = .init(.{ .tag = .top_level, .name = b.fmt("bs users {d}", .{i}), .owner = b }), .description = "" };
         gate.step.dependOn(first);
         g.* = &gate.step;
-        load.* = 0;
     }
     var seen: std.array_hash_map.Auto(*Step, void) = .empty;
     var users: std.ArrayList(*Step) = .empty;
-    for (roots) |r| seen.put(b.allocator, r, {}) catch @panic("OOM");
-    var i: usize = 0;
-    while (i < seen.count()) : (i += 1) {
-        const s = seen.keys()[i];
-        for (s.dependencies.items) |d| seen.put(b.allocator, d, {}) catch @panic("OOM");
-        if (s != first and std.mem.findScalar(*Step, s.dependencies.items, bs) != null) users.append(b.allocator, s) catch @panic("OOM");
-    }
-    std.mem.sort(*Step, users.items, {}, struct {
-        fn heavier(_: void, x: *Step, y: *Step) bool {
-            return stepSeconds(x) > stepSeconds(y);
+    // Each root's users are dealt on their own, so that a build of one
+    // root (a CI job's) spreads its work over every gate too; a user that
+    // an earlier root reaches is that root's.
+    for (roots) |root| {
+        var i = seen.count();
+        seen.put(b.allocator, root, {}) catch @panic("OOM");
+        users.clearRetainingCapacity();
+        while (i < seen.count()) : (i += 1) {
+            const s = seen.keys()[i];
+            for (s.dependencies.items) |d| seen.put(b.allocator, d, {}) catch @panic("OOM");
+            if (s != first and std.mem.findScalar(*Step, s.dependencies.items, bs) != null) users.append(b.allocator, s) catch @panic("OOM");
         }
-    }.heavier);
-    for (users.items) |s| {
-        const least = std.mem.findMin(usize, loads);
-        for (s.dependencies.items) |*d| {
-            if (d.* == bs or d.* == first) d.* = gates[least];
+        std.mem.sort(*Step, users.items, {}, struct {
+            fn heavier(_: void, x: *Step, y: *Step) bool {
+                return stepSeconds(x) > stepSeconds(y);
+            }
+        }.heavier);
+        @memset(loads, 0);
+        for (users.items) |s| {
+            const least = std.mem.findMin(usize, loads);
+            for (s.dependencies.items) |*d| {
+                if (d.* == bs or d.* == first) d.* = gates[least];
+            }
+            loads[least] += stepSeconds(s);
         }
-        loads[least] += stepSeconds(s);
     }
 }
 
@@ -2014,7 +2035,8 @@ fn fetchModule(b: *std.Build, zig_lib_dir: []const u8) *std.Build.Module {
 /// -fPIC, and the program must print what upstream's link of the same
 /// inputs prints.
 /// Returns the step that compiles translate-c with bs first.
-fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, std_zir: std.Build.LazyPath) ?*std.Build.Step {
+/// `cache_step` takes the inputs through the cache.
+fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, cache_step: *std.Build.Step, std_zir: std.Build.LazyPath) ?*std.Build.Step {
     const host = b.graph.host.result;
     if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return null;
     const expect = "44 108 12 gamma hello from C 0 4 9 copied\nthread 712\n712 4 23\nextern data data 30 30\nextern data data 23 111 1\n";
@@ -3144,7 +3166,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         cache.addDirectoryArg2(std_zir, .{});
         cache.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &cache.step, if (std.mem.eql(u8, part, "objects")) 38 else 18);
-        test_step.dependOn(&cache.step);
+        cache_step.dependOn(&cache.step);
     }
     return &tc_native.step;
 }
