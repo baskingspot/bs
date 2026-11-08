@@ -99,6 +99,11 @@
               inputs.mattware.packages.${system}.ziglint
               pkgs.python3
               pkgs.ruff
+              # OpenSSL's headers and libcrypto, which http's and tls's
+              # @cImport and `linkSystemLibrary("crypto")` need in the
+              # lint-parity set: in the shell, zig searches only the
+              # shell's include and library paths, not /usr.
+              pkgs.openssl
             ]
             # Runs aarch64-linux test binaries on x86_64-linux, as
             # .agents/setup's qemu-user-static does in orbs.
