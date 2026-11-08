@@ -1990,6 +1990,14 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
         // build runner then writes the configuration without creating it.
         try Io.Dir.cwd().createDirPath(io, try Io.Dir.path.join(arena, &.{ j.cache_dirs.local, "tmp" }));
     }
+    // Which bs `bs build` last ran with this local cache, an input of every
+    // compilation, so that the runner's caches tell bs binaries apart
+    // (`BuildRunner.compiler_file`).
+    const compiler_id: ?[]const u8 = if (job) |*j| id: {
+        const p = try Io.Dir.path.join(arena, &.{ j.cache_dirs.local, BuildRunner.compiler_file });
+        Io.Dir.cwd().access(io, p, .{}) catch break :id null;
+        break :id p;
+    } else null;
     const root_node = std.Progress.start(io, .{});
     defer root_node.end();
 
@@ -2024,6 +2032,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
                 var inc = j.openCache(out_path);
                 defer if (inc) |*i| i.close();
                 const outcome = try compile(init, j, if (inc) |*i| i else null, out_path, alt_path, root_node, &inputs);
+                if (compiler_id) |p| try appendInput(arena, &inputs, p);
                 if (outcome == .ok and outcome.ok.at_alt) current = 1 - current;
                 const docs_path = outs[current].docs;
                 const prefixed = try prefixInputs(arena, io, inputs.items, .{ .zig_lib_dir = j.zig_lib_dir, .trusted_lib = j.trusted_lib, .cache_dirs = j.cache_dirs, .build_root = j.opts.build_root });

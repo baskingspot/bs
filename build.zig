@@ -1736,7 +1736,7 @@ fn addBuildTest(b: *std.Build, bs: *std.Build.Step.Compile, build_web_wasm: std.
     const step = b.step("test-build", "Check `bs build` end to end on test/build/hello");
     if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return step;
     var first: ?*std.Build.Step = null;
-    for ([_][]const u8{ "build", "shape", "fuzz", "misc" }, [_]u32{ 32, 5, 20, 8 }) |part, seconds| {
+    for ([_][]const u8{ "build", "shape", "fuzz", "misc", "compiler" }, [_]u32{ 32, 5, 20, 8, 20 }) |part, seconds| {
         const run = b.addSystemCommand(&.{"sh"});
         run.setName(b.fmt("bs build test/build/hello ({s})", .{part}));
         run.addFileArg(b.path("test/build/check.sh"));

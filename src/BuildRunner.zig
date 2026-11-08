@@ -65,6 +65,11 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
         noteTool(io, runner_path, stamp_path);
     }
 
+    // This bs's identity where the runner's caches see it (`compiler_file`).
+    if (try localCacheDir(arena, io, env, cwd, user_args)) |local| {
+        noteCompiler(io, local, &std.fmt.bytesToHex(std.mem.asBytes(&seed), .lower));
+    }
+
     const self_exe = try std.process.executablePathAlloc(io, arena);
     var seed_bytes: [4]u8 = undefined;
     io.random(&seed_bytes);
@@ -81,6 +86,63 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     if (env.get("ZIG_VERBOSE_CMD") != null) std.log.info("{f}", .{std.zig.SubprocessCommand{ .argv = argv.items }});
     const err = std.process.replace(io, .{ .argv = argv.items, .environ_map = env });
     main.fatal("the following command failed to execve with '{t}':\n{s}", .{ err, try std.mem.join(arena, " ", argv.items) });
+}
+
+/// Under the project's local cache: the identity of the bs that last ran
+/// `bs build` there (the store seed `Incremental.compilationKey` derives
+/// from bs's executable), which `main.serve` reports as an input of every
+/// compilation the runner asks for. The runner keys its configuration
+/// cache and its steps' manifests on `builtin.zig_version_string`, which
+/// is upstream's for every bs, and on their inputs: with this file among
+/// them, a build by another bs configures and compiles again rather than
+/// keep what the last one made (its build graph, its lint findings).
+pub const compiler_file = "bs/compiler";
+
+/// The runner's local cache for `user_args`, as `Maker.zig` finds it:
+/// ZIG_LOCAL_CACHE_DIR or `--cache-dir`, else `.zig-cache` in the build
+/// root, the directory of `--build-file` or the nearest one up from `cwd`
+/// that has `build.zig`. Null if there is none, which the runner reports.
+fn localCacheDir(arena: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, user_args: []const []const u8) !?[]const u8 {
+    var override: ?[]const u8 = std.zig.EnvVar.ZIG_LOCAL_CACHE_DIR.get(env);
+    var build_file: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < user_args.len) : (i += 1) {
+        const arg = user_args[i];
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (i + 1 == user_args.len) break;
+        if (std.mem.eql(u8, arg, "--cache-dir")) {
+            i += 1;
+            override = user_args[i];
+        } else if (std.mem.eql(u8, arg, "--build-file")) {
+            i += 1;
+            build_file = user_args[i];
+        }
+    }
+    if (override) |p| {
+        const local = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, p });
+        return local;
+    }
+    var dir: []const u8 = if (build_file) |bf| try Io.Dir.path.resolveAlloc(arena, &.{ cwd, Io.Dir.path.dirname(bf) orelse "." }) else cwd;
+    while (build_file == null) {
+        if (Io.Dir.cwd().access(io, try Io.Dir.path.join(arena, &.{ dir, std.zig.build_zig_basename }), .{})) |_| break else |_| {}
+        dir = Io.Dir.path.dirname(dir) orelse return null;
+    }
+    const local = try Io.Dir.path.join(arena, &.{ dir, ".zig-cache" });
+    return local;
+}
+
+/// Writes `id` to `compiler_file` under `local` unless it is there
+/// already, so that a build by the same bs leaves the file's stat alone.
+/// Best effort: without it, the runner keeps what another bs made.
+fn noteCompiler(io: Io, local: []const u8, id: []const u8) void {
+    var dir = Io.Dir.cwd().createDirPathOpen(io, local, .{}) catch return;
+    defer dir.close(io);
+    var buf: [64]u8 = undefined;
+    if (dir.readFile(io, compiler_file, &buf)) |old| {
+        if (std.mem.eql(u8, old, id)) return;
+    } else |_| {}
+    dir.createDirPath(io, Io.Dir.path.dirname(compiler_file).?) catch return;
+    cache.writeReplace(io, dir, compiler_file, &.{id}) catch {}; // ziglint-ignore: Z026 -- best effort, as the doc comment says
 }
 
 /// Compiles one of upstream's programs that bs runs (the build runner,

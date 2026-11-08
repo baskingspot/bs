@@ -4,8 +4,8 @@
 #   $1 bs  $2 test/build/hello  $3 scratch directory
 #   $4 the build web client bs embeds (build-web.wasm)
 #   $5 the part to check, each its own build step: build, which compiles
-#      the build runner into the global cache, then shape, fuzz and misc
-#      at once, each in its own copy
+#      the build runner into the global cache, then shape, fuzz, misc and
+#      compiler at once, each in its own copy
 set -eu
 unset ZIG_LOCAL_CACHE_DIR ZIG_LIB_DIR
 rm -rf "$3"
@@ -188,6 +188,42 @@ line=$(($(wc -l <build.zig) + 1))
 echo "fn unused() void { const y = 1; }" >>build.zig
 if "$bs" build >"$work/log" 2>&1; then fail "bs build succeeded with a broken build.zig"; fi
 expect "build.zig:$line:26: error: [unused] unused local constant"
+;;
+compiler)
+# The runner keys its configuration and its steps on the compiler's
+# version, which every bs gives as upstream's, and on their inputs, which
+# include the identity of the bs that last ran `bs build` here
+# (`BuildRunner.compiler_file`): another bs, at another path or copied
+# over this one, configures again rather than keep the last one's build
+# graph. Two copies of bs, each its own compiler, and a global cache of
+# their own, where each compiles its runner.
+export ZIG_GLOBAL_CACHE_DIR="$work/global"
+mkdir "$work/a" "$work/b" "$work/p"
+cp "$bs" "$work/a/bs"
+cp "$bs" "$work/b/bs"
+cd "$work/p"
+cat >build.zig <<'ZIG'
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    std.debug.print("configured\n", .{});
+    const exe = b.addExecutable(.{ .name = "m", .root_module = b.createModule(.{ .root_source_file = b.path("m.zig"), .target = b.graph.host }) });
+    b.installArtifact(exe);
+}
+ZIG
+printf 'pub fn main() void {}\n' >m.zig
+# $1 which bs, $2 what the build is, $3 whether it configures (yes or no).
+configures() {
+    "$work/$1/bs" build >"$work/log" 2>&1 || fail "bs build ($2)"
+    if grep -qx configured "$work/log"; then [ "$3" = yes ] || fail "$2: configured again"; else [ "$3" = no ] || fail "$2: kept the last build's configuration"; fi
+}
+configures a "first" yes
+configures a "no change" no
+configures b "another bs" yes
+configures b "no change with it" no
+configures a "the first bs again" yes
+cp "$work/b/bs" "$work/a/bs"
+configures a "another bs copied over the first" yes
+configures a "no change after the copy" no
 ;;
 *)
     fail "unknown part '$part'"

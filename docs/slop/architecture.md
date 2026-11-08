@@ -7850,6 +7850,21 @@ state. Built for step 1:
   --global-cache=<global> --seed=<random> <user args>`. The runner
   compiles `build.zig` (with `configurer.zig`) and every compile step by
   running bs with `--listen=-`.
+- **Which bs built it.** The runner keys its configuration cache and its
+  steps' manifests on `builtin.zig_version_string`, upstream's "0.17.1"
+  for every bs, and on their inputs, not on the compiler binary, so a
+  `bs build` by another bs kept the last one's configuration: its build
+  graph, and the lint findings its configure compile reported (the
+  ziglint thread, 2026-11-08). Before it replaces itself with the runner,
+  `bs build` writes its identity (the store seed) to `<local
+  cache>/bs/compiler` unless the file holds it already, finding the
+  local cache as `Maker.zig` does (ZIG_LOCAL_CACHE_DIR, `--cache-dir`,
+  else the build root's `.zig-cache`), and `main.serve` reports that file
+  as an input of every compilation (`BuildRunner.compiler_file`). Another
+  bs, at another path or copied over this one, changes the file, so the
+  runner configures and compiles again; programs still see upstream's
+  version. The no-change cost is a read of the file and a stat per
+  manifest (test/build/check.sh, `compiler`).
 - **The compiler protocol** (`main.serve`, std's `std.zig.Server`): bs
   sends `zig_version` and the step's `config` (static, no libc), then
   answers each `update` with `file_system_inputs` (every file the build
