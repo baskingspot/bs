@@ -1,6 +1,7 @@
 .zig-cache/
 zig-out/
 /upstream
+/upstream-0.16
 .amp/portals/*
 /bench/.work/
 __pycache__/
