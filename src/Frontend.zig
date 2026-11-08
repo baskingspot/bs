@@ -51,8 +51,8 @@ modules: std.ArrayList(Module) = .empty,
 zon_imports: std.ArrayList(ZonImport) = .empty,
 /// The module whose tests `bs test` runs; `root` outside of tests.
 main_module: Module.Index = .root,
-/// The project's `.ziglint.zon`, if it has one: the files it covers that
-/// this build lowers get their lint findings from the same syntax tree
+/// The project's lint config, unless lint is off: the files it covers
+/// that this build lowers get their lint findings from the same syntax tree
 /// (`lintFindings`).
 lint: ?*const LintConfig = null,
 /// `Options.root_name`: what `displayName` calls `main_module`.

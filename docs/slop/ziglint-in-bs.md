@@ -4,7 +4,9 @@ Status: approved by the owner (2026-11-07), with the decisions listed
 at the end; being built. Written from main 457f2c4 and ziglint v0.8.1
 (rockorager/ziglint f6a3fc2). What is built, and where it departs from
 this note, is in docs/slop/architecture.md ("ziglint's rules as compile
-errors") and in "Built so far" below.
+errors") and in "Built so far" below. Since 2026-11-08 lint is on by
+default, configured or turned off by `.bs.zon` ("Lint by default",
+below); the opt-in described here is how it started.
 
 The owner's request: bs reads `.ziglint.zon` and enforces ziglint's
 rules as compile errors. There is no escape hatch: no flag or environment
@@ -625,6 +627,32 @@ Still in force: no escape hatch, never lint std or dependencies, and
 the standalone ziglint job stays in CI until the owner decides to drop
 it.
 
+## Lint by default (the owner's decisions, 2026-11-08)
+
+1. Lint is on by default with ziglint 0.8.1's defaults: every rule but
+   Z033 (off in ziglint, "can be controversial"), Z024 at 120 bytes. A
+   project turns Z033 on in its config.
+2. `.bs.zon` holds a `lint` section with `.ziglint.zon`'s schema;
+   `.lint = false` turns lint off, the only off switch. Discovery is
+   today's walk, stopping at the nearest `build.zig`: a `.bs.zon` there
+   decides and any `.ziglint.zon` is ignored; otherwise a `.ziglint.zon`
+   is used as before; with neither, the defaults cover the project's
+   own files.
+3. Files outside any project (no `build.zig` above) get the defaults,
+   over their own directory.
+
+Unchanged: never std, dependencies or the global package cache;
+`// ziglint-ignore:` is the only per-line exception; no flag or
+environment variable reports without failing.
+
+Everything that compiles upstream's or third-party code as root files
+turns lint off with a checked-in or generated `.bs.zon`: the upstream
+source tree (written by `.agents/setup` and the flake's `zigSrc`), the
+conformance runner's work directories, tools/corpus's checkouts, bench's
+workloads, the hunters' scratch directories, edithunt's trees, the
+diagnostics eval and roundtrip, and test/build/hello (a fixture of
+`bs build`'s mechanics whose check edits it by line number).
+
 ## Built so far
 
 1. Branch `lint-1-syntax` (2026-11-07): the config (discovery,
@@ -753,3 +781,5 @@ it.
    ported suite. Removed `tools/lint/parity.py`, the `lint-parity` CI job
    and recipe, the corpus's `lint` list, and OpenSSL in the dev shell,
    which only the parity set needed. `just lint-bs` stays.
+8. Branch `lint-default` (2026-11-08): lint by default and `.bs.zon`,
+   as above (`Config.discover`, `Config.read`).

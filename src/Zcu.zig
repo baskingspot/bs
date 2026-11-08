@@ -188,8 +188,8 @@ errors: std.ArrayList(ErrorMsg) = .empty,
 /// `@compileLog` lines in analysis order (`Sema.zirCompileLog`). Like an
 /// error, any fails the build.
 compile_logs: std.ArrayList(CompileLog) = .empty,
-/// The files the project's `.ziglint.zon` covers, a bit per file index;
-/// empty without one. Sema checks the ziglint rules it answers in code
+/// The files the project's lint config covers, a bit per file index;
+/// empty with lint off. Sema checks the ziglint rules it answers in code
 /// from these files (docs/slop/ziglint-in-bs.md).
 lint_covered: std.bit_set.Dynamic = .{},
 /// Those rules' findings, in analysis order, possibly repeated (an

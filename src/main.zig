@@ -768,16 +768,16 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     var rec: ?InputsRecord = if (inc_opt == null and out_path != null and !job.cacheable() and !job.opts.c_only and !job.opts.dump_ir and
         !std.mem.eql(u8, job.environ_map.get("BS_CACHE") orelse "", "off")) InputsRecord.open(init.arena.allocator(), job) else null;
     defer if (rec) |*r| r.close(init.io);
-    // The project's `.ziglint.zon` makes ziglint's rules compile errors in
-    // the files it covers. A build whose config is not the last successful
-    // build's builds (`LintState`).
+    // ziglint's rules are compile errors in the files the project's lint
+    // config (or the defaults) covers. A build whose config is not the
+    // last successful build's builds (`LintState`).
     const lint_cfg: ?*const LintConfig = switch (try findLintConfig(init, job)) {
         .none => null,
         .ok => |c| c,
         .err => |d| return .{ .errors = try dupeDiagnostics(init.arena.allocator(), &.{d}) },
     };
     var lint_state: LintState = .of(lint_cfg);
-    if (lint_cfg) |cfg| if (inputs) |list| try appendInput(init.arena.allocator(), list, cfg.path);
+    if (lint_cfg) |cfg| if (cfg.file()) |f| if (inputs) |list| try appendInput(init.arena.allocator(), list, f);
     if (inc_opt) |i| {
         try lint_state.load(init.arena.allocator(), init.io, i.dir);
         i.lint_changed = !lint_state.same;
@@ -1713,11 +1713,12 @@ fn dupeDiagnostics(arena: std.mem.Allocator, diags: []const diag.Diagnostic) ![]
     return out;
 }
 
-/// The `.ziglint.zon` of a compilation (`LintConfig.discover`) from its
+/// The lint config of a compilation (`LintConfig.discover`) from its
 /// root source file (under `bs test`, the module under test's; for
 /// `bs build`'s configure script, whose root is in the zig lib directory,
-/// the `@build` module's, the project's `build.zig`), read; a C root has
-/// none.
+/// the `@build` module's, the project's `build.zig`), read: its `.bs.zon`'s
+/// `lint`, its `.ziglint.zon` or ziglint's defaults. None for a C root, a
+/// root in std or a dependency, or a `.bs.zon` that turns lint off.
 fn findLintConfig(init: std.process.Init, job: *const Job) !union(enum) { none, ok: *const LintConfig, err: diag.Diagnostic } {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -1731,13 +1732,14 @@ fn findLintConfig(init: std.process.Init, job: *const Job) !union(enum) { none, 
     for (opts.modules) |m| if (std.mem.eql(u8, m.name, "@build")) {
         root = m.path;
     };
-    const path = try LintConfig.discover(arena, io, root, excluded) orelse return .none;
-    switch (try LintConfig.read(arena, io, path, excluded, try .init(arena, io, job.zig_lib_dir))) {
+    const found = try LintConfig.discover(arena, io, root, excluded) orelse return .none;
+    switch (try LintConfig.read(arena, io, found, excluded, try .init(arena, io, job.zig_lib_dir))) {
         .ok => |c| {
             const cfg = try arena.create(LintConfig);
             cfg.* = c;
             return .{ .ok = cfg };
         },
+        .off => return .none,
         .err => |d| return .{ .err = d },
     }
 }

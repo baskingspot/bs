@@ -1,8 +1,8 @@
-//! A project's `.ziglint.zon`, which opts it in to ziglint's rules as
-//! compile errors: finding it, reading it, the files it covers, and the
-//! report step, which turns the syntax pass's findings (`Linter`) into
-//! diagnostics by the config's rule switches. See "ziglint's rules" in
-//! docs/slop/architecture.md.
+//! ziglint's rules as compile errors, on by default: a project's config
+//! (the `lint` section of its `.bs.zon`, or its `.ziglint.zon`), finding
+//! and reading it, the files it covers, and the report step, which turns
+//! the syntax pass's findings (`Linter`) into diagnostics by the config's
+//! rule switches. See "ziglint's rules" in docs/slop/architecture.md.
 
 const std = @import("std");
 const Io = std.Io;
@@ -13,11 +13,12 @@ const Linter = @import("Linter.zig");
 
 const Config = @This();
 
-/// Absolute path of the `.ziglint.zon`, and of its directory, which
-/// `paths` are relative to.
+/// Absolute path of the config file, or of the directory the defaults
+/// cover when there is none, and the directory `paths` are relative to.
 path: []const u8,
 dir: []const u8,
-/// Its contents, which the cache compares (`Incremental`'s lint state).
+/// The config file's contents, which the cache compares (`Incremental`'s
+/// lint state); empty for the defaults.
 source: [:0]const u8,
 paths: []const Path,
 rules: Rule.Config,
@@ -31,13 +32,30 @@ excluded: []const []const u8,
 const Path = struct { abs: []const u8, dir: bool, gitignore: ?[]const u8 };
 
 pub const file_name = ".ziglint.zon";
+pub const bs_file_name = ".bs.zon";
 
-/// The `.ziglint.zon` that covers a compilation whose root source file is
-/// `root_file`, if any: the nearest one in its directory or above, up to
-/// the nearest directory that holds a `build.zig`. Without a `build.zig`
-/// above it, only the file's own directory is searched. A root file in an
-/// `excluded` directory or a `zig-pkg` directory (a dependency) has none.
-pub fn discover(arena: Allocator, io: Io, root_file: []const u8, excluded: []const []const u8) !?[]const u8 {
+/// What `discover` found for a compilation.
+pub const Found = struct {
+    /// The config file, or null for ziglint's defaults.
+    path: ?[]const u8,
+    /// What the defaults cover: the project's directory (the nearest one
+    /// with a `build.zig`), or the root file's own outside a project.
+    dir: []const u8,
+
+    pub fn isBs(f: Found) bool {
+        return std.mem.endsWith(u8, f.path orelse return false, bs_file_name);
+    }
+};
+
+/// The config of a compilation whose root source file is `root_file`:
+/// the nearest `.bs.zon` in its directory or above, up to the nearest
+/// directory that holds a `build.zig`; without one, the nearest
+/// `.ziglint.zon` there; without either, ziglint's defaults over the
+/// project. Without a `build.zig` above it, only the file's own directory
+/// is searched, and the defaults cover that directory. A root file in an
+/// `excluded` directory or a `zig-pkg` directory (a dependency) is never
+/// linted (null).
+pub fn discover(arena: Allocator, io: Io, root_file: []const u8, excluded: []const []const u8) !?Found {
     const cwd = Io.Dir.cwd();
     const start = cwd.realPathFileAlloc(io, Io.Dir.path.dirname(root_file) orelse ".", arena) catch return null;
     if (isExcluded(start, excluded)) return null;
@@ -47,14 +65,17 @@ pub fn discover(arena: Allocator, io: Io, root_file: []const u8, excluded: []con
         if (exists(io, try Io.Dir.path.join(arena, &.{ dir, "build.zig" }))) break dir;
         dir = Io.Dir.path.dirname(dir) orelse break null;
     };
-    dir = start;
-    while (true) {
-        const path = try Io.Dir.path.join(arena, &.{ dir, file_name });
-        if (exists(io, path)) return path;
-        const top = project orelse return null;
-        if (std.mem.eql(u8, dir, top)) return null;
-        dir = Io.Dir.path.dirname(dir) orelse return null;
+    for ([_][]const u8{ bs_file_name, file_name }) |name| {
+        dir = start;
+        while (true) {
+            const path = try Io.Dir.path.join(arena, &.{ dir, name });
+            if (exists(io, path)) return .{ .path = path, .dir = Io.Dir.path.dirname(path).? };
+            const top = project orelse break;
+            if (std.mem.eql(u8, dir, top)) break;
+            dir = Io.Dir.path.dirname(dir) orelse break;
+        }
     }
+    return .{ .path = null, .dir = project orelse start };
 }
 
 fn exists(io: Io, path: []const u8) bool {
@@ -76,25 +97,42 @@ fn under(path: []const u8, dir: []const u8) ?[]const u8 {
     return path[dir.len + 1 ..];
 }
 
-/// The schema of `.ziglint.zon`, as ziglint's (`Config.ZonConfig`).
+/// The schema of `.ziglint.zon`, as ziglint's (`Config.ZonConfig`), and
+/// of `.bs.zon`'s `lint`.
 const Zon = struct {
     paths: ?[]const []const u8 = null,
     rules: ?Rule.Config = null,
 };
 
-/// Reads the config at `path` (from `discover`). A config bs cannot read,
-/// with an unknown field or rule ID among others, is a compile error
-/// rather than ziglint's warning and defaults: with no other way to turn a
-/// rule off, a config ignored silently would be one.
-pub fn read(arena: Allocator, io: Io, path: []const u8, excluded: []const []const u8, paths: diag.Paths) !union(enum) { ok: Config, err: diag.Diagnostic } {
+/// `.bs.zon`: `.lint = false` turns lint off; `true`, a missing `lint`
+/// or `.{}` are ziglint's defaults.
+const BsZon = struct { lint: Zon = .{} };
+const BsZonSwitch = struct { lint: bool };
+
+/// Reads the config `discover` found. A config bs cannot read, with an
+/// unknown field or rule ID among others, is a compile error rather than
+/// ziglint's warning and defaults: with no other way to turn a rule off,
+/// a config ignored silently would be one.
+pub fn read(arena: Allocator, io: Io, found: Found, excluded: []const []const u8, paths: diag.Paths) !union(enum) { ok: Config, off, err: diag.Diagnostic } {
     const cwd = Io.Dir.cwd();
+    const path = found.path orelse return .{ .ok = try make(arena, io, found.dir, found.dir, "", .{}, excluded) };
     const source = cwd.readFileAllocOptions(io, path, arena, .limited(1 << 20), .of(u8), 0) catch |err| return .{ .err = .{
         .code = .@"lint-config",
         .loc = null,
         .msg = try arena.print("unable to read '{s}': {t}", .{ (try paths.display(arena, path))[0], err }),
     } };
     var zon_diag: std.zon.parse.Diagnostics = undefined;
-    const zon = std.zon.parse.fromSlice(Zon, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &zon_diag }) catch |err| switch (err) {
+    const opts: std.zon.parse.Options = .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &zon_diag };
+    if (found.isBs()) {
+        if (std.zon.parse.fromSlice(BsZonSwitch, opts)) |sw| {
+            if (!sw.lint) return .off;
+            return .{ .ok = try make(arena, io, path, found.dir, source, .{}, excluded) };
+        } else |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.ParseZon => {},
+        }
+    }
+    const zon = (if (found.isBs()) bsLint(opts) else std.zon.parse.fromSlice(Zon, opts)) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         error.ParseZon => {
             const e = zon_diag.errors[0];
@@ -106,7 +144,17 @@ pub fn read(arena: Allocator, io: Io, path: []const u8, excluded: []const []cons
             } };
         },
     };
-    const dir = Io.Dir.path.dirname(path).?;
+    return .{ .ok = try make(arena, io, path, found.dir, source, zon, excluded) };
+}
+
+fn bsLint(opts: std.zon.parse.Options) !Zon {
+    return (try std.zon.parse.fromSlice(BsZon, opts)).lint;
+}
+
+/// The config `zon` read from `path` (the directory itself for the
+/// defaults), whose `paths` are relative to `dir`.
+fn make(arena: Allocator, io: Io, path: []const u8, dir: []const u8, source: [:0]const u8, zon: Zon, excluded: []const []const u8) !Config {
+    const cwd = Io.Dir.cwd();
     // ziglint lints its working directory when the config names no paths.
     const names: []const []const u8 = zon.paths orelse &.{"."};
     var list: std.ArrayList(Path) = .empty;
@@ -118,14 +166,14 @@ pub fn read(arena: Allocator, io: Io, path: []const u8, excluded: []const []cons
         const gitignore = if (is_dir) cwd.readFileAlloc(io, try Io.Dir.path.join(arena, &.{ abs, ".gitignore" }), arena, .limited(1024 * 64)) catch null else null;
         try list.append(arena, .{ .abs = abs, .dir = is_dir, .gitignore = gitignore });
     }
-    return .{ .ok = .{
+    return .{
         .path = path,
         .dir = dir,
         .source = source,
         .paths = list.items,
         .rules = zon.rules orelse .{},
         .excluded = excluded,
-    } };
+    };
 }
 
 /// Whether the file at absolute path `abs` is covered: one of `paths`,
@@ -174,6 +222,11 @@ fn matchesGitignore(path: []const u8, pattern: []const u8) bool {
         if (std.mem.eql(u8, component, clean)) return true;
     }
     return std.mem.find(u8, path, clean) != null;
+}
+
+/// The config file, or null for ziglint's defaults.
+pub fn file(cfg: *const Config) ?[]const u8 {
+    return if (cfg.path.ptr == cfg.dir.ptr) null else cfg.path;
 }
 
 pub fn enabled(cfg: *const Config, rule: Rule) bool {

@@ -1050,9 +1050,10 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         upstream_step.dependOn(&up.step);
     }
 
-    // The cache: a build with no config that succeeded does not let a
-    // build that has one skip as unchanged, and the build after the
-    // config is gone builds again.
+    // The cache: a build with lint off that succeeded does not let a
+    // build with lint on (by default, or by a config) skip as unchanged,
+    // nor one config another's build, and turning lint off builds again.
+    // A `.bs.zon` decides over a `.ziglint.zon`.
     const added = b.addSystemCommand(&.{
         "sh", "-c",
         \\set -e
@@ -1062,23 +1063,26 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         \\: > build.zig
         \\printf 'pub fn main() void {}\nfn Bad() void {}\ntest {\n    _ = &Bad;\n}\n' > main.zig
         \\c="--cache-dir l --global-cache-dir g -target x86_64-linux"
+        \\printf '.{ .lint = false }\n' > .bs.zon
         \\"$bs" build-exe main.zig $c
-        \\printf '.{}\n' > .ziglint.zon
-        \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with a config passed"; exit 1; fi
+        \\rm .bs.zon
+        \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with the defaults passed"; exit 1; fi
         \\grep -q "main.zig:2:4: error\[style, Z001\]: function 'Bad' should be camelCase" log || { cat log; exit 1; }
         \\if "$bs" build-exe main.zig $c 2>log; then echo "the build again passed"; exit 1; fi
         \\printf '.{ .rules = .{ .Z001 = .{ .enabled = false } } }\n' > .ziglint.zon
         \\"$bs" build-exe main.zig $c
         \\printf '.{}\n' > .ziglint.zon
         \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with Z001 on again passed"; exit 1; fi
-        \\rm .ziglint.zon
+        \\printf '.{ .lint = .{ .rules = .{ .Z001 = .{ .enabled = false } } } }\n' > .bs.zon
         \\"$bs" build-exe main.zig $c
-        \\# Z011 is Sema's: a unit recorded without the config is analyzed
-        \\# again once the config covers its file.
+        \\printf '.{ .lint = false }\n' > .bs.zon
+        \\"$bs" build-exe main.zig $c
+        \\# Z011 is Sema's: a unit recorded with lint off is analyzed again
+        \\# once a config covers its file.
         \\printf 'const lib = @import("lib.zig");\npub fn main() void {\n    lib.thing();\n}\n' > main.zig
         \\printf '/// Deprecated: gone soon.\npub fn thing() void {}\n' > lib.zig
         \\"$bs" build-exe main.zig $c
-        \\printf '.{}\n' > .ziglint.zon
+        \\rm .bs.zon
         \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with a config passed"; exit 1; fi
         \\grep -q "main.zig:3:9: error\[deprecated, Z011\]: 'thing' is deprecated: Deprecated: gone soon." log || { cat log; exit 1; }
         \\# And it reads doc comments, which no source hash covers:

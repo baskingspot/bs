@@ -58,16 +58,18 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   humans: exact locations, the facts an agent needs to fix the error, and
   fixes where bs knows them, in a form a program can parse.
 - bs may reject more than upstream in two ways. Extra compile errors that
-  catch real mistakes are allowed. And a project opts in to ziglint's
-  style rules with a `.ziglint.zon`: bs then enforces those rules as
-  compile errors on the files the config's `paths` cover, never on std or
-  on dependencies. `// ziglint-ignore:` comments, part of the config
-  language, are the only exception, and no flag or environment variable
-  reports a finding without failing. ziglint 0.8.1 is the oracle for
-  those rules, as upstream zig is for the language. Without a
-  `.ziglint.zon`, everything upstream accepts must still compile and mean
-  the same, and upstream's std and `test/behavior` must still compile,
-  since they are the conformance measure.
+  catch real mistakes are allowed. And bs enforces ziglint's rules as
+  compile errors on a project's own files, never on std or on
+  dependencies. ziglint 0.8.1's defaults apply: every rule but Z033 is
+  on. A project configures them, or turns them off, with a `lint` section
+  in `.bs.zon` (the schema of `.ziglint.zon`), or with a `.ziglint.zon`
+  when it has no `.bs.zon`. `// ziglint-ignore:` comments are the only
+  per-line exception, and no flag or environment variable reports a
+  finding without failing. ziglint 0.8.1 is the oracle for those rules,
+  as upstream zig is for the language. With lint turned off, everything
+  upstream accepts must still compile and mean the same, and upstream's
+  std and `test/behavior` must still compile, since they are the
+  conformance measure.
 
 ## Architecture decisions
 

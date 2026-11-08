@@ -9357,7 +9357,7 @@ The owner's review (2026-11-03) settled:
    when a file cannot be lowered, so since 2026-11-04 bs analyzes
    after the others too, with replay; see "AstGen" below.)
 4. No error limit.
-5. No bs-only checks other than the opt-in ziglint rules ("ziglint's
+5. No bs-only checks other than the ziglint rules ("ziglint's
    rules as compile errors", below), and no `-fanalyze-unreferenced`
    for now. Their measurements stay below as background, marked not
    adopted.
@@ -9835,7 +9835,7 @@ or a person knows why upstream accepts the program. Checks:
 - have a source-level way out that is valid upstream Zig and states the
   intent (listed per check), plus `-fno-check=<code>` for a whole build.
   There are no suppression comments: ZIR doesn't see comments, and
-  suppressions rot. (The opt-in ziglint rules are the exception: their
+  suppressions rot. (The ziglint rules are the exception: their
   `// ziglint-ignore:` comments are part of ziglint's config language.)
 - must cost under 2% of Sema time on the libvaxis workload (a linear
   pass over IR), measured with `BS_TIMING`.
@@ -9989,20 +9989,28 @@ unchanged:
    crashes left.)
 8. Later: `bs explain` and `bs fix` (applies exact fixes).
 
-## ziglint's rules as compile errors (designed and owner-approved 2026-11-07; being built)
+## ziglint's rules as compile errors (designed and owner-approved 2026-11-07; on by default since 2026-11-08)
 
-A project opts in with a `.ziglint.zon`: bs then reports ziglint
-0.8.1's rules as compile errors in the files the config covers, never in
-std or dependencies. The design, its rule-by-rule placement and the
-owner's decisions are in docs/slop/ziglint-in-bs.md. What is built:
+bs reports ziglint 0.8.1's rules as compile errors in a project's own
+files, on by default (owner, 2026-11-08), never in std or dependencies.
+A project configures them, or turns them off, with the `lint` section of
+a `.bs.zon`, or with a `.ziglint.zon` when it has no `.bs.zon`. The
+design, its rule-by-rule placement and the owner's decisions are in
+docs/slop/ziglint-in-bs.md. What is built:
 
 - **Config** (`src/lint/Config.zig`). Discovery walks up from the root
   module's root source file (`bs test`: the module under test's;
   `bs build`'s configure script: the `@build` module's `build.zig`) to
   the nearest directory with a `build.zig`, and only the file's own
-  directory without one; a root in the zig lib directory, the global
-  package cache's `p/` or a `zig-pkg/` directory finds none. `paths` are
-  relative to the config's directory, `.` when there are none. A file is
+  directory without one, for a `.bs.zon`, then for a `.ziglint.zon`; a
+  root in the zig lib directory, the global package cache's `p/` or a
+  `zig-pkg/` directory is never linted. A `.bs.zon` decides: its `lint`
+  has `.ziglint.zon`'s schema, `.lint = false` turns lint off (the only
+  off switch), and `true`, `.{}` or no `lint` are the defaults. With
+  neither file, ziglint 0.8.1's defaults (every rule but Z033, Z024 at
+  120 bytes) cover the project's directory, or the root file's own
+  outside a project. `paths` are relative to the config's directory, `.`
+  when there are none. A file is
   covered as ziglint's walk would take it: a `paths` file, or a `.zig`
   file under a `paths` directory with no component starting with `.` or
   named `zig-cache` or `zig-out`, and none that directory's `.gitignore`
@@ -10040,18 +10048,19 @@ owner's decisions are in docs/slop/ziglint-in-bs.md. What is built:
   and fail the build as any error does: nothing is emitted or recorded.
 - **The cache.** The config is not part of the compilation key.
   `<compilation dir>/lint` (`main.LintState`) holds, after a successful
-  build, a hash of the config's path, contents and the `.gitignore`s its
-  paths read, then the lint keys of the files it covered, sorted; there
-  is no file without a config. A build whose config hash differs (a
-  config added, edited or removed) does not take the no-change skips
+  build, a hash of the config's path (the covered directory for the
+  defaults), contents and the `.gitignore`s its paths read, then the lint
+  keys of the files it covered, sorted; there is no file with lint off.
+  A build whose config hash differs (a config added, edited or removed,
+  lint turned on or off) does not take the no-change skips
   (`Incremental.relinkIfUnchanged`, `InputsRecord`). With the same
   config, a covered file whose key is listed had no findings, since that
   build succeeded, so an edit build reads the findings of the edited
-  files alone. The config file is reported as an input
+  files alone. The config file, if any, is reported as an input
   (`file_system_inputs`).
 - **Sema's rules.** Z010 (returns and call arguments), Z011, Z029 (call
   arguments) and Z034 are Sema's (`LintConfig.sema_rules`): in code from a
-  covered file (`Zcu.lint_covered`, a bit per file, empty without a config
+  covered file (`Zcu.lint_covered`, a bit per file, empty with lint off
   or with those rules off), Z010, Z029 and Z034 compare the types Sema has
   at a typed init, a returned field of a type, an argument before its
   coercion (`Sema.lintArg`) and a `print` call on `std.Io.Writer`

@@ -96,8 +96,7 @@ pub const Code = enum(u16) {
     // The linkers.
     @"branch-range",
     @"version-script",
-    // ziglint's rules, with a project's `.ziglint.zon` (`lint/`): the
-    // rule's ID is in `Diagnostic.rule`.
+    // ziglint's rules (`lint/`): the rule's ID is in `Diagnostic.rule`.
     style,
     deprecated,
     @"lint-config",

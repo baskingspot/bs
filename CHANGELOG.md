@@ -26,6 +26,7 @@ Changes a user of bs notices, newest first, in the
 
 ### Changed
 
+- ziglint 0.8.1's rules are on by default, as compile errors in a project's own files (never std or dependencies), with ziglint's defaults: every rule but Z033. A project configures them, or turns them off with `.lint = false`, in the `lint` section of a `.bs.zon` (the schema of `.ziglint.zon`); without a `.bs.zon`, a `.ziglint.zon` is used as before. bs looks for both from the root source file up to the nearest `build.zig`; outside a project the defaults cover the root file's directory.
 - An explicit x86_64 CPU past x86-64-v2 (`-mcpu x86_64_v3`, `haswell`, `znver5`, and the like, as per-CPU kernel objects ask for) is accepted instead of refused: `builtin.cpu` is that CPU, so the program's comptime choices match upstream's, and bs's own code stays SSE4.2. A C-convention function that passes a vector over 16 bytes by value on a CPU with AVX, and an asm `x` operand over 16 bytes, are `[unsupported]`, since AVX would put them in YMM or ZMM registers. Features no CPU model has (`soft_float`, `retpoline`) stay refused. siv builds and passes its tests under `bs build` with its image decoders' fastmem kernels.
 - `-fomit-frame-pointer` (`.omit_frame_pointer = true`) is accepted; bs still keeps frame pointers.
 - bs finds Zig 0.17.1's lib directory when it runs, not where it was built: `--zig-lib-dir`, then `ZIG_LIB_DIR`, then the lib directory of upstream zig (`BS_ZIG`, else `zig` on `PATH`), which must be 0.17.1. Without one, bs fails with an error that names the version it needs.
