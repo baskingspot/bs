@@ -67,8 +67,17 @@ def setup(proj, zig, refresh):
     return src, record(proj, zig, src, cmds_path)
 
 
+def lint_off(path):
+    """Writes a `.bs.zon` that turns bs's lint off over `path`: bs lints a
+    project's own files by default, and the corpus is third-party code."""
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, ".bs.zon"), "w") as f:
+        f.write(".{ .lint = false }\n")
+
+
 def checkout(proj, zig):
     """Clone the project at its pinned commit and fetch its data packages."""
+    lint_off(WORK)
     src = os.path.join(WORK, "src", proj["name"])
     proj["fetched"] = {
         "src": src,
@@ -87,6 +96,7 @@ def checkout(proj, zig):
             os.makedirs(os.path.dirname(os.path.join(src, name)), exist_ok=True)
             with open(os.path.join(src, name), "w") as f:
                 f.write(text)
+        lint_off(src)
         return src
     if not os.path.isdir(os.path.join(src, ".git")):
         os.makedirs(os.path.dirname(src), exist_ok=True)
@@ -97,6 +107,7 @@ def checkout(proj, zig):
     if proj.get("submodules"):
         # Vendored C sources (buzz's mimalloc, pcre2, ...).
         sh(["git", "submodule", "update", "--quiet", "--init", "--recursive"], src)
+    lint_off(src)
     # Data packages a target's run needs (`fetch`), unpacked under .work/fetch/.
     for name, url in proj.get("fetch", {}).items():
         h = sh([zig, "fetch", url], WORK).stdout.strip()

@@ -70,6 +70,14 @@ if [ "$ZIG_HOST" = x86_64-linux ]; then
   ln -sfn "$bin_dir/zig" "$HOME/.local/bin/zig"
 fi
 ln -sfn "$cache/zig-$ZIG_VERSION-src" "$repo_root/upstream"
+# The source tree is upstream's code, which bs would otherwise lint as a
+# project: its tests, cases and langref examples are the conformance
+# measure, compiled with lint off. A .bs.zon goes at its root and beside
+# each of its build.zig files (doc/langref has one), where bs's search
+# for a config stops.
+find "$cache/zig-$ZIG_VERSION-src" -name build.zig -exec sh -c \
+  'echo ".{ .lint = false }" >"$(dirname "$1")/.bs.zon"' _ {} \;
+echo '.{ .lint = false }' >"$cache/zig-$ZIG_VERSION-src/.bs.zon"
 
 "$bin_dir/zig" version
 

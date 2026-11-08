@@ -117,6 +117,7 @@ class ZigCompiler(Workload):
         d = os.path.join(self.work, "zig-src")
         shutil.rmtree(d, ignore_errors=True)
         shutil.copytree(os.path.join(REPO_DIR, "upstream", "src"), os.path.join(d, "src"))
+        bench.lint_off(os.path.join(d, "src"))
         shutil.copy(os.path.join(BENCH_DIR, "workloads", "zig", "build_options.zig"), d)
         self.cwd = d
         self.lib = os.path.join(REPO_DIR, "upstream", "lib")
@@ -234,6 +235,7 @@ class ZlsTest(Workload):
                 [sys.executable, os.path.join(REPO_DIR, "tools", "corpus", "run.py"), "--projects", "zls", "--list"],
                 check=True,
             )
+        bench.lint_off(os.path.join(corpus, "src", "zls"))
         with open(cmds) as f:
             words = json.load(f)["test"]
         res = []

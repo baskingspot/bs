@@ -83,7 +83,15 @@
             dontConfigure = true;
             dontBuild = true;
             dontFixup = true;
-            installPhase = "cp -r . $out";
+            # Upstream's code, compiled by the conformance measure with
+            # lint off: a .bs.zon at the root and beside each build.zig,
+            # where bs's search for a config stops (as .agents/setup).
+            installPhase = ''
+              cp -r . $out
+              find $out -name build.zig -exec sh -c \
+                'echo ".{ .lint = false }" > "$(dirname "$1")/.bs.zon"' _ {} \;
+              echo '.{ .lint = false }' > $out/.bs.zon
+            '';
           };
         in
         {

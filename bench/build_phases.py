@@ -106,6 +106,7 @@ def checkout(name, zig):
         run_checked(["git", "clone", "--quiet", url, src], WORK)
     run_checked(["git", "checkout", "--quiet", "--force", "--detach", commit], src)
     run_checked([zig, "build", "--fetch"], src, dict(os.environ, ZIG_GLOBAL_CACHE_DIR=os.path.join(WORK, "src-global")))
+    bench.lint_off(src)
     return src
 
 

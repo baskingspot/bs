@@ -255,7 +255,14 @@ def value_diff(got, want):
 def new_scratch():
     base = os.path.join(WORK, "tmp")
     os.makedirs(base, exist_ok=True)
-    return tempfile.mkdtemp(prefix="ct-", dir=base)
+    # bs lints a project's files by default; generated programs are
+    # compiled with lint off (a .bs.zon over the work tree and in each
+    # scratch directory, which is all bs searches outside a project).
+    d = tempfile.mkdtemp(prefix="ct-", dir=base)
+    for path in (WORK, d):
+        with open(os.path.join(path, ".bs.zon"), "w") as f:
+            f.write(".{ .lint = false }\n")
+    return d
 
 
 def first_error(text):
