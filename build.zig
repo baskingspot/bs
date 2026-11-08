@@ -2282,6 +2282,8 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             .{ .what = "only C sources", .lib = "-lc", .files = &.{"cmain.c"}, .args = &.{"5"}, .stdout = "argc=2 q=478165905515354922\n", .code = 7 },
             .{ .what = "a C++ source", .lib = "-lc++", .files = &.{ "cxx_main.zig", "cxx.cpp" }, .stdout = "caught: boom at depth 4\ntype: 7Derived\nctor 42, tls tls42!, sum 6\n", .stderr = "result 151, link_libcpp true\n" },
         };
+        // The first builds libc.a, which the others reuse.
+        var first: ?*std.Build.Step = null;
         for (cases) |case| {
             const m_exe = b.addRunArtifact(bs);
             m_exe.setName(b.fmt("bs build-exe {s} -target {s} with {s}", .{ case.lib, target, case.what }));
@@ -2290,6 +2292,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
             m_exe.setEnvironmentVariable("BS_ZIG", zig);
             // With a cold global cache, libc.a's thousand sources.
             takes(b, &m_exe.step, 40);
+            if (first) |f| m_exe.step.dependOn(f) else first = &m_exe.step;
             const m_run = std.Build.Step.Run.create(b, b.fmt("run bs {s} {s} build with {s}", .{ target, case.lib, case.what }));
             m_run.addArgs(runner);
             m_run.addFileArg(m_exe.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" }));
@@ -2462,6 +2465,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         // R_AARCH64_PREL64).
         const cxx_exe = b.addRunArtifact(bs);
         cxx_exe.setName("bs build-exe -lc++ -target aarch64-linux-gnu with a C++ source");
+        takes(b, &cxx_exe.step, 40);
         cxx_exe.addArgs(&.{ "build-exe", "-lc++", "-target", "aarch64-linux-gnu" });
         cxx_exe.addFileArg(b.path("test/link_input/cxx_main.zig"));
         cxx_exe.addFileArg(b.path("test/link_input/cxx.cpp"));
@@ -2473,7 +2477,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         cxx_run.addCheck(.{ .expect_stderr_exact = "result 151, link_libcpp true\n" });
         cxx_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&cxx_run.step);
-        addAarch64LinuxSharedTests(b, bs, test_step, runner);
+        addAarch64LinuxSharedTests(b, bs, test_step, runner, &cxx_exe.step);
     }
     // Thread-locals through TLS descriptors (-mtls-dialect=gnu2), which
     // the link relaxes to local-exec: Clang's, with _TLS_MODULE_BASE_
@@ -2798,6 +2802,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     // frames, RTTI, a static constructor and thread_local.
     const cxx_exe = b.addRunArtifact(bs);
     cxx_exe.setName("bs build-exe -lc++ with a C++ source");
+    takes(b, &cxx_exe.step, 40);
     cxx_exe.addArgs(&.{ "build-exe", "-lc++", "-target", "x86_64-linux-gnu" });
     cxx_exe.addFileArg(b.path("test/link_input/cxx_main.zig"));
     cxx_exe.addFileArg(b.path("test/link_input/cxx.cpp"));
@@ -2810,11 +2815,14 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     test_step.dependOn(&cxx_run.step);
     // A shared library of C++ only, versioned: libc++ is built into it,
     // and the loader finds it by its soname, libsxx.so.1, as upstream's.
+    // After the executable, to reuse its libc++: builds that run at once
+    // each build a runtime library the global cache lacks.
     const so_cxx = b.addRunArtifact(bs);
     so_cxx.setName("bs build-lib -dynamic -lc++ --version with a C++ source");
     so_cxx.addArgs(&.{ "build-lib", "-dynamic", "-lc++", "-target", "x86_64-linux-gnu", "--name", "sxx", "--version", "1.2.3" });
     so_cxx.addFileArg(b.path("test/link_input/so_cxx.cpp"));
     so_cxx.setEnvironmentVariable("BS_ZIG", zig);
+    so_cxx.step.dependOn(&cxx_exe.step);
     const so_cxx_file = so_cxx.addOutputFileArg2("libsxx.so.1.2.3", .{ .prefix = "-femit-bin=" });
     const so_cxx_host = b.addSystemCommand(&.{ zig, "build-exe", "-lc" });
     so_cxx_host.addFileArg(b.path("test/link_input/so_cxx_main.zig"));
@@ -3080,12 +3088,14 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
 
     // A shared library's operator new replaces libc++'s, which the C++
     // runtime's archive would otherwise supply, as upstream links it.
+    // For the C++ executable's target, after it, to reuse its libc++.
     {
         const lib = b.addSystemCommand(&.{ upstreamZig(b), "c++", "-shared", "-fPIC", "-Wl,-soname,libcxxnew.so" });
         lib.addFileArg(b.path("test/link_input/cxx_new.cpp"));
         const lib_file = lib.addOutputFileArg2("libcxxnew.so", .{ .prefix = "-o" });
         const new_exe = b.addRunArtifact(bs);
-        new_exe.addArgs(&.{ "build-exe", "-lc", "-lc++" });
+        new_exe.addArgs(&.{ "build-exe", "-lc", "-lc++", "-target", "x86_64-linux-gnu" });
+        new_exe.step.dependOn(&cxx_exe.step);
         new_exe.addFileArg(lib_file);
         new_exe.addFileArg(b.path("test/link_input/cxx_new_main.cpp"));
         new_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
@@ -3189,7 +3199,9 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
 /// archives and libc++, loaded by programs upstream links and by dlopen;
 /// -fPIC and -lc objects in upstream's PIEs and shared objects; and the
 /// three models of a thread-local another module defines.
-fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, runner: []const []const u8) void {
+/// `libcxx` builds libc++ for aarch64-linux-gnu, which the C++ library
+/// here reuses.
+fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, runner: []const []const u8, libcxx: *std.Build.Step) void {
     const zig = upstreamZig(b);
     const gnu = "aarch64-linux-gnu";
     // Runs `exe` with the directory of `lib` on the emulated program's
@@ -3363,6 +3375,7 @@ fn addAarch64LinuxSharedTests(b: *std.Build, bs: *std.Build.Step.Compile, test_s
         so.addArgs(&.{ "build-lib", "-dynamic", "-lc++", "-target", gnu, "--name", "sxx", "--version", "1.2.3" });
         so.addFileArg(b.path("test/link_input/so_cxx.cpp"));
         so.setEnvironmentVariable("BS_ZIG", zig);
+        so.step.dependOn(libcxx);
         const so_file = so.addOutputFileArg2("libsxx.so.1.2.3", .{ .prefix = "-femit-bin=" });
         const host = b.addSystemCommand(&.{ zig, "build-exe", "-lc", "-target", gnu });
         host.addFileArg(b.path("test/link_input/so_cxx_main.zig"));
