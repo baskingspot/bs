@@ -8025,7 +8025,8 @@ state. Built for step 1:
   `lib/compiler/build_runner.zig` in 0.16 with `--dep @build --dep
   @dependencies` and a `-M` module per package build.zig into `<local
   cache>/bs/build-runner/build` (in process, `BuildRunner.compileTool`;
-  bs's cache makes an unchanged one a no-change build), and runs it with
+  bs's cache makes an unchanged one a no-change build), with the Progress
+  display the whole command shares, and runs it with
   0.16's arguments (bs, lib, build root, local and global cache,
   `--seed`, `-Z<nonce>`, the user's). Exit code 3 means lazy packages are
   missing, their hashes in `<local cache>/tmp/<nonce>`: bs adds them to
@@ -8034,9 +8035,7 @@ state. Built for step 1:
   0.16's protocol to it: version "0.16.0", no `config` message, no
   `build_root` path prefix (0.16 knows four). `--webui`, `--fuzz` and
   `--time-report` start 0.16's web UI, which bs does not serve, and are
-  refused. `BS_TEST_RUNNER_ZIG` (test only) has an upstream zig 0.16
-  compile the runner until bs compiles 0.16's std.Build
-  (test/build16/check.sh). The fetcher costs bs's binary its HTTP, TLS,
+  refused. The fetcher costs bs's binary its HTTP, TLS,
   git and archive code.
 - **The compiler protocol** (`main.serve`, std's `std.zig.Server`): bs
   sends `zig_version` and the step's `config` (static, no libc), then

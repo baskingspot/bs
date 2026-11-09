@@ -5,11 +5,9 @@
 # (the runner exits for it and runs again); the generated
 # dependencies.zig, the same as upstream zig 0.16's; the runner's steps
 # compiled by bs over 0.16's `--listen=-` protocol; compile errors; and
-# the refused web UI.
-#
-# Until bs compiles 0.16's std.Build, upstream zig 0.16 compiles the
-# runner (BS_TEST_RUNNER_ZIG), with 0.17's lib directory for its steps,
-# which bs compiles as 0.16 with 0.17's frontend (BS_TEST_LANGUAGE_KEYS).
+# the refused web UI. bs compiles 0.16's build runner and every step
+# itself, with zig 0.16's lib directory (BS_UNFINISHED_0_16 until bs
+# supports 0.16 in full).
 #   $1 bs  $2 test/build16  $3 scratch directory
 set -eu
 unset ZIG_LOCAL_CACHE_DIR ZIG_GLOBAL_CACHE_DIR ZIG_LIB_DIR ZIG_BUILD_RUNNER BS_ZIG_VERSION
@@ -18,8 +16,6 @@ mkdir -p "$3"
 bs=$(realpath "$1") src=$(realpath "$2") work=$(realpath "$3")
 zig16=${BS_ZIG_0_16:-$HOME/.cache/bs/zig-$(uname -m)-linux-0.16.0/zig}
 [ -x "$zig16" ] || { echo "bs build 0.16 check failed: no zig 0.16.0 at $zig16 (run .agents/setup, or set BS_ZIG_0_16)" >&2; exit 1; }
-lib17=$("$bs" env | sed -n 's/^ *\.lib_dir = "\(.*\)",$/\1/p')
-runner=$(dirname "$zig16")/lib/compiler/build_runner.zig
 
 fail() {
     echo "bs build 0.16 check failed: $1" >&2
@@ -40,8 +36,8 @@ sed -e "s|LAZY_TARBALL|$work/lazy.tar.gz|" -e "s|LAZY_HASH|$hash|" "$src/project
 cd "$work/project"
 
 bsb() {
-    BS_ZON_SELECTS=1 BS_TEST_RUNNER_ZIG="$zig16" BS_TEST_LANGUAGE_KEYS=1 \
-        "$bs" build --zig-lib-dir "$lib17" --build-runner "$runner" --global-cache-dir "$work/global" "$@" >"$work/log" 2>&1
+    BS_ZON_SELECTS=1 BS_UNFINISHED_0_16=1 BS_ZIG_0_16="$zig16" \
+        "$bs" build --global-cache-dir "$work/global" "$@" >"$work/log" 2>&1
 }
 
 bsb run --summary all || fail "bs build run"

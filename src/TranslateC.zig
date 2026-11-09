@@ -507,7 +507,9 @@ fn ensureBinary(init: std.process.Init, lib: []const u8, lang: language.Language
     };
     const root = try arena.print("{s}/compiler/translate-c/main.zig", .{lib});
     if (!separate) {
-        try BuildRunner.compileTool(init, dir, compile_args, "Compiling translate-c (first time setup)", "translate-c", root, try arena.print("{s}/compiler", .{lib}));
+        const prog = std.Progress.start(io, .{ .root_name = "Compiling translate-c (first time setup)" });
+        defer prog.end();
+        try BuildRunner.compileTool(init, dir, compile_args, prog, "translate-c", root, try arena.print("{s}/compiler", .{lib}));
     } else {
         // `@cImport`, in the middle of a compilation, which compileTool's
         // change of directory and progress display would disturb: the

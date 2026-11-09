@@ -142,6 +142,11 @@ pub fn run(init: std.process.Init, args: []const []const u8, choice: language.Ch
     const runner_path = try Io.Dir.path.join(arena, &.{ runner_dir, "build" });
     const self_exe = try std.process.executablePathAlloc(io, arena);
 
+    // One display for the whole command, as upstream's: a process starts
+    // std.Progress once, and a lazy fetch compiles the runner again.
+    const prog = std.Progress.start(io, .{ .disable_printing = color == .off, .root_name = "Compile Build Script" });
+    defer prog.end();
+
     var unlazy_set: Fetch.JobQueue.UnlazySet = .{};
     while (true) {
         const modules = try fetchPackages(init, .{
@@ -153,6 +158,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, choice: language.Ch
             .unlazy_set = unlazy_set,
             .forks = forks.items,
             .color = color,
+            .prog = prog,
         });
         if (fetch_only) std.process.exit(0);
 
@@ -168,13 +174,19 @@ pub fn run(init: std.process.Init, args: []const []const u8, choice: language.Ch
         if (debug_compile_errors) try compile_args.append(arena, "--debug-compile-errors");
         try compile_args.appendSlice(arena, &.{ "--dep", "@build", "--dep", "@dependencies", try arena.print("-Mroot={s}", .{runner_root}) });
         try compile_args.appendSlice(arena, modules);
-        try compileRunner(init, choice, runner_dir, runner_path, compile_args.items, runner_root);
+        // Said for the build.zig.zon that chose, not for the BS_ZIG_VERSION
+        // that bs set from it.
+        main.checkSupported(init.environ_map, choice);
+        try BuildRunner.compileTool(init, runner_dir, compile_args.items, prog, "build runner", runner_root, null);
 
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(arena, &.{ runner_path, self_exe, lib, build_root, local, global, "--seed", seed, try arena.print("-Z{s}", .{&nonce}) });
         try argv.appendSlice(arena, child_args.items);
         if (env.get("ZIG_VERBOSE_CMD") != null) std.log.info("{f}", .{std.zig.SubprocessCommand{ .argv = argv.items }});
         const term = term: {
+            // The runner draws its own progress meanwhile.
+            _ = try io.lockStderr(&.{}, .no_color);
+            defer io.unlockStderr();
             var child = std.process.spawn(io, .{ .argv = argv.items, .environ_map = env }) catch |err|
                 main.fatal("failed to spawn build runner {s}: {t}", .{ runner_path, err });
             defer child.kill(io);
@@ -283,6 +295,7 @@ const FetchOptions = struct {
     unlazy_set: Fetch.JobQueue.UnlazySet,
     forks: []Fetch.JobQueue.Fork,
     color: std.zig.Color,
+    prog: std.Progress.Node,
 };
 
 /// Fetches the root package's dependencies, as 0.16's `cmdBuild` (and
@@ -294,9 +307,8 @@ fn fetchPackages(init: std.process.Init, o: FetchOptions) ![]const []const u8 {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
-    // No progress display: a process starts std.Progress once, and the
-    // runner's compilation (`BuildRunner.compileTool`) starts its own.
-    const prog: std.Progress.Node = .none;
+    const prog = o.prog.start("Fetch Packages", 0);
+    defer prog.end();
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
@@ -449,35 +461,4 @@ fn fetchPackages(init: std.process.Init, o: FetchOptions) ![]const []const u8 {
     try deps_mod.lower(arena, &argv);
     try build_mod.lower(arena, &argv);
     return argv.items;
-}
-
-/// Compiles the runner into `runner_path`, in Zig 0.16. With
-/// `BS_TEST_RUNNER_ZIG` set to an upstream zig 0.16, that zig compiles it
-/// instead, with its own lib directory: test/build16 tests the rest of
-/// `bs build` that way until bs compiles 0.16's std.Build, giving the
-/// runner, and so its steps, 0.17's lib directory, which the steps'
-/// `BS_TEST_LANGUAGE_KEYS` compilations can compile.
-fn compileRunner(init: std.process.Init, choice: language.Choice, runner_dir: []const u8, runner_path: []const u8, compile_args: []const []const u8, runner_root: []const u8) !void {
-    const arena = init.arena.allocator();
-    const io = init.io;
-    if (init.environ_map.get("BS_TEST_RUNNER_ZIG")) |zig| {
-        var argv: std.ArrayList([]const u8) = .empty;
-        try argv.appendSlice(arena, &.{ zig, "build-exe" });
-        var i: usize = 2;
-        while (i < compile_args.len) : (i += 1) {
-            if (std.mem.eql(u8, compile_args[i], "--zig-lib-dir")) {
-                i += 1;
-                continue;
-            }
-            try argv.append(arena, compile_args[i]);
-        }
-        try argv.append(arena, try arena.print("-femit-bin={s}", .{runner_path}));
-        const r = try std.process.run(arena, io, .{ .argv = argv.items });
-        if (!r.term.success()) main.fatal("{s} could not compile the build runner:\n{s}", .{ zig, r.stderr });
-        return;
-    }
-    // Said for the build.zig.zon that chose, not for the BS_ZIG_VERSION
-    // that bs set from it.
-    main.checkSupported(init.environ_map, choice);
-    try BuildRunner.compileTool(init, runner_dir, compile_args, "Compile Build Script", "build runner", runner_root, null);
 }

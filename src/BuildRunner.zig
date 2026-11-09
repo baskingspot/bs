@@ -62,6 +62,8 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     // so it is always checked.
     const stamp_path = try Io.Dir.path.join(arena, &.{ runner_dir, "maker.stat" });
     if (!(lib.trusted and toolUnchanged(io, runner_path, stamp_path))) {
+        const prog = std.Progress.start(io, .{ .root_name = "Compiling build runner" });
+        defer prog.end();
         try compileTool(init, runner_dir, &.{
             "bs",                 "build-exe",
             mode,                 try arena.print("-Mroot={s}/compiler/Maker.zig", .{zig_lib_dir}),
@@ -69,7 +71,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
             "--zig-lib-dir",      zig_lib_dir,
             "--cache-dir",        global,
             "--global-cache-dir", global,
-        }, "Compiling build runner", "build runner", try arena.print("{s}/compiler/Maker.zig", .{zig_lib_dir}), null);
+        }, prog, "build runner", try arena.print("{s}/compiler/Maker.zig", .{zig_lib_dir}), null);
         noteTool(io, runner_path, stamp_path);
     }
 
@@ -173,7 +175,8 @@ fn noteCompiler(io: Io, local: []const u8, id: []const u8) void {
 /// Compiles one of upstream's programs that bs runs (the build runner,
 /// translate-c) with `compile_args`, from `dir`, where its binary goes.
 /// `root_dir` is the root module's directory if not the root file's.
-pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []const []const u8, progress: []const u8, what: []const u8, root: []const u8, root_dir: ?[]const u8) !void {
+/// `node` is the caller's: a process starts std.Progress once.
+pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []const []const u8, node: std.Progress.Node, what: []const u8, root: []const u8, root_dir: ?[]const u8) !void {
     const arena = init.arena.allocator();
     const io = init.io;
     const cwd = try std.process.currentPathAlloc(io, arena);
@@ -184,11 +187,9 @@ pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []cons
     opts.root_dir = root_dir;
     const job: main.Job = try .init(init, compile_args, opts);
     {
-        const prog = std.Progress.start(io, .{ .root_name = progress });
-        defer prog.end();
         var inc = job.openCache(job.stem);
         defer if (inc) |*i| i.close();
-        switch (try main.compile(init, &job, if (inc) |*i| i else null, job.stem, null, prog, null)) {
+        switch (try main.compile(init, &job, if (inc) |*i| i else null, job.stem, null, node, null)) {
             .ok => {},
             .errors => |diags| {
                 main.printDiagnostics(io, diags, .text) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
