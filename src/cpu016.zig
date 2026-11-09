@@ -81,6 +81,11 @@ pub fn resolve(arena: std.mem.Allocator, arch: std.Target.Cpu.Arch, macos: bool,
     return .{ .model = m.name, .features = names.items };
 }
 
+/// 0.16's features of `arch`, in its order.
+pub fn features(arch: std.Target.Cpu.Arch) []const tables.Feature {
+    return (if (arch == .x86_64) tables.x86 else tables.aarch64).features;
+}
+
 /// 0.16's `Cpu.baseline` for aarch64 (`Model.baseline`).
 fn baseline(macos: bool) []const u8 {
     return if (macos) "apple_m1" else "generic";

@@ -8864,6 +8864,43 @@ libraries as inputs. To be agreed with that thread.
   program): a header edit translates again, a touched header is
   `translate-c cached`.
 
+### Zig 0.16's `@cImport` (2026-11-09)
+
+0.16 still has `@cImport`, and 0.16's AstGen lowers it (`c_import`, with
+`c_include`, `c_define` and `c_undef` inside its body).
+
+- **Sema** (`zirCImport`) evaluates the body at comptime, and the three
+  builtins write upstream's C source into `Block.c_import_buf`:
+  `#include <x>`, `#define n v` (`#define n` for `void`) and `#undef n`.
+  `Zcu.c_importer` then runs `TranslateC.cImport`.
+- **translate-c** gets `bs translate-c`'s arguments for the compilation's
+  target, followed by the compilation's global C flags and the importing
+  module's (`Frontend.Module.cc_argv`, from the `-I`/`-D` flags that the
+  module's `-M` takes, as upstream's `cc_argv`). 0.16's `-mcpu` comes
+  from cpu016's tables. The key covers the source bytes. The source is
+  `cimport.h` next to the output, `<local>/o/<key>/cimport.zig`, so the
+  cache trims the two together.
+- **The result** is the root struct of a module of its own,
+  `=cimport@<key>` (`Frontend.cImportFile`), with the parent's options,
+  family and C flags. Sema adds that module and file while CodeGen
+  threads read `files` and `modules`, and while Sema's ZIR points into
+  `files`, so neither list may move. `Frontend.reserveCImports` leaves
+  room for 64 translations in a 0.16 compilation, at points where
+  nothing points into the lists. Past that, it is a compile error.
+- **Errors:** "C import failed" at the call, with upstream's note when
+  libc is not linked, then translate-c's own errors.
+- **Cache:** the translation reads files that no `Dependee` records, so
+  a build that imports C is not recorded. It writes `cimport` in the
+  compilation's directory. If it had replayed the last build's analysis,
+  it builds again with replay off. Later builds of that compilation skip
+  the incremental cache (`Job.openCache`) and use the inputs record,
+  which lists the headers translate-c read. A build without `@cImport`
+  deletes the marker. A no-change build is still answered without
+  compiling, but an edit build of a 0.16 program that imports C is a
+  full build. Recording it would need a `Dependee` for a translation
+  (its inputs and output hash) and a replay that recreates the
+  `=cimport@` modules before it maps the units that use them.
+
 ### Step 3, C sources, as built (2026-11-04)
 
 - **Options** (`main.parseOptions`), as upstream's: `-I`, `-isystem`,

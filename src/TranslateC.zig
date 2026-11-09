@@ -30,10 +30,16 @@ const CSource = @import("CSource.zig");
 const toolchain = @import("toolchain.zig");
 const language = @import("language.zig");
 const InternPool = @import("InternPool.zig");
+const Zcu = @import("Zcu.zig");
+const cpu016 = @import("cpu016.zig");
 const builtin = @import("builtin");
 
 const Request = struct {
     source: []const u8,
+    /// `@cImport`'s C source, in place of `source`: written to
+    /// `cimport.h` in the output's directory, whose key covers the
+    /// contents, so that the output is `cimport.zig`, as upstream's.
+    c_src: ?[]const u8 = null,
     target: InternPool.Target,
     link_libc: bool,
     /// The target's glibc, which the target triple names: the native
@@ -50,6 +56,9 @@ const Request = struct {
     /// `-mcpu`, as for a compilation (`cpu.resolve`): it sets the macros
     /// the headers see (`__SSE4_1__`).
     cpu: std.Target.Cpu,
+    /// Zig 0.16: `cpu` in 0.16's names (`cpu016.resolve`), which 0.16's
+    /// translate-c takes in `-mcpu`.
+    cpu_016: ?cpu016.Names = null,
     /// The user's C flags (include directories, macros), in order.
     cc_args: []const []const u8,
     /// `std.zig.system.NativePaths`' include directories, after libc's:
@@ -172,7 +181,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
     if (opts.bs_target == .aarch64_macos) opts.link_libc = true;
     const cache_dirs = Frontend.resolveCacheDirs(arena, io, init.environ_map, .{ .local = opts.cache_dir, .global = opts.global_cache_dir });
     const choice = try language.resolve(arena, io, init.environ_map, null, null);
-    if (choice.language != language.Language.newest) main.notYetSupported(choice);
+    main.checkSupported(init.environ_map, choice);
     return .{
         .source = source orelse if (opts.unsupported != null) "" else main.fatal("expected a C source file to translate", .{}),
         .target = opts.bs_target,
@@ -181,6 +190,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         .macos_version = opts.macos_version,
         .musl = if (opts.linux) |t| t.abi == .musl else false,
         .cpu = opts.cpu,
+        .cpu_016 = if (choice.language == .zig_0_16 and opts.unsupported == null) try cpu016.resolve(arena, opts.bs_target.arch(), opts.bs_target == .aarch64_macos, mcpu, std.mem.eql(u8, target, "native"), opts.cpu) else null,
         .cc_args = cc_args.items,
         .native_includes = native_includes,
         .native_abi = std.mem.eql(u8, target, "native"),
@@ -284,11 +294,10 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     const lib = try Io.Dir.path.resolveAlloc(arena, &.{ cwd_path, req.zig_lib.path });
     const global = try Io.Dir.path.resolveAlloc(arena, &.{ cwd_path, req.cache_dirs.global });
     const local = req.cache_dirs.local;
-    const source = try Io.Dir.path.resolveAlloc(arena, &.{ cwd_path, req.source });
 
     // As the build runner, translate-c from the default lib directory is
     // trusted not to change.
-    const exe, const exe_hash, const use = try ensureBinary(init, lib, req.language, global, req.zig_lib.trusted);
+    const exe, const exe_hash, const use = try ensureBinary(init, lib, req.language, global, req.zig_lib.trusted, req.c_src != null);
     defer if (use) |f| f.close(io);
 
     // Upstream's arguments, with the depfile and output paths left for
@@ -319,20 +328,33 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     for (libc_dirs.includes) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
     for (req.native_includes) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
     for (libc_dirs.frameworks) |d| try argv.appendSlice(arena, &.{ "-iframework", d });
-    try argv.appendSlice(arena, &.{ "-O0", "-target", try target.zigTriple(arena), try mcpuArg(arena, &target) });
+    const mcpu = if (req.cpu_016) |names| try mcpu016Arg(arena, target.cpu.arch, names) else try mcpuArg(arena, &target);
+    try argv.appendSlice(arena, &.{ "-O0", "-target", try target.zigTriple(arena), mcpu });
     try argv.appendSlice(arena, req.cc_args);
 
     // The key: the binary's contents, which bs's code generation makes
     // (a new bs that builds the same bytes keeps the records), the working
-    // directory and the arguments.
+    // directory and the arguments, and the source's path or `@cImport`'s
+    // source itself.
     var key_args: std.ArrayList([]const u8) = .empty;
     try key_args.appendSlice(arena, argv.items[1..]);
-    try key_args.append(arena, source);
+    try key_args.append(arena, if (req.c_src) |c_src| try std.mem.concat(arena, u8, &.{ "@cImport\x00", c_src }) else try Io.Dir.path.resolveAlloc(arena, &.{ cwd_path, req.source }));
     const key = try ToolRecord.key(arena, io, "translate-c", &std.fmt.bytesToHex(@as([16]u8, @bitCast(exe_hash)), .lower), lib, key_args.items);
     const digest: [16]u8 = @bitCast(key);
     const hex = std.fmt.bytesToHex(digest, .lower);
     const record_path = try Io.Dir.path.join(arena, &.{ local, "bs", "tc", &hex });
     const out_dir = try Io.Dir.path.join(arena, &.{ local, "o", &hex });
+    // `@cImport`'s source goes beside its output, where the cache's
+    // trimming deletes both, unless it is there from an earlier build.
+    const source_arg = if (req.c_src) |c_src| path: {
+        const h_path = try Io.Dir.path.join(arena, &.{ out_dir, "cimport.h" });
+        if (cwd.access(io, h_path, .{})) |_| {} else |_| {
+            try cwd.createDirPath(io, out_dir);
+            try cache.writeReplace(io, cwd, h_path, &.{c_src});
+        }
+        break :path h_path;
+    } else req.source;
+    const source = try Io.Dir.path.resolveAlloc(arena, &.{ cwd_path, source_arg });
     const out_path = try Io.Dir.path.join(arena, &.{ out_dir, try arena.print("{s}.zig", .{Io.Dir.path.stem(source)}) });
 
     var old_output: ?cache.Hash = null;
@@ -353,7 +375,7 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     defer cwd.deleteFile(io, dep_path) catch {};
     defer cwd.deleteFile(io, tmp_out) catch {};
     // The source as given, as upstream, so that diagnostics name it so.
-    try argv.appendSlice(arena, &.{ "-MD", "-MV", "-MF", dep_path, req.source, "-o", tmp_out });
+    try argv.appendSlice(arena, &.{ "-MD", "-MV", "-MF", dep_path, source_arg, "-o", tmp_out });
     if (init.environ_map.get("ZIG_VERBOSE_CC") != null) std.log.info("{f}", .{std.zig.SubprocessCommand{ .argv = argv.items }});
     const res = std.process.run(arena, io, .{
         .argv = argv.items,
@@ -385,6 +407,38 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     return .{ .digest = digest, .cache_hit = false, .out_path = out_path, .inputs = inputs };
 }
 
+/// Zig 0.16's `@cImport`: translates `c_src` for `job`'s target with
+/// upstream's arguments (`Compilation.cImport`), after the compilation's
+/// C flags those of the importing module, `cc_argv`. The translation is
+/// recorded and reused as `bs translate-c`'s.
+pub fn cImport(init: std.process.Init, job: *const main.Job, c_src: []const u8, cc_argv: []const []const u8) !Zcu.CImport {
+    const opts = &job.opts;
+    const macos = opts.bs_target == .aarch64_macos;
+    const req: Request = .{
+        .source = "cimport.h",
+        .c_src = c_src,
+        .target = opts.bs_target,
+        // Darwin always links libc (libSystem), as in `parse`.
+        .link_libc = opts.link_libc or macos,
+        .glibc_version = if (macos) null else opts.glibc_version,
+        .macos_version = opts.macos_version,
+        .musl = if (opts.linux) |t| t.abi == .musl else false,
+        .cpu = opts.cpu,
+        .cpu_016 = job.cpu_016,
+        .cc_args = try std.mem.concat(init.arena.allocator(), []const u8, &.{ opts.c_global_cc_argv, cc_argv }),
+        .native_includes = opts.c_native_includes,
+        .native_abi = opts.target == null or std.mem.eql(u8, opts.target.?, "native"),
+        .listen = false,
+        .zig_lib = .{ .path = job.zig_lib_dir, .trusted = job.trusted_lib },
+        .language = opts.language.language,
+        .cache_dirs = job.cache_dirs,
+        .build_root = null,
+        .unsupported = null,
+    };
+    const r = try translate(init, &req);
+    return .{ .dir = Io.Dir.path.dirname(r.out_path).?, .inputs = r.inputs, .errors = r.errors };
+}
+
 /// Upstream's `-mcpu`: the model and every feature, each `+` or `-`.
 fn mcpuArg(arena: std.mem.Allocator, target: *const std.Target) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
@@ -396,13 +450,27 @@ fn mcpuArg(arena: std.mem.Allocator, target: *const std.Target) ![]const u8 {
     return buf.items;
 }
 
+/// 0.16's `-mcpu`, as `mcpuArg`, from 0.16's tables.
+fn mcpu016Arg(arena: std.mem.Allocator, arch: std.Target.Cpu.Arch, names: cpu016.Names) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(arena, "-mcpu={s}", .{names.model});
+    var on = names.features;
+    for (cpu016.features(arch)) |feature| {
+        // `names.features` is in the tables' order.
+        const enabled = on.len != 0 and std.mem.eql(u8, on[0], feature.name);
+        if (enabled) on = on[1..];
+        try buf.print(arena, "{c}{s}", .{ "-+"[@intFromBool(enabled)], feature.name });
+    }
+    return buf.items;
+}
+
 /// Builds translate-c once per bs binary and zig lib directory, into
 /// `<global cache>/bs/o/<hash>/translate-c`, as the build runner, and
 /// returns its path and the hash of its contents, kept beside it in
 /// `translate-c.hash` while the binary stats as the stamp says. Also
 /// returns the directory's use (`cache.useTool`), held while the binary
-/// runs.
-fn ensureBinary(init: std.process.Init, lib: []const u8, lang: language.Language, global: []const u8, trusted: bool) !struct { []const u8, cache.Hash, ?Io.File } {
+/// runs. `separate` builds it in a child process.
+fn ensureBinary(init: std.process.Init, lib: []const u8, lang: language.Language, global: []const u8, trusted: bool, separate: bool) !struct { []const u8, cache.Hash, ?Io.File } {
     const arena = init.arena.allocator();
     const io = init.io;
     const seed, _ = try Incremental.compilationKey(arena, io, &.{}, lib, lang, "x86_64-linux");
@@ -419,7 +487,7 @@ fn ensureBinary(init: std.process.Init, lib: []const u8, lang: language.Language
     // allocator records no stack trace per allocation, which took more
     // than half of a Debug build's time translating a header. `-O` sets
     // the modules that follow it.
-    try BuildRunner.compileTool(init, dir, &.{
+    const compile_args: []const []const u8 = &.{
         "bs",
         "build-exe",
         "--name",
@@ -436,7 +504,25 @@ fn ensureBinary(init: std.process.Init, lib: []const u8, lang: language.Language
         try arena.print("-Mroot={s}/compiler/translate-c/main.zig", .{lib}),
         "-OReleaseSafe",
         try arena.print("-Maro={s}/compiler/aro/aro.zig", .{lib}),
-    }, "Compiling translate-c (first time setup)", "translate-c", try arena.print("{s}/compiler/translate-c/main.zig", .{lib}), try arena.print("{s}/compiler", .{lib}));
+    };
+    const root = try arena.print("{s}/compiler/translate-c/main.zig", .{lib});
+    if (!separate) {
+        try BuildRunner.compileTool(init, dir, compile_args, "Compiling translate-c (first time setup)", "translate-c", root, try arena.print("{s}/compiler", .{lib}));
+    } else {
+        // `@cImport`, in the middle of a compilation, which compileTool's
+        // change of directory and progress display would disturb: the
+        // same build in a child bs, from the same directory, which keys
+        // its cache the same way.
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.append(arena, try std.process.executablePathAlloc(io, arena));
+        try argv.appendSlice(arena, compile_args[1..]);
+        try argv.appendSlice(arena, &.{ "--bs-root-dir", try arena.print("{s}/compiler", .{lib}), "--zig-version", lang.versionString() });
+        var env = try init.environ_map.clone(arena);
+        _ = env.swapRemove("ZIG_PROGRESS");
+        const r = std.process.run(arena, io, .{ .argv = argv.items, .cwd = .{ .path = dir }, .environ_map = &env }) catch |err|
+            main.fatal("unable to run bs to compile translate-c: {t}", .{err});
+        if (!r.term.success()) main.fatal("bs could not compile translate-c ({s}):\n{s}", .{ root, r.stderr });
+    }
     // The binary's contents, hashed again only when it changed.
     if (BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h, use };
     const content = cache.hash(0, try Io.Dir.cwd().readFileAlloc(io, exe, arena, .unlimited));

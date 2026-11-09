@@ -377,8 +377,9 @@ Alternatives I rejected:
     `lib/compiler/translate-c` of 0.16's lib dir by bs itself in 0.16 mode,
     as bs builds 0.17's today. The tool and its outputs are keyed by
     ToolRecord (tool identity plus lib dir).
-  - The output is imported as a module, with a dependency on the header
-    inputs so that edits rebuild it.
+  - The output is imported as a module. Builds that import C use the
+    inputs record instead of the incremental cache, so header edits
+    rebuild them (architecture.md, "Zig 0.16's `@cImport`").
 
 ### std and the lib dir
 

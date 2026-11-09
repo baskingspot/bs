@@ -92,7 +92,8 @@ pub const Options = struct {
     command: Command,
     root_src_path: []const u8,
     /// The root module's directory if not `root_src_path`'s (only for
-    /// tools bs builds, `Frontend.Options.root_dir`); no flag sets it.
+    /// tools bs builds, `Frontend.Options.root_dir`): `--bs-root-dir`, for
+    /// translate-c built in a child bs (`TranslateC.ensureBinary`).
     root_dir: ?[]const u8 = null,
     name: ?[]const u8 = null,
     emit_bin: union(enum) { default, path: []const u8, none } = .default,
@@ -280,6 +281,9 @@ pub const Options = struct {
     /// test` the module under test), which other modules' `--dep`s name.
     root_name: []const u8 = "root",
     root_deps: []const []const u8 = &.{},
+    /// The root module's C flags (`-I`, `-D`, ...), which its C sources
+    /// and Zig 0.16's `@cImport`s take after `c_global_cc_argv`.
+    root_cc_argv: []const []const u8 = &.{},
     modules: []const Frontend.ModuleArg = &.{},
 };
 
@@ -565,6 +569,8 @@ pub const Job = struct {
     builtin_dir: []const u8,
     /// The fuzzer's `builtin` (`-ffuzz` on an executable), else null.
     fuzzer_builtin_dir: ?[]const u8,
+    /// Zig 0.16: the CPU in 0.16's names, as builtin states it.
+    cpu_016: ?cpu016.Names,
     /// The target as the cache keys it (`cacheTarget`).
     cache_target: []const u8,
     /// The command line that keys the compilation in the cache.
@@ -698,6 +704,7 @@ pub const Job = struct {
             .cache_dirs = cache_dirs,
             .builtin_dir = builtin_dir,
             .fuzzer_builtin_dir = fuzzer_builtin_dir,
+            .cpu_016 = builtin_opts.cpu_016,
             .cache_target = try cacheTarget(arena, &opts, init_.environ_map),
             .compile_args = compile_args.items,
             .link_objects = link_objects,
@@ -732,6 +739,19 @@ pub const Job = struct {
             !std.mem.eql(u8, job.environ_map.get("BS_CACHE") orelse "", "off");
     }
 
+    /// Whether the last build of this compilation imported C (Zig 0.16's
+    /// `@cImport`), which the cache does not record: the compilation's
+    /// directory has `c_import_marker`.
+    fn cImported(job: *const Job) bool {
+        var arena: std.heap.ArenaAllocator = .init(job.gpa);
+        defer arena.deinit();
+        _, const key = Incremental.compilationKey(arena.allocator(), job.io, job.compile_args, job.zig_lib_dir, job.opts.language.language, job.cache_target) catch return false;
+        const hex = std.fmt.hex(key);
+        const path = Io.Dir.path.join(arena.allocator(), &.{ job.cache_dirs.local, "bs", "c", &hex, c_import_marker }) catch return false;
+        Io.Dir.cwd().access(job.io, path, .{}) catch return false;
+        return true;
+    }
+
     /// Opens the on-disk cache for a build into `out_path`: a build whose
     /// inputs did not change relinks the last build's Atoms and skips
     /// everything else.
@@ -745,6 +765,11 @@ pub const Job = struct {
             std.log.warn("unable to use the cache: {t}", .{err});
             return null;
         };
+        // The last build imported C: the inputs record answers instead.
+        if (i.dir.access(job.io, c_import_marker, .{})) |_| {
+            i.close();
+            return null;
+        } else |_| {}
         i.check = env.get("BS_CACHE_CHECK") != null;
         i.donors = !std.mem.eql(u8, env.get("BS_CACHE_DONOR") orelse "", "off");
         i.stack_size = job.opts.stack_size;
@@ -790,6 +815,21 @@ pub const Job = struct {
     }
 };
 
+/// In a compilation's cache directory: its last build imported C
+/// (`Job.cImported`).
+const c_import_marker = "cimport";
+
+/// `Zcu.c_importer` of a compilation: `TranslateC.cImport` for its job.
+const CImporter = struct {
+    init: std.process.Init,
+    job: *const Job,
+
+    fn run(ctx: *anyopaque, c_src: []const u8, cc_argv: []const []const u8) anyerror!Zcu.CImport {
+        const c: *CImporter = @ptrCast(@alignCast(ctx));
+        return TranslateC.cImport(c.init, c.job, c_src, cc_argv);
+    }
+};
+
 pub const Outcome = union(enum) {
     /// `cache_hit`: the inputs had not changed and the output was relinked
     /// from the cache. `at_alt`: the build wrote `alt_path`, not `out_path`.
@@ -809,7 +849,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     // every aarch64-macos build) answers a build of the same compilation
     // that changed nothing from its inputs record, unless asked to check
     // itself (`BS_CACHE_VERIFY`), which takes a build.
-    var rec: ?InputsRecord = if (inc_opt == null and out_path != null and !job.cacheable() and !job.opts.c_only and !job.opts.dump_ir and
+    var rec: ?InputsRecord = if (inc_opt == null and out_path != null and (!job.cacheable() or job.cImported()) and !job.opts.c_only and !job.opts.dump_ir and
         !std.mem.eql(u8, job.environ_map.get("BS_CACHE") orelse "", "off")) InputsRecord.open(init.arena.allocator(), job) else null;
     defer if (rec) |*r| r.close(init.io);
     // ziglint's rules are compile errors in the files the project's lint
@@ -870,6 +910,13 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
         error.NamesFullBuild => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             if (inc_opt) |i| i.endReplay();
+            replay_mode = "off";
+            continue;
+        },
+        // A build that replayed the last one's analysis and imports C
+        // (`compileReplaying`).
+        error.CImportFullBuild => {
+            if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             replay_mode = "off";
             continue;
         },
@@ -1316,6 +1363,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .custom_test_runner = is_test and opts.test_runner != null,
         .root_name = opts.root_name,
         .root_deps = opts.root_deps,
+        .root_cc_argv = opts.root_cc_argv,
         .modules = opts.modules,
         .fuzz = opts.root_fuzz,
         .error_tracing = opts.error_tracing,
@@ -1373,6 +1421,10 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         Incremental.inputPath(arena, &path_buf, &fe, f.module, f.sub_path) catch {};
         appendInput(arena, list, path_buf.items) catch {};
     };
+    // Zig 0.16's `@cImport`s translate with this job's target and flags.
+    var c_importer: CImporter = .{ .init = init, .job = job };
+    zcu.c_importer = .{ .ctx = &c_importer, .run = CImporter.run };
+    defer if (inputs) |list| for (zcu.c_imports.items) |c| appendCInputs(arena, list, c.inputs) catch {};
     zcu.is_test = is_test;
     zcu.name_pins = pins.*;
     zcu.single_threaded = opts.single_threaded;
@@ -1561,6 +1613,18 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     try zcu.lint_covered.resize(init.gpa, fe.files.items.len, false);
     for (lint_state.covered_files.items) |i| zcu.lint_covered.set(i);
     try zcu.analyzeAll(&emit);
+    // A build that imports C reads files no dependency records
+    // (`Zcu.c_imports`): the cache does not record it, and its marker
+    // keeps the next builds to the inputs record (`Job.openCache`). One
+    // that replayed the last build's analysis builds again without.
+    const c_imported = zcu.c_imports.items.len != 0;
+    if (c_imported) if (inc_opt) |i| {
+        i.dir.writeFile(init.io, .{ .sub_path = c_import_marker, .data = "" }) catch {}; // ziglint-ignore: Z026 -- without it, the next build finds out again
+        if (zcu.replay != null) {
+            i.endReplay();
+            return error.CImportFullBuild;
+        }
+    };
     try zcu.checkExportCollisions();
     if (bench_runs != 0) try emit.benchCodegen(bench_runs);
     stages.markSplit("sema", "codegen", emit.codegen_ns);
@@ -1607,7 +1671,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // only if the link succeeds.
     // A lazy edit build links from the manifest it appends to.
     const lazy_linked = if (inc_opt) |i| try i.finishLazy(&fe, &zcu, &emit, Io.Dir.cwd(), bin_path) else null;
-    if (lazy_linked == null) if (inc_opt) |i| i.startRecord(&fe, &zcu, &emit);
+    if (lazy_linked == null and !c_imported) if (inc_opt) |i| i.startRecord(&fe, &zcu, &emit);
     // A static library is its object in an archive (link/Archive.zig); an
     // object with object inputs or C sources merges them (`writeMerged`).
     // A lazy edit build writes either itself.
@@ -1636,14 +1700,20 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         };
     }
     stages.mark("link");
-    if (lazy_linked == null) if (inc_opt) |i| {
+    if (lazy_linked == null and !c_imported) if (inc_opt) |i| {
         i.finishRecord(linked);
         if (linked) i.noteOutput(Io.Dir.cwd(), bin_path);
     };
     if (linked) if (inc_opt) |i| lint_state.record(init.io, i.dir);
     if (rec) |r| if (linked) {
-        try r.write(arena, init.io, job, &fe, &zcu, if (c_batch) |b| (try b.wait()).inputs else "", bin_path);
+        var c_inputs: std.ArrayList(u8) = .empty;
+        if (c_batch) |b| try c_inputs.appendSlice(arena, (try b.wait()).inputs);
+        for (zcu.c_imports.items) |c| try appendInput(arena, &c_inputs, c.inputs);
+        try r.write(arena, init.io, job, &fe, &zcu, c_inputs.items, bin_path);
         lint_state.record(init.io, r.dir);
+        // A build without `@cImport`s gives the compilation back to the
+        // cache (`Job.openCache`).
+        if (!c_imported) r.dir.deleteFile(init.io, c_import_marker) catch {}; // ziglint-ignore: Z026 -- usually there is none
     };
     stages.mark("cache record (after the link)");
     stages.print();
@@ -2398,7 +2468,7 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"-fincremental"},                  .{"-fno-incremental"},
     .{"--debug-rt"},                     .{"-femit-bin"},
     .{"--compress-debug-sections=none"}, .{"-fno-dll-export-fns"},
-    .{"-fno-sanitize-thread"},
+    .{"-fno-sanitize-thread"},           .{"--verbose-cimport"},
 });
 
 /// Ignored options that take a parameter.
@@ -2638,35 +2708,41 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             // A module without a root source file holds C sources: no Zig
             // module, and `--dep`s on it name nothing.
             const eq = std.mem.findScalar(u8, spec, '=');
-            if (eq == null) {
-                if (root == null and !rootless_root) {
-                    rootless_root = true;
-                    opts.root_name = spec;
+            const takes: enum { rootless, root, module } = if (eq == null) .rootless else if (root == null and !rootless_root) .root else .module;
+            // The module's C files, arguments and options; its C flags
+            // are also its `@cImport`s'.
+            const module_cc = try cc_argv.toOwnedSlice(arena);
+            switch (takes) {
+                .rootless => {
+                    if (root == null and !rootless_root) {
+                        rootless_root = true;
+                        opts.root_name = spec;
+                        root_c_flags = c_flags;
+                    } else try rootless.append(arena, spec);
+                    deps.clearRetainingCapacity();
+                },
+                .root => {
+                    root = spec[eq.? + 1 ..];
+                    opts.root_name = spec[0..eq.?];
+                    opts.root_deps = try deps.toOwnedSlice(arena);
+                    opts.root_cc_argv = module_cc;
+                    root_fuzz = fuzz;
+                    root_mode = mode;
                     root_c_flags = c_flags;
-                } else try rootless.append(arena, spec);
-                deps.clearRetainingCapacity();
-                fuzz = null;
-                mode = .{};
-            } else if (root == null and !rootless_root) {
-                root = spec[eq.? + 1 ..];
-                opts.root_name = spec[0..eq.?];
-                opts.root_deps = try deps.toOwnedSlice(arena);
-                root_fuzz = fuzz;
-                root_mode = mode;
-                root_c_flags = c_flags;
-            } else try modules.append(arena, .{
-                .name = spec[0..eq.?],
-                .path = spec[eq.? + 1 ..],
-                .deps = try deps.toOwnedSlice(arena),
-                .fuzz = fuzz,
-                .optimize = mode.optimize,
-                .error_tracing = mode.error_tracing,
-                .valgrind = mode.valgrind,
-            });
+                },
+                .module => try modules.append(arena, .{
+                    .name = spec[0..eq.?],
+                    .path = spec[eq.? + 1 ..],
+                    .deps = try deps.toOwnedSlice(arena),
+                    .cc_argv = module_cc,
+                    .fuzz = fuzz,
+                    .optimize = mode.optimize,
+                    .error_tracing = mode.error_tracing,
+                    .valgrind = mode.valgrind,
+                }),
+            }
             fuzz = null;
             mode = .{};
-            // The module's C files, arguments and options.
-            const module_cc = try cc_argv.toOwnedSlice(arena);
             for (c_files.items[c_owned..]) |*f| {
                 f.cc_argv = module_cc;
                 f.flags = c_flags;
@@ -2677,6 +2753,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (std.mem.startsWith(u8, arg, "--error-format=")) {
             const v = arg["--error-format=".len..];
             opts.error_format = std.meta.stringToEnum(diag.Format, v) orelse fatal("invalid --error-format '{s}': expected 'text' or 'json'", .{v});
+        } else if (std.mem.eql(u8, arg, "--bs-root-dir")) {
+            opts.root_dir = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--debug-dump-ir")) {
             opts.dump_ir = true;
         } else if (std.mem.eql(u8, arg, "--stack")) {
@@ -2960,6 +3038,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         c_flags.optimize = mode.optimize;
         root_c_flags = c_flags;
         const module_cc = try cc_argv.toOwnedSlice(arena);
+        if (positional_root) opts.root_cc_argv = module_cc;
         for (c_files.items[c_owned..]) |*f| {
             f.cc_argv = module_cc;
             f.flags = c_flags;

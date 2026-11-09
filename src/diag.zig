@@ -2080,6 +2080,8 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "compiler_rt file '{s}' not found", .@"bad-import" },
     .{ "compiler_rt has no declaration '{s}'", .@"bad-import" },
     .{ "embed of file outside package path: '{s}'", .@"bad-import" },
+    .{ "C import failed", .@"bad-import" },
+    .{ "C import failed: {t}", .@"bad-import" },
     .{ "file path name cannot be empty", .@"bad-import" },
     .{ "import of file outside module path: '{s}'", .@"bad-import" },
     .{ "import of file outside module path", .@"bad-import" },

@@ -169,6 +169,16 @@ exports: std.ArrayList(Export) = .empty,
 global_asm: std.ArrayList(GlobalAsm) = .empty,
 /// Files read by `@embedFile`, each once; `Dependee.embed_file` indexes it.
 embed_files: std.array_hash_map.String(EmbedFile) = .empty,
+/// Zig 0.16's `@cImport`: translates C source for a module's C flags
+/// (main sets it, to `TranslateC.cImport`); null where nothing can.
+c_importer: ?CImporter = null,
+/// What this build's `@cImport`s translated, in analysis order. Files
+/// that no dependency records were read: a build that imports C is not
+/// recorded in the on-disk cache (main's `cimport` marker).
+c_imports: std.ArrayList(CImport) = .empty,
+/// translate-c's errors (ErrorBundle message bodies) of the failed
+/// `@cImport`s, reported after Sema's, as upstream's.
+c_import_errors: std.ArrayList([]const u8) = .empty,
 /// compiler_rt functions that CodeGen calls and the functions and
 /// variables the link resolves names to, by the stable key of their
 /// declaration; `analyzeAll` resolves each to its declaration (`.none`
@@ -544,6 +554,22 @@ pub const ErrorMsg = struct {
     pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8, count: u32 = 1, call: ?diag.CallKind = null, decl: bool = false, embed: bool = false, no_loc: bool = false };
 };
 
+/// A translation of Zig 0.16's `@cImport` (`TranslateC.cImport`), in
+/// memory that outlives the Zcu.
+pub const CImport = struct {
+    /// The directory of its `cimport.zig`.
+    dir: []const u8,
+    /// The files translate-c read, zero-separated, `cimport.h` first.
+    inputs: []const u8,
+    /// An ErrorBundle message body, when translate-c reported errors.
+    errors: ?[]const u8,
+};
+
+pub const CImporter = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, c_src: []const u8, cc_argv: []const []const u8) anyerror!CImport,
+};
+
 pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
     var zcu: Zcu = .{
         .gpa = gpa,
@@ -556,6 +582,7 @@ pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
     };
     errdefer zcu.deinit();
     try zcu.file_root_types.appendNTimes(gpa, .none, fe.files.items.len);
+    try fe.reserveCImports();
     return zcu;
 }
 
@@ -608,6 +635,8 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.exports.deinit(gpa);
     zcu.global_asm.deinit(gpa);
     zcu.embed_files.deinit(gpa);
+    zcu.c_imports.deinit(gpa);
+    zcu.c_import_errors.deinit(gpa);
     zcu.rt_helpers.deinit(gpa);
     zcu.test_functions.deinit(gpa);
     zcu.errors.deinit(gpa);
@@ -857,6 +886,7 @@ pub fn diagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths) ![]diag
         try out.append(arena, .{ .code = e.code, .loc = if (e.no_loc) null else try zcu.diagLocIn(arena, paths, e.file, e.embed, e.span), .msg = e.msg, .notes = notes.items, .refs = try zcu.referenceTrace(arena, paths, e.unit), .candidates = e.candidates, .hint = e.hint, .fixes = fixes });
     }
     if (zcu.compile_logs.items.len != 0) try zcu.compileLogDiagnostics(arena, paths, &out);
+    for (zcu.c_import_errors.items) |body| try diag.fromBundle(arena, paths, try std.zig.Server.allocErrorBundle(arena, body), &out);
     return out.items;
 }
 
@@ -1871,6 +1901,7 @@ fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
         else => return zcu.addError(0, no_span, "unable to load compiler_rt file '{s}': {t}", .{ sub_path, err }),
     } orelse return zcu.addError(0, no_span, "compiler_rt file '{s}' not found", .{sub_path});
     try zcu.file_root_types.appendNTimes(zcu.gpa, .none, zcu.fe.files.items.len - zcu.file_root_types.items.len);
+    try zcu.fe.reserveCImports();
     var ty = try zcu.fileRootType(@backingInt(file_index));
     // A dotted name is in a nested container (fmv.zig's `x86`).
     var parts = std.mem.splitScalar(u8, name, '.');

@@ -388,6 +388,9 @@ pub const Block = struct {
     /// The error return trace's index saved for this block, which restores
     /// return the trace to (see `restoreErrRetIndex`).
     error_return_trace_index: Ref = .none,
+    /// Inside Zig 0.16's `@cImport`: the C source its `@cInclude`,
+    /// `@cDefine` and `@cUndef` write (`zirCImport`).
+    c_import_buf: ?*std.ArrayList(u8) = null,
 
     pub const Label = struct {
         zir_block: Zir.Inst.Index,
@@ -471,6 +474,7 @@ pub const Block = struct {
             .runtime_depth = b.runtime_depth,
             .runtime_src = b.runtime_src,
             .runtime_loop = b.runtime_loop,
+            .c_import_buf = b.c_import_buf,
         };
     }
 
@@ -6267,6 +6271,30 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             break :blk .fromInterned(try sema.intern(.{ .opt = .{ .ty = opt_ty, .val = .none } }));
         },
         .builtin_src => sema.zirBuiltinSrc(block, ext),
+        .c_import => sema.zirCImport(block, inst, ext),
+        .c_include, .c_undef => blk: {
+            const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
+            const name = try sema.resolveConstString(block, sema.callArgSrc(block.nodeSrc(extra.node), false, 0), sema.resolveInst(extra.operand));
+            if (ext.opcode == .c_include)
+                try block.c_import_buf.?.print(sema.gpa, "#include <{s}>\n", .{name})
+            else
+                try block.c_import_buf.?.print(sema.gpa, "#undef {s}\n", .{name});
+            break :blk .void_value;
+        },
+        .c_define => blk: {
+            const extra = sema.code.extraData(Zir.Inst.BinNode, ext.operand).data;
+            const src = block.nodeSrc(extra.node);
+            const name = try sema.resolveConstString(block, sema.callArgSrc(src, false, 0), sema.resolveInst(extra.lhs));
+            const rhs = sema.resolveInst(extra.rhs);
+            // `void` defines the name without a value, as upstream.
+            if (sema.typeOf(rhs) == .void_type) {
+                try block.c_import_buf.?.print(sema.gpa, "#define {s}\n", .{name});
+            } else {
+                const value = try sema.resolveConstString(block, sema.callArgSrc(src, false, 1), rhs);
+                try block.c_import_buf.?.print(sema.gpa, "#define {s} {s}\n", .{ name, value });
+            }
+            break :blk .void_value;
+        },
         .compile_log => sema.zirCompileLog(block, ext),
         // As upstream on targets other than WebAssembly.
         .wasm_memory_size => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.UnNode, ext.operand).data.node), "builtin @wasmMemorySize is available when targeting WebAssembly; targeted CPU architecture is {s}", .{@tagName(sema.ip.target.arch())}),
@@ -6322,6 +6350,53 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     };
     try sema.declareDependency(.{ .embed_file = index });
     return .fromInterned(try sema.stringLiteral(sema.zcu.embed_files.values()[index].bytes));
+}
+
+/// Zig 0.16's `@cImport`: the body, evaluated at comptime, writes C
+/// source, which translate-c translates (`Zcu.c_importer`), and the
+/// result is the root struct of the translation's `cimport.zig`, a module
+/// of its own, as upstream's. The translation reads files that no
+/// dependency records, so a build that imports C is not recorded in the
+/// on-disk cache (`Zcu.c_imports`), and the comptime evaluator leaves it
+/// to the walker.
+fn zirCImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.Inst.Extended.InstData) CompileError!Ref {
+    const zcu = sema.zcu;
+    const gpa = sema.gpa;
+    const extra = sema.code.extraData(Zir.Inst.CImport, ext.operand);
+    const src = block.nodeSrc(extra.data.node);
+    const body = sema.code.bodySlice(extra.end, extra.data.body_len);
+    try sema.bcRefuse();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    {
+        var child = block.child();
+        defer child.deinitInsts();
+        child.is_comptime = true;
+        child.comptime_reason = frontend.SimpleComptimeReason.operand_cImport.message();
+        child.c_import_buf = &buf;
+        _ = try sema.analyzeInlineBody(&child, body, inst);
+    }
+    const importer = zcu.c_importer orelse return sema.fail(block, src, "bs translates @cImport only in a compilation", .{});
+    const module = zcu.file(sema.file).module;
+    const result = importer.run(importer.ctx, buf.items, zcu.fe.module(module).cc_argv) catch |err|
+        return sema.fail(block, src, "C import failed: {t}", .{err});
+    try zcu.c_imports.append(gpa, result);
+    if (result.errors) |errors| {
+        const err = sema.fail(block, src, "C import failed", .{});
+        if (!zcu.link_libc) try zcu.addNote(sema.file, src.span(try zcu.fe.tree(@fromBackingInt(sema.file))), "libc headers not available; compilation does not link against libc", .{});
+        try zcu.c_import_errors.append(gpa, errors);
+        return err;
+    }
+    const file_index = zcu.fe.cImportFile(module, result.dir) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoRoom => return sema.fail(block, src, "bs translates at most {d} distinct @cImports in a compilation", .{Frontend.c_import_room}),
+        // AstGen's messages are in `Frontend.late_errors`.
+        error.AstGenFailed => return sema.fail(block, src, "C import failed", .{}),
+        else => return sema.fail(block, src, "C import failed: {t}", .{err}),
+    } orelse return sema.fail(block, src, "C import failed: {t}", .{error.FileNotFound});
+    if (zcu.file_root_types.items.len < zcu.fe.files.items.len)
+        try zcu.file_root_types.appendNTimes(gpa, .none, zcu.fe.files.items.len - zcu.file_root_types.items.len);
+    return .fromInterned(try sema.fileRootType(@backingInt(file_index)));
 }
 
 /// `@src()`: a `std.builtin.SourceLocation` of the enclosing function, as

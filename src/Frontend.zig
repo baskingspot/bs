@@ -127,6 +127,9 @@ pub const Module = struct {
     safety: bool = true,
     /// `name` is `gpa`'s (an extra builtin's, `ModuleArg.builtin_dir`).
     owned_name: bool = false,
+    /// Its C flags (`-I`, `-D`, ...), which Zig 0.16's `@cImport` passes
+    /// to translate-c (`Zcu.c_import`). Not owned.
+    cc_argv: []const []const u8 = &.{},
 
     pub const Index = enum(u32) {
         root,
@@ -151,6 +154,8 @@ pub const ModuleArg = struct {
     path: []const u8,
     /// `name` or `name=module`.
     deps: []const []const u8,
+    /// Its C flags (`Module.cc_argv`).
+    cc_argv: []const []const u8 = &.{},
     /// Its `-ffuzz` or `-fno-fuzz`, if any; after `main.parseOptions`, the
     /// flag it inherits otherwise.
     fuzz: ?bool = null,
@@ -243,6 +248,8 @@ pub const Options = struct {
     /// modules.
     root_name: []const u8 = "root",
     root_deps: []const []const u8 = &.{},
+    /// The C flags of the module `root_name` names (`Module.cc_argv`).
+    root_cc_argv: []const []const u8 = &.{},
     modules: []const ModuleArg = &.{},
     /// `-ffuzz` on the main module, which std, builtin and the test runner
     /// inherit.
@@ -343,6 +350,8 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     fe.modules.items[@backingInt(fe.main_module)].deps = try resolve(&fe, options.root_name, options.root_deps);
     if (options.custom_test_runner) fe.modules.items[@backingInt(Module.Index.root)].deps = try gpa.dupe(Dep, fe.modules.items[@backingInt(fe.main_module)].deps);
     for (options.modules, first_extra..) |m, k| fe.modules.items[k].deps = try resolve(&fe, options.root_name, m.deps);
+    fe.modules.items[@backingInt(fe.main_module)].cc_argv = options.root_cc_argv;
+    for (options.modules, first_extra..) |m, k| fe.modules.items[k].cc_argv = m.cc_argv;
     // `-ffuzz` per module: the main module's flag for it, std, builtin
     // and the test runner; each other module's resolved by `main`.
     for ([_]Module.Index{ .root, .std, .builtin, fe.main_module }) |m| fe.modules.items[@backingInt(m)].fuzz = options.fuzz;
@@ -404,6 +413,62 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         try fe.modules.append(gpa, .{ .name = "=zigc", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "c.zig"), .cache = .global, .error_tracing = options.error_tracing });
     }
     return fe;
+}
+
+/// The Zig 0.16 `@cImport` translations one compilation can hold: Sema
+/// adds each one's module and file (`cImportFile`) in the room
+/// `reserveCImports` made, as nothing that points into `files` and
+/// `modules` (Sema's ZIR, CodeGen's reads) may move then.
+pub const c_import_room = 64;
+
+/// Makes `c_import_room` room in `files` and `modules` in a Zig 0.16
+/// compilation. Call where nothing points into them.
+pub fn reserveCImports(fe: *Frontend) !void {
+    if (fe.syntax_language != .zig_0_16) return;
+    try fe.files.ensureUnusedCapacity(fe.gpa, c_import_room);
+    try fe.modules.ensureUnusedCapacity(fe.gpa, c_import_room);
+}
+
+/// Zig 0.16's `@cImport` in module `parent`: loads the translation's
+/// `cimport.zig` in `dir`, which names the translation, as the root of a
+/// module of its own, made once per directory. The module has `parent`'s
+/// options, family and C flags, as upstream's, and no dependencies:
+/// translate-c's output imports std alone, which is loaded. Returns
+/// `error.NoRoom` past `c_import_room`; else as `loadFile`.
+pub fn cImportFile(fe: *Frontend, parent: Module.Index, dir: []const u8) !?File.Index {
+    const gpa = fe.gpa;
+    var name_buf: [64]u8 = undefined;
+    const name = std.mem.print(&name_buf, "=cimport@{s}", .{Io.Dir.path.basename(dir)}) catch return error.NameTooLong;
+    const mod: Module.Index = for (fe.modules.items, 0..) |m, k| {
+        if (std.mem.eql(u8, m.name, name)) break @fromBackingInt(@intCast(k));
+    } else mod: {
+        if (fe.modules.items.len == fe.modules.capacity or fe.files.items.len == fe.files.capacity) return error.NoRoom;
+        const p = fe.module(parent);
+        const abs = try Io.Dir.cwd().realPathFileAlloc(fe.io, dir, gpa);
+        errdefer gpa.free(abs);
+        const owned_name = try gpa.dupe(u8, name);
+        errdefer gpa.free(owned_name);
+        const root_dir = try gpa.dupe(u8, dir);
+        errdefer gpa.free(root_dir);
+        fe.modules.appendAssumeCapacity(.{
+            .name = owned_name,
+            .owned_name = true,
+            .root_dir = root_dir,
+            .root_file = try gpa.dupe(u8, "cimport.zig"),
+            // As `enableCache` sets it for the modules there were then.
+            .abs_root_dir = abs,
+            .cache = .local,
+            .std_mod = p.std_mod,
+            .root_mod = p.root_mod,
+            .builtin_mod = p.builtin_mod,
+            .fuzz = p.fuzz,
+            .error_tracing = p.error_tracing,
+            .safety = p.safety,
+            .cc_argv = p.cc_argv,
+        });
+        break :mod @fromBackingInt(@intCast(fe.modules.items.len - 1));
+    };
+    return fe.loadFile(mod, "cimport.zig");
 }
 
 /// compiler_rt's stack protector, a root with `ubsan_rt` (`c_runtimes`).
