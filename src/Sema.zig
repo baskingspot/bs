@@ -13534,13 +13534,17 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
     for (ia.stores.items, operands) |store, *op| op.* = sema.ir_insts.items(.data)[@backingInt(store)].bin_op.rhs;
     const ty = try sema.resolvePeerTypes(block, src, operands);
     if (ty == .noreturn_type) return sema.fail(block, src, "unable to infer variable type", .{});
-    if (ia.is_const and ia.same_block and operands.len == 1 and ia.alignment == 0) {
+    if (ia.is_const and ia.same_block and operands.len == 1) {
         // A constant initialized once with a comptime-known value is
-        // comptime-known, as upstream; the runtime store goes unread.
+        // comptime-known, as upstream, aligned or not; the runtime store
+        // goes unread.
         const coerced = try sema.coerce(block, ty, operands[0], src);
         if (sema.resolveValue(coerced)) |v| if (!sema.refersToComptimeAlloc(v)) {
             const comptime_only = try sema.localLayout(block, src, ty, .comptime_only, true);
-            const const_ty = try sema.ptrType(.{ .child = ty, .flags = .{ .is_const = true } });
+            if (ia.alignment != 0) try sema.resolveLayout(block, src, ty);
+            var info = Type.ptrInfo(sema.ip, try sema.allocPtrType(ty, ia.alignment));
+            info.flags.is_const = true;
+            const const_ty = try sema.ptrType(info);
             sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = try sema.ptrType(.{ .child = ty }) };
             if (comptime_only) {
                 // The runtime alloc cannot hold it: drop the store.

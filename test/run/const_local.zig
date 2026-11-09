@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "16\n10\n6\n3\n12\n"
+//! stdout: "16\n10\n6\n3\n12\n0\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 pub export fn _start() callconv(.naked) noreturn { asm volatile ("call %[main:P]" : : [main] "X" (&main)); }
@@ -30,5 +30,9 @@ fn main() callconv(.c) noreturn {
     const p = &a;
     rt.printInt(@intCast(p[2]));
     rt.printInt(s.a + s.b[0]);
+    // Aligned, it is comptime-known too, and keeps its alignment.
+    const al align(16) = @as(u32, 4);
+    comptime if (al != 4) unreachable;
+    rt.printInt(@intCast(@intFromPtr(&al) % 16));
     rt.exit(0);
 }
