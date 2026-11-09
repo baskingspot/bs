@@ -226,7 +226,10 @@ pub fn build(b: *std.Build) void {
     }
     addLintTests(b, test_bs, diag_step, cache_step, upstream_step, std_zir);
     const build_test_step = addBuildTest(b, test_bs, build_web_wasm, translate_c);
-    spreadBsUsers(b, &test_bs.step, &zir.step, &(test_parts ++ [_]*std.Build.Step{build_test_step}));
+    // The two longest parts in halves, each a CI job of its own.
+    const run_halves = halve(b, run_step, &test_bs.step, &zir.step);
+    const link_halves = halve(b, link_step, &test_bs.step, &zir.step);
+    spreadBsUsers(b, &test_bs.step, &zir.step, &(run_halves ++ link_halves ++ [_]*std.Build.Step{ unit_step, edit_step, cache_step, diag_step, build_test_step }));
 
     // Always ReleaseFast: a Debug build of bs says nothing about its speed.
     const bench_link = b.addExecutable(.{ .name = "bench-link", .root_module = b.createModule(.{
@@ -1954,6 +1957,68 @@ fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roo
             loads[least] += stepSeconds(s);
         }
     }
+}
+
+/// Deals `whole`'s dependencies between two new steps, `<whole>-1` and
+/// `<whole>-2`, and makes `whole` wait for the halves instead, so that CI
+/// runs each half as a job. Dependencies that share a step other than bs
+/// and `first` stay together (a runtime library built once, a build and
+/// its checks), and the groups go heaviest first to the lighter half by
+/// the seconds of their steps (`takes`).
+fn halve(b: *std.Build, whole: *std.Build.Step, bs: *std.Build.Step, first: *std.Build.Step) [2]*std.Build.Step {
+    const Step = std.Build.Step;
+    const deps = whole.dependencies.items;
+    // A union-find over the dependencies: `group[i]` leads toward the
+    // representative of dependency i's group.
+    const group = b.allocator.alloc(usize, deps.len) catch @panic("OOM");
+    for (group, 0..) |*g, i| g.* = i;
+    const root = struct {
+        fn of(g: []usize, i: usize) usize {
+            var r = i;
+            while (g[r] != r) r = g[r];
+            g[i] = r;
+            return r;
+        }
+    }.of;
+    // Each step the dependencies reach, and the first dependency that does.
+    var owner: std.array_hash_map.Auto(*Step, usize) = .empty;
+    var todo: std.ArrayList(*Step) = .empty;
+    for (deps, 0..) |d, i| {
+        todo.append(b.allocator, d) catch @panic("OOM");
+        while (todo.pop()) |s| {
+            const gop = owner.getOrPut(b.allocator, s) catch @panic("OOM");
+            if (gop.found_existing) {
+                group[root(group, i)] = root(group, gop.value_ptr.*);
+                continue;
+            }
+            gop.value_ptr.* = i;
+            for (s.dependencies.items) |dd| if (dd != bs and dd != first) todo.append(b.allocator, dd) catch @panic("OOM");
+        }
+    }
+    const seconds = b.allocator.alloc(u64, deps.len) catch @panic("OOM");
+    @memset(seconds, 0);
+    for (owner.keys(), owner.values()) |s, i| seconds[root(group, i)] += stepSeconds(s);
+    var roots: std.ArrayList(usize) = .empty;
+    for (group, 0..) |_, i| if (root(group, i) == i) roots.append(b.allocator, i) catch @panic("OOM");
+    std.mem.sort(usize, roots.items, seconds, struct {
+        fn heavier(w: []const u64, x: usize, y: usize) bool {
+            return w[x] > w[y];
+        }
+    }.heavier);
+    const half = b.allocator.alloc(usize, deps.len) catch @panic("OOM");
+    var loads = [2]u64{ 0, 0 };
+    for (roots.items) |r| {
+        half[r] = if (loads[1] < loads[0]) 1 else 0;
+        loads[half[r]] += seconds[r];
+    }
+    const halves = [2]*Step{
+        b.step(b.fmt("{s}-1", .{whole.name}), b.fmt("Half of {s}, for a CI job", .{whole.name})),
+        b.step(b.fmt("{s}-2", .{whole.name}), b.fmt("The other half of {s}, for a CI job", .{whole.name})),
+    };
+    for (deps, 0..) |d, i| halves[half[root(group, i)]].dependOn(d);
+    whole.dependencies.clearRetainingCapacity();
+    for (halves) |h| whole.dependOn(h);
+    return halves;
 }
 
 /// About how many seconds a step that runs bs takes with a Debug bs on a
