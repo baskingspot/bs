@@ -25,6 +25,11 @@ test *ARGS:
 test-steps +STEPS:
     zig build {{ STEPS }} --summary failures
 
+[doc("The checks CI runs nightly, not on every push (.github/workflows/nightly.yml); `just test` runs them too")]
+[group("test")]
+nightly:
+    zig build test-nightly --summary failures
+
 [doc("The conformance measure: upstream's test/behavior compiled by bs (tools/conformance/run.py)")]
 [group("test")]
 conformance *ARGS:

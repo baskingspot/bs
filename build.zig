@@ -1757,8 +1757,6 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     bs_run.setName("bs run args");
     bs_run.addArg("run");
     bs_run.addFileArg(b.path("test/obj/args.zig"));
-    bs_run.addArg("--global-cache-dir");
-    _ = bs_run.addOutputDirectoryArg2("run-cache", .{});
     bs_run.addArgs(&.{ "--", "a", "b c", "" });
     bs_run.addCheck(.{ .expect_stdout_exact = "[a][b c][]\n" });
     bs_run.addCheck(.{ .expect_term = .{ .exited = 43 } });
@@ -1806,8 +1804,6 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     no_bin_test.setName("bs test -fno-emit-bin");
     no_bin_test.addArgs(&.{ "test", "-fno-emit-bin" });
     no_bin_test.addFileArg(b.path("test/obj/failing_test.zig"));
-    no_bin_test.addArg("--global-cache-dir");
-    _ = no_bin_test.addOutputDirectoryArg2("no-bin-test-cache", .{});
     no_bin_test.addCheck(.{ .expect_stderr_exact = "" });
     no_bin_test.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&no_bin_test.step);
@@ -1822,8 +1818,6 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     self_test.addArgs(&.{ "test", "--dep", "self=root", "--dep", "main" });
     self_test.addPrefixedFileArg("-Mroot=", b.path("test/obj/mod/self.zig"));
     self_test.addPrefixedFileArg("-Mmain=", b.path("test/obj/mod/seven.zig"));
-    self_test.addArg("--global-cache-dir");
-    _ = self_test.addOutputDirectoryArg2("self-test-cache", .{});
     self_test.addCheck(.{ .expect_stderr_match = "All 2 tests passed." });
     self_test.addCheck(.{ .expect_term = .{ .exited = 0 } });
     takes(b, &self_test.step, 5);
