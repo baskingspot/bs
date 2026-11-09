@@ -118,6 +118,12 @@ pub const Object = struct {
 };
 
 /// Parses an ELF64 x86_64 ET_REL in place.
+/// Whether a symbol of visibility `vis` (`visibility`'s values) is local
+/// to the output: STV_INTERNAL or STV_HIDDEN.
+fn hidden(vis: u2) bool {
+    return vis == 1 or vis == 2;
+}
+
 pub fn parseObject(arena: Allocator, path: []const u8, bytes: []const u8) Error!Object {
     return parseObjectFor(arena, path, bytes, .x86_64);
 }
@@ -532,9 +538,11 @@ pub fn convert(in: *ElfInput, ctx: anytype) !Converted {
             s -= 1;
             const sym = o.syms[s];
             // A global names its section's atom when it covers the whole
-            // section, so that the atom's symbol has the symbol's size.
+            // section, so that the atom's symbol has the symbol's size;
+            // a hidden one stays a symbol of its own, with its visibility
+            // (`Elf.LocalSymbol.visibility`).
             if (sym.st_value == 0 and sym.st_shndx != elf.SHN_UNDEF and sym.st_shndx < o.shdrs.len and
-                sym.st_size == o.shdrs[sym.st_shndx].sh_size) c.names[sym.st_shndx] = @intCast(s);
+                sym.st_size == o.shdrs[sym.st_shndx].sh_size and !hidden(in.visibility.get(o.symName(sym)) orelse 0)) c.names[sym.st_shndx] = @intCast(s);
         }
         c.whole = try arena.realloc(c.whole, o.shdrs.len);
         @memset(c.whole, false);
@@ -562,15 +570,16 @@ pub fn convert(in: *ElfInput, ctx: anytype) !Converted {
             if (sym.st_shndx >= o.shdrs.len or !c.whole[sym.st_shndx]) continue;
             const name = o.symName(sym);
             if (name.len == 0 or std.mem.startsWith(u8, name, ".L")) continue;
+            // A global's merged visibility, a local's own.
+            const vis: u2 = if (s_index >= o.first_global) in.visibility.get(name) orelse 0 else @truncate(sym.st_other);
             // The definition the link keeps, unless the merged visibility
             // hides it.
-            const bind: @FieldType(Elf.LocalSymbol, "bind") = if (in.lld and s_index >= o.first_global and in.isKept(o, @intCast(s_index), name) and
-                (in.visibility.get(name) orelse 0) != 1 and (in.visibility.get(name) orelse 0) != 2)
+            const bind: @FieldType(Elf.LocalSymbol, "bind") = if (in.lld and s_index >= o.first_global and in.isKept(o, @intCast(s_index), name) and !hidden(vis))
                 if (sym.st_bind() == elf.STB_WEAK) .weak else .global
             else
                 .local;
             if (bind == .local and c.names[sym.st_shndx] == s_index) continue;
-            try symbols.append(arena, .{ .name = name, .atom = sectionKey(o, sym.st_shndx), .offset = sym.st_value, .size = sym.st_size, .bind = bind });
+            try symbols.append(arena, .{ .name = name, .atom = sectionKey(o, sym.st_shndx), .offset = sym.st_value, .size = sym.st_size, .bind = bind, .visibility = @fromBackingInt(@intCast(vis)) });
         }
     }
     for (in.commons.keys(), in.commons.values()) |name, common| {

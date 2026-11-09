@@ -155,6 +155,9 @@ pub const LocalSymbol = struct {
     /// symbol, as lld lists them. At offset 0 it also replaces its atom's
     /// own (local) symbol.
     bind: enum { local, global, weak } = .local,
+    /// st_other's visibility, as lld keeps it: a hidden global listed as
+    /// a local symbol stays STV_HIDDEN.
+    visibility: elf.STV = .DEFAULT,
 };
 
 /// An input object's section that is copied rather than made atoms of
@@ -1368,7 +1371,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
                     .global => .GLOBAL,
                     .weak => .WEAK,
                 } },
-                .other = .{ .visibility = .DEFAULT },
+                .other = .{ .visibility = ls.visibility },
                 .shndx = l.shndx[p.section],
                 .value = l.atomAddr(atom) + ls.offset - l.sym_bias[p.section],
                 .size = ls.size,
