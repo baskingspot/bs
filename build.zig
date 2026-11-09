@@ -177,6 +177,7 @@ pub fn build(b: *std.Build) void {
         inputs.addArtifactArg2(test_bs, .{});
         inputs.addArg(upstreamZig(b));
         inputs.addDirectoryArg2(b.path("test/link_input"), .{});
+        addDirectoryInputs(b, inputs, "test/link_input", false);
         _ = inputs.addOutputDirectoryArg2("work", .{});
         inputs.addCheck(.{ .expect_term = .{ .exited = 0 } });
         takes(b, &inputs.step, 30);
@@ -759,7 +760,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, run_step: *std.Build.
                 addFlags(b, r, expect.flags.items, src_path);
                 break :blk r;
             };
-            compile.addFileInput(b.path("test/run/rt.zig"));
+            addProgramInputs(b, compile, src_path);
             if (!upstream) {
                 const uses_std = std.mem.find(u8, source, "@import(\"std\")") != null;
                 const edits = expect.rebuild_without.items.len != 0 or expect.lib_edit != null;
@@ -781,7 +782,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, run_step: *std.Build.
                 serial.setName(b.fmt("compile {s} (BS_THREADS=1)", .{name}));
                 serial.addArgs(&.{ "build-exe", "-target", "x86_64-linux" });
                 serial.addFileArg(b.path(src_path));
-                serial.addFileInput(b.path("test/run/rt.zig"));
+                addProgramInputs(b, serial, src_path);
                 serial.setEnvironmentVariable("BS_THREADS", "1");
                 serial.setEnvironmentVariable("BS_CACHE", "off");
                 const serial_bin = serial.addOutputFileArg2(name, .{ .prefix = "-femit-bin=" });
@@ -847,6 +848,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, run_step: *std.Build.
                 const compile = b.addRunArtifact(bs);
                 compile.addArgs(&.{ "build-exe", "-target", "aarch64-macos" });
                 compile.addFileArg(b.path(src_path));
+                addProgramInputs(b, compile, src_path);
                 break :blk compile.addOutputFileArg2(name, .{ .prefix = "-femit-bin=" });
             };
             const run = std.Build.Step.Run.create(b, b.fmt("run {s} (aarch64-macos)", .{name}));
@@ -904,6 +906,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, run_step: *std.Build.
                 compile.addArgs(if (expect.libc) &.{ "build-exe", "-target", "aarch64-linux-gnu", "-lc" } else &.{ "build-exe", "-target", "aarch64-linux" });
                 if (upstream and expect.upstream_llvm) compile.addArg("-fllvm");
                 compile.addFileArg(b.path(src_path));
+                addProgramInputs(b, compile, src_path);
                 break :blk compile.addOutputFileArg2(name, .{ .prefix = "-femit-bin=" });
             };
             const runner = (if (expect.libc) aarch64_linux_glibc_runner else aarch64_linux_runner) orelse {
@@ -958,6 +961,7 @@ fn traceCheck(b: *std.Build, test_step: *std.Build.Step, bs: *std.Build.Step.Com
         c.setName(b.fmt("compile {s} for {s}{s}", .{ name, target, if (inline_env != null) " (BS_INLINE=0)" else "" }));
         c.addArgs(&.{ "build-exe", "-target", target });
         c.addFileArg(b.path(src_path));
+        addProgramInputs(b, c, src_path);
         if (inline_env) |v| c.setEnvironmentVariable("BS_INLINE", v);
         c.setEnvironmentVariable("BS_CACHE", "off");
         o.* = c.addOutputFileArg2(name, .{ .prefix = "-femit-bin=" });
@@ -1015,6 +1019,14 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
     var dir = b.root.openDir(io, "test/diag", .{ .iterate = true }) catch |err|
         std.debug.panic("unable to open test/diag: {t}", .{err});
     defer dir.close(io);
+    // What the programs import from their directory: test/diag's files
+    // other than the programs, and its subdirectories.
+    var helpers: std.ArrayList(struct { []const u8, bool }) = .empty;
+    var hit = dir.iterate();
+    while (hit.next(io) catch |err| std.debug.panic("unable to list test/diag: {t}", .{err})) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        helpers.append(b.allocator, .{ b.fmt("test/diag/{s}", .{entry.name}), entry.kind == .directory }) catch @panic("OOM");
+    }
     var it = dir.iterate();
     while (it.next(io) catch |err| std.debug.panic("unable to list test/diag: {t}", .{err})) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
@@ -1071,6 +1083,7 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         var arg_it = std.mem.tokenizeScalar(u8, args, ' ');
         while (arg_it.next()) |a| run.addArg(a);
         run.addFileInput(b.path(src_path));
+        for (helpers.items) |h| if (h[1]) addDirectoryInputs(b, run, h[0], true) else run.addFileInput(b.path(h[0]));
         run.setEnvironmentVariable("BS_CACHE", "off");
         run.addCheck(.{ .expect_stderr_exact = expected.items });
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
@@ -1162,6 +1175,12 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         run.setName(b.fmt("lint {s}", .{name}));
         run.setCwd(b.path(case_dir));
         run.addArgs(&.{ "build-obj", "-target", "x86_64-linux", "-fno-emit-bin", file });
+        // The file, what it imports and its lint config, read from its
+        // directory.
+        if (entry.kind == .directory) addDirectoryInputs(b, run, case_dir, true) else {
+            run.addFileInput(b.path(src_path));
+            run.addFileInput(b.path("test/lint/.ziglint.zon"));
+        }
         run.setEnvironmentVariable("BS_CACHE", "off");
         run.addCheck(.{ .expect_stderr_exact = expected.items });
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
@@ -1913,7 +1932,8 @@ fn addBuildTest(b: *std.Build, bs: *std.Build.Step.Compile, build_web_wasm: std.
 /// CPU at 4, 42 s at 2, 37 s at 1), much of it the system time of
 /// unmapping freed memory under SafeAllocator. Two keeps CodeGen on a
 /// worker, as any count above one does; the output is the same for
-/// every count.
+/// every count. And each declares the repository's .ziglint.zon, which bs
+/// reads as the lint config of the files it compiles there.
 fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roots: []const *std.Build.Step) void {
     const Step = std.Build.Step;
     const workers = @max(1, (std.Thread.getCpuCount() catch 1) -| 1);
@@ -1948,6 +1968,9 @@ fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roo
         for (users.items) |s| {
             if (s.cast(Step.Run)) |run| {
                 if (run.getEnvMap().get("BS_THREADS") == null) run.setEnvironmentVariable("BS_THREADS", "2");
+                // bs looks up a lint config from each file it compiles,
+                // which in the repository finds its .ziglint.zon.
+                run.addFileInput(b.path(".ziglint.zon"));
             }
             const least = std.mem.findMin(usize, loads);
             s.dependOn(gates[least]);
@@ -2016,6 +2039,52 @@ fn halve(b: *std.Build, whole: *std.Build.Step, bs: *std.Build.Step, first: *std
     whole.dependencies.clearRetainingCapacity();
     for (halves) |h| whole.dependOn(h);
     return halves;
+}
+
+/// Declares what a test/run program reads besides its source as inputs
+/// of `r`, a build of it: the files it imports or embeds by path, such as
+/// rt.zig. A name without a file of its own is a module the flags give,
+/// and a path built with `++` is left out.
+fn addProgramInputs(b: *std.Build, r: *std.Build.Step.Run, src_path: []const u8) void {
+    const io = b.graph.io;
+    const dir = std.Io.Dir.path.dirname(src_path).?;
+    var d = b.root.openDir(io, dir, .{}) catch |err| std.debug.panic("unable to open {s}: {t}", .{ dir, err });
+    defer d.close(io);
+    const source = d.readFileAlloc(io, std.Io.Dir.path.basename(src_path), b.allocator, .limited(1 << 20)) catch |err|
+        std.debug.panic("unable to read {s}: {t}", .{ src_path, err });
+    for ([_][]const u8{ "@import(\"", "@embedFile(\"" }) |needle| {
+        var rest = source;
+        while (std.mem.find(u8, rest, needle)) |at| {
+            rest = rest[at + needle.len ..];
+            const name = rest[0 .. std.mem.findScalar(u8, rest, '"') orelse continue];
+            const path = b.pathJoin(&.{ dir, name });
+            if (std.mem.eql(u8, path, src_path)) continue;
+            const stat = b.root.statFile(io, path) catch continue;
+            if (stat.kind == .file) r.addFileInput(b.path(path));
+        }
+    }
+}
+
+/// Declares the files under `sub_path` (in its subdirectories too when
+/// `recursive`) as inputs of `run`, which reads them through a directory
+/// argument or its working directory: the build runner hashes a
+/// directory argument's path, not what is in it, so a step whose files
+/// changed would otherwise pass from the cache.
+fn addDirectoryInputs(b: *std.Build, run: *std.Build.Step.Run, sub_path: []const u8, recursive: bool) void {
+    const io = b.graph.io;
+    b.dependOnDirectoryContents(b.path(sub_path));
+    var dir = b.root.openDir(io, sub_path, .{ .iterate = true }) catch |err|
+        std.debug.panic("unable to open {s}: {t}", .{ sub_path, err });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch |err| std.debug.panic("unable to list {s}: {t}", .{ sub_path, err })) |entry| {
+        const path = b.fmt("{s}/{s}", .{ sub_path, entry.name });
+        switch (entry.kind) {
+            .file => run.addFileInput(b.path(path)),
+            .directory => if (recursive) addDirectoryInputs(b, run, path, true),
+            else => {},
+        }
+    }
 }
 
 /// About how many seconds a step that runs bs takes with a Debug bs on a
@@ -2926,6 +2995,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     tc_native.setName("bs translate-c -l<lib> takes the native include directories");
     tc_native.addArgs(&.{ "translate-c", "-lfoo", "-isystem" });
     tc_native.addDirectoryArg2(b.path("test/link_input/tc_native/shadow"), .{});
+    addDirectoryInputs(b, tc_native, "test/link_input/tc_native/shadow", true);
     tc_native.addFileArg(b.path("test/link_input/tc_native/s.h"));
     tc_native.setCwd(b.path("."));
     tc_native.setEnvironmentVariable("NIX_CFLAGS_COMPILE", "-isystem test/link_input/tc_native/sys");
@@ -3127,6 +3197,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         });
         const lib_dir = libs.addOutputDirectoryArg2("needed", .{});
         libs.addDirectoryArg2(b.path("test/link_input"), .{});
+        addDirectoryInputs(b, libs, "test/link_input", false);
         const so_exe = b.addRunArtifact(bs);
         so_exe.addArgs(&.{ "build-exe", "-lc", "-lneeded_a", "-lneeded_b", "-lneeded_c", "-lneeded_d" });
         so_exe.addDirectoryArg2(lib_dir, .{ .prefix = "-L" });
@@ -3158,6 +3229,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         });
         const dir = libs.addOutputDirectoryArg2("dup", .{});
         libs.addDirectoryArg2(b.path("test/link_input"), .{});
+        addDirectoryInputs(b, libs, "test/link_input", false);
         libs.addArtifactArg2(bs, .{});
         for ([_][]const u8{ "dup_main.zig", "dup_main.c" }, [_][]const u8{ "false\n", "true\n" }) |m, want| {
             const r = b.addSystemCommand(&.{ "sh", "-c", "d=$(realpath \"$1\"); cd / && LD_LIBRARY_PATH=\"$d\" exec \"$d/$2.exe\" 2>&1", "sh" });
@@ -3267,6 +3339,7 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         cache.addArtifactArg2(bs, .{});
         cache.addArg(zig);
         cache.addDirectoryArg2(b.path("test/link_input"), .{});
+        addDirectoryInputs(b, cache, "test/link_input", false);
         _ = cache.addOutputDirectoryArg2("work", .{});
         cache.addArg(part);
         cache.addDirectoryArg2(std_zir, .{});
