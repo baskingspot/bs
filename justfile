@@ -20,7 +20,7 @@ release-build TARGET DIR:
 test *ARGS:
     zig build test --summary failures {{ ARGS }}
 
-[doc("Some of the parts of `just test`, as CI's test jobs run them: test-unit, test-run, test-edit, test-cache, test-link, test-diag (`zig build --help` describes each)")]
+[doc("Some of the parts of `just test`, as CI's test jobs run them: test-unit, test-run (or test-run-1 and -2), test-edit, test-cache, test-link (or test-link-1 and -2), test-diag (`zig build --help` describes each)")]
 [group("test")]
 test-steps +STEPS:
     zig build {{ STEPS }} --summary failures

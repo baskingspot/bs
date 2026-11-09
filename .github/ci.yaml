@@ -1,13 +1,16 @@
 # x86_64 Linux is first class: tests, lint, and ziglint block. The tests run
 # as parallel jobs, one or more of build.zig's test-* steps each, which
-# together are `zig build test`. The macOS lane runs the same tests on a real
+# together are `zig build test` (test-nightly aside, which
+# workflows/nightly.yml runs). The macOS lane runs the same tests on a real
 # Apple Silicon Mac and does not block until it passes. The conformance
 # measure shows its results and never blocks: it reports a share, not a pass.
 # It measures upstream's test/behavior and its std tests on every target the
 # runner can run (aarch64-linux under qemu).
 jobs:
-  - recipe: test-steps test-link
-  - recipe: test-steps test-run
+  - recipe: test-steps test-link-1
+  - recipe: test-steps test-link-2
+  - recipe: test-steps test-run-1
+  - recipe: test-steps test-run-2
   - recipe: test-steps test-edit
   - recipe: test-steps test-cache
   - recipe: test-steps test-diag test-unit
