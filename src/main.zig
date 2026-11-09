@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const Io = std.Io;
 const diag = @import("diag.zig");
 const Frontend = @import("Frontend.zig");
@@ -46,10 +47,11 @@ const thread_stack_size = 60 << 20;
 const usage =
     \\Usage: bs [command] [options]
     \\
-    \\bs is a fast Debug-mode compiler for Zig 0.17.1. It needs upstream
-    \\zig 0.17.1 on PATH (or in BS_ZIG): bs compiles that zig's std and
-    \\runs its `zig cc` for C. --zig-lib-dir or ZIG_LIB_DIR name another
-    \\lib directory.
+    \\bs is a fast Debug-mode compiler for Zig 0.17.1, and for Zig 0.16.0
+    \\in a project whose .bs.zon says .zig_version = "0.16". It needs
+    \\upstream zig 0.17.1 on PATH (or in BS_ZIG), and zig 0.16.0 for 0.16
+    \\(BS_ZIG_0_16): bs compiles that zig's std and runs its `zig cc` for
+    \\C. --zig-lib-dir or ZIG_LIB_DIR name another lib directory.
     \\
     \\Commands:
     \\  build            Build project from build.zig
@@ -63,6 +65,7 @@ const usage =
     \\  ast-check        Look for simple compile errors in any set of files
     \\  env              Print lib path, std path, cache directory, and version
     \\  version          Print the Zig version bs compiles
+    \\  --version        Print bs's own version
     \\  help             Print this help and exit
     \\
 ;
@@ -363,6 +366,10 @@ pub fn main(init_std: std.process.Init) !void {
     const raw_args = try init.minimal.args.toSlice(arena);
     if (raw_args.len < 2) fatalUsage();
     const cmd = raw_args[1];
+    if (std.mem.eql(u8, cmd, "--version")) {
+        try Io.File.stdout().writeStreamingAll(init.io, "bs " ++ build_options.version ++ "\n");
+        return;
+    }
     if (std.mem.eql(u8, cmd, "build")) return BuildRunner.run(init, raw_args[2..]);
     if (std.mem.eql(u8, cmd, "translate-c")) return TranslateC.run(init, raw_args[2..]);
     if (forwarded_commands.has(cmd)) return CSource.forward(arena, init.io, init.environ_map, raw_args[1..]);

@@ -5,17 +5,17 @@
   </picture>
 </h1>
 
-A fast Debug-mode compiler for Zig 0.17.
+A fast Debug-mode compiler for Zig 0.17 and 0.16.
 
-bs compiles exactly one Zig release, 0.17.1, and the std library that ships with it, for x86_64 Linux and Apple Silicon macOS. It takes the same commands and flags as `zig build-exe`, `zig build-obj`, `zig run`, `zig test`, and `zig build`, so a project's own `build.zig` builds with it unchanged. Every build has Debug semantics: safety checks stay on, and the output keeps line tables and frame pointers. For ReleaseFast, use upstream `zig`.
+bs compiles two Zig releases, 0.17.1 and 0.16.0, each with the std library that ships with it, for x86_64 and aarch64 Linux and Apple Silicon macOS. A project builds as 0.17 unless its `.bs.zon` says `.zig_version = "0.16"`. It takes the same commands and flags as `zig build-exe`, `zig build-obj`, `zig run`, `zig test`, and `zig build`, so a project's own `build.zig` builds with it unchanged. Every build has Debug semantics: safety checks stay on, and the output keeps line tables and frame pointers. For ReleaseFast, use upstream `zig`.
 
-Its compile errors are written for coding agents: an exact location, the facts needed to fix the error, and the fix when bs knows it, in a form a program can parse.
+Its compile errors are written for coding agents: an exact location, the facts needed to fix the error, and the fix when bs knows it, in a form a program can parse. A project that asks for it, with a `lint` section in `.bs.zon` or a `.ziglint.zon`, also gets [ziglint](https://github.com/rockorager/ziglint)'s rules as compile errors in its own files.
 
 bs is incubating.
 
 ## Install
 
-bs needs upstream Zig 0.17.1 on `PATH`: it compiles that release's std library, and hands C and C++ sources to its `zig cc`. Without it, or with another version, bs stops and says so. `--zig-lib-dir` or `ZIG_LIB_DIR` point it at a lib directory instead.
+bs needs upstream Zig 0.17.1 on `PATH`: it compiles that release's std library, and hands C and C++ sources to its `zig cc`. Without it, or with another version, bs stops and says so. `--zig-lib-dir` or `ZIG_LIB_DIR` point it at a lib directory instead. A project on Zig 0.16 also needs zig 0.16.0, in `BS_ZIG_0_16` or as `zig` on `PATH`.
 
 With Homebrew, on macOS or Linux:
 
@@ -54,7 +54,7 @@ bs test lib.zig
 bs build            # in a project with a build.zig
 ```
 
-`bs help` lists every command. A flag that upstream accepts and bs cannot honor yet, such as a release mode or the LLVM backend, fails with a message that says so.
+`bs help` lists every command. `bs --version` prints bs's own version; `bs version` prints the Zig version it compiles, as `zig version` does. A flag that upstream accepts and bs cannot honor yet, such as a release mode or the LLVM backend, fails with a message that says so.
 
 ## Work on it
 

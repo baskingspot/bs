@@ -5,8 +5,13 @@ Changes a user of bs notices, newest first, in the
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-09
+
+The first release.
+
 ### Added
 
+- `bs --version` prints bs's own version. `bs version` still prints the Zig version it compiles, as `zig version` does.
 - Zig 0.16.0 next to 0.17.1. A project opts in with `.zig_version = "0.16"` in its `.bs.zon`: `bs build` then builds it as Zig 0.16, with its dependencies and every step, and so do `bs build-exe`, `test` and `run` of a file under it, as does any compilation with `--zig-version 0.16`. Without it, everything builds as Zig 0.17, whatever `minimum_zig_version` says; when such a build fails and the project's `minimum_zig_version` is 0.16.x, the first error gets a note at that field naming the `.bs.zon` fix. Its syntax, semantics, std, build system, `@cImport` and compile errors are 0.16's. It needs a zig 0.16.0 install, found as `BS_ZIG_0_16`, else in `~/.cache/bs/zig-<host>-0.16.0`, else as `zig` on PATH if that is 0.16.0, for its lib directory and its `zig cc`. A build that uses `@cImport` uses the incremental cache: an edit to its Zig code or to a header it includes rebuilds only what the edit reaches.
 - A project that asks for it, with a `lint` section in its `.bs.zon` (the schema of `.ziglint.zon`) or with a `.ziglint.zon` (used when the `.bs.zon` has no `lint` section), gets ziglint 0.8.1's rules as compile errors in the files the config's `paths` cover, never in std or dependencies: `error[style, Z026]: empty catch block suppresses errors` and the like, with ziglint's messages, exact locations, and `"rule"` in JSON output. `.lint = true` or `.lint = .{}` means ziglint's defaults (every rule but Z033), and `.lint = false` keeps lint off. bs finds the config from the root source file up to the nearest `build.zig`; `// ziglint-ignore:` comments work as in ziglint, and nothing else turns a finding off. A config bs cannot read, an unknown rule included, is an `error[lint-config]`. This first part covers the rules ziglint checks from the syntax alone; deprecated calls (Z011), declarations used through an instance (Z027) and the type-aware parts of the other rules follow. Builds of a project with neither are unchanged.
 - On aarch64-macos, executables and tests (`bs build-exe`, `bs run`, `bs test`, and those `bs build` steps) use the on-disk cache as Linux builds do: an edit build analyzes and generates only what the edit reaches and relinks from the cache, with a fresh ad-hoc code signature and dSYM, so an edit to the zig compiler's sources builds in 0.11–0.17 s instead of 3.8 s, and to hello or libvaxis in 9–20 ms instead of 70–130 ms (mac.large). Executables with object inputs, archives and C sources relink from the cache too, with their objects converted again; a change to an object alone relinks in milliseconds. Objects, static libraries and dylibs build in full when their inputs changed, as before.
@@ -57,3 +62,6 @@ Changes a user of bs notices, newest first, in the
 - A C object's strong definition now replaces a weak export of the Zig code, as in ld, instead of failing with a duplicate symbol.
 - Copying a struct that the optimizer splits into a global variable no longer crashes bs (upstream's `lib/c.zig` `drand48` does).
 - `callconv` takes a `std.builtin.CallingConvention` value computed at comptime, such as `callconv(cc orelse .c)`.
+
+[Unreleased]: https://github.com/baskingspot/bs/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/baskingspot/bs/releases/tag/v0.1.0

@@ -1,4 +1,5 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -15,6 +16,8 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption([]const u8, "zig_lib_dir", zig_lib_dir);
+    // bs's own version, which `bs --version` prints.
+    options.addOption([]const u8, "version", zon.version);
 
     // `-Dsanitize-thread`: a ThreadSanitizer build of bs, for checking the
     // state CodeGen workers share with the Sema thread (see "Parallel
@@ -23,12 +26,15 @@ pub fn build(b: *std.Build) void {
     // ThreadSanitizer intercepts; std's SafeAllocator hands memory between
     // threads in ways it cannot see, and every reuse then looks like a race.
     const sanitize_thread = b.option(bool, "sanitize-thread", "Build bs with ThreadSanitizer (use with -Doptimize=ReleaseFast)") orelse false;
+    // `-Dstrip`: no debug info in bs, as the release workflow ships it.
+    const strip = b.option(bool, "strip", "Omit bs's debug info (the release build)");
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
         .link_libc = if (sanitize_thread) true else null,
+        .strip = strip,
     });
     exe_mod.addOptions("build_options", options);
     // Upstream's parser and AstGen, vendored (frontend/frontend.zig): a
