@@ -19838,9 +19838,17 @@ fn bitCastUnchecked(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operan
     // bytes, read as the destination type.
     if (sema.zcu.language == .zig_0_16) for ([_]Index{ dest_ty, src_ty }) |t| {
         if ((Type.class(ip, t) == .@"struct" or Type.class(ip, t) == .@"union") and ip.structInfo(t).layout == .@"extern") {
-            const d_bits = Type.abiSize(ip, dest_ty) * 8;
-            const s_bits = Type.abiSize(ip, src_ty) * 8;
+            // Upstream compares bit sizes: a 3-byte extern struct and a
+            // `u24` (zigimg's `BgrColor(u8)`) reinterpret, through the
+            // struct's bytes.
+            const d_bits = sema.bitSize016(dest_ty);
+            const s_bits = sema.bitSize016(src_ty);
             if (d_bits != s_bits) return sema.fail(block, src, "@bitCast size mismatch: destination type '{f}' has {d} bits but source type '{f}' has {d} bits", .{ sema.fmtType(dest_ty), d_bits, sema.fmtType(src_ty), s_bits });
+            if (Type.abiSize(ip, dest_ty) != Type.abiSize(ip, src_ty)) {
+                if (d_bits % 8 != 0) return sema.failUnsupported(block, src, "@bitCast between these types");
+                const bytes = try sema.intern(.{ .array_type = .{ .len = d_bits / 8, .child = .u8_type } });
+                return sema.bitCastUnchecked(block, src, dest_ty, try sema.bitCastUnchecked(block, src, bytes, operand));
+            }
             // A comptime-known struct of the same field layout converts
             // field by field, which keeps pointers pointers.
             if (sema.resolveValue(operand)) |v| if (!sema.isUndef(v) and ip.keyTag(dest_ty) == .struct_type and ip.keyTag(src_ty) == .struct_type) same: {
@@ -19865,6 +19873,14 @@ fn bitCastUnchecked(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operan
         }
     };
     return sema.failUnsupported(block, src, "@bitCast between these types");
+}
+
+/// Upstream 0.16's `Type.bitSize` of an operand of `@bitCast` between
+/// extern types: an extern container's bytes, else the type's own bits.
+fn bitSize016(sema: *Sema, ty: Index) u64 {
+    const ip = sema.ip;
+    if ((Type.class(ip, ty) == .@"struct" or Type.class(ip, ty) == .@"union") and ip.structInfo(ty).layout == .@"extern") return Type.abiSize(ip, ty) * 8;
+    return sema.logicalBits(ty) orelse sema.bitCastBits(ty) orelse Type.abiSize(ip, ty) * 8;
 }
 
 /// `operand` as a value of `dest_ty` with the same bits, for a packed type

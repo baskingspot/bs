@@ -16,7 +16,7 @@ BS_ZIG_VERSION=0.16 BS_UNFINISHED_0_16=1 "$bs" run main.zig --cache-dir local --
     exit 1
 }
 # zig 0.16.0's output.
-want='{ 1, 2, 1, 2, 1, 2 } .{ 97, 98, 97, 98 } 7 6 [*c]u32 5 *u32 34 12 0 true 32 true'
+want='{ 1, 2, 1, 2, 1, 2 } .{ 97, 98, 97, 98 } 7 6 [*c]u32 5 *u32 34 12 0 true 32 true 30201'
 [ "$(cat out)" = "$want" ] || {
     printf 'bs Zig 0.16 check failed:\n  want %s\n  got  %s\n' "$want" "$(cat out)" >&2
     exit 1

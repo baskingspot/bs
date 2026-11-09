@@ -6,6 +6,7 @@ const std = @import("std");
 const Empty = enum {};
 const Full = extern struct { number: u16 };
 const Halves = extern struct { lo: u8, hi: u8 };
+const Bgr = extern struct { b: u8, g: u8, r: u8 };
 const S = struct { x: u32 };
 const private_decl = 1;
 const Self = @This();
@@ -32,15 +33,18 @@ pub fn main() void {
     var full: Full = .{ .number = 0x1234 };
     _ = &full;
     const halves: Halves = @bitCast(full);
+    var bgr: Bgr = .{ .b = 1, .g = 2, .r = 3 };
+    _ = &bgr;
+    const rgb: u24 = @bitCast(bgr);
     var f: f32 = -0.5;
     _ = &f;
     const z: i0 = @intFromFloat(f);
     const nothing: void = void{};
     _ = nothing;
-    std.debug.print("{any} {any} {d} {d} {} {d} {} {x} {x} {d} {} {d} {}\n", .{
+    std.debug.print("{any} {any} {d} {d} {} {d} {} {x} {x} {d} {} {d} {} {x}\n", .{
         rep,                                     tup,  log,                            p.*.x,
         @TypeOf(&p.*.x),                         v[1], @TypeOf(pv),                    halves.lo,
         halves.hi,                               z,    @hasDecl(Self, "private_decl"), @bitSizeOf(S),
-        @typeInfo(Empty).@"enum".tag_type == u0,
+        @typeInfo(Empty).@"enum".tag_type == u0, rgb,
     });
 }
