@@ -1,4 +1,4 @@
-# bs: a fast Debug-mode compiler for Zig 0.17. `just --list` shows the recipes.
+# bs: fast Debug-mode compiler for Zig 0.17 and 0.16. `just --list` shows the recipes.
 # AGENTS.md holds the working conventions.
 
 [private]

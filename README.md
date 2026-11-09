@@ -5,7 +5,7 @@
   </picture>
 </h1>
 
-A fast Debug-mode compiler for Zig 0.17 and 0.16.
+Fast Debug-mode compiler for Zig 0.17 and 0.16.
 
 bs compiles two Zig releases, 0.17.1 and 0.16.0, each with the std library that ships with it, for x86_64 and aarch64 Linux and Apple Silicon macOS. A project builds as 0.17 unless its `.bs.zon` says `.zig_version = "0.16"`. It takes the same commands and flags as `zig build-exe`, `zig build-obj`, `zig run`, `zig test`, and `zig build`, so a project's own `build.zig` builds with it unchanged. Every build has Debug semantics: safety checks stay on, and the output keeps line tables and frame pointers. For ReleaseFast, use upstream `zig`.
 
