@@ -13711,6 +13711,9 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
         // Under @TypeOf only the type matters, also through a generic
         // function's runtime parameter, which stands as undefined.
         if (block.is_typeof and sema.isUndef(pv)) return .fromInterned(try sema.undefValue(info.child));
+        // A type with one value reads no memory, as upstream's analyzeLoad.
+        if (sema.layoutResolved(info.child) and !Type.hasRuntimeBits(ip, info.child) and !Type.isComptimeOnly(ip, info.child))
+            if (try sema.onePossibleValue(info.child)) |v| return .fromInterned(v);
         if (try sema.comptimeLoadOrNull(block, src, pv)) |v| return .fromInterned(v);
     };
     _ = try sema.localLayout(block, src, info.child, .resolve, sema.bcLocal(ptr));
@@ -14968,7 +14971,12 @@ fn readMem(sema: *Sema, block: *Block, src: Src, val: Index, offset: u64, ty: In
     const val_ty = ip.typeOf(val);
     if (val_ty == ty and offset == 0) return val;
     const size = Type.abiSize(ip, ty);
-    if (size == 0) if (try sema.onePossibleValue(ty)) |v| return v;
+    // A zero-bit value needs no bytes, unless reading it reinterprets
+    // memory without a defined layout (`[1]A` as `[1]B`), as upstream.
+    if (size == 0) if (try sema.onePossibleValue(ty)) |v| {
+        if (sema.childCoercibleInMemory(sema.arrayBase(val_ty).ty, sema.arrayBase(ty).ty) or
+            (sema.wellDefinedLayout(ty) and sema.wellDefinedLayout(val_ty))) return v;
+    };
     if (offset > Type.abiSize(ip, val_ty) or size > Type.abiSize(ip, val_ty) - offset)
         return sema.fail(block, src, "dereference of '{f}' exceeds bounds of containing decl of type '{f}'", .{ sema.fmtType(try sema.ptrType(.{ .child = ty })), sema.fmtType(val_ty) });
     // Descend into the field or element holding all of the bytes.

@@ -54,6 +54,15 @@ comptime {
     @panic("comptime panic message");
 }
 
+const A = struct {};
+const B = struct {};
+comptime {
+    // Zero-bit, but read as another type without a defined layout.
+    const val: [1]A = .{.{}};
+    const ptr: *const [1]B = @ptrCast(&val);
+    _ = ptr ++ ptr;
+}
+
 pub fn main() void {}
 
 // error
@@ -76,4 +85,6 @@ pub fn main() void {}
 //   | _ = p.* catch unreachable;
 // comptime_failures.zig:54:5: error[comptime-trap]: encountered @panic at comptime: comptime panic message
 //   | @panic("comptime panic message");
-// 9 errors
+// comptime_failures.zig:63:9: error[bad-type]: comptime dereference requires '[1]comptime_failures.B' to have a well-defined layout
+//   | _ = ptr ++ ptr;
+// 10 errors
