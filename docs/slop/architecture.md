@@ -8909,17 +8909,33 @@ libraries as inputs. To be agreed with that thread.
   nothing points into the lists. Past that, it is a compile error.
 - **Errors:** "C import failed" at the call, with upstream's note when
   libc is not linked, then translate-c's own errors.
-- **Cache:** the translation reads files that no `Dependee` records, so
-  a build that imports C is not recorded. It writes `cimport` in the
-  compilation's directory. If it had replayed the last build's analysis,
-  it builds again with replay off. Later builds of that compilation skip
-  the incremental cache (`Job.openCache`) and use the inputs record,
-  which lists the headers translate-c read. A build without `@cImport`
-  deletes the marker. A no-change build is still answered without
-  compiling, but an edit build of a 0.16 program that imports C is a
-  full build. Recording it would need a `Dependee` for a translation
-  (its inputs and output hash) and a replay that recreates the
-  `=cimport@` modules before it maps the units that use them.
+- **Cache** (2026-11-09; before, a build that imported C was not
+  recorded, and every edit build of it was a full build). The importer
+  depends on the translation (`Dependee.c_import`, an index into
+  `Zcu.c_imports`, which holds each directory once): its node is keyed by
+  the directory's name, its result is the hash of `cimport.zig`, and its
+  source is that file's input, so it is a seed whenever the file's
+  contents changed. The translated file is an ordinary input of a module
+  of its own, and the manifest also gets inputs no node names
+  (`Incremental.translationInputs`): each translation's `cimport.h` as
+  `:cimport:<key>:<importing module>`, and every header it read as
+  `:c:<path>`, so that an edited header makes the next build an edit
+  build. An edit build first translates each `:cimport:` input's source
+  again with its importing module's flags (`Replay.remakeTranslations`;
+  the translation record answers in a few milliseconds when no header
+  changed) and loads its module, before files are matched to inputs:
+  green units' results can name the translation's types, and an edited
+  header rewrites `cimport.zig`, whose changes the seeds then map as any
+  file's. A translation that cannot be made again (its source trimmed,
+  its importing module gone, translate-c failing now) is left out: its
+  file's nodes are outdated, the importer's `c_import` dependency does
+  not decode, and analysis translates and reports as a full build does.
+  A donor's translations are another project's and are not made again.
+  Translations an edit build makes again but no longer uses stay in the
+  manifest until the next full build. On the program in
+  test/run/edit_cimport.sh with `-lc` and stdio.h, string.h and stdlib.h:
+  a Zig edit builds in 40 ms instead of 330, a header edit in 90 instead
+  of 380.
 
 ### Step 3, C sources, as built (2026-11-04)
 

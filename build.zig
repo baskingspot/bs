@@ -1762,6 +1762,18 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &em.step, 10);
         edit_step.dependOn(&em.step);
     }
+    // Edits of a Zig 0.16 program that imports C: test/run/edit_cimport.sh.
+    {
+        const ci = b.addSystemCommand(&.{"sh"});
+        ci.setName("bs edit of a program that imports C");
+        ci.addFileArg(b.path("test/run/edit_cimport.sh"));
+        ci.addArtifactArg2(bs, .{});
+        _ = ci.addOutputDirectoryArg2("work", .{});
+        ci.addDirectoryArg2(std_zir, .{});
+        ci.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &ci.step, 15);
+        edit_step.dependOn(&ci.step);
+    }
     // An error in a unit a failing edit no longer reaches:
     // test/run/edit_unreached_error.sh.
     {

@@ -633,6 +633,39 @@ pub fn isLinkInput(key: []const u8) bool {
     return std.mem.startsWith(u8, key, link_input_prefix);
 }
 
+/// The key prefixes of the inputs of Zig 0.16's `@cImport` translations,
+/// which no node names (its `cimport.zig` is a module's file): each
+/// translation's source, `:cimport:<key>:<importing module>` at its
+/// `cimport.h`, which an edit build translates again before analysis
+/// (`Replay.create`), and the headers it read, `:c:<path>`, so that an
+/// edited header makes the build an edit build.
+pub const c_import_prefix = ":cimport:";
+pub const c_header_prefix = ":c:";
+
+pub fn isTranslationInput(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, c_import_prefix) or std.mem.startsWith(u8, key, c_header_prefix);
+}
+
+pub const TranslationInput = struct { path: []const u8, key: []const u8 };
+
+/// The inputs of this build's translations (`isTranslationInput`), each
+/// path once, allocated in `arena`.
+pub fn translationInputs(arena: Allocator, zcu: *const Zcu) ![]const TranslationInput {
+    var out: std.ArrayList(TranslationInput) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (zcu.c_imports.items) |c| {
+        if (c.file == null) continue;
+        var it = std.mem.splitScalar(u8, c.inputs, 0);
+        const source = it.first();
+        try out.append(arena, .{ .path = source, .key = try std.mem.concat(arena, u8, &.{ c_import_prefix, Io.Dir.path.basename(c.dir), ":", zcu.fe.module(c.parent).name }) });
+        while (it.next()) |path| {
+            if (path.len == 0 or (try seen.getOrPut(arena, path)).found_existing) continue;
+            try out.append(arena, .{ .path = path, .key = try std.mem.concat(arena, u8, &.{ c_header_prefix, path }) });
+        }
+    }
+    return out.items;
+}
+
 /// Links manifest `m`'s live atoms from the packs into `sub_path`, and
 /// records the output's stat (`noteOutput`). Returns null, saying why
 /// under `BS_CACHE_TIMING`, if the packs or the manifest are damaged.
@@ -1957,6 +1990,7 @@ pub const Tag = enum(u8) {
     struct_defaults,
     func_inline,
     deprecation,
+    c_import,
 };
 
 /// Keys that are hashes already.
@@ -2010,6 +2044,7 @@ pub const DependeeContext = struct {
             .embed_file => |i| mix(7, i),
             .struct_defaults => |t| mix(8, @backingInt(t)),
             .deprecation => |n| mix(10, @backingInt(n)),
+            .c_import => |i| mix(11, i),
         };
     }
     pub fn eql(_: DependeeContext, a: Zcu.Dependee, b: Zcu.Dependee) bool {
@@ -2106,7 +2141,7 @@ pub const Recorder = struct {
             // With an edge to the unit that produces them.
             .nav_ty => |nav| try r.addUnit(.{ .nav_val = nav }),
             .func_ies, .func_inline => |func| try r.addUnit(.{ .func = func }),
-            .func_body, .namespace_name, .namespace, .embed_file, .deprecation => no_node,
+            .func_body, .namespace_name, .namespace, .embed_file, .deprecation, .c_import => no_node,
         };
         const gop = try r.dependees.getOrPut(r.gpa, d);
         if (!gop.found_existing) {
@@ -2178,6 +2213,7 @@ pub const Recorder = struct {
             .namespace => .namespace,
             .embed_file => .embed_file,
             .deprecation => .deprecation,
+            .c_import => .c_import,
         };
         const index, const new = try r.node(info.key, tag);
         info.node = index;
@@ -2430,6 +2466,19 @@ pub const Keyer = struct {
                     .key = try k.keyOf(.embed_file, &.{f.key}),
                     .result_hash = f.hash,
                     .source = .{ .input = @intCast(k.zcu.fe.files.items.len + i), .inst = Manifest.Source.no_inst },
+                };
+            },
+            // The translation's output, by its directory's name (the
+            // translation's key): its `cimport.zig`, whose input it names,
+            // so that an edit build that translated it again into other
+            // contents (a header changed) analyzes the importer again.
+            .c_import => |i| {
+                const c = k.zcu.c_imports.items[i];
+                const file = c.file.?;
+                return .{
+                    .key = try k.keyOf(.c_import, &.{Io.Dir.path.basename(c.dir)}),
+                    .result_hash = @bitCast(k.zcu.fe.files.items[file].content_hash),
+                    .source = .{ .input = file, .inst = Manifest.Source.no_inst },
                 };
             },
         }
@@ -2953,6 +3002,20 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         defer gpa.free(bytes);
         const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch return inc.lazyFallback("{s} is gone", .{path_buf.items});
         try d.setInput(known, path_buf.items, key_buf.items, stat, @bitCast(Frontend.hashSource(bytes)), inc.build_start);
+    }
+    // Translations' inputs: new ones, and those whose contents changed.
+    {
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        for (try translationInputs(arena_state.allocator(), zcu)) |t| {
+            const hash = try inc.contentHash(t.path) orelse return inc.lazyFallback("{s} is gone", .{t.path});
+            const known = rp.by_path.get(t.path);
+            if (known) |in| {
+                if (m.input(in)[0].content_hash == hash and std.mem.eql(u8, m.inputKey(in), t.key)) continue;
+            } else n_inputs += 1;
+            const stat = Io.Dir.cwd().statFile(io, t.path, .{}) catch return inc.lazyFallback("{s} is gone", .{t.path});
+            try d.setInput(known, t.path, t.key, stat, hash, inc.build_start);
+        }
     }
 
     // Results, with this build's items after the manifest's: those it
@@ -3492,7 +3555,7 @@ fn sameSubject(m: *const Manifest, enc: *const results.Encoder, old: []const u32
     if (old.len == 0) return true;
     if (old[0] != new[0]) return false;
     const tag: std.meta.Tag(results.Subject) = @fromBackingInt(@intCast(old[0]));
-    if (tag == .embed_file) return std.mem.eql(u32, old, new);
+    if (tag == .embed_file or tag == .c_import) return std.mem.eql(u32, old, new);
     if (!std.mem.eql(u32, old[2..], new[2..])) return false;
     const a = old[1];
     const b = new[1];
@@ -4226,6 +4289,18 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         else |_|
             try b.addUnstattedInput(path_buf.items, key_buf.items, content_hash);
     }
+    // Translations' inputs, by contents.
+    {
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        for (try translationInputs(arena_state.allocator(), zcu)) |t| {
+            const hash = try inc.contentHash(t.path) orelse 0;
+            if (Io.Dir.cwd().statFile(io, t.path, .{})) |stat|
+                try b.addInput(t.path, t.key, stat, hash, inc.build_start)
+            else |_|
+                try b.addUnstattedInput(t.path, t.key, hash);
+        }
+    }
     // Link-only inputs, by the same rule.
     for (0..inc.link_objects.len + inc.link_shared.len) |n| {
         const path = inc.linkPath(n);
@@ -4334,6 +4409,7 @@ fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.
             .namespace_name => |nn| .{ .namespace_name = .{ .owner = zcu.namespacePtr(nn.namespace).owner_type, .name = ip.stringSlice(nn.name) } },
             .namespace => |ns| .{ .namespace = zcu.namespacePtr(ns).owner_type },
             .embed_file => |i| .{ .embed_file = zcu.embed_files.values()[i].key },
+            .c_import => |i| .{ .c_import = Io.Dir.path.basename(zcu.c_imports.items[i].dir) },
         };
         const sj_start = words.items.len;
         if (try results.encodeSubject(enc, words, subject)) {
@@ -4748,8 +4824,8 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
         }
         // As `Replay.create`: an input whose key names no file here (a
         // donor's) is changed; one this build did not read has no nodes,
-        // nor has a link-only one.
-        if (isLinkInput(m.inputKey(@intCast(j)))) continue;
+        // nor has a link-only one or a translation's.
+        if (isLinkInput(m.inputKey(@intCast(j))) or isTranslationInput(m.inputKey(@intCast(j)))) continue;
         if (!try inputKeyHolds(gpa, &path_buf, m, @intCast(j), fe)) try changed.append(gpa, .{ .input = @intCast(j), .file = null });
     }
     var seed_list: std.ArrayList(u32) = .empty;
@@ -5278,6 +5354,7 @@ fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const resul
             .namespace_name => |nn| .{ .namespace_name = .{ .owner = zcu.namespacePtr(nn.namespace).owner_type, .name = ip.stringSlice(nn.name) } },
             .namespace => |ns| .{ .namespace = zcu.namespacePtr(ns).owner_type },
             .embed_file => |i| .{ .embed_file = zcu.embed_files.values()[i].key },
+            .c_import => |i| .{ .c_import = Io.Dir.path.basename(zcu.c_imports.items[i].dir) },
         };
         const got = results.decodeSubject(&d, words[sj[0]..][0..sj[1]]) catch null;
         if (got != null and subjectEql(got.?, want)) continue;
@@ -5313,6 +5390,7 @@ fn subjectEql(a: results.Subject, b: results.Subject) bool {
         .namespace => |t| t == b.namespace,
         .namespace_name => |nn| nn.owner == b.namespace_name.owner and std.mem.eql(u8, nn.name, b.namespace_name.name),
         .embed_file => |k| std.mem.eql(u8, k, b.embed_file),
+        .c_import => |k| std.mem.eql(u8, k, b.c_import),
     };
 }
 
@@ -5425,6 +5503,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
                     .namespace_name => |nn| w.print("{s} {s}", .{ z.namespacePtr(nn.namespace).key, z.ip.stringSlice(nn.name) }) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
                     .namespace => |ns| w.writeAll(z.namespacePtr(ns).key) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
                     .embed_file => |i| w.writeAll(z.embed_files.values()[i].key) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
+                    .c_import => |i| w.writeAll(z.c_imports.items[i].dir) catch {}, // ziglint-ignore: Z026 -- only names a unit in a message
                     .nav_val, .type_layout, .struct_defaults => {},
                 }
                 return;
@@ -5462,7 +5541,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         fn isDependee(tag: u8) bool {
             const t = std.enums.fromInt(Tag, tag) orelse return false;
             return switch (t) {
-                .nav_ty, .func_body, .func_ies, .func_inline, .namespace_name, .namespace, .embed_file, .deprecation => true,
+                .nav_ty, .func_body, .func_ies, .func_inline, .namespace_name, .namespace, .embed_file, .deprecation, .c_import => true,
                 else => false,
             };
         }
@@ -5569,7 +5648,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
             .func_body, .func_ies, .func_inline => |f| f,
             .namespace_name => |nn| r.zcu.namespacePtr(nn.namespace).owner_type,
             .namespace => |ns| r.zcu.namespacePtr(ns).owner_type,
-            .embed_file, .nav_val, .type_layout, .struct_defaults => continue,
+            .embed_file, .c_import, .nav_val, .type_layout, .struct_defaults => continue,
         };
         const old = m.subject(pi);
         if (old.len == 0) continue;

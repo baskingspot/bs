@@ -716,19 +716,6 @@ pub const Job = struct {
             !std.mem.eql(u8, job.environ_map.get("BS_CACHE") orelse "", "off");
     }
 
-    /// Whether the last build of this compilation imported C (Zig 0.16's
-    /// `@cImport`), which the cache does not record: the compilation's
-    /// directory has `c_import_marker`.
-    fn cImported(job: *const Job) bool {
-        var arena: std.heap.ArenaAllocator = .init(job.gpa);
-        defer arena.deinit();
-        _, const key = Incremental.compilationKey(arena.allocator(), job.io, job.compile_args, job.zig_lib_dir, job.opts.language.language, job.cache_target) catch return false;
-        const hex = std.fmt.hex(key);
-        const path = Io.Dir.path.join(arena.allocator(), &.{ job.cache_dirs.local, "bs", "c", &hex, c_import_marker }) catch return false;
-        Io.Dir.cwd().access(job.io, path, .{}) catch return false;
-        return true;
-    }
-
     /// Opens the on-disk cache for a build into `out_path`: a build whose
     /// inputs did not change relinks the last build's Atoms and skips
     /// everything else.
@@ -742,11 +729,6 @@ pub const Job = struct {
             std.log.warn("unable to use the cache: {t}", .{err});
             return null;
         };
-        // The last build imported C: the inputs record answers instead.
-        if (i.dir.access(job.io, c_import_marker, .{})) |_| {
-            i.close();
-            return null;
-        } else |_| {}
         i.check = env.get("BS_CACHE_CHECK") != null;
         i.donors = !std.mem.eql(u8, env.get("BS_CACHE_DONOR") orelse "", "off");
         i.stack_size = job.opts.stack_size;
@@ -791,10 +773,6 @@ pub const Job = struct {
         return i;
     }
 };
-
-/// In a compilation's cache directory: its last build imported C
-/// (`Job.cImported`).
-const c_import_marker = "cimport";
 
 /// `Zcu.c_importer` of a compilation: `TranslateC.cImport` for its job.
 const CImporter = struct {
@@ -861,7 +839,7 @@ fn compileJob(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, o
     // every aarch64-macos build) answers a build of the same compilation
     // that changed nothing from its inputs record, unless asked to check
     // itself (`BS_CACHE_VERIFY`), which takes a build.
-    var rec: ?InputsRecord = if (inc_opt == null and out_path != null and (!job.cacheable() or job.cImported()) and !job.opts.c_only and !job.opts.dump_ir and
+    var rec: ?InputsRecord = if (inc_opt == null and out_path != null and !job.cacheable() and !job.opts.c_only and !job.opts.dump_ir and
         !std.mem.eql(u8, job.environ_map.get("BS_CACHE") orelse "", "off")) InputsRecord.open(init.arena.allocator(), job) else null;
     defer if (rec) |*r| r.close(init.io);
     // ziglint's rules are compile errors in the files the project's lint
@@ -922,13 +900,6 @@ fn compileJob(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, o
         error.NamesFullBuild => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             if (inc_opt) |i| i.endReplay();
-            replay_mode = "off";
-            continue;
-        },
-        // A build that replayed the last one's analysis and imports C
-        // (`compileReplaying`).
-        error.CImportFullBuild => {
-            if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             replay_mode = "off";
             continue;
         },
@@ -1625,18 +1596,6 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     try zcu.lint_covered.resize(init.gpa, fe.files.items.len, false);
     for (lint_state.covered_files.items) |i| zcu.lint_covered.set(i);
     try zcu.analyzeAll(&emit);
-    // A build that imports C reads files no dependency records
-    // (`Zcu.c_imports`): the cache does not record it, and its marker
-    // keeps the next builds to the inputs record (`Job.openCache`). One
-    // that replayed the last build's analysis builds again without.
-    const c_imported = zcu.c_imports.items.len != 0;
-    if (c_imported) if (inc_opt) |i| {
-        i.dir.writeFile(init.io, .{ .sub_path = c_import_marker, .data = "" }) catch {}; // ziglint-ignore: Z026 -- without it, the next build finds out again
-        if (zcu.replay != null) {
-            i.endReplay();
-            return error.CImportFullBuild;
-        }
-    };
     try zcu.checkExportCollisions();
     if (bench_runs != 0) try emit.benchCodegen(bench_runs);
     stages.markSplit("sema", "codegen", emit.codegen_ns);
@@ -1683,7 +1642,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // only if the link succeeds.
     // A lazy edit build links from the manifest it appends to.
     const lazy_linked = if (inc_opt) |i| try i.finishLazy(&fe, &zcu, &emit, Io.Dir.cwd(), bin_path) else null;
-    if (lazy_linked == null and !c_imported) if (inc_opt) |i| i.startRecord(&fe, &zcu, &emit);
+    if (lazy_linked == null) if (inc_opt) |i| i.startRecord(&fe, &zcu, &emit);
     // A static library is its object in an archive (link/Archive.zig); an
     // object with object inputs or C sources merges them (`writeMerged`).
     // A lazy edit build writes either itself.
@@ -1712,7 +1671,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         };
     }
     stages.mark("link");
-    if (lazy_linked == null and !c_imported) if (inc_opt) |i| {
+    if (lazy_linked == null) if (inc_opt) |i| {
         i.finishRecord(linked);
         if (linked) i.noteOutput(Io.Dir.cwd(), bin_path);
     };
@@ -1723,9 +1682,6 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         for (zcu.c_imports.items) |c| try appendInput(arena, &c_inputs, c.inputs);
         try r.write(arena, init.io, job, &fe, &zcu, c_inputs.items, bin_path);
         lint_state.record(init.io, r.dir);
-        // A build without `@cImport`s gives the compilation back to the
-        // cache (`Job.openCache`).
-        if (!c_imported) r.dir.deleteFile(init.io, c_import_marker) catch {}; // ziglint-ignore: Z026 -- usually there is none
     };
     stages.mark("cache record (after the link)");
     stages.print();

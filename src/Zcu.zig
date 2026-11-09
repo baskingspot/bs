@@ -172,9 +172,9 @@ embed_files: std.array_hash_map.String(EmbedFile) = .empty,
 /// Zig 0.16's `@cImport`: translates C source for a module's C flags
 /// (main sets it, to `TranslateC.cImport`); null where nothing can.
 c_importer: ?CImporter = null,
-/// What this build's `@cImport`s translated, in analysis order. Files
-/// that no dependency records were read: a build that imports C is not
-/// recorded in the on-disk cache (main's `cimport` marker).
+/// The translations this build's `@cImport`s made, each directory once
+/// (`Dependee.c_import` indexes it), with those an edit build made again
+/// before analysis (`Replay.create`).
 c_imports: std.ArrayList(CImport) = .empty,
 /// translate-c's errors (ErrorBundle message bodies) of the failed
 /// `@cImport`s, reported after Sema's, as upstream's.
@@ -468,6 +468,9 @@ pub const Dependee = union(enum) {
     /// (`deprecation`): Z011 reads it, and doc comments are not in ZIR,
     /// so no source hash covers them.
     deprecation: InternPool.NavIndex,
+    /// The output of translation `c_imports[index]` (Zig 0.16's
+    /// `@cImport`), which reads headers no source hash covers.
+    c_import: u32,
 };
 
 /// A file read by `@embedFile`.
@@ -557,12 +560,16 @@ pub const ErrorMsg = struct {
 /// A translation of Zig 0.16's `@cImport` (`TranslateC.cImport`), in
 /// memory that outlives the Zcu.
 pub const CImport = struct {
-    /// The directory of its `cimport.zig`.
+    /// The directory of its `cimport.zig`, named by the translation's key.
     dir: []const u8,
     /// The files translate-c read, zero-separated, `cimport.h` first.
     inputs: []const u8,
     /// An ErrorBundle message body, when translate-c reported errors.
     errors: ?[]const u8,
+    /// The module that imported it, whose options its module has
+    /// (`Frontend.cImportFile`), and its `cimport.zig`: set once loaded.
+    parent: Frontend.Module.Index = undefined,
+    file: ?u32 = null,
 };
 
 pub const CImporter = struct {

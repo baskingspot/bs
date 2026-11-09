@@ -6371,10 +6371,10 @@ fn failEmbed(sema: *Sema, block: *Block, src: Src, name: []const u8, err: anyerr
 /// Zig 0.16's `@cImport`: the body, evaluated at comptime, writes C
 /// source, which translate-c translates (`Zcu.c_importer`), and the
 /// result is the root struct of the translation's `cimport.zig`, a module
-/// of its own, as upstream's. The translation reads files that no
-/// dependency records, so a build that imports C is not recorded in the
-/// on-disk cache (`Zcu.c_imports`), and the comptime evaluator leaves it
-/// to the walker.
+/// of its own, as upstream's. The unit depends on the translation's
+/// output (`Dependee.c_import`), which an edit build makes again before
+/// analysis (`Replay.create`), and the comptime evaluator leaves it to
+/// the walker.
 fn zirCImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.Inst.Extended.InstData) CompileError!Ref {
     const zcu = sema.zcu;
     const gpa = sema.gpa;
@@ -6396,12 +6396,24 @@ fn zirCImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.Inst.Ex
     const module = zcu.file(sema.file).module;
     const result = importer.run(importer.ctx, buf.items, zcu.fe.module(module).cc_argv) catch |err|
         return sema.fail(block, src, "C import failed: {t}", .{err});
-    try zcu.c_imports.append(gpa, result);
     if (result.errors) |errors| {
+        // Listed for its inputs, which a build system watches.
+        try zcu.c_imports.append(gpa, result);
         const err = sema.fail(block, src, "C import failed", .{});
         if (!zcu.link_libc) try zcu.addNote(sema.file, src.span(try zcu.fe.tree(@fromBackingInt(sema.file))), "libc headers not available; compilation does not link against libc", .{});
         try zcu.c_import_errors.append(gpa, errors);
         return err;
+    }
+    // Each directory once: the same source and flags translate the same.
+    const index: u32 = for (zcu.c_imports.items, 0..) |c, i| {
+        if (c.file != null and std.mem.eql(u8, c.dir, result.dir)) break @intCast(i);
+    } else index: {
+        try zcu.c_imports.append(gpa, result);
+        break :index @intCast(zcu.c_imports.items.len - 1);
+    };
+    if (zcu.c_imports.items[index].file) |file| {
+        try sema.declareDependency(.{ .c_import = index });
+        return .fromInterned(try sema.fileRootType(file));
     }
     const file_index = zcu.fe.cImportFile(module, result.dir) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -6412,6 +6424,9 @@ fn zirCImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.Inst.Ex
     } orelse return sema.fail(block, src, "C import failed: {t}", .{error.FileNotFound});
     if (zcu.file_root_types.items.len < zcu.fe.files.items.len)
         try zcu.file_root_types.appendNTimes(gpa, .none, zcu.fe.files.items.len - zcu.file_root_types.items.len);
+    zcu.c_imports.items[index].parent = module;
+    zcu.c_imports.items[index].file = @backingInt(file_index);
+    try sema.declareDependency(.{ .c_import = index });
     return .fromInterned(try sema.fileRootType(@backingInt(file_index)));
 }
 

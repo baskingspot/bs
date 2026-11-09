@@ -239,6 +239,8 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
     r.decoder.resolver = .{ .r = r };
     @memset(r.state, .unknown);
     @memset(r.input_files, 0);
+    // A donor's translations are another project's.
+    if (!donor) try remakeTranslations(zcu, m);
 
     // Each loaded file's input, and the inputs that changed.
     for (0..m.inputCount()) |i| _ = try r.by_path.getOrPutValue(gpa, m.input(@intCast(i))[1], @intCast(i));
@@ -272,8 +274,8 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
     // are outdated, whether or not the file is still on disk; inputs not
     // loaded yet whose key holds here are checked below.
     for (0..m.inputCount()) |i| {
-        // Link-only inputs: no node depends on them.
-        if (Incremental.isLinkInput(m.inputKey(@intCast(i)))) seen.set(i);
+        // Link-only and translations' inputs: no node depends on them.
+        if (Incremental.isLinkInput(m.inputKey(@intCast(i))) or Incremental.isTranslationInput(m.inputKey(@intCast(i)))) seen.set(i);
         if (seen.isSet(i) or try Incremental.inputKeyHolds(gpa, &path_buf, m, @intCast(i), fe)) continue;
         seen.set(i);
         if (try Incremental.inputKeyRebound(gpa, &path_buf, m, @intCast(i), fe)) {
@@ -443,6 +445,45 @@ fn donorEager(r: *Replay, fe: *const Frontend, missing: bool) !?[]const u8 {
     for (r.m.atom_refs) |ref| if (ref.pack == 0) return "the donor's atoms are not all in store packs";
     if (!try Incremental.donorPathsKnown(r.gpa, r.m, fe)) return "the donor's debug info names paths this build does not";
     return null;
+}
+
+/// Translates the last build's `@cImport`s again (`Incremental.c_import_prefix`)
+/// and loads their modules, as their importers did, before files are
+/// matched to inputs: a green unit's results can name the translation's
+/// types, and an edited header changes its `cimport.zig`, which the seeds
+/// then see as any changed file. One that cannot be made again (its
+/// importer is gone, the translation fails now, its source was trimmed)
+/// is left out: its file's nodes are then outdated, and so are the
+/// importers through their `c_import` dependency, which analysis makes
+/// again and reports on as a full build would.
+fn remakeTranslations(zcu: *Zcu, m: *const Manifest) !void {
+    if (zcu.language != .zig_0_16) return;
+    const importer = zcu.c_importer orelse return;
+    const fe = zcu.fe;
+    for (0..m.inputCount()) |i| {
+        const key = m.inputKey(@intCast(i));
+        if (!std.mem.startsWith(u8, key, Incremental.c_import_prefix)) continue;
+        const rest = key[Incremental.c_import_prefix.len..];
+        const colon = std.mem.findScalar(u8, rest, ':') orelse continue;
+        const parent: Frontend.Module.Index = for (fe.modules.items, 0..) |mod, k| {
+            if (std.mem.eql(u8, mod.name, rest[colon + 1 ..])) break @fromBackingInt(@as(u32, @intCast(k)));
+        } else continue;
+        const c_src = Io.Dir.cwd().readFileAlloc(zcu.io, m.input(@intCast(i))[1], zcu.arena.allocator(), .limited(16 << 20)) catch continue;
+        var c = importer.run(importer.ctx, c_src, fe.module(parent).cc_argv) catch continue;
+        if (c.errors != null or !std.mem.eql(u8, Io.Dir.path.basename(c.dir), rest[0..colon])) continue;
+        if (for (zcu.c_imports.items) |made| {
+            if (std.mem.eql(u8, made.dir, c.dir)) break true;
+        } else false) continue;
+        const file = fe.cImportFile(parent, c.dir) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => continue,
+        } orelse continue;
+        c.parent = parent;
+        c.file = @backingInt(file);
+        try zcu.c_imports.append(zcu.gpa, c);
+    }
+    if (zcu.file_root_types.items.len < fe.files.items.len)
+        try zcu.file_root_types.appendNTimes(zcu.gpa, .none, fe.files.items.len - zcu.file_root_types.items.len);
 }
 
 pub fn destroy(r: *Replay) void {
@@ -1123,6 +1164,14 @@ fn decodeDependee(r: *Replay, d: u32, tag: Tag) !?Zcu.Dependee {
             } else return null;
             break :blk .{ .embed_file = zcu.embedFile(mod, key[colon + 1 ..]) catch return null };
         },
+        // The translation `create` made again, if it could.
+        .c_import => blk: {
+            if (s != .c_import) return null;
+            for (zcu.c_imports.items, 0..) |c, i| {
+                if (c.file != null and std.mem.eql(u8, Io.Dir.path.basename(c.dir), s.c_import)) break :blk .{ .c_import = @intCast(i) };
+            }
+            return null;
+        },
         .comptime_decl, .content, .link => null,
     };
 }
@@ -1147,7 +1196,7 @@ fn ensure(r: *Replay, dep: Zcu.Dependee) bool {
             defer zcu.speculating -= 1;
             if ((r.emit.inlineFate(func) catch return false) != .fate) return false;
         },
-        .func_body, .namespace_name, .namespace, .embed_file, .deprecation => {},
+        .func_body, .namespace_name, .namespace, .embed_file, .deprecation, .c_import => {},
     }
     return true;
 }
@@ -1447,7 +1496,7 @@ fn addRefer(
         .struct_defaults => |ty| .{ .struct_defaults = ty },
         .func_ies, .func_inline => |func| .{ .func = func },
         .func_body => return,
-        .namespace, .namespace_name, .embed_file => {
+        .namespace, .namespace_name, .embed_file, .c_import => {
             const node = r.m.find((try r.keyer.dependeeInfo(d)).key) orelse return;
             const gop = try dep_nodes.getOrPut(gpa, unit);
             if (!gop.found_existing) gop.value_ptr.* = .empty;

@@ -1012,6 +1012,8 @@ pub const Subject = union(enum) {
     namespace: Index,
     /// The file's stable key, `module:sub/path`.
     embed_file: []const u8,
+    /// The translation's key, its directory's name.
+    c_import: []const u8,
 };
 
 /// Words: the subject's tag, then a ref, a declaration (its namespace's
@@ -1032,7 +1034,7 @@ pub fn encodeSubject(e: *Encoder, out: *std.ArrayList(u32), s: Subject) !bool {
             try appendBytes(e.gpa, out, nn.name);
             break :blk true;
         },
-        .embed_file => |key| blk: {
+        .embed_file, .c_import => |key| blk: {
             try appendBytes(e.gpa, out, key);
             break :blk true;
         },
@@ -1058,6 +1060,7 @@ pub fn decodeSubject(d: anytype, words: []const u32) !?Subject {
             break :blk .{ .namespace_name = .{ .owner = owner, .name = c.bytes() } };
         },
         .embed_file => .{ .embed_file = c.bytes() },
+        .c_import => .{ .c_import = c.bytes() },
     };
 }
 
