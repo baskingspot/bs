@@ -206,10 +206,7 @@ cat >build.zig <<'ZIG'
 const std = @import("std");
 pub fn build(b: *std.Build) void {
     std.debug.print("configured\n", .{});
-    const exe = b.addExecutable(.{
-        .name = "m",
-        .root_module = b.createModule(.{ .root_source_file = b.path("m.zig"), .target = b.graph.host }),
-    });
+    const exe = b.addExecutable(.{ .name = "m", .root_module = b.createModule(.{ .root_source_file = b.path("m.zig"), .target = b.graph.host }) });
     b.installArtifact(exe);
 }
 ZIG

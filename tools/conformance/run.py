@@ -202,15 +202,6 @@ STATUS_LABELS = {
 # itself, filtered to its own tests: one of them only reproduces in the root.
 
 
-def lint_off(d, zig_version=None):
-    """bs lints a project's files by default; upstream's code is compiled
-    with lint off. A `.bs.zon` in `d` turns it off for root files there
-    (all bs searches outside a project) and for a project rooted there,
-    and with `zig_version` chooses the language."""
-    field = f' .zig_version = "{zig_version}",' if zig_version else ""
-    (d / ".bs.zon").write_text(f".{{ .lint = false,{field} }}\n")
-
-
 def unit_root(unit, workdir, editable=False):
     """The unit's root source file, generated if needed. If `editable`, the
     unit's own file is a copy (`behavior/<unit>`), the others links."""
@@ -234,7 +225,6 @@ def unit_root(unit, workdir, editable=False):
             shutil.rmtree(link)
         link.unlink(missing_ok=True)
         link.symlink_to(UPSTREAM_TEST / "behavior", target_is_directory=True)
-    lint_off(unit_dir)
     root = unit_dir / "behavior.zig"
     text = f'comptime {{\n    _ = @import("behavior/{unit}");\n}}\n'
     if not root.exists() or root.read_text() != text:
@@ -1385,7 +1375,6 @@ def run_case(compiler, path, cfg, expected, args, workdir, target=None):
     """`target`: the `-target` to compile for, or None for the host."""
     out_dir = workdir / "compile-errors" / path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
-    lint_off(out_dir)
     # Upstream's harness compiles each case as tmp.zig, in a module named
     # root.
     root = out_dir / "tmp.zig"
@@ -1591,7 +1580,6 @@ def run_one_case(compiler, case, args, workdir):
     out_dir = workdir / "cases" / re.sub(r"[^\w.-]", "_", name)
     shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True)
-    lint_off(out_dir)
     if kind == "error":
         _, expected = parse_case(path)
         if args.upstream:
@@ -1746,7 +1734,8 @@ def run_one_standalone(compiler, name, args, workdir, env):
     shutil.rmtree(out_dir, ignore_errors=True)
     shutil.copytree(STANDALONE_ROOT / name, out_dir)
     # `bs build` takes its language from the root package's .bs.zon.
-    lint_off(out_dir, "0.16" if ZIG_0_16 and not args.upstream else None)
+    if ZIG_0_16 and not args.upstream:
+        (out_dir / ".bs.zon").write_text('.{ .zig_version = "0.16" }\n')
     argv = [str(compiler), "build", "--summary", "all"]
     code, _out, err, timed_out = run_process(argv, out_dir, args.compile_timeout, env)
     r = {}
@@ -1948,7 +1937,6 @@ def run_one_langref(compiler, path, cfg, args, workdir):
     out_dir = workdir / "langref" / re.sub(r"[^\w.-]", "_", name)
     shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True)
-    lint_off(out_dir)
     argv = langref_argv(compiler, path, kind, opts, name, cfg)
     # Under the emulator, an example linking glibc needs the target's
     # glibc (.agents/setup installs it); without it the run says nothing.
@@ -2197,7 +2185,6 @@ def run_one_incremental(compiler, path, cfg, args, workdir):
     shutil.rmtree(out_dir, ignore_errors=True)
     src = out_dir / "src"
     src.mkdir(parents=True)
-    lint_off(src)
     bin_path = out_dir / "main"
     argv = [str(compiler), "build-exe", *exe_args, f"-femit-bin={bin_path}", "--error-format=json"]
     if cfg["host"] != (platform.system(), platform.machine()):
@@ -2475,13 +2462,6 @@ def main():
         p.error("--out needs exactly one --target")
     if not (UPSTREAM_TEST / "behavior.zig").exists():
         sys.exit(f"error: {UPSTREAM_TEST} is missing; run .agents/setup")
-    # Upstream's own tree turns lint off with a .bs.zon at its root and
-    # beside each build.zig, written by .agents/setup and the flake
-    # (`lint_off`).
-    for d in (UPSTREAM_TEST.parent, UPSTREAM_TEST.parent / "doc" / "langref"):
-        if not (d / ".bs.zon").exists():
-            sys.exit(f"error: {d / '.bs.zon'} is missing; run .agents/setup")
-    lint_off(args.workdir)
 
     host = (platform.system(), platform.machine())
     # Compile errors need no binary run, so any host measures any target.

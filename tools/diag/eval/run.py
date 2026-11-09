@@ -83,10 +83,6 @@ def compile_cmd(fname):
 def write_case(d, seed, src):
     with open(os.path.join(d, seed_file(seed)), "w") as f:
         f.write(src)
-    # The seeds are sample user programs scored on bs's other errors, so
-    # bs's lint, on by default, is off for them.
-    with open(os.path.join(d, ".bs.zon"), "w") as f:
-        f.write(".{ .lint = false }\n")
     if seed_file(seed) == "build.zig":
         os.makedirs(os.path.join(d, "src"), exist_ok=True)
         with open(os.path.join(d, "src", "main.zig"), "w") as f:

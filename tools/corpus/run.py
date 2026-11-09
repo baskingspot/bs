@@ -67,14 +67,11 @@ def setup(proj, zig, refresh):
     return src, record(proj, zig, src, cmds_path)
 
 
-def lint_off(path, zig_version=None):
-    """Writes a `.bs.zon` that turns bs's lint off over `path`: bs lints a
-    project's own files by default, and the corpus is third-party code.
-    With `zig_version` it also chooses bs's language there."""
-    os.makedirs(path, exist_ok=True)
-    field = f' .zig_version = "{zig_version}",' if zig_version else ""
+def choose_language(path, zig_version):
+    """Writes a `.bs.zon` that chooses bs's language for the project at
+    `path` (the manifest's `zig_version`)."""
     with open(os.path.join(path, ".bs.zon"), "w") as f:
-        f.write(f".{{ .lint = false,{field} }}\n")
+        f.write(f'.{{ .zig_version = "{zig_version}" }}\n')
 
 
 def oracle(proj, zig):
@@ -89,7 +86,6 @@ def oracle(proj, zig):
 
 def checkout(proj, zig):
     """Clone the project at its pinned commit and fetch its data packages."""
-    lint_off(WORK)
     src = os.path.join(WORK, "src", proj["name"])
     proj["fetched"] = {
         "src": src,
@@ -108,7 +104,6 @@ def checkout(proj, zig):
             os.makedirs(os.path.dirname(os.path.join(src, name)), exist_ok=True)
             with open(os.path.join(src, name), "w") as f:
                 f.write(text)
-        lint_off(src)
         return src
     if not os.path.isdir(os.path.join(src, ".git")):
         os.makedirs(os.path.dirname(src), exist_ok=True)
@@ -119,7 +114,8 @@ def checkout(proj, zig):
     if proj.get("submodules"):
         # Vendored C sources (buzz's mimalloc, pcre2, ...).
         sh(["git", "submodule", "update", "--quiet", "--init", "--recursive"], src)
-    lint_off(src, proj.get("zig_version"))
+    if proj.get("zig_version"):
+        choose_language(src, proj["zig_version"])
     # Data packages a target's run needs (`fetch`), unpacked under .work/fetch/.
     for name, url in proj.get("fetch", {}).items():
         h = sh([zig, "fetch", url], WORK).stdout.strip()

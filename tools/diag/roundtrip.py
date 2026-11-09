@@ -102,10 +102,6 @@ def check(bs, zig, case, kinds):
     try:
         path = os.path.join(tmp, os.path.basename(case))
         shutil.copy(case, path)
-        # The fixes checked are of bs's other errors: lint, on by
-        # default, is off.
-        with open(os.path.join(tmp, ".bs.zon"), "w") as f:
-            f.write(".{ .lint = false }\n")
         problems = []
         n_applied = 0
         before = bs_errors(bs, path)

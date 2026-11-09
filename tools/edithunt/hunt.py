@@ -173,10 +173,6 @@ class Project:
         )
         for rel, path in self.extra.items():
             shutil.copy(path, os.path.join(dest, rel))
-        # bs lints a project's own files by default; the hunt builds
-        # upstream's and third-party code, with lint off.
-        with open(os.path.join(dest, ".bs.zon"), "w") as f:
-            f.write(".{ .lint = false }\n")
         return root
 
     def roots(self, tree):

@@ -257,18 +257,7 @@ def ast_check(tools, src):
     return p.returncode == 0, p.stderr
 
 
-def lint_off(path):
-    """Writes a `.bs.zon` that turns bs's lint off for the root files in
-    `path` (and, inside this repository, under it): bs lints a project's
-    files by default, and generated programs are not bs's style."""
-    with open(os.path.join(path, ".bs.zon"), "w") as f:
-        f.write(".{ .lint = false }\n")
-
-
 def new_scratch(prefix="mchunt-"):
     base = os.path.join(WORK, "tmp")
     os.makedirs(base, exist_ok=True)
-    lint_off(WORK)
-    d = tempfile.mkdtemp(prefix=prefix, dir=base)
-    lint_off(d)
-    return d
+    return tempfile.mkdtemp(prefix=prefix, dir=base)

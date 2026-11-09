@@ -90,16 +90,6 @@ def rmtree(path):
         shutil.rmtree(path)
 
 
-def lint_off(path):
-    """Writes a `.bs.zon` that turns bs's lint off for the root files in
-    `path` (or the project it is the root of): bs lints a project's own
-    files by default, and the workloads are upstream's and third-party
-    code."""
-    os.makedirs(path, exist_ok=True)
-    with open(os.path.join(path, ".bs.zon"), "w") as f:
-        f.write(".{ .lint = false }\n")
-
-
 def run_checked(argv, cwd, env=None):
     log(f"  $ {shlex.join(argv)}  (in {cwd})")
     p = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
@@ -284,7 +274,7 @@ class Hello(Workload):
     description = "hello world through std.debug.print"
 
     def setup(self):
-        lint_off(self.dir)
+        os.makedirs(self.dir, exist_ok=True)
         shutil.copy(os.path.join(BENCH_DIR, "workloads", "hello", "hello.zig"), self.dir)
         lib = private_lib(self.dir, zig_env(self.setup_zig)["lib_dir"])
         self.commands = {
@@ -331,12 +321,11 @@ class Vaxis(Workload):
         if not os.path.isdir(os.path.join(src, ".git")):
             run_checked(["git", "clone", "--quiet", VAXIS_URL, src], self.work)
         run_checked(["git", "checkout", "--quiet", "--force", "--detach", VAXIS_COMMIT], src)
-        lint_off(src)
         gen = os.path.join(self.dir, "gen")
         setup_cache = os.path.join(self.work, "setup-cache")
         setup_env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=os.path.join(setup_cache, "global"))
         wrapper = os.path.join(self.dir, "wrapper")
-        lint_off(wrapper)
+        os.makedirs(wrapper, exist_ok=True)
         for f in ("build.zig", "build.zig.zon"):
             shutil.copy(os.path.join(BENCH_DIR, "workloads", "vaxis-build", f), wrapper)
         if not (
@@ -464,7 +453,6 @@ class ZigCompiler(Workload):
         src = os.path.join(self.dir, "src")
         rmtree(src)
         shutil.copytree(upstream_src, src)
-        lint_off(src)
         shutil.copy(os.path.join(BENCH_DIR, "workloads", "zig", "build_options.zig"), self.dir)
         self.commands = {
             "build-exe": {

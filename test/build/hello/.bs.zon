@@ -1,3 +1,0 @@
-// A fixture of bs build's mechanics (test/build/check.sh edits it and
-// expects its line numbers), not of the lint rules (test/lint/).
-.{ .lint = false }
