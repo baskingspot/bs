@@ -278,13 +278,19 @@ pub fn build(b: *std.Build) void {
     bench_codegen_run.has_side_effects = true;
     b.step("bench-codegen", "Measure the backend per stage, per IR instruction, on the hello workload (others: BS_BENCH_CODEGEN=n bs build-exe ...)").dependOn(&bench_codegen_run.step);
 
+    // Checks too slow for every push, part of `test` but left out of CI's
+    // jobs: .github/workflows/nightly.yml runs them once a day.
+    const nightly_step = b.step("test-nightly", "Checks CI runs nightly, not on every push: a ReleaseFast bs on aarch64-macos");
+    test_step.dependOn(nightly_step);
+
     // C sources on an aarch64-macos host, compiled with upstream's Clang
     // and linked against libSystem, by bs built as for the other tests and
     // by a ReleaseFast bs: only ReleaseFast reused the stack under a slice
     // of C arguments that outlived its function (a482a5f), which crashed
-    // every C compile on aarch64-macos.
+    // every C compile on aarch64-macos. The ReleaseFast bs takes LLVM two
+    // minutes to build on a 6-core Mac, so its check runs nightly.
     if (b.graph.host.result.os.tag == .macos) {
-        for ([_]*std.Build.Step.Compile{ exe, bench_bs }, [_][]const u8{ "", " (ReleaseFast bs)" }) |bs, what| {
+        for ([_]*std.Build.Step.Compile{ exe, bench_bs }, [_][]const u8{ "", " (ReleaseFast bs)" }, [_]*std.Build.Step{ link_step, nightly_step }) |bs, what, step| {
             const c_exe = b.addRunArtifact(bs);
             c_exe.setName(b.fmt("bs build-exe -lc with a C source on aarch64-macos{s}", .{what}));
             c_exe.addArgs(&.{ "build-exe", "-lc" });
@@ -296,7 +302,7 @@ pub fn build(b: *std.Build) void {
             c_run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
             c_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
             c_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
-            link_step.dependOn(&c_run.step);
+            step.dependOn(&c_run.step);
         }
         // An executable of C only in ReleaseSafe: Clang's function
         // sanitizer puts a prefix before `main` in its section, so the

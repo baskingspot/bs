@@ -1,0 +1,61 @@
+name: nightly
+
+# Checks too slow for every push (`just nightly`, build.zig's
+# test-nightly step), on main once a day. The org's shared CI workflow
+# takes its jobs from .github/ci.yaml only, so this runs the recipe the
+# way that workflow does, with the same pinned actions. A failure opens an
+# issue, or comments on the one still open.
+on:
+  schedule:
+    # 04:17 UTC daily.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  nightly:
+    name: nightly (macos-26)
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.35.3/install
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: baskingspot
+          extraPullNames: mattrobenolt
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.ref != 'refs/heads/main' }}
+      - name: Run the recipe
+        run: nix develop --command just nightly
+
+  report:
+    name: report a failure
+    needs: nightly
+    if: failure()
+    runs-on: ubuntu-26.04
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the issue
+        run: |
+          set -euo pipefail
+          title="Nightly checks failed"
+          num=$(gh issue list --repo "$REPO" --state open --search "in:title \"$title\"" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --repo "$REPO" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --repo "$REPO" --title "$title" \
+              --body "\`just nightly\` (build.zig's test-nightly step) failed on main: $RUN_URL"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
