@@ -18,7 +18,10 @@ jobs:
   - recipe: test-steps test-link
     runners: [macos-26]
     blocking: false
-  - recipe: test-steps test-run
+  - recipe: test-steps test-run-1
+    runners: [macos-26]
+    blocking: false
+  - recipe: test-steps test-run-2
     runners: [macos-26]
     blocking: false
   - recipe: test-steps test-edit test-unit
