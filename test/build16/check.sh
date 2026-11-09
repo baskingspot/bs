@@ -66,7 +66,7 @@ cmp -s "$work/bs-deps" "$work/zig-deps" || fail "dependencies.zig differs from z
 rm -rf .zig-cache zig-pkg
 bsb --fetch=all || fail "bs build --fetch=all"
 [ -d "zig-pkg/$hash" ] || fail "--fetch=all: zig-pkg/$hash"
-[ ! -e .zig-cache/bs/build-runner/build ] || fail "--fetch=all compiled the runner"
+! ls .zig-cache/bs/build-runner/*/build >/dev/null 2>&1 || fail "--fetch=all compiled the runner"
 
 # A step's compile error reaches the runner, which reports it.
 sed 's/greet.hello();/greet.hello();\n    return 1;/' main.zig >main.zig.new
@@ -80,3 +80,19 @@ for arg in --webui --fuzz --time-report; do
     bsb install "$arg" && fail "bs build $arg succeeded"
     expect "'$arg' starts Zig 0.16's build web UI, which bs does not serve"
 done
+
+# A step that runs `zig build --build-file` on a project of its own
+# without a build.zig.zon (zls's tests do) gets the runner's
+# BS_ZIG_VERSION, and bs builds that project in 0.16, with 0.16's runner
+# and that build file, as zig 0.16 would.
+mkdir "$work/nested"
+printf 'const std = @import("std");\npub fn build(b: *std.Build) void {\n    _ = b.step("nothing", "");\n}\n' >"$work/nested/case.zig"
+echo '.{ .lint = false }' >"$work/nested/.bs.zon"
+cd "$work/nested"
+BS_ZIG_VERSION=0.16 BS_UNFINISHED_0_16=1 BS_ZIG_0_16="$zig16" "$bs" build --build-file case.zig nothing --global-cache-dir "$work/global" >"$work/log" 2>&1 || fail "bs build of a project without build.zig.zon under BS_ZIG_VERSION=0.16"
+ls .zig-cache/bs/build-runner/*/build >/dev/null 2>&1 || fail "BS_ZIG_VERSION=0.16 did not build with 0.16's runner"
+# Each build file of a directory has a runner of its own, so that builds
+# of several at once (zls's tests) do not overwrite each other's.
+sed 's/"nothing", ""/"nothing", "case2"/' case.zig >case2.zig
+BS_ZIG_VERSION=0.16 BS_UNFINISHED_0_16=1 BS_ZIG_0_16="$zig16" "$bs" build --build-file case2.zig nothing --global-cache-dir "$work/global" >"$work/log" 2>&1 || fail "bs build --build-file case2.zig"
+[ "$(find .zig-cache/bs/build-runner -name build -type f | wc -l)" -eq 2 ] || fail "two build files share a runner"

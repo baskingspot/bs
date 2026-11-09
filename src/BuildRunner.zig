@@ -37,7 +37,13 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const global = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, dirs.global });
     // The root package's language is every compilation's (`BS_ZIG_VERSION`
     // for the compilations the runner asks for).
-    const choice: language.Choice = if (try buildRoot(arena, io, cwd, user_args)) |root| try language.forBuild(arena, io, env, root) else .{ .language = .newest, .source = .default };
+    var choice: language.Choice = if (try buildRoot(arena, io, cwd, user_args)) |root| try language.forBuild(arena, io, env, root) else .{ .language = .newest, .source = .default };
+    // A project without a build.zig.zon that a step of an outer build runs
+    // `zig build` on (zls's tests do) is in the outer build's language, as
+    // with that build's zig; one with a build.zig.zon is in its own.
+    if (choice.source == .default) if (env.get("BS_ZIG_VERSION")) |v| {
+        choice = .{ .language = language.Language.fromVersion(v) orelse main.fatal("BS_ZIG_VERSION '{s}': bs compiles {s}", .{ v, language.supported }), .source = .env };
+    };
     // Zig 0.16 fetches and runs its build runner from the compiler.
     if (choice.language == .zig_0_16) return Build16.run(init, args, choice);
     const lib = try toolchain.libDir(arena, io, env, global, lib_override, choice.language);

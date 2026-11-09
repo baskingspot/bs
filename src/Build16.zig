@@ -27,6 +27,7 @@ const Frontend = @import("Frontend.zig");
 const BuildRunner = @import("BuildRunner.zig");
 const toolchain = @import("toolchain.zig");
 const language = @import("language.zig");
+const cache = @import("cache.zig");
 const maker = @import("fetch");
 const Package = maker.Package;
 const Fetch = Package.Fetch;
@@ -137,9 +138,6 @@ pub fn run(init: std.process.Init, args: []const []const u8, choice: language.Ch
     for (fork_paths.items) |p| try forks.append(arena, try loadFork(arena, io, p, color));
 
     const runner_root = if (runner_override) |r| try Io.Dir.path.resolveAlloc(arena, &.{ cwd, r }) else try Io.Dir.path.join(arena, &.{ lib, "compiler", "build_runner.zig" });
-    const runner_dir = try Io.Dir.path.join(arena, &.{ local, "bs", "build-runner" });
-    try Io.Dir.cwd().createDirPath(io, runner_dir);
-    const runner_path = try Io.Dir.path.join(arena, &.{ runner_dir, "build" });
     const self_exe = try std.process.executablePathAlloc(io, arena);
 
     // One display for the whole command, as upstream's: a process starts
@@ -151,6 +149,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, choice: language.Ch
     while (true) {
         const modules = try fetchPackages(init, .{
             .build_root = build_root,
+            .build_zig_basename = if (build_file) |bf| Io.Dir.path.basename(bf) else std.zig.build_zig_basename,
             .local = local,
             .global = global,
             .system_pkg_dir = system_pkg_dir,
@@ -174,6 +173,12 @@ pub fn run(init: std.process.Init, args: []const []const u8, choice: language.Ch
         if (debug_compile_errors) try compile_args.append(arena, "--debug-compile-errors");
         try compile_args.appendSlice(arena, &.{ "--dep", "@build", "--dep", "@dependencies", try arena.print("-Mroot={s}", .{runner_root}) });
         try compile_args.appendSlice(arena, modules);
+        // One runner per build file and set of packages, as upstream's
+        // `o/<digest>`: zls's tests build several build files of one
+        // directory at once.
+        const runner_dir = try arena.print("{s}/bs/build-runner/{x:0>32}", .{ local, cache.hash(0, try std.mem.join(arena, "\x00", compile_args.items)) });
+        try Io.Dir.cwd().createDirPath(io, runner_dir);
+        const runner_path = try Io.Dir.path.join(arena, &.{ runner_dir, "build" });
         // Said for the build.zig.zon that chose, not for the BS_ZIG_VERSION
         // that bs set from it.
         main.checkSupported(init.environ_map, choice);
@@ -288,6 +293,8 @@ fn loadFork(arena: Allocator, io: Io, cwd_relative_path: []const u8, color: std.
 
 const FetchOptions = struct {
     build_root: []const u8,
+    /// `--build-file`'s, else build.zig: the `@build` module's root.
+    build_zig_basename: []const u8,
     local: []const u8,
     global: []const u8,
     system_pkg_dir: ?[]const u8,
@@ -342,7 +349,7 @@ fn fetchPackages(init: std.process.Init, o: FetchOptions) ![]const []const u8 {
     try job_queue.table.ensureUnusedCapacity(gpa, 1);
 
     const build_mod = try arena.create(CliModule);
-    build_mod.* = .{ .name = "@build", .root_path = try Io.Dir.path.join(arena, &.{ o.build_root, std.zig.build_zig_basename }) };
+    build_mod.* = .{ .name = "@build", .root_path = try Io.Dir.path.join(arena, &.{ o.build_root, o.build_zig_basename }) };
     const phantom_package_root: Cache.Path = .{ .root_dir = build_root_dir };
     var fetch: Fetch = .{
         .arena = std.heap.ArenaAllocator.init(gpa),

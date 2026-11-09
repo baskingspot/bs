@@ -8023,15 +8023,23 @@ state. Built for step 1:
   `dependencies.zig` did not change), writes `dependencies.zig` to
   `<local cache>/o/<hash>/`, compiles 0.16's
   `lib/compiler/build_runner.zig` in 0.16 with `--dep @build --dep
-  @dependencies` and a `-M` module per package build.zig into `<local
-  cache>/bs/build-runner/build` (in process, `BuildRunner.compileTool`;
-  bs's cache makes an unchanged one a no-change build), with the Progress
-  display the whole command shares, and runs it with
+  @dependencies` and a `-M` module per package build.zig (the root
+  package's is `--build-file`'s) into `<local
+  cache>/bs/build-runner/<hash of the arguments>/build`, one per build
+  file and package set as upstream's `o/<digest>`, since a project may
+  build several build files at once (zls's tests do), in process
+  (`BuildRunner.compileTool`; bs's cache makes an unchanged one a
+  no-change build), with the Progress display the whole command shares,
+  and runs it with
   0.16's arguments (bs, lib, build root, local and global cache,
   `--seed`, `-Z<nonce>`, the user's). Exit code 3 means lazy packages are
   missing, their hashes in `<local cache>/tmp/<nonce>`: bs adds them to
   the fetch and runs the runner again. `BS_ZIG_VERSION` in the runner's
-  environment puts every compilation it asks for in 0.16. `serve` speaks
+  environment puts every compilation it asks for in 0.16. A step that
+  runs `zig build` on a project of its own inherits it: `bs build` of a
+  project without a build.zig.zon takes that language, as the outer
+  build's zig would, and one with a build.zig.zon takes its own
+  (`BuildRunner.run`). `serve` speaks
   0.16's protocol to it: version "0.16.0", no `config` message, no
   `build_root` path prefix (0.16 knows four). `--webui`, `--fuzz` and
   `--time-report` start 0.16's web UI, which bs does not serve, and are
