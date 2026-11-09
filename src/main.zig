@@ -376,7 +376,10 @@ pub fn main(init_std: std.process.Init) !void {
     else if (std.mem.eql(u8, cmd, "test-obj"))
         .test_obj
     else if (std.mem.eql(u8, cmd, "version")) {
-        try Io.File.stdout().writeStreamingAll(init.io, zig_version ++ "\n");
+        // The language's, as a `zig version` inside a Zig 0.16 build (a
+        // step's own `zig build`, zls's version check) runs zig 0.16.
+        const lang = (try language.resolve(arena, init.io, init.environ_map, null, null)).language;
+        try Io.File.stdout().writeStreamingAll(init.io, try arena.print("{s}\n", .{lang.versionString()}));
         return;
     } else if (std.mem.eql(u8, cmd, "fmt")) {
         return zig_fmt.run(init.gpa, arena, init.io, raw_args[2..]);
@@ -1671,7 +1674,9 @@ fn printEnv(init: std.process.Init) !void {
     const env = init.environ_map;
     const cwd = try std.process.currentPathAlloc(io, arena);
     const dirs = Frontend.resolveCacheDirs(arena, io, env, .{ .local_is_global = true });
-    const lib_dir = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, (try toolchain.libDir(arena, io, env, dirs.global, null, .newest)).path });
+    // As `version`.
+    const lang = (try language.resolve(arena, io, env, null, null)).language;
+    const lib_dir = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, (try toolchain.libDir(arena, io, env, dirs.global, null, lang)).path });
     var buf: [4096]u8 = undefined;
     var out = Io.File.stdout().writerStreaming(io, &buf);
     var serializer: std.zon.Serializer = .{ .writer = &out.interface };
@@ -1680,7 +1685,7 @@ fn printEnv(init: std.process.Init) !void {
     try root.field("lib_dir", lib_dir, .{});
     try root.field("std_dir", try Io.Dir.path.join(arena, &.{ lib_dir, "std" }), .{});
     try root.field("global_cache_dir", try Io.Dir.path.resolveAlloc(arena, &.{ cwd, dirs.global }), .{});
-    try root.field("version", zig_version, .{});
+    try root.field("version", lang.versionString(), .{});
     try root.field("target", "x86_64-linux-none", .{});
     var env_struct = try root.beginStructField("env", .{});
     inline for (@typeInfo(std.zig.EnvVar).@"enum".field_names) |field_name| {
