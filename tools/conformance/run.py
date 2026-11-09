@@ -2344,8 +2344,18 @@ def use_zig_0_16(args):
     baseline/0.16/, zig 0.16.0 as the oracle (bs finds the same one), its
     test runner, and BS_ZIG_VERSION for every bs run. bs itself is still
     built with --zig, the 0.17.1 that builds bs."""
-    global UPSTREAM_TEST, UPSTREAM_LIB, BASELINE_DIR, CASES_DIR, CASES_ROOT, STANDALONE_ROOT, INCREMENTAL_ROOT, ZIG_0_16
+    global \
+        UPSTREAM_TEST, \
+        UPSTREAM_LIB, \
+        BASELINE_DIR, \
+        CASES_DIR, \
+        CASES_ROOT, \
+        STANDALONE_ROOT, \
+        INCREMENTAL_ROOT, \
+        LANGREF_ROOT, \
+        ZIG_0_16
     ZIG_0_16 = True
+    LANGREF_ROOT = REPO / "upstream-0.16" / "doc" / "langref"
     UPSTREAM_TEST = REPO / "upstream-0.16" / "test"
     UPSTREAM_LIB = REPO / "upstream-0.16" / "lib"
     BASELINE_DIR = HERE / "baseline" / "0.16"

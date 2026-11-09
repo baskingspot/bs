@@ -55,6 +55,18 @@
    "kind": "syntax",
    "outcome": "built"
   },
+  "builtin.CallModifier struct": {
+   "kind": "syntax",
+   "outcome": "built"
+  },
+  "cImport_builtin": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "hello\n",
+   "stderr": "",
+   "panic": null
+  },
   "catch": {
    "kind": "syntax",
    "outcome": "built"
@@ -140,7 +152,7 @@
    "outcome": "built",
    "exit": 0,
    "stdout": "",
-   "stderr": "x = 1, y = 2, z = 3\nx = 2\n",
+   "stderr": "x = 1, y = 2, z = 3\nx = 2",
    "panic": null
   },
   "destructuring_return_value": {
@@ -290,10 +302,6 @@
     "expected type expression, found 'a document comment'"
    ]
   },
-  "lang.CallModifier struct": {
-   "kind": "syntax",
-   "outcome": "built"
-  },
   "libc_export_entry_point": {
    "kind": "exe=succeed",
    "outcome": "built",
@@ -301,6 +309,10 @@
    "stdout": "",
    "stderr": "Hello! argv[0] is 'libc_export_entry_point'\n",
    "panic": null
+  },
+  "macro": {
+   "kind": "syntax",
+   "outcome": "built"
   },
   "math": {
    "kind": "exe=succeed",
@@ -450,11 +462,11 @@
   },
   "runtime_invalid_enum_cast": {
    "kind": "exe=fail",
-   "outcome": "build_failed",
-   "error": [
-    "runtime_invalid_enum_cast.zig:10:20",
-    "invalid builtin function: '@fromBackingInt'"
-   ]
+   "outcome": "built",
+   "exit": -6,
+   "stdout": "",
+   "stderr": "thread ? panic: invalid enum value\nruntime_invalid_enum_cast.zig:12:20: 0x? in main (runtime_invalid_enum_cast)\n    const b: Foo = @enumFromInt(a);\n                   ^\n/home/user/.cache/bs/zig-x86_64-linux-0.16.0/lib/std/start.zig:698:59: 0x? in callMain (runtime_invalid_enum_cast)\n    if (fn_info.params.len == 0) return wrapMain(root.main());\n                                                          ^\nqemu: uncaught target signal 6 (Aborted) - core dumped\n",
+   "panic": "thread ? panic: invalid enum value"
   },
   "runtime_invalid_error_code": {
    "kind": "exe=fail",
@@ -525,7 +537,7 @@
    "outcome": "built",
    "exit": -6,
    "stdout": "",
-   "stderr": "thread ? panic: right shift overflowed bits\nruntime_shrExact_overflow.zig:6:5: 0x? in main (runtime_shrExact_overflow)\n    const y = @shrExact(x, 2);\n    ^\n/home/user/.cache/bs/zig-x86_64-linux-0.16.0/lib/std/start.zig:698:59: 0x? in callMain (runtime_shrExact_overflow)\n    if (fn_info.params.len == 0) return wrapMain(root.main());\n                                                          ^\nqemu: uncaught target signal 6 (Aborted) - core dumped\n",
+   "stderr": "thread ? panic: right shift overflowed bits\nruntime_shrExact_overflow.zig:7:5: 0x? in main (runtime_shrExact_overflow)\n    const y = @shrExact(x, 2);\n    ^\n/home/user/.cache/bs/zig-x86_64-linux-0.16.0/lib/std/start.zig:698:59: 0x? in callMain (runtime_shrExact_overflow)\n    if (fn_info.params.len == 0) return wrapMain(root.main());\n                                                          ^\nqemu: uncaught target signal 6 (Aborted) - core dumped\n",
    "panic": "thread ? panic: right shift overflowed bits"
   },
   "runtime_unwrap_error": {
@@ -571,13 +583,6 @@
   "single_value_error_set_shortcut": {
    "kind": "syntax",
    "outcome": "built"
-  },
-  "slicing_by_length": {
-   "kind": "test",
-   "outcome": "built",
-   "exit": 0,
-   "summary": "All 1 tests passed.",
-   "panic": null
   },
   "stack_trace": {
    "kind": "exe=fail",
@@ -851,7 +856,7 @@
    "outcome": "build_failed",
    "error": [
     "test_comptime_invalid_enum_cast.zig:8:20",
-    "invalid builtin function: '@fromBackingInt'"
+    "enum 'test_comptime_invalid_enum_cast.Foo' has no tag with value '3'"
    ]
   },
   "test_comptime_invalid_error_code": {
@@ -994,6 +999,20 @@
     "access of union field 'float' while field 'int' is active"
    ]
   },
+  "test_container-level_comptime_expressions": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_container_level_variables": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
   "test_defer": {
    "kind": "test",
    "outcome": "built",
@@ -1024,11 +1043,17 @@
   },
   "test_enums": {
    "kind": "test",
-   "outcome": "build_failed",
-   "error": [
-    "test_enums.zig:25:24",
-    "invalid builtin function: '@backingInt'"
-   ]
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 8 tests passed.",
+   "panic": null
+  },
+  "test_errdefer_capture": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
   },
   "test_error_union": {
    "kind": "test",
@@ -1092,11 +1117,10 @@
   },
   "test_fn_reflection": {
    "kind": "test",
-   "outcome": "build_failed",
-   "error": [
-    "test_fn_reflection.zig:6:76",
-    "no field named 'param_types' in struct 'builtin.Type.Fn'"
-   ]
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
   },
   "test_fn_type_inference": {
    "kind": "test",
@@ -1109,7 +1133,7 @@
    "kind": "test",
    "outcome": "built",
    "exit": 0,
-   "summary": "All 5 tests passed.",
+   "summary": "All 4 tests passed.",
    "panic": null
   },
   "test_for_nested_break": {
@@ -1133,8 +1157,8 @@
   "test_hasDecl_builtin": {
    "kind": "test",
    "outcome": "built",
-   "exit": 1,
-   "summary": "0 passed; 0 skipped; 1 failed.",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
    "panic": null
   },
   "test_if": {
@@ -1174,11 +1198,10 @@
   },
   "test_inline_else": {
    "kind": "test",
-   "outcome": "build_failed",
-   "error": [
-    "test_inline_else.zig:26:28",
-    "invalid builtin function: '@backingInt'"
-   ]
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
   },
   "test_inline_for": {
    "kind": "test",
@@ -1189,11 +1212,10 @@
   },
   "test_inline_switch": {
    "kind": "test",
-   "outcome": "build_failed",
-   "error": [
-    "test_inline_switch.zig:6:48",
-    "no field named 'field_types' in struct 'builtin.Type.Struct'"
-   ]
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
   },
   "test_inline_switch_union_tag": {
    "kind": "test",
@@ -1252,13 +1274,6 @@
    "summary": "All 1 tests passed.",
    "panic": null
   },
-  "test_locally_scoped_global_variable": {
-   "kind": "test",
-   "outcome": "built",
-   "exit": 0,
-   "summary": "All 1 tests passed.",
-   "panic": null
-  },
   "test_merging_error_sets": {
    "kind": "test",
    "outcome": "built",
@@ -1289,21 +1304,7 @@
    "summary": "All 1 tests passed.",
    "panic": null
   },
-  "test_namespace-level_comptime_expressions": {
-   "kind": "test",
-   "outcome": "built",
-   "exit": 0,
-   "summary": "All 1 tests passed.",
-   "panic": null
-  },
-  "test_namespace_level_variables": {
-   "kind": "test",
-   "outcome": "built",
-   "exit": 0,
-   "summary": "All 1 tests passed.",
-   "panic": null
-  },
-  "test_namespaced_variable": {
+  "test_namespaced_container_level_variable": {
    "kind": "test",
    "outcome": "built",
    "exit": 0,
@@ -1377,14 +1378,6 @@
    "exit": 0,
    "summary": "All 1 tests passed.",
    "panic": null
-  },
-  "test_packed_struct_backing_int": {
-   "kind": "test",
-   "outcome": "build_failed",
-   "error": [
-    "test_packed_struct_backing_int.zig:13:25",
-    "invalid builtin function: '@backingInt'"
-   ]
   },
   "test_packed_struct_equality": {
    "kind": "test",
@@ -1544,11 +1537,10 @@
   },
   "test_slices": {
    "kind": "test",
-   "outcome": "build_failed",
-   "error": [
-    "test_slices.zig:21:32",
-    "root source file struct 'mem' has no member named 'print'"
-   ]
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
   },
   "test_splat_builtin": {
    "kind": "test",
@@ -1558,6 +1550,13 @@
    "panic": null
   },
   "test_src_builtin": {
+   "kind": "test",
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
+  },
+  "test_static_local_variable": {
    "kind": "test",
    "outcome": "built",
    "exit": 0,
@@ -1665,11 +1664,10 @@
   },
   "test_tagged_union_with_tag_values": {
    "kind": "test",
-   "outcome": "build_failed",
-   "error": [
-    "test_tagged_union_with_tag_values.zig:11:26",
-    "invalid builtin function: '@backingInt'"
-   ]
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
   },
   "test_this_builtin": {
    "kind": "test",
@@ -1745,19 +1743,17 @@
   },
   "test_variable_func_alignment": {
    "kind": "test",
-   "outcome": "build_failed",
-   "error": [
-    "test_variable_func_alignment.zig:6:57",
-    "no field named 'attrs' in struct 'builtin.Type.Pointer'"
-   ]
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 2 tests passed.",
+   "panic": null
   },
   "test_variadic_function": {
    "kind": "test",
-   "outcome": "build_failed",
-   "error": [
-    "test_variadic_function.zig:8:57",
-    "no field named 'attrs' in struct 'builtin.Type.Fn'"
-   ]
+   "outcome": "built",
+   "exit": 0,
+   "summary": "All 1 tests passed.",
+   "panic": null
   },
   "test_vector": {
    "kind": "test",
@@ -1970,6 +1966,14 @@
     "expected '=', found ';'"
    ]
   },
+  "verbose_cimport_flag": {
+   "kind": "exe=succeed",
+   "outcome": "built",
+   "exit": 0,
+   "stdout": "",
+   "stderr": "",
+   "panic": null
+  },
   "wasi_args": {
    "kind": "exe=succeed",
    "outcome": "skip"
@@ -1984,7 +1988,7 @@
   }
  },
  "summary": {
-  "examples": 290,
-  "compared": 283
+  "examples": 292,
+  "compared": 285
  }
 }
