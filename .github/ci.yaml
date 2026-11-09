@@ -24,7 +24,10 @@ jobs:
   - recipe: test-steps test-edit test-unit
     runners: [macos-26]
     blocking: false
-  - recipe: test-steps test-cache test-diag
+  - recipe: test-steps test-cache
+    runners: [macos-26]
+    blocking: false
+  - recipe: test-steps test-diag
     runners: [macos-26]
     blocking: false
   - recipe: ziglint
