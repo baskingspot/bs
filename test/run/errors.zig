@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n16\n41\nNope\nBad\nother\nA\n7\nGenericFailure\nWeird name!\n1\n100\n8\n200\n9\n300\n12\nOnlyFolded\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n16\n41\nNope\nBad\nother\nA\n7\nGenericFailure\nWeird name!\n1\n100\n8\n200\n9\n300\n12\nOnlyFolded\n0\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -57,6 +57,11 @@ fn halfUp(comptime T: type, x: T) !T {
 inline fn checked(x: u32) !u32 {
     if (x > 100) return error.TooBig;
     return x;
+}
+
+fn undefPayload(skip: bool) error{OutOfMemory}!u32 {
+    if (skip) return undefined;
+    return 3;
 }
 
 fn main() callconv(.c) noreturn {
@@ -206,6 +211,11 @@ fn main() callconv(.c) noreturn {
     _ = &folded;
     rt.print(@errorName(@errorFromInt(folded)));
     rt.print("\n");
+    // `undefined` coerces to an error union as its payload: not an error.
+    var in_macro = true;
+    _ = &in_macro;
+    rt.printInt(if (undefPayload(in_macro)) |_| 0 else |_| 1);
+    comptime _ = undefPayload(true) catch unreachable;
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
 }
 

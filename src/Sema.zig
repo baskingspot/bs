@@ -9529,10 +9529,20 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
     const src_ty = sema.typeOf(inst);
     if (src_ty == dest_ty or dest_ty == .generic_poison_type) return inst;
     if (src_ty == .noreturn_type) return inst;
-    if (src_ty == .undefined_type) {
+    if (src_ty == .undefined_type) undef: {
         // As upstream, no value of a type with no possible value exists,
         // not even an undefined one.
         if (try sema.noPossibleValue(block, src, dest_ty)) return null;
+        // As upstream, an error union takes `undefined` as its payload:
+        // it is not an error (Aro's `return undefined` from a function
+        // returning `Allocator.Error!Node.Index`). An inline call's
+        // inferred set is made concrete first, below.
+        if (Type.class(ip, dest_ty) == .error_union) {
+            const eu = ip.keyPayload(.error_union_type, dest_ty);
+            if (eu.error_set_type == .adhoc_inferred_error_set_type) break :undef;
+            const payload = (try sema.coerceInner(block, eu.payload_type, inst, src)) orelse return null;
+            return .fromInterned(try sema.intern(.{ .error_union = .{ .ty = dest_ty, .val = .{ .payload = sema.resolveValue(payload).? } } }));
+        }
         return .fromInterned(try sema.undefValue(dest_ty));
     }
     const val = sema.resolveValue(inst);
