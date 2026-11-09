@@ -13,6 +13,7 @@ const Writer = std.Io.Writer;
 const InternPool = @import("../InternPool.zig");
 const Ir = @import("../Ir.zig");
 const Type = @import("../Type.zig");
+const Language = @import("frontend").Language;
 const Inst = Ir.Inst;
 
 pub fn dump(ir: *const Ir, ip: *const InternPool, w: *Writer) Writer.Error!void {
@@ -331,6 +332,8 @@ pub const TemplateBuilder = struct {
 const Ctx = struct {
     ip: *const InternPool,
     names: Names = .render,
+    /// The language whose spelling values take (`@enumFromInt` in 0.16).
+    language: Language = .newest,
 };
 
 pub fn printType(ip: *const InternPool, ty: InternPool.Index, w: *Writer) Writer.Error!void {
@@ -345,8 +348,8 @@ pub fn printValueDepth(ip: *const InternPool, val: InternPool.Index, w: *Writer,
     return valueIn(.{ .ip = ip }, val, w, level);
 }
 
-pub fn printValueIn(ip: *const InternPool, val: InternPool.Index, w: *Writer, level: u8, names: Names) Writer.Error!void {
-    return valueIn(.{ .ip = ip, .names = names }, val, w, level);
+pub fn printValueIn(ip: *const InternPool, val: InternPool.Index, w: *Writer, level: u8, names: Names, language: Language) Writer.Error!void {
+    return valueIn(.{ .ip = ip, .names = names, .language = language }, val, w, level);
 }
 
 /// The name of container type or named tuple `ty`.
@@ -581,7 +584,7 @@ fn valueIn(cx: Ctx, val: InternPool.Index, w: *Writer, level: u8) Writer.Error!v
             for (info.field_defaults, 0..) |tag, i| {
                 if (tag == e.int and i < info.field_names.len) return w.print(".{s}", .{cx.ip.stringSlice(info.field_names[i])});
             }
-            try w.writeAll("@fromBackingInt(");
+            try w.writeAll(if (cx.language == .zig_0_16) "@enumFromInt(" else "@fromBackingInt(");
             if (level == 0) return w.writeAll("...)");
             try valueIn(cx, e.int, w, level - 1);
             try w.writeAll(")");

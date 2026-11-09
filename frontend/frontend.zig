@@ -24,6 +24,8 @@ pub const errors = @import("errors.zig");
 /// A hash of this module's sources (tools/frontend_hash.zig): ZIR from one
 /// version of them is not ZIR from another.
 pub const source_hash: u64 = @import("frontend_hash").hash;
+/// AstGen's source, whose error formats diag's test checks.
+pub const astgen_source = @embedFile("AstGen.zig");
 
 test {
     _ = tokenizer;

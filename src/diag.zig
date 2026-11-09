@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const frontend = @import("frontend");
-const build_options = @import("build_options");
 const Writer = std.Io.Writer;
 
 /// A kind of error, stable once released: never renamed or reused. Text
@@ -428,7 +427,9 @@ fn quoted(msg: []const u8) ?[]const u8 {
 /// without generic arguments (`array_list.Aligned`); a name of `*` covers
 /// every missing name of the container. Seeded from
 /// `tools/diag/std_removed.py` (0.11 to 0.15 against 0.17, most used
-/// first); every replacement is checked against 0.17's std.
+/// first); every replacement is checked against 0.17's std, and against
+/// 0.16's for an entry 0.16's std lacks the name of too, since a hint
+/// fires in either language (docs/slop/zig-0.16.md, "diag's fixes").
 const migrations = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "std", "io", "std.io is now std.Io: take `init: std.process.Init` in main, then `var w = std.Io.File.stdout().writer(init.io, &buffer);`, print with `w.interface.print(...)` and `w.interface.flush()`; std.debug.print writes to stderr without io" },
     .{ "std", "io.AnyWriter", "std.io.AnyWriter is now `*std.Io.Writer`: take `w: *std.Io.Writer` and pass `&file_writer.interface`, or `&aw.writer` of a std.Io.Writer.Allocating" },
@@ -2018,6 +2019,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "cannot infer length of comptime-only '{f}' from incompatible '{f}'", .@"bad-cast" },
     .{ "type '{f}' does not divide exactly into destination elements", .@"bad-cast" },
     .{ "untagged union '{f}' cannot be converted to integer", .@"bad-cast" },
+    .{ "cannot use @intFromEnum on empty enum '{f}'", .@"bad-cast" },
     .{ "backing integer bit width does not match total bit width of fields", .@"bad-container" },
     .{ "duplicate {t} field '{s}' at index '{d}'", .@"bad-container" },
     .{ "enum tag value '{f}' for field '{s}' already taken", .@"bad-container" },
@@ -2092,6 +2094,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "unable to load compiler_rt file '{s}': {t}", .@"bad-import" },
     .{ "unable to open '{s}': {t}", .@"bad-import" },
     .{ "failed opening {q}: {t}", .@"bad-import" },
+    .{ "unable to open '{s}': {t}", .@"bad-import" },
     .{ "unable to resolve module directory '{s}': {t}", .@"bad-import" },
     .{ "comptime field without default initialization value", .@"bad-init" },
     .{ "duplicate field name '{s}'", .@"bad-init" },
@@ -2147,6 +2150,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "bit shifting operation expected integer type, found '{f}'", .@"bad-operands" },
     .{ "comparison of union and enum literal is only valid for tagged union types", .@"bad-operands" },
     .{ "division with '{f}' and '{f}': signed integers must use @divTrunc, @divFloor, @divCeil, or @divExact", .@"bad-operands" },
+    .{ "division with '{f}' and '{f}': signed integers must use @divTrunc, @divFloor, or @divExact", .@"bad-operands" },
     .{ "incompatible pointer arithmetic operands '{f}' and '{f}'", .@"bad-operands" },
     .{ "invalid operands to binary expression: '{f}' and '{f}'", .@"bad-operands" },
     .{ "invalid operands to binary expression: '{t}' and '{t}'", .@"bad-operands" },
@@ -2179,12 +2183,14 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "cannot enumerate values of type '{f}' for 'inline else'", .@"bad-switch" },
     .{ "switch on non-exhaustive enum must include 'else' or '_' prong or both", .@"bad-switch" },
     .{ "switch on non-packed struct", .@"bad-switch" },
+    .{ "switch on struct with {t} layout", .@"bad-switch" },
     .{ "switch on optional type '{f}'", .@"bad-switch" },
     .{ "switch on error union type '{f}'", .@"bad-switch" },
     .{ "cannot capture tag of packed union", .@"bad-switch" },
     .{ "ranges not allowed when switching on type '{f}'", .@"bad-switch" },
     .{ "duplicate switch value '{f}'", .@"bad-switch" },
     .{ "duplicate switch ranges", .@"bad-switch" },
+    .{ "duplicate switch value", .@"bad-switch" },
     .{ "range start value is greater than the end value", .@"bad-switch" },
     .{ "unreachable else prong; all cases already handled", .@"bad-switch" },
     .{ "unreachable else prong; all explicit cases already handled", .@"bad-switch" },
@@ -2250,6 +2256,8 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "inline call is recursive", .@"eval-limit" },
     .{ "error set of type '{f}' is ignored", .@"ignored-value" },
     .{ "error union of type '{f}' is ignored", .@"ignored-value" },
+    .{ "error set is ignored", .@"ignored-value" },
+    .{ "error union is ignored", .@"ignored-value" },
     .{ "error set is discarded", .@"ignored-value" },
     .{ "error union is discarded", .@"ignored-value" },
     .{ "error union payload is ignored", .@"ignored-value" },
@@ -2301,6 +2309,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "negative infinity requires a known result type", .@"no-result-type" },
     .{ "unable to infer variable type", .@"no-result-type" },
     .{ "\"{s}\" not accessible from inner function", .@"not-accessible" },
+    .{ "'{s}' not accessible from inner function", .@"not-accessible" },
     .{ "'{s}' not accessible outside function scope", .@"not-accessible" },
     .{ "'{s}' is not marked 'pub'", .@"not-pub" },
     .{ "null pointer casted to type '{f}'", .@"null-value" },
@@ -2444,15 +2453,21 @@ fn matchFormat(fmt: []const u8, msg: []const u8) bool {
     }
 }
 
-/// Upstream 0.17.1 AstGen's error format strings and their codes, the
-/// specific ones before the general ones they also match. The
+/// bs's AstGen's error format strings (0.17.1's and 0.16.0's) and their
+/// codes, the specific ones before the general ones they also match. The
 /// "every AstGen error format has a code" test checks this list against
-/// AstGen.zig itself.
+/// frontend/AstGen.zig itself.
 const astgen_codes = [_]struct { []const u8, Code }{
     // The frontend's, for an imported file it cannot read.
     .{ "unable to load \"{s}\": {s}", .@"bad-import" },
+    // The frontend's, for an imported file it cannot read, in Zig 0.16.
+    .{ "unable to load '{s}': {s}", .@"bad-import" },
     // The frontend's, for a file two modules reach.
     .{ "file exists in modules '{s}' and '{s}'", .@"bad-import" },
+    // Zig 0.16's @cImport.
+    .{ "C define valid only inside C import block", .@"misplaced-builtin" },
+    .{ "{s} valid only inside C import block", .@"misplaced-builtin" },
+    .{ "cannot nest @cImport", .@"misplaced-builtin" },
     .{ "unused block label", .@"unused-label" },
     .{ "unused for loop label", .@"unused-label" },
     .{ "unused switch label", .@"unused-label" },
@@ -2632,12 +2647,9 @@ test matchFormat {
 }
 
 test "every AstGen error format has a code" {
-    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const path = try std.Io.Dir.path.join(gpa, &.{ build_options.zig_lib_dir, "std", "zig", "AstGen.zig" });
-    defer gpa.free(path);
-    const src = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4 << 20));
-    defer gpa.free(src);
+    // bs's AstGen, which lowers both languages.
+    const src = frontend.astgen_source;
     // The first string literal of every `fail*(` and `appendError*(` call
     // is an error's format string.
     var checked: usize = 0;

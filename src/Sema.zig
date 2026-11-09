@@ -2351,13 +2351,14 @@ fn fmtType(sema: *Sema, ty: Index) FmtType {
 const FmtValue = struct {
     ip: *const InternPool,
     val: Index,
+    language: frontend.Language,
     pub fn format(f: FmtValue, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try print.printValueIn(f.ip, f.val, w, 3, .read);
+        try print.printValueIn(f.ip, f.val, w, 3, .read, f.language);
     }
 };
 
 fn fmtValue(sema: *Sema, val: Index) FmtValue {
-    return .{ .ip = sema.ip, .val = val };
+    return .{ .ip = sema.ip, .val = val, .language = sema.zcu.language };
 }
 
 /// Whether `ty` has no possible value (`Type.hasNoPossibleValue`), after
@@ -5569,7 +5570,10 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                         .tuple_type => |t| .{ t.types.len, .none },
                         else => return sema.fail(block, src, "expected array of '{f}', found '{f}'", .{ sema.fmtType(p.child), sema.fmtType(operand_ty) }),
                     };
-                    const want = try sema.intern(.{ .array_type = .{ .len = len, .child = p.child, .sentinel = if (sentinel == .none) .none else try sema.resolveConstValue(block, src, try sema.coerce(block, p.child, .fromInterned(sentinel), src), "array sentinel value must be comptime-known") } });
+                    // Zig 0.16 takes the pointer's sentinel instead.
+                    const want = try sema.intern(.{ .array_type = .{ .len = len, .child = p.child, .sentinel = if (sema.zcu.language == .zig_0_16)
+                        p.sentinel
+                    else if (sentinel == .none) .none else try sema.resolveConstValue(block, src, try sema.coerce(block, p.child, .fromInterned(sentinel), src), "array sentinel value must be comptime-known") } });
                     break :blk sema.coerce(block, want, operand, src);
                 },
                 .c => break :blk operand,
@@ -5635,6 +5639,9 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             }
             if (Type.class(sema.ip, ty) != .@"enum") return sema.fail(block, src, "expected enum or tagged union, found '{f}'", .{sema.fmtType(ty)});
             try sema.resolveLayout(block, src, ty);
+            if (sema.zcu.language == .zig_0_16 and sema.ip.structInfo(ty).field_names.len == 0 and !sema.ip.structInfo(ty).nonexhaustive) {
+                return sema.fail(block, sema.callArgSrc(src, false, 0), "cannot use @intFromEnum on empty enum '{f}'", .{sema.fmtType(ty)});
+            }
             const int_ty = sema.ip.structInfo(ty).tag_type;
             if (sema.resolveValue(operand)) |v| {
                 if (sema.isUndef(v)) break :blk .fromInterned(try sema.undefValue(int_ty));
@@ -5864,7 +5871,10 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                     const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
                     const name = tree.tokenSlice(tree.nodeMainToken(src.loc.node.toAbsolute(src.base)));
                     if (sema.func == .none) return sema.fail(block, src, "'{s}' not accessible outside function scope", .{name});
-                    const err = sema.fail(block, src, "\"{s}\" not accessible from inner function", .{name});
+                    const err = if (sema.zcu.language == .zig_0_16)
+                        sema.fail(block, src, "'{s}' not accessible from inner function", .{name})
+                    else
+                        sema.fail(block, src, "\"{s}\" not accessible from inner function", .{name});
                     try sema.zcu.addNote(sema.file, block.nodeSrc(.zero).span(tree), "crossed function definition here", .{});
                     return err;
                 }
@@ -6329,7 +6339,7 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
         try sema.bcRefuse();
         const index = sema.zcu.embedFile(m, fe.module(m).root_file) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return sema.fail(block, sema.callArgSrc(src, false, 0), "failed opening {q}: {t}", .{ name, err }),
+            else => return sema.failEmbed(block, sema.callArgSrc(src, false, 0), name, err),
         };
         try sema.declareDependency(.{ .embed_file = index });
         return .fromInterned(try sema.stringLiteral(sema.zcu.embed_files.values()[index].bytes));
@@ -6346,10 +6356,16 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     try sema.bcRefuse();
     const index = sema.zcu.embedFile(file.module, sub_path) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return sema.fail(block, sema.callArgSrc(src, false, 0), "failed opening {q}: {t}", .{ name, err }),
+        else => return sema.failEmbed(block, sema.callArgSrc(src, false, 0), name, err),
     };
     try sema.declareDependency(.{ .embed_file = index });
     return .fromInterned(try sema.stringLiteral(sema.zcu.embed_files.values()[index].bytes));
+}
+
+/// `@embedFile` of `name` failed with `err`.
+fn failEmbed(sema: *Sema, block: *Block, src: Src, name: []const u8, err: anyerror) CompileError {
+    if (sema.zcu.language == .zig_0_16) return sema.fail(block, src, "unable to open '{s}': {t}", .{ name, err });
+    return sema.fail(block, src, "failed opening {q}: {t}", .{ name, err });
 }
 
 /// Zig 0.16's `@cImport`: the body, evaluated at comptime, writes C
@@ -8603,7 +8619,7 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
                 if (!first) w.writeAll(",") catch return error.OutOfMemory;
                 first = false;
                 h.int(InternPool.Hash, ip.stableHash(arg));
-                (if (ip.isType(arg)) print.printTypeIn(ip, arg, w, b.names()) else print.printValueIn(ip, arg, w, 1, b.names())) catch return error.OutOfMemory;
+                (if (ip.isType(arg)) print.printTypeIn(ip, arg, w, b.names()) else print.printValueIn(ip, arg, w, 1, b.names(), .newest)) catch return error.OutOfMemory;
             }
             w.writeAll(")") catch return error.OutOfMemory;
             return .{ .name = .{ .creator = h.final(), .template = b.finish() }, .key = try sema.anonTypeKey(block, inst, captures) };
@@ -11456,7 +11472,11 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
                 // A known operand is checked first, as upstream.
                 try sema.failUndefOperand(block, src, lv, rv);
                 if (rv != null and sema.intSign(rv.?) == 0) return sema.fail(block, src.operandSrc(1), "division by zero here causes illegal behavior", .{});
-                const err = sema.fail(block, src, "division with '{f}' and '{f}': signed integers must use @divTrunc, @divFloor, @divCeil, or @divExact", .{ sema.fmtType(ty), sema.fmtType(ty) });
+                // Zig 0.16 has no @divCeil.
+                const err = if (sema.zcu.language == .zig_0_16)
+                    sema.fail(block, src, "division with '{f}' and '{f}': signed integers must use @divTrunc, @divFloor, or @divExact", .{ sema.fmtType(ty), sema.fmtType(ty) })
+                else
+                    sema.fail(block, src, "division with '{f}' and '{f}': signed integers must use @divTrunc, @divFloor, @divCeil, or @divExact", .{ sema.fmtType(ty), sema.fmtType(ty) });
                 // `a / b` -> `@divTrunc(a, b)`, which rounds as C does.
                 const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
                 const l = src.operandSrc(0).span(tree);
@@ -12671,7 +12691,10 @@ fn analyzeFloatToInt(sema: *Sema, block: *Block, src: Src, dest_ty: Index, opera
     const ip = sema.ip;
     if (mode == .truncate) if (try sema.vectorCast(block, src, dest_ty, operand, analyzeFloatToIntTruncate)) |r| return r;
     const ty = sema.typeOf(operand);
-    if (Type.class(ip, dest_ty) != .int and dest_ty != .comptime_int_type) return sema.fail(block, src, "expected integer result type, found '{f}'", .{sema.fmtType(dest_ty)});
+    if (Type.class(ip, dest_ty) != .int and dest_ty != .comptime_int_type) return if (sema.zcu.language == .zig_0_16)
+        sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(dest_ty)})
+    else
+        sema.fail(block, src, "expected integer result type, found '{f}'", .{sema.fmtType(dest_ty)});
     const class = Type.class(ip, ty);
     // A comptime_int operand is already integral: every rounding mode
     // leaves it unchanged.
@@ -12702,7 +12725,10 @@ fn analyzeFloatFromInt(sema: *Sema, block: *Block, src: Src, dest_ty: Index, ope
     if (try sema.vectorCast(block, src, dest_ty, operand, analyzeFloatFromInt)) |r| return r;
     const ty = sema.typeOf(operand);
     const dc = Type.class(ip, dest_ty);
-    if (dc != .float and dc != .comptime_float) return sema.fail(block, src, "expected float result type, found '{f}'", .{sema.fmtType(dest_ty)});
+    if (dc != .float and dc != .comptime_float) return if (sema.zcu.language == .zig_0_16)
+        sema.fail(block, src, "expected float type, found '{f}'", .{sema.fmtType(dest_ty)})
+    else
+        sema.fail(block, src, "expected float result type, found '{f}'", .{sema.fmtType(dest_ty)});
     if (Type.class(ip, ty) != .int and ty != .comptime_int_type) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected integer type, found '{f}'", .{sema.fmtType(ty)});
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
@@ -16701,7 +16727,8 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
                 else => {
                     const err = sema.fail(block, src, "type '{f}' does not support indexing", .{FmtType{ .ip = ip, .ty = child, .decl_note = false }});
                     try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "operand must be an array, slice, tuple, or vector", .{});
-                    try sema.addDeclaredHereNote(child);
+                    // Zig 0.16 notes no declaration.
+                    if (sema.zcu.language != .zig_0_16) try sema.addDeclaredHereNote(child);
                     return err;
                 },
             },
@@ -16722,7 +16749,8 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
     if (p.flags.size == .many or p.flags.size == .slice) return sema.fail(block, src, "expected pointer to an indexable object, found '{f}'", .{sema.fmtType(ptr_ty)});
     const err = sema.fail(block, src, "type '{f}' does not support indexing", .{FmtType{ .ip = ip, .ty = child, .decl_note = false }});
     try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "operand must be an array, slice, tuple, or vector", .{});
-    try sema.addDeclaredHereNote(child);
+    // Zig 0.16 notes no declaration.
+    if (sema.zcu.language != .zig_0_16) try sema.addDeclaredHereNote(child);
     try sema.noteUnwrap(block, src, .operand, child);
     return err;
 }
@@ -16943,7 +16971,8 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
                     else => {
                         const err = sema.fail(block, src, "type '{f}' does not support indexing", .{FmtType{ .ip = ip, .ty = ty, .decl_note = false }});
                         try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "operand must be an array, slice, tuple, or vector", .{});
-                        try sema.addDeclaredHereNote(ty);
+                        // Zig 0.16 notes no declaration.
+                        if (sema.zcu.language != .zig_0_16) try sema.addDeclaredHereNote(ty);
                         return err;
                     },
                 }
@@ -16993,7 +17022,8 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
         else => {
             const err = sema.fail(block, src, "type '{f}' does not support indexing", .{FmtType{ .ip = ip, .ty = ty, .decl_note = false }});
             try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "operand must be an array, slice, tuple, or vector", .{});
-            try sema.addDeclaredHereNote(ty);
+            // Zig 0.16 notes no declaration.
+            if (sema.zcu.language != .zig_0_16) try sema.addDeclaredHereNote(ty);
             try sema.noteUnwrap(block, src, .operand, ty);
             return err;
         },
@@ -17879,6 +17909,12 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         .int, .comptime_int, .bool, .error_set, .enum_literal, .type, .@"enum", .void, .@"fn" => {},
         .pointer => if (Type.isSlice(ip, operand_ty)) return sema.fail(parent, src.operandSrc(0), "switch on type '{f}'", .{sema.fmtType(operand_ty)}),
         .@"struct" => {
+            if (sema.zcu.language == .zig_0_16) {
+                const err = sema.fail(parent, src.operandSrc(0), "switch on struct with {t} layout", .{ip.structInfo(operand_ty).layout});
+                if (sema.containerDecl(operand_ty)) |d|
+                    try sema.zcu.addNote(d.file, (try sema.zcu.fe.tree(@fromBackingInt(d.file))).nodeToSpan(d.node), "consider 'packed struct' here", .{});
+                return err;
+            }
             const err = sema.fail(parent, src.operandSrc(0), "switch on non-packed struct", .{});
             try sema.addDeclaredHereNote(operand_ty);
             return err;
@@ -18304,6 +18340,14 @@ fn intOrder(sema: *Sema, a: Index, b: Index) std.math.Order {
     return sema.ip.intToBig(a, &sa).order(sema.ip.intToBig(b, &sb));
 }
 
+/// Zig 0.16's error for a switch item or range at `src` that repeats a
+/// value of the one at `prev`, which names neither.
+fn failDuplicateSwitchValue016(sema: *Sema, block: *Block, src: Src, prev: Src) CompileError {
+    const err = sema.fail(block, src, "duplicate switch value", .{});
+    try sema.zcu.addNote(sema.file, prev.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "previous value here", .{});
+    return err;
+}
+
 /// Records switch item `first` (the range `first...last`, if `last`) of
 /// type `ty`, failing as upstream if an earlier item or range has one of
 /// its values, or if the range is empty.
@@ -18314,6 +18358,7 @@ fn validateSwitchItem(sema: *Sema, block: *Block, seen: *SwitchSeen, src: Src, f
         else => {
             const prev = (try seen.values.fetchPut(sema.gpa, first, src)) orelse return;
             const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+            if (sema.zcu.language == .zig_0_16) return sema.failDuplicateSwitchValue016(block, src, prev.value);
             const err = sema.fail(block, src, "duplicate switch value '{f}'", .{sema.fmtValue(first)});
             try sema.zcu.addNote(sema.file, prev.value.span(tree), "previous value here", .{});
             try sema.addDeclaredHereNote(if (ty == .type_type) first else ty);
@@ -18336,6 +18381,7 @@ fn validateSwitchItem(sema: *Sema, block: *Block, seen: *SwitchSeen, src: Src, f
         const overlap_start = if (sema.intOrder(first, prev.first) == .gt) first else prev.first;
         const overlap_end = if (sema.intOrder(end, prev.last) == .lt) end else prev.last;
         const prev_span = prev.src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+        if (sema.zcu.language == .zig_0_16) return sema.failDuplicateSwitchValue016(block, src, prev.src);
         if (overlap_start == overlap_end) {
             const err = sema.fail(block, src, "duplicate switch value '{f}'", .{sema.fmtValue(overlap_start)});
             try sema.zcu.addNote(sema.file, prev_span, "{s}", .{if (prev.first == prev.last) "previous value here" else "previous value inside range here"});
@@ -18515,6 +18561,7 @@ fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, opera
 fn failTagCapture(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError {
     if (Type.class(sema.ip, ty) != .@"union") return sema.fail(block, src, "cannot capture tag of non-union type '{f}'", .{sema.fmtType(ty)});
     const err = sema.fail(block, src, "cannot capture tag of packed union", .{});
+    if (sema.zcu.language == .zig_0_16) return err;
     try sema.addDeclaredHereNote(ty);
     if (sema.containerDecl(ty)) |d| try sema.zcu.addNote(d.file, (try sema.zcu.fe.tree(@fromBackingInt(d.file))).nodeToSpan(d.node), "consider using a tagged union", .{});
     return err;
@@ -19540,8 +19587,15 @@ fn zirEnsureResultUsed(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Compile
 fn ensureResultUsed(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
     switch (Type.class(sema.ip, ty)) {
         .void, .noreturn => {},
-        .error_set => return sema.fail(block, src, "error set of type '{f}' is ignored", .{sema.fmtType(ty)}),
-        .error_union => return sema.failIgnoredError(block, src, ty, sema.fail(block, src, "error union of type '{f}' is ignored", .{sema.fmtType(ty)})),
+        // Zig 0.16 names neither type.
+        .error_set => return if (sema.zcu.language == .zig_0_16)
+            sema.fail(block, src, "error set is ignored", .{})
+        else
+            sema.fail(block, src, "error set of type '{f}' is ignored", .{sema.fmtType(ty)}),
+        .error_union => return sema.failIgnoredError(block, src, ty, if (sema.zcu.language == .zig_0_16)
+            sema.fail(block, src, "error union is ignored", .{})
+        else
+            sema.fail(block, src, "error union of type '{f}' is ignored", .{sema.fmtType(ty)})),
         else => {
             const err = sema.fail(block, src, "value of type '{f}' ignored", .{sema.fmtType(ty)});
             const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
@@ -19802,7 +19856,8 @@ fn checkBitCastType016(sema: *Sema, block: *Block, src: Src, side_src: Src, ty: 
     switch (Type.class(ip, ty)) {
         .bool, .float, .int, .vector => {},
         .@"enum", .pointer => {
-            const err = sema.fail(block, side_src, "cannot @bitCast {s} '{f}'", .{ dir, sema.fmtType(ty) });
+            // Built without upstream's `fail`: no declared-here note.
+            const err = sema.fail(block, side_src, "cannot @bitCast {s} '{f}'", .{ dir, FmtType{ .ip = ip, .ty = ty, .decl_note = false } });
             const span = side_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
             const other_class = Type.class(ip, other);
             if (Type.class(ip, ty) == .@"enum") {
@@ -20681,9 +20736,7 @@ fn validateAsmOutputType(sema: *Sema, block: *Block, asm_src: Src, k: usize, ty:
     // Zig 0.16 takes any type with a defined layout.
     if (sema.zcu.language == .zig_0_16) {
         if (Type.class(ip, ty) == .vector or sema.wellDefinedLayout(ty)) return;
-        const err = sema.fail(block, sema.asmOperandSrc(asm_src, true, k), "invalid inline assembly output type; '{f}' does not have a guaranteed in-memory layout", .{sema.fmtType(ty)});
-        try sema.addDeclaredHereNote(ty);
-        return err;
+        return sema.fail(block, sema.asmOperandSrc(asm_src, true, k), "invalid inline assembly output type; '{f}' does not have a guaranteed in-memory layout", .{sema.fmtType(ty)});
     }
     const note: ?[]const u8 = switch (Type.class(ip, ty)) {
         .int, .float, .bool, .vector, .@"enum" => return,

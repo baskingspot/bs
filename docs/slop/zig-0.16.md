@@ -367,6 +367,17 @@ Alternatives I rejected:
   construct to a 0.16 program, such as the `@Int` hint for `std.meta.Int`
   or `@splat` for `**`. Each fix that names a builtin or a std path gets
   a language check, and the compile-error measure checks it.
+
+  Audited in phase 4. 0.16.0 already has the std.Io API and the
+  builtins that diag's hints, fixes and notes name. It also has
+  `std.meta.Int` and `Build.args`, so their migration hints never fire
+  in 0.16. 0.17 adds `@divCeil`, `@backingInt`, `@fromBackingInt` and
+  `@SpirvType`. Two places named one of those, and both are now per
+  language: the signed-division message, and the spelling of an
+  enum value with no name (`@enumFromInt(5)` in 0.16). The message
+  shapes that changed between 0.16 and 0.17 (duplicate switch
+  values, ignored error unions, `@embedFile` and import failures,
+  quoting of names) also follow the language.
 - **Unchanged:** the bytecode comptime evaluator, the IR, InternPool
   (stable hashes key on content, and the language enters through the cache
   root) and the backends. The one exception is the panic calls Sema emits.

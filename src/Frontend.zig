@@ -2128,7 +2128,10 @@ fn addUnreadable(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, importer: *con
     const note_loc = try fe.tokenLoc(errors, importer, token);
     try errors.addRootErrorMessage(.{
         // As upstream, the file by its base name; its path is the location.
-        .msg = try errors.printString("unable to load \"{s}\": {t}", .{ Io.Dir.path.basename(path), err }),
+        .msg = if (fe.language == .zig_0_16)
+            try errors.printString("unable to load '{s}': {t}", .{ Io.Dir.path.basename(path), err })
+        else
+            try errors.printString("unable to load \"{s}\": {t}", .{ Io.Dir.path.basename(path), err }),
         .src_loc = try wholeFileLoc(errors, path),
         .notes_len = 1,
     });
