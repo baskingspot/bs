@@ -10253,12 +10253,13 @@ unchanged:
    crashes left.)
 8. Later: `bs explain` and `bs fix` (applies exact fixes).
 
-## ziglint's rules as compile errors (designed and owner-approved 2026-11-07; on by default since 2026-11-08)
+## ziglint's rules as compile errors (designed and owner-approved 2026-11-07; opt-in through `.bs.zon` since 2026-11-09)
 
-bs reports ziglint 0.8.1's rules as compile errors in a project's own
-files, on by default (owner, 2026-11-08), never in std or dependencies.
-A project configures them, or turns them off, with the `lint` section of
-a `.bs.zon`, or with a `.ziglint.zon` when it has no `.bs.zon`. The
+bs reports ziglint 0.8.1's rules as compile errors in the own files of
+a project that asks for them, never in std or dependencies: a project
+turns lint on, and configures it, with the `lint` section of a
+`.bs.zon`, or with a `.ziglint.zon` when its `.bs.zon` has no `lint`
+section (owner, 2026-11-09; lint was on by default for a day before). The
 design, its rule-by-rule placement and the owner's decisions are in
 docs/slop/ziglint-in-bs.md. What is built:
 
@@ -10266,16 +10267,15 @@ docs/slop/ziglint-in-bs.md. What is built:
   module's root source file (`bs test`: the module under test's;
   `bs build`'s configure script: the `@build` module's `build.zig`) to
   the nearest directory with a `build.zig`, and only the file's own
-  directory without one, for a `.bs.zon`, then for a `.ziglint.zon`; a
-  root in the zig lib directory, the global package cache's `p/` or a
-  `zig-pkg/` directory is never linted. A `.bs.zon` decides: its `lint`
-  has `.ziglint.zon`'s schema, `.lint = false` turns lint off (the only
-  off switch), and `true`, `.{}` or no `lint` are the defaults. Its
-  `zig_version` is the language's (`language.resolve`). With
-  neither file, ziglint 0.8.1's defaults (every rule but Z033, Z024 at
-  120 bytes) cover the project's directory, or the root file's own
-  outside a project. `paths` are relative to the config's directory, `.`
-  when there are none. A file is
+  directory without one, for the nearest `.bs.zon` and the nearest
+  `.ziglint.zon`; a root in the zig lib directory, the global package
+  cache's `p/` or a `zig-pkg/` directory is never linted. A `.bs.zon`'s
+  `lint` section decides: it has `.ziglint.zon`'s schema, `true` or `.{}`
+  are ziglint 0.8.1's defaults (every rule but Z033, Z024 at 120 bytes),
+  and `.lint = false` keeps lint off. Without one, a `.ziglint.zon`
+  decides; with neither, lint is off. The `.bs.zon`'s `zig_version` is
+  the language's (`language.resolve`). `paths` are relative to the
+  config's directory, `.` when there are none. A file is
   covered as ziglint's walk would take it: a `paths` file, or a `.zig`
   file under a `paths` directory with no component starting with `.` or
   named `zig-cache` or `zig-out`, and none that directory's `.gitignore`
@@ -10313,15 +10313,15 @@ docs/slop/ziglint-in-bs.md. What is built:
   and fail the build as any error does: nothing is emitted or recorded.
 - **The cache.** The config is not part of the compilation key.
   `<compilation dir>/lint` (`main.LintState`) holds, after a successful
-  build, a hash of the config's path (the covered directory for the
-  defaults), contents and the `.gitignore`s its paths read, then the lint
+  build, a hash of the config's path, contents and the `.gitignore`s its
+  paths read, then the lint
   keys of the files it covered, sorted; there is no file with lint off.
   A build whose config hash differs (a config added, edited or removed,
   lint turned on or off) does not take the no-change skips
   (`Incremental.relinkIfUnchanged`, `InputsRecord`). With the same
   config, a covered file whose key is listed had no findings, since that
   build succeeded, so an edit build reads the findings of the edited
-  files alone. The config file, if any, is reported as an input
+  files alone. The config file is reported as an input
   (`file_system_inputs`).
 - **Sema's rules.** Z010 (returns and call arguments), Z011, Z029 (call
   arguments) and Z034 are Sema's (`LintConfig.sema_rules`): in code from a

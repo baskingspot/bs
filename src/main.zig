@@ -843,15 +843,15 @@ fn compileJob(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, o
         !std.mem.eql(u8, job.environ_map.get("BS_CACHE") orelse "", "off")) InputsRecord.open(init.arena.allocator(), job) else null;
     defer if (rec) |*r| r.close(init.io);
     // ziglint's rules are compile errors in the files the project's lint
-    // config (or the defaults) covers. A build whose config is not the
-    // last successful build's builds (`LintState`).
+    // config covers. A build whose config is not the last successful
+    // build's builds (`LintState`).
     const lint_cfg: ?*const LintConfig = switch (try findLintConfig(init, job)) {
         .none => null,
         .ok => |c| c,
         .err => |d| return .{ .errors = try dupeDiagnostics(init.arena.allocator(), &.{d}) },
     };
     var lint_state: LintState = .of(lint_cfg);
-    if (lint_cfg) |cfg| if (cfg.file()) |f| if (inputs) |list| try appendInput(init.arena.allocator(), list, f);
+    if (lint_cfg) |cfg| if (inputs) |list| try appendInput(init.arena.allocator(), list, cfg.path);
     if (inc_opt) |i| {
         try lint_state.load(init.arena.allocator(), init.io, i.dir);
         i.lint_changed = !lint_state.same;
@@ -1805,8 +1805,9 @@ fn dupeDiagnostics(arena: std.mem.Allocator, diags: []const diag.Diagnostic) ![]
 /// root source file (under `bs test`, the module under test's; for
 /// `bs build`'s configure script, whose root is in the zig lib directory,
 /// the `@build` module's, the project's `build.zig`), read: its `.bs.zon`'s
-/// `lint`, its `.ziglint.zon` or ziglint's defaults. None for a C root, a
-/// root in std or a dependency, or a `.bs.zon` that turns lint off.
+/// `lint` section, or its `.ziglint.zon`. None without either (lint is
+/// opt-in), for a C root, a root in std or a dependency, or a `.bs.zon`
+/// that turns lint off.
 fn findLintConfig(init: std.process.Init, job: *const Job) !union(enum) { none, ok: *const LintConfig, err: diag.Diagnostic } {
     const arena = init.arena.allocator();
     const io = init.io;

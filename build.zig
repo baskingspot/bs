@@ -1195,10 +1195,12 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         upstream_step.dependOn(&up.step);
     }
 
-    // The cache: a build with lint off that succeeded does not let a
-    // build with lint on (by default, or by a config) skip as unchanged,
-    // nor one config another's build, and turning lint off builds again.
-    // A `.bs.zon` decides over a `.ziglint.zon`.
+    // Lint is opt-in: a project without a config, or with a `.bs.zon`
+    // that has no `lint` section, is not linted. The cache: a build with
+    // lint off that succeeded does not let a build a config turns lint on
+    // for skip as unchanged, nor one config another's build, and turning
+    // lint off builds again. A `.bs.zon`'s `lint` decides over a
+    // `.ziglint.zon`, which decides without one.
     const added = b.addSystemCommand(&.{
         "sh", "-c",
         \\set -e
@@ -1208,12 +1210,14 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         \\: > build.zig
         \\printf 'pub fn main() void {}\nfn Bad() void {}\ntest {\n    _ = &Bad;\n}\n' > main.zig
         \\c="--cache-dir l --global-cache-dir g -target x86_64-linux"
-        \\printf '.{ .lint = false }\n' > .bs.zon
         \\"$bs" build-exe main.zig $c
-        \\rm .bs.zon
-        \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with the defaults passed"; exit 1; fi
+        \\printf '.{ .zig_version = "0.17" }\n' > .bs.zon
+        \\"$bs" build-exe main.zig $c
+        \\printf '.{ .lint = .{} }\n' > .bs.zon
+        \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with lint on passed"; exit 1; fi
         \\grep -q "main.zig:2:4: error\[style, Z001\]: function 'Bad' should be camelCase" log || { cat log; exit 1; }
         \\if "$bs" build-exe main.zig $c 2>log; then echo "the build again passed"; exit 1; fi
+        \\rm .bs.zon
         \\printf '.{ .rules = .{ .Z001 = .{ .enabled = false } } }\n' > .ziglint.zon
         \\"$bs" build-exe main.zig $c
         \\printf '.{}\n' > .ziglint.zon
@@ -1227,7 +1231,7 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         \\printf 'const lib = @import("lib.zig");\npub fn main() void {\n    lib.thing();\n}\n' > main.zig
         \\printf '/// Deprecated: gone soon.\npub fn thing() void {}\n' > lib.zig
         \\"$bs" build-exe main.zig $c
-        \\rm .bs.zon
+        \\printf '.{ .zig_version = "0.17" }\n' > .bs.zon
         \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with a config passed"; exit 1; fi
         \\grep -q "main.zig:3:9: error\[deprecated, Z011\]: 'thing' is deprecated: Deprecated: gone soon." log || { cat log; exit 1; }
         \\# And it reads doc comments, which no source hash covers:

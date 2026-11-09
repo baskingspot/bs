@@ -72,15 +72,16 @@ the oldest.
   humans: exact locations, the facts an agent needs to fix the error, and
   fixes where bs knows them, in a form a program can parse.
 - bs may reject more than upstream in two ways. Extra compile errors that
-  catch real mistakes are allowed. And bs enforces ziglint's rules as
-  compile errors on a project's own files, never on std or on
-  dependencies. ziglint 0.8.1's defaults apply: every rule but Z033 is
-  on. A project configures them, or turns them off, with a `lint` section
-  in `.bs.zon` (the schema of `.ziglint.zon`), or with a `.ziglint.zon`
-  when it has no `.bs.zon`. `// ziglint-ignore:` comments are the only
-  per-line exception, and no flag or environment variable reports a
-  finding without failing. ziglint 0.8.1 is the oracle for those rules,
-  as upstream zig is for the language. With lint turned off, everything
+  catch real mistakes are allowed. And when a project asks for it, bs
+  enforces ziglint's rules as compile errors on the project's own files,
+  never on std or on dependencies. Lint is off unless the project has a
+  `lint` section in `.bs.zon` (the schema of `.ziglint.zon`) or a
+  `.ziglint.zon` (used when `.bs.zon` has no `lint` section); then
+  ziglint 0.8.1's defaults apply (every rule but Z033) unless that config
+  changes them. `// ziglint-ignore:` comments are the only per-line
+  exception, and no flag or environment variable reports a finding
+  without failing. ziglint 0.8.1 is the oracle for those rules, as
+  upstream zig is for the language. With lint off, everything
   a supported release accepts must still compile and mean the same in
   that language, and each release's std and `test/behavior` must
   compile, since they are the conformance measure.

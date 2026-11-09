@@ -4,9 +4,9 @@ Status: approved by the owner (2026-11-07), with the decisions listed
 at the end; being built. Written from main 457f2c4 and ziglint v0.8.1
 (rockorager/ziglint f6a3fc2). What is built, and where it departs from
 this note, is in docs/slop/architecture.md ("ziglint's rules as compile
-errors") and in "Built so far" below. Since 2026-11-08 lint is on by
-default, configured or turned off by `.bs.zon` ("Lint by default",
-below); the opt-in described here is how it started.
+errors") and in "Built so far" below. Lint is opt-in, by a `lint`
+section in `.bs.zon` or a `.ziglint.zon` ("Opt-in through `.bs.zon`",
+below); it was on by default for a day on 2026-11-08, then reversed.
 
 The owner's request: bs reads `.ziglint.zon` and enforces ziglint's
 rules as compile errors. There is no escape hatch: no flag or environment
@@ -627,31 +627,30 @@ Still in force: no escape hatch, never lint std or dependencies, and
 the standalone ziglint job stays in CI until the owner decides to drop
 it.
 
-## Lint by default (the owner's decisions, 2026-11-08)
+## Opt-in through `.bs.zon` (the owner's decisions, 2026-11-09)
 
-1. Lint is on by default with ziglint 0.8.1's defaults: every rule but
-   Z033 (off in ziglint, "can be controversial"), Z024 at 120 bytes. A
-   project turns Z033 on in its config.
-2. `.bs.zon` holds a `lint` section with `.ziglint.zon`'s schema;
-   `.lint = false` turns lint off, the only off switch. Discovery is
-   today's walk, stopping at the nearest `build.zig`: a `.bs.zon` there
-   decides and any `.ziglint.zon` is ignored; otherwise a `.ziglint.zon`
-   is used as before; with neither, the defaults cover the project's
-   own files.
-3. Files outside any project (no `build.zig` above) get the defaults,
-   over their own directory.
+Lint was on by default from 2026-11-08 (`0e6ef6ae`); the owner reversed
+that. bs lints only a project that asks for it:
 
-Unchanged: never std, dependencies or the global package cache;
-`// ziglint-ignore:` is the only per-line exception; no flag or
-environment variable reports without failing.
+1. A `lint` section in the project's `.bs.zon` turns lint on, or a
+   `.ziglint.zon` when the `.bs.zon` has none. With neither, nothing is
+   linted, inside a project or outside one. A `.bs.zon` that only holds
+   `.zig_version` does not turn lint on.
+2. Once on, nothing else changes: ziglint 0.8.1's defaults minus Z033
+   (Z024 at 120 bytes), changed by that config; `.lint = false` keeps it
+   off, a `.ziglint.zon` included. `// ziglint-ignore:` is the only
+   per-line exception, findings always fail, and std and dependencies
+   are never linted.
+3. Discovery is the same walk: from the root source file up to the
+   nearest `build.zig` (only the file's own directory outside a
+   project), for the nearest `.bs.zon` and the nearest `.ziglint.zon`.
 
-Everything that compiles upstream's or third-party code as root files
-turns lint off with a checked-in or generated `.bs.zon`: the upstream
-source tree (written by `.agents/setup` and the flake's `zigSrc`), the
-conformance runner's work directories, tools/corpus's checkouts, bench's
-workloads, the hunters' scratch directories, edithunt's trees, the
-diagnostics eval and roundtrip, and test/build/hello (a fixture of
-`bs build`'s mechanics whose check edits it by line number).
+The `.bs.zon` files that lint-by-default had upstream's and third-party
+code write to turn lint off (the upstream source trees, the conformance
+runner, the corpus, bench, the hunters, edithunt, the diagnostics tools,
+test/build/hello) are gone again; the conformance runner's standalone
+projects and the corpus's 0.16 projects still get one, for
+`.zig_version`.
 
 ## Built so far
 
@@ -783,3 +782,6 @@ diagnostics eval and roundtrip, and test/build/hello (a fixture of
    which only the parity set needed. `just lint-bs` stays.
 8. Branch `lint-default` (2026-11-08): lint by default and `.bs.zon`,
    as above (`Config.discover`, `Config.read`).
+9. Branch `lint-optin` (2026-11-09): lint opt-in again, through a
+   `.bs.zon`'s `lint` section or a `.ziglint.zon` (above); the opt-out
+   `.bs.zon` files removed.
