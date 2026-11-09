@@ -113,7 +113,7 @@ pub fn targetDefault(arch: Cpu.Arch, macos: bool) Cpu {
 }
 
 /// Whether aarch64 feature `name` belongs to SVE or SME.
-fn isScalable(name: []const u8) bool {
+pub fn isScalable(name: []const u8) bool {
     const prefixes = [_][]const u8{ "sve", "sme", "ssve" };
     for (prefixes) |p| if (std.mem.startsWith(u8, name, p)) return true;
     return false;

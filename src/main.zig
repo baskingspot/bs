@@ -29,6 +29,7 @@ const CSource = @import("CSource.zig");
 const toolchain = @import("toolchain.zig");
 const language = @import("language.zig");
 const cpu_mod = @import("cpu.zig");
+const cpu016 = @import("cpu016.zig");
 const InternPool = @import("InternPool.zig");
 const BuildRunner = @import("BuildRunner.zig");
 const TranslateC = @import("TranslateC.zig");
@@ -102,6 +103,8 @@ pub const Options = struct {
     /// without it the clamped host CPU for the native target, else the
     /// baseline.
     cpu: std.Target.Cpu = cpu_mod.baseline,
+    /// `-mcpu`, as given (`cpu016.resolve`).
+    mcpu: ?[]const u8 = null,
     /// The target `target` names (`checkTarget`).
     bs_target: InternPool.Target = .x86_64_linux,
     zig_lib_dir: ?[]const u8 = null,
@@ -586,9 +589,10 @@ pub const Job = struct {
         const zig_lib_dir = lib.path;
         checkSupported(init_.environ_map, opts.language);
         const is_test = command.isTest();
+        // The newest under BS_TEST_LANGUAGE_KEYS, as the frontend's.
+        const builtin_language: language.Language = if (init_.environ_map.get("BS_TEST_LANGUAGE_KEYS") != null) .newest else opts.language.language;
         const builtin_opts: Builtin.Options = .{
-            // The newest under BS_TEST_LANGUAGE_KEYS, as the frontend's.
-            .language = if (init_.environ_map.get("BS_TEST_LANGUAGE_KEYS") != null) .newest else opts.language.language,
+            .language = builtin_language,
             .output_mode = switch (command) {
                 .build_obj, .test_obj => .Obj,
                 .build_lib => .Lib,
@@ -611,6 +615,7 @@ pub const Job = struct {
             .macos = opts.macos_version,
             .link_libcpp = opts.link_libcpp,
             .cpu = opts.cpu,
+            .cpu_016 = if (builtin_language == .zig_0_16) try cpu016.resolve(arena, opts.bs_target.arch(), opts.bs_target == .aarch64_macos, opts.mcpu, opts.target == null or std.mem.eql(u8, opts.target.?, "native"), opts.cpu) else null,
             .target = opts.bs_target,
         };
         const builtin_dir = try Builtin.writeToCache(arena, init_.io, try Io.Dir.path.join(arena, &.{ cache_dirs.global, "bs" }), builtin_opts);
@@ -644,6 +649,7 @@ pub const Job = struct {
                 .error_tracing = false,
                 .valgrind = false,
                 .cpu = opts.cpu,
+                .cpu_016 = builtin_opts.cpu_016,
                 .linux = opts.linux,
                 .target = opts.bs_target,
             })
@@ -3070,6 +3076,7 @@ fn unsupportedTarget(opts: *Options, arena: std.mem.Allocator, target: []const u
 /// (`cpu.targetDefault`). `zig build` passes `-mcpu baseline` with an
 /// explicit target and `-mcpu native` for `-Dcpu=native`.
 pub fn resolveCpu(opts: *Options, arena: std.mem.Allocator, io: Io, mcpu: ?[]const u8) void {
+    opts.mcpu = mcpu;
     const native = opts.target == null or std.mem.eql(u8, opts.target.?, "native");
     const macos = opts.bs_target == .aarch64_macos;
     if (opts.bs_target == .x86_64_linux) {
@@ -3420,6 +3427,7 @@ test {
     _ = @import("cache.zig");
     _ = @import("language.zig");
     _ = @import("cpu.zig");
+    _ = @import("cpu016.zig");
     _ = @import("link/Atom.zig");
     _ = @import("link/Elf.zig");
     _ = @import("link/VersionScript.zig");

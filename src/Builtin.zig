@@ -16,6 +16,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const InternPool = @import("InternPool.zig");
 const cpu_mod = @import("cpu.zig");
+const cpu016 = @import("cpu016.zig");
 const Language = @import("language.zig").Language;
 
 pub const OutputMode = enum { Exe, Obj, Lib };
@@ -72,6 +73,9 @@ pub const Options = struct {
     link_libcpp: bool = false,
     /// `-mcpu` (`cpu.resolve`).
     cpu: std.Target.Cpu = cpu_mod.baseline,
+    /// Zig 0.16: `cpu` in 0.16's names (`cpu016.resolve`), which the
+    /// builtin module states instead.
+    cpu_016: ?cpu016.Names = null,
     target: InternPool.Target = .x86_64_linux,
 };
 
@@ -306,9 +310,12 @@ fn generateNewest(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     // As upstream: every enabled feature, in the feature list's order.
     var features: std.ArrayList(u8) = .empty;
     defer features.deinit(gpa);
-    for (opts.cpu.arch.allFeaturesList(), 0..) |feature, i| {
+    if (opts.cpu_016) |c| {
+        for (c.features) |name| try features.print(gpa, "        .{f},\n", .{std.zig.fmtIdPU(name)});
+    } else for (opts.cpu.arch.allFeaturesList(), 0..) |feature, i| {
         if (opts.cpu.features.isEnabled(@intCast(i))) try features.print(gpa, "        .{f},\n", .{std.zig.fmtIdPU(feature.name)});
     }
+    const model = if (opts.cpu_016) |c| c.model else opts.cpu.model.name;
     if (opts.target == .aarch64_macos) return gpa.print(
         \\const std = @import("std");
         \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
@@ -376,7 +383,7 @@ fn generateNewest(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         @tagName(opts.unwind_tables),
         if (opts.is_test) "true" else "false",
         if (opts.single_threaded) "true" else "false",
-        std.zig.fmtIdPU(opts.cpu.model.name),
+        std.zig.fmtIdPU(model),
         features.items,
         opts.macos.min.major,
         opts.macos.min.minor,
@@ -471,7 +478,7 @@ fn generateNewest(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         @tagName(abi),
         @tagName(opts.cpu.arch),
         cpu_ns,
-        std.zig.fmtIdPU(opts.cpu.model.name),
+        std.zig.fmtIdPU(model),
         cpu_ns,
         features.items,
         versions.range.min.major,
