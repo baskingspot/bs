@@ -181,7 +181,6 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
     if (opts.bs_target == .aarch64_macos) opts.link_libc = true;
     const cache_dirs = Frontend.resolveCacheDirs(arena, io, init.environ_map, .{ .local = opts.cache_dir, .global = opts.global_cache_dir });
     const choice = try language.resolve(arena, io, init.environ_map, null, null);
-    main.checkSupported(init.environ_map, choice);
     return .{
         .source = source orelse if (opts.unsupported != null) "" else main.fatal("expected a C source file to translate", .{}),
         .target = opts.bs_target,

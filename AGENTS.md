@@ -9,17 +9,17 @@ the oldest.
 ## Scope
 
 - Language version: each compilation is in exactly one of the supported
-  languages. `bs build` takes it from the root package's `build.zig.zon`
-  `minimum_zig_version` (0.16.x → 0.16, 0.17.x or none → 0.17; anything
-  else is an error), and dependencies use the root's language.
-  `build-exe`, `test` and `run` take `--zig-version`, else the
-  `build.zig.zon` beside the nearest `build.zig` above the root source
-  file, else the newest. Each language is complete: its syntax, ZIR,
-  semantics, std, compile errors and build system, all through bs's own
-  Sema, backends and linkers; C and C++ go through the matching release's
-  `zig cc`. 0.16 is being built in phases (`docs/slop/zig-0.16.md`); until
-  it compiles, `build.zig.zon` selects a language only with
-  `BS_ZON_SELECTS` set, and selecting 0.16 stops with an error.
+  languages: the newest (0.17) unless the project opts into 0.16 with
+  `.zig_version = "0.16"` in its `.bs.zon`. `bs build` reads the root
+  package's `.bs.zon`, and dependencies use the root's language;
+  `build-exe`, `test` and `run` take `--zig-version`, else the nearest
+  `.bs.zon` (found as for lint), else the newest. `minimum_zig_version`
+  is a lower bound and selects nothing: when a 0.17 build fails, a
+  minimum of 0.16.x notes the `.bs.zon` fix, and one newer than the
+  newest release notes that bs doesn't know that release. Each language
+  is complete: its syntax, ZIR, semantics, std, compile errors and build
+  system, all through bs's own Sema, backends and linkers; C and C++ go
+  through the matching release's `zig cc` (`docs/slop/zig-0.16.md`).
 - Targets: `x86_64-linux` (static ELF first), `aarch64-macos` (Mach-O,
   dynamically linked against libSystem, ad-hoc code signed), and
   `aarch64-linux` (static ELF, reusing the aarch64 backend and the ELF

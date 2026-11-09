@@ -2,12 +2,12 @@
 # `zig build test`: each Zig language has caches of its own. The same
 # program, in the same directories with the same lib directory, is built
 # in 0.17 and then, with BS_TEST_LANGUAGE_KEYS, in 0.16 (with 0.17's
-# frontend and Sema until bs compiles 0.16). The 0.16 builds must reuse
+# frontend and Sema, so that both read the same sources). The 0.16 builds must reuse
 # nothing of 0.17's: not its compilation, ZIR, stat index, store entries,
 # donors or `bs run` binary, and each language must still find its own.
 #   $1 bs  $2 a program that imports std  $3 scratch directory
 set -eu
-unset ZIG_LOCAL_CACHE_DIR ZIG_GLOBAL_CACHE_DIR BS_CACHE BS_CACHE_VERIFY BS_CACHE_CHECK BS_ZIG_VERSION BS_ZON_SELECTS
+unset ZIG_LOCAL_CACHE_DIR ZIG_GLOBAL_CACHE_DIR BS_CACHE BS_CACHE_VERIFY BS_CACHE_CHECK BS_ZIG_VERSION
 rm -rf "$3"
 mkdir -p "$3"
 bs=$(realpath "$1") work=$(realpath "$3")

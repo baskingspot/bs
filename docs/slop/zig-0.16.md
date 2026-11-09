@@ -3,10 +3,13 @@
 Status: approved by the owner (2026-11-08) with every recommendation in
 "Open questions" taken as decided; being built in the phases below.
 Phase 0 (selection and plumbing) is described in docs/slop/architecture.md,
-"Finding the zig lib directory at run time". Until 0.16 compiles,
-`build.zig.zon` selects a language only with `BS_ZON_SELECTS` set, so
-that projects which name another release keep compiling as 0.17; the
-branch that makes 0.16 usable drops the variable.
+"Finding the zig lib directory at run time". The gate that kept 0.16
+behind `BS_ZON_SELECTS` and `BS_UNFINISHED_0_16` came off after phase
+4. The owner then changed how the language is chosen (2026-11-09; see
+"Selecting the language"): 0.17 unless the project's `.bs.zon` says
+`.zig_version = "0.16"`, since `minimum_zig_version` is a lower bound,
+and 7 of the corpus's 8 projects whose minimum is not 0.17 are 0.17
+code.
 
 The note was written from main b92b0c65, upstream 0.17.1 (`upstream/`),
 and the official 0.16.0 source and x86_64-linux binary tarballs. The cache
@@ -17,8 +20,9 @@ line references are at main f5befc23.
 The owner's decision: bs supports two Zig languages, the current release
 and the one before it. Today that is 0.17.1 and 0.16.0, chosen per
 compilation at run time. When 0.18 ships, bs adds it and drops 0.16. The
-switch is the root package's `build.zig.zon` `minimum_zig_version`, and
-the newest language when there is none (a lone file, for example). 0.16
+switch was first the root package's `build.zig.zon`
+`minimum_zig_version`; it is now the `zig_version` of the project's
+`.bs.zon`, and the newest language without one (owner, 2026-11-09). 0.16
 is a full second language: its syntax, ZIR, semantics, std, compile errors
 and build system, all compiled by bs's own Sema, backends and linkers.
 Nothing is handed to upstream zig except what bs hands it today, C and
@@ -264,16 +268,30 @@ slice dereference above is one.
 - **The type:** `Lang = enum(u8) { v0_16, v0_17 }`, fixed for a whole
   compilation and stored in `Zcu`. Each Sema copies it into a field when
   it starts.
-- **`bs build`** reads the root package's `build.zig.zon`:
-  - a `minimum_zig_version` of 0.16.x selects 0.16;
-  - 0.17.x, or no `minimum_zig_version`, selects 0.17;
-  - anything older than 0.16.0 or newer than 0.17.x is an error that names
-    the two supported versions.
+- **`bs build`** reads the root package's `.bs.zon` (owner, 2026-11-09;
+  first designed as `build.zig.zon`'s `minimum_zig_version`):
+  - `.zig_version = "0.16"` selects 0.16, `"0.17"` or none 0.17, and any
+    other value is an error at the field;
+  - `minimum_zig_version` selects nothing: it is a lower bound, as in
+    the corpus, where cache.zig, metrics.zig, libxev and zqlite.zig name
+    0.16.0, and forklift, serde.zig and zig-toml 0.14 and 0.15, but all
+    are 0.17 code. Upstream zig 0.16.0 and 0.17.1 do not check it
+    either, so one newer than 0.17.x builds as 0.17 too (owner,
+    2026-11-09; first refused). When a 0.17 build fails, the first error
+    that is not a lint finding gets a note at the field: for a minimum
+    of 0.16.x it names the `.bs.zon` fix, and for one newer than 0.17.x
+    it says this bs knows languages up to 0.17;
+  - no flag or environment variable chooses for `bs build` beyond the
+    `.bs.zon`. A nested `bs build` whose `.bs.zon` does not choose takes
+    the outer build's language (`BS_ZIG_VERSION`), as a nested
+    `zig build` gets the outer build's zig.
 - **Getting the language to the steps.** `bs build` passes it to every
   compile step it serves. 0.16's std.Build passes no such flag, so `bs
   build` sets an environment variable that its child processes inherit.
 - **`build-exe`, `test` and `run`** take an explicit `--zig-version
-  0.16|0.17` flag. Without the flag, see open question 1.
+  0.16|0.17` flag, else the nearest `.bs.zon`'s `zig_version`, found as
+  lint finds its config (from the root source file's directory up to
+  the nearest `build.zig`), else 0.17.
 - **Dependencies** take the root's language, as upstream has only one
   version per toolchain.
 
@@ -525,9 +543,9 @@ point anywhere.
   (aarch64-linux, aarch64-macos, langref, cases, c-abi) nightly. That
   keeps CI time from doubling. The full matrix moves to blocking once
   0.16 is at 100%.
-- **The corpus** records each project's `minimum_zig_version` and builds
-  0.16 projects in 0.16. Projects that still require 0.16 become
-  testable, though I haven't counted how many.
+- **The corpus** builds a project in 0.16 when its manifest entry says
+  `"zig_version": "0.16"` (zig-msgpack): the runner writes it into the
+  checkout's `.bs.zon` and records and compares against zig 0.16.0.
 
 ### Lint and the upcoming `.bs.zon`
 
@@ -543,9 +561,8 @@ point anywhere.
     Sema runs 0.16.
 - **Measure:** run `test/lint`'s ported suite in 0.16 mode, plus the
   corpus's configured 0.16 projects.
-- **`.bs.zon`:** I don't know its planned schema. I recommend that it
-  doesn't carry the language, since the owner chose `build.zig.zon`, and
-  that its lint settings apply to both languages.
+- **`.bs.zon`:** its lint settings apply to both languages, and since
+  2026-11-09 its `zig_version` carries the language.
 
 ### Compile-time cost for 0.17 builds
 
@@ -664,6 +681,10 @@ Development:
 >   both languages, and reports 0.17 compile-time numbers.
 
 ## Open questions, with recommendations
+
+Questions 1 and 2 were superseded on 2026-11-09: `.bs.zon` chooses the
+language, and no `minimum_zig_version` is refused; a failed build notes
+one of 0.16.x or newer than 0.17.x ("Selecting the language").
 
 1. **Plain `build-exe`/`test`/`run` without `--zig-version`.**
    - The owner's rule says the newest. But agents often run `bs test

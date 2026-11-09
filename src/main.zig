@@ -531,28 +531,6 @@ fn forwarding(env: *const std.process.Environ.Map) bool {
 /// How calls are inlined (docs/slop/architecture.md, "Inlining within a
 /// budget"): `BS_INLINE=<budget>` sets the budget, 0 turns inlining off,
 /// and `BS_INLINE_SAFE=1` inlines only callees that cannot panic.
-/// Exits: bs selects a language whose compilation is not built yet
-/// (docs/slop/zig-0.16.md).
-pub fn notYetSupported(choice: language.Choice) noreturn {
-    const by = switch (choice.source) {
-        .default => "",
-        .flag => " by --zig-version",
-        .env => " by BS_ZIG_VERSION",
-        .zon => |p| p,
-    };
-    fatal("Zig {s} is selected{s}{s}, but bs does not compile Zig {s} yet", .{ choice.language.name(), if (choice.source == .zon) " by the minimum_zig_version of " else "", by, choice.language.name() });
-}
-
-/// Exits (`notYetSupported`) unless bs compiles `choice`'s language.
-/// `BS_TEST_LANGUAGE_KEYS` lets a test compile in a language bs cannot
-/// compile yet, with the newest one's frontend and Sema, to check that
-/// its caches are its own (test/language/keys.sh). Until bs compiles Zig
-/// 0.16 in full, `BS_UNFINISHED_0_16` lets the conformance suite and its
-/// tests compile it (docs/slop/zig-0.16.md, phase 2).
-pub fn checkSupported(env: *const std.process.Environ.Map, choice: language.Choice) void {
-    if (choice.language != language.Language.newest and env.get("BS_TEST_LANGUAGE_KEYS") == null and env.get("BS_UNFINISHED_0_16") == null) notYetSupported(choice);
-}
-
 fn inlining(env: *const std.process.Environ.Map) struct { budget: u32, safe: bool } {
     const budget = if (env.get("BS_INLINE")) |v| std.fmt.parseInt(u32, v, 10) catch fatal("invalid BS_INLINE '{s}': expected a number", .{v}) else inline_ir.budget;
     return .{ .budget = budget, .safe = env.get("BS_INLINE_SAFE") != null };
@@ -596,7 +574,6 @@ pub const Job = struct {
         });
         const lib = try toolchain.libDir(arena, init_.io, init_.environ_map, cache_dirs.global, opts.zig_lib_dir, opts.language.language);
         const zig_lib_dir = lib.path;
-        checkSupported(init_.environ_map, opts.language);
         const is_test = command.isTest();
         // The newest under BS_TEST_LANGUAGE_KEYS, as the frontend's.
         const builtin_language: language.Language = if (init_.environ_map.get("BS_TEST_LANGUAGE_KEYS") != null) .newest else opts.language.language;
@@ -845,6 +822,41 @@ pub const Outcome = union(enum) {
 /// cannot leave `out_path` as it is writes its output there instead
 /// (`serve`).
 pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, alt_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8)) !Outcome {
+    const outcome = try compileJob(init, job, inc_opt, out_path, alt_path, prog, inputs);
+    if (outcome == .errors and outcome.errors.len != 0) if (job.opts.language.minimum_zon) |zon| {
+        if (job.opts.language.language == language.Language.newest) return .{ .errors = try noteMinimum(init.arena.allocator(), init.io, job, outcome.errors, zon) };
+    };
+    return outcome;
+}
+
+/// `diags` with a note on the first error about the `minimum_zig_version`
+/// of the `build.zig.zon` at `zon`, for a build in 0.17 that failed: a
+/// lower bound, it does not choose the language (language.zig). For
+/// 0.16.x the note names the `.bs.zon` that builds the project as 0.16;
+/// for a release newer than the newest, that bs does not know it.
+fn noteMinimum(arena: std.mem.Allocator, io: Io, job: *const Job, diags: []const diag.Diagnostic, zon: []const u8) ![]const diag.Diagnostic {
+    const field = try language.minimumField(arena, io, zon) orelse return diags;
+    const paths: diag.Paths = try .init(arena, io, job.zig_lib_dir);
+    const offset: u32 = @intCast(field.offset);
+    const newest = language.Language.newest;
+    const note: diag.Note = .{
+        .loc = try paths.loc(arena, zon, field.source, offset, offset, offset + @as(u32, @intCast(field.value.len)) + 2, false),
+        .msg = switch (field.kind) {
+            .zig_0_16 => try arena.print("bs built this as Zig {s}: minimum_zig_version '{s}' does not choose the language; if this is Zig 0.16 code, put `.zig_version = \"0.16\"` in a .bs.zon beside the build.zig.zon", .{ newest.name(), field.value }),
+            .newer => try arena.print("bs built this as Zig {s}: minimum_zig_version '{s}' names a release this bs does not know; it knows Zig languages up to {s}", .{ newest.name(), field.value, newest.name() }),
+        },
+    };
+    // Not on a lint finding, which is the same in either language.
+    const i = for (diags, 0..) |d, i| switch (d.code) {
+        .style, .deprecated, .@"lint-config" => {},
+        else => break i,
+    } else return diags;
+    const out = try arena.dupe(diag.Diagnostic, diags);
+    out[i].notes = try std.mem.concat(arena, diag.Note, &.{ out[i].notes, &.{note} });
+    return out;
+}
+
+fn compileJob(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, alt_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8)) !Outcome {
     // A build the cache cannot take (position-independent outputs, and
     // every aarch64-macos build) answers a build of the same compilation
     // that changed nothing from its inputs record, unless asked to check

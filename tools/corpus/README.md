@@ -41,7 +41,10 @@ recording their commands.
 
 - [`manifest.json`](manifest.json) lists each project: repository, pinned
   commit (a commit whose `build.zig.zon` declares `minimum_zig_version`
-  0.17.0 or which CI builds with 0.17.0), the `zig build` steps that build
+  0.17.0 or which CI builds with 0.17.0; or, with `"zig_version":
+  "0.16"`, a project of Zig 0.16 code, which the runner records and
+  compares with zig 0.16.0 and builds with bs as 0.16 through the
+  `.bs.zon` it writes into the checkout), the `zig build` steps that build
   its targets (`build`), and the targets: compile steps named by their
   `--name`, how to run each (`run`: arguments for an executable; tests run
   without arguments), and an `edit` line for the edit build. Recording

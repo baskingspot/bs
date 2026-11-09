@@ -36,18 +36,22 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const dirs = Frontend.resolveCacheDirs(arena, io, env, .{ .local_is_global = true });
     const global = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, dirs.global });
     // The root package's language is every compilation's (`BS_ZIG_VERSION`
-    // for the compilations the runner asks for).
-    var choice: language.Choice = if (try buildRoot(arena, io, cwd, user_args)) |root| try language.forBuild(arena, io, env, root) else .{ .language = .newest, .source = .default };
-    // A project without a build.zig.zon that a step of an outer build runs
-    // `zig build` on (zls's tests do) is in the outer build's language, as
-    // with that build's zig; one with a build.zig.zon is in its own.
+    // for every compilation the runner asks for, so that a dependency's
+    // .bs.zon does not choose), chosen by its .bs.zon.
+    var choice: language.Choice = if (try buildRoot(arena, io, cwd, user_args)) |root| try language.forBuild(arena, io, root) else .{ .language = .newest, .source = .default };
+    // A project whose .bs.zon does not choose, that a step of an outer
+    // build runs `zig build` on (zls's tests do), is in the outer build's
+    // language, as with that build's zig; one whose .bs.zon chooses is in
+    // its own.
     if (choice.source == .default) if (env.get("BS_ZIG_VERSION")) |v| {
-        choice = .{ .language = language.Language.fromVersion(v) orelse main.fatal("BS_ZIG_VERSION '{s}': bs compiles {s}", .{ v, language.supported }), .source = .env };
+        choice.language = language.Language.fromVersion(v) orelse main.fatal("BS_ZIG_VERSION '{s}': bs compiles {s}", .{ v, language.supported });
+        choice.source = .env;
     };
     // Zig 0.16 fetches and runs its build runner from the compiler.
     if (choice.language == .zig_0_16) return Build16.run(init, args, choice);
     const lib = try toolchain.libDir(arena, io, env, global, lib_override, choice.language);
-    if (choice.source == .zon) try env.put("BS_ZIG_VERSION", choice.language.name());
+    try env.put("BS_ZIG_VERSION", choice.language.name());
+    if (choice.minimum_zon) |zon| try env.put(language.minimum_zon_env, zon) else _ = env.swapRemove(language.minimum_zon_env);
     const zig_lib_dir = try Io.Dir.path.resolveAlloc(arena, &.{ cwd, lib.path });
 
     // One runner per bs binary, zig lib directory and mode.

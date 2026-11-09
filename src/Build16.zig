@@ -179,9 +179,6 @@ pub fn run(init: std.process.Init, args: []const []const u8, choice: language.Ch
         const runner_dir = try arena.print("{s}/bs/build-runner/{x:0>32}", .{ local, cache.hash(0, try std.mem.join(arena, "\x00", compile_args.items)) });
         try Io.Dir.cwd().createDirPath(io, runner_dir);
         const runner_path = try Io.Dir.path.join(arena, &.{ runner_dir, "build" });
-        // Said for the build.zig.zon that chose, not for the BS_ZIG_VERSION
-        // that bs set from it.
-        main.checkSupported(init.environ_map, choice);
         try BuildRunner.compileTool(init, runner_dir, compile_args.items, prog, "build runner", runner_root, null);
 
         var argv: std.ArrayList([]const u8) = .empty;

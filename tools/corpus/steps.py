@@ -174,19 +174,20 @@ def main():
         with open(path) as f:
             old = {(r["project"], tuple(r["args"])): r for r in json.load(f)}
     bs = os.path.abspath(args.bs)
-    # bs's build runner names itself by its real path (macOS's /tmp is
-    # /private/tmp), of which `bs` can be a suffix: longest first.
-    compilers = sorted(
-        {bs, os.path.realpath(bs), os.path.realpath(shutil.which(args.zig) or args.zig)}, key=len, reverse=True
-    )
     for proj in projects:
         run.log(f"{proj['name']} {proj['commit'][:12]}")
-        src = run.checkout(proj, args.zig)
+        zig = run.oracle(proj, args.zig)
+        # bs's build runner names itself by its real path (macOS's /tmp is
+        # /private/tmp), of which `bs` can be a suffix: longest first.
+        compilers = sorted(
+            {bs, os.path.realpath(bs), os.path.realpath(shutil.which(zig) or zig)}, key=len, reverse=True
+        )
+        src = run.checkout(proj, zig)
         for steps in proj.get("build", [["install"]]):
             key = (proj["name"], tuple(steps))
             prev = old.get(key, {})
             res = {"project": proj["name"], "args": steps}
-            res["zig"] = prev.get("zig") if args.bs_only else build(args.zig, src, steps, args.timeout)
+            res["zig"] = prev.get("zig") if args.bs_only else build(zig, src, steps, args.timeout)
             res["bs"] = build(bs, src, steps, args.timeout)
             res["verdict"] = compare(res["zig"], res["bs"], compilers)
             run.log(f"  {' '.join(steps)} => {res['verdict']}")

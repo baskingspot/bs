@@ -105,9 +105,10 @@ const Zon = struct {
 };
 
 /// `.bs.zon`: `.lint = false` turns lint off; `true`, a missing `lint`
-/// or `.{}` are ziglint's defaults.
-const BsZon = struct { lint: Zon = .{} };
-const BsZonSwitch = struct { lint: bool };
+/// or `.{}` are ziglint's defaults. Its `zig_version` is the language's
+/// (language.zig).
+const BsZon = struct { lint: Zon = .{}, zig_version: ?[]const u8 = null };
+const BsZonSwitch = struct { lint: bool, zig_version: ?[]const u8 = null };
 
 /// Reads the config `discover` found. A config bs cannot read, with an
 /// unknown field or rule ID among others, is a compile error rather than

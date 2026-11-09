@@ -202,11 +202,13 @@ STATUS_LABELS = {
 # itself, filtered to its own tests: one of them only reproduces in the root.
 
 
-def lint_off(d):
+def lint_off(d, zig_version=None):
     """bs lints a project's files by default; upstream's code is compiled
     with lint off. A `.bs.zon` in `d` turns it off for root files there
-    (all bs searches outside a project) and for a project rooted there."""
-    (d / ".bs.zon").write_text(".{ .lint = false }\n")
+    (all bs searches outside a project) and for a project rooted there,
+    and with `zig_version` chooses the language."""
+    field = f' .zig_version = "{zig_version}",' if zig_version else ""
+    (d / ".bs.zon").write_text(f".{{ .lint = false,{field} }}\n")
 
 
 def unit_root(unit, workdir, editable=False):
@@ -1743,9 +1745,8 @@ def run_one_standalone(compiler, name, args, workdir, env):
     out_dir = workdir / "standalone" / name
     shutil.rmtree(out_dir, ignore_errors=True)
     shutil.copytree(STANDALONE_ROOT / name, out_dir)
-    lint_off(out_dir)
-    if ZIG_0_16 and not args.upstream:
-        select_0_16(out_dir)
+    # `bs build` takes its language from the root package's .bs.zon.
+    lint_off(out_dir, "0.16" if ZIG_0_16 and not args.upstream else None)
     argv = [str(compiler), "build", "--summary", "all"]
     code, _out, err, timed_out = run_process(argv, out_dir, args.compile_timeout, env)
     r = {}
@@ -1767,24 +1768,6 @@ def run_one_standalone(compiler, name, args, workdir, env):
     return name, r
 
 
-def select_0_16(d):
-    """`bs build` takes its language from the root package's build.zig.zon
-    (with BS_ZON_SELECTS), not BS_ZIG_VERSION, and upstream's standalone
-    projects name none: has `d`'s select 0.16, writing one if needed (named
-    `standalone`: a project's own name may be a keyword or too long; the
-    fingerprint's high half is that name's CRC-32, as zig checks)."""
-    zon = d / "build.zig.zon"
-    if zon.exists():
-        text = zon.read_text()
-        zon.write_text(text.replace(".{", '.{\n    .minimum_zig_version = "0.16.0",', 1))
-        return
-    fingerprint = zlib.crc32(b"standalone") << 32 | 1
-    zon.write_text(
-        f'.{{\n    .name = .standalone,\n    .fingerprint = 0x{fingerprint:x},\n    .version = "0.0.0",\n'
-        f'    .minimum_zig_version = "0.16.0",\n    .paths = .{{""}},\n}}\n'
-    )
-
-
 def standalone_target(compiler, cfg, args, workdir):
     """--standalone: upstream's test/standalone projects built and run with
     `build`, against baseline/standalone-<target>.json."""
@@ -1794,8 +1777,6 @@ def standalone_target(compiler, cfg, args, workdir):
     global_cache = workdir / "standalone-global"
     shutil.rmtree(global_cache, ignore_errors=True)
     env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(global_cache))
-    if ZIG_0_16:
-        env["BS_ZON_SELECTS"] = "1"
     results = {}
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
         futs = [ex.submit(run_one_standalone, compiler, n, args, workdir, env) for n in names]
@@ -2372,8 +2353,6 @@ def use_zig_0_16(args):
         args.zig = oracle
     os.environ["BS_ZIG_0_16"] = args.zig
     os.environ["BS_ZIG_VERSION"] = "0.16"
-    # bs refuses 0.16 until it compiles; this measures it meanwhile.
-    os.environ["BS_UNFINISHED_0_16"] = "1"
     if args.test_runner is None and not args.default_runner:
         args.test_runner = HERE / "test_runner_0_16.zig"
 

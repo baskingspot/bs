@@ -1372,6 +1372,7 @@
    "name": "zig-msgpack",
    "url": "https://github.com/zigcc/zig-msgpack",
    "commit": "5884caaa3fcbcd315dbe88c3033e1fc60142071a",
+   "zig_version": "0.16",
    "ref": "main",
    "license": "MIT",
    "build": [

@@ -8043,8 +8043,8 @@ state. Built for step 1:
   the fetch and runs the runner again. `BS_ZIG_VERSION` in the runner's
   environment puts every compilation it asks for in 0.16. A step that
   runs `zig build` on a project of its own inherits it: `bs build` of a
-  project without a build.zig.zon takes that language, as the outer
-  build's zig would, and one with a build.zig.zon takes its own
+  project whose `.bs.zon` does not choose takes that language, as the
+  outer build's zig would, and one whose `.bs.zon` chooses takes its own
   (`BuildRunner.run`). `serve` speaks
   0.16's protocol to it: version "0.16.0", no `config` message, no
   `build_root` path prefix (0.16 knows four). `--webui`, `--fuzz` and
@@ -8169,16 +8169,23 @@ directory and upstream zig are those of the compilation's language
 `language`):
 
 - The language comes from `--zig-version`, else `BS_ZIG_VERSION` (which
-  `bs build` sets for the compilations it runs when its root package's
-  `build.zig.zon` chose), else the `minimum_zig_version` of the
-  `build.zig.zon` beside the nearest `build.zig` above the root source
-  file, else the newest (`language.resolve`; `language.forBuild` for
-  `bs build`, which reads its build root's and ignores the environment).
-  A version outside 0.16 and 0.17 is an error at the field or the flag.
-  Until 0.16 compiles, `build.zig.zon` is read only with
-  `BS_ZON_SELECTS` set, so projects that name another release keep
-  compiling as 0.17, and a compilation that selects 0.16 stops after its
-  lib directory is found (`main.notYetSupported`).
+  `bs build` sets for every compilation it runs, so that dependencies
+  take the root package's language), else the `zig_version` of the
+  nearest `.bs.zon` (`.zig_version = "0.16"`; found as lint finds its
+  config, from the root source file's directory up to the nearest
+  `build.zig`), else the newest (`language.resolve`;
+  `language.forBuild` for `bs build`, which reads its build root's
+  `.bs.zon`; owner, 2026-11-09). An unsupported `zig_version` or flag is
+  an error at it. A `minimum_zig_version` chooses nothing: it is a lower
+  bound, which upstream zig does not check either. One of 0.16.x or
+  newer than the newest release rides along as `Choice.minimum_zon`
+  (`BS_ZIG_MINIMUM_ZON` from `bs build`): a failed build in the newest
+  notes, at that field, the `.bs.zon` that chooses 0.16, or that bs
+  does not know that release (`main.noteMinimum`; owner, 2026-11-09).
+  A `bs build` whose `.bs.zon` does
+  not choose takes an inherited `BS_ZIG_VERSION`, as a nested
+  `zig build` takes the outer build's zig; no user-facing switch beyond
+  the `.bs.zon` chooses for `bs build`.
 - 0.16's zig is `BS_ZIG_0_16`, else `~/.cache/bs/zig-<host>-0.16.0/zig`
   (where `.agents/setup` installs it, never on PATH), else `zig` on
   PATH, which is usually 0.17.1's and then fails the version check with
@@ -8196,9 +8203,9 @@ directory and upstream zig are those of the compilation's language
   `src_hash`es and paths do not tell the languages apart. 0.17's keys
   and directory are named as before, so its caches stay warm. The
   `--listen=-` version (`serve`, translate-c's) is the language's.
-  `BS_TEST_LANGUAGE_KEYS` lets a test compile a language bs cannot
-  compile yet with the newest one's frontend and Sema, which
-  test/language/keys.sh uses to check all of this.
+  `BS_TEST_LANGUAGE_KEYS` compiles a language with the newest one's
+  frontend, Sema and builtin module, so that both languages read the
+  same sources; test/language/keys.sh uses it to check all of this.
 
 ## Fuzzing (designed and built 2026-11-03; x86_64-linux)
 
@@ -10247,7 +10254,8 @@ docs/slop/ziglint-in-bs.md. What is built:
   root in the zig lib directory, the global package cache's `p/` or a
   `zig-pkg/` directory is never linted. A `.bs.zon` decides: its `lint`
   has `.ziglint.zon`'s schema, `.lint = false` turns lint off (the only
-  off switch), and `true`, `.{}` or no `lint` are the defaults. With
+  off switch), and `true`, `.{}` or no `lint` are the defaults. Its
+  `zig_version` is the language's (`language.resolve`). With
   neither file, ziglint 0.8.1's defaults (every rule but Z033, Z024 at
   120 bytes) cover the project's directory, or the root file's own
   outside a project. `paths` are relative to the config's directory, `.`

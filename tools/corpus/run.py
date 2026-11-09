@@ -67,12 +67,24 @@ def setup(proj, zig, refresh):
     return src, record(proj, zig, src, cmds_path)
 
 
-def lint_off(path):
+def lint_off(path, zig_version=None):
     """Writes a `.bs.zon` that turns bs's lint off over `path`: bs lints a
-    project's own files by default, and the corpus is third-party code."""
+    project's own files by default, and the corpus is third-party code.
+    With `zig_version` it also chooses bs's language there."""
     os.makedirs(path, exist_ok=True)
+    field = f' .zig_version = "{zig_version}",' if zig_version else ""
     with open(os.path.join(path, ".bs.zon"), "w") as f:
-        f.write(".{ .lint = false }\n")
+        f.write(f".{{ .lint = false,{field} }}\n")
+
+
+def oracle(proj, zig):
+    """The upstream zig a project is recorded and compared with: `zig`, or
+    for a project of Zig 0.16 code (`zig_version`) zig 0.16.0, as bs finds
+    it (BS_ZIG_0_16, else .agents/setup's)."""
+    if proj.get("zig_version") != "0.16":
+        return zig
+    machine = "aarch64-macos" if sys.platform == "darwin" else f"{os.uname().machine}-linux"
+    return os.environ.get("BS_ZIG_0_16") or os.path.expanduser(f"~/.cache/bs/zig-{machine}-0.16.0/zig")
 
 
 def checkout(proj, zig):
@@ -81,7 +93,7 @@ def checkout(proj, zig):
     src = os.path.join(WORK, "src", proj["name"])
     proj["fetched"] = {
         "src": src,
-        "zig_lib": os.path.join(REPO_DIR, "upstream", "lib"),
+        "zig_lib": os.path.join(REPO_DIR, "upstream-0.16" if proj.get("zig_version") == "0.16" else "upstream", "lib"),
         "gen": os.path.join(WORK, "gen", proj["name"]),
     }
     if "copy" in proj:
@@ -107,7 +119,7 @@ def checkout(proj, zig):
     if proj.get("submodules"):
         # Vendored C sources (buzz's mimalloc, pcre2, ...).
         sh(["git", "submodule", "update", "--quiet", "--init", "--recursive"], src)
-    lint_off(src)
+    lint_off(src, proj.get("zig_version"))
     # Data packages a target's run needs (`fetch`), unpacked under .work/fetch/.
     for name, url in proj.get("fetch", {}).items():
         h = sh([zig, "fetch", url], WORK).stdout.strip()
@@ -139,9 +151,13 @@ def record(proj, zig, src, cmds_path):
         p = sh(argv, src, check=False, timeout=3600)
         shutil.rmtree(prefix, ignore_errors=True)
         for line in p.stderr.splitlines():
-            if not line.startswith("info(verbose): "):
+            if line.startswith("info(verbose): "):
+                words = shlex.split(line[len("info(verbose): ") :])
+            elif line.startswith(zig + " "):
+                # zig 0.16 prints the bare command line.
+                words = shlex.split(line)
+            else:
                 continue
-            words = shlex.split(line[len("info(verbose): ") :])
             if len(words) >= 2 and words[1] == "translate-c":
                 # A translated header, which each compiler translates
                 # itself for the targets that import it (`translate`).
@@ -191,7 +207,7 @@ def strip_common(words, cache_dir, out):
             # bs has no other mode. (Some build scripts force a release
             # mode on their build-time tools.) Not Clang's `-O…` flags in
             # `-cflags`, such as raylib's `-ObjC` on macOS.
-            res.append("-Odebug")
+            res.append("-ODebug")
         elif w in ("--cache-dir", "--global-cache-dir", "--zig-lib-dir"):
             # The recording zig's lib dir: each compiler uses its own, so
             # bs gets the std it was built for and upstream its release's.
@@ -721,11 +737,12 @@ def main():
         with open(results_path) as f:
             old = {(r["project"], r["target"]): r for r in json.load(f)}
     os.makedirs(WORK, exist_ok=True)
-    compilers = [("bs", os.path.abspath(args.bs))] + ([] if args.bs_only else [("zig", args.zig)])
     tool_secs = None if args.list else warm_translate_c(os.path.abspath(args.bs))
     for proj in projects:
         log(f"{proj['name']} {proj['commit'][:12]}")
-        src, cmds = setup(proj, args.zig, args.refresh)
+        zig = oracle(proj, args.zig)
+        compilers = [("bs", os.path.abspath(args.bs))] + ([] if args.bs_only else [("zig", zig)])
+        src, cmds = setup(proj, zig, args.refresh)
         if args.list:
             for name, words in cmds.items():
                 print(

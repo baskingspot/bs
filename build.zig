@@ -185,19 +185,20 @@ pub fn build(b: *std.Build) void {
     }
     addDiagTests(b, test_bs, diag_step, edit_step, upstream_step, std_zir);
     // The language a compilation is in (src/language.zig): a version bs
-    // does not compile is an error, at the build.zig.zon's field or the
-    // flag.
-    for ([_]struct { []const []const u8, []const u8 }{
-        .{ &.{}, "build.zig.zon:5:28: minimum_zig_version '0.15.2' is not supported: bs compiles Zig 0.16 and 0.17" },
-        .{ &.{ "--zig-version", "0.18" }, "--zig-version '0.18': bs compiles Zig 0.16 and 0.17" },
+    // does not compile is an error at the flag; a minimum_zig_version of
+    // 0.16.x or 0.18.0 builds as 0.17, and a failed build notes the
+    // .bs.zon that chooses 0.16, or that bs does not know 0.18.
+    for ([_]struct { []const u8, []const []const u8, []const []const u8 }{
+        .{ "newer", &.{}, &.{ "newer/main.zig:6:42: error[compile-error]: built as Zig 0.17", "newer/build.zig.zon:5:28: bs built this as Zig 0.17: minimum_zig_version '0.18.0' names a release this bs does not know; it knows Zig languages up to 0.17" } },
+        .{ "newer", &.{ "--zig-version", "0.18" }, &.{"--zig-version '0.18': bs compiles Zig 0.16 and 0.17"} },
+        .{ "min016", &.{}, &.{ "min016/main.zig:6:42: error[compile-error]: built as Zig 0.17", "min016/build.zig.zon:5:28: bs built this as Zig 0.17: minimum_zig_version '0.16.0' does not choose the language; if this is Zig 0.16 code, put `.zig_version = \"0.16\"` in a .bs.zon beside the build.zig.zon" } },
     }) |case| {
         const run = b.addRunArtifact(test_bs);
-        run.setName(b.fmt("bs refuses {s}", .{if (case[0].len == 0) "an unsupported minimum_zig_version" else "an unsupported --zig-version"}));
-        run.setEnvironmentVariable("BS_ZON_SELECTS", "1");
+        run.setName(b.fmt("bs language of test/language/{s}{s}", .{ case[0], if (case[1].len == 0) "" else " with --zig-version" }));
         run.addArgs(&.{ "build-exe", "-fno-emit-bin" });
-        run.addFileArg(b.path("test/language/old/main.zig"));
-        run.addArgs(case[0]);
-        run.addCheck(.{ .expect_stderr_match = case[1] });
+        run.addFileArg(b.path(b.fmt("test/language/{s}/main.zig", .{case[0]})));
+        run.addArgs(case[1]);
+        for (case[2]) |m| run.addCheck(.{ .expect_stderr_match = m });
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
         diag_step.dependOn(&run.step);
     }
