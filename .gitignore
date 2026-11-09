@@ -11,3 +11,4 @@ __pycache__/
 .direnv/
 .envrc.local
 /tools/edithunt/.work/
+/test/diag/arith_operand
