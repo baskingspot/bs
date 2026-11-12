@@ -51,9 +51,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/frontend_hash.zig"),
         .target = b.graph.host,
     }) }));
-    frontend_hash.addDirectoryArg(b.path("frontend"));
-    const frontend_hash_zig = frontend_hash.addOutputFileArg("frontend_hash.zig");
-    _ = frontend_hash.addDepFileOutputArg("frontend_hash.d");
+    frontend_hash.addDirectoryArg2(b.path("frontend"), .{});
+    const frontend_hash_zig = frontend_hash.addOutputFileArg2("frontend_hash.zig", .{});
+    _ = frontend_hash.addDepFileOutputArg2("frontend_hash.d", .{});
     frontend.module.addAnonymousImport("frontend_hash", .{ .root_source_file = frontend_hash_zig });
     // The same for the ReleaseFast tools below: a module's own optimize mode
     // decides its unions' layout, and std's runtime_safety follows the
@@ -2500,9 +2500,9 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         vcc.addFileArg(b.path("test/link_input/libc.c"));
         _ = vcc.addOutputFileArg2("main", .{ .prefix = "-femit-bin=" });
         vcc.addArg("--cache-dir");
-        _ = vcc.addOutputDirectoryArg("local");
+        _ = vcc.addOutputDirectoryArg2("local", .{});
         vcc.addArg("--global-cache-dir");
-        _ = vcc.addOutputDirectoryArg("global");
+        _ = vcc.addOutputDirectoryArg2("global", .{});
         vcc.setEnvironmentVariable("BS_ZIG", zig);
         for (case.flags) |f| vcc.addCheck(.{ .expect_stderr_match = f });
         vcc.addCheck(.{ .expect_term = .{ .exited = 0 } });
