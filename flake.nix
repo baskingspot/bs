@@ -17,9 +17,11 @@
         shell
       ];
 
-      # bs runs on x86_64 Linux and Apple Silicon macOS.
+      # bs runs on x86_64 Linux and Apple Silicon macOS, and builds for
+      # aarch64 Linux too, so a native aarch64 Linux host gets a shell.
       systems = [
         "x86_64-linux"
+        "aarch64-linux"
         "aarch64-darwin"
       ];
 
@@ -48,6 +50,11 @@
                 name = "x86_64-linux";
                 sha256 = "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a";
                 oldSha256 = "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00";
+              };
+              aarch64-linux = {
+                name = "aarch64-linux";
+                sha256 = "a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795";
+                oldSha256 = "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17";
               };
               aarch64-darwin = {
                 name = "aarch64-macos";
@@ -132,9 +139,12 @@
               pkgs.python3
               pkgs.ruff
             ]
-            # Runs aarch64-linux test binaries on x86_64-linux, as
-            # .agents/setup's qemu-user-static does in orbs.
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.qemu-user ];
+            # Runs aarch64-linux test binaries here, as .agents/setup's
+            # qemu-user-static does in orbs. A native aarch64 host needs no
+            # emulator.
+            ++ pkgs.lib.optionals (pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isx86_64) [
+              pkgs.qemu-user
+            ];
             env.ZIG_SRC = zigSrc;
             env.ZIG_SRC_0_16 = zigOldSrc;
             env.BS_ZIG_0_16 = "${zigOld}/zig";
