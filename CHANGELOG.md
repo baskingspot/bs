@@ -8,6 +8,7 @@ Changes a user of bs notices, newest first, in the
 ### Fixed
 
 - An edit build after a function passed to `std.Thread.spawn` or `io.concurrent` gained a parameter no longer reports a false type error in that function, such as `expected type 'bool', found 'i16'` at the new parameter's use. The build reused the old thread entry point's records, whose function had the old type.
+- On a native aarch64 Linux host, `translate-c` (and so a `zig build` with `b.addTranslateC`) translates for the native target instead of refusing with `bs translates C only for x86_64-linux and aarch64-macos so far ('native')`. It resolves the native target as `build-exe` does, so a native musl host's `-lc` now takes musl's headers on x86_64 too, as `build-exe` links musl there.
 
 ## [0.1.1] - 2026-11-12
 

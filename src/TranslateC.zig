@@ -157,23 +157,15 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
     }
     const target = opts.target orelse "native";
     var native_includes: []const []const u8 = &.{};
-    const host = builtin.target;
-    if (std.mem.eql(u8, target, "native") and host.cpu.arch == .aarch64 and host.os.tag == .macos) {
-        main.checkTarget(&opts, arena, io, target);
-    } else if (std.mem.eql(u8, target, "native")) {
-        if (!(host.cpu.arch == .x86_64 and host.os.tag == .linux))
-            main.setUnsupported(&opts, "bs translates C only for x86_64-linux and aarch64-macos so far ('native'); pass -target x86_64-linux", arena, .{})
-        else if (std.zig.system.resolveTargetQuery(io, .{})) |native| {
-            if (native.abi.isGnu()) opts.glibc_version = native.os.version_range.linux.glibc;
-            if (named_libs) if (std.zig.system.NativePaths.detect(arena, io, &native, init.environ_map)) |paths| {
+    main.checkTarget(&opts, arena, io, target);
+    if (named_libs and opts.unsupported == null and std.mem.eql(u8, target, "native") and builtin.os.tag == .linux) {
+        if (std.zig.system.resolveTargetQuery(io, .{})) |native| {
+            if (std.zig.system.NativePaths.detect(arena, io, &native, init.environ_map)) |paths| {
                 native_includes = paths.include_dirs.items;
-            } else |_| {};
+            } else |_| {}
         } else |_| {}
-        if (opts.link_libc and opts.unsupported == null) main.resolveGlibc(&opts, arena);
-    } else {
-        main.checkTarget(&opts, arena, io, target);
-        if (opts.link_libc and opts.unsupported == null and opts.bs_target != .aarch64_macos) main.resolveGlibc(&opts, arena);
     }
+    if (opts.link_libc and opts.unsupported == null and opts.bs_target != .aarch64_macos) main.resolveGlibc(&opts, arena);
     // The CPU of the code bs compiles the headers into.
     main.resolveCpu(&opts, arena, io, mcpu);
     // Darwin always links libc (libSystem), as upstream's
