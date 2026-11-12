@@ -5,6 +5,8 @@ Changes a user of bs notices, newest first, in the
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-12
+
 ### Fixed
 
 - An edit build after a function passed to `std.Thread.spawn` or `io.concurrent` gained a parameter no longer reports a false type error in that function, such as `expected type 'bool', found 'i16'` at the new parameter's use. The build reused the old thread entry point's records, whose function had the old type.
@@ -78,5 +80,7 @@ The first release.
 - Copying a struct that the optimizer splits into a global variable no longer crashes bs (upstream's `lib/c.zig` `drand48` does).
 - `callconv` takes a `std.builtin.CallingConvention` value computed at comptime, such as `callconv(cc orelse .c)`.
 
-[Unreleased]: https://github.com/baskingspot/bs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/baskingspot/bs/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/baskingspot/bs/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/baskingspot/bs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/baskingspot/bs/releases/tag/v0.1.0
