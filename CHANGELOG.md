@@ -5,6 +5,10 @@ Changes a user of bs notices, newest first, in the
 
 ## [Unreleased]
 
+### Fixed
+
+- An edit build after a struct's fields all lost their default values (`choices: []Choice = &.{},` becoming `choices: []Choice,` on the last one) no longer crashes with a segmentation fault. The struct's declarations are then made again, and the build brought a type's field defaults up to date before its layout when the edit reached only the defaults, such as those of the `StaticStringMap` that `std.meta.stringToEnum` makes from an enum in that struct.
+
 ## [0.1.2] - 2026-11-12
 
 ### Fixed

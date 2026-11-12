@@ -1183,7 +1183,13 @@ fn ensure(r: *Replay, dep: Zcu.Dependee) bool {
         .nav_val => |nav| zcu.ensureNavVal(nav) catch return false,
         .nav_ty => |nav| zcu.ensureNavTy(nav) catch return false,
         .type_layout => |ty| zcu.ensureStructLayout(ty) catch return false,
-        .struct_defaults => |ty| zcu.ensureStructDefaults(ty) catch return false,
+        // The layout first, as `Sema.resolveStructDefaults` resolves it: a
+        // lazy build skips a reader's dependencies that no edit reached,
+        // so an outdated `struct_defaults` can come before its layout.
+        .struct_defaults => |ty| {
+            zcu.ensureStructLayout(ty) catch return false;
+            zcu.ensureStructDefaults(ty) catch return false;
+        },
         .func_ies => |func| _ = zcu.ensureFuncIes(func) catch return false,
         // Decided now, analyzing the function out of order if needed; when
         // that cannot happen now, the reader is analyzed again. Out of
