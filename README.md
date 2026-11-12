@@ -34,7 +34,7 @@ zig = "0.17.1"
 With Nix, pinned to a release, which brings the Zig 0.17.1 it needs:
 
 ```sh
-nix run github:baskingspot/bs/v0.1.2 -- build-exe main.zig
+nix run github:baskingspot/bs/v0.1.3 -- build-exe main.zig
 ```
 
 Or download `bs-<version>-<platform>.tar.gz` for `linux-x64`, `linux-arm64`, or `macos-arm64` from [the releases](https://github.com/baskingspot/bs/releases), check it against `SHA256SUMS`, and put `bs` on `PATH`.
