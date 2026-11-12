@@ -1,4 +1,13 @@
 {
+  # The org's binary cache, so `nix run` fetches bs instead of building it.
+  # Nix asks once whether to accept these settings from a flake.
+  nixConfig = {
+    extra-substituters = [ "https://baskingspot.cachix.org" ];
+    extra-trusted-public-keys = [
+      "baskingspot.cachix.org-1:4KDZc1xfJdL8VGAOZo1SkOgZlqMNH+thBzux9J66EjU="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-parts.follows = "baskingspot/flake-parts";
@@ -39,7 +48,7 @@
         in
         {
           packages.zig = toolchain.zig;
-          packages.default = pkgs.callPackage ./nix/package.nix { inherit (toolchain) zig zigOld; };
+          packages.default = pkgs.callPackage ./nix/package.nix { inherit (toolchain) zig; };
 
           devShells.default = pkgs.mkShell {
             inputsFrom = [
