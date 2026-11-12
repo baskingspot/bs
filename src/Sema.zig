@@ -2039,6 +2039,15 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     const module = zcu.file(nav.file).module;
     if (module == .compiler_rt or !zcu.fe.module(module).safety) block.want_safety = false;
 
+    // A function an edit build decoded from the last build's records may
+    // be gone, with a type that does not fit its ZIR's parameters: its
+    // declaration decides, resolved first as in a full build. The error
+    // sends a lazy build back to an eager one (`Replay.errorsReached`).
+    if (zcu.replay != null) {
+        if (nav.status == .unresolved) try zcu.ensureNavVal(func.owner_nav);
+        if (zcu.isStaleFunc(func_index))
+            return sema.fail(&block, block.nodeSrc(.zero), "bs cache: '{s}' is a function of the last build that this one does not have", .{ip.stringSlice(nav.name)});
+    }
     for (fn_ty.param_types) |pt| try sema.resolveLayout(&block, block.nodeSrc(.zero), pt);
     try sema.resolveLayout(&block, block.nodeSrc(.zero), fn_ty.return_type);
     // A generic function has no runtime body; asking for one can only

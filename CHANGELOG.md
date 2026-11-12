@@ -5,6 +5,10 @@ Changes a user of bs notices, newest first, in the
 
 ## [Unreleased]
 
+### Fixed
+
+- An edit build after a function passed to `std.Thread.spawn` or `io.concurrent` gained a parameter no longer reports a false type error in that function, such as `expected type 'bool', found 'i16'` at the new parameter's use. The build reused the old thread entry point's records, whose function had the old type.
+
 ## [0.1.1] - 2026-11-12
 
 ### Added

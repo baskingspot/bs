@@ -6687,7 +6687,17 @@ records only what changed, and links from the manifest.
   printed though a full build never analyzes it (the edit hunter, seeds
   5201 and 5202 on the zig compiler; test/run/edit_unreached_error.sh).
   The check costs a walk of the graph, and only failing lazy builds pay
-  it.
+  it. Such a unit's records can name a function as it was: a thread's
+  entry point under the old `std.Thread.spawn` instance names the old
+  `serve`, with its old function type, after `serve` gained a parameter.
+  That item is no function of this build (`Zcu.isStaleFunc`: its
+  declaration's value, or its generic owner's, is another), and its
+  unit key, its declaration's, is the new function's. Sema refuses to
+  analyze its body (the new ZIR) against the old type, and
+  `errorsReached` finds no node for it, so the build goes eager. Until
+  2026-11-12 Sema read the new parameter's type past the old type's end
+  and reported a false type mismatch (parcel;
+  test/run/edit_spawn_param.zig).
 - `BS_CACHE_VERIFY` compares a full build with the edit build's manifest
   as before, and also requires the full build's nodes to be neither
   `stale` nor, with atoms, `unlinked` there. Nodes only in the edit

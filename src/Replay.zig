@@ -1510,6 +1510,9 @@ fn addRefer(
 }
 
 fn nodeOf(r: *Replay, unit: Zcu.AnalUnit) !?u32 {
+    // Not the node of the function now under its key, which a full build
+    // reaches instead.
+    if (unit == .func and r.zcu.isStaleFunc(unit.func)) return null;
     return r.unit_nodes.get(unit) orelse r.m.find(try r.keyer.keyOf(Incremental.Recorder.unitTag(unit), &.{try r.keyer.unitKeyString(unit)}));
 }
 

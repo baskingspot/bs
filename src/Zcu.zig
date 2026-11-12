@@ -1664,6 +1664,24 @@ pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !bool {
     return true;
 }
 
+/// Whether `func` is a function of the last build that this one does not
+/// have: its declaration, or its generic owner's, now has another value.
+/// A function is its declaration's value or an instance of it, but an
+/// edit build decodes the last build's records as they were, with the
+/// function types of then: a lazy build walks into a unit no longer
+/// reached (`Replay.assumeReached`), such as a thread's entry point that
+/// calls the old `fn serve(port: u16)` after a `named: bool` parameter was
+/// added. Its body is the new ZIR, so Sema must not analyze it against the
+/// old type; and its unit key, its declaration's, names the new function's
+/// node (`Replay.errorsReached`). Only a resolved declaration can tell.
+pub fn isStaleFunc(zcu: *Zcu, func: InternPool.Index) bool {
+    const ip = &zcu.ip;
+    const f = ip.keyPayload(.func, func);
+    const decl_func = if (f.generic_owner != .none) f.generic_owner else func;
+    const nav = ip.getNav(ip.keyPayload(.func, decl_func).owner_nav);
+    return nav.status == .resolved and nav.val != decl_func;
+}
+
 pub const InlineResult = struct {
     /// `not_inlinable` for a function here only for its `ret_len`.
     size: u32,
