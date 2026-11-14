@@ -788,12 +788,13 @@ pub fn addDeclNote(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []c
 
 /// Fails on two strong exports of one name, as upstream's
 /// `processExports`: an error at the later export, with a note at the
-/// first.
+/// first. In Zig 0.16 a weak export collides too, with a strong one or
+/// with another weak one; 0.17 lets the linker choose among those.
 pub fn checkExportCollisions(zcu: *Zcu) !void {
     var first: std.AutoHashMapUnmanaged(InternPool.String, usize) = .empty;
     defer first.deinit(zcu.gpa);
     for (zcu.exports.items, 0..) |x, i| {
-        if (x.linkage != .strong) continue;
+        if (x.linkage != .strong and zcu.language != .zig_0_16) continue;
         const gop = try first.getOrPut(zcu.gpa, x.name);
         if (!gop.found_existing) {
             gop.value_ptr.* = i;

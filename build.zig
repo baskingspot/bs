@@ -193,11 +193,13 @@ pub fn build(b: *std.Build) void {
     // The language a compilation is in (src/language.zig): a version bs
     // does not compile is an error at the flag; a minimum_zig_version of
     // 0.16.x or 0.18.0 builds as 0.17, and a failed build notes the
-    // .bs.zon that chooses 0.16, or that bs does not know 0.18.
+    // .bs.zon that chooses 0.16, or that bs does not know 0.18. And one
+    // compile error only 0.16 has: a weak export of a name exported twice.
     for ([_]struct { []const u8, []const []const u8, []const []const u8 }{
         .{ "newer", &.{}, &.{ "newer/main.zig:6:42: error[compile-error]: built as Zig 0.17", "newer/build.zig.zon:5:28: bs built this as Zig 0.17: minimum_zig_version '0.18.0' names a release this bs does not know; it knows Zig languages up to 0.17" } },
         .{ "newer", &.{ "--zig-version", "0.18" }, &.{"--zig-version '0.18': bs compiles Zig 0.16 and 0.17"} },
         .{ "min016", &.{}, &.{ "min016/main.zig:6:42: error[compile-error]: built as Zig 0.17", "min016/build.zig.zon:5:28: bs built this as Zig 0.17: minimum_zig_version '0.16.0' does not choose the language; if this is Zig 0.16 code, put `.zig_version = \"0.16\"` in a .bs.zon beside the build.zig.zon" } },
+        .{ "export016", &.{ "--zig-version", "0.16" }, &.{ "export016/main.zig:16:5: error[bad-export]: exported symbol collision: weak_twice", "export016/main.zig:18:5: error[bad-export]: exported symbol collision: weak_and_strong", "export016/main.zig:17:5: other symbol here", "2 errors" } },
     }) |case| {
         const run = b.addRunArtifact(test_bs);
         run.setName(b.fmt("bs language of test/language/{s}{s}", .{ case[0], if (case[1].len == 0) "" else " with --zig-version" }));

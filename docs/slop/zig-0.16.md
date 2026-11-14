@@ -217,6 +217,13 @@ language:
 - **Smaller changes:**
   - empty enums must be backed by `noreturn` in 0.17;
   - `internal` and `link_once` linkage exist in 0.16 only;
+  - two exports of one name are `exported symbol collision` in 0.16
+    whatever their linkage; 0.17 reports only two strong ones and leaves
+    a weak one to the linker (`Zcu.checkExportCollisions`). One case of
+    0.16's is left out: an object built with `-fcompiler-rt` whose
+    program exports a name compiler_rt exports (`memcpy`), which 0.16
+    reports because compiler_rt is then part of the compilation, and bs
+    puts in an object only the compiler_rt functions it calls;
   - 0.17's `std.lang.panic` handlers add `unexpectedErrorCode` and
     `loadUninstantiableType`, so the panic calls Sema emits follow 0.16's
     handler set;
