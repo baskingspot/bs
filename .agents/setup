@@ -46,7 +46,9 @@ fetch() { # url sha dest_dir
   if [ -d "$dest" ]; then echo "have $dest"; return; fi
   echo "fetching $url"
   tmp="$(mktemp)"
-  curl -fsSL "$url" -o "$tmp"
+  # The mirror sometimes drops a stream (curl exit 92), which plain
+  # --retry does not count as transient.
+  curl -fsSL --retry 5 --retry-all-errors "$url" -o "$tmp"
   got="$(sha256 "$tmp" | cut -d' ' -f1)"
   if [ "$got" != "$sha" ]; then
     echo "sha256 mismatch for $url: got $got, want $sha" >&2
