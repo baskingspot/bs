@@ -6631,7 +6631,16 @@ and manifest are a full build's, which `BS_CACHE_VERIFY` checks.
   and code reading `@typeName` went stale.
 - The error name table is written in code order, not use order, so that
   its atom does not depend on which units were loaded.
-- `bs test` replays too: the test list is sorted (above).
+- `bs test` replays too: the test list is sorted (above). Its value,
+  `builtin.test_functions`, is the one result set after analysis
+  (`Sema.populateTestFunctions`), so it has an `analyze` reference and
+  an eager build analyzes it and sets its own list. Until 2026-11-14 the
+  build loaded the last build's list, and decoding its pointers made
+  each old test's container (`Resolver.container`, `fileRootType`),
+  whose scan queued the tests again: after an edit that stopped a file
+  from being imported, that file's tests still ran
+  (test/run/edit_test_unreached.sh; fastmem 0.2.0's
+  `-Dx86-dispatch=false` tests after a default build).
 - Known limits: a unit is red, not loaded, if a result or dependency
   cannot be made (`BS_CACHE_CHECK` prints each one; none in hello or
   conformance). Two declarations that take each other's addresses, one
@@ -6808,7 +6817,11 @@ records only what changed, and links from the manifest.
   an `@export` that ran again, a function generated again that an
   `@export` left green names (`Emit.nameAtoms` would name its atom after
   the declaration), exported or test declarations added or
-  removed, a declaration's data lowered for the first time without its
+  removed, in a test build a namespace with tests or exports that was
+  reached and no longer is (the link would keep
+  `builtin.test_functions`'s data, which names its tests: until
+  2026-11-14 such a build failed with an undefined symbol), a
+  declaration's data lowered for the first time without its
   unit being analyzed, data with the address of a link input's symbol
   (`Emit.inputs_deferred`), or a change in the link's inputs outside the atoms
   (external symbols, whether the error name table is written, and new

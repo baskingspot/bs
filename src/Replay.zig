@@ -932,10 +932,11 @@ fn greenNode(r: *Replay, unit: Zcu.AnalUnit) !?Green {
     };
     if (r.lazy and !is_outdated and !r.dead.isSet(node) and !materialize) return g;
     // A unit with effects (`@export`) runs again in an eager build, which
-    // makes the effects again; a lazy one keeps them in the manifest, so
-    // the unit stays green there if its dependencies' results did
-    // (`Incremental.recordDelta` falls back if a function it exports is
-    // generated again).
+    // makes the effects again (and `builtin.test_functions` takes this
+    // build's tests, `Incremental.Graph.collect`); a lazy one keeps them
+    // in the manifest, so the unit stays green there if its dependencies'
+    // results did (`Incremental.recordDelta` falls back if a function it
+    // exports is generated again).
     if (analyze and !r.lazy) return r.red(node);
     const n = m.node(node);
     const has_result = switch (unit) {

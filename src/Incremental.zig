@@ -3057,6 +3057,22 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     // assumed nodes no longer reached out of the walk's.
     var reached = try inc.reachedNow(rp, nodes, final, write, node_refs.items, ref_starts, n_new);
     defer reached.deinit(gpa);
+    // A namespace with tests that is no longer reached: the test list
+    // changed, which a lazy build does not set (`builtin.test_functions`'s
+    // data from the manifest would still list them). A root that is not a
+    // `comptime` block is a test or an export; exports alone need no
+    // fallback, so only a test build checks.
+    if (zcu.is_test) {
+        var before = try m.reachedSet(gpa);
+        defer before.deinit(gpa);
+        const word_bits = @bitSizeOf(std.bit_set.Dynamic.MaskInt);
+        for (before.masks[0 .. (n_prev + word_bits - 1) / word_bits], 0..) |*w, k| w.* &= ~reached.masks[k];
+        var it = before.iterator(.{});
+        while (it.next()) |x| if (m.node(@intCast(x)).tag == @backingInt(Tag.namespace)) {
+            for (m.nodeRefs(@intCast(x))) |ref| if (ref.kind == .root and m.node(ref.value).tag != @backingInt(Tag.comptime_decl))
+                return inc.lazyFallback("tests no longer reached", .{});
+        };
+    }
     // Which nodes are live now: those the walk reached, and those written
     // with what they depend on.
     var live = try std.bit_set.Dynamic.initEmpty(gpa, n_prev + n_new);
@@ -3854,6 +3870,16 @@ const Graph = struct {
         };
         for (zcu.exports.items) |e| if (e.unit) |unit| try g.analyze_items.append(gpa, try r.addUnit(unit));
         for (zcu.global_asm.items) |a| try g.analyze_items.append(gpa, try r.addUnit(a.unit));
+        // `builtin.test_functions`, whose result is the test list
+        // `Sema.populateTestFunctions` set after analysis: an eager build
+        // analyzes it again and sets its own. Loading the list would make
+        // its tests' containers, whose scans queue the tests again, even
+        // those of a file the build no longer imports.
+        if (zcu.is_test) if (zcu.moduleRootFile(.builtin)) |file| if (zcu.file_root_types.items[file] != .none) {
+            const ns = zcu.namespacePtr(ip.structInfo(zcu.file_root_types.items[file]).namespace);
+            const nav = ns.decls.get(try ip.getString(Zcu.tid, "test_functions")) orelse .none;
+            if (nav != .none and zcu.deps.contains(.{ .nav_val = nav })) try g.analyze_items.append(gpa, try r.addUnit(.{ .nav_val = nav }));
+        };
         var it_quota = zcu.branch_quotas.iterator();
         while (it_quota.next()) |q| if (zcu.deps.contains(.{ .func = q.key_ptr.* }))
             try g.quota_items.append(gpa, .{ try r.addUnit(.{ .func = q.key_ptr.* }), q.value_ptr.* });

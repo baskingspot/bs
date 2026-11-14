@@ -341,7 +341,8 @@ pub const Ref = extern struct {
         error_names,
         /// An edit build must analyze the unit rather than load it: its
         /// analysis had effects outside its result (an `@export`, or a new
-        /// namespace with `comptime`, exported or test declarations).
+        /// namespace with `comptime`, exported or test declarations), or
+        /// its result is set after analysis (`builtin.test_functions`).
         analyze,
         /// The branch quota (`value`) a generic instance's callers gave it
         /// (`Zcu.branch_quotas`), which it keeps when they are loaded.

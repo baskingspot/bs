@@ -1799,6 +1799,19 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         takes(b, &ue.step, 10);
         edit_step.dependOn(&ue.step);
     }
+    // `bs test` after an import of a file with tests went:
+    // test/run/edit_test_unreached.sh.
+    {
+        const tu = b.addSystemCommand(&.{"sh"});
+        tu.setName("bs test after an import of a file with tests went");
+        tu.addFileArg(b.path("test/run/edit_test_unreached.sh"));
+        tu.addArtifactArg2(bs, .{});
+        _ = tu.addOutputDirectoryArg2("work", .{});
+        tu.addDirectoryArg2(std_zir, .{});
+        tu.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &tu.step, 15);
+        edit_step.dependOn(&tu.step);
+    }
 
     const bs_run = b.addRunArtifact(bs);
     bs_run.setName("bs run args");
