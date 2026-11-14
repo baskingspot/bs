@@ -256,6 +256,8 @@ pub const Options = struct {
     /// `-fllvm`: the backend upstream would use, which bs does not, but
     /// which gives the compilation's C a stack protector upstream.
     use_llvm: bool = false,
+    /// `-fcompiler-rt` (true) or `-fno-compiler-rt` (false), as given.
+    compiler_rt: ?bool = null,
     function_sections: bool = false,
     data_sections: bool = false,
     /// `--verbose-cc`: print each Clang command line, as upstream.
@@ -1603,7 +1605,9 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     try zcu.lint_covered.resize(init.gpa, fe.files.items.len, false);
     for (lint_state.covered_files.items) |i| zcu.lint_covered.set(i);
     try zcu.analyzeAll(&emit);
-    try zcu.checkExportCollisions();
+    // As upstream, `-fcompiler-rt` makes an object's compiler_rt part of
+    // the compilation.
+    try zcu.checkExportCollisions(opts.command.isObj() and opts.compiler_rt == true);
     if (bench_runs != 0) try emit.benchCodegen(bench_runs);
     stages.markSplit("sema", "codegen", emit.codegen_ns);
     sema_node.end();
@@ -2435,8 +2439,7 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"--no-dynamicbase"},               .{"-fallow-shlib-undefined"},
     .{"-fno-allow-shlib-undefined"},     .{"-headerpad_max_install_names"},
     .{"-dead_strip_dylibs"},             .{"-ObjC"},
-    .{"--discard-all"},                  .{"-fcompiler-rt"},
-    .{"-fno-compiler-rt"},               .{"-fubsan-rt"},
+    .{"--discard-all"},                  .{"-fubsan-rt"},
     .{"-fno-ubsan-rt"},                  .{"-fdll-export-fns"},
     .{"--enable-new-dtags"},             .{"--disable-new-dtags"},
     .{"-feach-lib-rpath"},               .{"-fno-each-lib-rpath"},
@@ -2767,6 +2770,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (std.mem.eql(u8, arg, "-fllvm") or std.mem.eql(u8, arg, "-fno-llvm")) {
             // bs uses its own backend either way (see `ignored_flags`).
             opts.use_llvm = arg[2] == 'l';
+        } else if (std.mem.eql(u8, arg, "-fcompiler-rt") or std.mem.eql(u8, arg, "-fno-compiler-rt")) {
+            // Changes only Zig 0.16's export collisions (`Zcu.checkExportCollisions`):
+            // bs links the compiler_rt functions a program uses either way.
+            opts.compiler_rt = arg[2] == 'c';
         } else if (ignored_flags.has(arg)) {
             // Changes nothing bs does.
         } else if (ignored_flags_with_arg.has(arg)) {

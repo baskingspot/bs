@@ -219,11 +219,14 @@ language:
   - `internal` and `link_once` linkage exist in 0.16 only;
   - two exports of one name are `exported symbol collision` in 0.16
     whatever their linkage; 0.17 reports only two strong ones and leaves
-    a weak one to the linker (`Zcu.checkExportCollisions`). One case of
-    0.16's is left out: an object built with `-fcompiler-rt` whose
-    program exports a name compiler_rt exports (`memcpy`), which 0.16
-    reports because compiler_rt is then part of the compilation, and bs
-    puts in an object only the compiler_rt functions it calls;
+    a weak one to the linker (`Zcu.checkExportCollisions`). An object
+    built with `-fcompiler-rt` whose program exports a name compiler_rt
+    exports (`memcpy`) collides too, because 0.16 then analyzes
+    compiler_rt with the program; bs puts in an object only the
+    compiler_rt functions it calls, but finds the name in 0.16's export
+    table and reports the collision at the program's export, where 0.16
+    reports it at compiler_rt's (fastmem's `test-export-collisions`
+    checks it, 2026-11-14);
   - 0.17's `std.lang.panic` handlers add `unexpectedErrorCode` and
     `loadUninstantiableType`, so the panic calls Sema emits follow 0.16's
     handler set;

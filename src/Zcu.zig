@@ -790,7 +790,10 @@ pub fn addDeclNote(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []c
 /// `processExports`: an error at the later export, with a note at the
 /// first. In Zig 0.16 a weak export collides too, with a strong one or
 /// with another weak one; 0.17 lets the linker choose among those.
-pub fn checkExportCollisions(zcu: *Zcu) !void {
+/// `compiler_rt`: an object built with `-fcompiler-rt`, whose compiler_rt
+/// 0.16 analyzes with the program, so that an export of a name it exports
+/// (`memcpy`) collides too.
+pub fn checkExportCollisions(zcu: *Zcu, compiler_rt: bool) !void {
     var first: std.AutoHashMapUnmanaged(InternPool.String, usize) = .empty;
     defer first.deinit(zcu.gpa);
     for (zcu.exports.items, 0..) |x, i| {
@@ -798,6 +801,16 @@ pub fn checkExportCollisions(zcu: *Zcu) !void {
         const gop = try first.getOrPut(zcu.gpa, x.name);
         if (!gop.found_existing) {
             gop.value_ptr.* = i;
+            // bs puts only the compiler_rt functions a program calls in
+            // the object, but reports the collision as 0.16 does, at the
+            // program's export (0.16's error is at compiler_rt's).
+            if (compiler_rt and zcu.language == .zig_0_16) {
+                const name = zcu.ip.stringSlice(x.name);
+                if (compilerRtExport(.zig_0_16, name)) |rt| {
+                    try zcu.addError(x.file, try x.span(zcu), "exported symbol collision: {s}", .{name});
+                    try zcu.appendNote(.{ .file = x.file, .span = try x.span(zcu), .msg = try zcu.arena.allocator().print("compiler_rt exports it ('{s}' in lib/compiler_rt{s}{s}), which -fcompiler-rt puts in this object", .{ rt.decl, if (rt.file.len == 0) ".zig" else "/", rt.file }), .no_loc = true });
+                }
+            }
             continue;
         }
         const other = zcu.exports.items[gop.value_ptr.*];
