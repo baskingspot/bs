@@ -14262,6 +14262,8 @@ fn mutStore(sema: *Sema, ptr: Index, val: Index) !bool {
     if (path.steps.len == 0) return false;
     const alloc = sema.comptime_allocs.getPtr(path.id) orelse return false;
     if (alloc.val == .none and alloc.mut == null) return false;
+    // How many elements a store of a subarray writes, from the last step's.
+    var range: ?u64 = null;
     // Check the whole path before changing anything.
     {
         var ty = if (alloc.mut) |m| sema.mutType(m) else ip.typeOf(alloc.val);
@@ -14274,7 +14276,21 @@ fn mutStore(sema: *Sema, ptr: Index, val: Index) !bool {
             ty = sema.elemTypeOf(ty, st.index);
         }
         const last = path.steps[path.steps.len - 1];
-        if (last.is_elem and ip.typeOf(val) != ty) return false;
+        if (last.is_elem and ip.typeOf(val) != ty) {
+            // A subarray (`arr[j..][0..k].* = v`), which the general
+            // path stores by interning the whole array again: the same
+            // elements, in place. Only through a view of the array
+            // itself, where its bounds are the ones that path checks.
+            const key = ip.keyPayload(.ptr, ptr);
+            if (key.base.elem.index != last.index or ip.typeOf(key.base.elem.base) != last.base_ptr_ty) return false;
+            const val_ty = ip.typeOf(val);
+            const arr_ty = Type.ptrInfo(ip, last.base_ptr_ty).child;
+            if (ip.keyTag(val_ty) != .array_type or ip.keyTag(arr_ty) != .array_type or ip.keyTag(val) == .undef) return false;
+            const sub = ip.keyPayload(.array_type, val_ty);
+            const a = ip.keyPayload(.array_type, arr_ty);
+            if (sub.child != a.child or sub.len == 0 or last.index + sub.len > a.len) return false;
+            range = sub.len;
+        }
     }
     if (alloc.mut == null) {
         try sema.bcLogAlloc(path.id, alloc);
@@ -14300,6 +14316,13 @@ fn mutStore(sema: *Sema, ptr: Index, val: Index) !bool {
             node.* = .{ .agg = .{ .ty = ip.typeOf(v), .elems = mut_elems, .interned = .none } };
         }
         node.agg.interned = .none;
+        if (i + 1 == path.steps.len) if (range) |n| {
+            for (node.agg.elems[@intCast(st.index)..][0..@intCast(n)], 0..) |*elem, k| {
+                try sema.bcLogNode(path.id, elem);
+                elem.* = .{ .val = try sema.elemValue(val, k) };
+            }
+            break;
+        };
         node = &node.agg.elems[@intCast(st.index)];
         if (i + 1 == path.steps.len) {
             try sema.bcLogNode(path.id, node);

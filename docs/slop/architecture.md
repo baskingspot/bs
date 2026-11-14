@@ -517,6 +517,10 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   field by field or element by element holds a mutable tree that those
   stores write in place; it is interned only when read as a whole, so
   filling an n-element array costs O(n), not O(n²) interned aggregates.
+  A store of a subarray (`a[i..][0..k].* = v`, as code that builds a
+  string k bytes at a time makes) writes its k elements in the tree
+  too (`mutStore`, 2026-11-14); it used to take the general path, which
+  interned the whole array at every store.
 - Comptime strings stay bytes. A defined `[n]u8` value interns with
   `bytes` storage (one InternPool string), and `++`, slicing at
   comptime-known bounds, and reading a `[]const u8` as a name (`@field`,
