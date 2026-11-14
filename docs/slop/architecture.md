@@ -9571,6 +9571,31 @@ and `zig build -Dtarget=aarch64-macos`.
   aarch64-linux, when qemu is on PATH. Binaries linking glibc (`--libc`,
   run tests with `libc: true`) run with the aarch64 glibc as qemu's
   sysroot (`-L /usr/aarch64-linux-gnu`), and are not run without it.
+- The baseline is a floor (2026-11-14). When bs passes fewer tests than
+  upstream in the behavior measure, `--std` (with `--libc` or `--musl`
+  too) or `--c-abi`, `run.py` lists what fell short under the target's
+  summary line (a file that did not build, with its log; else each test
+  and its outcome), finishes the other targets, names the measures on
+  stderr and exits 1. CI's conformance jobs block on it on Linux
+  (x86_64-linux, and aarch64-linux under qemu) and show on the Mac, as
+  the tests do (`.github/ci.yaml`), and `just ci` runs them. There is no
+  committed count to maintain: the floor is the baseline file, and it
+  holds for a partial run (`--files`) over the tests that ran. Named
+  exceptions, `HOST_OUTCOMES` in `run.py`: a std test with an outcome
+  that is the host's in upstream's build too is not held against bs for
+  that outcome, and the summary line still counts it. Two today.
+  `process.decltest.lockMemoryAll`, which aarch64-linux's baseline
+  passed, skips itself under qemu-user, where `mlockall` returns `NOMEM`
+  (3329/3330). `Io.test`'s `tasks spawned in group after Group.cancel
+  are canceled` (left out below 4 CPUs, `FEW_CPU_HANGS`) may time out:
+  on a 4-CPU orb with four loops spinning, bs's build of std's tests
+  hung there in 2 of 10 runs and upstream's in 1 of 9. The other
+  measures (`--compile-errors`, `--cases`, `--standalone`, `--langref`,
+  `--incremental`) report and exit 0, and 0.16's measures are not in CI
+  yet. One failure is not explained: `os.linux.test.test.timer` failed
+  once (`TestUnexpectedResult`) on x86_64-linux in CI's eight runs
+  before the floor, and in none of 60 runs of bs's build in an orb. It
+  fails the job if it recurs.
 - Each file `behavior.zig` imports is its own unit: one `bs test` compile and
   one run, in parallel with the others, so a compile error, crash, or timeout
   costs only that file. The root is a generated `behavior.zig` wrapper next to

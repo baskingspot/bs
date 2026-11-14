@@ -11,6 +11,13 @@ backend. Upstream's per-test results are committed in baseline/<target>.json.
 Each run prints one summary line per target to stdout and writes a per-file,
 per-test JSON breakdown (bs: .zig-cache/conformance/<target>.json).
 
+The baseline is also a floor. When bs passes fewer tests than upstream in the
+behavior measure, --std or --c-abi, the run lists what fell short under the
+target's summary line, finishes the other targets, names the measures on
+stderr and exits 1. CI blocks on that for the Linux targets
+(.github/ci.yaml). A test in HOST_OUTCOMES with the outcome named there is
+not held against bs. The other measures only report.
+
 With --zig-version 0.16, every measure is the same for bs's second
 language (docs/slop/zig-0.16.md): upstream 0.16.0's tree at upstream-0.16/
 (its test/, and its lib/ for --std), its baselines in baseline/0.16/, zig
@@ -171,6 +178,36 @@ def exec_argv(bin_path, *args):
 # counts there instead of waiting out the run timeout.
 FEW_CPU_HANGS = frozenset({"Io.test.test.tasks spawned in group after Group.cancel are canceled"})
 MIN_CPUS = 4
+
+# std tests with an outcome that is the host's, not the compiler's, in
+# upstream's build too: that outcome does not put bs below a baseline that
+# passed on another host or at another time. lockMemoryAll skips itself when
+# mlockall fails with NOMEM past RLIMIT_MEMLOCK, which a program under
+# qemu-user is, and aarch64-linux's baseline passed it. The Group.cancel
+# test (FEW_CPU_HANGS) also hangs now and then on a busy 4-CPU host: with
+# four loops spinning on a 4-CPU orb, bs's build hung in 2 of 10 runs of
+# std's tests and upstream's in 1 of 9.
+HOST_OUTCOMES = {
+    "process.decltest.lockMemoryAll": "skip",
+    "Io.test.test.tasks spawned in group after Group.cancel are canceled": "timeout",
+}
+
+# The measures of this run in which bs passed fewer tests than the baseline,
+# as "<target> <measure> (<n> of <m> tests short)"; main exits 1 when there
+# are any.
+below_baseline = []
+SHORTFALL_LOG_LINES = 20
+
+
+def fell_short(key, t):
+    """Whether merged test `t` ({"upstream", "bs"}) puts bs below the baseline."""
+    return t["upstream"] == "pass" and t["bs"] != "pass" and HOST_OUTCOMES.get(key) != t["bs"]
+
+
+def print_log(log):
+    for line in (log or "").strip().splitlines()[:SHORTFALL_LOG_LINES]:
+        print(f"    {line}")
+
 
 ROOT_UNIT = "behavior.zig"
 ROOT_TEST_RE = re.compile(r"^behavior\.(test\.|test_\d+$)")
@@ -1045,6 +1082,7 @@ def bs_target(bs, cfg, args, workdir):
     backend = pop_backends(files)
 
     passed = expected = extra = unknown = 0
+    short = []
     for unit in units:
         r = files[unit]
         upstream_tests = baseline["files"][unit]["tests"]
@@ -1065,6 +1103,7 @@ def bs_target(bs, cfg, args, workdir):
                 merged[key] = {"upstream": "absent", "bs": got}
                 unknown += 1
         r["tests"] = merged
+        short += [(unit, key, t["bs"]) for key, t in merged.items() if fell_short(key, t)]
         r["pass"] = sum(1 for t in merged.values() if t["upstream"] == "pass" and t["bs"] == "pass")
         r["of"] = sum(1 for t in merged.values() if t["upstream"] == "pass")
 
@@ -1099,6 +1138,18 @@ def bs_target(bs, cfg, args, workdir):
         f"{ok_files}/{len(files)} files compiled and ran"
         f"{'; ' + problems if problems else ''}{note} -> {rel(out)}"
     )
+    # What fell short of the baseline, so a log shows which: a file that
+    # did not build or finish once, with its log, then the other tests.
+    for unit, r in files.items():
+        if r["status"] != "ok" and any(u == unit for u, _, _ in short):
+            print(f"  {r['status']}: {unit} ({r['of'] - r['pass']} of {r['of']} tests)")
+            print_log(r.get("log"))
+    for unit, key, got in short:
+        if files[unit]["status"] == "ok":
+            print(f"  {got}: {key}")
+    if short:
+        measure = "behavior (default runner)" if args.default_runner else "behavior"
+        below_baseline.append(f"{cfg['name']} {measure} ({len(short)} of {expected} tests short)")
 
 
 # ---------------------------------------------------------------- std mode
@@ -1257,15 +1308,22 @@ def std_target(compiler, cfg, args, workdir):
         f"{cfg['name']} {suite}: {passed}/{expected} {suite} tests pass ({pct:.1f}% of upstream){status}{note}; "
         f"compiled in {compile_s:.1f}s (upstream baseline {baseline['compile_seconds']:.1f}s) -> {rel(out_path)}"
     )
-    # The tests upstream passes and bs does not, so a log shows which.
+    # The tests upstream passes and bs does not, so a log shows which; when
+    # no test ran, the build's log instead.
     details = r.get("details", {})
-    for key, t in merged.items():
-        if t["upstream"] == "pass" and t["bs"] != "pass":
-            print(f"  {t['bs']}: {key}")
-            for line in (details.get(key) or "").strip().splitlines()[:20]:
-                print(f"    {line}")
+    if r["tests"]:
+        for key, t in merged.items():
+            if t["upstream"] == "pass" and t["bs"] != "pass":
+                print(f"  {t['bs']}: {key}")
+                print_log(details.get(key))
+    elif not failure:
+        print(f"  {r['status']}:")
+        print_log(r.get("log"))
     if failure:
         print(failure["log"])
+    short = sum(fell_short(key, t) for key, t in merged.items())
+    if short:
+        below_baseline.append(f"{cfg['name']} {suite} ({short} of {expected} tests short)")
 
 
 # ---------------------------------------------------------------- compile-errors mode
@@ -2503,6 +2561,8 @@ def main():
     except KeyboardInterrupt:
         kill_all()
         sys.exit(130)
+    if below_baseline:
+        sys.exit("error: bs passes fewer tests than upstream's baseline: " + ", ".join(below_baseline))
 
 
 if __name__ == "__main__":

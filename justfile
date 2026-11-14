@@ -30,7 +30,7 @@ test-steps +STEPS:
 nightly:
     zig build test-nightly --summary failures
 
-[doc("The conformance measure: upstream's test/behavior compiled by bs (tools/conformance/run.py)")]
+[doc("The conformance measure: upstream's test/behavior compiled by bs, or its std tests with --std (tools/conformance/run.py). Fails when bs passes fewer tests than upstream's baseline")]
 [group("test")]
 conformance *ARGS:
     tools/conformance/run.py {{ ARGS }}
@@ -91,6 +91,6 @@ fmt:
     oxfmt README.md AGENTS.md CHANGELOG.md .github
     just --fmt
 
-[doc("What CI blocks on: the tests, lint, and ziglint")]
+[doc("What CI blocks on: the tests, lint, ziglint, and conformance (behavior and std)")]
 [group("ci")]
-ci: test lint ziglint
+ci: test lint ziglint conformance (conformance "--std")

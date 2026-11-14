@@ -3,9 +3,10 @@
 # together are `zig build test` (test-nightly aside, which
 # workflows/nightly.yml runs). The macOS lane runs the same tests on a real
 # Apple Silicon Mac and does not block until it passes. The conformance
-# measure shows its results and never blocks: it reports a share, not a pass.
-# It measures upstream's test/behavior and its std tests on every target the
-# runner can run (aarch64-linux under qemu).
+# measure runs upstream's test/behavior and its std tests on every target the
+# runner can run (aarch64-linux under qemu) and fails when bs passes fewer
+# tests than upstream's baseline (tools/conformance/run.py). It blocks on
+# Linux and shows on the Mac, as the tests do.
 jobs:
   - recipe: test-steps test-link-1
   - recipe: test-steps test-link-2
@@ -35,8 +36,10 @@ jobs:
     blocking: false
   - recipe: ziglint
   - recipe: conformance
-    runners: [ubuntu-26.04, macos-26]
+  - recipe: conformance --std
+  - recipe: conformance
+    runners: [macos-26]
     blocking: false
   - recipe: conformance --std
-    runners: [ubuntu-26.04, macos-26]
+    runners: [macos-26]
     blocking: false
