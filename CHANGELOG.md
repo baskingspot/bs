@@ -11,6 +11,8 @@ Changes a user of bs notices, newest first, in the
 
 ### Fixed
 
+- A program that coerces a generic function to another function type (`const f: fn (anytype, anytype) u32 = foo;`, or `std.math.add` passed as a `fn (comptime type, i32, i32) error{Overflow}!i32`) builds again after an edit, and when bs reuses another program's cache: since 0.1.2 such a build failed with `bs cache: 'foo' is a function of the last build that this one does not have`, and only a build with an empty cache compiled it.
+- An edit build after a generic function passed to `std.Thread.spawn` gained a parameter no longer reads past the end of the old function type, which crashed a Debug bs with `index out of bounds`.
 - A comptime loop that fills an array a few elements at a time through a subarray (`s[i * 4 ..][0..4].* = "nop\n".*`) takes time in proportion to the array, not to its square: bs made the whole array again at every such store. Filling 36,000 bytes this way took 15 s and 4.6 GiB of memory, and takes 0.2 s and 37 MiB.
 - On aarch64-macos, `;` in inline and container-level assembly starts a comment, as it does for upstream's assembler there, and `%%` separates two statements on a line (`%%%%` in an inline template, where `%%` is one `%`). bs took `;` as the separator on every target, so `mov x0, #1 ; mov x0, #2` ran both instructions on a Mac where upstream runs the first. aarch64-linux is unchanged: `;` separates there.
 - aarch64 inline assembly's `mrs xzr, <register>` discards the value instead of writing it to x0, and `mrs`, `msr` and `adr` with a w register or sp are errors, as they are upstream; bs assembled them with the x register or xzr of that number, or crashed (`adr sp`).

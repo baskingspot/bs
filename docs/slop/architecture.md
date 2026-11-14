@@ -6728,7 +6728,23 @@ records only what changed, and links from the manifest.
   `errorsReached` finds no node for it, so the build goes eager. Until
   2026-11-12 Sema read the new parameter's type past the old type's end
   and reported a false type mismatch (parcel;
-  test/run/edit_spawn_param.zig).
+  test/run/edit_spawn_param.zig). A call that reads the callee's ZIR
+  (generic, inline or comptime) refuses such a function too
+  (`Sema.refuseStaleFunc`, 2026-11-14): the old entry point instantiated
+  the old generic `serve` and read past its type's end the same way
+  (test/run/edit_generic_param.zig). A generic function coerced to
+  another function type (`const f: fn (anytype, anytype) void = foo`) is
+  a function of its own, with the declaration's ZIR and that type, and
+  its calls instantiate it; it is not the declaration's value, and from
+  2026-11-12 to 2026-11-14 the check took it and its instances for
+  functions of the last build, in every build that replays records,
+  another program's included: upstream's cast.zig, fn.zig and
+  generics.zig failed to compile in a conformance run after its first
+  file, 239 tests. `Zcu.isCoercedFunc` tells one from the types (a
+  generic type, of a declaration that is generic, with its parameter
+  count, calling convention and comptime parameters); the old function
+  of a generic declaration that kept those passes as one
+  (test/run/edit_coerced_generic.zig).
 - `BS_CACHE_VERIFY` compares a full build with the edit build's manifest
   as before, and also requires the full build's nodes to be neither
   `stale` nor, with atoms, `unlinked` there. Nodes only in the edit

@@ -22,6 +22,7 @@ const InternPool = @import("InternPool.zig");
 const Ir = @import("Ir.zig");
 const Replay = @import("Replay.zig");
 const Sema = @import("Sema.zig");
+const Type = @import("Type.zig");
 const diag = @import("diag.zig");
 const print = @import("Ir/print.zig");
 const Incremental = @import("Incremental.zig");
@@ -1666,7 +1667,8 @@ pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !bool {
 
 /// Whether `func` is a function of the last build that this one does not
 /// have: its declaration, or its generic owner's, now has another value.
-/// A function is its declaration's value or an instance of it, but an
+/// A function is its declaration's value, that value coerced to another
+/// function type (`isCoercedFunc`), or an instance of either, but an
 /// edit build decodes the last build's records as they were, with the
 /// function types of then: a lazy build walks into a unit no longer
 /// reached (`Replay.assumeReached`), such as a thread's entry point that
@@ -1678,8 +1680,38 @@ pub fn isStaleFunc(zcu: *Zcu, func: InternPool.Index) bool {
     const ip = &zcu.ip;
     const f = ip.keyPayload(.func, func);
     const decl_func = if (f.generic_owner != .none) f.generic_owner else func;
-    const nav = ip.getNav(ip.keyPayload(.func, decl_func).owner_nav);
-    return nav.status == .resolved and nav.val != decl_func;
+    const item = ip.keyPayload(.func, decl_func);
+    const nav = ip.getNav(item.owner_nav);
+    if (nav.status != .resolved or nav.val == decl_func) return false;
+    return !zcu.isCoercedFunc(nav.val, item);
+}
+
+/// Whether `item`, a function of the declaration whose value is
+/// `decl_val`, can be that value coerced to another function type. Sema's
+/// coercion of a function to a generic function type makes a function of
+/// that type with the declaration's ZIR (`const f: fn (anytype, anytype)
+/// void = foo`), and its calls make instances of it. This checks what
+/// `Sema.fnTypeCoercible` asks of every such coercion that the two types
+/// alone tell, and that holds through a chain of them (the parameter
+/// types need not: `anytype` between two types that do not coerce). The
+/// old function of a declaration that is not generic, or that changed its
+/// parameter count, calling convention or which parameters are comptime,
+/// is not one; that of a generic declaration that kept them passes, as
+/// the function it coerces to.
+fn isCoercedFunc(zcu: *Zcu, decl_val: InternPool.Index, item: InternPool.Func) bool {
+    const ip = &zcu.ip;
+    if (ip.keyTag(decl_val) != .func) return false;
+    const decl = ip.keyPayload(.func, decl_val);
+    if (decl.zir_inst != item.zir_inst or decl.generic_owner != .none or item.generic_owner != .none) return false;
+    const s = ip.keyPayload(.func_type, decl.ty);
+    const d = ip.keyPayload(.func_type, item.ty);
+    // Only a generic type makes a function of its own, and only of a
+    // function without runtime bits, as it has none.
+    if (!Type.fnIsGeneric(ip, d) or !(Type.fnIsGeneric(ip, s) or Type.isComptimeOnly(ip, s.return_type))) return false;
+    if (s.cc != d.cc or s.stack_align != d.stack_align or s.is_var_args != d.is_var_args or
+        s.param_types.len != d.param_types.len or s.noalias_bits != d.noalias_bits) return false;
+    // A coercion may drop `comptime` from a parameter, and adds none.
+    return d.comptime_bits & ~s.comptime_bits == 0;
 }
 
 pub const InlineResult = struct {

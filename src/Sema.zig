@@ -2009,6 +2009,22 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
     try sema.finish();
 }
 
+/// Fails in an edit build if `func`, whose ZIR is about to be read against
+/// its type, is a function of the last build that this one does not have
+/// (`Zcu.isStaleFunc`): its declaration decides, resolved first as in a
+/// full build. The error is for the cache, not the user: no full build
+/// reaches such a function, so a lazy build that does builds again
+/// eagerly (`Replay.errorsReached`).
+fn refuseStaleFunc(sema: *Sema, block: *Block, src: Src, func: Index) CompileError!void {
+    const zcu = sema.zcu;
+    if (zcu.replay == null) return;
+    const ip = sema.ip;
+    const owner = ip.keyPayload(.func, func).owner_nav;
+    if (ip.getNav(owner).status == .unresolved) try zcu.ensureNavVal(owner);
+    if (zcu.isStaleFunc(func))
+        return sema.fail(block, src, "bs cache: '{s}' is a function of the last build that this one does not have", .{ip.stringSlice(ip.getNav(owner).name)});
+}
+
 pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     const ip = &zcu.ip;
     const func = ip.keyPayload(.func, func_index);
@@ -2043,11 +2059,7 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     // be gone, with a type that does not fit its ZIR's parameters: its
     // declaration decides, resolved first as in a full build. The error
     // sends a lazy build back to an eager one (`Replay.errorsReached`).
-    if (zcu.replay != null) {
-        if (nav.status == .unresolved) try zcu.ensureNavVal(func.owner_nav);
-        if (zcu.isStaleFunc(func_index))
-            return sema.fail(&block, block.nodeSrc(.zero), "bs cache: '{s}' is a function of the last build that this one does not have", .{ip.stringSlice(nav.name)});
-    }
+    try sema.refuseStaleFunc(&block, block.nodeSrc(.zero), func_index);
     for (fn_ty.param_types) |pt| try sema.resolveLayout(&block, block.nodeSrc(.zero), pt);
     try sema.resolveLayout(&block, block.nodeSrc(.zero), fn_ty.return_type);
     // A generic function has no runtime body; asking for one can only
@@ -21577,6 +21589,10 @@ fn analyzeCall(
         if (func != .none) if (ip.keyAs(.func, func)) |f| try sema.noteFnDeclared(f.owner_nav);
         return err;
     }
+    // A generic, inline or comptime call reads the callee's parameter
+    // types by its ZIR's parameters, which a function of the last build
+    // may have fewer of than the new ZIR.
+    if (func != .none and ip.keyTag(func) == .func) try sema.refuseStaleFunc(block, src, func);
     // Arguments are analyzed in the caller, with the call instruction
     // standing for the parameter type.
     const args = try sema.arena.alloc(Ref, total_args);
