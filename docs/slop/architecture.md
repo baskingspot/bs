@@ -1118,6 +1118,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   the operator precedence LLVM gives them, which is GNU as's on ELF and
   its own on Mach-O (`1 + 2 << 3` is 17 on ELF and 24 on Mach-O). An
   offset no encoding holds is an error that names the offsets one does.
+  A line's statements are separated as LLVM separates them: by `;` on
+  ELF, and on Mach-O by `%%` (`%%%%` in an inline template), where `;`
+  starts a comment; container-level assembly does the same.
   Padding fixes offsets, so `Encoder.finish` does not relax a branch in
   a function that padded: a conditional branch out of range there is
   `error.AlignedCodeMoved`, reported as a compile error.

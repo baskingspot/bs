@@ -1,5 +1,5 @@
 //! exit: 0
-//! stderr: "5050 0 1 3 1 0\n0 0 4\n443b75582d7519c2 5a 5a5a\n1 1\n24 67 248 4 true\n"
+//! stderr: "5050 0 1 3 1 0\n0 0 4\n443b75582d7519c2 5a 5a5a\n1 1\n24 67 248 4 true\ntrue 2\n"
 //! targets: aarch64-macos aarch64-linux
 //! aarch64 inline assembly as hand-written kernels use it: named labels
 //! (`.Lloop:`) that branches reach forward and backward, `bhi` for
@@ -8,6 +8,8 @@
 //! an index register), `dup` from a general register, `dc zva` sized by
 //! `dczid_el0`, and constant expressions. Each case prints what upstream
 //! prints. Other targets print the same text without running the assembly.
+//! Then two statements on a line, which the object formats separate
+//! differently.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -175,9 +177,23 @@ noinline fn exprs() [5]u64 {
     return r;
 }
 
+/// Two statements on a line: `;` separates them on ELF and starts a
+/// comment on Mach-O, where `%%` separates, which a template writes
+/// `%%%%`.
+noinline fn separated() [2]u64 {
+    var r: [2]u64 = undefined;
+    r[0] = asm ("mov %[o], #1 ; mov %[o], #2"
+        : [o] "=r" (-> u64),
+    );
+    r[1] = asm ("mov %[o], #1 " ++ (if (builtin.os.tag == .macos) "%%%%" else ";") ++ " mov %[o], #2"
+        : [o] "=r" (-> u64),
+    );
+    return r;
+}
+
 pub fn main() void {
     if (builtin.cpu.arch != .aarch64) {
-        std.debug.print("5050 0 1 3 1 0\n0 0 4\n443b75582d7519c2 5a 5a5a\n1 1\n24 67 248 4 true\n", .{});
+        std.debug.print("5050 0 1 3 1 0\n0 0 4\n443b75582d7519c2 5a 5a5a\n1 1\n24 67 248 4 true\ntrue 2\n", .{});
         return;
     }
     var n: u64 = 100;
@@ -207,4 +223,8 @@ pub fn main() void {
     const e = exprs();
     const shifted: u64 = if (builtin.os.tag == .macos) 24 else 17;
     std.debug.print("{d} {d} {d} {d} {}\n", .{ e[0], e[1], e[2], e[3], e[4] == shifted });
+
+    const sep = separated();
+    const first: u64 = if (builtin.os.tag == .macos) 1 else 2;
+    std.debug.print("{} {d}\n", .{ sep[0] == first, sep[1] });
 }

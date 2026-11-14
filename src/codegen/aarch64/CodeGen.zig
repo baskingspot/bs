@@ -5574,7 +5574,14 @@ fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnm
         counted = start;
         var code = source_line;
         if (std.mem.find(u8, code, "//")) |i| code = code[0..i];
-        var statements = std.mem.tokenizeScalar(u8, code, ';');
+        // LLVM's Mach-O assembler starts a comment at `;` and separates
+        // statements with `%%`, which a template writes `%%%%`; its ELF
+        // one separates them with `;`.
+        const macho = cg.emit.zcu.ip.target == .aarch64_macos;
+        if (macho) if (std.mem.findScalar(u8, code, ';')) |i| {
+            code = code[0..i];
+        };
+        var statements = std.mem.tokenizeSequence(u8, code, if (macho) "%%%%" else ";");
         while (statements.next()) |raw| try cg.assembleStatement(std.mem.trim(u8, raw, " \t\r"), names, &locals);
     }
     try cg.asmLabelsDefined(&locals);

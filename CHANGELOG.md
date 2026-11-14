@@ -9,6 +9,10 @@ Changes a user of bs notices, newest first, in the
 
 - aarch64 inline assembly takes what hand-written kernels use, so a build for aarch64-linux of a project that depends on fastmem 0.2.0 no longer stops at `bs does not support this inline assembly instruction yet: 'b.hi .L…_fm_simd_cpy_long'`, and fastmem's Advanced SIMD memcpy, memmove and memset come out byte for byte as upstream's. New are named labels (`name:`, `.Lname:`) as branch and `adr` targets within one asm; `tbz` and `tbnz`; a conditional branch without the dot (`bhi` for `b.hi`); `.p2align`, `.align` and `.balign` with an optional most padding, which pad with nops and align the function to match; `ldr`, `str`, `ldur`, `stur`, `ldp` and `stp` of the b, h, s, d and q registers; index registers with `lsl`, `uxtw`, `sxtw` and `sxtx`; `dup` from a general register; `dc zva` and the other `dc` and `ic` operations with a register; `mrs` of `dczid_el0`; and constant expressions such as `#(16 * 4)`, with the assembler's operator precedence for the object format. A branch to a label the asm does not define is an error at the branch, as is a fill value other than nops, and a load or store offset that no encoding holds is an error that names the offsets one does.
 
+### Fixed
+
+- On aarch64-macos, `;` in inline and container-level assembly starts a comment, as it does for upstream's assembler there, and `%%` separates two statements on a line (`%%%%` in an inline template, where `%%` is one `%`). bs took `;` as the separator on every target, so `mov x0, #1 ; mov x0, #2` ran both instructions on a Mac where upstream runs the first. aarch64-linux is unchanged: `;` separates there.
+
 ## [0.1.3] - 2026-11-12
 
 ### Fixed

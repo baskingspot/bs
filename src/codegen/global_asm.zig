@@ -105,7 +105,13 @@ fn assemble(comptime Asm: type, emit: *Emit, block: *const Zcu.GlobalAsm, nth: u
         if (target.arch() == .x86_64) if (std.mem.findScalar(u8, code, '#')) |i| {
             code = code[0..i];
         };
-        var statements = std.mem.tokenizeScalar(u8, code, ';');
+        // LLVM's Mach-O assembler for aarch64 starts a comment at `;` and
+        // separates statements with `%%`; the ELF ones separate with `;`.
+        const macho = target == .aarch64_macos;
+        if (macho) if (std.mem.findScalar(u8, code, ';')) |i| {
+            code = code[0..i];
+        };
+        var statements = std.mem.tokenizeSequence(u8, code, if (macho) "%%" else ";");
         while (statements.next()) |raw| {
             var s = std.mem.trim(u8, raw, " \t\r");
             // Named labels; numeric ones are the inline assembler's.
