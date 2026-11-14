@@ -6006,12 +6006,16 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         const rt = reg(ops, 0) orelse return cg.asmUnsupported(line);
         if (ops.len != 2 or ops[1] != .name) return cg.asmUnsupported(line);
         const base = System.mrs(ops[1].name) orelse return cg.asmUnsupported(line);
-        return e.raw(base | @backingInt(rt.reg));
+        if (rt.width != .x) return cg.asmUnsupported(line);
+        if (rt.reg == .sp) return cg.asmBadSp(line);
+        return e.raw(base | rt.reg.zrEnc());
     }
     if (eql(u8, mnemonic, "msr")) {
         if (ops.len != 2 or ops[0] != .name or !eql(u8, ops[0].name, "tpidr_el0")) return cg.asmUnsupported(line);
         const rt = reg(ops, 1) orelse return cg.asmUnsupported(line);
-        return e.raw(System.msr_tpidr_el0 | @backingInt(rt.reg));
+        if (rt.width != .x) return cg.asmUnsupported(line);
+        if (rt.reg == .sp) return cg.asmBadSp(line);
+        return e.raw(System.msr_tpidr_el0 | rt.reg.zrEnc());
     }
     if (eql(u8, mnemonic, "ret")) {
         const r = reg(ops, 0) orelse return cg.asmUnsupported(line);

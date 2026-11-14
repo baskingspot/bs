@@ -1,5 +1,5 @@
 //! exit: 0
-//! stderr: "5050 0 1 3 1 0\n0 0 4\n443b75582d7519c2 5a 5a5a\n1 1\n24 67 248 4 true\ntrue 2\n"
+//! stderr: "5050 0 1 3 1 0\n0 0 4\n443b75582d7519c2 5a 5a5a\n1 1\n24 67 248 4 true\ntrue 2 7\n"
 //! targets: aarch64-macos aarch64-linux
 //! aarch64 inline assembly as hand-written kernels use it: named labels
 //! (`.Lloop:`) that branches reach forward and backward, `bhi` for
@@ -9,7 +9,7 @@
 //! `dczid_el0`, and constant expressions. Each case prints what upstream
 //! prints. Other targets print the same text without running the assembly.
 //! Then two statements on a line, which the object formats separate
-//! differently.
+//! differently, and a system register read into xzr.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -191,9 +191,18 @@ noinline fn separated() [2]u64 {
     return r;
 }
 
+/// `mrs` into xzr discards the value: x0 keeps its 7.
+fn discarded() callconv(.naked) void {
+    asm volatile (
+        \\    mov x0, #7
+        \\    mrs xzr, dczid_el0
+        \\    ret
+    );
+}
+
 pub fn main() void {
     if (builtin.cpu.arch != .aarch64) {
-        std.debug.print("5050 0 1 3 1 0\n0 0 4\n443b75582d7519c2 5a 5a5a\n1 1\n24 67 248 4 true\ntrue 2\n", .{});
+        std.debug.print("5050 0 1 3 1 0\n0 0 4\n443b75582d7519c2 5a 5a5a\n1 1\n24 67 248 4 true\ntrue 2 7\n", .{});
         return;
     }
     var n: u64 = 100;
@@ -226,5 +235,5 @@ pub fn main() void {
 
     const sep = separated();
     const first: u64 = if (builtin.os.tag == .macos) 1 else 2;
-    std.debug.print("{} {d}\n", .{ sep[0] == first, sep[1] });
+    std.debug.print("{} {d} {d}\n", .{ sep[0] == first, sep[1], @as(*const fn () callconv(.c) u64, @ptrCast(&discarded))() });
 }

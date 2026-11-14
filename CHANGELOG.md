@@ -12,6 +12,7 @@ Changes a user of bs notices, newest first, in the
 ### Fixed
 
 - On aarch64-macos, `;` in inline and container-level assembly starts a comment, as it does for upstream's assembler there, and `%%` separates two statements on a line (`%%%%` in an inline template, where `%%` is one `%`). bs took `;` as the separator on every target, so `mov x0, #1 ; mov x0, #2` ran both instructions on a Mac where upstream runs the first. aarch64-linux is unchanged: `;` separates there.
+- aarch64 inline assembly's `mrs xzr, <register>` discards the value instead of writing it to x0, and `mrs`, `msr` and `adr` with a w register or sp are errors, as they are upstream; bs assembled them with the x register or xzr of that number, or crashed (`adr sp`).
 
 ## [0.1.3] - 2026-11-12
 
