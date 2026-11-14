@@ -1143,19 +1143,57 @@ comptime arguments are run-time values in the lowered code (uucode's
   pairwise forms, and `shrn` (`asmNeonSized`), with `bsl`, `bit`,
   `bif`, `bic` and `orn`. The crypto instructions need their CPU
   feature, as `crc32` does and as LLVM asks.
+  The instructions without a label operand that the backend's Encoder
+  has no use for live in `codegen/aarch64/asm_insn.zig`: `Asm.encode`
+  takes the mnemonic and the operands as CodeGen's `asmOperand` parsed
+  them and gives the word, null for an instruction that is CodeGen's
+  (`mov`, `add`, the loads and stores, branches), `error.AsmUnsupported`
+  for a form bs does not have, or `error.AsmInvalid` with a message
+  for operands LLVM rejects. It is a list of families, each a function
+  that returns null when the mnemonic or the operands' shape is not
+  its own, so two families can share a mnemonic (`fcvtzs w0, d1` is
+  scalar floating point's, `fcvtzs v0.2d, v1.2d` Advanced SIMD's).
+  The families (2026-11-14): `scalar` and `structure` and `neon` as
+  above; `integer` (multiply and divide, shifts by a register, carries,
+  the bitfield moves and their aliases, `extr`); `atomic` (the
+  exclusive and the acquire and release loads and stores, and with the
+  CPU's `lse` feature `cas`, `casp`, `swp` and the `ld<op>` and
+  `st<op>` instructions); `memory` (the unscaled and unprivileged
+  loads and stores of a byte, halfword or word, `ldnp`, `stnp`,
+  `ldpsw`, `prfm` and `prfum`); and `float` (scalar floating point on
+  s and d registers, and h ones with `fullfp16`: arithmetic, rounding,
+  `fcmp`, `fccmp`, `fcsel`, `fcvt`, `fmov` in its forms, and the
+  conversions to and from general registers, also fixed-point). A
+  floating-point immediate is operand `fimm`, a token with a fraction
+  or an exponent, which LLVM tells from an integer: `fcmp d0, #0.0`
+  assembles and `fcmp d0, #0` does not, and `fmov d0, #2` is 2.0 where
+  `fmov d0, #0x70` is the encoding of 1.0.
+  bs refuses what the architecture calls unpredictable, which LLVM
+  refuses in most forms and assembles in a few that bs refuses too: a
+  pair loaded into one register (LLVM assembles `ldnp x3, x3, [x1]`,
+  and `ldp` and `ldpsw` of one register with a write-back), a
+  write-back whose base is also loaded or stored (LLVM assembles it
+  for `ldpsw` with a post-index), and a store-exclusive whose status
+  register is also a source or the base. It also refuses a fixed-point
+  `scvtf` or `ucvtf` whose fraction bits are out of range (LLVM
+  encodes `scvtf d0, x1, #65` as `#1`).
   The measure of this assembler is LLVM's own: every statement of
   LLVM 22.1.8's `test/MC/AArch64` files for the base and Advanced SIMD
   instructions (81 files, 9,430 distinct statements), each assembled by
   bs in a naked function and by `zig cc`, bytes compared. For the
   generic CPU LLVM takes 7,635: bs assembled 1,329 to the same bytes
-  before this, ten to other bytes (`crc32` with zr, `pmull` on bytes,
-  `clrex`; fixed), and now 2,277, with three that differ and mean the
-  same (`uxtw x1, w2` as `mov w1, w2`, and `add w3, w4, #0, lsl #12`
-  without the shift) and 5,355 it refuses: mostly system registers by
-  name (940), the `ld2` to `ld4` and single-element structure loads,
-  scalar floating point, multiply and divide, bitfield moves, exclusive
-  loads and stores, and the rest of Advanced SIMD. The harness is not in
-  the tree yet.
+  before the string routines, ten to other bytes (`crc32` with zr,
+  `pmull` on bytes, `clrex`; fixed), 2,277 with them, and 3,100 with
+  the integer, atomic, memory and floating-point families, with three
+  that differ and mean the same (`uxtw x1, w2` as `mov w1, w2`, and
+  `add w3, w4, #0, lsl #12` without the shift) and 4,532 it refuses:
+  mostly system registers by name (940), the `ld2` to `ld4` and
+  single-element structure loads, and the rest of Advanced SIMD. For
+  apple_m1, which has `lse` and `fullfp16`, it is 3,672 of 8,538. Each
+  family also has a generated list that probes its operand
+  combinations, most of which an assembler rejects (5,300 statements
+  for floating point), on which bs and LLVM agree on every statement
+  but the refusals above. The harness is not in the tree yet.
 - aarch64-linux (started 2026-11-05) runs the same CodeGen and links
   static, non-PIE executables with the ELF linker (`Elf.Options.arch`),
   and position-independent objects and shared objects ("Position-

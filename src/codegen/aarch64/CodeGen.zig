@@ -5283,6 +5283,7 @@ fn regConstraint(c: []const u8) ?[]const u8 {
 
 fn parseReg(name: []const u8) ?ParsedReg {
     if (std.mem.eql(u8, name, "sp")) return .{ .reg = .sp, .width = .x };
+    if (std.mem.eql(u8, name, "wsp")) return .{ .reg = .sp, .width = .w };
     if (std.mem.eql(u8, name, "xzr")) return .{ .reg = .zr, .width = .x };
     if (std.mem.eql(u8, name, "wzr")) return .{ .reg = .zr, .width = .w };
     if (std.mem.eql(u8, name, "fp")) return .{ .reg = .fp, .width = .x };
@@ -5648,7 +5649,7 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
     }
     const sp = std.mem.findAny(u8, line, " \t") orelse line.len;
     const mnemonic = line[0..sp];
-    var operands: [4]AsmOperand = undefined;
+    var operands: [6]AsmOperand = undefined;
     var n: usize = 0;
     // Split at commas outside brackets.
     const rest = line[sp..];
@@ -5698,10 +5699,12 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
             else => return cg.fail("bad asm memory base: '{s}'", .{line}),
         };
         var off: i64 = 0;
+        var offset_written = false;
         if (it.next()) |off_tok| switch (try cg.asmOperand(std.mem.trim(u8, off_tok, " \t"), names, locals, line)) {
             .imm => |v| {
                 if (it.next() != null) return cg.fail("bad asm memory operand: '{s}'", .{line});
                 off = v;
+                offset_written = true;
             },
             .reg => |r| {
                 // `[base, xm]`, `[base, xm, lsl #n]`, `[base, wm, uxtw #n]`.
@@ -5730,7 +5733,7 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
             else => return cg.fail("bad asm memory offset: '{s}'", .{line}),
         };
         const o: i32 = std.math.cast(i32, off) orelse return cg.fail("asm memory offset out of range: '{s}'", .{line});
-        return .{ .mem = .{ .mem = .{ .base = base, .offset = if (pre) .{ .pre = o } else .{ .imm = o } } } };
+        return .{ .mem = .{ .mem = .{ .base = base, .offset = if (pre) .{ .pre = o } else .{ .imm = o } }, .offset_written = offset_written } };
     }
     if (tok[0] == '#') {
         const rest = std.mem.trimStart(u8, tok[1..], " \t");
@@ -5806,14 +5809,23 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
     if (parseReg(tok)) |r| return .{ .reg = r };
     if (parseVReg(tok)) |v| return v;
     if (parseModifier(tok)) |m| return m;
-    if (std.mem.findScalar(u8, "-+~(", tok[0]) != null or std.ascii.isDigit(tok[0])) {
-        return .{ .imm = cg.asmConst(tok) orelse return cg.fail("bad asm immediate '{s}'", .{tok}) };
+    if (std.mem.findScalar(u8, "-+~(", tok[0]) != null or std.ascii.isDigit(tok[0]) or (tok[0] == '.' and tok.len > 1 and std.ascii.isDigit(tok[1]))) {
+        if (cg.asmConst(tok)) |v| return .{ .imm = v };
+        // A fraction or an exponent: floating point, which LLVM reads
+        // without a plus sign.
+        if (tok[0] != '+' and std.mem.findAny(u8, tok, ".eE") != null) if (std.fmt.parseFloat(f64, tok)) |v| return .{ .fimm = v } else |_| {};
+        return cg.fail("bad asm immediate '{s}'", .{tok});
     }
     return .{ .name = tok };
 }
 
 fn asmUnsupported(cg: *CodeGen, line: []const u8) Error {
     return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
+}
+
+/// The error for operands LLVM calls unpredictable and rejects.
+fn asmUnpredictable(cg: *CodeGen, what: []const u8, line: []const u8) Error {
+    return cg.fail("inline assembly: {s}, which is unpredictable: '{s}'", .{ what, line });
 }
 
 fn asmBadSp(cg: *CodeGen, line: []const u8) Error {
@@ -6033,6 +6045,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             const v2 = ops[1].vreg;
             const size = v1.kind.size() orelse return cg.asmUnsupported(line);
             if (v2.kind != v1.kind or size == .b or size == .h or v1.arr != null or v2.arr != null) return cg.asmUnsupported(line);
+            if (mnemonic[0] == 'l' and v1.reg == v2.reg) return cg.asmUnpredictable("the two registers loaded are the same", line);
             return e.pairV(size, mnemonic[0] == 'l', v1.reg, v2.reg, try cg.asmMem(ops[2], @backingInt(size), .pair, line));
         }
         const r1 = reg(ops, 0) orelse return cg.asmUnsupported(line);
@@ -6041,6 +6054,8 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         if (r1.reg == .sp or r2.reg == .sp) return cg.asmBadSp(line);
         const size: Size = if (r1.width == .x) .dword else .word;
         const mem = try cg.asmMem(ops[2], @backingInt(size), .pair, line);
+        if (mnemonic[0] == 'l' and r1.reg == r2.reg) return cg.asmUnpredictable("the two registers loaded are the same", line);
+        if ((mem.offset == .pre or mem.offset == .post) and (mem.base == r1.reg or mem.base == r2.reg)) return cg.asmUnpredictable("the base register written back is also loaded or stored", line);
         return if (mnemonic[0] == 's') e.stp(size, r1.reg, r2.reg, mem) else e.ldp(size, r1.reg, r2.reg, mem);
     }
     const loads_stores = [_]struct { []const u8, ?Size, enum { load, store, load_signed } }{
@@ -6064,7 +6079,9 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         if (r.reg == .sp) return cg.asmBadSp(line);
         const size = ls[1] orelse if (r.width == .x) Size.dword else Size.word;
         if (ls[2] == .load_signed and size == .word and r.width == .w) return cg.asmUnsupported(line);
+        if (ls[1] != null and ls[2] != .load_signed and r.width == .x) return cg.fail("inline assembly: '{s}' takes a w register: '{s}'", .{ mnemonic, line });
         const mem = try cg.asmMem(ops[1], @backingInt(size), form, line);
+        if ((mem.offset == .pre or mem.offset == .post) and mem.base == r.reg) return cg.asmUnpredictable("the base register written back is also loaded or stored", line);
         return switch (ls[2]) {
             .load => e.ldr(size, r.reg, mem),
             .store => e.str(size, r.reg, mem),

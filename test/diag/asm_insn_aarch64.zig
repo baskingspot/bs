@@ -8,7 +8,7 @@ fn reverse(x: u64) u64 {
     var r: u64 = x;
     asm volatile (
         \\ nop
-        \\ umulh %[r], %[r], %[r]
+        \\ udiv %[r], %[r], sp
         : [r] "+r" (r),
     );
     return r;
@@ -25,13 +25,13 @@ fn fused() void {
     var x: u64 = 0;
     x += 1;
     switch (builtin.cpu.arch) {
-        .aarch64 => asm volatile ("fmla v0.4s, v1.4s, v2.4s" ::: .{ .v0 = true }),
+        .aarch64 => asm volatile ("fmov d0, #0.1" ::: .{ .v0 = true }),
         else => {},
     }
 }
 
 fn indexed(x: [2]u64) u64 {
-    return asm ("umulh %[r], %[a], %[a]"
+    return asm ("ubfx %[r], %[a], #60, #8"
         : [r] "=r" (-> u64),
         : [a] "r" (x[1]),
     );
@@ -48,13 +48,13 @@ pub fn main() void {
 
 // error
 // args: -target aarch64-linux
-// bs-only: upstream assembles inline assembly only when it emits code, which -fno-emit-bin skips, and then with LLVM, which takes umulh and fmla and rejects only ldadd (generic has no LSE)
-// asm_insn_aarch64.zig:11:9: error[unsupported]: bs codegen (aarch64): bs does not support this inline assembly instruction yet: 'umulh %[r], %[r], %[r]'
-//   | \\ umulh %[r], %[r], %[r]
-// asm_insn_aarch64.zig:18:19: error[unsupported]: bs codegen (aarch64): bs does not support this inline assembly instruction yet: 'ldadd x1, x1, [%[p]]'
+// bs-only: upstream assembles inline assembly only when it emits code, which -fno-emit-bin skips; then LLVM rejects the same lines
+// asm_insn_aarch64.zig:11:9: error[unsupported]: bs codegen (aarch64): inline assembly: sp is not a valid operand there (register 31 is zr in that position): 'udiv %[r], %[r], sp'
+//   | \\ udiv %[r], %[r], sp
+// asm_insn_aarch64.zig:18:19: error[unsupported]: bs codegen (aarch64): inline assembly instruction 'ldadd x1, x1, [%[p]]' needs the target CPU feature 'lse', as upstream's assembler does
 //   | asm volatile ("ldadd x1, x1, [%[p]]"
-// asm_insn_aarch64.zig:28:35: error[unsupported]: bs codegen (aarch64): bs does not support this inline assembly instruction yet: 'fmla v0.4s, v1.4s, v2.4s'
-//   | .aarch64 => asm volatile ("fmla v0.4s, v1.4s, v2.4s" ::: .{ .v0 = true }),
-// asm_insn_aarch64.zig:34:17: error[unsupported]: bs codegen (aarch64): bs does not support this inline assembly instruction yet: 'umulh %[r], %[a], %[a]'
-//   | return asm ("umulh %[r], %[a], %[a]"
+// asm_insn_aarch64.zig:28:35: error[unsupported]: bs codegen (aarch64): inline assembly: 'fmov' takes #0.0 or plus or minus 16 to 31 sixteenths times a power of two from 1/8 to 16: 'fmov d0, #0.1'
+//   | .aarch64 => asm volatile ("fmov d0, #0.1" ::: .{ .v0 = true }),
+// asm_insn_aarch64.zig:34:17: error[unsupported]: bs codegen (aarch64): inline assembly: the field's width here is 1 to 4: 'ubfx %[r], %[a], #60, #8'
+//   | return asm ("ubfx %[r], %[a], #60, #8"
 // 4 errors
