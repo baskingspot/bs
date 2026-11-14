@@ -5764,7 +5764,9 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
             try cg.checkNaked(tag);
             try cg.ret(data.un_op, next);
         },
-        .unreach => try cg.e.ud2(),
+        // A naked function's `unreachable` without safety is no
+        // instruction, as upstream's (see the aarch64 backend).
+        .unreach => if (cg.fn_ty.cc != .naked or tag == .trap) try cg.e.ud2(),
     }
 }
 

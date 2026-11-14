@@ -1556,7 +1556,11 @@ of values, then a terminator (`jump`, `branch`, `switch`, `ret`,
 `unreachable`, or `noreturn_call`, which ends the block after an
 ordinary call: it emits `call`/`bl`, never a jump, because a panic
 handler prints the trace from its return address and needs the caller's
-frame). A value has an op, a type class, up to three inline operands (more in an extra array), and a source
+frame; `unreachable` emits a trap, `ud2` or `brk #1`, except Sema's
+`unreach` in a naked function, where there is no safety and upstream
+emits nothing after the function's assembly, so a routine written in
+assembly has its own size; with safety that end is a `trap` and stays).
+A value has an op, a type class, up to three inline operands (more in an extra array), and a source
 position. Operands are value indices or constants. Phis sit at the start
 of a block, one operand per predecessor in predecessor order. All arrays
 are flat (`std.MultiArrayList`), indices are `u32`, and a function's SSA

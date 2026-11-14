@@ -2792,8 +2792,11 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
             try cg.checkNaked(tag);
             try cg.ret(data.un_op);
         },
-        // As LLVM lowers `@trap` and `unreachable` on arm64.
-        .unreach => try cg.e.brk(1),
+        // As LLVM lowers `@trap` and `unreachable` on arm64. A naked
+        // function's `unreachable` without safety (its end in ReleaseFast,
+        // or under `@setRuntimeSafety(false)`) is no instruction, as
+        // upstream's: the function is its assembly and nothing after it.
+        .unreach => if (cg.fn_ty.cc != .naked or tag == .trap) try cg.e.brk(1),
     }
 }
 
