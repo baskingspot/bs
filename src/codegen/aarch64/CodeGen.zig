@@ -6089,8 +6089,9 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         const n = reg(ops, 1) orelse return cg.asmUnsupported(line);
         const m = reg(ops, 2) orelse return cg.asmUnsupported(line);
         if (ops.len != 3 or d.width != .w or n.width != .w or m.width != (if (sz == 3) Encoder.Width.x else Encoder.Width.w)) return cg.asmUnsupported(line);
+        if (d.reg == .sp or n.reg == .sp or m.reg == .sp) return cg.asmBadSp(line);
         const sf: u32 = if (sz == 3) 1 << 31 else 0;
-        return e.raw(sf | 0x1ac04000 | @as(u32, @intFromBool(c)) << 12 | sz << 10 | @as(u32, @backingInt(m.reg)) << 16 | @as(u32, @backingInt(n.reg)) << 5 | @backingInt(d.reg));
+        return e.raw(sf | 0x1ac04000 | @as(u32, @intFromBool(c)) << 12 | sz << 10 | m.reg.zrEnc() << 16 | n.reg.zrEnc() << 5 | d.reg.zrEnc());
     }
     if (eql(u8, mnemonic, "stp") or eql(u8, mnemonic, "ldp")) {
         if (ops.len != 3) return cg.asmUnsupported(line);
@@ -6272,8 +6273,8 @@ fn asmNeon(cg: *CodeGen, mnemonic_in: []const u8, ops: []const AsmOperand, line:
         .{ "eor", .three, 0x2E201C00 },
         .{ "and", .three, 0x0E201C00 },
         .{ "orr", .three, 0x0EA01C00 },
-        .{ "pmull", .three, 0x0EE0E000 }, // Vd.1q, Vn.1d, Vm.1d
-        .{ "pmull2", .three, 0x4EE0E000 }, // Vd.1q, Vn.2d, Vm.2d
+        .{ "pmull", .three, 0x0E20E000 }, // Vd.1q, Vn.1d, Vm.1d or Vd.8h, Vn.8b, Vm.8b
+        .{ "pmull2", .three, 0x4E20E000 }, // Vd.1q, Vn.2d, Vm.2d or Vd.8h, Vn.16b, Vm.16b
         .{ "sha256h", .three, 0x5E004000 },
         .{ "sha256h2", .three, 0x5E005000 },
         .{ "sha256su1", .three, 0x5E006000 },
@@ -6287,11 +6288,24 @@ fn asmNeon(cg: *CodeGen, mnemonic_in: []const u8, ops: []const AsmOperand, line:
     } else return false;
     const d = ops[0].vreg;
     const arr = d.arr orelse suffix;
+    const pmull = std.mem.startsWith(u8, mnemonic, "pmull");
     // The Q bit of the instructions whose encoding above leaves it clear.
     const q: u32 = switch (insn[2] >> 30 & 1) {
-        0 => if (std.mem.eql(u8, mnemonic, "pmull")) 0 else (arr orelse return cg.asmUnsupported(line)).q(),
+        0 => if (pmull) 0 else (arr orelse return cg.asmUnsupported(line)).q(),
         else => 0,
     };
+    // pmull's size field is its result's: polynomials of 64 bits (`.1q`)
+    // or of 8 (`.8h`).
+    const pmull_size: u32 = if (!pmull) 0 else switch (arr orelse return cg.asmUnsupported(line)) {
+        .@"1q" => 0b11 << 22,
+        .@"8h" => 0,
+        else => return cg.asmUnsupported(line),
+    };
+    // The crypto instructions need their CPU feature, as `crc32` does;
+    // `pmull` on bytes is plain NEON.
+    const feature: ?std.Target.aarch64.Feature = if (std.mem.startsWith(u8, mnemonic, "aes") or pmull_size != 0) .aes else if (std.mem.startsWith(u8, mnemonic, "sha256")) .sha2 else null;
+    if (feature) |f| if (!cg.emit.zcu.cpu.has(.aarch64, f))
+        return cg.fail("inline assembly instruction '{s}' needs the target CPU feature '{t}', as upstream's assembler does", .{ line, f });
     const v = struct {
         fn at(o: []const AsmOperand, k: usize) ?u32 {
             return if (k < o.len and o[k] == .vreg) @backingInt(o[k].vreg.reg) else null;
@@ -6309,7 +6323,7 @@ fn asmNeon(cg: *CodeGen, mnemonic_in: []const u8, ops: []const AsmOperand, line:
             const rn = v(ops, 1) orelse return cg.asmUnsupported(line);
             const rm = v(ops, 2) orelse return cg.asmUnsupported(line);
             if (ops.len != 3) return cg.asmUnsupported(line);
-            break :w insn[2] | q << 30 | rm << 16 | rn << 5 | rd;
+            break :w insn[2] | pmull_size | q << 30 | rm << 16 | rn << 5 | rd;
         },
         .ext => w: {
             const rn = v(ops, 1) orelse return cg.asmUnsupported(line);

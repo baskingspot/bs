@@ -1390,7 +1390,8 @@ pub const System = struct {
     pub const sev: u32 = 0xd503209f;
     pub const sevl: u32 = 0xd50320bf;
     pub const isb: u32 = 0xd5033fdf;
-    pub const clrex: u32 = 0xd503305f;
+    /// `clrex` without an operand is `clrex #15`.
+    pub const clrex: u32 = 0xd5033f5f;
     /// `dsb <option>`: or in the option (`Barrier`) at bit 8.
     pub const dsb: u32 = 0xd503309f;
     /// `mrs xt, tpidrro_el0` / `tpidr_el0`: or in the register.
