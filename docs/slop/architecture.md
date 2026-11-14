@@ -1099,6 +1099,28 @@ comptime arguments are run-time values in the lowered code (uucode's
   output's register.
   A vector operand moves from its register, and a vector result into
   its home register unless the statement restores that register.
+  What hand-written kernels add (built 2026-11-14 for fastmem's
+  Advanced SIMD memcpy, memmove and memset, whose bytes equal
+  upstream's): named labels (`name:`, `.Lname:`) as the target of `b`,
+  `bl`, `b.cond`, `cbz`, `cbnz`, `tbz`, `tbnz` and `adr`, which live in
+  `LocalLabels.named` for one asm statement, so that a branch to a label
+  the statement does not define is an error at the branch and not a
+  symbol for the linker, where LLVM's labels are the module's (so bs
+  takes one name in two statements, and on Mach-O a `.L` or bare name
+  where LLVM's conditional branches reach only `L` labels);
+  `.p2align`, `.align` and `.balign` with an optional most padding,
+  which pad with nops (`Encoder.alignTo`) and raise `Encoder.alignment`,
+  which the function's atom takes, so the padded offset is aligned in
+  the output; loads, stores and pairs of the b, h, s, d and q registers
+  in every addressing form, index registers with `lsl`, `uxtw`, `sxtw`
+  and `sxtx`, `dup` from a general register, `dc` and `ic` with a
+  register, and `dczid_el0`; and constant expressions (`AsmExpr`) with
+  the operator precedence LLVM gives them, which is GNU as's on ELF and
+  its own on Mach-O (`1 + 2 << 3` is 17 on ELF and 24 on Mach-O). An
+  offset no encoding holds is an error that names the offsets one does.
+  Padding fixes offsets, so `Encoder.finish` does not relax a branch in
+  a function that padded: a conditional branch out of range there is
+  `error.AlignedCodeMoved`, reported as a compile error.
 - aarch64-linux (started 2026-11-05) runs the same CodeGen and links
   static, non-PIE executables with the ELF linker (`Elf.Options.arch`),
   and position-independent objects and shared objects ("Position-
@@ -1301,7 +1323,9 @@ into the module's code, on all three targets.
   module's, as LLVM assembles all of a module's blocks as one: a `.globl`
   in one block may name a label or alias of another, and a block of
   directives alone has no atom. Anything else, such as
-  an unknown directive, instruction or operand, a named label or an
+  an unknown directive, instruction or operand, a named label (on
+  aarch64, one of another block: a block's branches reach its own
+  labels since 2026-11-14) or an
   external symbol as an operand, a `.set` of a number or of a symbol the
   module does not define, or alignment after the start, is a
   compile error at the `asm` (test/diag/global_asm.zig), never dropped

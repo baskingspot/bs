@@ -399,7 +399,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     const probes_at = if (!naked) try cg.allocFrame(frame_at, body) else null;
     cg.e.finish() catch |err| switch (err) {
         error.BranchOutOfRange => return cg.fail("function too large for its branches", .{}),
-        else => |x| return x,
+        error.AlignedCodeMoved => return cg.fail(asm_aligned_code_moved, .{}),
+        error.OutOfMemory => return error.OutOfMemory,
     };
     // The stubs, then the probes, end the code (`Atom.Unwind.epilogue`).
     var unwind: Atom.Unwind = .{ .kind = .frame_pointer, .saved = cg.saved };
@@ -444,7 +445,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         // Names can change until analysis ends (`Emit.nameAtoms`).
         .name = Emit.name_later,
         .section = .text,
-        .alignment = .fromByteUnits(@max(4, nav.alignment)),
+        // Inline assembly's `.p2align` pads from the start of the code.
+        .alignment = std.mem.Alignment.fromByteUnits(@max(4, nav.alignment)).max(cg.e.alignment),
         .bytes = try arena.dupe(u8, cg.e.code.items),
         .targets = try arena.dupe(SymbolKey, cg.e.refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
@@ -4989,6 +4991,11 @@ fn cVaArg(cg: *CodeGen, inst: Inst.Index, ty: Index, list: Ref) Error!void {
 // input to that output's register. `X`, `i`, `n`, and `N` inputs are
 // substituted as symbols or immediates. Callee-saved registers the
 // template names or the operands get are saved around it.
+//
+// A named label (`loop:`, `.Lloop:`) belongs to the asm that defines it
+// and is a branch target there only; LLVM's are the module's. `.p2align`,
+// `.balign` and `.align` pad with nops from the start of the function,
+// whose alignment they raise.
 
 const AsmArg = union(enum) { sym: struct { key: SymbolKey, off: i32 }, imm: i64, reg: Reg, vreg: VReg };
 
@@ -5302,6 +5309,7 @@ pub const GlobalAsm = struct {
     }
 
     pub fn deinit(g: *GlobalAsm) void {
+        g.locals.named.deinit(g.cg.gpa);
         g.cg.e.deinit();
         g.* = undefined;
     }
@@ -5310,28 +5318,254 @@ pub const GlobalAsm = struct {
         return g.cg.assembleStatement(line, &.empty, &g.locals);
     }
 
+    /// Binds named label `name`, which must outlive `g`, to the current
+    /// offset, as a target of the block's branches.
+    pub fn label(g: *GlobalAsm, name: []const u8) Error!void {
+        return g.cg.asmDefineLabel(&g.locals, name);
+    }
+
     pub fn fail(g: *GlobalAsm, comptime fmt: []const u8, args: anytype) Error {
         return g.cg.fail(fmt, args);
     }
 
     pub fn finish(g: *GlobalAsm) Error!void {
-        for (g.locals.fwd) |l| if (l != null) return g.cg.fail("asm refers to an undefined local label", .{});
+        try g.cg.asmLabelsDefined(&g.locals);
         g.cg.e.finish() catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.BranchOutOfRange => return g.cg.fail("asm branch out of range", .{}),
+            error.AlignedCodeMoved => return g.cg.fail(asm_aligned_code_moved, .{}),
         };
     }
 };
 
-/// GNU as local labels `0:` to `9:`, referenced as `1f` (the next) and
-/// `1b` (the previous).
+const asm_aligned_code_moved = "a conditional branch cannot reach its label (b.cond, cbz and cbnz reach 1 MiB, tbz and tbnz 32 KiB) in code that an assembler alignment directive pads; bs does not relax branches there yet";
+
+/// The labels of one asm: GNU as local labels `0:` to `9:`, referenced as
+/// `1f` (the next) and `1b` (the previous), and named labels (`loop:`,
+/// `.Lloop:`), keyed by their names in the template.
 const LocalLabels = struct {
     fwd: [10]?Encoder.Label = @splat(null),
     back: [10]?Encoder.Label = @splat(null),
+    named: std.StringHashMapUnmanaged(Named) = .empty,
+
+    /// `line` is the asm line of the first branch to it, for the error
+    /// when nothing defines it.
+    const Named = struct { label: Encoder.Label, defined: bool, line: u32 = 0 };
 };
+
+/// Binds named label `name` to the current offset.
+fn asmDefineLabel(cg: *CodeGen, locals: *LocalLabels, name: []const u8) Error!void {
+    const gop = try locals.named.getOrPut(cg.gpa, name);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{ .label = undefined, .defined = true };
+        errdefer _ = locals.named.remove(name);
+        gop.value_ptr.label = try cg.e.newLabel();
+    } else if (gop.value_ptr.defined) {
+        return cg.fail("asm label '{s}' is defined twice", .{name});
+    }
+    gop.value_ptr.defined = true;
+    cg.e.bind(gop.value_ptr.label);
+}
+
+/// Named label `name` as a branch target, defined before or after.
+fn asmNamedLabel(cg: *CodeGen, locals: *LocalLabels, name: []const u8) Error!Encoder.Label {
+    const gop = try locals.named.getOrPut(cg.gpa, name);
+    if (!gop.found_existing) {
+        errdefer _ = locals.named.remove(name);
+        gop.value_ptr.* = .{ .label = try cg.e.newLabel(), .defined = false, .line = cg.asm_line orelse 0 };
+    }
+    return gop.value_ptr.label;
+}
+
+/// Fails if the asm that ends here refers to a label it does not define.
+fn asmLabelsDefined(cg: *CodeGen, locals: *const LocalLabels) Error!void {
+    for (locals.fwd) |l| if (l != null) return cg.fail("asm refers to an undefined local label", .{});
+    // The first one in the source, whatever the map's order.
+    var first: ?struct { []const u8, u32 } = null;
+    var it = locals.named.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.defined) continue;
+        if (first == null or entry.value_ptr.line < first.?[1]) first = .{ entry.key_ptr.*, entry.value_ptr.line };
+    }
+    const name, const line = first orelse return;
+    if (cg.asm_line != null) cg.asm_line = line;
+    return cg.fail("asm branches to '{s}', which is not a label this asm defines; bs resolves a label only in the asm that defines it, and does not resolve a symbol by name (pass it as an operand)", .{name});
+}
+
+/// `name:` at the start of `line`, a named label's definition.
+fn asmLabelName(line: []const u8) ?[]const u8 {
+    const colon = std.mem.findScalar(u8, line, ':') orelse return null;
+    const name = line[0..colon];
+    return if (isLabelName(name)) name else null;
+}
+
+fn isLabelName(name: []const u8) bool {
+    if (name.len == 0 or std.ascii.isDigit(name[0])) return false;
+    for (name) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '.' and c != '$') return false;
+    return true;
+}
+
+/// Whether instruction `mnemonic` ends in a label operand.
+fn asmTakesLabel(mnemonic: []const u8) bool {
+    for ([_][]const u8{ "b", "bl", "cbz", "cbnz", "tbz", "tbnz", "adr" }) |m| if (std.mem.eql(u8, mnemonic, m)) return true;
+    return asmBranchCond(mnemonic) != null;
+}
+
+/// The condition of a conditional branch: `b.hi` or, as LLVM also reads
+/// it, `bhi`.
+fn asmBranchCond(mnemonic: []const u8) ?Cond {
+    if (mnemonic.len < 3 or mnemonic[0] != 'b') return null;
+    const name = mnemonic[@as(usize, 1) + @intFromBool(mnemonic[1] == '.') ..];
+    if (std.mem.eql(u8, name, "cs")) return .hs;
+    if (std.mem.eql(u8, name, "cc")) return .lo;
+    return std.meta.stringToEnum(Cond, name);
+}
+
+/// The constant expressions of operands and directives: integers (`0x`
+/// hexadecimal, `0b` binary, a leading `0` octal), parentheses, unary
+/// `-`, `+` and `~`, and the binary operators below, with the precedence
+/// LLVM's assembler gives them, which is GNU as's on ELF and its own on
+/// Mach-O. 64-bit and wrapping.
+const AsmExpr = struct {
+    s: []const u8,
+    i: usize = 0,
+    macho: bool,
+
+    const Op = enum { add, sub, mul, div, rem, shl, shr, @"and", @"or", xor };
+
+    /// The value of all of `s`, or null if it is not such an expression.
+    fn eval(s: []const u8, macho: bool) ?i64 {
+        var p: AsmExpr = .{ .s = s, .macho = macho };
+        const v = p.binary(1) orelse return null;
+        p.skip();
+        return if (p.i == s.len) v else null;
+    }
+
+    fn skip(p: *AsmExpr) void {
+        while (p.i < p.s.len and (p.s[p.i] == ' ' or p.s[p.i] == '\t')) p.i += 1;
+    }
+
+    fn operator(p: *AsmExpr) ?struct { Op, u8, usize } {
+        const rest = p.s[p.i..];
+        if (rest.len == 0) return null;
+        // ELF: `+ -`, then `| & ^`, then `* / % << >>`.
+        // Mach-O: `| & ^`, then `<< >>`, then `+ -`, then `* / %`.
+        const shift: u8 = if (p.macho) 2 else 4;
+        if (std.mem.startsWith(u8, rest, "<<")) return .{ .shl, shift, 2 };
+        if (std.mem.startsWith(u8, rest, ">>")) return .{ .shr, shift, 2 };
+        const additive: u8 = if (p.macho) 3 else 1;
+        const bitwise: u8 = if (p.macho) 1 else 2;
+        return switch (rest[0]) {
+            '+' => .{ .add, additive, 1 },
+            '-' => .{ .sub, additive, 1 },
+            '|' => .{ .@"or", bitwise, 1 },
+            '&' => .{ .@"and", bitwise, 1 },
+            '^' => .{ .xor, bitwise, 1 },
+            '*' => .{ .mul, 4, 1 },
+            '/' => .{ .div, 4, 1 },
+            '%' => .{ .rem, 4, 1 },
+            else => null,
+        };
+    }
+
+    fn binary(p: *AsmExpr, min: u8) ?i64 {
+        var lhs = p.primary() orelse return null;
+        while (true) {
+            p.skip();
+            const op, const prec, const len = p.operator() orelse return lhs;
+            if (prec < min) return lhs;
+            p.i += len;
+            const rhs = p.binary(prec + 1) orelse return null;
+            lhs = switch (op) {
+                .add => lhs +% rhs,
+                .sub => lhs -% rhs,
+                .mul => lhs *% rhs,
+                .div => if (rhs == 0 or (rhs == -1 and lhs == std.math.minInt(i64))) return null else @divTrunc(lhs, rhs),
+                .rem => if (rhs == 0 or (rhs == -1 and lhs == std.math.minInt(i64))) return null else @rem(lhs, rhs),
+                .shl => if (rhs < 0 or rhs > 63) return null else lhs << @intCast(rhs),
+                // Logical, as LLVM shifts.
+                .shr => if (rhs < 0 or rhs > 63) return null else @bitCast(@as(u64, @bitCast(lhs)) >> @intCast(rhs)),
+                .@"and" => lhs & rhs,
+                .@"or" => lhs | rhs,
+                .xor => lhs ^ rhs,
+            };
+        }
+    }
+
+    fn primary(p: *AsmExpr) ?i64 {
+        p.skip();
+        if (p.i == p.s.len) return null;
+        const c = p.s[p.i];
+        switch (c) {
+            '-', '+', '~' => {
+                p.i += 1;
+                const v = p.primary() orelse return null;
+                return switch (c) {
+                    '-' => 0 -% v,
+                    '~' => ~v,
+                    else => v,
+                };
+            },
+            '(' => {
+                p.i += 1;
+                const v = p.binary(1) orelse return null;
+                p.skip();
+                if (p.i == p.s.len or p.s[p.i] != ')') return null;
+                p.i += 1;
+                return v;
+            },
+            '0'...'9' => {
+                const start = p.i;
+                while (p.i < p.s.len and std.ascii.isAlphanumeric(p.s[p.i])) p.i += 1;
+                const digits = p.s[start..p.i];
+                // 64-bit patterns such as 0xffffffffffffffff are negative values.
+                const v: u64 = if (digits.len > 1 and digits[0] == '0' and std.ascii.isDigit(digits[1]))
+                    std.fmt.parseInt(u64, digits[1..], 8) catch return null
+                else
+                    std.fmt.parseInt(u64, digits, 0) catch return null;
+                return @bitCast(v);
+            },
+            else => return null,
+        }
+    }
+};
+
+fn asmConst(cg: *CodeGen, tok: []const u8) ?i64 {
+    return AsmExpr.eval(tok, cg.emit.zcu.ip.target == .aarch64_macos);
+}
+
+/// Assembles `line` if it is an alignment directive: `.p2align n` and
+/// `.align n` (to `1 << n` bytes) or `.balign n` (to `n`), then
+/// optionally `, , max`, the most padding to add. Pads with nops.
+fn asmAlign(cg: *CodeGen, line: []const u8) Error!bool {
+    const eql = std.mem.eql;
+    const sp = std.mem.findAny(u8, line, " \t") orelse line.len;
+    const directive = line[0..sp];
+    const log2 = eql(u8, directive, ".p2align") or eql(u8, directive, ".align");
+    if (!log2 and !eql(u8, directive, ".balign")) return false;
+    if (cg.global_asm != null) return cg.fail("bs does not support '{s}' after the start of container-level assembly yet", .{line});
+    var args = std.mem.splitScalar(u8, line[sp..], ',');
+    const n = cg.asmConst(args.first()) orelse return cg.fail("bad alignment in '{s}'", .{line});
+    const fill = std.mem.trim(u8, args.next() orelse "", " \t");
+    const max_tok = std.mem.trim(u8, args.next() orelse "", " \t");
+    if (args.next() != null) return cg.fail("bad alignment in '{s}'", .{line});
+    if (fill.len != 0) return cg.fail("bs pads code with nops only, not with the fill value of '{s}'", .{line});
+    const alignment: std.mem.Alignment = if (log2)
+        if (n >= 0 and n < 16) @fromBackingInt(@intCast(n)) else return cg.fail("bad alignment in '{s}'", .{line})
+    else if (n > 0 and n <= 1 << 15 and std.math.isPowerOfTwo(n)) .fromByteUnits(@intCast(n)) else return cg.fail("bad alignment in '{s}'", .{line});
+    if (max_tok.len != 0 or std.mem.count(u8, line, ",") == 2) {
+        const max = cg.asmConst(max_tok) orelse return cg.fail("bad alignment in '{s}'", .{line});
+        if (max < 1) return cg.fail("the most padding '{s}' allows is less than 1 byte, which upstream's assembler (LLVM) rejects", .{line});
+        const at = cg.e.code.items.len;
+        if (alignment.forward(at) - at > max) return true;
+    }
+    try cg.e.alignTo(alignment);
+    return true;
+}
 
 fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg)) Error!void {
     var locals: LocalLabels = .{};
+    defer locals.named.deinit(cg.gpa);
     var source_lines = std.mem.tokenizeScalar(u8, source, '\n');
     var counted: usize = 0;
     while (source_lines.next()) |source_line| {
@@ -5343,7 +5577,7 @@ fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnm
         var statements = std.mem.tokenizeScalar(u8, code, ';');
         while (statements.next()) |raw| try cg.assembleStatement(std.mem.trim(u8, raw, " \t\r"), names, &locals);
     }
-    for (locals.fwd) |l| if (l != null) return cg.fail("asm refers to an undefined local label", .{});
+    try cg.asmLabelsDefined(&locals);
 }
 
 const AsmOperand = union(enum) {
@@ -5351,17 +5585,50 @@ const AsmOperand = union(enum) {
     imm: i64,
     sym: struct { key: SymbolKey, off: i32 },
     label: Encoder.Label,
-    mem: Encoder.Mem,
-    /// A bare word: a barrier option or system register.
+    mem: AsmMem,
+    /// A bare word: a barrier option, a system register, a cache
+    /// operation, or a named label, by the instruction.
     name: []const u8,
-    /// A SIMD register (`v3.16b`, `q3`, `%[name].4s`), with the
-    /// arrangement it is written with.
-    vreg: struct { reg: VReg, arr: ?Arrangement },
+    /// A SIMD register (`v3.16b`, `q3`, `%[name].4s`), with the width
+    /// and the arrangement it is written with.
+    vreg: struct { reg: VReg, kind: VKind = .v, arr: ?Arrangement },
     /// A list of consecutive SIMD registers (`{v3.16b}`).
     vlist: struct { first: VReg, len: u3, arr: ?Arrangement },
     /// The shift or extension of the register before it (`lsl #2`,
     /// `uxtw`, `sxtw #3`), or of an immediate (`lsl #12`).
     modifier: struct { op: Modifier, amount: ?u8 },
+};
+
+/// A memory operand as written. An index register's shift amount is
+/// checked against the access size once the instruction is known
+/// (`asmMem`).
+const AsmMem = struct { mem: Encoder.Mem, shift: ?u8 = null };
+
+/// How a SIMD register is named: the whole vector (`v3`) or its low
+/// bytes as a scalar (`q3`, `d3`, `s3`, `h3`, `b3`).
+const VKind = enum {
+    v,
+    q,
+    d,
+    s,
+    h,
+    b,
+
+    fn of(c: u8) ?VKind {
+        return std.meta.stringToEnum(VKind, &.{std.ascii.toLower(c)});
+    }
+
+    /// The width a load or store of the register moves.
+    fn size(k: VKind) ?Encoder.VSize {
+        return switch (k) {
+            .v => null,
+            .q => .q,
+            .d => .d,
+            .s => .s,
+            .h => .h,
+            .b => .b,
+        };
+    }
 };
 
 /// A register operand's shift (lsl, lsr, asr, ror) or extension (the
@@ -5401,27 +5668,40 @@ const Arrangement = enum {
             .@"16b", .@"8h", .@"4s", .@"2d", .@"1q" => 1,
         };
     }
+
+    /// `16b` or `16B`.
+    fn parse(s: []const u8) ?Arrangement {
+        var buf: [3]u8 = undefined;
+        if (s.len > buf.len) return null;
+        return std.meta.stringToEnum(Arrangement, std.ascii.lowerString(&buf, s));
+    }
 };
 
 /// A SIMD register written as `v3`, `q3`, `d3`, `s3`, `h3` or `b3`,
 /// optionally with an arrangement (`v3.4s`).
 fn parseVReg(tok: []const u8) ?AsmOperand {
-    if (tok.len < 2 or std.mem.findScalar(u8, "vqdshb", tok[0]) == null) return null;
+    if (tok.len < 2) return null;
+    const kind = VKind.of(tok[0]) orelse return null;
     const dot = std.mem.findScalar(u8, tok, '.') orelse tok.len;
     const n = std.fmt.parseInt(u5, tok[1..dot], 10) catch return null;
-    const arr: ?Arrangement = if (dot == tok.len) null else std.meta.stringToEnum(Arrangement, tok[dot + 1 ..]) orelse return null;
-    return .{ .vreg = .{ .reg = @fromBackingInt(n), .arr = arr } };
+    const arr: ?Arrangement = if (dot == tok.len) null else Arrangement.parse(tok[dot + 1 ..]) orelse return null;
+    return .{ .vreg = .{ .reg = @fromBackingInt(n), .kind = kind, .arr = arr } };
 }
 
 fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg), locals: *LocalLabels) Error!void {
     var line = line_in;
-    if (line.len >= 2 and std.ascii.isDigit(line[0]) and line[1] == ':') {
-        const n = line[0] - '0';
-        const label = locals.fwd[n] orelse try cg.e.newLabel();
-        cg.e.bind(label);
-        locals.fwd[n] = null;
-        locals.back[n] = label;
-        line = std.mem.trim(u8, line[2..], " \t");
+    while (true) {
+        if (line.len >= 2 and std.ascii.isDigit(line[0]) and line[1] == ':') {
+            const n = line[0] - '0';
+            const label = locals.fwd[n] orelse try cg.e.newLabel();
+            cg.e.bind(label);
+            locals.fwd[n] = null;
+            locals.back[n] = label;
+            line = std.mem.trim(u8, line[2..], " \t");
+        } else if (asmLabelName(line)) |name| {
+            try cg.asmDefineLabel(locals, name);
+            line = std.mem.trim(u8, line[name.len + 1 ..], " \t");
+        } else break;
     }
     if (line.len == 0) return;
     if (line[0] == '.') {
@@ -5429,6 +5709,7 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
             cg.outermost_frame = true;
             return;
         }
+        if (try cg.asmAlign(line)) return;
         return cg.fail("bs does not support the assembler directive '{s}' yet", .{line});
     }
     const sp = std.mem.findAny(u8, line, " \t") orelse line.len;
@@ -5457,10 +5738,16 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
     }
     // A post-index immediate follows the memory operand.
     if (n >= 2 and operands[n - 2] == .mem and operands[n - 1] == .imm and std.mem.find(u8, line, "]!") == null) {
-        const m = operands[n - 2].mem;
+        const m = operands[n - 2].mem.mem;
         if (m.offset != .imm or m.offset.imm != 0) return cg.fail("bad post-indexed operand: '{s}'", .{line});
-        operands[n - 2] = .{ .mem = .{ .base = m.base, .offset = .{ .post = @intCast(operands[n - 1].imm) } } };
+        const post = std.math.cast(i32, operands[n - 1].imm) orelse return cg.fail("asm memory offset out of range: '{s}'", .{line});
+        operands[n - 2] = .{ .mem = .{ .mem = .{ .base = m.base, .offset = .{ .post = post } } } };
         n -= 1;
+    }
+    // A bare word where the instruction branches is a named label.
+    if (n > 0 and operands[n - 1] == .name and isLabelName(operands[n - 1].name) and asmTakesLabel(mnemonic)) {
+        const label = try cg.asmNamedLabel(locals, operands[n - 1].name);
+        operands[n - 1] = .{ .label = label };
     }
     try cg.asmInst(mnemonic, operands[0..n], line);
 }
@@ -5473,22 +5760,49 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
         var it = std.mem.tokenizeScalar(u8, inner, ',');
         const base_tok = std.mem.trim(u8, it.next() orelse return cg.fail("bad asm memory operand: '{s}'", .{line}), " \t");
         const base = switch (try cg.asmOperand(base_tok, names, locals, line)) {
-            .reg => |r| r.reg,
+            .reg => |r| if (r.width == .x and r.reg != .zr) r.reg else return cg.fail("bad asm memory base (an x register or sp): '{s}'", .{line}),
             else => return cg.fail("bad asm memory base: '{s}'", .{line}),
         };
         var off: i64 = 0;
         if (it.next()) |off_tok| switch (try cg.asmOperand(std.mem.trim(u8, off_tok, " \t"), names, locals, line)) {
-            .imm => |v| off = v,
+            .imm => |v| {
+                if (it.next() != null) return cg.fail("bad asm memory operand: '{s}'", .{line});
+                off = v;
+            },
             .reg => |r| {
-                if (it.next() != null) return cg.fail("bs does not support this asm memory operand yet: '{s}'", .{line});
-                return .{ .mem = .{ .base = base, .offset = .{ .index = .{ .reg = r.reg } } } };
+                // `[base, xm]`, `[base, xm, lsl #n]`, `[base, wm, uxtw #n]`.
+                var index: Encoder.Mem.Index = .{ .reg = r.reg };
+                var shift: ?u8 = null;
+                if (it.next()) |mod_tok| {
+                    const m = switch (try cg.asmOperand(std.mem.trim(u8, mod_tok, " \t"), names, locals, line)) {
+                        .modifier => |m| m,
+                        else => return cg.fail("bad asm memory operand: '{s}'", .{line}),
+                    };
+                    index.extend = switch (m.op) {
+                        .lsl => .lsl,
+                        .uxtw => .uxtw,
+                        .sxtw => .sxtw,
+                        .sxtx => .sxtx,
+                        else => return cg.fail("inline assembly: an index register is shifted by 'lsl' or extended by 'uxtw', 'sxtw' or 'sxtx': '{s}'", .{line}),
+                    };
+                    if (m.op == .lsl and m.amount == null) return cg.fail("bad asm memory operand: '{s}'", .{line});
+                    shift = m.amount;
+                }
+                const width: Encoder.Width = if (index.extend == .uxtw or index.extend == .sxtw) .w else .x;
+                if (pre or it.next() != null or r.reg == .sp) return cg.fail("bad asm memory operand: '{s}'", .{line});
+                if (r.width != width) return cg.fail("inline assembly: an index register is an x register, or a w register extended by 'uxtw' or 'sxtw': '{s}'", .{line});
+                return .{ .mem = .{ .mem = .{ .base = base, .offset = .{ .index = index } }, .shift = shift } };
             },
             else => return cg.fail("bad asm memory offset: '{s}'", .{line}),
         };
         const o: i32 = std.math.cast(i32, off) orelse return cg.fail("asm memory offset out of range: '{s}'", .{line});
-        return .{ .mem = .{ .base = base, .offset = if (pre) .{ .pre = o } else .{ .imm = o } } };
+        return .{ .mem = .{ .mem = .{ .base = base, .offset = if (pre) .{ .pre = o } else .{ .imm = o } } } };
     }
-    if (tok[0] == '#') return cg.asmOperand(tok[1..], names, locals, line);
+    if (tok[0] == '#') {
+        const rest = std.mem.trimStart(u8, tok[1..], " \t");
+        if (rest.len == 0) return cg.fail("bad asm immediate: '{s}'", .{line});
+        return cg.asmOperand(rest, names, locals, line);
+    }
     if (tok[0] == '{') {
         // A register list: `{v1.16b}`, `{v1.16b, v2.16b}`, `{%[t].16b}`.
         if (tok[tok.len - 1] != '}') return cg.fail("bad asm register list: '{s}'", .{line});
@@ -5512,16 +5826,18 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
         // operand's arrangement after it (`%[name].16b`).
         var t = tok[1..];
         var width: ?Encoder.Width = null;
+        var kind: VKind = .v;
         if (t.len > 0 and (t[0] == 'x' or t[0] == 'w')) {
             width = if (t[0] == 'x') .x else .w;
             t = t[1..];
         } else if (t.len > 0 and std.mem.findScalar(u8, "qdshb", t[0]) != null) {
+            kind = VKind.of(t[0]).?;
             t = t[1..];
         }
         var arr: ?Arrangement = null;
         if (std.mem.findScalarLast(u8, t, ']')) |close| if (close + 1 < t.len) {
             if (t[close + 1] != '.') return cg.fail("bad asm operand '{s}'", .{tok});
-            arr = std.meta.stringToEnum(Arrangement, t[close + 2 ..]) orelse return cg.fail("bad asm operand '{s}'", .{tok});
+            arr = Arrangement.parse(t[close + 2 ..]) orelse return cg.fail("bad asm operand '{s}'", .{tok});
             t = t[0 .. close + 1];
         };
         if (t.len < 3 or t[0] != '[' or t[t.len - 1] != ']') return cg.fail("bad asm operand '{s}'", .{tok});
@@ -5539,7 +5855,7 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
             .reg => |r| .{ .reg = .{ .reg = r, .width = width orelse .x } },
             .imm => |v| .{ .imm = v },
             .sym => |s| .{ .sym = .{ .key = s.key, .off = s.off } },
-            .vreg => |v| if (width != null) cg.fail("asm operand modifier '{s}' on a SIMD register", .{tok}) else .{ .vreg = .{ .reg = v, .arr = arr } },
+            .vreg => |v| if (width != null) cg.fail("asm operand modifier '{s}' on a SIMD register", .{tok}) else .{ .vreg = .{ .reg = v, .kind = kind, .arr = arr } },
         };
     }
     if (std.mem.eql(u8, tok, ".")) {
@@ -5556,8 +5872,8 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
     if (parseReg(tok)) |r| return .{ .reg = r };
     if (parseVReg(tok)) |v| return v;
     if (parseModifier(tok)) |m| return m;
-    if (tok[0] == '-' or std.ascii.isDigit(tok[0])) {
-        return .{ .imm = std.fmt.parseInt(i64, tok, 0) catch return cg.fail("bad asm immediate '{s}'", .{tok}) };
+    if (std.mem.findScalar(u8, "-+~(", tok[0]) != null or std.ascii.isDigit(tok[0])) {
+        return .{ .imm = cg.asmConst(tok) orelse return cg.fail("bad asm immediate '{s}'", .{tok}) };
     }
     return .{ .name = tok };
 }
@@ -5707,9 +6023,8 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         };
         return if (mnemonic.len == 1) e.b(target) else e.bl(target);
     }
-    if (mnemonic.len > 2 and mnemonic[0] == 'b' and mnemonic[1] == '.') {
-        const cond = std.meta.stringToEnum(Cond, mnemonic[2..]) orelse (if (eql(u8, mnemonic[2..], "cs")) Cond.hs else if (eql(u8, mnemonic[2..], "cc")) Cond.lo else return cg.asmUnsupported(line));
-        if (ops[0] != .label) return cg.asmUnsupported(line);
+    if (asmBranchCond(mnemonic)) |cond| {
+        if (ops.len != 1 or ops[0] != .label) return cg.asmUnsupported(line);
         return e.bcond(cond, ops[0].label);
     }
     if (eql(u8, mnemonic, "cbz") or eql(u8, mnemonic, "cbnz")) {
@@ -5717,9 +6032,24 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         if (ops.len != 2 or ops[1] != .label) return cg.asmUnsupported(line);
         return e.cbz(mnemonic.len == 4, r.width, r.reg, ops[1].label);
     }
+    if (eql(u8, mnemonic, "tbz") or eql(u8, mnemonic, "tbnz")) {
+        const r = reg(ops, 0) orelse return cg.asmUnsupported(line);
+        if (ops.len != 3 or ops[1] != .imm or ops[2] != .label) return cg.asmUnsupported(line);
+        if (r.reg == .sp) return cg.asmBadSp(line);
+        if (ops[1].imm < 0 or ops[1].imm >= r.width.bits()) return cg.fail("inline assembly: '{s}' tests bit 0 to {d} of {s} register: '{s}'", .{ mnemonic, r.width.bits() - 1, if (r.width == .x) "an x" else "a w", line });
+        return e.tbz(mnemonic.len == 4, r.reg, @intCast(ops[1].imm), ops[2].label);
+    }
+    if (eql(u8, mnemonic, "dc") or eql(u8, mnemonic, "ic")) {
+        if (ops.len != 2 or ops[0] != .name) return cg.asmUnsupported(line);
+        const rt = reg(ops, 1) orelse return cg.asmUnsupported(line);
+        if (rt.width != .x or rt.reg == .sp) return cg.asmUnsupported(line);
+        const base = System.cacheOp(mnemonic, ops[0].name) orelse return cg.asmUnsupported(line);
+        return e.raw(base | rt.reg.zrEnc());
+    }
     if (eql(u8, mnemonic, "adr")) {
         const r = reg(ops, 0) orelse return cg.asmUnsupported(line);
-        if (ops.len != 2 or ops[1] != .label) return cg.asmUnsupported(line);
+        if (ops.len != 2 or ops[1] != .label or r.width != .x) return cg.asmUnsupported(line);
+        if (r.reg == .sp) return cg.asmBadSp(line);
         return e.adr(r.reg, ops[1].label);
     }
     if (eql(u8, mnemonic, "mov")) {
@@ -5752,11 +6082,22 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         return e.raw(sf | 0x1ac04000 | @as(u32, @intFromBool(c)) << 12 | sz << 10 | @as(u32, @backingInt(m.reg)) << 16 | @as(u32, @backingInt(n.reg)) << 5 | @backingInt(d.reg));
     }
     if (eql(u8, mnemonic, "stp") or eql(u8, mnemonic, "ldp")) {
+        if (ops.len != 3) return cg.asmUnsupported(line);
+        if (ops[0] == .vreg and ops[1] == .vreg) {
+            // Two s, d or q registers.
+            const v1 = ops[0].vreg;
+            const v2 = ops[1].vreg;
+            const size = v1.kind.size() orelse return cg.asmUnsupported(line);
+            if (v2.kind != v1.kind or size == .b or size == .h or v1.arr != null or v2.arr != null) return cg.asmUnsupported(line);
+            return e.pairV(size, mnemonic[0] == 'l', v1.reg, v2.reg, try cg.asmMem(ops[2], @backingInt(size), .pair, line));
+        }
         const r1 = reg(ops, 0) orelse return cg.asmUnsupported(line);
         const r2 = reg(ops, 1) orelse return cg.asmUnsupported(line);
-        if (ops.len != 3 or ops[2] != .mem) return cg.asmUnsupported(line);
+        if (r1.width != r2.width) return cg.asmUnsupported(line);
+        if (r1.reg == .sp or r2.reg == .sp) return cg.asmBadSp(line);
         const size: Size = if (r1.width == .x) .dword else .word;
-        return if (mnemonic[0] == 's') e.stp(size, r1.reg, r2.reg, ops[2].mem) else e.ldp(size, r1.reg, r2.reg, ops[2].mem);
+        const mem = try cg.asmMem(ops[2], @backingInt(size), .pair, line);
+        return if (mnemonic[0] == 's') e.stp(size, r1.reg, r2.reg, mem) else e.ldp(size, r1.reg, r2.reg, mem);
     }
     const loads_stores = [_]struct { []const u8, ?Size, enum { load, store, load_signed } }{
         .{ "ldr", null, .load },           .{ "str", null, .store },          .{ "ldur", null, .load },
@@ -5765,13 +6106,25 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         .{ "ldrsh", .half, .load_signed }, .{ "ldrsw", .word, .load_signed },
     };
     for (loads_stores) |ls| if (eql(u8, mnemonic, ls[0])) {
+        if (ops.len != 2) return cg.asmUnsupported(line);
+        // ldur and stur are the unscaled forms.
+        const form: AsmMemForm = if (ls[0].len == 4 and ls[0][2] == 'u') .unscaled else .single;
+        if (ops[0] == .vreg and ls[1] == null) {
+            // A b, h, s, d or q register.
+            const v = ops[0].vreg;
+            const size = v.kind.size() orelse return cg.asmUnsupported(line);
+            if (v.arr != null) return cg.asmUnsupported(line);
+            return e.loadStoreV(size, ls[2] == .load, v.reg, try cg.asmMem(ops[1], @backingInt(size), form, line));
+        }
         const r = reg(ops, 0) orelse return cg.asmUnsupported(line);
-        if (ops.len != 2 or ops[1] != .mem) return cg.asmUnsupported(line);
+        if (r.reg == .sp) return cg.asmBadSp(line);
         const size = ls[1] orelse if (r.width == .x) Size.dword else Size.word;
+        if (ls[2] == .load_signed and size == .word and r.width == .w) return cg.asmUnsupported(line);
+        const mem = try cg.asmMem(ops[1], @backingInt(size), form, line);
         return switch (ls[2]) {
-            .load => e.ldr(size, r.reg, ops[1].mem),
-            .store => e.str(size, r.reg, ops[1].mem),
-            .load_signed => e.ldrs(size, r.width, r.reg, ops[1].mem),
+            .load => e.ldr(size, r.reg, mem),
+            .store => e.str(size, r.reg, mem),
+            .load_signed => e.ldrs(size, r.width, r.reg, mem),
         };
     };
     const arith = [_]struct { []const u8, Encoder.AddOp }{ .{ "add", .add }, .{ "adds", .adds }, .{ "sub", .sub }, .{ "subs", .subs } };
@@ -5837,6 +6190,55 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
     return cg.asmUnsupported(line);
 }
 
+/// The addressing forms a load or store takes: one register (`ldr`), one
+/// register at an unscaled offset (`ldur`), or a pair (`ldp`).
+const AsmMemForm = enum { single, unscaled, pair };
+
+/// The memory operand `op` of a load or store of `1 << log2` bytes (per
+/// register of a pair), in `form`. Errors where upstream's assembler
+/// (LLVM) rejects the operand for that instruction.
+fn asmMem(cg: *CodeGen, op: AsmOperand, log2: u3, form: AsmMemForm, line: []const u8) Error!Encoder.Mem {
+    if (op != .mem) return cg.asmUnsupported(line);
+    const m = op.mem.mem;
+    const scale = @as(i32, 1) << log2;
+    const pair_ok = struct {
+        fn ok(v: i32, s: i32) bool {
+            return @rem(v, s) == 0 and v >= -64 * s and v <= 63 * s;
+        }
+    }.ok;
+    switch (m.offset) {
+        .imm => |v| switch (form) {
+            .single => {
+                const scaled = v >= 0 and @rem(v, scale) == 0 and @divExact(v, scale) < 4096;
+                if (!scaled and (v < -256 or v > 255)) return cg.fail("inline assembly: the offset is a multiple of {d} from 0 to {d}, or -256 to 255: '{s}'", .{ scale, 4095 * scale, line });
+            },
+            .unscaled => {
+                if (v < -256 or v > 255) return cg.fail("inline assembly: the offset is -256 to 255: '{s}'", .{line});
+                return .{ .base = m.base, .offset = .{ .unscaled = v } };
+            },
+            .pair => if (!pair_ok(v, scale)) return cg.fail("inline assembly: the offset is a multiple of {d} from {d} to {d}: '{s}'", .{ scale, -64 * scale, 63 * scale, line }),
+        },
+        .pre, .post => |v| switch (form) {
+            .single => if (v < -256 or v > 255) return cg.fail("inline assembly: the offset is -256 to 255: '{s}'", .{line}),
+            .unscaled => return cg.asmUnsupported(line),
+            .pair => if (!pair_ok(v, scale)) return cg.fail("inline assembly: the offset is a multiple of {d} from {d} to {d}: '{s}'", .{ scale, -64 * scale, 63 * scale, line }),
+        },
+        .index => |i| {
+            if (form != .single) return cg.asmUnsupported(line);
+            const shift = op.mem.shift orelse 0;
+            if (shift != 0 and shift != log2) {
+                if (log2 == 0) return cg.fail("inline assembly: the index register of this load or store shifts left by 0 only: '{s}'", .{line});
+                return cg.fail("inline assembly: the index register of this load or store shifts left by 0 or {d}: '{s}'", .{ log2, line });
+            }
+            // A byte access's explicit `#0` sets the scale bit, as LLVM encodes it.
+            const scaled = if (log2 == 0) op.mem.shift != null else shift != 0;
+            return .{ .base = m.base, .offset = .{ .index = .{ .reg = i.reg, .extend = i.extend, .scaled = scaled } } };
+        },
+        .unscaled, .page_off, .got_page_off => unreachable,
+    }
+    return m;
+}
+
 /// The NEON instructions std's crypto uses on whole vectors, in the
 /// standard syntax (`eor v0.16b, v1.16b, v2.16b`) and Apple's
 /// (`sha256su0.4s v0, v1`, the arrangement on the mnemonic). Returns false
@@ -5845,8 +6247,8 @@ fn asmNeon(cg: *CodeGen, mnemonic_in: []const u8, ops: []const AsmOperand, line:
     if (ops.len == 0 or (ops[0] != .vreg)) return false;
     const dot = std.mem.findScalar(u8, mnemonic_in, '.') orelse mnemonic_in.len;
     const mnemonic = mnemonic_in[0..dot];
-    const suffix: ?Arrangement = if (dot == mnemonic_in.len) null else std.meta.stringToEnum(Arrangement, mnemonic_in[dot + 1 ..]) orelse return cg.asmUnsupported(line);
-    const Shape = enum { two, three, ext, tbl, movi };
+    const suffix: ?Arrangement = if (dot == mnemonic_in.len) null else Arrangement.parse(mnemonic_in[dot + 1 ..]) orelse return cg.asmUnsupported(line);
+    const Shape = enum { two, three, ext, tbl, movi, dup };
     const Insn = struct { []const u8, Shape, u32 };
     // Base encodings with Q clear (or fixed) and the registers zero.
     const table = [_]Insn{
@@ -5867,6 +6269,7 @@ fn asmNeon(cg: *CodeGen, mnemonic_in: []const u8, ops: []const AsmOperand, line:
         .{ "ext", .ext, 0x2E000000 },
         .{ "tbl", .tbl, 0x0E000000 },
         .{ "movi", .movi, 0x0F000400 },
+        .{ "dup", .dup, 0x0E000C00 }, // Vd.T, Wn or Xn
     };
     const insn = for (table) |t| {
         if (std.mem.eql(u8, t[0], mnemonic)) break t;
@@ -5920,6 +6323,21 @@ fn asmNeon(cg: *CodeGen, mnemonic_in: []const u8, ops: []const AsmOperand, line:
             };
             const imm: u32 = @intCast(ops[1].imm);
             break :w insn[2] | q << 30 | (imm >> 5) << 16 | cmode << 12 | (imm & 31) << 5 | rd;
+        },
+        .dup => w: {
+            // Every element from a general register: an x register for
+            // `.2d`, else a w register.
+            if (ops.len != 2 or ops[1] != .reg) return cg.asmUnsupported(line);
+            const r = ops[1].reg;
+            const imm5: u32 = switch (arr.?) {
+                .@"8b", .@"16b" => 0b00001,
+                .@"4h", .@"8h" => 0b00010,
+                .@"2s", .@"4s" => 0b00100,
+                .@"2d" => 0b01000,
+                .@"1d", .@"1q" => return cg.asmUnsupported(line),
+            };
+            if (r.reg == .sp or r.width != (if (imm5 == 0b01000) Encoder.Width.x else Encoder.Width.w)) return cg.asmUnsupported(line);
+            break :w insn[2] | q << 30 | imm5 << 16 | r.reg.zrEnc() << 5 | rd;
         },
     };
     try cg.e.raw(word);

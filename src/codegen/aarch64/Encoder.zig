@@ -25,6 +25,9 @@ fixups: std.ArrayList(Fixup) = .empty,
 /// After `finish`: the offsets, before relaxation, of the conditional
 /// branches it relaxed, in increasing order (see `finalOffset`).
 relaxed: std.ArrayList(u32) = .empty,
+/// The alignment the code needs where it is placed: an instruction's, or
+/// the largest that `alignTo` padded to.
+alignment: std.mem.Alignment = .@"4",
 /// The atom's `Debug.lines`, written by `finish` from `line_events` at the
 /// rows' final offsets.
 lines: Atom.LineProgram = .{},
@@ -90,7 +93,7 @@ pub const Reg = enum(u6) {
         return @as(u5, @truncate(@backingInt(r)));
     }
     /// The register as an operand that may be `zr` but not `sp`.
-    fn zrEnc(r: Reg) u32 {
+    pub fn zrEnc(r: Reg) u32 {
         assert(r != .sp);
         return if (r == .zr) 31 else @backingInt(r);
     }
@@ -221,6 +224,9 @@ pub const Mem = struct {
         /// range, else the unscaled signed 9-bit form (ldur/stur). Pairs
         /// take a signed 7-bit multiple of the access size.
         imm: i32,
+        /// `[base, #imm]` in the unscaled signed 9-bit form whatever `imm`
+        /// is, as ldur and stur are written. Not for pairs.
+        unscaled: i32,
         /// `[base, #imm]!`: pre-index, writing the address back to `base`.
         pre: i32,
         /// `[base], #imm`: post-index.
@@ -376,8 +382,10 @@ pub fn switchLines(e: *Encoder, file: u32, base: u32) !void {
 /// (each round only relaxes, so this ends). Labels and relocations move
 /// with the code; offsets the caller recorded before `finish`, such as
 /// line rows, inline ranges, or the code size, map with `finalOffset`.
-/// Fails only if an `adr` or `b` cannot reach its label.
-pub fn finish(e: *Encoder) (Allocator.Error || error{BranchOutOfRange})!void {
+/// Fails if an `adr` or `b` cannot reach its label, and, with
+/// `error.AlignedCodeMoved`, if a branch needs relaxing in code that
+/// `alignTo` padded, since the inserted `b` would move what was aligned.
+pub fn finish(e: *Encoder) (Allocator.Error || error{ BranchOutOfRange, AlignedCodeMoved })!void {
     const gpa = e.gpa;
     e.relaxed.clearRetainingCapacity();
     const relax = try gpa.alloc(bool, e.fixups.items.len);
@@ -399,6 +407,7 @@ pub fn finish(e: *Encoder) (Allocator.Error || error{BranchOutOfRange})!void {
         for (e.fixups.items, relax) |f, r| if (r) try e.relaxed.append(gpa, f.at);
     }
     if (e.relaxed.items.len > 0) {
+        if (e.alignment != .@"4") return error.AlignedCodeMoved;
         var code: std.ArrayList(u8) = try .initCapacity(gpa, e.code.items.len + 4 * e.relaxed.items.len);
         var prev: u32 = 0;
         for (e.relaxed.items) |at| {
@@ -480,6 +489,15 @@ pub fn bind(e: *Encoder, label: Label) void {
     e.labels.items[@backingInt(label)] = @intCast(e.code.items.len);
 }
 
+/// Pads with `nop`s until the offset is a multiple of `alignment`, as
+/// assemblers align code (`.p2align`). The offset counts from the start
+/// of the code, so the code must be placed at `e.alignment`, which this
+/// raises to `alignment`.
+pub fn alignTo(e: *Encoder, alignment: std.mem.Alignment) !void {
+    e.alignment = e.alignment.max(alignment);
+    while (!alignment.check(e.code.items.len)) try e.raw(System.nop);
+}
+
 // ---------------------------------------------------------------- loads and stores
 
 /// Loads `size` bytes into `dst`, zero-extended: ldrb, ldrh, and ldr into a
@@ -557,6 +575,40 @@ pub fn stpQ(e: *Encoder, r1: VReg, r2: VReg, mem: Mem) !void {
     try e.pairRaw(0b10, 4, true, false, r1.enc(), r2.enc(), mem);
 }
 
+/// The widths a SIMD and floating-point register is loaded and stored at,
+/// named as the register is written (`b3`, `q3`), numbered by log2 of the
+/// bytes.
+pub const VSize = enum(u3) {
+    b,
+    h,
+    s,
+    d,
+    q,
+
+    pub fn bytes(s: VSize) u8 {
+        return @as(u8, 1) << @backingInt(s);
+    }
+};
+
+/// Loads (`ldr`) or stores (`str`) a b, h, s, d, or q register.
+pub fn loadStoreV(e: *Encoder, size: VSize, load: bool, reg: VReg, mem: Mem) !void {
+    // A q register has size 00 and the high opc bit set.
+    const sz: Size = if (size == .q) .byte else @fromBackingInt(@intCast(@backingInt(size)));
+    const opc: u2 = @as(u2, @intFromBool(size == .q)) << 1 | @intFromBool(load);
+    try e.loadStore(sz, true, opc, reg.enc(), mem);
+}
+
+/// Loads (`ldp`) or stores (`stp`) two s, d, or q registers.
+pub fn pairV(e: *Encoder, size: VSize, load: bool, r1: VReg, r2: VReg, mem: Mem) !void {
+    const opc: u2 = switch (size) {
+        .s => 0b00,
+        .d => 0b01,
+        .q => 0b10,
+        .b, .h => unreachable,
+    };
+    try e.pairRaw(opc, @backingInt(size), true, load, r1.enc(), r2.enc(), mem);
+}
+
 /// Single-register load/store with any addressing form. `opc` selects
 /// store (00), load (01), or sign-extending load to x (10) or w (11); for
 /// SIMD registers with size 00, opc 10 and 11 store and load a q register.
@@ -573,6 +625,7 @@ fn loadStore(e: *Encoder, size: Size, simd: bool, opc: u2, rt: u32, mem: Mem) !v
                 e.word(0x38000000 | common | (simm(9, imm) << 12));
             }
         },
+        .unscaled => |imm| e.word(0x38000000 | common | (simm(9, imm) << 12)),
         .pre => |imm| e.word(0x38000c00 | common | (simm(9, imm) << 12)),
         .post => |imm| e.word(0x38000400 | common | (simm(9, imm) << 12)),
         .index => |i| {
@@ -1359,11 +1412,28 @@ pub const System = struct {
             .{ "id_aa64afr0_el1", .{ 3, 0, 0, 5, 4 } },  .{ "id_aa64afr1_el1", .{ 3, 0, 0, 5, 5 } },
             .{ "id_aa64isar0_el1", .{ 3, 0, 0, 6, 0 } }, .{ "id_aa64isar1_el1", .{ 3, 0, 0, 6, 1 } },
             .{ "id_aa64mmfr0_el1", .{ 3, 0, 0, 7, 0 } }, .{ "id_aa64mmfr1_el1", .{ 3, 0, 0, 7, 1 } },
-            .{ "id_aa64mmfr2_el1", .{ 3, 0, 0, 7, 2 } },
+            .{ "id_aa64mmfr2_el1", .{ 3, 0, 0, 7, 2 } }, .{ "dczid_el0", .{ 3, 3, 0, 0, 7 } },
         };
         for (regs) |r| if (std.ascii.eqlIgnoreCase(name, r[0])) {
             const f = r[1];
             return 0xd5200000 | f[0] << 19 | f[1] << 16 | f[2] << 12 | f[3] << 8 | f[4] << 5;
+        };
+        return null;
+    }
+
+    /// `dc <op>, xt` and `ic <op>, xt` for the cache operations EL0 code
+    /// runs (Linux enables them; `dc zva` where `dczid_el0` allows it),
+    /// case-insensitive: or in the register. Null for another operation.
+    pub fn cacheOp(insn: []const u8, op: []const u8) ?u32 {
+        // op1, CRm, op2 of `sys #op1, c7, cm, #op2, xt`.
+        const ops = [_]struct { []const u8, []const u8, [3]u32 }{
+            .{ "dc", "zva", .{ 3, 4, 1 } },   .{ "dc", "cvac", .{ 3, 10, 1 } },
+            .{ "dc", "cvau", .{ 3, 11, 1 } }, .{ "dc", "civac", .{ 3, 14, 1 } },
+            .{ "ic", "ivau", .{ 3, 5, 1 } },
+        };
+        for (ops) |o| if (std.ascii.eqlIgnoreCase(insn, o[0]) and std.ascii.eqlIgnoreCase(op, o[1])) {
+            const f = o[2];
+            return 0xd5087000 | f[0] << 16 | f[1] << 8 | f[2] << 5;
         };
         return null;
     }

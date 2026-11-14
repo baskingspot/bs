@@ -10,8 +10,9 @@
 //! a block may define named labels (`name:`) and use `.global`/`.globl`,
 //! `.set`/`.equ` with a symbol (an alias), `.type`, `.text`,
 //! `.section .text` and, at its start, `.p2align` and `.balign`. Labels,
-//! globals and aliases are the module's, across its blocks. A named label
-//! is not an operand yet.
+//! globals and aliases are the module's, across its blocks. On aarch64 a
+//! named label is a branch target in its own block; elsewhere it is not
+//! an operand yet.
 
 const std = @import("std");
 const Zcu = @import("../Zcu.zig");
@@ -110,7 +111,9 @@ fn assemble(comptime Asm: type, emit: *Emit, block: *const Zcu.GlobalAsm, nth: u
             // Named labels; numeric ones are the inline assembler's.
             while (namedLabel(s)) |name| {
                 for (labels.items) |l| if (std.mem.eql(u8, l.name, name)) return g.fail("asm label '{s}' is defined twice", .{name});
-                try labels.append(arena, .{ .name = try arena.dupe(u8, name), .offset = @intCast(g.cg.e.code.items.len) });
+                const owned = try arena.dupe(u8, name);
+                try labels.append(arena, .{ .name = owned, .offset = @intCast(g.cg.e.code.items.len) });
+                if (@hasDecl(Asm, "label")) try g.label(owned);
                 s = std.mem.trim(u8, s[name.len + 1 ..], " \t");
             }
             if (s.len == 0) continue;
