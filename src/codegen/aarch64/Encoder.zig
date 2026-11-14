@@ -88,7 +88,7 @@ pub const Reg = enum(u6) {
     pub const lr: Reg = .x30;
 
     /// The register as an operand that may be `sp` but not `zr`.
-    fn spEnc(r: Reg) u32 {
+    pub fn spEnc(r: Reg) u32 {
         assert(r != .zr);
         return @as(u5, @truncate(@backingInt(r)));
     }

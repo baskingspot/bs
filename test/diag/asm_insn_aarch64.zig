@@ -8,7 +8,7 @@ fn reverse(x: u64) u64 {
     var r: u64 = x;
     asm volatile (
         \\ nop
-        \\ rbit %[r], %[r]
+        \\ umulh %[r], %[r], %[r]
         : [r] "+r" (r),
     );
     return r;
@@ -31,7 +31,7 @@ fn fused() void {
 }
 
 fn indexed(x: [2]u64) u64 {
-    return asm ("rbit %[r], %[a]"
+    return asm ("umulh %[r], %[a], %[a]"
         : [r] "=r" (-> u64),
         : [a] "r" (x[1]),
     );
@@ -48,13 +48,13 @@ pub fn main() void {
 
 // error
 // args: -target aarch64-linux
-// bs-only: upstream assembles inline assembly only when it emits code, which -fno-emit-bin skips, and then with LLVM, which takes rbit and fmla and rejects only ldadd (generic has no LSE)
-// asm_insn_aarch64.zig:11:9: error[unsupported]: bs codegen (aarch64): bs does not support this inline assembly instruction yet: 'rbit %[r], %[r]'
-//   | \\ rbit %[r], %[r]
+// bs-only: upstream assembles inline assembly only when it emits code, which -fno-emit-bin skips, and then with LLVM, which takes umulh and fmla and rejects only ldadd (generic has no LSE)
+// asm_insn_aarch64.zig:11:9: error[unsupported]: bs codegen (aarch64): bs does not support this inline assembly instruction yet: 'umulh %[r], %[r], %[r]'
+//   | \\ umulh %[r], %[r], %[r]
 // asm_insn_aarch64.zig:18:19: error[unsupported]: bs codegen (aarch64): bs does not support this inline assembly instruction yet: 'ldadd x1, x1, [%[p]]'
 //   | asm volatile ("ldadd x1, x1, [%[p]]"
 // asm_insn_aarch64.zig:28:35: error[unsupported]: bs codegen (aarch64): bs does not support this inline assembly instruction yet: 'fmla v0.4s, v1.4s, v2.4s'
 //   | .aarch64 => asm volatile ("fmla v0.4s, v1.4s, v2.4s" ::: .{ .v0 = true }),
-// asm_insn_aarch64.zig:34:17: error[unsupported]: bs codegen (aarch64): bs does not support this inline assembly instruction yet: 'rbit %[r], %[a]'
-//   | return asm ("rbit %[r], %[a]"
+// asm_insn_aarch64.zig:34:17: error[unsupported]: bs codegen (aarch64): bs does not support this inline assembly instruction yet: 'umulh %[r], %[a], %[a]'
+//   | return asm ("umulh %[r], %[a], %[a]"
 // 4 errors

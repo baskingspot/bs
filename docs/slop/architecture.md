@@ -1128,6 +1128,34 @@ comptime arguments are run-time values in the lowered code (uucode's
   Padding fixes offsets, so `Encoder.finish` does not relax a branch in
   a function that padded: a conditional branch out of range there is
   `error.AlignedCodeMoved`, reported as a compile error.
+  What string routines add (2026-11-14, for Arm's optimized-routines,
+  which fastmem and libcs port: of its 16 routines without SVE, MOPS or
+  MTE, bs assembled 4 and now assembles all, each statement to
+  upstream's bytes): conditional select and its aliases, `ccmp` and
+  `ccmn`, `rbit`, `rev`, `rev16`, `rev32`, `clz`, `cls`, `movz`, `movn`
+  and `movk`, `fmov` between a general register and an s or d one, and
+  an element to a general register (`umov`, `mov x0, v1.d[0]`, operand
+  `velem`), in `asmScalar`; `ld1` and `st1` of a list of one to four
+  registers, with a post-index of the bytes moved or a register
+  (`asmStructure`); and on whole vectors the instructions whose
+  encoding has the element size, `add`, `sub`, the integer compares
+  with a register or `#0`, `addp`, the maxima and minima and their
+  pairwise forms, and `shrn` (`asmNeonSized`), with `bsl`, `bit`,
+  `bif`, `bic` and `orn`. The crypto instructions need their CPU
+  feature, as `crc32` does and as LLVM asks.
+  The measure of this assembler is LLVM's own: every statement of
+  LLVM 22.1.8's `test/MC/AArch64` files for the base and Advanced SIMD
+  instructions (81 files, 9,430 distinct statements), each assembled by
+  bs in a naked function and by `zig cc`, bytes compared. For the
+  generic CPU LLVM takes 7,635: bs assembled 1,329 to the same bytes
+  before this, ten to other bytes (`crc32` with zr, `pmull` on bytes,
+  `clrex`; fixed), and now 2,277, with three that differ and mean the
+  same (`uxtw x1, w2` as `mov w1, w2`, and `add w3, w4, #0, lsl #12`
+  without the shift) and 5,355 it refuses: mostly system registers by
+  name (940), the `ld2` to `ld4` and single-element structure loads,
+  scalar floating point, multiply and divide, bitfield moves, exclusive
+  loads and stores, and the rest of Advanced SIMD. The harness is not in
+  the tree yet.
 - aarch64-linux (started 2026-11-05) runs the same CodeGen and links
   static, non-PIE executables with the ELF linker (`Elf.Options.arch`),
   and position-independent objects and shared objects ("Position-
