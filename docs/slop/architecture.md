@@ -1135,12 +1135,11 @@ comptime arguments are run-time values in the lowered code (uucode's
   `ccmn`, `rbit`, `rev`, `rev16`, `rev32`, `clz`, `cls`, `movz`, `movn`
   and `movk`, `fmov` between a general register and an s or d one, and
   an element to a general register (`umov`, `mov x0, v1.d[0]`, operand
-  `velem`), in `asmScalar`; `ld1` and `st1` of a list of one to four
-  registers, with a post-index of the bytes moved or a register
-  (`asmStructure`); and on whole vectors the instructions whose
-  encoding has the element size, `add`, `sub`, the integer compares
-  with a register or `#0`, `addp`, the maxima and minima and their
-  pairwise forms, and `shrn` (`asmNeonSized`), with `bsl`, `bit`,
+  `velem`); `ld1` and `st1` of a list of one to four registers, with
+  a post-index of the bytes moved or a register; and on whole vectors
+  the instructions whose encoding has the element size, `add`, `sub`,
+  the integer compares with a register or `#0`, `addp`, the maxima and
+  minima and their pairwise forms, and `shrn`, with `bsl`, `bit`,
   `bif`, `bic` and `orn`. The crypto instructions need their CPU
   feature, as `crc32` does and as LLVM asks.
   The instructions without a label operand that the backend's Encoder
@@ -1153,8 +1152,10 @@ comptime arguments are run-time values in the lowered code (uucode's
   that returns null when the mnemonic or the operands' shape is not
   its own, so two families can share a mnemonic (`fcvtzs w0, d1` is
   scalar floating point's, `fcvtzs v0.2d, v1.2d` Advanced SIMD's).
-  The families (2026-11-14): `scalar` and `structure` and `neon` as
-  above; `integer` (multiply and divide, shifts by a register, carries,
+  The families (2026-11-14): `scalar` (conditional select and compare,
+  bit and byte reversal, the move-wide instructions, an element to a
+  general register); `integer` (multiply and divide, shifts by a
+  register, carries,
   the bitfield moves and their aliases, `extr`); `atomic` (the
   exclusive and the acquire and release loads and stores, and with the
   CPU's `lse` feature `cas`, `casp`, `swp` and the `ld<op>` and
@@ -1168,6 +1169,43 @@ comptime arguments are run-time values in the lowered code (uucode's
   or an exponent, which LLVM tells from an integer: `fcmp d0, #0.0`
   assembles and `fcmp d0, #0` does not, and `fmov d0, #2` is 2.0 where
   `fmov d0, #0x70` is the encoding of 1.0.
+  Advanced SIMD is the last family and a file of its own,
+  `codegen/aarch64/asm_simd.zig`: a table of about 330 instructions,
+  each with the shape of its operands (`Kind`: three vectors of one
+  arrangement, two, a vector and `#0`, the widening and narrowing
+  forms and their `2` forms on the high half, shifts by an immediate,
+  reductions across a vector, multiplies by an element, the crypto
+  instructions' fixed forms) and its encoding with the registers, Q
+  and the size zero, so that an instruction is a line of the table
+  and a shape is written once (`Match.one`). A shape that has a scalar
+  form (`add d0, d1, d2`, `sqshrn s0, d1, #3`) says which sizes, and
+  the scalar encoding is the vector one with two bits set; half
+  precision is the vector encoding rearranged per shape (`fpBase`) and
+  needs `fullfp16`. One mnemonic can have several lines (`cmeq` with a
+  register and with `#0`, `mul` of vectors and by an element), and the
+  first whose shape reads the operands wins. The instructions whose
+  operands decide the encoding are functions: `copy` (`mov`, `dup`,
+  `ins`, `smov` between vectors, elements, scalars and general
+  registers), `immediate` (`movi`, `mvni`, `orr`, `bic` and `fmov` of
+  eight bits, shifted by `lsl` or `msl`, or of eight bytes of zeros
+  and ones), `tbl`, `tbx` and `ext`, and `structure` (`ld1` to `ld4`,
+  `st1` to `st4` and `ld1r` to `ld4r` of a register list, which
+  `asmRegList` reads: `{v1.16b, v2.16b}`, a range `{v1.16b-v4.16b}`,
+  or one element of each, `{v1.b, v2.b}[3]`). Apple's syntax, the
+  arrangement on the mnemonic and none on the operands (`add.16b v0,
+  v1, v2`, which std's SHA-2 uses), is read where LLVM reads it, but
+  for elements (`mov.s v0[1], w1`, `ld1.b {v0}[3], [x0]`), which are
+  refused as not supported yet. When the mnemonic is one of the
+  table's and no shape reads the operands, the error says so and
+  names what to check, rather than calling the instruction
+  unsupported. bs refuses two things LLVM assembles here: `ext` from
+  a byte past the vector (`ext v0.8b, v1.8b, v2.8b, #8`, an undefined
+  instruction) and `fmov` of a hexadecimal immediate above 255. And it
+  refuses `fcmle` and its kin on half-precision scalars as LLVM does,
+  though the alias would have a meaning.
+  CodeGen's own `mov` is LLVM's too now: an immediate that one
+  instruction loads (bs took any and assembled up to four
+  instructions; `mov sp, #1` crashed bs), and registers of one width.
   bs refuses what the architecture calls unpredictable, which LLVM
   refuses in most forms and assembles in a few that bs refuses too: a
   pair loaded into one register (LLVM assembles `ldnp x3, x3, [x1]`,
@@ -1183,17 +1221,21 @@ comptime arguments are run-time values in the lowered code (uucode's
   bs in a naked function and by `zig cc`, bytes compared. For the
   generic CPU LLVM takes 7,635: bs assembled 1,329 to the same bytes
   before the string routines, ten to other bytes (`crc32` with zr,
-  `pmull` on bytes, `clrex`; fixed), 2,277 with them, and 3,100 with
-  the integer, atomic, memory and floating-point families, with three
-  that differ and mean the same (`uxtw x1, w2` as `mov w1, w2`, and
-  `add w3, w4, #0, lsl #12` without the shift) and 4,532 it refuses:
-  mostly system registers by name (940), the `ld2` to `ld4` and
-  single-element structure loads, and the rest of Advanced SIMD. For
-  apple_m1, which has `lse` and `fullfp16`, it is 3,672 of 8,538. Each
-  family also has a generated list that probes its operand
-  combinations, most of which an assembler rejects (5,300 statements
-  for floating point), on which bs and LLVM agree on every statement
-  but the refusals above. The harness is not in the tree yet.
+  `pmull` on bytes, `clrex`; fixed), 2,277 with them, 3,100 with the
+  integer, atomic, memory and floating-point families, and 6,099 with
+  Advanced SIMD, with three that differ and mean the same (`uxtw x1,
+  w2` as `mov w1, w2`, and `add w3, w4, #0, lsl #12` without the
+  shift) and 1,533 it refuses: system registers by name (940) and
+  `sys`, `tlbi` and `at` (150), operands that need a relocation (`ldr
+  x0, sym`, `#:lo12:sym`, branches to a symbol), and Apple's syntax
+  for elements. For apple_m1, which has `lse`, `fullfp16`, `rdm`,
+  `sha3` and `dotprod`, it is 6,979 of 8,538. Each family also has a
+  generated list that probes its operand combinations, most of which
+  an assembler rejects: 150,054 statements for the table's shapes
+  (every mnemonic with every shape's operands, 2,798 of which LLVM
+  takes for apple_m1), 44,240 for the functions and 43,134 for
+  Apple's syntax. bs and LLVM agree on every statement of these lists
+  but the refusals named above. The harness is not in the tree yet.
 - aarch64-linux (started 2026-11-05) runs the same CodeGen and links
   static, non-PIE executables with the ELF linker (`Elf.Options.arch`),
   and position-independent objects and shared objects ("Position-

@@ -5599,12 +5599,14 @@ fn parseModifier(tok: []const u8) ?AsmOperand {
     const sp = std.mem.findAny(u8, tok, " \t") orelse tok.len;
     if (sp != 3 and sp != 4) return null;
     var buf: [4]u8 = undefined;
-    const op = std.meta.stringToEnum(Modifier, std.ascii.lowerString(&buf, tok[0..sp])) orelse return null;
+    const name = std.ascii.lowerString(&buf, tok[0..sp]);
+    const msl = std.mem.eql(u8, name, "msl");
+    const op: Modifier = if (msl) .lsl else std.meta.stringToEnum(Modifier, name) orelse return null;
     var amount_tok = std.mem.trim(u8, tok[sp..], " \t");
-    if (amount_tok.len == 0) return .{ .modifier = .{ .op = op, .amount = null } };
+    if (amount_tok.len == 0) return if (msl) null else .{ .modifier = .{ .op = op, .amount = null } };
     if (amount_tok[0] == '#') amount_tok = amount_tok[1..];
     const amount = std.fmt.parseInt(u8, amount_tok, 0) catch return null;
-    return .{ .modifier = .{ .op = op, .amount = amount } };
+    return if (msl) .{ .msl = amount } else .{ .modifier = .{ .op = op, .amount = amount } };
 }
 
 /// A SIMD register written as `v3`, `q3`, `d3`, `s3`, `h3` or `b3`,
@@ -5740,24 +5742,7 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
         if (rest.len == 0) return cg.fail("bad asm immediate: '{s}'", .{line});
         return cg.asmOperand(rest, names, locals, line);
     }
-    if (tok[0] == '{') {
-        // A register list: `{v1.16b}`, `{v1.16b, v2.16b}`, `{%[t].16b}`.
-        if (tok[tok.len - 1] != '}') return cg.fail("bad asm register list: '{s}'", .{line});
-        var it = std.mem.tokenizeAny(u8, tok[1 .. tok.len - 1], ", \t");
-        var list: ?AsmOperand = null;
-        while (it.next()) |r| {
-            const v = switch (try cg.asmOperand(r, names, locals, line)) {
-                .vreg => |v| v,
-                else => return cg.fail("bad asm register list: '{s}'", .{line}),
-            };
-            if (list) |*l| {
-                if (@backingInt(v.reg) != (@as(u32, @backingInt(l.vlist.first)) + l.vlist.len) % 32 or l.vlist.len == 4)
-                    return cg.fail("bad asm register list: '{s}'", .{line});
-                l.vlist.len += 1;
-            } else list = .{ .vlist = .{ .first = v.reg, .len = 1, .arr = v.arr } };
-        }
-        return list orelse cg.fail("bad asm register list: '{s}'", .{line});
-    }
+    if (tok[0] == '{') return cg.asmRegList(tok, names, locals, line);
     if (tok[0] == '%') {
         // `%[name]`, `%x[name]`, `%w[name]`, `%q[name]`, and a SIMD
         // operand's arrangement after it (`%[name].16b`).
@@ -5817,6 +5802,75 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
         return cg.fail("bad asm immediate '{s}'", .{tok});
     }
     return .{ .name = tok };
+}
+
+/// A list of SIMD registers: `{v1.16b, v2.16b}`, `{v1.16b-v4.16b}`,
+/// `{%[t].16b}`, in Apple's syntax `{v1, v2}`, or one element of each
+/// (`{v1.b, v2.b}[5]`).
+fn asmRegList(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg), locals: *LocalLabels, line: []const u8) Error!AsmOperand {
+    const close = std.mem.findScalar(u8, tok, '}') orelse return cg.asmBadList(line);
+    // The index of the elements, after the list.
+    const after = std.mem.trim(u8, tok[close + 1 ..], " \t");
+    const index: ?u8 = if (after.len == 0) null else index: {
+        if (after.len < 3 or after[0] != '[' or after[after.len - 1] != ']') return cg.asmBadList(line);
+        break :index std.fmt.parseInt(u8, std.mem.trim(u8, after[1 .. after.len - 1], " \t"), 10) catch return cg.asmBadList(line);
+    };
+    const Item = struct { reg: VReg, arr: ?Arrangement, log2: ?u2 };
+    var first: ?Item = null;
+    var len: u32 = 0;
+    var it = std.mem.splitScalar(u8, tok[1..close], ',');
+    var ranged = false;
+    while (it.next()) |part| {
+        // `v1.16b-v4.16b` is the registers from the first to the last,
+        // and then the whole list.
+        var ends = std.mem.splitScalar(u8, part, '-');
+        var range: [2]Item = undefined;
+        var count: usize = 0;
+        while (ends.next()) |untrimmed| : (count += 1) {
+            const r = std.mem.trim(u8, untrimmed, " \t");
+            if (count == 2 or r.len == 0) return cg.asmBadList(line);
+            range[count] = item: {
+                // An element's size alone (`v1.b`), with an index.
+                if (index != null) if (std.mem.findScalarLast(u8, r, '.')) |dot| if (dot + 2 == r.len) {
+                    const log2 = std.mem.findScalar(u8, "bhsd", std.ascii.toLower(r[dot + 1])) orelse return cg.asmBadList(line);
+                    switch (try cg.asmOperand(r[0..dot], names, locals, line)) {
+                        .vreg => |v| if (v.kind == .v and v.arr == null) break :item .{ .reg = v.reg, .arr = null, .log2 = @intCast(log2) },
+                        else => {},
+                    }
+                    return cg.asmBadList(line);
+                };
+                switch (try cg.asmOperand(r, names, locals, line)) {
+                    .vreg => |v| if (v.kind == .v) break :item .{ .reg = v.reg, .arr = v.arr, .log2 = null },
+                    else => {},
+                }
+                return cg.asmBadList(line);
+            };
+        }
+        const from = range[0];
+        const through: u32 = if (count == 2) (@as(u32, @backingInt(range[1].reg)) + 32 - @backingInt(from.reg)) % 32 + 1 else 1;
+        if (count == 2 and (range[1].arr != from.arr or range[1].log2 != from.log2 or through == 1 or first != null)) return cg.asmBadList(line);
+        if (ranged) return cg.asmBadList(line);
+        ranged = count == 2;
+        if (first) |f| {
+            if (@backingInt(from.reg) != (@as(u32, @backingInt(f.reg)) + len) % 32 or from.arr != f.arr or from.log2 != f.log2)
+                return cg.asmBadList(line);
+        } else first = from;
+        len += through;
+        if (len > 4) return cg.asmBadList(line);
+    }
+    const f = first orelse return cg.asmBadList(line);
+    // An index names elements, which have a size and no count.
+    if (index != null and f.log2 == null and f.arr != null) return cg.asmBadList(line);
+    return .{ .vlist = .{
+        .first = f.reg,
+        .len = @intCast(len),
+        .arr = f.arr,
+        .elem = if (index) |n| if (f.log2) |log2| .{ .log2 = log2, .index = n } else return cg.fail("bs does not support an indexed register list without the elements' size yet: '{s}'", .{line}) else null,
+    } };
+}
+
+fn asmBadList(cg: *CodeGen, line: []const u8) Error {
+    return cg.fail("inline assembly: a register list is one to four consecutive SIMD registers of one arrangement ('{{v1.16b, v2.16b}}', '{{v1.16b-v4.16b}}'), or one element of each ('{{v1.b, v2.b}}[3]'): '{s}'", .{line});
 }
 
 fn asmUnsupported(cg: *CodeGen, line: []const u8) Error {
@@ -6010,11 +6064,32 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
     if (eql(u8, mnemonic, "mov")) {
         const d = reg(ops, 0) orelse return cg.asmUnsupported(line);
         if (ops.len != 2) return cg.asmUnsupported(line);
-        return switch (ops[1]) {
-            .reg => |s| e.mov(d.width, d.reg, s.reg),
-            .imm => |v| e.movImm(d.width, d.reg, @bitCast(v)),
-            else => cg.asmUnsupported(line),
-        };
+        switch (ops[1]) {
+            .reg => |s| {
+                if (s.width != d.width) return cg.fail("inline assembly: 'mov' between an x and a w register: '{s}'", .{line});
+                return e.mov(d.width, d.reg, s.reg);
+            },
+            .imm => |v| {
+                // What one instruction loads, as LLVM takes it: sixteen
+                // bits at a multiple of 16 or their inverse (movz, movn),
+                // or a bitmask (orr), which alone writes sp.
+                const bits: u64 = if (d.width == .w) @as(u64, @bitCast(v)) & 0xffff_ffff else @bitCast(v);
+                const inverse = if (d.width == .w) ~bits & 0xffff_ffff else ~bits;
+                var wide = false;
+                for (0..4) |k| {
+                    const field = @as(u64, 0xffff) << @intCast(16 * k);
+                    if (bits & ~field == 0 or inverse & ~field == 0) wide = true;
+                }
+                const mask = Encoder.bitmaskImm(d.width, bits) != null;
+                if (d.reg == .sp) {
+                    if (!mask) return cg.fail("inline assembly: 'mov' to sp takes a bitmask immediate: '{s}'", .{line});
+                    return e.logic(.orr, d.width, .sp, .zr, .{ .imm = bits });
+                }
+                if (!wide and !mask) return cg.fail("inline assembly: 'mov' takes an immediate that one instruction loads (sixteen bits at a multiple of 16, their inverse, or a bitmask); use 'movz' and 'movk': '{s}'", .{line});
+                return e.movImm(d.width, d.reg, bits);
+            },
+            else => return cg.asmUnsupported(line),
+        }
     }
     if (std.mem.startsWith(u8, mnemonic, "crc32")) crc: {
         // crc32{,c}{b,h,w,x} wd, wn, (wm or xm for x)
