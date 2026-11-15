@@ -8299,8 +8299,14 @@ state. Built for step 1:
   with another lib directory, every input is reported, as upstream does.
 - **Errors over the protocol** travel as std's `ErrorBundle`, built by
   `diag.toBundle` from bs's diagnostic records, and the runner renders
-  them in upstream's format: the message is prefixed with the code
-  (`[type-mismatch] ...`), notes keep their source lines, call frames are
+  them in upstream's format, with upstream's text: a compile error has no
+  code and none of bs's own notes (candidates, the hint, fixes), since a
+  step's `expect_errors` compares the rendered text with what zig gives
+  (2026-11-14, for parity; fastmem's hooks steps expect
+  `error: <@compileError message>`). Only what upstream has no
+  counterpart of keeps its code: a lint finding (`[style Z001] ...`, with
+  its notes) and an `[unsupported]` error, which the conformance tools
+  count apart. Notes keep their source lines, call frames are
   notes worded as upstream's ("called inline here"), and the reference
   trace keeps upstream's limit (`-freference-trace=n`, else two frames for
   the first error that has a trace) and its hidden-frame count. A step bs

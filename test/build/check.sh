@@ -157,19 +157,16 @@ sed -i 's/"hello"/"howdy"/' src/greet.zig
 "$bs" build >"$work/log" 2>&1 || fail "bs build (edit)"
 [ "$(./zig-out/bin/hello 2>&1)" = "howdy 0" ] || fail "the edited hello prints 'howdy 0'"
 
-# A compile error travels as an error bundle, with bs's code.
+# A compile error travels as an error bundle, as upstream's text: no code,
+# and none of bs's own notes, so that `expect_errors` matches as with zig.
 sed -i 's/args.len - 1/args.len - "x"/' src/main.zig
 if "$bs" build >"$work/log" 2>&1; then fail "bs build succeeded with a compile error"; fi
-expect "src/main.zig:6:"
-expect "error: [type-mismatch]"
+expect "src/main.zig:6:61: error: incompatible types: 'usize' and '*const [1:0]u8'"
 sed -i 's/args.len - "x"/args.len - 1/' src/main.zig
-
-# Candidates and the migration hint travel as notes without a location.
 sed -i 's/std.debug.print/std.io.print/' src/main.zig
 if "$bs" build >"$work/log" 2>&1; then fail "bs build succeeded with std.io"; fi
-expect "error: [no-member] root source file struct 'std' has no member named 'io'"
-expect "note: candidates: Io"
-expect "note: hint: std.io is now std.Io"
+expect "error: root source file struct 'std' has no member named 'io'"
+if grep -qF -e "[no-member]" -e "note: candidates" -e "note: hint" "$work/log"; then fail "bs's code or notes in the build's error"; fi
 sed -i 's/std.io.print/std.debug.print/' src/main.zig
 
 # ReleaseSafe: -Osafe on the root module, which greet inherits.
@@ -187,7 +184,7 @@ expect " 2 small untagged"
 line=$(($(wc -l <build.zig) + 1))
 echo "fn unused() void { const y = 1; }" >>build.zig
 if "$bs" build >"$work/log" 2>&1; then fail "bs build succeeded with a broken build.zig"; fi
-expect "build.zig:$line:26: error: [unused] unused local constant"
+expect "build.zig:$line:26: error: unused local constant"
 ;;
 compiler)
 # The runner keys its configuration and its steps on the compiler's

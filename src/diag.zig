@@ -769,12 +769,16 @@ fn bundleLoc(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorBundle
 }
 
 /// Adds `diags` to `wip` as root messages, for the compiler protocol
-/// (`--listen=-`), whose client renders them in upstream's format: the
-/// code prefixes the message (`[type-mismatch] ...`), each call frame is
-/// a note worded as upstream's, and the reference trace keeps upstream's
-/// limit: `ref_limit` frames (`-freference-trace=n`), else 2 for the first
-/// error that has a trace and none for the rest, then a frame counting the
-/// hidden ones.
+/// (`--listen=-`), whose client renders them as upstream's: a build step's
+/// `expect_errors` compares the rendered text with upstream's, so a
+/// compile error carries no code and none of bs's own notes (candidates,
+/// hint, fixes), each call frame is a note worded as upstream's, and the
+/// reference trace keeps upstream's limit: `ref_limit` frames
+/// (`-freference-trace=n`), else 2 for the first error that has a trace and
+/// none for the rest, then a frame counting the hidden ones. What upstream
+/// has no counterpart of keeps its code: a lint finding its rule and notes
+/// (`[style Z001] ...`), and what bs does not support yet `[unsupported]`,
+/// which tools/conformance/run.py counts apart from failures.
 pub fn toBundle(wip: *std.zig.ErrorBundle.Wip, diags: []const Diagnostic, ref_limit: ?u32) !void {
     var traced = false;
     for (diags) |d| {
@@ -782,12 +786,13 @@ pub fn toBundle(wip: *std.zig.ErrorBundle.Wip, diags: []const Diagnostic, ref_li
         if (d.refs.len != 0) traced = true;
         const shown = @min(limit, d.refs.len);
         const hidden = d.refs.len - shown;
+        const lint = d.rule != null;
         const msg = if (d.rule) |r|
             try wip.printString("[{t} {s}] {s}", .{ d.code, r, d.msg })
-        else if (d.code == .unclassified)
-            try wip.addString(d.msg)
+        else if (d.code == .unsupported)
+            try wip.printString("[{t}] {s}", .{ d.code, d.msg })
         else
-            try wip.printString("[{t}] {s}", .{ d.code, d.msg });
+            try wip.addString(d.msg);
         // Frames without a location cannot be shown; they count as hidden.
         var refs: std.ArrayList(std.zig.ErrorBundle.ReferenceTrace) = .empty;
         defer refs.deinit(wip.gpa);
@@ -803,7 +808,7 @@ pub fn toBundle(wip: *std.zig.ErrorBundle.Wip, diags: []const Diagnostic, ref_li
         // Candidates and the hint trail the notes as notes without a location.
         var n_edits: u32 = 0;
         for (d.fixes) |f| n_edits += @intCast(f.edits.len);
-        const extra_notes = @as(u32, @intFromBool(d.candidates.len != 0)) + @intFromBool(d.hint != null) + n_edits;
+        const extra_notes = if (!lint) 0 else @as(u32, @intFromBool(d.candidates.len != 0)) + @intFromBool(d.hint != null) + n_edits;
         const notes_len: u32 = @intCast(d.notes.len + extra_notes);
         try wip.addRootErrorMessage(.{ .msg = msg, .count = d.count, .src_loc = src_loc, .notes_len = notes_len });
         const notes_start = try wip.reserveNotes(notes_len);
@@ -817,6 +822,7 @@ pub fn toBundle(wip: *std.zig.ErrorBundle.Wip, diags: []const Diagnostic, ref_li
             const index = try wip.addErrorMessage(.{ .msg = note_msg, .count = n.count, .src_loc = note_loc });
             wip.extra.items[i] = @backingInt(index);
         }
+        if (!lint) continue;
         var i = notes_start + d.notes.len;
         if (d.candidates.len != 0) {
             var text: std.ArrayList(u8) = .empty;
@@ -2323,7 +2329,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "expected {d}-bit float type or smaller; found {d}-bit float type", .@"operand-type" },
     .{ "expected {d}-bit integer type or smaller; found {d}-bit integer type", .@"operand-type" },
     .{ "unable to perform tail call: type of function being called '{f}' does not match type of calling function '{f}'", .@"bad-call" },
-    .{ "unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags", .unsupported },
+    .{ "unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags", .@"bad-call" },
     .{ "expected calling convention, found '{f}'", .@"operand-type" },
     .{ "expected enum or tagged union, found '{f}'", .@"operand-type" },
     .{ "expected enum or union; found '{f}'", .@"operand-type" },

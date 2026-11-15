@@ -75,7 +75,11 @@ the oldest.
   `--listen=-` compiler protocol).
 - bs's main users are coding agents. Shape compile errors for them, not for
   humans: exact locations, the facts an agent needs to fix the error, and
-  fixes where bs knows them, in a form a program can parse.
+  fixes where bs knows them, in a form a program can parse. That is the
+  command line's shape. Over `zig build`'s `--listen=-` protocol, compile
+  errors carry upstream's text, without the `[code]` prefix or bs's
+  notes, so that build scripts matching upstream's errors
+  (`expect_errors`) see the same text.
 - bs may reject more than upstream in two ways. Extra compile errors that
   catch real mistakes are allowed. And when a project asks for it, bs
   enforces ziglint's rules as compile errors on the project's own files,

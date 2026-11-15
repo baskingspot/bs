@@ -23,7 +23,7 @@ pub fn main() void {
 }
 
 // error
-// target_limits.zig:13:12: error[unsupported]: unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags
+// target_limits.zig:13:12: error[bad-call]: unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags
 //   | return @call(.always_tail, plain, .{n});
 //   ref: main target_limits.zig:21:13 (+3 std frames)
 // target_limits.zig:17:24: error[operand-type]: expected 64-bit integer type or smaller; found 128-bit integer type
