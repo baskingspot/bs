@@ -106,7 +106,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         if (std.mem.eql(u8, arg, "--listen=-")) {
             opts.listen = true;
         } else if (std.mem.eql(u8, arg, "-target")) {
-            opts.target = next(args, &i);
+            opts.target = main.nativeTarget(next(args, &i));
         } else if (std.mem.eql(u8, arg, "-mcpu") or std.mem.startsWith(u8, arg, "-mcpu=")) {
             mcpu = if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else next(args, &i);
         } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {

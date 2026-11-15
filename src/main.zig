@@ -2604,11 +2604,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (std.mem.eql(u8, arg, "--name")) {
             opts.name = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "-target")) {
-            const t = nextArg(args, &i, arg);
-            // `zig build` names the native OS with the CPU's architecture
-            // when it passes a CPU (`-target x86_64-native -mcpu x86_64_v2`
-            // for `-Dcpu=x86_64_v2`).
-            opts.target = if (std.mem.eql(u8, t, "native-native") or std.mem.eql(u8, t, @tagName(builtin.cpu.arch) ++ "-native")) "native" else t;
+            opts.target = nativeTarget(nextArg(args, &i, arg));
         } else if (std.mem.eql(u8, arg, "-mcpu") or std.mem.startsWith(u8, arg, "-mcpu=")) {
             // Resolved once the target is known.
             mcpu = if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else nextArg(args, &i, arg);
@@ -3115,6 +3111,13 @@ fn inheritFlags(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []con
         }
     }
 }
+/// `-target`'s argument, with the native target under the names `zig
+/// build` gives it when it passes a CPU (`-target x86_64-native -mcpu
+/// x86_64_v2` for `-Dcpu=x86_64_v2`) as `native`.
+pub fn nativeTarget(target: []const u8) []const u8 {
+    return if (std.mem.eql(u8, target, "native-native") or std.mem.eql(u8, target, @tagName(builtin.cpu.arch) ++ "-native")) "native" else target;
+}
+
 
 /// Resolves `-target` (`opts.bs_target`), or refuses a target bs does
 /// not support. A Linux target resolves as upstream's

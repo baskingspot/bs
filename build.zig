@@ -3043,10 +3043,11 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     // With -lc and the native target, libc's headers are the system's,
     // which the C compiler's search path names, as upstream's
     // `LibCInstallation.findNative`; an explicit target takes the lib
-    // directory's glibc headers.
-    for ([_][]const []const u8{ &.{}, &.{ "-target", "x86_64-linux-gnu" } }, [_][]const u8{ "tcl_system", "tcl_bundled" }) |target, name| {
+    // directory's glibc headers. `zig build -Dcpu=` names the native
+    // target by its architecture (`-target x86_64-native`).
+    for ([_][]const []const u8{ &.{}, &.{ "-target", "x86_64-native" }, &.{ "-target", "x86_64-linux-gnu" } }, [_][]const u8{ "tcl_system", "tcl_system", "tcl_bundled" }) |target, name| {
         const tc_libc = b.addRunArtifact(bs);
-        tc_libc.setName(b.fmt("bs translate-c -lc {s} takes libc's headers from {s}", .{ if (target.len == 0) "native" else target[1], if (target.len == 0) "the system" else "the lib directory" }));
+        tc_libc.setName(b.fmt("bs translate-c -lc {s} takes libc's headers from {s}", .{ if (target.len == 0) "native" else target[1], if (std.mem.eql(u8, name, "tcl_system")) "the system" else "the lib directory" }));
         tc_libc.addArgs(&.{ "translate-c", "-lc" });
         tc_libc.addArgs(target);
         tc_libc.addFileArg(b.path("test/link_input/tc_libc/s.h"));
