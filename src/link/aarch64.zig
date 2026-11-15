@@ -32,3 +32,12 @@ pub fn pageOffScale(insn: u32) ?u5 {
 pub fn patchImm12(insn: u32, imm: u32) u32 {
     return (insn & ~@as(u32, 0xfff << 10)) | (imm << 10);
 }
+
+/// Sets a b.cond's, cbz's or cbnz's imm19 (`cond`) or a tbz's or tbnz's
+/// imm14 to branch `delta` bytes, or null if it cannot reach.
+pub fn patchBranch(insn: u32, cond: bool, delta: i64) ?u32 {
+    const bits: u6 = if (cond) 19 else 14;
+    if (delta & 3 != 0 or delta < -(@as(i64, 1) << (bits + 1)) or delta >= @as(i64, 1) << (bits + 1)) return null;
+    const mask = ((@as(u32, 1) << @intCast(bits)) - 1) << 5;
+    return (insn & ~mask) | (@as(u32, @truncate(@as(u64, @bitCast(delta >> 2)))) << 5 & mask);
+}

@@ -184,6 +184,13 @@ asm_line: ?u32 = null,
 asm_failed: bool = false,
 /// In a variadic C function: the stack bytes the named parameters use.
 va_stack: u32 = 0,
+/// Named labels this function's own inline assembly defines (not code
+/// the backend inlined), which other functions' assembly may branch to,
+/// as all of a module's assembly is one file to LLVM's assembler.
+asm_defs: std.ArrayList(AsmDef) = .empty,
+/// Some inline assembly branches to a label it does not define, which is
+/// a relocation (`Encoder.labelToSym`), appended out of order.
+asm_extern_labels: bool = false,
 /// Debug info, as in the x86_64 backend.
 dbg_line: u32 = 0,
 dbg_column: u32 = 0,
@@ -327,6 +334,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.dbg_inline_units.deinit(gpa);
         cg.dbg_files.deinit(gpa);
         cg.dbg_open.deinit(gpa);
+        cg.asm_defs.deinit(gpa);
         cg.cold_starts.deinit(gpa);
         cg.cold_open.deinit(gpa);
         cg.tmp_slots.deinit(gpa);
@@ -422,6 +430,11 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         in.high = cg.e.finalOffset(in.high);
     }
 
+    if (cg.asm_extern_labels) cg.e.refs.sort();
+    const key = try emit.funcKey(ir.func);
+    for (cg.asm_defs.items) |d| try emit.defineAsmLabel(d.name, key, cg.e.labels.items[@backingInt(d.label)], d.flags);
+    if (emit.literalLinkSection(func.owner_nav)) |section| try emit.placeInSection(key, section);
+
     emit.codegen_stats.functions += 1;
     emit.codegen_stats.ir_insts += ir.instructions.len;
     emit.codegen_stats.code_bytes += cg.e.code.items.len;
@@ -449,7 +462,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .patches = try arena.dupe(u32, cg.e.lines.patches.items),
     };
     try emit.addFunction(.{
-        .key = try emit.funcKey(ir.func),
+        .key = key,
         // Names can change until analysis ends (`Emit.nameAtoms`).
         .name = Emit.name_later,
         .section = .text,
@@ -5360,6 +5373,8 @@ const LocalLabels = struct {
     /// What the block's last `.arch` or `.arch_extension` said of SVE:
     /// null before one, when the CPU's features decide.
     sve: ?bool = null,
+    /// `.globl` and `.hidden` names, which a named label defines.
+    globals: std.StringHashMapUnmanaged(Emit.AsmLabelFlags) = .empty,
 
     /// `line` is the asm line of the first branch to it, for the error
     /// when nothing defines it.
@@ -5579,6 +5594,7 @@ fn asmAlign(cg: *CodeGen, line: []const u8) Error!bool {
 fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg)) Error!void {
     var locals: LocalLabels = .{};
     defer locals.named.deinit(cg.gpa);
+    defer locals.globals.deinit(cg.gpa);
     var source_lines = std.mem.tokenizeScalar(u8, source, '\n');
     var counted: usize = 0;
     while (source_lines.next()) |source_line| {
@@ -5597,7 +5613,43 @@ fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnm
         var statements = std.mem.tokenizeSequence(u8, code, if (macho) "%%%%" else ";");
         while (statements.next()) |raw| try cg.assembleStatement(std.mem.trim(u8, raw, " \t\r"), names, &locals);
     }
+    try cg.asmCrossLabels(&locals);
     try cg.asmLabelsDefined(&locals);
+}
+
+/// A named label of a function's inline assembly, at its offset once the
+/// code is final (`Emit.defineAsmLabel`).
+const AsmDef = struct { name: []const u8, label: Encoder.Label, flags: Emit.AsmLabelFlags };
+
+/// Publishes the named labels the function's own assembly block defines,
+/// and turns branches to the ones it does not into relocations against
+/// the symbol of that name, which another function's assembly, an export,
+/// or a library defines, as LLVM assembles all of a module's assembly as
+/// one file.
+fn asmCrossLabels(cg: *CodeGen, locals: *LocalLabels) Error!void {
+    const target = cg.emit.zcu.ip.target;
+    var it = locals.named.iterator();
+    while (it.next()) |entry| {
+        const raw = entry.key_ptr.*;
+        const name = Emit.asmSymbolName(target, raw);
+        if (entry.value_ptr.defined) {
+            if (cg.dbg_open.items.len != 0) continue;
+            const flags = locals.globals.get(raw) orelse Emit.AsmLabelFlags{};
+            try cg.asm_defs.append(cg.gpa, .{ .name = try cg.emit.allocator().dupe(u8, name), .label = entry.value_ptr.label, .flags = flags });
+            continue;
+        }
+        if (cg.asm_line != null) cg.asm_line = entry.value_ptr.line;
+        _ = try cg.emit.useExtern(name, false);
+        if (!try cg.e.labelToSym(entry.value_ptr.label, Emit.externAddrKey(name)))
+            return cg.fail("asm takes the address of '{s}', which is not a label this asm defines; bs resolves a label's address only in the asm that defines it (pass it as an operand)", .{raw});
+        entry.value_ptr.defined = true;
+        cg.asm_extern_labels = true;
+    }
+    var g = locals.globals.iterator();
+    while (g.next()) |entry| {
+        const d = locals.named.get(entry.key_ptr.*);
+        if (d == null or !entry.value_ptr.global) return cg.fail("bs supports '.globl' and '.hidden' in inline assembly only for a label the block defines ('{s}')", .{entry.key_ptr.*});
+    }
 }
 
 /// `tok` as a shift or extension: its name, any case, then an amount,
@@ -5661,6 +5713,15 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
             locals.sve = std.mem.find(u8, line, "+sve") != null;
             return;
         }
+        inline for (.{ ".globl", ".global", ".hidden" }) |d| if (std.mem.startsWith(u8, line, d) and line.len > d.len and (line[d.len] == ' ' or line[d.len] == '\t')) {
+            if (cg.global_asm != null) break;
+            const name = std.mem.trim(u8, line[d.len..], " \t");
+            if (!isLabelName(name)) return cg.fail("bad symbol in '{s}'", .{line});
+            const gop = try locals.globals.getOrPut(cg.gpa, name);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            if (comptime std.mem.eql(u8, d, ".hidden")) gop.value_ptr.hidden = true else gop.value_ptr.global = true;
+            return;
+        };
         if (std.mem.startsWith(u8, line, ".arch_extension")) {
             const ext = std.mem.trim(u8, line[".arch_extension".len..], " \t");
             if (std.mem.startsWith(u8, ext, "sve")) locals.sve = true;

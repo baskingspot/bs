@@ -712,6 +712,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             // executable's definitions does not see (`Glibc.dynamicOptions`).
             .@"export" => try exports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name, .weak = ls.flags & 2 != 0, .visibility = if (ls.flags & 1 != 0) .hidden else if (ls.flags & 4 != 0) .protected else .default }),
             .rt_alias => try rt_aliases.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name }),
+            .asm_label => try rt_aliases.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name, .offset = ls.flags >> 8, .label = @bitCast(@as(u8, @truncate(ls.flags))) }),
             .import => {
                 const f: Emit.ImportFlags = .fromBits(@truncate(ls.flags));
                 try imports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls });
@@ -3264,7 +3265,7 @@ fn refsEql(m: *const Manifest, old: []const Manifest.Ref, new: []const Manifest.
     for (old, new) |a, b| {
         if (a.kind != b.kind) return false;
         switch (a.kind) {
-            .ext, .ext_weak, .rt, .import => if (b.value >= m.refNameCount() or a.value != b.value) return false,
+            .ext, .ext_weak, .rt, .import, .asm_label, .link_section => if (b.value >= m.refNameCount() or a.value != b.value) return false,
             .quota, .effects => {},
             else => if (a.value != b.value) return false,
         }
@@ -3301,9 +3302,44 @@ fn onlyComptimeRootsDiffer(m: *const Manifest, old: []const Manifest.Ref, new: [
 /// Whether a reference names a symbol outside the build.
 fn externalRef(kind: Manifest.Ref.Kind) bool {
     return switch (kind) {
-        .ext, .ext_weak, .import => true,
+        .ext, .ext_weak, .import, .asm_label, .link_section => true,
         else => false,
     };
+}
+
+/// The `refName` of an inline assembly label: its name, NUL, then its
+/// offset, flags and atom key, so that a label that moves is a changed
+/// reference.
+fn asmLabelRefName(gpa: Allocator, namer: anytype, name: []const u8, label: Emit.AsmLabel) !u32 {
+    const ref_name = try gpa.print("{s}\x00{d}\x00{d}\x00{x}", .{ name, label.target.addend, @as(u8, @bitCast(label.flags)), @backingInt(label.target.key) });
+    defer gpa.free(ref_name);
+    return namer.addRefName(ref_name);
+}
+
+/// The `refName` of a function's `linksection`.
+fn linkSectionRefName(gpa: Allocator, namer: anytype, key: Atom.SymbolKey, section: Emit.LinkSection) !u32 {
+    const ref_name = try gpa.print("{s}\x00{d}\x00{x}\x00{s}", .{ section.name, section.line, @backingInt(key), section.path });
+    defer gpa.free(ref_name);
+    return namer.addRefName(ref_name);
+}
+
+/// The parts of a `linkSectionRefName`.
+pub fn parseLinkSectionRef(ref_name: []const u8) ?struct { Atom.SymbolKey, Emit.LinkSection } {
+    var it = std.mem.splitScalar(u8, ref_name, 0);
+    const name = it.next().?;
+    const line = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const key = std.fmt.parseInt(u128, it.next() orelse return null, 16) catch return null;
+    return .{ @fromBackingInt(key), .{ .name = name, .line = line, .path = it.rest() } };
+}
+
+/// The parts of an `asmLabelRefName`.
+pub fn parseAsmLabelRef(ref_name: []const u8) ?struct { []const u8, Atom.SymbolKey, u32, Emit.AsmLabelFlags } {
+    var it = std.mem.splitScalar(u8, ref_name, 0);
+    const name = it.next().?;
+    const offset = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const flags = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
+    const key = std.fmt.parseInt(u128, it.next() orelse return null, 16) catch return null;
+    return .{ name, @fromBackingInt(key), offset, @bitCast(flags) };
 }
 
 /// The `refName` of an import: its name, NUL, and its flags as a digit
@@ -3357,6 +3393,11 @@ fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.bit_set.Dyna
                 // Any change of an import's flags falls back, even one
                 // that merges to the same flags.
                 .import => try s.names.put(a, try a.print("\x00import\x00{s}", .{name}), {}),
+                // Its offset and atom are in the name: where another
+                // function's branch to it binds (its extern slot).
+                .asm_label => try s.names.put(a, try a.print("\x00asm\x00{s}", .{name}), {}),
+                // The order of a section's functions is the link's.
+                .link_section => try s.names.put(a, try a.print("\x00section\x00{s}", .{name}), {}),
                 .error_names => s.error_names = true,
                 else => {},
             }
@@ -3398,7 +3439,7 @@ fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.bit_set.Dyna
     }
     for (nodes, write, 0..) |n, w, ni| if (w and n.atoms.len != 0) for (node_refs[ref_starts[ni]..ref_starts[ni + 1]]) |nr| {
         const name = switch (nr.ref.kind) {
-            .ext, .ext_weak, .import => if (nr.ref.value < m.refNameCount()) m.refName(nr.ref.value) else d.strings.items[d.ref_names.items[nr.ref.value - m.refNameCount()].off..][0..d.ref_names.items[nr.ref.value - m.refNameCount()].len],
+            .ext, .ext_weak, .import, .asm_label, .link_section => if (nr.ref.value < m.refNameCount()) m.refName(nr.ref.value) else d.strings.items[d.ref_names.items[nr.ref.value - m.refNameCount()].off..][0..d.ref_names.items[nr.ref.value - m.refNameCount()].len],
             else => "",
         };
         try new.add(arena, nr.ref.kind, name);
@@ -4066,6 +4107,8 @@ const Graph = struct {
             .import => |e| .{ .kind = .import, .value = try addImportRefName(gpa, namer, e.name, e.flags) },
             .rt => |key| .{ .kind = .rt, .value = try namer.addRefName(key) },
             .error_names => .{ .kind = .error_names, .value = 0 },
+            .asm_label => |l| .{ .kind = .asm_label, .value = try asmLabelRefName(gpa, namer, l.name, l.label) },
+            .link_section => |l| .{ .kind = .link_section, .value = try linkSectionRefName(gpa, namer, l.key, l.section) },
         } });
         for (g.reach_items.items, g.reach_nodes) |it, rn| if (rn[0] != rn[1]) try node_refs.append(gpa, .{ .node = rn[0], .ref = .{ .kind = it.kind, .value = rn[1] } });
         std.mem.sortUnstable(NodeRef, node_refs.items, {}, NodeRef.lessThan);
@@ -4287,6 +4330,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         var rt_arena: std.heap.ArenaAllocator = .init(gpa);
         defer rt_arena.deinit();
         for (try Emit.rtNames(rt_arena.allocator(), inc.language, emit.atoms.items)) |rt| try b.addLinkSymbol(.rt_alias, @backingInt(rt.key), rt.name, 0);
+        for (try emit.asmLabelNames(rt_arena.allocator())) |l| try b.addLinkSymbol(.asm_label, @backingInt(l.key), l.name, l.offset << 8 | @as(u8, @bitCast(l.label.?)));
     }
     for (emit.imports.keys(), emit.imports.values()) |name, flags| try b.addLinkSymbol(.import, @backingInt(Emit.importKey(name)), name, flags.bits());
     for (ip.error_names.items[1..]) |name| _ = try b.addErrorName(ip.stringSlice(name), @backingInt(Emit.errorKey(ip, name)));
@@ -5557,14 +5601,14 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         fn refKey(bb: *const Manifest.Builder, rec: *const Recorder, ref: Manifest.Ref) [2]Hash {
             return .{ @backingInt(ref.kind), switch (ref.kind) {
                 .func, .nav, .effects, .root, .defaults => rec.nodes.items[ref.value].key,
-                .ext, .ext_weak, .rt, .import => cache.hash(0, bb.strings.items[bb.ref_names.items[ref.value].off..][0..bb.ref_names.items[ref.value].len]),
+                .ext, .ext_weak, .rt, .import, .asm_label, .link_section => cache.hash(0, bb.strings.items[bb.ref_names.items[ref.value].off..][0..bb.ref_names.items[ref.value].len]),
                 .err, .error_names, .analyze, .quota => ref.value,
             } };
         }
         fn prevRefKey(mm: *const Manifest, ref: Manifest.Ref) [2]Hash {
             return .{ @backingInt(ref.kind), switch (ref.kind) {
                 .func, .nav, .effects, .root, .defaults => mm.node(ref.value).key,
-                .ext, .ext_weak, .rt, .import => cache.hash(0, mm.refName(ref.value)),
+                .ext, .ext_weak, .rt, .import, .asm_label, .link_section => cache.hash(0, mm.refName(ref.value)),
                 .err, .error_names, .analyze, .quota => ref.value,
             } };
         }

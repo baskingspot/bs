@@ -1073,6 +1073,15 @@ fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
                 _ = try emit.requestCompilerRt(file, name);
             },
             .error_names => try emit.useErrorNames(),
+            .asm_label => {
+                const name, const key, const offset, const flags = Incremental.parseAsmLabelRef(m.refName(o.value)) orelse return error.InvalidImportRef;
+                try emit.defineAsmLabel(try emit.allocator().dupe(u8, name), key, offset, flags);
+            },
+            .link_section => {
+                const key, const section = Incremental.parseLinkSectionRef(m.refName(o.value)) orelse return error.InvalidImportRef;
+                const a = emit.allocator();
+                try emit.placeInSection(key, .{ .name = try a.dupe(u8, section.name), .path = try a.dupe(u8, section.path), .line = section.line });
+            },
             .func, .nav, .analyze, .quota, .effects, .root, .defaults => unreachable,
         },
     };

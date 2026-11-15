@@ -2421,6 +2421,12 @@ fn LinkOf(comptime Input: type) type {
                         const imm: u32 = @truncate(@as(u64, @bitCast(delta >> 2)) & 0x3ffffff);
                         std.mem.writeInt(u32, field[0..4], (insn & 0xfc000000) | imm, .little);
                     },
+                    .aarch64_condbr19, .aarch64_tstbr14 => {
+                        if (t.kind != .addr) return invalid;
+                        const delta: i64 = @bitCast((t.v +% @as(u64, @bitCast(addend))) -% p);
+                        const v = a64.patchBranch(insn, r.info.kind == .aarch64_condbr19, delta) orelse return error.RelocationOverflow;
+                        std.mem.writeInt(u32, field[0..4], v, .little);
+                    },
                     .aarch64_page21, .aarch64_got_load_page21 => {
                         const s = switch (t.kind) {
                             .addr => t.v,

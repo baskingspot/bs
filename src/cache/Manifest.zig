@@ -298,7 +298,10 @@ pub const LinkSymbol = extern struct {
 
     /// `rt_alias`: a name compiler_rt exports its function `key` under,
     /// which an executable's .symtab lists (`Emit.aliasSymbols`).
-    pub const Kind = enum(u32) { @"export", import, rt_alias, _ };
+    /// `asm_label`: a named label of function `key`'s inline assembly
+    /// (`Emit.asmLabelNames`); flags: its offset << 8 and its
+    /// `Emit.AsmLabelFlags`.
+    pub const Kind = enum(u32) { @"export", import, rt_alias, asm_label, _ };
 };
 
 /// A node's offer of a name to a type (`type_name_index`), by the type's
@@ -368,6 +371,16 @@ pub const Ref = extern struct {
         /// (`value`), which a build that resolves the layout analyzes
         /// (`Zcu.queueDefaults`).
         defaults,
+        /// A named label the unit's inline assembly defines, which other
+        /// functions' assembly may branch to (`Emit.defineAsmLabel`): an
+        /// index for `refName` of its name, NUL, its offset, flags and
+        /// atom key (`Incremental.asmLabelRefName`).
+        asm_label,
+        /// The unit's function atom states a `linksection`
+        /// (`Emit.placeInSection`): an index for `refName` of the section,
+        /// NUL, the line, the atom key and the path
+        /// (`Incremental.linkSectionRefName`).
+        link_section,
     };
 };
 
@@ -2263,7 +2276,7 @@ pub const Builder = struct {
             for (b.refs.items[range[0]..][0..range[1]]) |r| {
                 switch (r.kind) {
                     .func, .nav, .effects, .root, .defaults => if (r.value >= nodes.len) return error.InvalidNodeIndex,
-                    .ext, .ext_weak, .rt, .import => if (r.value >= b.ref_names.items.len) return error.InvalidRefName,
+                    .ext, .ext_weak, .rt, .import, .asm_label, .link_section => if (r.value >= b.ref_names.items.len) return error.InvalidRefName,
                     .err, .error_names, .analyze, .quota => {},
                 }
                 node_refs.appendAssumeCapacity(r);

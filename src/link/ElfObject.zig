@@ -387,6 +387,8 @@ fn aarch64Type(a: *const Atom, r: Atom.Reloc, image: []u8, file_offset: u64, dia
         .value32 => .ABS32,
         .value16 => .ABS16,
         .aarch64_branch26 => if (insn & 0x80000000 != 0) .CALL26 else .JUMP26,
+        .aarch64_condbr19 => .CONDBR19,
+        .aarch64_tstbr14 => .TSTBR14,
         .aarch64_page21 => .ADR_PREL_PG_HI21,
         .aarch64_pageoff12 => if (insn & 0x7fc00000 == 0x11000000) .ADD_ABS_LO12_NC else switch (a64_fields.pageOffScale(insn) orelse return badReloc(a, diag)) {
             0 => .LDST8_ABS_LO12_NC,

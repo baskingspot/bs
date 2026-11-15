@@ -510,6 +510,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .inline_callees = try arena.dupe(SymbolKey, cg.dbg_inline_callees.items),
         .patches = try arena.dupe(u32, cg.e.lines.patches.items),
     };
+    if (emit.literalLinkSection(func.owner_nav)) |section| try emit.placeInSection(try emit.funcKey(ir.func), section);
     try emit.addFunction(.{
         .key = try emit.funcKey(ir.func),
         // Names can change until analysis ends (`Emit.nameAtoms`).

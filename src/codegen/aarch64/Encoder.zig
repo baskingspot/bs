@@ -483,6 +483,31 @@ pub fn newLabel(e: *Encoder) Allocator.Error!Label {
     return @fromBackingInt(@intCast(e.labels.items.len - 1));
 }
 
+/// Turns the branches to `label`, which nothing binds, into relocations
+/// against `sym`: a label another function's inline assembly defines.
+/// Returns false if an `adr` or a data word refers to it, which no
+/// relocation here expresses.
+pub fn labelToSym(e: *Encoder, label: Label, sym: SymbolKey) Allocator.Error!bool {
+    var n: usize = 0;
+    for (e.fixups.items) |f| {
+        if (f.label != label) {
+            e.fixups.items[n] = f;
+            n += 1;
+            continue;
+        }
+        const kind: Atom.Reloc.Kind = switch (f.field) {
+            .imm26 => .aarch64_branch26,
+            .imm19 => .aarch64_condbr19,
+            .imm14 => .aarch64_tstbr14,
+            .adr21, .word32 => return false,
+        };
+        try e.refs.append(e.gpa, f.at, kind, sym, 0);
+    }
+    e.fixups.shrinkRetainingCapacity(n);
+    e.labels.items[@backingInt(label)] = 0;
+    return true;
+}
+
 /// Binds `label` to the current offset.
 pub fn bind(e: *Encoder, label: Label) void {
     assert(e.labels.items[@backingInt(label)] == unbound);

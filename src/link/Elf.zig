@@ -2728,7 +2728,7 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
                 const f = try relocField(a, dst, r.offset, 1, diag);
                 f[0] = std.math.cast(u8, @as(i128, s) + r.addend) orelse return overflow(a, r, diag);
             },
-            .aarch64_branch26, .aarch64_page21, .aarch64_pageoff12, .aarch64_got_load_page21, .aarch64_got_load_pageoff12, .aarch64_movw_value16, .aarch64_tprel_hi12, .aarch64_tprel_lo12_nc, .aarch64_tprel_g1, .aarch64_tprel_g0_nc => try aarch64Reloc(a, r, dst, p_base, s, tls, diag),
+            .aarch64_branch26, .aarch64_condbr19, .aarch64_tstbr14, .aarch64_page21, .aarch64_pageoff12, .aarch64_got_load_page21, .aarch64_got_load_pageoff12, .aarch64_movw_value16, .aarch64_tprel_hi12, .aarch64_tprel_lo12_nc, .aarch64_tprel_g1, .aarch64_tprel_g0_nc => try aarch64Reloc(a, r, dst, p_base, s, tls, diag),
             else => return invalidReloc(a, diag),
         }
     }
@@ -2775,6 +2775,7 @@ noinline fn aarch64Reloc(a: *const Atom, r: Atom.Reloc, dst: []u8, p_base: u64, 
             if (delta & 3 != 0 or delta < -(1 << 27) or delta >= 1 << 27) return overflow(a, r, diag);
             break :v (insn & 0xfc000000) | @as(u32, @truncate(@as(u64, @bitCast(delta >> 2)) & 0x3ffffff));
         },
+        .aarch64_condbr19, .aarch64_tstbr14 => a64.patchBranch(insn, r.info.kind == .aarch64_condbr19, @bitCast(target -% p)) orelse return overflow(a, r, diag),
         .aarch64_page21, .aarch64_got_load_page21 => v: {
             const pages = a64.pageDelta(target, p);
             if (pages < -(1 << 20) or pages >= 1 << 20) return overflow(a, r, diag);

@@ -82,6 +82,13 @@ aliases: std.ArrayList(Alias) = .empty,
 /// code and C objects know them by, at offsets in its atoms
 /// (codegen/global_asm.zig).
 asm_symbols: std.array_hash_map.String(ExternTarget) = .empty,
+/// The named labels functions' inline assembly defines, by the name Zig
+/// code and C objects know them by (`asmSymbolName`), at offsets in the
+/// functions' atoms (`defineAsmLabel`).
+asm_labels: std.array_hash_map.String(AsmLabel) = .empty,
+/// The `linksection` of functions that state a literal one, by their
+/// atoms' keys (`placeInSection`), which `groupByOwner` keeps together.
+link_sections: std.AutoHashMapUnmanaged(SymbolKey, LinkSection) = .empty,
 /// Whether code reads `error_name_table`.
 uses_error_names: bool = false,
 /// Compile errors that codegen reports (unsupported constructs), rendered
@@ -550,8 +557,74 @@ pub const UnitRef = struct {
         /// `requestCompilerRt`'s key, owned by the Emit that requested it.
         rt: []const u8,
         error_names,
+        /// `defineAsmLabel`; the name is owned by the Emit that defined it.
+        asm_label: struct { name: []const u8, label: AsmLabel },
+        /// `placeInSection`; the strings are owned by the Emit that placed it.
+        link_section: struct { key: SymbolKey, section: LinkSection },
     },
 };
+
+/// Whether an inline assembly label is `.globl` and `.hidden`.
+pub const AsmLabelFlags = packed struct(u8) { global: bool = false, hidden: bool = false, unused: u6 = 0 };
+
+/// Where a function's inline assembly defines a named label. `ambiguous`:
+/// more than one place does, as when two functions' assembly defines it,
+/// which LLVM's assembler rejects, so that no branch binds to it.
+pub const AsmLabel = struct { target: ExternTarget, flags: AsmLabelFlags, ambiguous: bool = false };
+
+/// The name Zig code and C know inline assembly symbol `name` by: on
+/// aarch64-macos, without its leading underscore.
+pub fn asmSymbolName(target: InternPool.Target, name: []const u8) []const u8 {
+    if (target == .aarch64_macos and name.len >= 2 and name[0] == '_') return name[1..];
+    return name;
+}
+
+/// A function's `linksection`, and where it is declared, which orders a
+/// section's functions as the source does.
+pub const LinkSection = struct { name: []const u8, path: []const u8, line: u32 };
+
+/// The `linksection` function `nav` states as a string literal, or null.
+/// bs places every function in `.text` (docs/slop/architecture.md,
+/// "Sections"); this only keeps one section's functions together.
+pub fn literalLinkSection(emit: *Emit, nav_index: InternPool.NavIndex) ?LinkSection {
+    const nav = emit.zcu.ip.getNav(nav_index);
+    const file = emit.zcu.file(nav.file);
+    const zir = &file.zir;
+    const decl = zir.getDeclaration(nav.zir_inst);
+    const body = decl.linksection_body orelse return null;
+    var name: ?[]const u8 = null;
+    for (body) |inst| switch (zir.instructions.items(.tag)[@backingInt(inst)]) {
+        .str => {
+            if (name != null) return null;
+            const str = zir.instructions.items(.data)[@backingInt(inst)].str;
+            name = str.get(zir.*);
+        },
+        .as_node, .break_inline => {},
+        else => return null,
+    };
+    return .{ .name = name orelse return null, .path = file.display_path, .line = decl.src_line };
+}
+
+/// Records that function atom `key` is in section `section`.
+pub fn placeInSection(emit: *Emit, key: SymbolKey, section: LinkSection) !void {
+    try emit.link_sections.put(emit.gpa, key, section);
+    try emit.addRef(.{ .link_section = .{ .key = key, .section = section } });
+}
+
+/// Records that the current function's inline assembly defines label
+/// `name` (owned by the caller's Emit) `offset` bytes into atom `key`.
+pub fn defineAsmLabel(emit: *Emit, name: []const u8, key: SymbolKey, offset: u32, flags: AsmLabelFlags) !void {
+    const label: AsmLabel = .{ .target = .{ .key = key, .addend = offset }, .flags = flags };
+    try emit.putAsmLabel(name, label);
+    try emit.addRef(.{ .asm_label = .{ .name = name, .label = label } });
+}
+
+fn putAsmLabel(emit: *Emit, name: []const u8, label: AsmLabel) !void {
+    const gop = try emit.asm_labels.getOrPut(emit.gpa, name);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = label;
+    } else if (!std.meta.eql(gop.value_ptr.target, label.target)) gop.value_ptr.ambiguous = true;
+}
 
 pub fn init(gpa: Allocator, zcu: *Zcu) Emit {
     return .{ .gpa = gpa, .arena = .init(gpa), .zcu = zcu };
@@ -567,6 +640,8 @@ pub fn deinit(emit: *Emit) void {
     emit.externs.deinit(gpa);
     emit.aliases.deinit(gpa);
     emit.asm_symbols.deinit(gpa);
+    emit.asm_labels.deinit(gpa);
+    emit.link_sections.deinit(gpa);
     emit.imports.deinit(gpa);
     emit.copies.deinit(gpa);
     emit.exports.deinit(gpa);
@@ -1340,6 +1415,8 @@ fn mergeOut(emit: *Emit, w: *const Emit, out: Out) Allocator.Error!void {
         // In `side`.
         .rt => {},
         .error_names => emit.uses_error_names = true,
+        .asm_label => |x| try emit.putAsmLabel(x.name, x.label),
+        .link_section => |x| try emit.link_sections.put(gpa, x.key, x.section),
     };
     for (w.codegen_errors.items[out.start.errors..out.end.errors]) |e| {
         var copy = e;
@@ -1486,7 +1563,7 @@ pub fn finish(emit: *Emit) !bool {
     if (emit.lazy) {
         try emit.lowerNavs();
         if (emit.failed) return false;
-        try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
+        try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug, &emit.link_sections);
         try emit.nameAtoms();
         return true;
     }
@@ -1534,7 +1611,7 @@ pub fn finish(emit: *Emit) !bool {
         return false;
     }
 
-    try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
+    try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug, &emit.link_sections);
     try emit.nameAtoms();
     // An object's symbols by name, not in the order analysis or the
     // cache's loading found them, so that the object is a function of its
@@ -1694,7 +1771,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     // An object's exports are its global symbols (`ElfObject`).
     const local_symbols = if (emit.obj and !emit.shared) emit.input_symbols else l: {
         const a = alias_arena.allocator();
-        break :l try std.mem.concat(a, Elf.LocalSymbol, &.{ emit.input_symbols, try aliasSymbols(a, emit.exports.items, try rtNames(a, emit.zcu.language, emit.atoms.items)) });
+        break :l try std.mem.concat(a, Elf.LocalSymbol, &.{ emit.input_symbols, try aliasSymbols(a, emit.exports.items, try std.mem.concat(a, RtName, &.{ try rtNames(a, emit.zcu.language, emit.atoms.items), try emit.asmLabelNames(a) })) });
     };
     const options: Elf.Options = .{ .entry = emit.entry, .arch = if (emit.zcu.ip.target.arch() == .aarch64) .aarch64 else .x86_64, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none, .local_symbols = local_symbols, .input_sections = emit.input_sections, .aliases = emit.aliases.items, .strip = emit.strip };
     const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
@@ -1748,7 +1825,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         // The version script's locals are hidden.
         if (emit.version_script != null) {
             const a = alias_arena.allocator();
-            shared_options.local_symbols = try std.mem.concat(a, Elf.LocalSymbol, &.{ emit.input_symbols, try aliasSymbols(a, exports, try rtNames(a, emit.zcu.language, emit.atoms.items)) });
+            shared_options.local_symbols = try std.mem.concat(a, Elf.LocalSymbol, &.{ emit.input_symbols, try aliasSymbols(a, exports, try std.mem.concat(a, RtName, &.{ try rtNames(a, emit.zcu.language, emit.atoms.items), try emit.asmLabelNames(a) })) });
         }
         break :shared Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, shared_options);
     } else if (emit.obj)
@@ -1762,8 +1839,22 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     return true;
 }
 
-/// A name compiler_rt exports its function `key` under (`rtNames`).
-pub const RtName = struct { key: SymbolKey, name: []const u8 };
+/// A name compiler_rt exports its function `key` under (`rtNames`), or,
+/// with `label`, a named label `offset` bytes into function `key` that
+/// its inline assembly defines (`asmLabelNames`).
+pub const RtName = struct { key: SymbolKey, name: []const u8, offset: u32 = 0, label: ?AsmLabelFlags = null };
+
+/// The labels functions' inline assembly defines that LLVM's assembler
+/// lists as symbols: all but assembler-local `.L` ones, and none defined
+/// in more than one place.
+pub fn asmLabelNames(emit: *const Emit, arena: Allocator) ![]const RtName {
+    var out: std.ArrayList(RtName) = .empty;
+    for (emit.asm_labels.keys(), emit.asm_labels.values()) |name, l| {
+        if (l.ambiguous or std.mem.startsWith(u8, name, ".L")) continue;
+        try out.append(arena, .{ .key = l.target.key, .name = name, .offset = @intCast(l.target.addend), .label = l.flags });
+    }
+    return out.items;
+}
 
 /// The names compiler_rt exports the functions of `atoms` under (atoms
 /// named `compiler_rt.<...>`), as `language`'s compiler_rt does.
@@ -1810,7 +1901,19 @@ pub fn aliasSymbols(arena: Allocator, exports: []const ElfDynamic.Export, rt: []
         });
     };
     for (rt) |r| if (!names.contains(r.name)) {
-        try out.append(arena, .{ .name = r.name, .atom = r.key, .offset = 0, .bind = .local, .visibility = .HIDDEN, .alias = true });
+        const l = r.label orelse {
+            try out.append(arena, .{ .name = r.name, .atom = r.key, .offset = 0, .bind = .local, .visibility = .HIDDEN, .alias = true });
+            continue;
+        };
+        try out.append(arena, .{
+            .name = r.name,
+            .atom = r.key,
+            .offset = r.offset,
+            .size = 0,
+            .bind = if (l.global and !l.hidden) .global else .local,
+            .visibility = if (l.hidden) .HIDDEN else .DEFAULT,
+            .alias = true,
+        });
     };
     return out.items;
 }
@@ -2242,6 +2345,7 @@ pub const entry_alias_key: SymbolKey = .fromName("bs.entry");
 /// analysis is, and the inputs pulled.
 fn externTarget(emit: *Emit, name: []const u8, weak: bool) !?ExternTarget {
     if (emit.asm_symbols.get(name)) |t| return t;
+    if (emit.asm_labels.get(name)) |l| return if (l.ambiguous) null else l.target;
     if (emit.inputs) |in| if (try emit.userExport(name) == null) switch (in) {
         inline else => |p| if (try p.lookup(name)) |t| return .{ .key = t.key, .addend = @intCast(t.offset) },
     };
@@ -2444,7 +2548,12 @@ fn appendAtom(emit: *Emit, atom: Atom) !void {
 /// atom, `Incremental.record`), and the linker lays out atoms in chunks of
 /// input positions, so a fresh link of any other order or with duplicates
 /// could differ from a relink in padding.
-pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.ArrayList(Owner), debug: *std.ArrayList(Atom.Debug)) !void {
+///
+/// Functions in one `linksection` (`sections`, by atom key) are adjacent,
+/// in source order, at the place of the first one, as LLVM keeps them in
+/// one section: their inline assembly may branch to each other's labels,
+/// whose distances depend on that layout.
+pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.ArrayList(Owner), debug: *std.ArrayList(Atom.Debug), sections: *const std.AutoHashMapUnmanaged(SymbolKey, LinkSection)) !void {
     const Group = union(enum) { unit: Zcu.AnalUnit, content: SymbolKey, link, input };
     const dropped = std.math.maxInt(u32);
     const n = atoms.items.len;
@@ -2484,18 +2593,53 @@ pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.Ar
     const order = try gpa.alloc(u32, groups.count());
     defer gpa.free(order);
     for (order, 0..) |*o, i| o.* = @intCast(i);
+    // Each group's section, from its first atom, and each section's
+    // place: the least first-atom key of its groups.
+    const group_section = try gpa.alloc(?LinkSection, groups.count());
+    defer gpa.free(group_section);
+    var anchors: std.StringHashMapUnmanaged(u128) = .empty;
+    defer anchors.deinit(gpa);
+    for (group_section, groups.keys(), 0..) |*gs, g, i| {
+        gs.* = null;
+        if (sections.count() == 0 or g == .input or g == .link or starts[i] == starts[i + 1]) continue;
+        const first = atoms.items[by_group[starts[i]]].key;
+        gs.* = sections.get(first) orelse continue;
+        const gop = try anchors.getOrPut(gpa, gs.*.?.name);
+        if (!gop.found_existing or @backingInt(first) < gop.value_ptr.*) gop.value_ptr.* = @backingInt(first);
+    }
     const Sort = struct {
         atoms: []const Atom,
         groups: []const Group,
         starts: []const u32,
         by_group: []const u32,
+        group_section: []const ?LinkSection,
+        anchors: *const std.StringHashMapUnmanaged(u128),
 
         const Self = @This();
+        fn place(c: Self, g: u32) u128 {
+            if (c.group_section[g]) |sec| return c.anchors.get(sec.name).?;
+            return @backingInt(c.atoms[c.by_group[c.starts[g]]].key);
+        }
         fn lessThan(c: Self, x: u32, y: u32) bool {
             const gx = c.groups[x];
             const gy = c.groups[y];
             if ((gx == .input) != (gy == .input)) return gy == .input;
             if ((gx == .link) != (gy == .link)) return gy == .link;
+            if (c.group_section[x] != null or c.group_section[y] != null) {
+                const px = c.place(x);
+                const py = c.place(y);
+                if (px != py) return px < py;
+                // One section's.
+                if (c.group_section[x] != null and c.group_section[y] != null) {
+                    const sx = c.group_section[x].?;
+                    const sy = c.group_section[y].?;
+                    switch (std.mem.order(u8, sx.path, sy.path)) {
+                        .lt => return true,
+                        .gt => return false,
+                        .eq => if (sx.line != sy.line) return sx.line < sy.line,
+                    }
+                }
+            }
             const ax = c.by_group[c.starts[x]..c.starts[x + 1]];
             const ay = c.by_group[c.starts[y]..c.starts[y + 1]];
             for (ax[0..@min(ax.len, ay.len)], ay[0..@min(ax.len, ay.len)]) |i, j| {
@@ -2511,7 +2655,7 @@ pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.Ar
             return hx.final() < hy.final();
         }
     };
-    std.mem.sortUnstable(u32, order, Sort{ .atoms = atoms.items, .groups = groups.keys(), .starts = starts, .by_group = by_group }, Sort.lessThan);
+    std.mem.sortUnstable(u32, order, Sort{ .atoms = atoms.items, .groups = groups.keys(), .starts = starts, .by_group = by_group, .group_section = group_section, .anchors = &anchors }, Sort.lessThan);
     // New positions, dropping repeated keys.
     var keys: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty;
     defer keys.deinit(gpa);
@@ -2915,7 +3059,7 @@ test "a relink in the manifest's order reproduces the fresh link, with mixed ali
 
     const ungrouped = try Elf.emit(gpa, io, atoms.items, .{ .entry = start, .debug = debug.items });
     defer gpa.free(ungrouped);
-    try groupByOwner(gpa, &atoms, &owners, &debug);
+    try groupByOwner(gpa, &atoms, &owners, &debug, &.empty);
     const fresh = try Elf.emit(gpa, io, atoms.items, .{ .entry = start, .debug = debug.items });
     defer gpa.free(fresh);
     // The input order matters to the layout, which is why both builds

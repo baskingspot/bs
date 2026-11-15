@@ -346,6 +346,12 @@ pub const Reloc = extern struct {
         aarch64_tlsdesc_call,
         aarch64_gottprel_page21,
         aarch64_gottprel_lo12,
+        /// b.cond, cbz, cbnz: (S + A - P) >> 2 into imm19 (±1 MiB), and
+        /// tbz, tbnz: into imm14 (±32 KiB), from inline assembly that
+        /// branches to a label another function's assembly defines (ELF
+        /// R_AARCH64_CONDBR19, TSTBR14). S must be in the image.
+        aarch64_condbr19,
+        aarch64_tstbr14,
     };
 };
 

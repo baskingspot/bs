@@ -1117,11 +1117,29 @@ comptime arguments are run-time values in the lowered code (uucode's
   Advanced SIMD memcpy, memmove and memset, whose bytes equal
   upstream's): named labels (`name:`, `.Lname:`) as the target of `b`,
   `bl`, `b.cond`, `cbz`, `cbnz`, `tbz`, `tbnz` and `adr`, which live in
-  `LocalLabels.named` for one asm statement, so that a branch to a label
-  the statement does not define is an error at the branch and not a
-  symbol for the linker, where LLVM's labels are the module's (so bs
-  takes one name in two statements, and on Mach-O a `.L` or bare name
-  where LLVM's conditional branches reach only `L` labels);
+  `LocalLabels.named` for one asm statement. Since 2026-11-14 (fastmem's
+  SVE kernels, whose move entry branches into its copy entry's blocks)
+  labels are also the module's, as LLVM's are: a function's own asm
+  publishes its named labels (`Emit.defineAsmLabel`, at their final
+  offsets in its atom; not from code the backend inlined, which never
+  defines one), and a branch to a label its statement does not define
+  becomes a relocation (`Encoder.labelToSym`: `aarch64_branch26`,
+  `aarch64_condbr19`, `aarch64_tstbr14`) against the extern of that name,
+  which binds to another function's label (`Emit.asm_labels`), an
+  export, or a library's symbol. `.globl` and `.hidden` of a label the
+  statement defines list it in an executable's .symtab
+  (`Emit.asmLabelNames`, size 0, local when hidden, as lld lists LLVM's);
+  other non-`.L` labels are listed as local symbols. A label two places
+  define binds nothing (LLVM rejects it), an `adr` to another
+  statement's label is still an error, Mach-O objects have no
+  relocation for a conditional branch, and the labels are a unit's cache
+  reference (`Manifest.Ref.Kind.asm_label`, with its offset and atom), so
+  a label that moves is an external change and an edit build falls back.
+  Functions that state one literal `linksection` are kept together in
+  source order (`Emit.link_sections`, `groupByOwner`), as LLVM keeps a
+  section's functions, so a `tbz` reaches and the distances between them,
+  which such branches encode, are LLVM's; every function is still in
+  `.text`;
   `.p2align`, `.align` and `.balign` with an optional most padding,
   which pad with nops (`Encoder.alignTo`) and raise `Encoder.alignment`,
   which the function's atom takes, so the padded offset is aligned in
