@@ -210,6 +210,22 @@ pub fn build(b: *std.Build) void {
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
         diag_step.dependOn(&run.step);
     }
+    // `-ffuzz` is refused where bs places no coverage points, on the root
+    // module or on another one.
+    for ([_][]const u8{ "aarch64-linux", "aarch64-macos" }) |fuzz_target| for ([_]bool{ true, false }) |on_root| {
+        const run = b.addRunArtifact(test_bs);
+        run.setName(b.fmt("bs -ffuzz for {s}{s}", .{ fuzz_target, if (on_root) "" else " on a dependency" }));
+        run.addArgs(&.{ "build-exe", "-fno-emit-bin", "-target", fuzz_target });
+        if (on_root) run.addArg("-ffuzz") else run.addArgs(&.{ "--dep", "m" });
+        run.addPrefixedFileArg("-Mroot=", b.path("bench/workloads/hello/hello.zig"));
+        if (!on_root) {
+            run.addArg("-ffuzz");
+            run.addPrefixedFileArg("-Mm=", b.path("bench/workloads/hello/hello.zig"));
+        }
+        run.addCheck(.{ .expect_stderr_match = b.fmt("error[unsupported]: bs does not instrument code for fuzzing on {s} yet", .{fuzz_target}) });
+        run.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        diag_step.dependOn(&run.step);
+    };
     // A Zig 0.16 program means what it means in 0.16: test/language/zig016.sh.
     {
         const z16 = b.addSystemCommand(&.{"sh"});

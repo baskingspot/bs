@@ -2859,14 +2859,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // The aarch64-macos backend builds executables and tests, linked
     // against libSystem, which is macOS's libc (`-lc` asks for nothing
     // more), with C sources, Mach-O objects and archives.
-    if (opts.bs_target == .aarch64_macos) {
-        if (opts.fuzz)
-            setUnsupported(&opts, "bs does not instrument code for fuzzing on aarch64-macos yet ('-ffuzz'); build this step with upstream zig", arena, .{});
-        opts.link_libc = false;
-    } else if (opts.bs_target == .aarch64_linux) {
-        if (opts.fuzz)
-            setUnsupported(&opts, "bs does not instrument code for fuzzing on aarch64-linux yet ('-ffuzz'); build this step with upstream zig", arena, .{});
-    }
+    if (opts.bs_target == .aarch64_macos) opts.link_libc = false;
     resolveCpu(&opts, arena, io, mcpu);
     // The last of `-static` and `-dynamic` (upstream's `link_mode`). Shared
     // objects are position-independent; executables stay static unless
@@ -3061,6 +3054,12 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     opts.fuzz = opts.root_fuzz or for (modules.items) |m| {
         if (m.fuzz.?) break true;
     } else false;
+    // Only the x86_64 backend places coverage points, and only the ELF
+    // linker bounds their sections: without this an aarch64 build had
+    // none, and the fuzzer found no points (Linux) or did not load (a
+    // Mac, whose linker defines the bounds it imports).
+    if (opts.fuzz and opts.bs_target != .x86_64_linux)
+        setUnsupported(&opts, "bs does not instrument code for fuzzing on {s} yet ('-ffuzz'); build this step with upstream zig", arena, .{opts.bs_target.name()});
     return opts;
 }
 
@@ -3111,13 +3110,13 @@ fn inheritFlags(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []con
         }
     }
 }
+
 /// `-target`'s argument, with the native target under the names `zig
 /// build` gives it when it passes a CPU (`-target x86_64-native -mcpu
 /// x86_64_v2` for `-Dcpu=x86_64_v2`) as `native`.
 pub fn nativeTarget(target: []const u8) []const u8 {
     return if (std.mem.eql(u8, target, "native-native") or std.mem.eql(u8, target, @tagName(builtin.cpu.arch) ++ "-native")) "native" else target;
 }
-
 
 /// Resolves `-target` (`opts.bs_target`), or refuses a target bs does
 /// not support. A Linux target resolves as upstream's

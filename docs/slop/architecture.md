@@ -8433,7 +8433,10 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   module's in every module, where upstream gives each module its own.
   `zig build --fuzz` passes `-ffuzz` ahead of the root module and a
   module's `.fuzz` ahead of its `-M`. `-ffuzz` on `build-obj` and
-  `build-lib`, and for aarch64-macos, is `[unsupported]` for now.
+  `build-lib`, and for aarch64-linux and aarch64-macos, is
+  `[unsupported]` for now, decided once every module's flag is known
+  (`parseOptions`' end): the aarch64 backend places no points, and the
+  Mach-O linker defines no section bounds.
 - **The fuzzer is a module family, not a second compilation.** bs
   compiles `<zig lib>/fuzzer.zig` in the same compilation as the program,
   but as its own *module family*: the root `=root@fuzzer` (fuzzer.zig), its
