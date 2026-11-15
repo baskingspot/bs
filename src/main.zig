@@ -3101,7 +3101,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     const macos = opts.bs_target == .aarch64_macos;
     for (libs.items) |q| {
         link_inputs.items[q.at] = try q.find(arena, io, search_dirs.items, macos) orelse {
-            opts.link_error = opts.link_error orelse try std.fmt.allocPrint(arena, "unable to find library '-l{s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_dirs.items) });
+            opts.link_error = opts.link_error orelse try arena.print("unable to find library '-l{s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_dirs.items) });
             continue;
         };
         try found.put(arena, link_inputs.items[q.at], {});
@@ -3114,9 +3114,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         link_inputs.items[q.at] = (if (macos) try findFramework(arena, io, search_frameworks.items, q.name) else null) orelse {
             if (!links_frameworks) continue;
             opts.link_error = opts.link_error orelse if (!macos)
-                try std.fmt.allocPrint(arena, "frameworks are for macOS targets ('-framework {s}')", .{q.name})
+                try arena.print("frameworks are for macOS targets ('-framework {s}')", .{q.name})
             else
-                try std.fmt.allocPrint(arena, "unable to find framework '-framework {s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_frameworks.items) });
+                try arena.print("unable to find framework '-framework {s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_frameworks.items) });
             continue;
         };
     }

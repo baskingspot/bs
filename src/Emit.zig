@@ -1927,7 +1927,7 @@ pub fn asmLabelNames(emit: *const Emit, arena: Allocator) ![]const RtName {
 
 /// The names compiler_rt exports the functions of `atoms` under (atoms
 /// named `compiler_rt.<...>`), as `language`'s compiler_rt does.
-pub fn rtNames(arena: Allocator, language: @import("language.zig").Language, atoms: []const Atom) ![]const RtName {
+pub fn rtNames(arena: Allocator, language: Language, atoms: []const Atom) ![]const RtName {
     var by_key: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty;
     for (atoms) |atom| if (std.mem.startsWith(u8, atom.name, "compiler_rt.")) try by_key.put(arena, atom.key, {});
     var out: std.ArrayList(RtName) = .empty;
