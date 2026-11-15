@@ -5678,8 +5678,45 @@ The other direction, bs's own relocatable output, is new:
   compiler_rt sees `is_test = true`; it reads it only in declarations bs
   does not analyze (exports, its panic handler) and in `@setRuntimeSafety`
   arguments, which bs ignores there.
-- `@memcpy`, `@memset`, and `@memmove` are inlined by CodeGen, not
-  calls. On x86_64 a copy of known size (a struct copy, or `@memcpy` into
+- In a program that defines its own `memcpy`, `memmove` or `memset` in
+  Zig (since 2026-11-14; `Emit.own_mem`), a runtime-length `@memcpy` or
+  `@memmove` (a slice destination, not volatile), and on aarch64 a byte
+  `@memset`, calls that function, as upstream's code does
+  (`CodeGen.memCall`): a direct `bl` or `call` the link binds to the
+  program's export (fastmem's `exportSymbols`). On x86_64 `@memset` stays
+  `rep stosb`, as in upstream's self-hosted backend. As upstream, a
+  function that called `@disableIntrinsics()` (`Ir`, never inlined into
+  another by the backend) and a `-fno-builtin` module
+  (`Frontend.Module.no_builtin`; compiler_rt, ubsan_rt and zigc always)
+  keep the inline lowering below, so no memcpy implementation calls
+  itself. Known sizes stay inline. A program that defines none keeps the
+  inline lowering everywhere (owner, 2026-11-14): calling compiler_rt's
+  or libSystem's functions for every copy, as upstream does, cost fmt
+  13% and hash 8% on x86_64 and fmt 39%, sieve 15% on the Mac for 1% of
+  `.text`, and fastmem's `check_debug.py`, which expects calls in an
+  object that defines none, is left failing.
+  - *Deciding it before analysis.* CodeGen runs while Sema does, so the
+    set is fixed per compilation, and the store keys and donors mix it in
+    (`Incremental.setOwnMem`) and the manifest records it (`own_mem`,
+    ZAPMAN19): a manifest of another set does not replay. The guess is
+    the last build's manifest, else `Emit.predictOwnMem`: an `export`
+    declaration of the name, or the name as a string literal, in a file
+    outside the zig lib directory. After analysis `Emit.ownMemDefined`
+    takes the set from `Zcu.exports` (any linkage); when it differs, the
+    compilation builds again with it (`error.OwnMemRerun`, once). A lazy
+    edit build does not run the exports it keeps, so a program with a
+    nonempty set replays eagerly (`beginReplay`). Exports from C sources,
+    objects or global assembly do not count.
+  - *Cost*, measured 2026-11-14 against 5e12f2c: bench/runtime, which
+    defines none, has byte-identical `.text` on x86_64-linux and
+    identical disassembly on aarch64-macos; compile and run times within
+    noise (±2.5% on x86_64, ±1.2% on the Mac). A program that exports
+    `memcpy` (`export fn memcpy`): a cold build 263 → 277 ms; with a
+    computed export name the guess misses and the cold build takes two,
+    219 → 438 ms; an edit build 16 → 114 ms (eager instead of lazy). The
+    ZIR scan only runs without a manifest.
+- Otherwise `@memcpy`, `@memset`, and `@memmove` are inlined by CodeGen,
+  not calls. On x86_64 a copy of known size (a struct copy, or `@memcpy` into
   a `*[N]T`) is straight 16-byte moves up to 256 bytes, a loop of 64-byte
   blocks and an overlapping last block up to 1 KB, and `rep movsb` above,
   where its start (about 8 ns) stops mattering. A runtime-length

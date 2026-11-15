@@ -6693,6 +6693,18 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 try cg.load(.rsi, data.bin_op.rhs);
                 return cg.copyMem(Mem.at(.rdi, 0), Mem.at(.rsi, 0), a.len * Type.abiSize(cg.ip, a.child));
             }
+            if (cg.memCall(inst)) {
+                // As upstream's self-hosted backend: the C function, with
+                // the destination, source and length in bytes in rdi, rsi
+                // and rdx (`memCall`).
+                const elem_size = try cg.memDest(.rdi, .rdx, data.bin_op.lhs);
+                if (elem_size != 1) try cg.e.imul(.qword, .rdx, .{ .reg = .rdx }, @intCast(elem_size));
+                try cg.load(.rsi, data.bin_op.rhs);
+                const name = @tagName(tag);
+                if (!cg.emit.obj or cg.emit.shared) _ = try cg.emit.requestCompilerRtExport(name);
+                _ = try cg.emit.useExtern(name, false);
+                return cg.e.call(.{ .sym = Emit.externAddrKey(name) });
+            }
             const elem_size = try cg.memDest(.rdi, .rcx, data.bin_op.lhs);
             if (elem_size != 1) try cg.e.imul(.qword, .rcx, .{ .reg = .rcx }, @intCast(elem_size));
             try cg.load(.rsi, data.bin_op.rhs);
@@ -6823,6 +6835,24 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
 /// Loads the pointer of `@memcpy`/`@memset` destination `dest` (a slice
 /// or `*[N]T`) into `ptr` and its length in elements into `len`, and
 /// returns the element size. May use rax.
+/// Whether `@memcpy` or `@memmove` `inst` calls `memcpy` or `memmove`, as
+/// upstream's self-hosted x86_64 backend does for a slice destination
+/// (`@memset` stays `rep stosb`, as there), when the program defines the
+/// function itself (`Emit.own_mem`): it is the one called. Else, and when
+/// volatile, in `@disableIntrinsics()` functions and in `-fno-builtin`
+/// modules (compiler_rt among them), the copy stays inline.
+fn memCall(cg: *CodeGen, inst: Inst.Index) bool {
+    const ip = cg.ip;
+    if (!cg.emit.own_mem.has(@tagName(cg.ir.instructions.items(.tag)[@backingInt(inst)]))) return false;
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    const dst = Type.ptrInfo(ip, cg.typeOf(data.bin_op.lhs));
+    if (dst.flags.size != .slice or dst.flags.is_volatile) return false;
+    if (Type.ptrInfo(ip, cg.typeOf(data.bin_op.rhs)).flags.is_volatile) return false;
+    if (cg.ir.disable_intrinsics) return false;
+    const func = ip.keyPayload(.func, cg.ir.func);
+    return !cg.emit.zcu.fe.module(cg.emit.zcu.file(ip.getNav(func.owner_nav).file).module).no_builtin;
+}
+
 fn memDest(cg: *CodeGen, ptr: Reg, len: Reg, dest: Ref) Error!u64 {
     const ip = cg.ip;
     const p = Type.ptrInfo(ip, cg.typeOf(dest));

@@ -125,6 +125,11 @@ pub const Module = struct {
     /// ReleaseFast and ReleaseSmall (as resolved for it), nor in the
     /// fuzzer's family, which upstream builds ReleaseFast.
     safety: bool = true,
+    /// `-fno-builtin`: CodeGen lowers the module's memory builtins inline,
+    /// never to calls of `memcpy`, `memmove` and `memset`, as upstream's
+    /// LLVM backend does for it. compiler_rt and the C runtimes have it,
+    /// as upstream builds them.
+    no_builtin: bool = false,
     /// `name` is `gpa`'s (an extra builtin's, `ModuleArg.builtin_dir`).
     owned_name: bool = false,
     /// Its C flags (`-I`, `-D`, ...), which Zig 0.16's `@cImport` passes
@@ -164,6 +169,9 @@ pub const ModuleArg = struct {
     optimize: ?std.lang.Optimize = null,
     error_tracing: ?bool = null,
     valgrind: ?bool = null,
+    /// Its `-fno-builtin` (or `-fbuiltin`); after `main.parseOptions`, the
+    /// root module's otherwise.
+    no_builtin: ?bool = null,
     /// The directory of its own generated `builtin.zig`, when those
     /// differ from the root module's, as upstream gives each set of
     /// module options a builtin of its own.
@@ -258,6 +266,8 @@ pub const Options = struct {
     error_tracing: bool = true,
     /// `-O` on the main module, inherited as `fuzz`.
     optimize: std.lang.Optimize = .debug,
+    /// `-fno-builtin` on the main module, inherited as `fuzz`.
+    no_builtin: bool = false,
     /// With `-ffuzz` on an executable: the directory of the fuzzer's
     /// generated `builtin.zig`. The fuzzer (`<lib>/fuzzer.zig`) then joins
     /// the compilation as a module family of its own (docs/slop/architecture.md,
@@ -361,6 +371,9 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     fe.any_error_tracing = options.error_tracing;
     for ([_]Module.Index{ .root, .std, .builtin, fe.main_module }) |m| fe.modules.items[@backingInt(m)].safety = safeMode(options.optimize);
     for (options.modules, first_extra..) |m, k| fe.modules.items[k].safety = safeMode(m.optimize orelse options.optimize);
+    for ([_]Module.Index{ .root, .std, .builtin, fe.main_module }) |m| fe.modules.items[@backingInt(m)].no_builtin = options.no_builtin;
+    for (options.modules, first_extra..) |m, k| fe.modules.items[k].no_builtin = m.no_builtin orelse options.no_builtin;
+    fe.modules.items[@backingInt(Module.Index.compiler_rt)].no_builtin = true;
     for (options.modules, first_extra..) |m, k| {
         const et = m.error_tracing orelse options.error_tracing;
         fe.modules.items[k].error_tracing = et;
@@ -406,11 +419,11 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     }
     if (options.c_runtimes) {
         fe.ubsan_rt = @fromBackingInt(@intCast(fe.modules.items.len));
-        try fe.modules.append(gpa, .{ .name = "=ubsan_rt", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "ubsan_rt.zig"), .cache = .global, .error_tracing = options.error_tracing });
+        try fe.modules.append(gpa, .{ .name = "=ubsan_rt", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "ubsan_rt.zig"), .cache = .global, .error_tracing = options.error_tracing, .no_builtin = true });
     }
     if (options.zigc) {
         fe.zigc = @fromBackingInt(@intCast(fe.modules.items.len));
-        try fe.modules.append(gpa, .{ .name = "=zigc", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "c.zig"), .cache = .global, .error_tracing = options.error_tracing });
+        try fe.modules.append(gpa, .{ .name = "=zigc", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "c.zig"), .cache = .global, .error_tracing = options.error_tracing, .no_builtin = true });
     }
     return fe;
 }

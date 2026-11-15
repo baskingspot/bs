@@ -59,6 +59,8 @@ panic_ns: Index = .none,
 unwrap_err: Ref = .none,
 /// `@disableInstrumentation()` ran in `func`'s body (`Ir.disable_instrumentation`).
 disable_instrumentation: bool = false,
+/// `@disableIntrinsics()` ran in `func`'s body (`Ir.disable_intrinsics`).
+disable_intrinsics: bool = false,
 /// The member body of a container that its layout or defaults are
 /// evaluating (`resolveMemberBody`): the anonymous types it makes are
 /// numbered from its start.
@@ -2135,6 +2137,7 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
         .rbrace_line = src_locs.rbrace_line,
         .rbrace_column = @as(u16, @truncate(src_locs.columns >> 16)),
         .disable_instrumentation = sema.disable_instrumentation,
+        .disable_intrinsics = sema.disable_intrinsics,
     };
     _ = &ir;
     return ir;
@@ -6077,8 +6080,13 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             if (sema.func != .none) sema.disable_instrumentation = true;
             break :blk .void_value;
         },
-        // Intrinsics are not something bs emits.
-        .disable_intrinsics => .void_value,
+        // As upstream, the runtime function being analyzed (through any
+        // inline calls) lowers its memory builtins without calls of
+        // `memcpy`, `memmove` and `memset`.
+        .disable_intrinsics => blk: {
+            if (sema.func != .none) sema.disable_intrinsics = true;
+            break :blk .void_value;
+        },
         // Zig 0.16's superset opcodes; 0.17's AstGen never emits them.
         .array_mul => sema.zirArrayMul(block, ext.operand),
         .validate_deref => blk: {

@@ -1093,7 +1093,8 @@ fn callFree(cg: *CodeGen, inst: Inst.Index) bool {
         .is_null, .is_non_null, .is_err, .is_non_err, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set, .wrap_optional => true,
         .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => true,
         .wrap_errunion_payload, .wrap_errunion_err, .aggregate_init, .union_init, .get_union_tag, .set_union_tag => true,
-        .memcpy, .memmove, .memset, .int_from_bool, .int_from_ptr, .ret_addr, .frame_addr => true,
+        .memcpy, .memmove, .memset => !cg.memCall(inst),
+        .int_from_bool, .int_from_ptr, .ret_addr, .frame_addr => true,
         .save_err_return_trace_index, .err_return_trace, .set_err_return_trace => true,
         // Unless the template calls; a system call keeps v0-v31.
         .assembly => !asmCalls(cg.ip.stringSlice(ir.extraData(Ir.Asm, data.ty_pl.payload).data.source)),
@@ -3621,7 +3622,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.load(.x9, data.bin_op.rhs);
             try cg.storeBytes(.at(.x12, @intCast(layout.tag_offset)), .x9, layout.tag_size);
         },
-        .memcpy, .memmove => {
+        .memcpy, .memmove, .memset => if (cg.memCall(inst)) {
+            return cg.callMem(tag, data);
+        } else if (tag == .memset) {
+            try cg.memset(data);
+        } else {
             const elem_size = try cg.memDest(.x13, .x11, data.bin_op.lhs);
             if (elem_size != 1) {
                 try cg.e.movImm(.x, .x9, elem_size);
@@ -3630,7 +3635,6 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.load(.x14, data.bin_op.rhs);
             try cg.copyBytes(tag == .memmove);
         },
-        .memset => try cg.memset(data),
         .clz, .ctz, .popcount, .byte_swap, .bit_reverse => {
             const ty = data.ty_op.ty;
             const src_ty = cg.typeOf(data.ty_op.operand);
@@ -3681,6 +3685,60 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             else => |e| return e,
         },
     }
+}
+
+/// Whether `@memcpy`, `@memmove` or `@memset` `inst` calls `memcpy`,
+/// `memmove` or `memset`, as upstream's backends do for a length known
+/// only at run time (its self-hosted aarch64 backend for every length,
+/// LLVM for those it does not expand): a slice destination, of bytes for
+/// `memset`, not volatile, outside `@disableIntrinsics()` functions and
+/// `-fno-builtin` modules (compiler_rt among them), and only when the
+/// program defines the function itself (`Emit.own_mem`, fastmem's): it is
+/// the one called. Else the copy stays inline.
+fn memCall(cg: *CodeGen, inst: Inst.Index) bool {
+    const ip = cg.ip;
+    if (!cg.emit.own_mem.has(@tagName(cg.ir.instructions.items(.tag)[@backingInt(inst)]))) return false;
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    const dst = Type.ptrInfo(ip, cg.typeOf(data.bin_op.lhs));
+    if (dst.flags.size != .slice or dst.flags.is_volatile) return false;
+    switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .memset => if (Type.abiSize(ip, dst.child) != 1) return false,
+        else => if (Type.ptrInfo(ip, cg.typeOf(data.bin_op.rhs)).flags.is_volatile) return false,
+    }
+    if (cg.ir.disable_intrinsics) return false;
+    const func = ip.keyPayload(.func, cg.ir.func);
+    return !cg.emit.zcu.fe.module(cg.emit.zcu.file(ip.getNav(func.owner_nav).file).module).no_builtin;
+}
+
+/// `@memcpy`, `@memmove` or `@memset` as a call of the C function of that
+/// name (`memCall`): destination, source or byte, and length in bytes in
+/// x0-x2.
+fn callMem(cg: *CodeGen, tag: Inst.Tag, data: Inst.Data) Error!void {
+    const elem_size = try cg.memDest(.x0, .x2, data.bin_op.lhs);
+    if (elem_size != 1) {
+        try cg.e.movImm(.x, .x9, elem_size);
+        try cg.e.mul(.x, .x2, .x2, .x9);
+    }
+    if (tag == .memset) {
+        const elem = data.bin_op.rhs;
+        if (elem.toInterned()) |v| if (cg.ip.keyTag(v) == .undef) {
+            try cg.e.movImm(.x, .x1, 0xaa);
+        } else try cg.load(.x1, elem) else try cg.load(.x1, elem);
+    } else try cg.load(.x1, data.bin_op.rhs);
+    try cg.saveTrace();
+    const name = @tagName(tag);
+    if (cg.ip.target == .aarch64_macos) {
+        // libSystem's, through its slot.
+        try cg.callExtern(name);
+    } else {
+        // A direct call, as upstream's: the link binds it to the program's
+        // export, an input's definition or compiler_rt's (`externTarget`),
+        // and an object leaves it to the symbol of that name.
+        if (!cg.emit.obj or cg.emit.shared) _ = try cg.emit.requestCompilerRtExport(name);
+        _ = try cg.emit.useExtern(name, false);
+        try cg.e.bl(.{ .sym = Emit.externAddrKey(name) });
+    }
+    try cg.restoreTrace();
 }
 
 /// Loads the pointer of `@memcpy`/`@memset` destination `dest` (a slice

@@ -70,6 +70,13 @@ lock: Io.File,
 /// entries are shared by every project built by the same bs for the same
 /// target.
 store_seed: Hash,
+/// `Emit.own_mem` of the build (`setOwnMem`), which decides code that the
+/// store's keys do not: mixed into `store_seed` and `donor_key`, and
+/// recorded in the manifest, whose replay needs the same.
+own_mem: Emit.OwnMem = .{},
+/// `store_seed` and `donor_key` without `own_mem` mixed in.
+base_store_seed: Hash,
+base_donor_key: Hash,
 /// The target's architecture, whose unwind records cached atoms must have.
 arch: Atom.Unwind.Arch,
 /// Taken before the inputs are read; inputs modified after it are
@@ -240,8 +247,10 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .dir = dir,
         .lock = lock,
         .store_seed = store_seed,
+        .base_store_seed = store_seed,
         .language = lang,
-        .donor_key = try donorKey(gpa, io, store_seed, zig_lib_dir, root_name, tests_std, args),
+        .donor_key = undefined,
+        .base_donor_key = try donorKey(gpa, io, store_seed, zig_lib_dir, root_name, tests_std, args),
         .donor_tag_seed = donorTagSeed(args),
         .arch = if (std.mem.startsWith(u8, target, "aarch64")) .aarch64 else .x86_64,
         .build_start = build_start,
@@ -249,11 +258,39 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .local_is_global = local_is_global,
         .trusted_lib = try trustedLib(gpa, io, zig_lib_dir, trusted_lib),
     };
+    inc.donor_key = inc.base_donor_key;
     inc.prev = Manifest.open(gpa, io, dir) catch |err| prev: {
         if (timing) std.debug.print("cache: unable to open the manifest: {t}\n", .{err});
         break :prev null;
     };
     return inc;
+}
+
+/// The last build's `Emit.own_mem`, if it recorded one.
+pub fn prevOwnMem(inc: *const Incremental) ?Emit.OwnMem {
+    if (inc.donor != null) return null;
+    const m = if (inc.prev) |*m| m else return null;
+    return @bitCast(@as(u3, @truncate(m.own_mem)));
+}
+
+/// Sets the build's `Emit.own_mem`, before `useDonor` and `beginReplay`:
+/// the store keys and donors it uses are that set's, and a manifest of
+/// another set does not replay. A donor taken for another set is dropped.
+pub fn setOwnMem(inc: *Incremental, m: Emit.OwnMem) void {
+    if (inc.donor != null and m != inc.own_mem) {
+        inc.prev.?.close(inc.gpa, inc.io);
+        inc.prev = null;
+        inc.donor = null;
+    }
+    inc.own_mem = m;
+    const bits: u3 = @bitCast(m);
+    if (bits == 0) {
+        inc.store_seed = inc.base_store_seed;
+        inc.donor_key = inc.base_donor_key;
+        return;
+    }
+    inc.store_seed = cache.hash(bits, std.mem.asBytes(&inc.base_store_seed));
+    inc.donor_key = cache.hash(bits, std.mem.asBytes(&inc.base_donor_key));
 }
 
 /// `zig_lib_dir` resolved, if it is `trusted`: the default one
@@ -1554,6 +1591,10 @@ fn noRelink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) bo
 pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emit, mode: []const u8) !void {
     const m = if (inc.prev) |*m| m else return;
     if (std.mem.eql(u8, mode, "off") or inc.verify == .full) return;
+    if (m.own_mem != @as(u3, @bitCast(inc.own_mem))) {
+        if (inc.timing) std.debug.print("cache: not replaying: the last build called other memory functions of the program's\n", .{});
+        return;
+    }
     // A build whose objects or archives or shared libraries changed
     // records in full (`linkInputsChanged`, `link_objects_pending`), and so
     // does a donor's with project inputs: the log would keep the donor's
@@ -1565,7 +1606,10 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     // differs from, and fail to link with it.
     const rebound = has_inputs and inc.baseRebound(.{ m.id, m.pack_id });
     if (rebound and inc.timing) std.debug.print("cache: replaying eagerly: the last relink bound the extern slots to changed objects\n", .{});
-    const lazy = !rebound and !std.mem.eql(u8, mode, "eager") and
+    // A lazy build does not run the exports it keeps, so it cannot tell
+    // whether the program still defines the memory functions its code
+    // calls (`Emit.ownMemDefined`); an eager one runs them all.
+    const lazy = !rebound and !std.mem.eql(u8, mode, "eager") and @as(u3, @bitCast(inc.own_mem)) == 0 and
         (!has_inputs or (!inc.link_objects_pending and if (inc.donor == null) !try inc.linkInputsChanged(m) else try inc.donorSharesLinkInputs(m)));
     const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy, inc.donor != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -4323,6 +4367,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     b.item_starts = enc.starts.items;
     b.entry = if (emit.entry) |e| @backingInt(e) else 0;
     b.output = inc.output;
+    b.own_mem = @as(u3, @bitCast(inc.own_mem));
     for (emit.exports.items) |x| try b.addLinkSymbol(.@"export", @backingInt(x.key), x.name, @as(u32, @intFromBool(x.visibility == .hidden)) | @as(u32, @intFromBool(x.weak)) << 1 | @as(u32, @intFromBool(x.visibility == .protected)) << 2);
     // The names compiler_rt exports its linked functions under, which a
     // relink lists without reading every atom's name (`Emit.aliasSymbols`).

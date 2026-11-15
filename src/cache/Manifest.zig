@@ -86,6 +86,9 @@ pack_id: Hash,
 entry: Hash,
 /// What the build linked.
 output: Output,
+/// `Emit.own_mem` of the build, as its bits: whose memory builtins its
+/// code calls.
+own_mem: u32,
 /// The entry's number, and how many numbers the base uses.
 entry_symbol: u32,
 /// How many base nodes are `unlinked`.
@@ -544,6 +547,7 @@ const Header = extern struct {
     /// How many nodes are `unlinked`.
     unlinked: u32 = 0,
     output: Output = .exe,
+    own_mem: u32 = 0,
     id: Hash,
     pack_id: Hash,
     entry: Hash,
@@ -775,6 +779,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
     m.pack_id = h.pack_id;
     m.entry = h.entry;
     m.output = h.output;
+    m.own_mem = h.own_mem;
     m.entry_symbol = h.entry_symbol;
     m.base_unlinked = h.unlinked;
     m.symbol_len = h.symbol_len;
@@ -1832,6 +1837,7 @@ pub const Builder = struct {
     strings: std.ArrayList(u8) = .empty,
     entry: Hash = 0,
     output: Output = .exe,
+    own_mem: u32 = 0,
     link_symbols: std.ArrayList(LinkSymbol) = .empty,
     /// Each number's key.
     symbol_keys: std.ArrayList(Hash) = .empty,
@@ -1883,7 +1889,7 @@ pub const Builder = struct {
     /// Starts from `base` with its log applied. `base` must stay open while
     /// the builder is used.
     pub fn initFrom(gpa: Allocator, base: *const Manifest) !Builder {
-        var b: Builder = .{ .gpa = gpa, .base = base, .entry = base.entry, .output = base.output };
+        var b: Builder = .{ .gpa = gpa, .base = base, .entry = base.entry, .output = base.output, .own_mem = base.own_mem };
         errdefer b.deinit();
         try b.nodes.appendSlice(gpa, base.nodes);
         try b.edges.appendSlice(gpa, base.edges);
@@ -2475,6 +2481,7 @@ pub const Builder = struct {
             .pack_id = pack_id,
             .entry = b.entry,
             .output = b.output,
+            .own_mem = b.own_mem,
             .symbol_len = next,
             .entry_symbol = entry_symbol,
             .unlinked = n_unlinked: {

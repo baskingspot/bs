@@ -27,6 +27,10 @@ rbrace_column: u32 = 0,
 /// The body called `@disableInstrumentation()`: no coverage points under
 /// `-ffuzz`.
 disable_instrumentation: bool = false,
+/// The body called `@disableIntrinsics()`: its memory builtins are lowered
+/// inline, never to calls of `memcpy`, `memmove` and `memset`, and the
+/// backend inliner leaves it alone, so that its builtins stay inline.
+disable_intrinsics: bool = false,
 /// Callees of calls in this IR that return a slice whose length is one
 /// of their arguments (`inline.retLen`), owned. Set by Emit, read by
 /// prove.

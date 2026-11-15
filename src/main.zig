@@ -282,6 +282,10 @@ pub const Options = struct {
     /// Why bs cannot build what the options ask for (a release mode, C
     /// sources, LLVM), as a diagnostic's message: the first such option.
     unsupported: ?[]const u8 = null,
+    /// The root module's `-fno-builtin` (each other module's is in
+    /// `modules`): CodeGen lowers its memory builtins inline, never to
+    /// calls of `memcpy`, `memmove` and `memset`.
+    no_builtin: bool = false,
     /// The name of the first `-M` module (the root module, or under `bs
     /// test` the module under test), which other modules' `--dep`s name.
     root_name: []const u8 = "root",
@@ -507,7 +511,9 @@ pub fn main(init_std: std.process.Init) !void {
 /// generated for every function, follows the target as `@<model>` and its
 /// feature words (`cpu.cacheName`). A backend other than upstream's Debug
 /// default for the target (`Options.zigBackend`: `-fno-llvm` on aarch64),
-/// which changes what Sema accepts (tail calls), follows as `=<backend>`.
+/// which changes what Sema accepts (tail calls) and how
+/// memory builtins are lowered, follows as `=<backend>`, and modules with
+/// `-fno-builtin` as `=nobuiltin` (the root) and `=<name>:[no]builtin`.
 fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.process.Environ.Map) ![]const u8 {
     const inl = inlining(env);
     const default_inl = inl.budget == inline_ir.budget and !inl.safe;
@@ -520,7 +526,10 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
     const cpu_name = try cpu_mod.cacheName(arena, opts.cpu, cpu_mod.targetDefault(opts.bs_target.arch(), opts.bs_target == .aarch64_macos));
     const backend = opts.zigBackend();
     const default_backend: std.lang.CompilerBackend = if (opts.bs_target == .x86_64_linux) .stage2_x86_64 else .stage2_llvm;
-    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on and forward_on and cpu_name.len == 0 and backend == default_backend) return opts.bs_target.name();
+    const builtins = !opts.no_builtin and for (opts.modules) |m| {
+        if (m.no_builtin.?) break false;
+    } else true;
+    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on and forward_on and cpu_name.len == 0 and backend == default_backend and builtins) return opts.bs_target.name();
     var s: std.ArrayList(u8) = .empty;
     try s.appendSlice(arena, opts.bs_target.name());
     try s.appendSlice(arena, cpu_name);
@@ -538,6 +547,8 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
         if (m.optimize.? == opts.optimize and m.error_tracing.? == opts.error_tracing and m.valgrind.? == opts.valgrind) continue;
         try s.print(arena, "={s}:{t}{c}{c}", .{ m.name, m.optimize.?, "nt"[@intFromBool(m.error_tracing.?)], "nv"[@intFromBool(m.valgrind.?)] });
     }
+    if (opts.no_builtin) try s.appendSlice(arena, "=nobuiltin");
+    for (opts.modules) |m| if (m.no_builtin.? != opts.no_builtin) try s.print(arena, "={s}:{s}", .{ m.name, if (m.no_builtin.?) "nobuiltin" else "builtin" });
     if (!default_inl) try s.print(arena, "+inline{d}{s}", .{ inl.budget, if (inl.safe) "s" else "" });
     if (!prove_on) try s.appendSlice(arena, "+noprove");
     if (!forward_on) try s.appendSlice(arena, "+noforward");
@@ -909,6 +920,9 @@ fn compileJob(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, o
     // A build whose analysis read a type name that then changed builds
     // again with the first attempt's final names (`Zcu.finalizeNames`).
     var pins: ?*const Zcu.NamePins = null;
+    // A build whose analysis found that the program defines other memory
+    // functions than predicted builds again with those (`Emit.own_mem`).
+    var own_mem: ?Emit.OwnMem = null;
     // C sources compile while the build analyzes, once for every attempt.
     const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0 or cxxRuntime(&job.opts) or libcNonshared(&job.opts) or linksMusl(&job.opts)) try startC(init, job) else null;
     defer if (c_batch) |b| CSource.destroy(b);
@@ -920,13 +934,13 @@ fn compileJob(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, o
         i.link_runtime_from = job.link_objects.len;
         i.link_archives_from = i.link_objects.len - b.archives.len;
     };
-    while (true) return compileReplaying(init, job, inc_opt, if (rec) |*r| r else null, out_path, alt_path, prog, inputs, replay_mode, &pins, c_batch, lint_cfg, &lint_state) catch |err| switch (err) {
+    while (true) return compileReplaying(init, job, inc_opt, if (rec) |*r| r else null, out_path, alt_path, prog, inputs, replay_mode, &pins, &own_mem, c_batch, lint_cfg, &lint_state) catch |err| switch (err) {
         error.LazyFallback => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             replay_mode = "eager";
             continue;
         },
-        error.NamesRerun => {
+        error.NamesRerun, error.OwnMemRerun => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             continue;
         },
@@ -1328,7 +1342,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
     });
 }
 
-fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, rec: ?*InputsRecord, out_path: ?[]const u8, alt_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode_in: []const u8, pins: *?*const Zcu.NamePins, c_batch: ?*CSource.Batch, lint_cfg: ?*const LintConfig, lint_state: *LintState) !Outcome {
+fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, rec: ?*InputsRecord, out_path: ?[]const u8, alt_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode_in: []const u8, pins: *?*const Zcu.NamePins, own_mem: *?Emit.OwnMem, c_batch: ?*CSource.Batch, lint_cfg: ?*const LintConfig, lint_state: *LintState) !Outcome {
     var replay_mode = replay_mode_in;
     const arena = init.arena.allocator();
     const opts = job.opts;
@@ -1386,6 +1400,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .fuzz = opts.root_fuzz,
         .error_tracing = opts.error_tracing,
         .optimize = opts.optimize,
+        .no_builtin = opts.no_builtin,
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
         // Only executables link the C runtimes; a library's C objects
         // reach them when an executable links the library, as upstream's.
@@ -1467,6 +1482,9 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         i.lint_sig = sig;
         if (i.prev != null and !std.meta.eql(lint_state.prev_sema_sig, sig)) replay_mode = "off";
     };
+    // Fixed before the cache picks what to replay, which depends on it.
+    const own_mem_now = own_mem.* orelse (if (inc_opt) |i| i.prevOwnMem() else null) orelse Emit.predictOwnMem(&fe);
+    if (inc_opt) |i| i.setOwnMem(own_mem_now);
     if (inc_opt) |i| if (!std.mem.eql(u8, replay_mode, "off")) try i.useDonor(&fe);
     if (inc_opt) |i| try i.seedErrors(&zcu);
     if (opts.dump_ir) {
@@ -1484,6 +1502,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     var emit: Emit = .init(init.gpa, &zcu);
     defer emit.deinit();
     emit.obj = opts.command.isObj() or opts.command == .build_lib;
+    emit.own_mem = own_mem_now;
     emit.pic = if (opts.pie) .pie else if (opts.pic) .pic else .none;
     emit.shared = opts.dynamic;
     if (opts.dynamic) emit.soname = switch (opts.soname) {
@@ -1643,6 +1662,15 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         pins.* = p;
         if (inc_opt) |i| i.endReplay();
         return error.NamesRerun;
+    }
+    // Once: the second build fixes the set to what the first one found.
+    if (own_mem.* == null and !zcu.failed()) {
+        const defined = Emit.ownMemDefined(&zcu);
+        if (defined != own_mem_now) {
+            own_mem.* = defined;
+            if (inc_opt) |i| i.endReplay();
+            return error.OwnMemRerun;
+        }
     }
     // Sema's lint findings fail the build with AstGen's errors and the
     // syntax pass's findings.
@@ -2734,6 +2762,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
                     .path = spec[eq.? + 1 ..],
                     .deps = try deps.toOwnedSlice(arena),
                     .cc_argv = module_cc,
+                    .no_builtin = c_flags.no_builtin,
                     .fuzz = fuzz,
                     .optimize = mode.optimize,
                     .error_tracing = mode.error_tracing,
@@ -3044,6 +3073,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     }
     if (c_owned != c_files.items.len and opts.unsupported == null) fatal("C source file '{s}' has no parent module", .{c_files.items[c_owned].path});
     for (c_files.items) |*f| f.flags = f.flags.inherit(root_c_flags orelse .{});
+    // `-fno-builtin` for Zig code too, as upstream's `Module.create`
+    // resolves it: unset takes the root module's.
+    opts.no_builtin = (root_c_flags orelse CSource.Flags{}).no_builtin orelse false;
+    for (modules.items) |*m| m.no_builtin = m.no_builtin orelse opts.no_builtin;
     opts.c_sources = c_files.items;
     opts.c_global_cc_argv = cc_argv.items;
     // As upstream, a root file given without `-M` names its module "test"

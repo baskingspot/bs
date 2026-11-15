@@ -100,6 +100,13 @@ entry: ?SymbolKey = null,
 /// no entry, its exports are symbols for other objects, and symbols it
 /// does not define are imported from them.
 obj: bool = false,
+/// Which of `memcpy`, `memmove` and `memset` the program defines in Zig
+/// (`ownMemDefined`): only those do `@memcpy`, `@memmove` and `@memset`
+/// call (`CodeGen.memCall`); the others stay inline. Fixed for the whole
+/// compilation, before analysis: `main.compileReplaying` predicts it
+/// (`predictOwnMem`, or the last build's manifest), and builds again
+/// with the real set when analysis finds another.
+own_mem: OwnMem = .{},
 /// How code reaches thread-locals: `.pic` is position-independent code
 /// that may end up in a shared object (`-fPIC`), which uses the
 /// local-dynamic model; `.pie` and `.none` use local-exec. `.pic` and
@@ -442,6 +449,65 @@ pub const ImportFlags = struct {
     }
 };
 
+/// `Emit.own_mem`: a set of the memory functions.
+pub const OwnMem = packed struct(u3) {
+    memcpy: bool = false,
+    memmove: bool = false,
+    memset: bool = false,
+
+    pub fn has(m: OwnMem, name: []const u8) bool {
+        const b = bit(name) orelse return false;
+        return @as(u3, @bitCast(m)) & b != 0;
+    }
+
+    fn add(m: *OwnMem, name: []const u8) void {
+        if (bit(name)) |b| m.* = @bitCast(@as(u3, @bitCast(m.*)) | b);
+    }
+
+    fn bit(name: []const u8) ?u3 {
+        if (std.mem.eql(u8, name, "memcpy")) return 1;
+        if (std.mem.eql(u8, name, "memmove")) return 2;
+        if (std.mem.eql(u8, name, "memset")) return 4;
+        return null;
+    }
+};
+
+/// The memory functions the program exports from Zig, under any linkage:
+/// what `own_mem` must be once analysis is done. Exports are effects that
+/// an edit build always analyzes again, so the list is complete then.
+pub fn ownMemDefined(zcu: *const Zcu) OwnMem {
+    const ip = &zcu.ip;
+    var m: OwnMem = .{};
+    for (zcu.exports.items) |x| {
+        if (x.target == .nav and ip.getNav(x.target.nav).status != .resolved) continue;
+        m.add(ip.stringSlice(x.name));
+    }
+    return m;
+}
+
+/// A first guess at `ownMemDefined` before analysis, from the ZIR of the
+/// files outside the zig lib directory: an `export` declaration of the
+/// name, or the name as a string literal (`@export(f, .{ .name =
+/// "memcpy" })`). A wrong guess costs a second build, not correctness.
+pub fn predictOwnMem(fe: *const Frontend) OwnMem {
+    var m: OwnMem = .{};
+    for (fe.files.items, 0..) |*f, i| {
+        if (fe.module(f.module).cache == .global) continue;
+        const zir = &fe.file(@fromBackingInt(@intCast(i))).zir;
+        // Such a build fails before it generates anything.
+        if (zir.hasCompileErrors()) continue;
+        for (zir.instructions.items(.tag), zir.instructions.items(.data), 0..) |tag, data, inst| switch (tag) {
+            .str => m.add(data.str.get(zir.*)),
+            .declaration => {
+                const d = zir.getDeclaration(@fromBackingInt(@intCast(inst)));
+                if (d.linkage == .@"export") m.add(zir.nullTerminatedString(d.name));
+            },
+            else => {},
+        };
+    }
+    return m;
+}
+
 /// `Zcu.exports` as CodeGen may read them: a worker's snapshot, taken when
 /// Sema handed over its function, or the live list on the main Emit.
 pub const ExportsView = struct {
@@ -710,6 +776,7 @@ pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64, late: bool) !void {
         w.* = .init(gpa, emit.zcu);
         w.is_worker = true;
         w.obj = emit.obj;
+        w.own_mem = emit.own_mem;
         w.fuzz = emit.fuzz;
         w.prove_on = emit.prove_on;
         w.forward_on = emit.forward_on;
@@ -838,6 +905,8 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
     defer sites.deinit(gpa);
     var s = try inline_ir.scan(gpa, zcu, &ir, &sites);
     if (emit.inline_safe and s.panics) s.inlinable = false;
+    // Its memory builtins stay inline only in its own body (`Ir.disable_intrinsics`).
+    if (ir.disable_intrinsics) s.inlinable = false;
     const ret_len = inline_ir.retLen(&zcu.ip, &ir);
     if (ret_len) |k| try emit.ret_lens.put(gpa, func, k);
     // Every candidate call reads its callee's `func_inline`, inlined or
