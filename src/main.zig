@@ -286,6 +286,9 @@ pub const Options = struct {
     /// `modules`): CodeGen lowers its memory builtins inline, never to
     /// calls of `memcpy`, `memmove` and `memset`.
     no_builtin: bool = false,
+    /// Some module's C is compiled with `-fsanitize-c=full`, upstream's
+    /// condition for linking ubsan_rt (`Frontend.Options.ubsan_rt`).
+    sanitize_c_full: bool = false,
     /// The name of the first `-M` module (the root module, or under `bs
     /// test` the module under test), which other modules' `--dep`s name.
     root_name: []const u8 = "root",
@@ -1409,6 +1412,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         // before 2.4 lacks it, and upstream's then comes from compiler_rt.
         .c_runtimes = !opts.objects_only and ((!opts.command.isObj() and opts.command != .build_lib) or opts.dynamic) and (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp) and
             !(plain and (opts.bs_target == .aarch64_macos or opts.glibc_version != null and opts.glibc_version.?.order(.{ .major = 2, .minor = 4, .patch = 0 }) != .lt)),
+        .ubsan_rt = opts.sanitize_c_full,
         .zigc = linksMusl(&opts),
     });
     defer fe.deinit();
@@ -2763,6 +2767,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
                     .deps = try deps.toOwnedSlice(arena),
                     .cc_argv = module_cc,
                     .no_builtin = c_flags.no_builtin,
+                    .sanitize_c = c_flags.sanitize_c,
                     .fuzz = fuzz,
                     .optimize = mode.optimize,
                     .error_tracing = mode.error_tracing,
@@ -3125,6 +3130,14 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // Mac, whose linker defines the bounds it imports).
     if (opts.fuzz and opts.bs_target != .x86_64_linux)
         setUnsupported(&opts, "bs does not instrument code for fuzzing on {s} yet ('-ffuzz'); build this step with upstream zig", arena, .{opts.bs_target.name()});
+    // As upstream's `Compilation.create` resolves `any_sanitize_c`: each
+    // module's `-fsanitize-c`, else the root's, else its mode's default.
+    const root_sanitize = (root_c_flags orelse CSource.Flags{}).sanitize_c;
+    const root_flags_c: CSource.Flags = .{ .sanitize_c = root_sanitize, .optimize = opts.optimize };
+    opts.sanitize_c_full = root_flags_c.sanitizeC() == .full or for (modules.items) |m| {
+        const f: CSource.Flags = .{ .sanitize_c = m.sanitize_c orelse root_sanitize, .optimize = m.optimize.? };
+        if (f.sanitizeC() == .full) break true;
+    } else false;
     return opts;
 }
 

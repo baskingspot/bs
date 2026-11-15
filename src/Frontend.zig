@@ -76,11 +76,13 @@ fuzzer_root: ?Module.Index = null,
 /// `Config.any_error_tracing`: only then do functions other than `.auto`
 /// ones set up a trace for their `.auto` callees.
 any_error_tracing: bool = true,
-/// With `Options.c_runtimes`: the module of `<lib>/ubsan_rt.zig`, whose
-/// `__ubsan_handle_*` exports `zig cc`'s Debug objects call. It shares
-/// the main std and builtin. compiler_rt's `ssp_sub_path` is a root then
-/// too, for `__stack_chk_fail` and `__stack_chk_guard`.
+/// With `Options.c_runtimes` and `Options.ubsan_rt`: the module of
+/// `<lib>/ubsan_rt.zig`, whose `__ubsan_handle_*` exports `zig cc`'s
+/// Debug objects call. It shares the main std and builtin.
 ubsan_rt: ?Module.Index = null,
+/// With `Options.c_runtimes`: compiler_rt's `ssp_sub_path` is a root, for
+/// `__stack_chk_fail` and `__stack_chk_guard`.
+ssp_root: bool = false,
 /// With `Options.zigc`: the module of `<lib>/c.zig`, upstream's libc in
 /// Zig, whose weak exports (`memcpy`, `malloc`, the math functions and
 /// others) replace the musl sources that libc.a leaves out. It shares
@@ -172,6 +174,8 @@ pub const ModuleArg = struct {
     /// Its `-fno-builtin` (or `-fbuiltin`); after `main.parseOptions`, the
     /// root module's otherwise.
     no_builtin: ?bool = null,
+    /// Its `-fsanitize-c` mode, if given (`main.Options.sanitize_c_full`).
+    sanitize_c: ?std.zig.SanitizeC = null,
     /// The directory of its own generated `builtin.zig`, when those
     /// differ from the root module's, as upstream gives each set of
     /// module options a builtin of its own.
@@ -277,6 +281,10 @@ pub const Options = struct {
     /// compilation for their exports, as upstream links them for C code
     /// (`c_runtimes`).
     c_runtimes: bool = false,
+    /// Some module's C is compiled with `-fsanitize-c=full` (upstream's
+    /// `any_sanitize_c == .full`, its condition for linking ubsan_rt): with
+    /// `c_runtimes`, ubsan_rt joins the compilation.
+    ubsan_rt: bool = false,
     /// An executable or test linking musl statically (`zigc`), as
     /// upstream's `target_util.wantsZigC`.
     zigc: bool = false,
@@ -417,7 +425,8 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         }
         fe.fuzzer_root = root;
     }
-    if (options.c_runtimes) {
+    fe.ssp_root = options.c_runtimes;
+    if (options.c_runtimes and options.ubsan_rt) {
         fe.ubsan_rt = @fromBackingInt(@intCast(fe.modules.items.len));
         try fe.modules.append(gpa, .{ .name = "=ubsan_rt", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "ubsan_rt.zig"), .cache = .global, .error_tracing = options.error_tracing, .no_builtin = true });
     }
@@ -484,7 +493,7 @@ pub fn cImportFile(fe: *Frontend, parent: Module.Index, dir: []const u8) !?File.
     return fe.loadFile(mod, "cimport.zig");
 }
 
-/// compiler_rt's stack protector, a root with `ubsan_rt` (`c_runtimes`).
+/// compiler_rt's stack protector, a root with C objects (`ssp_root`).
 pub const ssp_sub_path = "compiler_rt/ssp.zig";
 
 fn addModule(fe: *Frontend, name: []const u8, root_src_path: []const u8, cache: CacheKind) !void {
@@ -1648,8 +1657,11 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
     }
     if (fe.ubsan_rt) |u| {
         roots[n] = .{ .module = u, .sub_path = fe.module(u).root_file };
-        roots[n + 1] = .{ .module = .compiler_rt, .sub_path = ssp_sub_path };
-        n += 2;
+        n += 1;
+    }
+    if (fe.ssp_root) {
+        roots[n] = .{ .module = .compiler_rt, .sub_path = ssp_sub_path };
+        n += 1;
     }
     if (fe.zigc) |z| {
         roots[n] = .{ .module = z, .sub_path = fe.module(z).root_file };

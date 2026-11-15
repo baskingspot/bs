@@ -1167,9 +1167,9 @@ pub fn createContainerType(
     var comptime_ordinal: u32 = 0;
     var unnamed_tests: u32 = 0;
     // compiler_rt's export blocks are not analyzed, except the stack
-    // protector's when it is a root (`Frontend.ubsan_rt`).
+    // protector's when it is a root (`Frontend.ssp_root`).
     const f = zcu.file(file_index);
-    const skip_comptime = f.module == .compiler_rt and !(zcu.fe.ubsan_rt != null and std.mem.eql(u8, f.sub_path, Frontend.ssp_sub_path));
+    const skip_comptime = f.module == .compiler_rt and !(zcu.fe.ssp_root and std.mem.eql(u8, f.sub_path, Frontend.ssp_sub_path));
     for (decls) |decl_inst| {
         const d = zir.getDeclaration(decl_inst);
         const simple: []const u8 = switch (d.kind) {
@@ -1939,7 +1939,7 @@ pub fn rootFiles(zcu: *Zcu) [8]?u32 {
         if (fuzzer) |r| zcu.moduleRootFile(r) else null,
         if (fuzzer) |r| zcu.moduleRootFile(zcu.fe.module(r).std_mod) else null,
         if (ubsan_rt) |r| zcu.moduleRootFile(r) else null,
-        if (ubsan_rt != null) zcu.moduleFile(.compiler_rt, Frontend.ssp_sub_path) else null,
+        if (zcu.fe.ssp_root) zcu.moduleFile(.compiler_rt, Frontend.ssp_sub_path) else null,
         if (zcu.fe.zigc) |z| zcu.moduleRootFile(z) else null,
     };
 }
