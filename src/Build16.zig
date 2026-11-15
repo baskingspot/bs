@@ -189,10 +189,13 @@ pub fn run(init: std.process.Init, args: []const []const u8, choice: language.Ch
             // The runner draws its own progress meanwhile.
             _ = try io.lockStderr(&.{}, .no_color);
             defer io.unlockStderr();
+            const handoffs = try BuildRunner.startHandoffs(arena, io, env, global);
             var child = std.process.spawn(io, .{ .argv = argv.items, .environ_map = env }) catch |err|
                 main.fatal("failed to spawn build runner {s}: {t}", .{ runner_path, err });
             defer child.kill(io);
-            break :term child.wait(io) catch |err| main.fatal("failed to wait build runner {s}: {t}", .{ runner_path, err });
+            const t = child.wait(io) catch |err| main.fatal("failed to wait build runner {s}: {t}", .{ runner_path, err });
+            BuildRunner.reportHandoffs(arena, io, handoffs, choice.language);
+            break :term t;
         };
         const cmd = try std.mem.join(arena, " ", argv.items);
         switch (term) {

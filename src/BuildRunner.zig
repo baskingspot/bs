@@ -1,5 +1,5 @@
 //! `bs build`: compiles upstream's build runner (`lib/compiler/Maker.zig`)
-//! with bs and replaces bs with it, as upstream's `zig build` does, but
+//! with bs and runs it, as upstream's `zig build` does, but
 //! with `--zig=<bs>`: the runner then compiles `build.zig` (with
 //! `lib/compiler/configurer.zig`) and every compile step by running bs
 //! with `--listen=-` (`main.serve`).
@@ -104,8 +104,60 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     });
     try argv.appendSlice(arena, user_args);
     if (env.get("ZIG_VERBOSE_CMD") != null) std.log.info("{f}", .{std.zig.SubprocessCommand{ .argv = argv.items }});
-    const err = std.process.replace(io, .{ .argv = argv.items, .environ_map = env });
-    main.fatal("the following command failed to execve with '{t}':\n{s}", .{ err, try std.mem.join(arena, " ", argv.items) });
+    // The runner is a child, not bs's replacement, so that bs reports the
+    // steps that went to upstream zig after it (`reportHandoffs`).
+    const handoffs = try startHandoffs(arena, io, env, global);
+    var child = std.process.spawn(io, .{ .argv = argv.items, .environ_map = env }) catch |err|
+        main.fatal("failed to spawn build runner {s}: {t}", .{ runner_path, err });
+    const term = child.wait(io) catch |err| main.fatal("failed to wait build runner {s}: {t}", .{ runner_path, err });
+    reportHandoffs(arena, io, handoffs, choice.language);
+    // As upstream's `zig build` reports its runner's end.
+    const cmd = try std.mem.join(arena, " ", argv.items);
+    switch (term) {
+        .exited => |code| std.process.exit(code),
+        .signal => |sig| main.fatal("the following build command terminated with signal {t}:\n{s}", .{ sig, cmd }),
+        .stopped => |sig| main.fatal("the following build command stopped with signal {t}:\n{s}", .{ sig, cmd }),
+        .unknown => main.fatal("the following build command crashed:\n{s}", .{cmd}),
+    }
+}
+
+/// The environment variable that names the directory where a compile step
+/// that went to upstream zig (`main.handToZig`) leaves its name.
+pub const handoff_env = "BS_HANDOFF_DIR";
+
+/// Makes the directory of `handoff_env` for one `bs build`, under the
+/// global cache, and puts it in `env` for the runner's compile steps.
+pub fn startHandoffs(arena: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, global: []const u8) ![]const u8 {
+    var nonce: [8]u8 = undefined;
+    io.random(&nonce);
+    const dir = try Io.Dir.path.join(arena, &.{ global, "tmp", try arena.print("handoff-{x}", .{&nonce}) });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    try env.put(handoff_env, dir);
+    return dir;
+}
+
+/// After the runner: names the steps that upstream zig compiled (`-fllvm`
+/// or a release mode), each with that flag, so that a user sees which of
+/// the build's binaries bs did not make, and removes the directory.
+pub fn reportHandoffs(arena: std.mem.Allocator, io: Io, dir_path: []const u8, lang: language.Language) void {
+    defer Io.Dir.cwd().deleteTree(io, dir_path) catch {}; // ziglint-ignore: Z026 -- a leftover temporary directory is harmless
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        const why = dir.readFileAlloc(io, entry.name, arena, .limited(64)) catch "";
+        names.append(arena, arena.print("{s} ({s})", .{ entry.name, why }) catch return) catch return;
+    }
+    if (names.items.len == 0) return;
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lt);
+    const list = std.mem.join(arena, ", ", names.items) catch return;
+    const msg = arena.print("note: upstream zig {s} compiled {d} step{s}: {s}\n", .{ lang.versionString(), names.items.len, if (names.items.len == 1) "" else "s", list }) catch return;
+    Io.File.stderr().writeStreamingAll(io, msg) catch {}; // ziglint-ignore: Z026 -- a note
 }
 
 /// Under the project's local cache: the identity of the bs that last ran
@@ -194,6 +246,7 @@ pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []cons
     // includes the working directory) is the same for every project.
     try std.process.setCurrentPath(io, dir);
     var opts = try main.parseOptions(arena, io, init.environ_map, .build_exe, compile_args[2..]);
+    if (opts.link_error) |msg| main.fatal("{s}", .{msg});
     opts.root_dir = root_dir;
     const job: main.Job = try .init(init, compile_args, opts);
     {

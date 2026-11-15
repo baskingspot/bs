@@ -8178,7 +8178,10 @@ state. Built for step 1:
   diagnostic naming the option and the way out; and unknown, also
   `[unsupported]`. Response files (`@file`, which the runner writes for
   long command lines) are expanded where an option is expected.
-- **ReleaseSafe.** `-O` (`-ODebug`, `-OReleaseSafe`, `-Osafe`, `-O safe`,
+- **ReleaseSafe.** Since 2026-11-14 a compilation in a release mode goes
+  to upstream zig (**Hand-off to upstream zig**); what follows is how bs
+  compiles one itself, under `BS_FALLBACK=off` and for its own build
+  runner. `-O` (`-ODebug`, `-OReleaseSafe`, `-Osafe`, `-O safe`,
   ...), `-ferror-tracing` and `-fvalgrind` with their `-fno-` forms are
   per module, as upstream's: each `-M` takes those given since the last
   one, a module without its own takes them from the module that first
@@ -8197,10 +8200,10 @@ state. Built for step 1:
   (`-O2`, `-D_FORTIFY_SOURCE=2`, `-Werror=date-time`, UBSan in trap mode;
   `CSource.Flags.optimize`), taken like the other C module options from
   the module or else the root module.
-- **ReleaseFast and ReleaseSmall** are `[unsupported]` on the command
-  line, and accepted in `bs build`'s steps (`--listen=-`), whose build
-  scripts may ask for them (supermd builds its translate-c tool
-  ReleaseFast). They compile with the same code generation, with
+- **ReleaseFast and ReleaseSmall** go to upstream zig like ReleaseSafe,
+  on the command line (where they were `[unsupported]`) and in `bs
+  build`'s steps (where bs compiled them; supermd builds its translate-c
+  tool ReleaseFast). Under `BS_FALLBACK=off` they compile with the same code generation, with
   `builtin.mode` `.fast` or `.small`, error tracing and Valgrind off, and
   no safety checks in the module's functions (`Frontend.Module.safety`;
   `@setRuntimeSafety(true)` still adds them) and no hidden safety tag in
@@ -8208,25 +8211,25 @@ state. Built for step 1:
   IR with no dependency recording it, so a root module without them
   salts the store seed with `=nosafety`. Their C sources get `-DNDEBUG`,
   `-O2` or `-Os`, and no UBSan, as upstream's.
-- **Backend flags.** bs generates the same code in Debug and ReleaseSafe,
-  where upstream's choice of backend changes nothing a program means. So
-  with `-fllvm`, `-flld` and their `-fno-` forms bs compiles with its own
-  backend and linker. `builtin.zig_backend` names the
+- **Backend flags.** A compilation with `-fllvm` (what `.use_llvm =
+  true` in a `build.zig` becomes) or a release mode is compiled by
+  upstream zig of the same release (**Hand-off to upstream zig** below);
+  every other compilation is bs's, with bs's backend and linker. Until 2026-11-14 bs accepted
+  `-fllvm` without a word and compiled it itself (uucode's table
+  generator, which libvaxis builds with `.use_llvm = true` in Debug, then
+  compiled with bs; it now goes to zig). `builtin.zig_backend` names the
   backend that compiles (`Options.zigBackend`): `.stage2_x86_64` on
   x86_64-linux in every mode, since bs's x86_64 backend has the
   self-hosted backend's limits (no tail calls, SSE in inline assembly),
   and `.stage2_llvm` on aarch64, whose backend follows LLVM's rules,
   unless `-fno-llvm` asks for upstream's self-hosted aarch64 backend
   (`.stage2_aarch64`, which refuses `@call(.always_tail)` and takes std's
-  self-hosted paths, as upstream); `-fllvm` names `.stage2_llvm`. Sema's
-  backend-dependent checks read
+  self-hosted paths, as upstream). Sema's backend-dependent checks read
   `Zcu.backend`, and a backend other than the target's default salts the
   cache name with `=<backend>` (`cacheTarget`). Upstream's own choice of
   backend (`Options.llvmBackend`: LLVM for a release mode or on aarch64)
   still decides the C flags it implies (the stack protector). `-flld`
-  and `-fno-lld` change nothing. Example: uucode's `build.zig` builds its
-  Unicode table generator with `.use_llvm = true` in Debug; under `bs
-  build` that step compiles with bs, and libvaxis needs no `-Dllvm=false`.
+  and `-fno-lld` change nothing.
   The same rule covers `-fPIE` and `-fPIC` on executables (linuxwave's
   `.pie = true`): bs links them static and non-PIE, which changes no
   program meaning, only address randomization, and
@@ -8243,9 +8246,8 @@ state. Built for step 1:
   `-fasync-unwind-tables` and `-fno-unwind-tables` set
   `builtin.unwind_tables` as upstream does (ghostty asks for `.sync`);
   bs emits asynchronous tables for each, which serve every request.
-  ReleaseFast and ReleaseSmall, C, C++ and assembly sources,
-  and system libraries stay `[unsupported]`; `-lc` links glibc and `bs
-  translate-c` translates headers (see "C interop"). bs never hands a step to upstream zig.
+  `-lc` links glibc and `bs translate-c` translates headers (see "C
+  interop").
 - **`bs build`** (`src/BuildRunner.zig`) does what upstream's `zig build`
   does, with bs as the compiler. It compiles upstream's build runner,
   `<zig lib>/compiler/Maker.zig`, with bs in ReleaseSafe as upstream
@@ -8518,10 +8520,13 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   module's in every module, where upstream gives each module its own.
   `zig build --fuzz` passes `-ffuzz` ahead of the root module and a
   module's `.fuzz` ahead of its `-M`. `-ffuzz` on `build-obj` and
-  `build-lib`, and for aarch64-linux and aarch64-macos, is
-  `[unsupported]` for now, decided once every module's flag is known
-  (`parseOptions`' end): the aarch64 backend places no points, and the
-  Mach-O linker defines no section bounds.
+  `build-lib` is `[unsupported]` for now. For aarch64-linux and
+  aarch64-macos, where the aarch64 backend places no points and the
+  Mach-O linker defines no section bounds, a compilation with `-ffuzz` on
+  any module goes to upstream zig (**Hand-off to upstream zig**), which
+  fuzzes there in Debug with LLVM; with `BS_FALLBACK=off` it is
+  `[unsupported]`, decided once every module's flag is known
+  (`parseOptions`' end).
 - **The fuzzer is a module family, not a second compilation.** bs
   compiles `<zig lib>/fuzzer.zig` in the same compilation as the program,
   but as its own *module family*: the root `=root@fuzzer` (fuzzer.zig), its
@@ -9744,6 +9749,99 @@ conformance with `BS_CACHE_CHECK=1` (behavior `--edit-verify`, std, and
 from step 1 std with `-lc`), the std compile-time comparison with main,
 and `zig build -Dtarget=aarch64-macos`.
 
+## Hand-off to upstream zig
+
+Owner, 2026-11-14: "if something requires llvm bs should fallback to zig
+because there is little benefit", then "The rule is simple: any step with
+-fllvm or use_llvm goes to zig", and later the same day, seeing that
+fastmem's failing x86_64 steps are fixtures whose build.zig hard-codes a
+release mode: "if we see a hardcoded ReleaseSafe or ReleaseFast we
+should defer to zig", then "yeah we should basically only use bs when a
+debug build is used in zig": bs is the Debug compiler. A `build-exe`, `build-obj`, `build-lib`, `test`,
+`test-obj` or `run` whose command line ends up with `-fllvm`
+(`Options.handOff`, after the last of `-fllvm` and `-fno-llvm`), or
+with a release mode (ReleaseSafe, ReleaseFast or ReleaseSmall) on its
+root module or any other `-M` module (a C-only module's is its C
+sources' `-O`), is compiled by upstream zig of the
+compilation's release
+(`toolchain.findZigFor`, version-checked by `CSource.checkZig`, as for C).
+`main.handToZig` execs zig with the same arguments minus bs's own
+(`--zig-version`, `--error-format`), so zig serves `--listen=-` itself
+and its cache entries sit beside bs's in the same directories. A
+compilation reaches bs with its mode resolved, so a mode the build.zig
+hard-codes and one `-Doptimize` asks for look the same, and both go;
+ReleaseSmall goes with the other two; the command line is treated as
+`bs build`'s steps are; and every target goes, aarch64 included, though
+bs's aarch64 backend passed fastmem's aarch64 release steps itself. Debug
+stays bs's on every target, aarch64 included, where upstream's Debug is
+LLVM's too. What bs compiles itself in ReleaseSafe without a
+command line stays bs's: the build runner (`BuildRunner.compileTool`).
+One Debug case goes too (owner, 2026-11-15): `-ffuzz` on any module
+for a target other than x86_64-linux, where bs places no coverage
+points and upstream fuzzes with LLVM; the note names it `(-ffuzz)`.
+Nothing else goes: a Debug compilation on any target, SVE CPUs
+included, stays bs's.
+
+A user sees it: on the command line zig's compilation follows `note:
+upstream zig compiles '<name>' (-fllvm): <zig>` (or `(-OReleaseSafe)`
+and so on) on stderr. A build step
+cannot print (a compiler's stderr fails the step), so it leaves its name,
+with the flag in the file, in the directory `BS_HANDOFF_DIR` names, which `bs build` makes under
+the global cache for its runner (`BuildRunner.startHandoffs`; the runner
+is now bs's child instead of its replacement, in both languages) and
+reads when the runner ends: `note: upstream zig 0.17.1 compiled 3
+steps: a (-fllvm), b (-OReleaseFast), c (-OReleaseSafe)`. upstream's
+`zig build` writes nothing there, so a step that runs a nested build
+(fastmem's two-packages) shows the note as its stderr, which does not
+fail it. With
+`BS_FALLBACK=off` bs compiles the step itself, with its one code
+generation and the mode's meaning (below): bs's own tests set it on
+every step (build.zig's `spreadBsUsers`) but test/build's check of the
+hand-off, and it is how a release build's cost under bs is measured.
+No zig of the release is an `[unsupported]` error naming where bs
+looked and `BS_FALLBACK=off`. A `-l` or `-framework` that bs does not
+find is reported after the decision (`Options.link_error`), so a
+handed-off step's libraries are zig's to find (Ghostty's ReleaseFast
+`macos` library names `-framework CoreFoundation` for an explicit
+`aarch64-macos.13.0`, which neither compiler searches the SDK for); and
+as upstream, an object or a static library, which links no frameworks,
+does not fail on one it cannot find.
+
+Why the line is `-fllvm` and not what a program does: programs branch on
+`builtin.zig_backend == .stage2_llvm` into code only LLVM compiles
+(fastmem v0.2.0's x86_64 kernels: `@call(.always_tail)`, YMM and ZMM asm
+operands, LLVM intrinsics as externs) and their tests compare LLVM's
+instructions, and `-fllvm` is how a build says it wants that. A release
+mode is how a build says it wants upstream's optimized code, which bs's
+fast backend does not try to match (Scope: LLVM-class optimization stays
+upstream's), and fastmem's x86_64 release fixtures need its LLVM paths.
+
+Cost, measured 2026-11-14 (bs ReleaseFast, fresh project cache, a warm
+global cache; "edit" appends a comment to the root file):
+
+- bench/runtime's fib, fmt, hash and sieve in ReleaseFast, each: handed
+  off, 16.3 to 17.2 s cold and the same after an edit on x86_64-linux
+  (orb), 17.6 to 18.2 s for aarch64-linux, 3.4 to 3.5 s on aarch64-macos
+  (Mac satellite); bs itself, 244 to 275 ms cold and 26 to 36 ms after an
+  edit on x86_64, 445 and 41 ms for aarch64-linux, 76 and 19 ms on the
+  Mac. Upstream's release build has no incremental compilation, so an
+  edit costs a cold build: 45 to 600 times bs's. Its executables are
+  3.9 MB against bs's 1.8 MB on x86_64-linux (both with debug info) and
+  379 KB against 1.1 MB on the Mac.
+- Ghostty 6d95777 on the Mac, `zig build -Demit-bench -Demit-exe=false
+  -Dapp-runtime=none` (its build.zig hard-codes ReleaseFast for the bench
+  tools and their C and C++ libraries; 18 steps go to zig): 83.7 s cold,
+  37.3 s after an edit of src/terminal/Terminal.zig, 0.47 s with nothing
+  changed; upstream zig alone takes 152.6, 46.8 and 0.62 s (the
+  difference is presumably the build runner, which upstream compiles
+  with LLVM and bs itself; not broken down). With
+  `BS_FALLBACK=off` the build does not finish: bs's Mach-O link of
+  ghostty-bench fails on libglslang.a's members (`relocation addend
+  -9223372036854775655 out of range`) after 33.9 s.
+- An executable with `.use_llvm = true` in Debug (fastmem's consumer
+  program, x86_64): 11.0 s cold and 3.0 s after an edit, against bs's
+  own 3.9 s and 52 ms.
+
 ## `builtin` and conformance
 
 - bs generates the `builtin` module itself (`src/Builtin.zig`).
@@ -9887,8 +9985,10 @@ and `zig build -Dtarget=aarch64-macos`.
   and anonymous type numbers taken out), a test's exit status, summary
   and first panic line. `run.py --upstream --langref` records upstream's
   outcomes in `baseline/langref-<target>.json`; the measure is the share
-  that matches, with the examples bs refuses (`-OReleaseFast`) counted
-  apart.
+  that matches, with the examples bs refuses counted apart (since
+  2026-11-14 bs compiles `-OReleaseFast` and `-OReleaseSmall` on the
+  command line too, with its one code generation and upstream's builtin
+  and defaults for the mode).
 - `run.py --incremental` runs upstream's `test/incremental` cases (49):
   each is a sequence of updates (files written or deleted) with the
   stdout or compile errors expected after each. bs builds the updates in

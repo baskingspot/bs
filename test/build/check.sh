@@ -180,6 +180,16 @@ expect " 2 fast untagged"
 "$bs" build run -Doptimize=ReleaseSmall >"$work/log" 2>&1 || fail "bs build run in ReleaseSmall"
 expect " 2 small untagged"
 
+# The steps above were bs's own, as every test's (build.zig sets
+# BS_FALLBACK=off). Without it, upstream zig compiles each step in a
+# release mode and each with -fllvm (`Options.handOff`), and bs names
+# them once the runner ends.
+BS_FALLBACK='' "$bs" build install run -Doptimize=ReleaseFast >"$work/log" 2>&1 || fail "bs build handing ReleaseFast to zig"
+expect " 2 fast untagged"
+expect "compiled"
+expect "hello (-fllvm)"
+expect "answer (-OReleaseFast)"
+
 # build.zig itself fails to compile.
 line=$(($(wc -l <build.zig) + 1))
 echo "fn unused() void { const y = 1; }" >>build.zig

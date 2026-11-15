@@ -282,6 +282,10 @@ pub const Options = struct {
     /// Why bs cannot build what the options ask for (a release mode, C
     /// sources, LLVM), as a diagnostic's message: the first such option.
     unsupported: ?[]const u8 = null,
+    /// A `-l` or `-framework` that bs could not find, reported after the
+    /// hand-off decision: upstream zig finds or skips it in a compilation
+    /// handed to it (a static library links no frameworks).
+    link_error: ?[]const u8 = null,
     /// The root module's `-fno-builtin` (each other module's is in
     /// `modules`): CodeGen lowers its memory builtins inline, never to
     /// calls of `memcpy`, `memmove` and `memset`.
@@ -302,7 +306,8 @@ pub const Options = struct {
     /// `Compilation.Config` decides: `-fllvm` or `-fno-llvm`, else LLVM for
     /// a release mode of the root module and on aarch64, and its own
     /// backend for a Debug x86_64-linux build. It decides upstream's C
-    /// flags (the stack protector).
+    /// flags (the stack protector); `-fllvm` itself hands the compilation
+    /// to zig (`handOff`).
     pub fn llvmBackend(opts: *const Options) bool {
         return opts.use_llvm orelse (opts.optimize != .debug or opts.bs_target != .x86_64_linux);
     }
@@ -316,6 +321,33 @@ pub const Options = struct {
         if (opts.use_llvm == true) return .stage2_llvm;
         if (opts.bs_target == .x86_64_linux) return .stage2_x86_64;
         return if (opts.use_llvm == false) .stage2_aarch64 else .stage2_llvm;
+    }
+
+    /// Why upstream zig of the same release compiles this rather than bs,
+    /// as the flag that asks for it, or null: `-fllvm` (owner, 2026-11-14:
+    /// "any step with -fllvm or use_llvm goes to zig"), or a release mode
+    /// of the root module or any other, C-only ones included through
+    /// their C sources' flags (owner, 2026-11-14: "if we see a hardcoded
+    /// ReleaseSafe or ReleaseFast we should defer to zig"; bs cannot tell
+    /// a build.zig's mode from `-Doptimize`'s, so every one).
+    pub fn handOff(opts: *const Options) ?[]const u8 {
+        if (opts.use_llvm == true) return "-fllvm";
+        // Only bs's x86_64-linux code has coverage points; upstream fuzzes
+        // on aarch64 in Debug, with LLVM.
+        if (opts.fuzz and opts.bs_target != .x86_64_linux) return "-ffuzz";
+        if (releaseFlag(opts.optimize)) |f| return f;
+        for (opts.modules) |m| if (releaseFlag(m.optimize orelse opts.optimize)) |f| return f;
+        for (opts.c_sources) |c| if (releaseFlag(c.flags.optimize orelse .debug)) |f| return f;
+        return null;
+    }
+
+    fn releaseFlag(o: std.lang.Optimize) ?[]const u8 {
+        return switch (o) {
+            .debug => null,
+            .safe => "-OReleaseSafe",
+            .fast => "-OReleaseFast",
+            .small => "-OReleaseSmall",
+        };
     }
 };
 
@@ -441,10 +473,12 @@ pub fn main(init_std: std.process.Init) !void {
     } else fatal("unknown command: {s}", .{cmd});
 
     const opts = try parseOptions(arena, init.io, init.environ_map, command, args[2..]);
-    if (opts.listen) {
-        if (BuildWeb.matches(&opts)) return BuildWeb.serve(init, &opts);
-        return serve(init, args, opts);
-    }
+    // The build runner's web client, a ReleaseFast wasm build, is bs's
+    // embedded copy.
+    if (opts.listen and BuildWeb.matches(&opts)) return BuildWeb.serve(init, &opts);
+    if (opts.handOff()) |why| if (!std.mem.eql(u8, init.environ_map.get("BS_FALLBACK") orelse "", "off")) try handToZig(init, args[1..], &opts, why);
+    if (opts.link_error) |msg| fatal("{s}", .{msg});
+    if (opts.listen) return serve(init, args, opts);
     if (opts.unsupported) |msg| {
         printDiagnostics(init.io, &.{.{ .code = .unsupported, .loc = null, .msg = msg }}, opts.error_format) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
         std.process.exit(1);
@@ -2470,8 +2504,9 @@ const DumpSink = struct {
 /// layout, C-only settings, and settings bs already has.
 const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     // The linker is a preference that changes nothing a program means:
-    // bs uses its own (`-fllvm` and `-fno-llvm` are parsed: they choose
-    // `builtin.zig_backend`).
+    // bs uses its own (`-fllvm` and `-fno-llvm` are parsed: the first
+    // hands the compilation to zig, the second chooses
+    // `builtin.zig_backend` on aarch64).
     .{"-flld"},                          .{"-fno-lld"},
     .{"-fnew-linker"},                   .{"-fno-new-linker"},
     .{"-fallow-so-scripts"},             .{"-fno-allow-so-scripts"},
@@ -2549,6 +2584,60 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-municode", "bs does not target Windows ('-municode')" },
 });
 
+/// Runs upstream zig of the compilation's release in place of bs, for a
+/// compilation with `-fllvm` or a release mode (`Options.handOff`; `why`
+/// is that flag), with the same command line (`args`, the command first)
+/// but bs's own flags (`--zig-version`, `--error-format`). Under
+/// `--listen=-` zig answers the build runner itself, and the step's name
+/// and `why` go to `BuildRunner.handoff_env`'s directory for `bs build` to
+/// report (a compiler's stderr would fail the step); on the command line
+/// a note on stderr says so. With `BS_FALLBACK=off` bs compiles it itself
+/// instead (its own code generation, with the mode's `builtin.mode` and
+/// safety), which bs's tests and measurements use.
+fn handToZig(init: std.process.Init, args: []const []const u8, opts: *const Options, why: []const u8) !noreturn {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const lang = opts.language.language;
+    const refuse = struct {
+        fn f(i: std.process.Init, o: *const Options, msg: []const u8) !noreturn {
+            const d: []const diag.Diagnostic = &.{.{ .code = .unsupported, .loc = null, .msg = msg }};
+            if (o.listen) {
+                try serveFailure(i, o.language.language, d, .Exe);
+                std.process.exit(0);
+            }
+            printDiagnostics(i.io, d, o.error_format) catch {}; // ziglint-ignore: Z026 -- stderr is where it would be reported
+            std.process.exit(1);
+        }
+    }.f;
+    const need = try arena.print("{s}, which bs hands to upstream zig {s} (BS_FALLBACK=off builds it with bs),", .{ why, lang.versionString() });
+    const found = toolchain.findZigFor(arena, io, init.environ_map, lang);
+    const zig = found.found orelse
+        try refuse(init, opts, try arena.print("{s} needs it in {s}, on PATH, or at {s}", .{ need, toolchain.envVar(lang), found.looked }));
+    if (try CSource.checkZig(arena, io, zig, lang, why)) |msg| try refuse(init, opts, msg);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(arena, zig);
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--zig-version") or std.mem.eql(u8, a, "--error-format")) {
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--zig-version=") or std.mem.startsWith(u8, a, "--error-format=")) continue;
+        try argv.append(arena, a);
+    }
+    const name = opts.name orelse Io.Dir.path.stem(if (opts.root_src_path.len != 0) opts.root_src_path else if (opts.c_sources.len != 0) opts.c_sources[0].path else opts.root_name);
+    if (!opts.listen) {
+        Io.File.stderr().writeStreamingAll(io, try arena.print("note: upstream zig compiles '{s}' ({s}): {s}\n", .{ name, why, zig })) catch {}; // ziglint-ignore: Z026 -- a note
+    } else if (init.environ_map.get(BuildRunner.handoff_env)) |dir| {
+        // One file per step name: the report lists each once.
+        const file = try Io.Dir.path.join(arena, &.{ dir, if (name.len == 0) "_" else name });
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = why, .flags = .{} }) catch {}; // ziglint-ignore: Z026 -- only the report misses the step
+    }
+    const err = std.process.replace(io, .{ .argv = argv.items, .environ_map = init.environ_map });
+    fatal("unable to run '{s}': {t}", .{ zig, err });
+}
+
 pub fn setUnsupported(opts: *Options, comptime fmt: []const u8, arena: std.mem.Allocator, args: anytype) void {
     if (opts.unsupported == null) opts.unsupported = arena.print(fmt, args) catch fatal("out of memory", .{});
 }
@@ -2557,8 +2646,6 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     var args = args_in;
     var root: ?[]const u8 = null;
     var positional_root = false;
-    // A ReleaseFast or ReleaseSmall `-O`, which only `bs build` steps may use.
-    var unsafe_mode: ?[]const u8 = null;
     var opts: Options = .{ .command = command, .root_src_path = undefined };
     var test_filters: std.ArrayList([]const u8) = .empty;
     var link_inputs: std.ArrayList([]const u8) = .empty;
@@ -2707,10 +2794,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
                 .{ "debug", .debug }, .{ "safe", .safe },        .{ "fast", .fast },        .{ "small", .small },
             }).get(v) orelse fatal("unrecognized optimization mode: '{s}'", .{v});
             // bs compiles every mode with its one code generation, with
-            // upstream's builtin and defaults for the mode. ReleaseFast and
-            // ReleaseSmall (no safety checks) only for `bs build`'s steps,
-            // which a project's build script may ask for.
-            if (o == .fast or o == .small) unsafe_mode = arg;
+            // upstream's builtin and defaults for the mode.
             mode.optimize = o;
         } else if (std.mem.eql(u8, arg, "-funwind-tables")) {
             opts.unwind_tables = .sync;
@@ -3016,8 +3100,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     var found: std.StringHashMapUnmanaged(void) = .empty;
     const macos = opts.bs_target == .aarch64_macos;
     for (libs.items) |q| {
-        link_inputs.items[q.at] = try q.find(arena, io, search_dirs.items, macos) orelse
-            fatal("unable to find library '-l{s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_dirs.items) });
+        link_inputs.items[q.at] = try q.find(arena, io, search_dirs.items, macos) orelse {
+            opts.link_error = opts.link_error orelse try std.fmt.allocPrint(arena, "unable to find library '-l{s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_dirs.items) });
+            continue;
+        };
         try found.put(arena, link_inputs.items[q.at], {});
     }
     // As upstream, an object or a static library links no frameworks, so
@@ -3027,8 +3113,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     for (frameworks.items) |q| {
         link_inputs.items[q.at] = (if (macos) try findFramework(arena, io, search_frameworks.items, q.name) else null) orelse {
             if (!links_frameworks) continue;
-            if (!macos) fatal("frameworks are for macOS targets ('-framework {s}')", .{q.name});
-            fatal("unable to find framework '-framework {s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_frameworks.items) });
+            opts.link_error = opts.link_error orelse if (!macos)
+                try std.fmt.allocPrint(arena, "frameworks are for macOS targets ('-framework {s}')", .{q.name})
+            else
+                try std.fmt.allocPrint(arena, "unable to find framework '-framework {s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_frameworks.items) });
+            continue;
         };
     }
     // As upstream, an object or a static library links nothing: it leaves
@@ -3118,8 +3207,6 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     }
     opts.root_fuzz = root_fuzz orelse false;
     if (command == .test_obj and !opts.test_no_exec and !opts.listen) fatal("test-obj requires --test-no-exec", .{});
-    if (unsafe_mode) |a| if (!opts.listen)
-        setUnsupported(&opts, "bs builds only Debug and ReleaseSafe on the command line ('{s}'); use -OReleaseSafe, or upstream zig for an optimized build", arena, .{a});
     // As upstream's `Config.resolve` and `Module.create`: error tracing and
     // Valgrind client requests are on in Debug and off in ReleaseSafe
     // unless asked for.
@@ -3138,7 +3225,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // Only the x86_64 backend places coverage points, and only the ELF
     // linker bounds their sections: without this an aarch64 build had
     // none, and the fuzzer found no points (Linux) or did not load (a
-    // Mac, whose linker defines the bounds it imports).
+    // Mac, whose linker defines the bounds it imports). Such a step goes
+    // to upstream zig (`handOff`); this is what `BS_FALLBACK=off` gives.
     if (opts.fuzz and opts.bs_target != .x86_64_linux)
         setUnsupported(&opts, "bs does not instrument code for fuzzing on {s} yet ('-ffuzz'); build this step with upstream zig", arena, .{opts.bs_target.name()});
     // As upstream's `Compilation.create` resolves `any_sanitize_c`: each

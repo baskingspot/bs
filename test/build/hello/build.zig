@@ -19,8 +19,9 @@ pub fn build(b: *std.Build) void {
             }),
         }},
     });
-    // A Debug step that asks for LLVM and PIE: bs builds it with its
-    // own backend, static and non-PIE.
+    // A Debug step that asks for LLVM and PIE: upstream zig compiles it
+    // (`main.Options.handOff`), unless BS_FALLBACK=off, as in the tests
+    // but one, has bs build it, with its own backend, static and non-PIE.
     const exe = b.addExecutable(.{ .name = "hello", .root_module = mod, .use_llvm = true });
     exe.pie = true;
     b.installArtifact(exe);

@@ -213,11 +213,13 @@ pub fn build(b: *std.Build) void {
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
         diag_step.dependOn(&run.step);
     }
-    // `-ffuzz` is refused where bs places no coverage points, on the root
-    // module or on another one.
+    // `-ffuzz` where bs places no coverage points, on the root module or
+    // on another one, goes to upstream zig (`Options.handOff`); bs itself
+    // (`BS_FALLBACK=off`) refuses it.
     for ([_][]const u8{ "aarch64-linux", "aarch64-macos" }) |fuzz_target| for ([_]bool{ true, false }) |on_root| {
         const run = b.addRunArtifact(test_bs);
         run.setName(b.fmt("bs -ffuzz for {s}{s}", .{ fuzz_target, if (on_root) "" else " on a dependency" }));
+        run.setEnvironmentVariable("BS_FALLBACK", "off");
         run.addArgs(&.{ "build-exe", "-fno-emit-bin", "-target", fuzz_target });
         if (on_root) run.addArg("-ffuzz") else run.addArgs(&.{ "--dep", "m" });
         run.addPrefixedFileArg("-Mroot=", b.path("bench/workloads/hello/hello.zig"));
@@ -229,6 +231,17 @@ pub fn build(b: *std.Build) void {
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
         diag_step.dependOn(&run.step);
     };
+    {
+        const run = b.addRunArtifact(test_bs);
+        run.setName("bs -ffuzz for aarch64-linux handed to upstream zig");
+        run.setEnvironmentVariable("BS_FALLBACK", "");
+        run.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+        run.addArgs(&.{ "build-exe", "-fno-emit-bin", "-target", "aarch64-linux", "-ffuzz" });
+        run.addPrefixedFileArg("-Mroot=", b.path("bench/workloads/hello/hello.zig"));
+        run.addCheck(.{ .expect_stderr_match = "note: upstream zig compiles 'hello' (-ffuzz): " });
+        run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        diag_step.dependOn(&run.step);
+    }
     // A Zig 0.16 program means what it means in 0.16: test/language/zig016.sh.
     {
         const z16 = b.addSystemCommand(&.{"sh"});
@@ -341,6 +354,8 @@ pub fn build(b: *std.Build) void {
         c_exe.addArgs(&.{ "build-exe", "-OReleaseSafe", "-lc" });
         c_exe.addFileArg(b.path("test/link_input/cmain.c"));
         c_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+        // bs's own link of it, not upstream zig's (`main.handToZig`).
+        c_exe.setEnvironmentVariable("BS_FALLBACK", "off");
         const c_run = std.Build.Step.Run.create(b, "run bs -OReleaseSafe -lc build of only C sources on aarch64-macos");
         c_run.addFileArg(c_exe.addOutputFileArg2("cmain", .{ .prefix = "-femit-bin=" }));
         c_run.addArg("5");
@@ -2028,6 +2043,10 @@ fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roo
         for (users.items) |s| {
             if (s.cast(Step.Run)) |run| {
                 if (run.getEnvMap().get("BS_THREADS") == null) run.setEnvironmentVariable("BS_THREADS", "2");
+                // The tests are of bs's own compilation: a release mode
+                // or -fllvm stays bs's (`main.handToZig`). test/build's
+                // check.sh tests the hand-off itself.
+                if (run.getEnvMap().get("BS_FALLBACK") == null) run.setEnvironmentVariable("BS_FALLBACK", "off");
                 // bs looks up a lint config from each file it compiles,
                 // which in the repository finds its .bs.zon.
                 run.addFileInput(b.path(".bs.zon"));

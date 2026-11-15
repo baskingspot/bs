@@ -24,14 +24,25 @@ the oldest.
   dynamically linked against libSystem, ad-hoc code signed), and
   `aarch64-linux` (static ELF, reusing the aarch64 backend and the ELF
   linker; started 2026-11-05).
-- One optimization level, as in Go: no `-O` modes. Every build has Debug
-  semantics (safety checks on, `builtin.mode == .debug`) and always-on
-  optimization sized to compile fast (SSA, register allocation, inlining
+- bs is the Debug compiler (owner, 2026-11-14: "we should basically only
+  use bs when a debug build is used in zig"). It compiles Debug
+  compilations on every target, aarch64 included, where upstream's own
+  Debug uses LLVM: safety checks on, `builtin.mode == .debug`, and
+  always-on optimization sized to compile fast (SSA, register allocation, inlining
   within a budget). Output stays debuggable: line tables, frame pointers,
   inlined frames; a request to omit frame pointers (`-fomit-frame-pointer`)
-  is accepted and changes nothing. LLVM-class optimization (auto-vectorization, scheduling,
-  heavy loop work) stays upstream's job; users run upstream
-  `zig` for ReleaseFast and friends. Explicit `@Vector` code is lowered to
+  is accepted and changes nothing. LLVM-class optimization
+  (auto-vectorization, scheduling, heavy loop work) stays upstream's job,
+  and bs hands it over itself: upstream zig of the same release compiles
+  any compilation in a release mode (ReleaseSafe, ReleaseFast or
+  ReleaseSmall, on any module, whether a build.zig hard-codes it or
+  `-Doptimize` sets it), any compilation with `-fllvm` (what
+  `.use_llvm = true` becomes) in any mode, and any with `-ffuzz` for a
+  target other than x86_64-linux, where bs places no coverage points.
+  This holds on every target, from the command line and from `bs build`
+  steps alike. bs says so: a `note: upstream zig compiles …` on the
+  command line, and one `note: upstream zig 0.17.1 compiled N steps: …`
+  after `bs build`. Explicit `@Vector` code is lowered to
   SIMD registers (SSE/NEON), as upstream's Debug backend does, not
   scalarized. Cheap analyses that remove provably redundant work (bounds
   checks proven true, common subexpressions, invariant loads) are allowed
@@ -51,14 +62,12 @@ the oldest.
   `builtin.cpu` reports it, and inline assembly may use the SVE
   instructions bs's assembler encodes, while bs's own code stays NEON.
   The native host's CPU stays clamped (2026-11-14).
-- One exception: `-OReleaseSafe` (which `zig build` steps such as Ghostty's
-  tool executables pass) is accepted and compiled with the same code
-  generation, with `builtin.mode == .safe` and upstream's
-  ReleaseSafe defaults (safety on, no error return traces), so std and the
-  program take the same paths as upstream's ReleaseSafe build. ReleaseFast
-  and ReleaseSmall stay refused on the command line; in `bs build` steps
-  they get the same treatment (their `builtin.mode`, safety off, same code
-  generation) once a real project's build needs it.
+- Release modes are upstream zig's (above): Ghostty's ReleaseFast tool
+  executables and libraries and fastmem's release fixtures go to zig. bs
+  still compiles two things in a release mode itself, with its one code
+  generation and the mode's `builtin.mode` and safety: its own build
+  runner (ReleaseSafe, compiled in-process), and any compilation when
+  `BS_FALLBACK=off` is set, which bs's tests use.
 - C interop is in scope: `-lc`, `@cImport`, and C and C++ source files.
   translate-c (upstream's Aro-based Zig program in `lib/compiler/translate-c`)
   is built by bs itself, so `@cImport` needs no LLVM. C and C++ source files
@@ -68,8 +77,9 @@ the oldest.
   musl (`-target x86_64-linux-musl -lc`, libc built from the zig lib
   directory's sources through upstream Clang) follows when a target needs
   it.
-- Out of scope unless the user asks: other targets, ReleaseFast and
-  ReleaseSmall, LLVM, the C backend, a C or C++ compiler inside bs.
+- Out of scope unless the user asks: other targets, release-mode code
+  generation and LLVM inside bs (both go to upstream zig), the C backend,
+  a C or C++ compiler inside bs.
 - CLI: drop-in for `zig build-exe`, `zig build-obj`, `zig run`, `zig test`, and `zig build`
   (bs compiles and runs the build runner and serves its compile steps over the
   `--listen=-` compiler protocol).
@@ -87,7 +97,8 @@ the oldest.
   `.bs.zon` has a `lint` section (the schema of `.ziglint.zon`; bs does
   not read a `.ziglint.zon`, which is ziglint's alone); then ziglint
   0.8.1's defaults apply (every rule but Z033) unless that section
-  changes them (owner, 2026-11-14). `// ziglint-ignore:` comments are the only per-line
+  changes them (owner, 2026-11-14). A compilation handed to upstream zig
+  gets no lint. `// ziglint-ignore:` comments are the only per-line
   exception, and no flag or environment variable reports a finding
   without failing. ziglint 0.8.1 is the oracle for those rules, as
   upstream zig is for the language. With lint off, everything
@@ -107,7 +118,9 @@ the oldest.
   release does (see `docs/slop/zig-0.16.md`). Do not reimplement them.
   Sema branches on the language only where meaning differs.
 - Everything after ZIR is bs's own code: semantic analysis and comptime
-  (Sema), the typed IR, the backends, and the linkers.
+  (Sema), the typed IR, the backends, and the linkers. A compilation in a
+  release mode or with `-fllvm` is not bs's: upstream zig of the same
+  release compiles it (see Scope).
 - Speed comes from architecture, not micro-tuning:
   - a per-declaration cache persisted on disk across runs, keyed by ZIR
     content and dependencies;

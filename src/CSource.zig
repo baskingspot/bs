@@ -756,7 +756,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         if (found) {
             runtime.shrinkRetainingCapacity(first);
             try archives.append(ra, .{ .path = path, .object = rl.object });
-        } else if (is_nonshared and sources.len == 0 and !o.cxx_runtime and try checkZig(s, io, zig.found.?, o.language) != null) {
+        } else if (is_nonshared and sources.len == 0 and !o.cxx_runtime and try checkZig(s, io, zig.found.?, o.language, "compiling C sources") != null) {
             // A build of Zig only does not fail for want of upstream zig
             // 0.17.1; it links without libc_nonshared.a, as before.
             runtime.shrinkRetainingCapacity(first);
@@ -869,7 +869,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     // Only a build that compiles C needs upstream zig, and checks its
     // version once.
     b.zig = if (misses == 0) .{ .path = "" } else if (zig.found) |p|
-        if (try checkZig(s, io, p, o.language)) |msg| .{ .missing = try gpa.dupe(u8, msg) } else .{ .path = try gpa.dupe(u8, p) }
+        if (try checkZig(s, io, p, o.language, "compiling C sources")) |msg| .{ .missing = try gpa.dupe(u8, msg) } else .{ .path = try gpa.dupe(u8, p) }
     else
         .{ .missing = try gpa.print("compiling C sources needs upstream zig {s}; bs looked for it in {s}, as 'zig' on PATH, and in {s}", .{ o.language.versionString(), toolchain.envVar(o.language), zig.looked }) };
     b.misses = misses;
@@ -1670,22 +1670,23 @@ fn runCc(arena: std.mem.Allocator, io: Io, argv: []const []const u8, env: *const
 pub fn forward(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, args: []const []const u8) !void {
     const zig = toolchain.findZig(arena, io, environ);
     const path = zig.found orelse main.fatal("'{s}' runs upstream zig 0.17.1; bs looked for it in BS_ZIG, as 'zig' on PATH, and in {s}", .{ args[0], zig.looked });
-    if (try checkZig(arena, io, path, .newest)) |msg| main.fatal("{s}", .{msg});
+    if (try checkZig(arena, io, path, .newest, "compiling C sources")) |msg| main.fatal("{s}", .{msg});
     const argv = try std.mem.concat(arena, []const u8, &.{ &.{path}, args });
     const err = std.process.replace(io, .{ .argv = argv });
     main.fatal("unable to run '{s}': {t}", .{ path, err });
 }
 
-/// Null when `zig` is the upstream release of `language`, else why not.
-fn checkZig(arena: std.mem.Allocator, io: Io, zig: []const u8, language: Language) !?[]const u8 {
+/// Null when `zig` is the upstream release of `language`, else why not,
+/// as what `need` (`compiling C sources`) needs.
+pub fn checkZig(arena: std.mem.Allocator, io: Io, zig: []const u8, language: Language, need: []const u8) !?[]const u8 {
     const want = language.versionString();
     const res = std.process.run(arena, io, .{ .argv = &.{ zig, "version" } }) catch |err| {
-        const why = try arena.print("compiling C sources needs upstream zig {s}; unable to run '{s}': {t}", .{ want, zig, err });
+        const why = try arena.print("{s} needs upstream zig {s}; unable to run '{s}': {t}", .{ need, want, zig, err });
         return why;
     };
     const version = std.mem.trim(u8, res.stdout, " \n");
     if (res.term.success() and std.mem.eql(u8, version, want)) return null;
-    const why = try arena.print("compiling C sources needs upstream zig {s}; '{s}' is version '{s}' (set {s} to upstream {s})", .{ want, zig, version, toolchain.envVar(language), want });
+    const why = try arena.print("{s} needs upstream zig {s}; '{s}' is version '{s}' (set {s} to upstream {s})", .{ need, want, zig, version, toolchain.envVar(language), want });
     return why;
 }
 
