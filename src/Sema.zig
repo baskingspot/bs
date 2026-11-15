@@ -9942,12 +9942,15 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 // (See also the `.@"fn"` case below.)
                 const d = Type.ptrInfo(ip, dest_ty);
                 const v = val orelse return null;
+                // As upstream, which coerces `&f` on: to `*const anyopaque`
+                // too (Ghostty's `dladdr(main, …)`).
+                const opaque_dest = d.flags.size == .one and d.child == .anyopaque_type and d.flags.is_const;
                 // An extern function's address is the pointer the link
                 // binds, as `&f` gives it: comptime-known, as upstream.
-                if (d.flags.size == .one and d.child == src_ty and ip.keyTag(v) == .extern_func)
+                if (d.flags.size == .one and (d.child == src_ty or opaque_dest) and ip.keyTag(v) == .extern_func)
                     return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .{ .uav = .{ .val = v, .orig_ty = dest_ty } } } }));
                 if (d.flags.size != .one or ip.keyTag(v) != .func) return null;
-                if (d.child != src_ty and !try sema.fnTypeCoercible(block, src, v, d.child)) return null;
+                if (d.child != src_ty and !opaque_dest and !try sema.fnTypeCoercible(block, src, v, d.child)) return null;
                 const f = ip.keyPayload(.func, v);
                 if (f.generic_owner != .none) return null;
                 // The function's alignment may only decrease, as for `&f`.
