@@ -1,5 +1,6 @@
 //! ziglint's rules as compile errors, for a project that asks for them:
-//! its config (the `lint` section of its `.bs.zon`, or its `.ziglint.zon`),
+//! its config (the `lint` section of its `.bs.zon`; a `.ziglint.zon` is
+//! ziglint's alone and turns nothing on),
 //! finding and reading it, the files it covers, and the report step, which
 //! turns the syntax pass's findings (`Linter`) into diagnostics by the
 //! config's rule switches. See "ziglint's rules" in
@@ -31,23 +32,14 @@ excluded: []const []const u8,
 /// named `zig-cache` or `zig-out`, and none its own `.gitignore` matches.
 const Path = struct { abs: []const u8, dir: bool, gitignore: ?[]const u8 };
 
-pub const file_name = ".ziglint.zon";
 pub const bs_file_name = ".bs.zon";
 
-/// What `discover` found for a compilation: the nearest `.bs.zon` and the
-/// nearest `.ziglint.zon`, either possibly null, not both.
-pub const Found = struct {
-    bs: ?[]const u8,
-    ziglint: ?[]const u8,
-};
-
-/// The config files of a compilation whose root source file is
-/// `root_file`: the nearest `.bs.zon` and the nearest `.ziglint.zon` in its
-/// directory or above, up to the nearest directory that holds a
-/// `build.zig` (only the file's own directory without one). Null when
-/// there is neither, and for a root file in an `excluded` directory or a
-/// `zig-pkg` directory (a dependency): nothing is linted.
-pub fn discover(arena: Allocator, io: Io, root_file: []const u8, excluded: []const []const u8) !?Found {
+/// The `.bs.zon` of a compilation whose root source file is `root_file`:
+/// the nearest one in its directory or above, up to the nearest directory
+/// that holds a `build.zig` (only the file's own directory without one).
+/// Null when there is none, and for a root file in an `excluded`
+/// directory or a `zig-pkg` directory (a dependency): nothing is linted.
+pub fn discover(arena: Allocator, io: Io, root_file: []const u8, excluded: []const []const u8) !?[]const u8 {
     const cwd = Io.Dir.cwd();
     const start = cwd.realPathFileAlloc(io, Io.Dir.path.dirname(root_file) orelse ".", arena) catch return null;
     if (isExcluded(start, excluded)) return null;
@@ -57,19 +49,14 @@ pub fn discover(arena: Allocator, io: Io, root_file: []const u8, excluded: []con
         if (exists(io, try Io.Dir.path.join(arena, &.{ dir, "build.zig" }))) break dir;
         dir = Io.Dir.path.dirname(dir) orelse break null;
     };
-    var found: [2]?[]const u8 = .{ null, null };
-    for ([_][]const u8{ bs_file_name, file_name }, &found) |name, *f| {
-        dir = start;
-        f.* = while (true) {
-            const path = try Io.Dir.path.join(arena, &.{ dir, name });
-            if (exists(io, path)) break path;
-            const top = project orelse break null;
-            if (std.mem.eql(u8, dir, top)) break null;
-            dir = Io.Dir.path.dirname(dir) orelse break null;
-        };
+    dir = start;
+    while (true) {
+        const path = try Io.Dir.path.join(arena, &.{ dir, bs_file_name });
+        if (exists(io, path)) return path;
+        const top = project orelse return null;
+        if (std.mem.eql(u8, dir, top)) return null;
+        dir = Io.Dir.path.dirname(dir) orelse return null;
     }
-    if (found[0] == null and found[1] == null) return null;
-    return .{ .bs = found[0], .ziglint = found[1] };
 }
 
 fn exists(io: Io, path: []const u8) bool {
@@ -91,51 +78,40 @@ fn under(path: []const u8, dir: []const u8) ?[]const u8 {
     return path[dir.len + 1 ..];
 }
 
-/// The schema of `.ziglint.zon`, as ziglint's (`Config.ZonConfig`), and
-/// of `.bs.zon`'s `lint`.
+/// `.bs.zon`'s `lint`: the schema of ziglint's `.ziglint.zon`
+/// (`Config.ZonConfig`).
 const Zon = struct {
     paths: ?[]const []const u8 = null,
     rules: ?Rule.Config = null,
 };
 
 /// `.bs.zon`: a `lint` section turns lint on, with ziglint's defaults for
-/// `true` or `.{}`; `.lint = false` keeps it off, a `.ziglint.zon`'s
-/// included. Without a `lint` section, a `.ziglint.zon` decides. Its
+/// `true` or `.{}`; `.lint = false` or no `lint` section keeps it off. Its
 /// `zig_version` is the language's (language.zig).
 const BsZon = struct { lint: ?Zon = null, zig_version: ?[]const u8 = null };
 const BsZonSwitch = struct { lint: bool, zig_version: ?[]const u8 = null };
 
-/// Reads the config `discover` found: the `.bs.zon`'s `lint` section, or
-/// the `.ziglint.zon` when it has none; lint is off with neither. A config
-/// bs cannot read, with an unknown field or rule ID among others, is a
-/// compile error rather than ziglint's warning and defaults: with no other
-/// way to turn a rule off, a config ignored silently would be one.
-pub fn read(arena: Allocator, io: Io, found: Found, excluded: []const []const u8, paths: diag.Paths) !union(enum) { ok: Config, off, err: diag.Diagnostic } {
-    if (found.bs) |path| {
-        const source = switch (try readSource(arena, io, path, paths)) {
-            .ok => |s| s,
-            .err => |d| return .{ .err = d },
-        };
-        var zon_diag: std.zon.parse.Diagnostics = undefined;
-        const opts: std.zon.parse.Options = .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &zon_diag };
-        if (std.zon.parse.fromSlice(BsZonSwitch, opts)) |sw| {
-            if (!sw.lint) return .off;
-            return .{ .ok = try make(arena, io, path, source, .{}, excluded) };
-        } else |err| switch (err) {
-            error.OutOfMemory => |e| return e,
-            error.ParseZon => {},
-        }
-        const bs = std.zon.parse.fromSlice(BsZon, opts) catch |err| return .{ .err = try parseError(arena, err, &zon_diag, path, source, paths) };
-        if (bs.lint) |zon| return .{ .ok = try make(arena, io, path, source, zon, excluded) };
-    }
-    const path = found.ziglint orelse return .off;
+/// Reads the `.bs.zon` `discover` found at `path`: its `lint` section,
+/// or off without one. A config bs cannot read, with an unknown field or
+/// rule ID among others, is a compile error rather than ziglint's warning
+/// and defaults: with no other way to turn a rule off, a config ignored
+/// silently would be one.
+pub fn read(arena: Allocator, io: Io, path: []const u8, excluded: []const []const u8, paths: diag.Paths) !union(enum) { ok: Config, off, err: diag.Diagnostic } {
     const source = switch (try readSource(arena, io, path, paths)) {
         .ok => |s| s,
         .err => |d| return .{ .err = d },
     };
     var zon_diag: std.zon.parse.Diagnostics = undefined;
     const opts: std.zon.parse.Options = .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &zon_diag };
-    const zon = std.zon.parse.fromSlice(Zon, opts) catch |err| return .{ .err = try parseError(arena, err, &zon_diag, path, source, paths) };
+    if (std.zon.parse.fromSlice(BsZonSwitch, opts)) |sw| {
+        if (!sw.lint) return .off;
+        return .{ .ok = try make(arena, io, path, source, .{}, excluded) };
+    } else |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.ParseZon => {},
+    }
+    const bs = std.zon.parse.fromSlice(BsZon, opts) catch |err| return .{ .err = try parseError(arena, err, &zon_diag, path, source, paths) };
+    const zon = bs.lint orelse return .off;
     return .{ .ok = try make(arena, io, path, source, zon, excluded) };
 }
 

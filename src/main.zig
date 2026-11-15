@@ -1871,9 +1871,9 @@ fn dupeDiagnostics(arena: std.mem.Allocator, diags: []const diag.Diagnostic) ![]
 /// root source file (under `bs test`, the module under test's; for
 /// `bs build`'s configure script, whose root is in the zig lib directory,
 /// the `@build` module's, the project's `build.zig`), read: its `.bs.zon`'s
-/// `lint` section, or its `.ziglint.zon`. None without either (lint is
-/// opt-in), for a C root, a root in std or a dependency, or a `.bs.zon`
-/// that turns lint off.
+/// `lint` section. None without one (lint is opt-in; a `.ziglint.zon` is
+/// ziglint's and turns nothing on), for a C root, and for a root in std or
+/// a dependency.
 fn findLintConfig(init: std.process.Init, job: *const Job) !union(enum) { none, ok: *const LintConfig, err: diag.Diagnostic } {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -1906,7 +1906,7 @@ fn findLintConfig(init: std.process.Init, job: *const Job) !union(enum) { none, 
 /// (`Frontend.lintKey`) of the files it covered, sorted; no file without a
 /// config. The no-change skips (`Incremental.relinkIfUnchanged`,
 /// `InputsRecord`) do not skip a build whose config is not the last one's:
-/// adding, editing or removing a `.ziglint.zon` builds, and reports. With
+/// adding, editing or removing a `lint` section builds, and reports. With
 /// the same config, a covered file with a key of the last build has no
 /// findings, as that build had none: an edit build reads the findings of
 /// the edited files alone.

@@ -1,7 +1,8 @@
 # The ziglint rules' conformance suite
 
 ziglint 0.8.1 (rockorager/ziglint f6a3fc2) is the oracle for the rules
-bs enforces with a project's `.ziglint.zon` (docs/slop/ziglint-in-bs.md).
+bs enforces with the `lint` section of a project's `.bs.zon`
+(docs/slop/ziglint-in-bs.md).
 Its 372 tests, and the 146 examples in its rules' docs, are ported here
 and in `src/lint/` as follows. `zig build test` runs all of them. This
 suite is the rules' conformance measure (AGENTS.md). Parity with
@@ -20,8 +21,8 @@ dropped for this suite.
 
 ## The cases
 
-Each `*.zig` file here is a case under `test/lint/.ziglint.zon`, and each
-directory one under its own config, with `main.zig` as its root. The root
+Each `*.zig` file here is a case under `test/lint/.bs.zon`, and each
+directory one under its own, with `main.zig` as its root. The root
 file ends with a `// error` block of bs's exact standard error, which
 `zig build test` checks with `bs build-obj -fno-emit-bin`;
 `zig build test-upstream` checks that upstream zig accepts the case.

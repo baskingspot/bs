@@ -83,11 +83,11 @@ the oldest.
 - bs may reject more than upstream in two ways. Extra compile errors that
   catch real mistakes are allowed. And when a project asks for it, bs
   enforces ziglint's rules as compile errors on the project's own files,
-  never on std or on dependencies. Lint is off unless the project has a
-  `lint` section in `.bs.zon` (the schema of `.ziglint.zon`) or a
-  `.ziglint.zon` (used when `.bs.zon` has no `lint` section); then
-  ziglint 0.8.1's defaults apply (every rule but Z033) unless that config
-  changes them. `// ziglint-ignore:` comments are the only per-line
+  never on std or on dependencies. Lint is off unless the project's
+  `.bs.zon` has a `lint` section (the schema of `.ziglint.zon`; bs does
+  not read a `.ziglint.zon`, which is ziglint's alone); then ziglint
+  0.8.1's defaults apply (every rule but Z033) unless that section
+  changes them (owner, 2026-11-14). `// ziglint-ignore:` comments are the only per-line
   exception, and no flag or environment variable reports a finding
   without failing. ziglint 0.8.1 is the oracle for those rules, as
   upstream zig is for the language. With lint off, everything

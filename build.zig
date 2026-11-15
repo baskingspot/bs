@@ -1166,9 +1166,9 @@ fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
     }
 }
 
-/// The ziglint rules as compile errors, with a project's `.ziglint.zon`
-/// (`src/lint/`). Each `test/lint/*.zig` file is a case under
-/// test/lint/.ziglint.zon, and each directory one under its own config,
+/// The ziglint rules as compile errors, with the `lint` section of a
+/// project's `.bs.zon` (`src/lint/`). Each `test/lint/*.zig` file is a
+/// case under test/lint/.bs.zon, and each directory one under its own,
 /// with `main.zig` as its root file. The root file ends with a `// error`
 /// block of bs's exact standard error, as a test/diag case's: `test` runs
 /// `bs build-obj -fno-emit-bin` on it; `test-upstream` checks that
@@ -1207,7 +1207,7 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         // directory.
         if (entry.kind == .directory) addDirectoryInputs(b, run, case_dir, true) else {
             run.addFileInput(b.path(src_path));
-            run.addFileInput(b.path("test/lint/.ziglint.zon"));
+            run.addFileInput(b.path("test/lint/.bs.zon"));
         }
         run.setEnvironmentVariable("BS_CACHE", "off");
         run.addCheck(.{ .expect_stderr_exact = expected.items });
@@ -1223,11 +1223,11 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
     }
 
     // Lint is opt-in: a project without a config, or with a `.bs.zon`
-    // that has no `lint` section, is not linted. The cache: a build with
-    // lint off that succeeded does not let a build a config turns lint on
-    // for skip as unchanged, nor one config another's build, and turning
-    // lint off builds again. A `.bs.zon`'s `lint` decides over a
-    // `.ziglint.zon`, which decides without one.
+    // that has no `lint` section, is not linted, and a `.ziglint.zon`,
+    // which is ziglint's, turns nothing on. The cache: a build with lint
+    // off that succeeded does not let a build a config turns lint on for
+    // skip as unchanged, nor one config another's build, and turning lint
+    // off builds again.
     const added = b.addSystemCommand(&.{
         "sh", "-c",
         \\set -e
@@ -1245,9 +1245,12 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         \\grep -q "main.zig:2:4: error\[style, Z001\]: function 'Bad' should be camelCase" log || { cat log; exit 1; }
         \\if "$bs" build-exe main.zig $c 2>log; then echo "the build again passed"; exit 1; fi
         \\rm .bs.zon
-        \\printf '.{ .rules = .{ .Z001 = .{ .enabled = false } } }\n' > .ziglint.zon
-        \\"$bs" build-exe main.zig $c
         \\printf '.{}\n' > .ziglint.zon
+        \\"$bs" build-exe main.zig $c
+        \\rm .ziglint.zon
+        \\printf '.{ .lint = .{ .rules = .{ .Z001 = .{ .enabled = false } } } }\n' > .bs.zon
+        \\"$bs" build-exe main.zig $c
+        \\printf '.{ .lint = .{} }\n' > .bs.zon
         \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with Z001 on again passed"; exit 1; fi
         \\printf '.{ .lint = .{ .rules = .{ .Z001 = .{ .enabled = false } } } }\n' > .bs.zon
         \\"$bs" build-exe main.zig $c
@@ -1258,7 +1261,7 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         \\printf 'const lib = @import("lib.zig");\npub fn main() void {\n    lib.thing();\n}\n' > main.zig
         \\printf '/// Deprecated: gone soon.\npub fn thing() void {}\n' > lib.zig
         \\"$bs" build-exe main.zig $c
-        \\printf '.{ .zig_version = "0.17" }\n' > .bs.zon
+        \\printf '.{ .zig_version = "0.17", .lint = .{} }\n' > .bs.zon
         \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with a config passed"; exit 1; fi
         \\grep -q "main.zig:3:9: error\[deprecated, Z011\]: 'thing' is deprecated: Deprecated: gone soon." log || { cat log; exit 1; }
         \\# And it reads doc comments, which no source hash covers:
@@ -1274,9 +1277,9 @@ fn addLintTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Buil
         \\# config turns on: a unit recorded with Z029 off is analyzed again
         \\# when it is turned on.
         \\printf 'fn take(v: u32) u32 {\n    return v;\n}\npub fn main() void {\n    _ = take(@as(u32, 1));\n}\n' > main.zig
-        \\printf '.{ .rules = .{ .Z029 = .{ .enabled = false } } }\n' > .ziglint.zon
+        \\printf '.{ .lint = .{ .rules = .{ .Z029 = .{ .enabled = false } } } }\n' > .bs.zon
         \\"$bs" build-exe main.zig $c
-        \\printf '.{}\n' > .ziglint.zon
+        \\printf '.{ .lint = .{} }\n' > .bs.zon
         \\if "$bs" build-exe main.zig $c 2>log; then echo "the build with Z029 on passed"; exit 1; fi
         \\grep -q "main.zig:5:14: error\[style, Z029\]" log || { cat log; exit 1; }
         ,
@@ -1989,8 +1992,8 @@ fn addBuildTest(b: *std.Build, bs: *std.Build.Step.Compile, build_web_wasm: std.
 /// CPU at 4, 42 s at 2, 37 s at 1), much of it the system time of
 /// unmapping freed memory under SafeAllocator. Two keeps CodeGen on a
 /// worker, as any count above one does; the output is the same for
-/// every count. And each declares the repository's .ziglint.zon, which bs
-/// reads as the lint config of the files it compiles there.
+/// every count. And each declares the repository's .bs.zon, whose `lint`
+/// section bs reads as the lint config of the files it compiles there.
 fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roots: []const *std.Build.Step) void {
     const Step = std.Build.Step;
     const workers = @max(1, (std.Thread.getCpuCount() catch 1) -| 1);
@@ -2026,8 +2029,8 @@ fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roo
             if (s.cast(Step.Run)) |run| {
                 if (run.getEnvMap().get("BS_THREADS") == null) run.setEnvironmentVariable("BS_THREADS", "2");
                 // bs looks up a lint config from each file it compiles,
-                // which in the repository finds its .ziglint.zon.
-                run.addFileInput(b.path(".ziglint.zon"));
+                // which in the repository finds its .bs.zon.
+                run.addFileInput(b.path(".bs.zon"));
             }
             const least = std.mem.findMin(usize, loads);
             s.dependOn(gates[least]);

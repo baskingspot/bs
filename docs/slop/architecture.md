@@ -10549,13 +10549,15 @@ unchanged:
    crashes left.)
 8. Later: `bs explain` and `bs fix` (applies exact fixes).
 
-## ziglint's rules as compile errors (designed and owner-approved 2026-11-07; opt-in through `.bs.zon` since 2026-11-09)
+## ziglint's rules as compile errors (designed and owner-approved 2026-11-07; opt-in through `.bs.zon` since 2026-11-09, through `.bs.zon` alone since 2026-11-14)
 
 bs reports ziglint 0.8.1's rules as compile errors in the own files of
 a project that asks for them, never in std or dependencies: a project
 turns lint on, and configures it, with the `lint` section of a
-`.bs.zon`, or with a `.ziglint.zon` when its `.bs.zon` has no `lint`
-section (owner, 2026-11-09; lint was on by default for a day before). The
+`.bs.zon` (owner, 2026-11-14). A `.ziglint.zon` is ziglint's and turns
+nothing on: from 2026-11-09 until then it did when the `.bs.zon` had no
+`lint` section, which linted projects such as fastmem that keep one for
+ziglint, and lint was on by default for a day before that. The
 design, its rule-by-rule placement and the owner's decisions are in
 docs/slop/ziglint-in-bs.md. What is built:
 
@@ -10563,13 +10565,14 @@ docs/slop/ziglint-in-bs.md. What is built:
   module's root source file (`bs test`: the module under test's;
   `bs build`'s configure script: the `@build` module's `build.zig`) to
   the nearest directory with a `build.zig`, and only the file's own
-  directory without one, for the nearest `.bs.zon` and the nearest
-  `.ziglint.zon`; a root in the zig lib directory, the global package
-  cache's `p/` or a `zig-pkg/` directory is never linted. A `.bs.zon`'s
-  `lint` section decides: it has `.ziglint.zon`'s schema, `true` or `.{}`
-  are ziglint 0.8.1's defaults (every rule but Z033, Z024 at 120 bytes),
-  and `.lint = false` keeps lint off. Without one, a `.ziglint.zon`
-  decides; with neither, lint is off. The `.bs.zon`'s `zig_version` is
+  directory without one, for the nearest `.bs.zon`; a root in the zig
+  lib directory, the global package cache's `p/` or a `zig-pkg/`
+  directory is never linted. Its `lint` section decides: it has
+  `.ziglint.zon`'s schema, `true` or `.{}` are ziglint 0.8.1's defaults
+  (every rule but Z033, Z024 at 120 bytes), and `.lint = false` or no
+  `lint` section keeps lint off. bs's own repository keeps the same
+  config twice, in `.bs.zon` for bs and `.ziglint.zon` for ziglint
+  (`just ziglint`). The `.bs.zon`'s `zig_version` is
   the language's (`language.resolve`). `paths` are relative to the
   config's directory, `.` when there are none. A file is
   covered as ziglint's walk would take it: a `paths` file, or a `.zig`

@@ -1,0 +1,1 @@
+.{ .lint = .{ .paths = .{"lines.zig"}, .rules = .{ .Z024 = .{ .max_length = 60 } } } }

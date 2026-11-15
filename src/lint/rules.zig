@@ -49,7 +49,8 @@ pub const Rule = enum(u16) {
         };
     }
 
-    /// A `.ziglint.zon`'s `rules`: a field per rule.
+    /// A lint config's `rules` (`.bs.zon`'s `lint`, with ziglint's
+    /// `.ziglint.zon` schema): a field per rule.
     pub const Config = blk: {
         const info = @typeInfo(Rule).@"enum";
         var field_types: [info.field_names.len]type = undefined;

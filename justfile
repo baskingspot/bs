@@ -59,7 +59,7 @@ lint:
 ziglint:
     ziglint
 
-[doc("ziglint's rules enforced by bs: bs builds every program in the files .ziglint.zon covers (not emitting binaries where it can), so a finding fails the recipe. bench/realworld/vaxis_render.zig (needs libvaxis) and bench/workloads/vaxis-build (its own build root, where bs finds no config) stay unchecked")]
+[doc("ziglint's rules enforced by bs: bs builds every program in the files the lint section of .bs.zon covers (not emitting binaries where it can), so a finding fails the recipe. bench/realworld/vaxis_render.zig (needs libvaxis) and bench/workloads/vaxis-build (its own build root, where bs finds no config) stay unchecked")]
 [group("lint")]
 lint-bs:
     #!/usr/bin/env bash
