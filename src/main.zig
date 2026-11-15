@@ -3513,6 +3513,7 @@ test {
     _ = @import("link/Tbd.zig");
     _ = @import("Zcu.zig");
     _ = @import("codegen/aarch64/Encoder.zig");
+    _ = @import("codegen/aarch64/asm_sve.zig");
     _ = @import("codegen/Ssa.zig");
     _ = @import("codegen/rewrite.zig");
     _ = @import("codegen/prove.zig");

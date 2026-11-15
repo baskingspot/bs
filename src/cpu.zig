@@ -94,10 +94,13 @@ pub fn cacheName(arena: std.mem.Allocator, cpu: Cpu, default: Cpu) ![]const u8 {
 // ---------------------------------------------------------------------------
 // aarch64: by default the host's CPU, clamped, for the native target, and
 // Apple's M1 (aarch64-macos) or the generic ARMv8.0 core (aarch64-linux)
-// for an explicit one, as upstream; or a CPU model and features without
-// SVE and SME, which bs's backend and assembler do not handle (with them
-// std takes 256-bit vectors, `std.simd.suggestVectorLength`, and its Linux
-// syscalls clobber the z and p registers).
+// for an explicit one, as upstream; or a CPU model and features,
+// including SVE and SME. bs generates NEON code for any of them, as its
+// x86_64 code stays SSE under AVX models; inline assembly may use SVE's
+// instructions (`asm_sve.zig`), std takes its 256-bit vector length
+// (`std.simd.suggestVectorLength`) and its Linux syscalls clobber the z
+// registers, which bs reads as clobbering the v registers within. The
+// native host's CPU alone is clamped to one without SVE and SME.
 
 const aarch64 = std.Target.aarch64;
 
@@ -139,7 +142,7 @@ pub fn nativeAarch64(io: std.Io) ?Cpu {
 /// aarch64-macos (`macos`) or aarch64-linux: `native` is the host's CPU,
 /// clamped, or the target's default on a host of another architecture
 /// (whose CPU upstream would put in an aarch64 builtin); a model or
-/// features that enable SVE or SME are refused.
+/// features as upstream resolves them, SVE and SME included.
 pub fn resolveAarch64(arena: std.mem.Allocator, io: std.Io, text: []const u8, macos: bool) Resolved {
     const default = targetDefault(.aarch64, macos);
     if (std.mem.eql(u8, text, "native")) return .{ .cpu = nativeAarch64(io) orelse default };
@@ -147,14 +150,7 @@ pub fn resolveAarch64(arena: std.mem.Allocator, io: std.Io, text: []const u8, ma
         return .{ .cpu = default, .refused = arena.print("invalid CPU '{s}' ('-mcpu'): {t}", .{ text, err }) catch "out of memory" };
     const target = std.zig.system.resolveTargetQuery(io, query) catch |err|
         return .{ .cpu = default, .refused = arena.print("unable to resolve CPU '{s}' ('-mcpu'): {t}", .{ text, err }) catch "out of memory" };
-    var names: std.ArrayList(u8) = .empty;
-    for (Cpu.Arch.aarch64.allFeaturesList(), 0..) |f, i| {
-        if (!target.cpu.features.isEnabled(@intCast(i)) or !isScalable(f.name)) continue;
-        if (names.items.len != 0) names.appendSlice(arena, ", ") catch {}; // ziglint-ignore: Z026 -- out of memory only shortens the message
-        names.appendSlice(arena, f.name) catch {}; // ziglint-ignore: Z026 -- out of memory only shortens the message
-    }
-    if (names.items.len == 0) return .{ .cpu = target.cpu };
-    return .{ .cpu = default, .refused = arena.print("bs does not generate SVE or SME code for aarch64; '-mcpu {s}' enables {s}", .{ text, names.items }) catch "out of memory" };
+    return .{ .cpu = target.cpu };
 }
 
 test resolve {
@@ -212,9 +208,9 @@ test resolveAarch64 {
     try std.testing.expectEqual(null, n1.refused);
     try std.testing.expect(n1.cpu.has(.aarch64, .lse) and n1.cpu.has(.aarch64, .aes) and n1.cpu.has(.aarch64, .sha2));
     try std.testing.expect(resolveAarch64(arena, io, "generic+lse+crc", false).cpu.has(.aarch64, .crc));
-    // SVE, through a model, a feature, or a feature that needs it.
-    try std.testing.expect(std.mem.find(u8, resolveAarch64(arena, io, "a64fx", false).refused.?, "enables sve") != null);
-    try std.testing.expect(resolveAarch64(arena, io, "generic+sve2", false).refused != null);
+    // SVE, through a model or a feature that needs it, as upstream.
+    try std.testing.expect(resolveAarch64(arena, io, "neoverse_v1", false).cpu.has(.aarch64, .sve));
+    try std.testing.expect(resolveAarch64(arena, io, "generic+sve2", false).cpu.has(.aarch64, .sve));
 }
 
 test clampAarch64 {

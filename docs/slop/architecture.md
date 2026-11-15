@@ -10680,12 +10680,19 @@ the choice instead of failing:
   one (`apple_m1` on aarch64-macos, the generic ARMv8.0 core on
   aarch64-linux; `cpu.targetDefault`, which drops apple_m1's fuse_aes as
   upstream's `resolveTargetQuery` does). The host's CPU is clamped by
-  removing SVE and SME (`cpu.clampAarch64`), which bs's backend and
-  assembler do not handle and with which std would take
-  `std.simd`'s 256-bit vector length and the syscalls' z and p register
-  clobbers. An explicit model or feature list (upstream's syntax) is
-  accepted unless it enables SVE or SME, which is refused with a message
-  naming the features. `builtin.cpu`, the C and translate-c targets and
+  removing SVE and SME (`cpu.clampAarch64`), so that a build on an SVE
+  host is the build bs measured before SVE CPUs were accepted. An explicit model or feature list (upstream's syntax) is
+  accepted as upstream resolves it, SVE and SME included (until
+  2026-11-14 one with them was refused). bs's code stays NEON, as its
+  x86_64 code stays SSE under AVX models; what an SVE CPU changes is
+  upstream's: `builtin.cpu`, std's 256-bit `suggestVectorLength` (bs
+  lowers those vectors as it lowers any wider than a register), the
+  syscalls' z and p clobbers (a z clobber is its v register's, a p
+  clobber nothing bs allocates), and inline assembly's SVE instructions,
+  which `asm_sve.zig` encodes as LLVM does for the CPU's `sve` or after
+  `.arch ...+sve` (`ld1b` to `ld1d`, `st1b` to `st1d`, `cntb` to `cntd`,
+  the `while` comparisons and `ptrue`; others are "not supported yet").
+  The native host's CPU is still clamped. `builtin.cpu`, the C and translate-c targets and
   the cache name (`cpu.cacheName`, against the target's default) come
   from the resolved CPU. The backend tests lse and lse2 (atomics), crc
   (inline assembly) and fullfp16 (native f16 arithmetic). On the Mac no

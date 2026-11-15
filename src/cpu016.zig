@@ -6,8 +6,8 @@
 //! which code generation uses, cannot be written into a 0.16 builtin.
 //!
 //! bs's own limits apply in 0.16's terms too: a native x86_64 CPU is
-//! clamped (`cpu.clamp`) to the same model and features, and an aarch64
-//! one loses SVE and SME (`cpu.clampAarch64`).
+//! clamped (`cpu.clamp`) to the same model and features, and a native
+//! aarch64 one loses SVE and SME (`cpu.clampAarch64`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -73,7 +73,8 @@ pub fn resolve(arena: std.mem.Allocator, arch: std.Target.Cpu.Arch, macos: bool,
         s.* = false;
     };
     populate(t, set);
-    for (set, sub, t.features) |*s, x, f| if (x or (arch == .aarch64 and cpu_mod.isScalable(f.name))) {
+    const clamp = arch == .aarch64 and std.mem.eql(u8, model_name, "native");
+    for (set, sub, t.features) |*s, x, f| if (x or (clamp and cpu_mod.isScalable(f.name))) {
         s.* = false;
     };
     var names: std.ArrayList([]const u8) = .empty;

@@ -60,6 +60,7 @@ const asm_src = @import("../asm_src.zig");
 const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
 const asm_insn = @import("asm_insn.zig");
+const asm_sve = @import("asm_sve.zig");
 const AsmOperand = asm_insn.Operand;
 const AsmMem = asm_insn.Mem;
 const VKind = asm_insn.VKind;
@@ -5228,7 +5229,7 @@ fn saveVReg(cg: *CodeGen, vsaved: *[8]?Mem, r: u5) Error!void {
 }
 
 /// Whether template `source` names SIMD register `r` (`v3`, `q3.4s`,
-/// `d3`, ...), outside `%[name]` operand references.
+/// `d3`, SVE's `z3.b`, ...), outside `%[name]` operand references.
 fn mentionsVReg(source: []const u8, r: u8) bool {
     var k: usize = 0;
     while (k < source.len) {
@@ -5236,7 +5237,7 @@ fn mentionsVReg(source: []const u8, r: u8) bool {
             k = (std.mem.findScalarPos(u8, source, k, ']') orelse return false) + 1;
             continue;
         }
-        if (std.mem.findScalar(u8, "vqdshb", source[k]) != null and (k == 0 or !std.ascii.isAlphanumeric(source[k - 1]) and source[k - 1] != '_')) {
+        if (std.mem.findScalar(u8, "vqdshbz", source[k]) != null and (k == 0 or !std.ascii.isAlphanumeric(source[k - 1]) and source[k - 1] != '_')) {
             var end = k + 1;
             while (end < source.len and std.ascii.isDigit(source[end])) end += 1;
             if (end > k + 1 and (end == source.len or !std.ascii.isAlphanumeric(source[end]) and source[end] != '_')) {
@@ -5356,6 +5357,9 @@ const LocalLabels = struct {
     fwd: [10]?Encoder.Label = @splat(null),
     back: [10]?Encoder.Label = @splat(null),
     named: std.StringHashMapUnmanaged(Named) = .empty,
+    /// What the block's last `.arch` or `.arch_extension` said of SVE:
+    /// null before one, when the CPU's features decide.
+    sve: ?bool = null,
 
     /// `line` is the asm line of the first branch to it, for the error
     /// when nothing defines it.
@@ -5650,10 +5654,32 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
             return;
         }
         if (try cg.asmAlign(line)) return;
+        // `.arch armv8-a+sve` and `.arch_extension sve`, as fastmem's SVE
+        // kernels and Arm's optimized-routines begin: SVE for the rest of
+        // the block, whatever the CPU. bs keeps no other feature by them.
+        if (std.mem.startsWith(u8, line, ".arch ") or std.mem.startsWith(u8, line, ".arch\t")) {
+            locals.sve = std.mem.find(u8, line, "+sve") != null;
+            return;
+        }
+        if (std.mem.startsWith(u8, line, ".arch_extension")) {
+            const ext = std.mem.trim(u8, line[".arch_extension".len..], " \t");
+            if (std.mem.startsWith(u8, ext, "sve")) locals.sve = true;
+            if (std.mem.startsWith(u8, ext, "nosve")) locals.sve = false;
+            return;
+        }
         return cg.fail("bs does not support the assembler directive '{s}' yet", .{line});
     }
     const sp = std.mem.findAny(u8, line, " \t") orelse line.len;
     const mnemonic = line[0..sp];
+    {
+        var msg: []const u8 = "";
+        const sve = locals.sve orelse cg.emit.zcu.cpu.has(.aarch64, .sve);
+        const word = asm_sve.encode(mnemonic, line[sp..], sve, &msg) catch |err| switch (err) {
+            error.AsmUnsupported => return cg.asmUnsupported(line),
+            error.AsmInvalid => return cg.fail("inline assembly: {s}: '{s}'", .{ msg, line }),
+        };
+        if (word) |w| return cg.e.raw(w);
+    }
     var operands: [6]AsmOperand = undefined;
     var n: usize = 0;
     // Split at commas outside brackets.

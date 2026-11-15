@@ -46,6 +46,11 @@ the oldest.
   CPU. What AVX would change in meaning is refused: vectors over 16 bytes
   passed by value in the C ABI, and YMM or ZMM operands in inline assembly
   (2026-11-05). The native target's host CPU stays clamped to x86-64-v2.
+- bs's aarch64 code uses Advanced SIMD (NEON). An `-mcpu` with SVE or SME
+  (neoverse_v1 to v3, a64fx) is accepted as upstream resolves it:
+  `builtin.cpu` reports it, and inline assembly may use the SVE
+  instructions bs's assembler encodes, while bs's own code stays NEON.
+  The native host's CPU stays clamped (2026-11-14).
 - One exception: `-OReleaseSafe` (which `zig build` steps such as Ghostty's
   tool executables pass) is accepted and compiled with the same code
   generation, with `builtin.mode == .safe` and upstream's
