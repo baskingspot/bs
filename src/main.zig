@@ -2508,17 +2508,18 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
 
 /// Ignored options that take a parameter.
 const ignored_flags_with_arg: std.StaticStringMap(void) = .initComptime(.{
-    .{"-iquote"},                .{"-iframework"},  .{"-iframeworkwithsysroot"},
-    .{"-rpath"},                 .{"--libc"},       .{"--sysroot"},
-    .{"--error-limit"},          .{"--debug-log"},  .{"--dynamic-linker"},
-    .{"-z"},                     .{"--image-base"}, .{"-current_version"},
-    .{"-compatibility_version"},
+    .{"-iquote"},          .{"-rpath"},                 .{"--libc"},
+    .{"--sysroot"},        .{"--error-limit"},          .{"--debug-log"},
+    .{"--dynamic-linker"}, .{"-z"},                     .{"--image-base"},
+    .{"-current_version"}, .{"-compatibility_version"},
 });
 
 /// Include directory options of C, with their group's bit (upstream's
 /// `ClangSearchSanitizer`, which drops a directory given twice in a group).
 const cc_include_flags: std.StaticStringMap(u8) = .initComptime(.{
-    .{ "-I", 1 }, .{ "-isystem", 1 << 1 }, .{ "-iwithsysroot", 1 << 2 }, .{ "-idirafter", 1 << 3 },
+    .{ "-I", 1 },               .{ "-isystem", 1 << 1 },               .{ "-iwithsysroot", 1 << 2 }, .{ "-idirafter", 1 << 3 },
+    // `--embed-dir=` is `1 << 5`.
+    .{ "-iframework", 1 << 4 }, .{ "-iframeworkwithsysroot", 1 << 6 },
 });
 
 fn addInclude(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), seen: *std.StringHashMapUnmanaged(u8), group: u8, arg: []const u8, dir: []const u8, joined: bool) !void {
@@ -2844,7 +2845,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (std.mem.startsWith(u8, arg, "-D")) {
             try cc_argv.append(arena, arg);
         } else if (cc_include_flags.get(arg)) |group| {
-            try addInclude(arena, &cc_argv, &cc_seen, group, arg, nextArg(args, &i, arg), false);
+            const dir = nextArg(args, &i, arg);
+            try addInclude(arena, &cc_argv, &cc_seen, group, arg, dir, false);
+            // As upstream, a framework include directory is a `-F` too.
+            if (std.mem.startsWith(u8, arg, "-iframework")) try framework_dirs.append(arena, dir);
         } else if (std.mem.startsWith(u8, arg, "-I")) {
             try addInclude(arena, &cc_argv, &cc_seen, 1, arg, arg[2..], true);
         } else if (std.mem.startsWith(u8, arg, "--embed-dir=")) {
@@ -3016,10 +3020,16 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             fatal("unable to find library '-l{s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_dirs.items) });
         try found.put(arena, link_inputs.items[q.at], {});
     }
+    // As upstream, an object or a static library links no frameworks, so
+    // one that is not found is no error there: upstream finds them only to
+    // link.
+    const links_frameworks = !(command.isObj() or (command == .build_lib and link_mode != .dynamic));
     for (frameworks.items) |q| {
-        if (!macos) fatal("frameworks are for macOS targets ('-framework {s}')", .{q.name});
-        link_inputs.items[q.at] = try findFramework(arena, io, search_frameworks.items, q.name) orelse
+        link_inputs.items[q.at] = (if (macos) try findFramework(arena, io, search_frameworks.items, q.name) else null) orelse {
+            if (!links_frameworks) continue;
+            if (!macos) fatal("frameworks are for macOS targets ('-framework {s}')", .{q.name});
             fatal("unable to find framework '-framework {s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_frameworks.items) });
+        };
     }
     // As upstream, an object or a static library links nothing: it leaves
     // archive and shared library inputs out (`-l` names are still found).
@@ -3035,6 +3045,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         };
         var kept: usize = 0;
         for (link_inputs.items) |path| {
+            if (path.len == 0) continue; // a framework not found
             if (!opts.dynamic and (std.mem.eql(u8, Io.Dir.path.extension(path), ".a") or isSharedLib(path))) {
                 Io.Dir.cwd().access(io, path, .{}) catch fatal("{s}: file not found", .{path});
                 continue;

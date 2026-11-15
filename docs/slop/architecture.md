@@ -9210,8 +9210,10 @@ libraries as inputs. To be agreed with that thread.
 ### Step 3, C sources, as built (2026-11-04)
 
 - **Options** (`main.parseOptions`), as upstream's: `-I`, `-isystem`,
-  `-idirafter`, `-iwithsysroot`, `--embed-dir=` (each directory once per
-  group and module, as `ClangSearchSanitizer`) and `-D` collect in
+  `-idirafter`, `-iwithsysroot`, `-iframework`, `-iframeworkwithsysroot`
+  (also a `-F` for the link, as upstream's), `--embed-dir=` (each
+  directory once per group and module, as `ClangSearchSanitizer`) and
+  `-D` collect in
   `cc_argv`, which the next `-M` takes together with the `.c` files given
   since the last `-M` and the module's C options (`-fsanitize-c[=trap|
   full]`, `-fno-sanitize-c`, `-m[no-]red-zone`, `-f[no-]builtin`,
