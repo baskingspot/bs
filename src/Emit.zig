@@ -1495,10 +1495,10 @@ pub fn finish(emit: *Emit) !bool {
     // Before the declarations: a slot can request an exported one.
     if (!try emit.lowerExternSlots()) return false;
     if (emit.inputs) |in| if (!try emit.convertInputs(in)) return false;
-    // An executable's too, with inputs: the cache resolves their
-    // references to Zig's exports again when it relinks; and with shared
-    // libraries, which may name them (`Glibc.dynamicOptions`).
-    if (emit.obj or emit.inputs != null or emit.shared_libs.len != 0) try emit.findExports();
+    // An executable's too: its .symtab lists their names (`aliasSymbols`),
+    // the cache resolves the inputs' references to them again when it
+    // relinks, and shared libraries may name them (`Glibc.dynamicOptions`).
+    try emit.findExports();
     try emit.lowerNavs();
     if (emit.uses_error_names) try emit.emitErrorNameTable();
 
@@ -1572,18 +1572,19 @@ pub const name_later: []const u8 = "(named later)";
 /// and those it loaded, from the final names (docs/slop/architecture.md, "Type
 /// names"). A function's symbol name is upstream's: the declaration's
 /// qualified name, with `__func_` and a stable hash for an instance of a
-/// generic function (upstream numbers them by InternPool index), or its
-/// export name. Names may repeat, like upstream's local symbols; the
+/// generic function (upstream numbers them by InternPool index), or on
+/// Mach-O its export name. Names may repeat, like upstream's local symbols; the
 /// atom's key is its identity. Fills `atom_names`.
 fn nameAtoms(emit: *Emit) !void {
     const ip = &emit.zcu.ip;
     const arena = emit.allocator();
     try emit.atom_names.resize(emit.gpa, emit.atoms.items.len);
     @memset(emit.atom_names.items, .{});
-    // The last export of a declaration names its function.
+    // On Mach-O, the last export of a declaration names its function.
+    const macho = ip.target == .aarch64_macos;
     var exported: std.AutoHashMapUnmanaged(InternPool.NavIndex, InternPool.String) = .empty;
     defer exported.deinit(emit.gpa);
-    for (emit.zcu.exports.items) |x| if (x.target == .nav) try exported.put(emit.gpa, x.target.nav, x.name);
+    if (macho) for (emit.zcu.exports.items) |x| if (x.target == .nav) try exported.put(emit.gpa, x.target.nav, x.name);
     // Declarations share their parents' names.
     var parents: std.AutoHashMapUnmanaged(Index, []const u8) = .empty;
     defer parents.deinit(emit.gpa);
@@ -1600,7 +1601,8 @@ fn nameAtoms(emit: *Emit) !void {
             .content, .link, .input => continue,
         };
         const generic = func_index != .none and ip.keyPayload(.func, func_index).generic_owner != .none;
-        if (func_index != .none and !generic) if (exported.get(nav_index)) |name| {
+        // On ELF the export names are aliases (`aliasSymbols`), as upstream's.
+        if (func_index != .none and !generic and macho) if (exported.get(nav_index)) |name| {
             atom.name = ip.stringSlice(name);
             continue;
         };
@@ -1687,7 +1689,14 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         };
         return true;
     }
-    const options: Elf.Options = .{ .entry = emit.entry, .arch = if (emit.zcu.ip.target.arch() == .aarch64) .aarch64 else .x86_64, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none, .local_symbols = emit.input_symbols, .input_sections = emit.input_sections, .aliases = emit.aliases.items, .strip = emit.strip };
+    var alias_arena: std.heap.ArenaAllocator = .init(emit.gpa);
+    defer alias_arena.deinit();
+    // An object's exports are its global symbols (`ElfObject`).
+    const local_symbols = if (emit.obj and !emit.shared) emit.input_symbols else l: {
+        const a = alias_arena.allocator();
+        break :l try std.mem.concat(a, Elf.LocalSymbol, &.{ emit.input_symbols, try aliasSymbols(a, emit.exports.items, try rtNames(a, emit.zcu.language, emit.atoms.items)) });
+    };
+    const options: Elf.Options = .{ .entry = emit.entry, .arch = if (emit.zcu.ip.target.arch() == .aarch64) .aarch64 else .x86_64, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none, .local_symbols = local_symbols, .input_sections = emit.input_sections, .aliases = emit.aliases.items, .strip = emit.strip };
     const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
     defer emit.gpa.free(imports);
     for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls };
@@ -1736,6 +1745,11 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         var shared_options = options;
         shared_options.base_address = 0;
         shared_options.dynamic = &dynamic;
+        // The version script's locals are hidden.
+        if (emit.version_script != null) {
+            const a = alias_arena.allocator();
+            shared_options.local_symbols = try std.mem.concat(a, Elf.LocalSymbol, &.{ emit.input_symbols, try aliasSymbols(a, exports, try rtNames(a, emit.zcu.language, emit.atoms.items)) });
+        }
         break :shared Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, shared_options);
     } else if (emit.obj)
         ElfObject.link(emit.gpa, io, dir, sub_path, emit.atoms.items, options, .{ .exports = emit.exports.items, .imports = imports })
@@ -1746,6 +1760,59 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         return false;
     };
     return true;
+}
+
+/// A name compiler_rt exports its function `key` under (`rtNames`).
+pub const RtName = struct { key: SymbolKey, name: []const u8 };
+
+/// The names compiler_rt exports the functions of `atoms` under (atoms
+/// named `compiler_rt.<...>`), as `language`'s compiler_rt does.
+pub fn rtNames(arena: Allocator, language: @import("language.zig").Language, atoms: []const Atom) ![]const RtName {
+    var by_key: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty;
+    for (atoms) |atom| if (std.mem.startsWith(u8, atom.name, "compiler_rt.")) try by_key.put(arena, atom.key, {});
+    var out: std.ArrayList(RtName) = .empty;
+    if (by_key.count() == 0) return out.items;
+    var buf: [128]u8 = undefined;
+    for (Zcu.compilerRtExports(language)) |e| {
+        const key: SymbolKey = .fromName(Zcu.compilerRtKey(&buf, e[1], e[2]));
+        if (by_key.contains(key)) try out.append(arena, .{ .key = key, .name = e[0] });
+    }
+    return out.items;
+}
+
+/// The .symtab entries of an executable or shared object besides its
+/// atoms' own, which carry the declarations' qualified names: each export
+/// name of `exports` (hidden ones local, as lld lists them), and the names
+/// `rt` gives compiler_rt's functions (`__udivti3`, weak hidden upstream,
+/// so local) unless the program exports the name itself. As upstream's
+/// LLVM backend makes every export an alias of the declaration's symbol
+/// and links compiler_rt as an object of its own.
+pub fn aliasSymbols(arena: Allocator, exports: []const ElfDynamic.Export, rt: []const RtName) ![]Elf.LocalSymbol {
+    var out: std.ArrayList(Elf.LocalSymbol) = .empty;
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    try names.ensureTotalCapacity(arena, @intCast(exports.len));
+    // A strong export of a name wins over a weak one, as `userExport` picks.
+    for ([_]bool{ false, true }) |weak| for (exports) |x| {
+        if (x.weak != weak or names.contains(x.name)) continue;
+        names.putAssumeCapacity(x.name, {});
+        try out.append(arena, .{
+            .name = x.name,
+            .atom = x.key,
+            .offset = x.offset,
+            .size = x.size,
+            .bind = if (x.visibility == .hidden) .local else if (x.weak) .weak else .global,
+            .visibility = switch (x.visibility) {
+                .default => .DEFAULT,
+                .hidden => .HIDDEN,
+                .protected => .PROTECTED,
+            },
+            .alias = true,
+        });
+    };
+    for (rt) |r| if (!names.contains(r.name)) {
+        try out.append(arena, .{ .name = r.name, .atom = r.key, .offset = 0, .bind = .local, .visibility = .HIDDEN, .alias = true });
+    };
+    return out.items;
 }
 
 /// The exports with the places version script `vs` gives them: a local
@@ -2109,10 +2176,13 @@ fn findExports(emit: *Emit) !void {
         try emit.exports.append(emit.gpa, entry);
     }
     // Container-level assembly's, at the start of its atom (the others
-    // are an error in objects, `global_asm.assemble`).
-    for (emit.asm_symbols.keys(), emit.asm_symbols.values()) |name, t| {
+    // are an error in objects, `global_asm.assemble`), for objects and
+    // the inputs and libraries that may name them. An executable's
+    // .symtab lists them as its atoms' names already, and its edit builds
+    // do not assemble the blocks again.
+    if (emit.obj or emit.inputs != null or emit.shared_libs.len != 0) for (emit.asm_symbols.keys(), emit.asm_symbols.values()) |name, t| {
         if (t.addend == 0) try emit.exports.append(emit.gpa, .{ .key = t.key, .name = name, .weak = false, .visibility = .default });
-    }
+    };
 }
 
 /// Writes the slot of each external symbol: the address of the export of

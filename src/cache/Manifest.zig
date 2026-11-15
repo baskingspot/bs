@@ -292,10 +292,13 @@ pub const LinkSymbol = extern struct {
     key: Hash,
     name: StrRef,
     kind: Kind,
-    /// An import's `Emit.ImportFlags.bits`; 0 for an export.
+    /// An import's `Emit.ImportFlags.bits`; an export's visibility and
+    /// linkage: 1 hidden, 2 weak, 4 protected.
     flags: u32 = 0,
 
-    pub const Kind = enum(u32) { @"export", import, _ };
+    /// `rt_alias`: a name compiler_rt exports its function `key` under,
+    /// which an executable's .symtab lists (`Emit.aliasSymbols`).
+    pub const Kind = enum(u32) { @"export", import, rt_alias, _ };
 };
 
 /// A node's offer of a name to a type (`type_name_index`), by the type's
@@ -516,7 +519,7 @@ pub const Input = extern struct {
 const Section = enum { nodes, table, edges, redges, rref_starts, rref_nodes, reached_bits, stale_nodes, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, type_names, type_name_starts, type_name_index, atom_names, atom_name_bytes, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN18".*;
+const magic = "ZAPMAN19".*;
 const log_magic = "ZAPMLG08".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";

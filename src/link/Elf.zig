@@ -150,7 +150,8 @@ pub const LocalSymbol = struct {
     name: []const u8,
     atom: SymbolKey,
     offset: u64,
-    size: u64,
+    /// Null: to the atom's end.
+    size: ?u64 = null,
     /// A C global, listed STB_GLOBAL (or STB_WEAK) after every local
     /// symbol, as lld lists them. At offset 0 it also replaces its atom's
     /// own (local) symbol.
@@ -158,6 +159,10 @@ pub const LocalSymbol = struct {
     /// st_other's visibility, as lld keeps it: a hidden global listed as
     /// a local symbol stays STV_HIDDEN.
     visibility: elf.STV = .DEFAULT,
+    /// Another name of the atom (an export's, or compiler_rt's name of its
+    /// function), listed besides the atom's own symbol, as upstream's
+    /// exports are aliases of the declaration's symbol.
+    alias: bool = false,
 };
 
 /// An input object's section that is copied rather than made atoms of
@@ -289,6 +294,9 @@ pub const Symbols = struct {
     dynamic_imports: []const u32 = &.{},
     dynamic_exports: []const u32 = &.{},
     dynamic: u32 = no_bound,
+    /// The numbers of `Options.local_symbols`' atoms, parallel to them:
+    /// only aliases (`LocalSymbol.alias`) in a numbered link.
+    local_symbols: []const u32 = &.{},
     /// The numbers of `Options.aliases`, parallel to them.
     aliases: []const NumberedAlias = &.{},
     entry: u32,
@@ -733,7 +741,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const n_partitions = std.math.ceilPowerOfTwoAssert(usize, @min(n_threads, 8));
 
     const numbered = options.symbols;
-    if (numbered) |s| if (s.atoms.len != n_atoms or (options.entry != null and s.entry >= s.len) or options.local_symbols.len != 0 or options.input_sections.len != 0) return error.InvalidSymbols;
+    if (numbered) |s| if (s.atoms.len != n_atoms or (options.entry != null and s.entry >= s.len) or options.local_symbols.len != s.local_symbols.len or options.input_sections.len != 0) return error.InvalidSymbols;
     if (numbered) |s| if (options.dynamic) |d| if (s.dynamic_imports.len != d.imports.len or s.dynamic_exports.len != d.exports.len) return error.InvalidSymbols;
     if (numbered) |s| if (s.aliases.len != options.aliases.len) return error.InvalidSymbols;
     var symbols: SymbolTable = if (numbered == null) try .init(n_atoms, n_partitions) else .empty;
@@ -815,7 +823,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     defer gpa.free(failures);
     var unlisted: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty;
     defer unlisted.deinit(gpa);
-    for (options.local_symbols) |ls| if (ls.bind != .local and ls.offset == 0) try unlisted.put(gpa, ls.atom, {});
+    for (options.local_symbols) |ls| if (ls.bind != .local and ls.offset == 0 and !ls.alias) try unlisted.put(gpa, ls.atom, {});
     var l: Link = .{
         .gpa = gpa,
         .input = input,
@@ -836,6 +844,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .chunks = chunks,
         .symbols = &symbols,
         .unlisted = &unlisted,
+        .object = options.object,
         .failures = failures,
         .input_sections = inputs,
         .input_offs = input_offs,
@@ -882,11 +891,25 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const local_str = strtab_len;
     // The global ones go last, after every local symbol (.symtab's sh_info).
     var n_globals: u32 = 0;
-    for (options.local_symbols, local_atoms) |ls, *atom| {
-        atom.* = @intCast(symbols.get(ls.atom) orelse {
+    // A numbered link's, by number, found in one pass.
+    var local_of: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer local_of.deinit(gpa);
+    if (numbered) |s| if (s.local_symbols.len != 0) {
+        try local_of.ensureTotalCapacity(gpa, @intCast(s.local_symbols.len));
+        for (s.local_symbols) |n| local_of.putAssumeCapacity(n, std.math.maxInt(u32));
+        for (s.atoms, 0..) |a, i| if (local_of.getPtr(a.symbol)) |p| {
+            p.* = @intCast(i);
+        };
+    };
+    for (options.local_symbols, local_atoms, 0..) |ls, *atom, k| {
+        const found: ?u32 = if (numbered) |s| f: {
+            const i = local_of.get(s.local_symbols[k]).?;
+            break :f if (i == std.math.maxInt(u32)) null else i;
+        } else if (symbols.get(ls.atom)) |i| @intCast(i) else null;
+        atom.* = found orelse {
             diag.* = .{ .atom = ls.name, .target = ls.atom };
             return error.UndefinedSymbol;
-        });
+        };
         if (ls.offset > input.atom(atom.*).size()) {
             diag.* = .{ .atom = ls.name, .target = ls.atom };
             return error.InvalidSymbols;
@@ -1374,7 +1397,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
                 .other = .{ .visibility = ls.visibility },
                 .shndx = l.shndx[p.section],
                 .value = l.atomAddr(atom) + ls.offset - l.sym_bias[p.section],
-                .size = ls.size,
+                .size = ls.size orelse input.atom(atom).size() - ls.offset,
             };
             @memcpy(strs[at..][0..ls.name.len], ls.name);
             strs[at + ls.name.len] = 0;
@@ -1687,6 +1710,8 @@ fn LinkOf(comptime Input: type) type {
         /// The atoms a global `Options.local_symbols` entry lists instead
         /// of their own symbol.
         unlisted: *const std.AutoHashMapUnmanaged(SymbolKey, void),
+        /// `Options.object`, whose image lists every atom.
+        object: bool,
         /// One slot per task. A phase reports the failure of the lowest atom,
         /// whatever the thread timing.
         failures: []?Failure,
@@ -2266,6 +2291,9 @@ fn LinkOf(comptime Input: type) type {
         /// `i`, from `addrs`.
         /// Whether atom `a` has its own symbol.
         fn listed(l: *const Self, a: *const Atom) bool {
+            // An extern's slot (`Emit.lowerExternSlots`) is bs's: upstream
+            // lists only the symbol, whose name the slot's ends in.
+            if (!l.object and a.section == .rodata and std.mem.startsWith(u8, a.name, "extern.")) return false;
             return listedAtom(a) and (l.unlisted.count() == 0 or !l.unlisted.contains(a.key));
         }
 

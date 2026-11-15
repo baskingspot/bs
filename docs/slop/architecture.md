@@ -264,7 +264,17 @@ three parts):
   (`Emit.nameAtoms`), after `finalizeNames`, and so is a unit's atom that
   an eager edit build loaded. `Emit.atom_names` keeps, for the cache,
   which type's name each atom's name starts with (`nav.parent`; none for
-  an export's name).
+  an export's name). Since 2026-11-14 an exported function's ELF atom
+  keeps its declaration's qualified name, and its export names are
+  aliases in .symtab (`Emit.aliasSymbols`, `Elf.LocalSymbol.alias`), as
+  upstream's LLVM backend makes every export an alias of the
+  declaration's symbol: hidden ones local with STV_HIDDEN, the rest
+  global or weak, as lld lists them. compiler_rt's linked functions get
+  the names compiler_rt exports them under (`__udivti3`, local hidden)
+  unless the program exports the name. The manifest records both (an
+  export's flags, `LinkSymbol.Kind.rt_alias`), so a numbered relink lists
+  the same (`Elf.Symbols.local_symbols`). Mach-O still names an exported
+  function's atom after its last export.
 - *Parents.* A type's namespace's parent is the nearest enclosing
   namespace that is not inside a function (`Namespace.parent`,
   `Namespace.in_fn`). AstGen tunnels every reference to a declaration of
@@ -4164,6 +4174,9 @@ above), so bs's own executable link sees none of this.
   .rodata atom holding an `x86_64_abs64` to the definition, or in an
   object to an import). The slots are bs's GOT already: code loads a
   slot RIP-relative and calls through it, so no PLT is needed for them.
+  An executable's or shared object's .symtab does not list a slot
+  (`extern.<name>`, since 2026-11-14), as upstream has none and lists
+  only the symbol; an object's lists it, as its relocations name it.
 - Imports are the only symbols another module can preempt. Every
   reference from Zig code to Zig code, exported functions and variables
   included, binds inside the image, as upstream's: an upstream `-dynamic`

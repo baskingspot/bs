@@ -699,6 +699,8 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     defer exports.deinit(gpa);
     var imports: std.ArrayList(ElfObject.Import) = .empty;
     defer imports.deinit(gpa);
+    var rt_aliases: std.ArrayList(Emit.RtName) = .empty;
+    defer rt_aliases.deinit(gpa);
     var values: std.ArrayList(Elf.NumberedValue) = try .initCapacity(gpa, m.errorCount() + 1 + m.link_symbols.len);
     defer values.deinit(gpa);
     for (1..m.errorCount() + 1) |code| values.appendAssumeCapacity(.{ .symbol = m.errorSymbol(@intCast(code)), .value = code });
@@ -708,7 +710,8 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
         switch (ls.kind) {
             // Flag 1: hidden, which a shared library binding to the
             // executable's definitions does not see (`Glibc.dynamicOptions`).
-            .@"export" => try exports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name, .visibility = if (ls.flags & 1 != 0) .hidden else .default }),
+            .@"export" => try exports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name, .weak = ls.flags & 2 != 0, .visibility = if (ls.flags & 1 != 0) .hidden else if (ls.flags & 4 != 0) .protected else .default }),
+            .rt_alias => try rt_aliases.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name }),
             .import => {
                 const f: Emit.ImportFlags = .fromBits(@truncate(ls.flags));
                 try imports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls });
@@ -735,7 +738,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
         if (inc.output == .exe and inc.link_objects.len != 0) {
             var maps: std.ArrayList(Io.File.MemoryMap) = .empty;
             defer for (maps.items) |*mm| mm.destroy(io);
-            return inc.linkWithInputs(arena, &maps, m, &input, in.numbered, exports.items, imports.items, null, &.{}, out_dir, sub_path, cwd, gathered);
+            return inc.linkWithInputs(arena, &maps, m, &input, in.numbered, exports.items, rt_aliases.items, imports.items, null, &.{}, out_dir, sub_path, cwd, gathered);
         }
         return inc.linkMachO(arena, m, &input, in, values.items, imports.items, out_dir, sub_path, cwd, gathered, checked);
     }
@@ -758,7 +761,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     var maps: std.ArrayList(Io.File.MemoryMap) = .empty;
     defer for (maps.items) |*mm| mm.destroy(io);
     const shared: []const ElfShared = if (!exe_dyn) &.{} else inc.shared orelse (try inc.loadShared(arena, &maps)) orelse return null;
-    if (inc.link_objects.len != 0 and inc.output == .exe) return inc.linkWithInputs(arena, &maps, m, &input, in.numbered, exports.items, imports.items, glibc, shared, out_dir, sub_path, cwd, gathered);
+    if (inc.link_objects.len != 0 and inc.output == .exe) return inc.linkWithInputs(arena, &maps, m, &input, in.numbered, exports.items, rt_aliases.items, imports.items, glibc, shared, out_dir, sub_path, cwd, gathered);
     if (glibc) |g| {
         dynamic = g.dynamicOptions(arena, imports.items, &.{}, exports.items, shared, inc.lld, inc.rdynamic) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
@@ -781,6 +784,11 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
         .symbol = m.symbol(@backingInt(a.key)).?,
         .target = m.symbol(@backingInt(a.target)) orelse return inc.noLink("an extern slot's target has no symbol number", .{}),
     };
+    // An executable's other names of its atoms, as `Emit.link` lists them.
+    const alias_syms: []const Elf.LocalSymbol = if (inc.output == .exe) try Emit.aliasSymbols(arena, exports.items, rt_aliases.items) else &.{};
+    const alias_numbers = try arena.alloc(u32, alias_syms.len);
+    for (alias_numbers, alias_syms) |*n, ls| n.* = m.symbol(@backingInt(ls.atom)) orelse
+        return inc.noLink("'{s}' names an atom with no symbol number", .{ls.name});
     var diag: Elf.Diagnostic = .{};
     const options: Elf.Options = .{
         .entry = if (inc.output == .exe) @fromBackingInt(m.entry) else null,
@@ -798,7 +806,9 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             .dynamic_imports = dynamic_imports,
             .dynamic_exports = dynamic_exports,
             .aliases = numbered_aliases,
+            .local_symbols = alias_numbers,
         },
+        .local_symbols = alias_syms,
         .diag = &diag,
         .comp_dir = cwd,
         .stack_size = inc.stack_size,
@@ -1032,6 +1042,7 @@ fn linkWithInputs(
     pack_atoms: *const Pack.LinkAtoms,
     numbered: []const Elf.NumberedAtom,
     exports: []const ElfObject.Export,
+    rt: []const Emit.RtName,
     imports: []ElfObject.Import,
     glibc: ?*const Glibc,
     shared: []const ElfShared,
@@ -1042,10 +1053,10 @@ fn linkWithInputs(
 ) !?Linked {
     if (inc.macos != null) {
         var objects: MachOInput = .{ .arena = arena };
-        return inc.linkWithObjects(&objects, arena, maps, m, pack_atoms, numbered, exports, imports, glibc, shared, out_dir, sub_path, cwd, gathered);
+        return inc.linkWithObjects(&objects, arena, maps, m, pack_atoms, numbered, exports, rt, imports, glibc, shared, out_dir, sub_path, cwd, gathered);
     }
     var objects: ElfInput = .{ .arena = arena, .dynamic = glibc != null, .shared_libs = shared, .lld = inc.lld, .arch = inc.arch };
-    return inc.linkWithObjects(&objects, arena, maps, m, pack_atoms, numbered, exports, imports, glibc, shared, out_dir, sub_path, cwd, gathered);
+    return inc.linkWithObjects(&objects, arena, maps, m, pack_atoms, numbered, exports, rt, imports, glibc, shared, out_dir, sub_path, cwd, gathered);
 }
 
 /// `linkWithInputs` with the objects in `objects`, an empty `ElfInput` or
@@ -1063,6 +1074,7 @@ fn linkWithObjects(
     pack_atoms: *const Pack.LinkAtoms,
     numbered: []const Elf.NumberedAtom,
     exports: []const ElfObject.Export,
+    rt: []const Emit.RtName,
     imports: []ElfObject.Import,
     glibc: ?*const Glibc,
     shared: []const ElfShared,
@@ -1304,7 +1316,7 @@ fn linkWithObjects(
         .comp_dir = cwd,
         .stack_size = inc.stack_size,
         .strip = inc.strip,
-        .local_symbols = converted.symbols,
+        .local_symbols = try std.mem.concat(arena, Elf.LocalSymbol, &.{ converted.symbols, try Emit.aliasSymbols(arena, exports, rt) }),
         .input_sections = converted.sections,
         .aliases = aliases,
         .dynamic = if (glibc != null) &dynamic else null,
@@ -4268,7 +4280,14 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     b.item_starts = enc.starts.items;
     b.entry = if (emit.entry) |e| @backingInt(e) else 0;
     b.output = inc.output;
-    for (emit.exports.items) |x| try b.addLinkSymbol(.@"export", @backingInt(x.key), x.name, @intFromBool(x.visibility == .hidden));
+    for (emit.exports.items) |x| try b.addLinkSymbol(.@"export", @backingInt(x.key), x.name, @as(u32, @intFromBool(x.visibility == .hidden)) | @as(u32, @intFromBool(x.weak)) << 1 | @as(u32, @intFromBool(x.visibility == .protected)) << 2);
+    // The names compiler_rt exports its linked functions under, which a
+    // relink lists without reading every atom's name (`Emit.aliasSymbols`).
+    if (inc.output != .obj) {
+        var rt_arena: std.heap.ArenaAllocator = .init(gpa);
+        defer rt_arena.deinit();
+        for (try Emit.rtNames(rt_arena.allocator(), inc.language, emit.atoms.items)) |rt| try b.addLinkSymbol(.rt_alias, @backingInt(rt.key), rt.name, 0);
+    }
     for (emit.imports.keys(), emit.imports.values()) |name, flags| try b.addLinkSymbol(.import, @backingInt(Emit.importKey(name)), name, flags.bits());
     for (ip.error_names.items[1..]) |name| _ = try b.addErrorName(ip.stringSlice(name), @backingInt(Emit.errorKey(ip, name)));
     const t3 = now(io);
