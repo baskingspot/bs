@@ -8172,11 +8172,22 @@ state. Built for step 1:
   salts the store seed with `=nosafety`. Their C sources get `-DNDEBUG`,
   `-O2` or `-Os`, and no UBSan, as upstream's.
 - **Backend flags.** bs generates the same code in Debug and ReleaseSafe,
-  where upstream's choice of backend changes nothing a program means. So `-fllvm`, `-flld` and their
-  `-fno-` forms are accepted without a word and bs compiles with its own
-  backend and linker. `builtin.zig_backend` is upstream's Debug default for
-  the target, whatever the flags say: `.stage2_x86_64` on x86_64-linux,
-  `.stage2_llvm` on aarch64-macos. Example: uucode's `build.zig` builds its
+  where upstream's choice of backend changes nothing a program means. So
+  with `-fllvm`, `-flld` and their `-fno-` forms bs compiles with its own
+  backend and linker. `builtin.zig_backend` names the
+  backend that compiles (`Options.zigBackend`): `.stage2_x86_64` on
+  x86_64-linux in every mode, since bs's x86_64 backend has the
+  self-hosted backend's limits (no tail calls, SSE in inline assembly),
+  and `.stage2_llvm` on aarch64, whose backend follows LLVM's rules,
+  unless `-fno-llvm` asks for upstream's self-hosted aarch64 backend
+  (`.stage2_aarch64`, which refuses `@call(.always_tail)` and takes std's
+  self-hosted paths, as upstream); `-fllvm` names `.stage2_llvm`. Sema's
+  backend-dependent checks read
+  `Zcu.backend`, and a backend other than the target's default salts the
+  cache name with `=<backend>` (`cacheTarget`). Upstream's own choice of
+  backend (`Options.llvmBackend`: LLVM for a release mode or on aarch64)
+  still decides the C flags it implies (the stack protector). `-flld`
+  and `-fno-lld` change nothing. Example: uucode's `build.zig` builds its
   Unicode table generator with `.use_llvm = true` in Debug; under `bs
   build` that step compiles with bs, and libvaxis needs no `-Dllvm=false`.
   The same rule covers `-fPIE` and `-fPIC` on executables (linuxwave's
@@ -9495,8 +9506,8 @@ options, as upstream's.
   gets `-fstack-protector-strong --param ssp-buffer-size=4` when the
   compilation links libc and its Zig code has no self-hosted backend: a
   library of C only (`c_only`), an executable or shared library of C only
-  (`c_root`: upstream has no Zig for it), or `-fllvm`, which bs
-  otherwise ignores; a module's `-fstack-protector`/`-fno-stack-protector` wins.
+  (`c_root`: upstream has no Zig for it), or the LLVM backend
+  (`Options.llvmBackend`); a module's `-fstack-protector`/`-fno-stack-protector` wins.
   Otherwise `-fno-stack-protector`, as before.
 - **Native include directories** (upstream's
   `native_system_include_paths`): a native build without `--sysroot`
@@ -9697,10 +9708,11 @@ and `zig build -Dtarget=aarch64-macos`.
 ## `builtin` and conformance
 
 - bs generates the `builtin` module itself (`src/Builtin.zig`).
-  `zig_backend` is upstream's Debug default for the target, whatever
-  `-fllvm` says: `.stage2_x86_64` on x86_64-linux, `.stage2_llvm` on
-  aarch64-macos (decided 2026-11-03) and aarch64-linux. std and `test/behavior` then take
-  the paths they take upstream, and the conformance baseline stays
+  `zig_backend` is the backend that compiles (**Backend flags**):
+  `.stage2_x86_64` on x86_64-linux, `.stage2_llvm` on aarch64-macos
+  (decided 2026-11-03) and aarch64-linux, `.stage2_aarch64` there with
+  `-fno-llvm` (since 2026-11-14). std and `test/behavior` then take the
+  paths they take upstream in Debug, and the conformance baseline stays
   comparable. Where upstream's semantics depend on the backend, Sema
   follows the target's (a packed field pointer's host size, for one); the
   rest of aarch64-macos's `builtin` is upstream's `--show-builtin` for

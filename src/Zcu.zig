@@ -190,6 +190,10 @@ is_test: bool = false,
 /// `-fsingle-threaded`: `threadlocal` variables are ordinary globals, as
 /// upstream (std's start code sets up no thread pointer then).
 single_threaded: bool = false,
+/// `builtin.zig_backend`: the backend upstream would compile with
+/// (`main.Options.zigBackend`), whose rules Sema follows where upstream's
+/// backends differ (tail calls).
+backend: std.lang.CompilerBackend = .stage2_x86_64,
 /// `-mcpu`: the CPU code is generated for, whose features say which vector
 /// operations the backend lowers natively (`codegen/vector.zig`).
 cpu: std.Target.Cpu = cpu_mod.baseline,

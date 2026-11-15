@@ -21716,7 +21716,7 @@ fn analyzeCall(
         };
         try sema.requireRuntime(block, src);
         if (modifier == .always_tail) try sema.bcRefuse();
-        if (modifier == .always_tail and ip.target.arch() != .aarch64) return sema.failTailCall(block, src, ret_ty);
+        if (modifier == .always_tail and sema.zcu.backend != .stage2_llvm) return sema.failTailCall(block, src, ret_ty);
         if (fn_ty.cc == .auto) sema.has_error_trace = true;
         // As upstream, a function pointer or extern function that does not
         // return panics if it does: the call returns void, then panics.
@@ -21807,7 +21807,7 @@ fn analyzeCall(
         }
     }
     if (modifier == .always_tail) try sema.bcRefuse();
-    if (modifier == .always_tail and ip.target.arch() != .aarch64) return sema.failTailCall(block, src, call_ret_ty);
+    if (modifier == .always_tail and sema.zcu.backend != .stage2_llvm) return sema.failTailCall(block, src, call_ret_ty);
     if (callee_fn_ty.cc == .auto) sema.has_error_trace = true;
     const payload = try sema.addExtra(Ir.Call{ .ret_ty = call_ret_ty, .args_len = @intCast(call_args.len), .flags = .{ .never_inline = modifier == .never_inline, .always_tail = modifier == .always_tail } });
     try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(call_args));
@@ -21835,13 +21835,13 @@ fn tailRet(sema: *Sema, block: *Block, src: Src, callee_ty: Index, call: Ref) Co
     return .unreachable_value;
 }
 
-/// A runtime `@call(.always_tail, ...)` on x86_64. Upstream's self-hosted
-/// backends support no tail calls (`target_util.supportsTailCall`), while
-/// LLVM, aarch64-macos's Debug backend, does; comptime and inline calls are
-/// not tail calls and get here only at runtime.
+/// A runtime `@call(.always_tail, ...)` when upstream would compile with a
+/// self-hosted backend, which supports no tail calls
+/// (`target_util.supportsTailCall`), while LLVM does; comptime and inline
+/// calls are not tail calls and get here only at runtime.
 fn failTailCall(sema: *Sema, block: *Block, src: Src, ret_ty: Index) CompileError {
     try sema.checkTailResult(block, src, try sema.runtimeDummy(ret_ty));
-    return sema.fail(block, src, "unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags", .{});
+    return sema.fail(block, src, "unable to perform tail call: compiler backend '{t}' does not support tail calls on target architecture '{t}' with the selected CPU feature flags", .{ sema.zcu.backend, sema.zcu.ip.target.arch() });
 }
 
 /// As upstream, a tail call's result `result` is coerced to the return

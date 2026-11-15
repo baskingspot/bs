@@ -7,8 +7,8 @@
 //! aarch64-macos (macOS 15.0 to 27.0 as `-target
 //! aarch64-macos` gives, or the versions the target names) with LLVM,
 //! linked against libSystem.
-//! `zig_backend` is upstream's Debug default for the target, so std takes
-//! the code paths it takes with upstream.
+//! `zig_backend` is the backend upstream would use (`Options.zig_backend`),
+//! so std and the program take the code paths they take with upstream.
 //! Copyright (c) Zig contributors. MIT licensed (see LICENSE-ZIG).
 
 const std = @import("std");
@@ -39,6 +39,9 @@ pub const Options = struct {
     fuzz: bool = false,
     /// `-O`, `-ferror-tracing` and `-fvalgrind`, resolved (`main.Options`).
     optimize: std.lang.Optimize = .debug,
+    /// `builtin.zig_backend`: the backend upstream would compile with
+    /// (`main.Options.llvmBackend`), though bs compiles with its own.
+    zig_backend: std.lang.CompilerBackend = .stage2_x86_64,
     error_tracing: bool = true,
     valgrind: bool = true,
     /// `-fstrip`.
@@ -320,7 +323,7 @@ fn generateNewest(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\const std = @import("std");
         \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
         \\pub const zig_version_string = "{s}";
-        \\pub const zig_backend = std.lang.CompilerBackend.stage2_llvm;
+        \\pub const zig_backend = std.lang.CompilerBackend.{t};
         \\
         \\pub const output_mode: std.lang.OutputMode = .{s};
         \\pub const link_mode: std.lang.LinkMode = .dynamic;
@@ -379,6 +382,7 @@ fn generateNewest(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\
     , .{
         opts.language.versionString(),
+        opts.zig_backend,
         @tagName(opts.output_mode),
         @tagName(opts.unwind_tables),
         if (opts.is_test) "true" else "false",
@@ -424,7 +428,7 @@ fn generateNewest(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\const std = @import("std");
         \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
         \\pub const zig_version_string = "{s}";
-        \\pub const zig_backend = std.lang.CompilerBackend.{s};
+        \\pub const zig_backend = std.lang.CompilerBackend.{t};
         \\
         \\pub const output_mode: std.lang.OutputMode = .{s};
         \\pub const link_mode: std.lang.LinkMode = .{s};
@@ -467,9 +471,7 @@ fn generateNewest(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\
     , .{
         opts.language.versionString(),
-        // Upstream's Debug default: its own backend on x86_64-linux, LLVM
-        // on aarch64-linux.
-        if (opts.target == .x86_64_linux) "stage2_x86_64" else "stage2_llvm",
+        opts.zig_backend,
         @tagName(opts.output_mode),
         if (opts.dynamic or exe_libc) "dynamic" else "static",
         @tagName(opts.unwind_tables),

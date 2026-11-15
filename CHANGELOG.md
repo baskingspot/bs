@@ -17,7 +17,8 @@ Changes a user of bs notices, newest first, in the
 ### Changed
 
 - On ELF, a function's .symtab entry keeps its qualified name, such as `x86_64.dispatch.memcpy`. Each export name is listed beside it, as an alias with the export's binding and visibility; a hidden export is listed as a local symbol, as lld lists upstream's. compiler_rt's functions are listed under their C names too (`__udivti3`). bs used to name the function by one of its export names and list it as default. An executable's or shared object's .symtab no longer lists bs's `extern.<name>` slots, which upstream does not have.
-- Compile errors sent to `zig build` over `--listen=-` carry upstream's text: no `[code]` prefix and no notes of bs's own. The build runner used to print `error: [compile-error] …`, which `expect_errors` that match upstream's text did not match. On the command line the codes stay. A `@call(.always_tail)` refused on x86_64, as upstream's self-hosted backend refuses it, has the code `bad-call` instead of `unsupported`.
+- Compile errors sent to `zig build` over `--listen=-` carry upstream's text: no `[code]` prefix and no notes of bs's own. The build runner used to print `error: [compile-error] …`, which `expect_errors` that match upstream's text did not match. On the command line the codes stay. A `@call(.always_tail)` refused under `-fno-llvm` has the code `bad-call` instead of `unsupported`.
+- `builtin.zig_backend` is `.stage2_aarch64` on aarch64 under `-fno-llvm`, as upstream's, and std and Sema take that backend's paths. It stays `.stage2_llvm` on aarch64 otherwise and `.stage2_x86_64` on x86_64-linux.
 
 ### Fixed
 

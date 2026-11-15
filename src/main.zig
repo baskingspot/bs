@@ -253,9 +253,9 @@ pub const Options = struct {
     /// (`native_system_include_paths`).
     c_native_includes: []const []const u8 = &.{},
     c_pie: bool = false,
-    /// `-fllvm`: the backend upstream would use, which bs does not, but
-    /// which gives the compilation's C a stack protector upstream.
-    use_llvm: bool = false,
+    /// `-fllvm` (true) or `-fno-llvm` (false): the backend upstream would
+    /// use (`llvmBackend`), which bs does not.
+    use_llvm: ?bool = null,
     /// `-fcompiler-rt` (true) or `-fno-compiler-rt` (false), as given.
     compiler_rt: ?bool = null,
     function_sections: bool = false,
@@ -290,6 +290,26 @@ pub const Options = struct {
     /// and Zig 0.16's `@cImport`s take after `c_global_cc_argv`.
     root_cc_argv: []const []const u8 = &.{},
     modules: []const Frontend.ModuleArg = &.{},
+
+    /// Whether upstream would compile this with LLVM, as its
+    /// `Compilation.Config` decides: `-fllvm` or `-fno-llvm`, else LLVM for
+    /// a release mode of the root module and on aarch64, and its own
+    /// backend for a Debug x86_64-linux build. It decides upstream's C
+    /// flags (the stack protector).
+    pub fn llvmBackend(opts: *const Options) bool {
+        return opts.use_llvm orelse (opts.optimize != .debug or opts.bs_target != .x86_64_linux);
+    }
+
+    /// `builtin.zig_backend` of a compilation bs compiles: the backend that
+    /// compiles it. bs's x86_64 backend is the self-hosted one's peer,
+    /// `.stage2_x86_64`, in every mode; its aarch64 backend follows LLVM's
+    /// rules (tail calls, vector layout), so aarch64 reports `.stage2_llvm`
+    /// unless `-fno-llvm` asks for upstream's self-hosted backend.
+    pub fn zigBackend(opts: *const Options) std.lang.CompilerBackend {
+        if (opts.use_llvm == true) return .stage2_llvm;
+        if (opts.bs_target == .x86_64_linux) return .stage2_x86_64;
+        return if (opts.use_llvm == false) .stage2_aarch64 else .stage2_llvm;
+    }
 };
 
 /// Commands of upstream's CLI that `zig build` runs and bs does not
@@ -485,7 +505,9 @@ pub fn main(init_std: std.process.Init) !void {
 /// without memory forwarding (`BS_FORWARD=off`) as `+noforward`. A CPU
 /// other than the target's default (`-mcpu`), which changes builtin and the code
 /// generated for every function, follows the target as `@<model>` and its
-/// feature words (`cpu.cacheName`).
+/// feature words (`cpu.cacheName`). A backend other than upstream's Debug
+/// default for the target (`Options.zigBackend`: `-fno-llvm` on aarch64),
+/// which changes what Sema accepts (tail calls), follows as `=<backend>`.
 fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.process.Environ.Map) ![]const u8 {
     const inl = inlining(env);
     const default_inl = inl.budget == inline_ir.budget and !inl.safe;
@@ -496,7 +518,9 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
     const prove_on = proving(env);
     const forward_on = forwarding(env);
     const cpu_name = try cpu_mod.cacheName(arena, opts.cpu, cpu_mod.targetDefault(opts.bs_target.arch(), opts.bs_target == .aarch64_macos));
-    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on and forward_on and cpu_name.len == 0) return opts.bs_target.name();
+    const backend = opts.zigBackend();
+    const default_backend: std.lang.CompilerBackend = if (opts.bs_target == .x86_64_linux) .stage2_x86_64 else .stage2_llvm;
+    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on and forward_on and cpu_name.len == 0 and backend == default_backend) return opts.bs_target.name();
     var s: std.ArrayList(u8) = .empty;
     try s.appendSlice(arena, opts.bs_target.name());
     try s.appendSlice(arena, cpu_name);
@@ -509,6 +533,7 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
     }
     if (!opts.error_tracing) try s.appendSlice(arena, "=notrace");
     if (unsafe) try s.appendSlice(arena, "=nosafety");
+    if (backend != default_backend) try s.print(arena, "={t}", .{backend});
     for (opts.modules) |m| {
         if (m.optimize.? == opts.optimize and m.error_tracing.? == opts.error_tracing and m.valgrind.? == opts.valgrind) continue;
         try s.print(arena, "={s}:{t}{c}{c}", .{ m.name, m.optimize.?, "nt"[@intFromBool(m.error_tracing.?)], "nv"[@intFromBool(m.valgrind.?)] });
@@ -598,6 +623,7 @@ pub const Job = struct {
             .unwind_tables = opts.unwind_tables,
             .fuzz = opts.root_fuzz,
             .optimize = opts.optimize,
+            .zig_backend = opts.zigBackend(),
             .error_tracing = opts.error_tracing,
             .valgrind = opts.valgrind,
             .strip = opts.strip,
@@ -1289,7 +1315,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .musl_libc = linksMusl(opts),
         .global_cache = job.cache_dirs.global,
         .single_threaded = opts.single_threaded,
-        .stack_protector = opts.c_only or opts.c_root or opts.use_llvm or opts.bs_target != .x86_64_linux or opts.optimize != .debug,
+        .stack_protector = opts.c_only or opts.c_root or opts.llvmBackend(),
         .pic = opts.dynamic,
         .pie = opts.c_pie or macos,
         .function_sections = opts.function_sections,
@@ -1421,6 +1447,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     zcu.name_pins = pins.*;
     zcu.single_threaded = opts.single_threaded;
     zcu.cpu = opts.cpu;
+    zcu.backend = opts.zigBackend();
     // libSystem, macOS's libc, is linked into every executable.
     zcu.link_libc = opts.link_libc or opts.bs_target == .aarch64_macos;
     zcu.link_libcpp = opts.link_libcpp;
@@ -2410,13 +2437,10 @@ const DumpSink = struct {
 /// Options that upstream accepts and that change nothing bs does: link
 /// layout, C-only settings, and settings bs already has.
 const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
-    // bs builds only Debug, where the backend is a preference that
-    // changes nothing a program means: bs uses its own backend and
-    // linker, and `builtin.zig_backend` stays upstream's Debug default for
-    // the target (docs/slop/architecture.md, "The command line and `bs
-    // build`").
-    .{"-fllvm"},                         .{"-flld"},
-    .{"-fno-llvm"},                      .{"-fno-lld"},
+    // The linker is a preference that changes nothing a program means:
+    // bs uses its own (`-fllvm` and `-fno-llvm` are parsed: they choose
+    // `builtin.zig_backend`).
+    .{"-flld"},                          .{"-fno-lld"},
     .{"-fnew-linker"},                   .{"-fno-new-linker"},
     .{"-fallow-so-scripts"},             .{"-fno-allow-so-scripts"},
     .{"-fentry"},                        .{"-fno-emit-asm"},
@@ -2768,7 +2792,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             _ = nextArg(args, &i, arg);
             sysroot = true;
         } else if (std.mem.eql(u8, arg, "-fllvm") or std.mem.eql(u8, arg, "-fno-llvm")) {
-            // bs uses its own backend either way (see `ignored_flags`).
+            // bs uses its own backend either way; the flag chooses the one
+            // `builtin.zig_backend` names (`llvmBackend`).
             opts.use_llvm = arg[2] == 'l';
         } else if (std.mem.eql(u8, arg, "-fcompiler-rt") or std.mem.eql(u8, arg, "-fno-compiler-rt")) {
             // Changes only Zig 0.16's export collisions (`Zcu.checkExportCollisions`):
