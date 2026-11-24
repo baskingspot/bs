@@ -4,8 +4,8 @@
 #   $1 bs  $2 test/build/hello  $3 scratch directory
 #   $4 the build web client bs embeds (build-web.wasm)
 #   $5 the part to check, each its own build step: build, which compiles
-#      the build runner into the global cache, then shape, fuzz, misc and
-#      compiler at once, each in its own copy
+#      the build runner into the global cache, then shape, fuzz, misc,
+#      compiler and doc at once, each in its own copy
 set -eu
 unset ZIG_LOCAL_CACHE_DIR ZIG_LIB_DIR
 rm -rf "$3"
@@ -231,6 +231,39 @@ configures a "the first bs again" yes
 cp "$work/b/bs" "$work/a/bs"
 configures a "another bs copied over the first" yes
 configures a "no change after the copy" no
+;;
+doc)
+# `bs doc`: std's declarations through an alias to another file and
+# through a type function that returns a call to another; build.zig's
+# modules by import name and by step name; and its errors.
+lib=$("$bs" env | sed -n 's/^ *\.lib_dir = "\(.*\)",$/\1/p')
+"$bs" doc std.ArrayList >"$work/log" 2>&1 || fail "bs doc std.ArrayList"
+expect "Category: type_function"
+expect "Signature: pub fn ArrayList(comptime T: type) type"
+expect "  items: Slice"
+expect "  appendSlice"
+"$bs" doc std.mem.Allocator >"$work/log" 2>&1 || fail "bs doc std.mem.Allocator"
+expect "Alias Target: std.mem.Allocator"
+expect "Target Location: $lib/std/mem/Allocator.zig:1"
+expect "Type: struct (file root)"
+"$bs" doc greet.pick >"$work/log" 2>&1 || fail "bs doc greet.pick"
+expect "Location: $work/hello/src/greet.zig:6"
+expect "Signature: pub fn pick(n: usize) []const u8"
+expect "  The fuzz test calls it;"
+"$bs" doc hello.main >"$work/log" 2>&1 || fail "bs doc hello.main (the step's root module)"
+expect "Signature: pub fn main(init: std.process.Init) !void"
+! "$bs" doc greet.pik >"$work/log" 2>&1 || fail "bs doc greet.pik succeeded"
+expect "error: 'greet' has no public declaration 'pik'"
+expect "note: did you mean 'greet.pick'?"
+! "$bs" doc hello.add >"$work/log" 2>&1 || fail "bs doc hello.add succeeded"
+expect "error: 'add' is declared in 'hello' but is not pub"
+! "$bs" doc c.x >"$work/log" 2>&1 || fail "bs doc c.x succeeded"
+expect "error: build.zig generates the root file of module 'c'"
+! "$bs" doc nope >"$work/log" 2>&1 || fail "bs doc nope succeeded"
+expect "error: no module 'nope'; the modules are std, "
+"$bs" doc --zig-version 0.16 std.ArrayList >"$work/log" 2>&1 || fail "bs doc --zig-version 0.16 std.ArrayList"
+expect "0.16.0/lib/std/std.zig:49"
+expect "has been passed to an allocator's resize or free function."
 ;;
 *)
     fail "unknown part '$part'"

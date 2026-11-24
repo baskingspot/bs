@@ -8314,6 +8314,27 @@ state. Built for step 1:
   `--time-report` start 0.16's web UI, which bs does not serve, and are
   refused. The fetcher costs bs's binary its HTTP, TLS,
   git and archive code.
+- **`bs doc <symbol>`** (`src/Doc.zig`, owner's request 2026-11-24) is
+  rockorager's zigdoc in bs: the location, alias chain, category,
+  signature, doc comments and members of a public declaration, in
+  zigdoc's format. It reads syntax only, with bs's frontend in the
+  language `--zig-version` or the nearest `.bs.zon` chooses, parsing a
+  file when a path first reaches it (1.5 ms for `std.ArrayList`, where
+  zigdoc parses all of std up front; 33 ms for `vaxis.Window`, mostly
+  the runner's check that the configuration is current). Values are classified as
+  upstream's autodocs classify them (lib/docs/wasm/Walk.zig), but a
+  declaration carries its chain of enclosing containers, which is all a
+  container-level identifier resolves in, instead of autodocs' tables of
+  every scope; a type function's members are those of the container it
+  returns, or of the type function its `return` calls (`std.ArrayList`
+  returns `array_list.Aligned(T, null)`). Modules other than `std` come
+  from the configuration bs's build runner serializes: `bs doc` runs
+  `bs build --print-configuration-path` and loads the file with std's
+  `std.Build.Configuration`, taking every compile step's imports by
+  import name and its root module by step name. A module whose root the
+  build generates (options, translate-c) is named in the error rather
+  than made, and a Zig 0.16 project, whose runner keeps no
+  configuration, has std alone.
 - **The compiler protocol** (`main.serve`, std's `std.zig.Server`): bs
   sends `zig_version` and the step's `config` (static, no libc), then
   answers each `update` with `file_system_inputs` (every file the build

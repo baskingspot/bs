@@ -82,7 +82,9 @@ the oldest.
   a C or C++ compiler inside bs.
 - CLI: drop-in for `zig build-exe`, `zig build-obj`, `zig run`, `zig test`, and `zig build`
   (bs compiles and runs the build runner and serves its compile steps over the
-  `--listen=-` compiler protocol).
+  `--listen=-` compiler protocol). One command is bs's own:
+  `bs doc <symbol>`, rockorager's zigdoc rebuilt on bs's frontend
+  (owner, 2026-11-24).
 - bs's main users are coding agents. Shape compile errors for them, not for
   humans: exact locations, the facts an agent needs to fix the error, and
   fixes where bs knows them, in a form a program can parse. That is the

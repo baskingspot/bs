@@ -34,6 +34,7 @@ const cpu016 = @import("cpu016.zig");
 const InternPool = @import("InternPool.zig");
 const BuildRunner = @import("BuildRunner.zig");
 const TranslateC = @import("TranslateC.zig");
+const Doc = @import("Doc.zig");
 const zig_fmt = @import("fmt.zig");
 const ast_check = @import("ast_check.zig");
 const Sema = @import("Sema.zig");
@@ -63,6 +64,7 @@ const usage =
     \\  translate-c      Convert C code to Zig code
     \\  fmt              Reformat Zig source into canonical form
     \\  ast-check        Look for simple compile errors in any set of files
+    \\  doc              Print the documentation of a declaration, such as std.ArrayList
     \\  env              Print lib path, std path, cache directory, and version
     \\  version          Print the Zig version bs compiles
     \\  --version        Print bs's own version
@@ -433,6 +435,7 @@ pub fn main(init_std: std.process.Init) !void {
     }
     if (std.mem.eql(u8, cmd, "build")) return BuildRunner.run(init, raw_args[2..]);
     if (std.mem.eql(u8, cmd, "translate-c")) return TranslateC.run(init, raw_args[2..]);
+    if (std.mem.eql(u8, cmd, "doc")) return Doc.run(init, raw_args[2..]);
     if (forwarded_commands.has(cmd)) return CSource.forward(arena, init.io, init.environ_map, raw_args[1..]);
     const args = raw_args;
     const command: Command = if (std.mem.eql(u8, cmd, "build-exe"))
